@@ -30,6 +30,30 @@ test("extractRuntimeImports handles static imports, re-exports, dynamic imports,
   );
 });
 
+test("extractRuntimeImports ignores non-literal dynamic imports", () => {
+  const source = [
+    "const packageName = 'react';",
+    "const lazy = import(packageName);",
+    "const templated = import(`pkg-${packageName}`);",
+    "const literal = import('uuid');",
+    "const staticTemplate = import(`date-fns`);",
+  ].join("\n");
+
+  const imports = extractRuntimeImports("sample.ts", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      line: item.line,
+    })),
+    [
+      { specifier: "uuid", kind: "dynamic", line: 3 },
+      { specifier: "date-fns", kind: "dynamic", line: 4 },
+    ],
+  );
+});
+
 test("extractRuntimeImports skips relative imports and Node builtins", () => {
   const source = [
     "import local from './local';",

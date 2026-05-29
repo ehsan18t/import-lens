@@ -19,7 +19,20 @@ const parserOptions: ParserOptions & { recovery?: boolean } = {
   recovery: true,
 };
 
-const trimLiteralQuotes = (value: string): string => value.replace(/^['"`]|['"`]$/gu, "");
+const literalDynamicImportSpecifier = (value: string): string | null => {
+  const first = value.at(0);
+  const last = value.at(-1);
+
+  if ((first === "'" || first === '"') && first === last) {
+    return value.slice(1, -1);
+  }
+
+  if (first === "`" && last === "`" && !value.includes("${")) {
+    return value.slice(1, -1);
+  }
+
+  return null;
+};
 
 const createDetectedImport = (
   source: string,
@@ -139,7 +152,9 @@ const importsFromRegion = (source: string, region: ScriptRegion): DetectedImport
   }
 
   for (const item of parsed.module.dynamicImports) {
-    const specifier = trimLiteralQuotes(region.source.slice(item.moduleRequest.start, item.moduleRequest.end));
+    const specifier = literalDynamicImportSpecifier(
+      region.source.slice(item.moduleRequest.start, item.moduleRequest.end),
+    );
 
     if (specifier && isRuntimePackageSpecifier(specifier)) {
       imports.push(createDetectedImport(source, region, specifier, "dynamic", [], item.start, item.end, item.moduleRequest.end));
