@@ -88,6 +88,10 @@ export class DecorationController implements vscode.Disposable {
       return "Calculating...";
     }
 
+    if (state.status === "unavailable") {
+      return state.message ?? "Daemon unavailable";
+    }
+
     if (state.status === "ready" && state.result) {
       const config = getImportLensConfig();
       return formatImportSize(state.result, config, state.detected.runtime);
@@ -101,6 +105,10 @@ export class DecorationController implements vscode.Disposable {
       return tooltipForMessage("ImportLens", state.message ?? "Package not found");
     }
 
+    if (state.status === "unavailable") {
+      return tooltipForMessage("ImportLens", state.message ?? "Daemon unavailable");
+    }
+
     if (state.status === "ready" && state.result) {
       return tooltipForResult(state.result, state.detected.runtime);
     }
@@ -109,7 +117,7 @@ export class DecorationController implements vscode.Disposable {
   }
 
   private colorForState(state: ImportAnalysisState): vscode.ThemeColor {
-    if (state.status === "missing" || state.result?.error) {
+    if (state.status === "missing" || state.status === "unavailable" || state.result?.error) {
       return new vscode.ThemeColor("editorWarning.foreground");
     }
 

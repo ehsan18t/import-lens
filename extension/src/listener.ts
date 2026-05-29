@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { createImportRequest } from "./analysis/request.js";
+import { markLoadingStatesUnavailable } from "./analysis/status.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
@@ -95,7 +96,12 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
     this.#store.set(document.uri, states);
 
-    if (requestImports.length === 0 || this.#daemon.state !== "ready") {
+    if (requestImports.length === 0) {
+      return;
+    }
+
+    if (this.#daemon.state !== "ready") {
+      this.#store.set(document.uri, markLoadingStatesUnavailable(states, "Daemon unavailable"));
       return;
     }
 
@@ -148,6 +154,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       this.#statusBar.setStatus("ready");
     } catch (error) {
       this.#logger.warn(`Analysis request failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#store.set(document.uri, markLoadingStatesUnavailable(states, "Daemon unavailable"));
       this.#statusBar.setStatus("unavailable");
     }
   }

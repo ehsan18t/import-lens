@@ -34,6 +34,8 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
         label = "…";
       } else if (state.status === "missing") {
         label = state.message ?? "Package not found";
+      } else if (state.status === "unavailable") {
+        label = state.message ?? "Daemon unavailable";
       } else if (state.status === "ready" && state.result) {
         label = formatImportSize(state.result, config, state.detected.runtime);
         tooltip = tooltipForResult(state.result, state.detected.runtime);
