@@ -497,7 +497,7 @@ fn analyze_import_resolves_conditional_exports_with_nested_conditions() {
             "version": "3.0.0",
             "exports": {
                 "./utils": {
-                    "browser": { "import": "./browser/utils.mjs" },
+                    "import": { "default": "./browser/utils.mjs" },
                     "default": "./node/utils.js"
                 }
             }
