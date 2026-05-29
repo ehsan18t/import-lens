@@ -26,3 +26,9 @@ test("isRuntimePackageSpecifier rejects framework virtual and app alias imports"
   assert.equal(isRuntimePackageSpecifier("@/components/Button"), false);
   assert.equal(isRuntimePackageSpecifier("~/components/Button"), false);
 });
+
+test("isRuntimePackageSpecifier rejects host-provided runtime modules", () => {
+  assert.equal(isRuntimePackageSpecifier("vscode"), false);
+  assert.equal(isRuntimePackageSpecifier("electron"), false);
+  assert.equal(isRuntimePackageSpecifier("bun:test"), false);
+});

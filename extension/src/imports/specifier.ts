@@ -34,7 +34,17 @@ const isFrameworkVirtualSpecifier = (specifier: string): boolean =>
   specifier.startsWith("@/") ||
   specifier.startsWith("~/");
 
+const hostProvidedModules: ReadonlySet<string> = new Set([
+  "vscode",
+  "electron",
+]);
+
+const isHostProvidedModule = (specifier: string): boolean =>
+  hostProvidedModules.has(specifier) ||
+  specifier.startsWith("bun:");
+
 export const isRuntimePackageSpecifier = (specifier: string): boolean =>
   !isRelativeSpecifier(specifier) &&
   !isNodeBuiltinSpecifier(specifier) &&
-  !isFrameworkVirtualSpecifier(specifier);
+  !isFrameworkVirtualSpecifier(specifier) &&
+  !isHostProvidedModule(specifier);
