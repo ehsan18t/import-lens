@@ -17,12 +17,12 @@ export class RecycleGuard {
     this.#storagePath = storagePath;
   }
 
-  async shouldEnterDegradedMode(now = Date.now()): Promise<boolean> {
+  async shouldEnterDegradedMode(now: number = Date.now()): Promise<boolean> {
     const recent = this.#recentRecycleTimes(await this.readRecycleTimes(), now);
     return recent.length > MAX_RECYCLES_IN_WINDOW;
   }
 
-  async resetAfterCleanSession(now = Date.now()): Promise<void> {
+  async resetAfterCleanSession(now: number = Date.now()): Promise<void> {
     const recycleTimes = await this.readRecycleTimes();
     const hasRecentRecycle = recycleTimes.some((timestamp) => now - timestamp <= CLEAN_SESSION_MS);
 
