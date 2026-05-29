@@ -1,6 +1,7 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression, Program, Statement,
+    BindingPattern, Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression,
+    Program, Statement,
 };
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -27,6 +28,7 @@ pub struct ModuleRecord {
     pub exports: Vec<ExportRecord>,
     pub reexports: Vec<ReExportRecord>,
     pub star_exports: Vec<StarExportRecord>,
+    pub local_bindings: Vec<String>,
     pub has_top_level_side_effects: bool,
 }
 
@@ -35,6 +37,15 @@ pub struct ImportEdge {
     pub specifier: String,
     pub resolved_path: PathBuf,
     pub imported_names: Vec<String>,
+    pub imported_bindings: Vec<ImportedBinding>,
+    pub statement_start: usize,
+    pub statement_end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportedBinding {
+    pub imported_name: String,
+    pub local_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +157,7 @@ impl ModuleGraphBuilder {
             exports: parsed.exports,
             reexports: parsed.reexports,
             star_exports: parsed.star_exports,
+            local_bindings: parsed.local_bindings,
             has_top_level_side_effects: parsed.has_top_level_side_effects,
         });
 
@@ -163,6 +175,7 @@ struct ParsedModule {
     exports: Vec<ExportRecord>,
     reexports: Vec<ReExportRecord>,
     star_exports: Vec<StarExportRecord>,
+    local_bindings: Vec<String>,
     has_top_level_side_effects: bool,
 }
 
@@ -205,6 +218,7 @@ fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
         exports: export_records(&parsed.module_record),
         reexports: reexport_records(path, &parsed.module_record)?,
         star_exports: star_export_records(path, &parsed.module_record)?,
+        local_bindings: local_bindings(&parsed.program),
         has_top_level_side_effects: has_top_level_side_effects(&parsed.program),
     })
 }
@@ -224,7 +238,14 @@ fn import_edges(
         let specifier = entry.module_request.name.as_str().to_owned();
         binding_import_specifiers.insert(specifier.clone());
         if let Some(resolved_path) = resolve_relative_module(path, &specifier)? {
-            push_import_name(&mut imports, specifier, resolved_path, import_name(entry));
+            push_import_binding(
+                &mut imports,
+                specifier,
+                resolved_path,
+                import_name(entry),
+                entry.local_name.name.as_str().to_owned(),
+                entry.statement_span,
+            );
         }
     }
 
@@ -245,6 +266,9 @@ fn import_edges(
                 specifier: specifier.as_str().to_owned(),
                 resolved_path,
                 imported_names: Vec::new(),
+                imported_bindings: Vec::new(),
+                statement_start: span_start(requested_modules[0].statement_span),
+                statement_end: span_end(requested_modules[0].statement_span),
             });
         }
     }
@@ -252,18 +276,30 @@ fn import_edges(
     Ok(imports)
 }
 
-fn push_import_name(
+fn push_import_binding(
     imports: &mut Vec<ImportEdge>,
     specifier: String,
     resolved_path: PathBuf,
     imported_name: String,
+    local_name: String,
+    statement_span: Span,
 ) {
     if let Some(edge) = imports
         .iter_mut()
         .find(|edge| edge.specifier == specifier && edge.resolved_path == resolved_path)
     {
         if !edge.imported_names.contains(&imported_name) {
-            edge.imported_names.push(imported_name);
+            edge.imported_names.push(imported_name.clone());
+        }
+        if !edge
+            .imported_bindings
+            .iter()
+            .any(|binding| binding.local_name == local_name)
+        {
+            edge.imported_bindings.push(ImportedBinding {
+                imported_name,
+                local_name,
+            });
         }
         return;
     }
@@ -271,7 +307,13 @@ fn push_import_name(
     imports.push(ImportEdge {
         specifier,
         resolved_path,
-        imported_names: vec![imported_name],
+        imported_names: vec![imported_name.clone()],
+        imported_bindings: vec![ImportedBinding {
+            imported_name,
+            local_name,
+        }],
+        statement_start: span_start(statement_span),
+        statement_end: span_end(statement_span),
     });
 }
 
@@ -382,6 +424,101 @@ fn export_local_name(name: &ExportLocalName<'_>) -> Option<String> {
             Some(name.name.as_str().to_owned())
         }
         ExportLocalName::Null => None,
+    }
+}
+
+fn local_bindings(program: &Program<'_>) -> Vec<String> {
+    let mut bindings = Vec::new();
+    for statement in &program.body {
+        collect_statement_bindings(statement, &mut bindings);
+    }
+    bindings.sort();
+    bindings.dedup();
+    bindings
+}
+
+fn collect_statement_bindings(statement: &Statement<'_>, bindings: &mut Vec<String>) {
+    match statement {
+        Statement::VariableDeclaration(declaration) => {
+            for declarator in &declaration.declarations {
+                collect_binding_pattern(&declarator.id, bindings);
+            }
+        }
+        Statement::FunctionDeclaration(function) => {
+            if let Some(id) = &function.id {
+                bindings.push(id.name.as_str().to_owned());
+            }
+        }
+        Statement::ClassDeclaration(class) => {
+            if let Some(id) = &class.id {
+                bindings.push(id.name.as_str().to_owned());
+            }
+        }
+        Statement::ExportNamedDeclaration(export) => {
+            if let Some(declaration) = &export.declaration {
+                collect_declaration_bindings(declaration, bindings);
+            }
+        }
+        Statement::ExportDefaultDeclaration(export) => {
+            collect_export_default_bindings(&export.declaration, bindings);
+        }
+        _ => {}
+    }
+}
+
+fn collect_declaration_bindings(declaration: &Declaration<'_>, bindings: &mut Vec<String>) {
+    match declaration {
+        Declaration::VariableDeclaration(declaration) => {
+            for declarator in &declaration.declarations {
+                collect_binding_pattern(&declarator.id, bindings);
+            }
+        }
+        Declaration::FunctionDeclaration(function) => {
+            if let Some(id) = &function.id {
+                bindings.push(id.name.as_str().to_owned());
+            }
+        }
+        Declaration::ClassDeclaration(class) => {
+            if let Some(id) = &class.id {
+                bindings.push(id.name.as_str().to_owned());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_export_default_bindings(
+    declaration: &ExportDefaultDeclarationKind<'_>,
+    bindings: &mut Vec<String>,
+) {
+    match declaration {
+        ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+            if let Some(id) = &function.id {
+                bindings.push(id.name.as_str().to_owned());
+            } else {
+                bindings.push("default".to_owned());
+            }
+        }
+        ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+            if let Some(id) = &class.id {
+                bindings.push(id.name.as_str().to_owned());
+            } else {
+                bindings.push("default".to_owned());
+            }
+        }
+        _ => bindings.push("default".to_owned()),
+    }
+}
+
+fn collect_binding_pattern(pattern: &BindingPattern<'_>, bindings: &mut Vec<String>) {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => {
+            bindings.push(identifier.name.as_str().to_owned());
+        }
+        BindingPattern::AssignmentPattern(assignment) => {
+            collect_binding_pattern(&assignment.left, bindings);
+        }
+        BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_) => {}
     }
 }
 

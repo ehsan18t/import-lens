@@ -19,6 +19,15 @@ impl ReachableExports {
             .any(|(_, symbol)| symbol == exported_name)
     }
 
+    pub fn contains_module_symbol(&self, path: &Path, exported_name: &str) -> bool {
+        let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.symbols
+            .contains(&(normalized.clone(), exported_name.to_owned()))
+            || self
+                .symbols
+                .contains(&(path.to_path_buf(), exported_name.to_owned()))
+    }
+
     pub fn contains_module(&self, path: &Path) -> bool {
         let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         self.modules.contains(&normalized) || self.modules.contains(path)

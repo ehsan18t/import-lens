@@ -1,6 +1,9 @@
 use crate::{
     ipc::protocol::{ImportDiagnostic, ImportKind, ImportRequest, ImportResult},
-    pipeline::{compress::compress_all, resolver::resolve_package_entry},
+    pipeline::{
+        bundle::bundle_reachable_modules, compress::compress_all, graph::build_module_graph,
+        minify::minify_source, reachability::reachable_exports, resolver::resolve_package_entry,
+    },
 };
 use std::{fs, path::PathBuf};
 
@@ -68,6 +71,111 @@ fn analyze_import_inner(
         ));
     }
 
+    if !is_cjs
+        && matches!(
+            request.import_kind,
+            ImportKind::Named | ImportKind::Default | ImportKind::Namespace
+        )
+    {
+        match analyze_with_oxc_pipeline(context, request, entry_path.clone(), side_effects) {
+            Ok(result) => return Ok(result),
+            Err(_) if matches!(request.import_kind, ImportKind::Namespace) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    analyze_static_entry(context, request, entry_path, side_effects, is_cjs)
+}
+
+fn analyze_with_oxc_pipeline(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    entry_path: PathBuf,
+    side_effects: bool,
+) -> Result<ImportResult, AnalysisError> {
+    let graph = build_module_graph(&entry_path).map_err(|error| {
+        error_with_context(
+            "module_graph",
+            format!("failed to build module graph: {error}"),
+            context,
+            request,
+            vec![format!("entry_path: {}", entry_path.display())],
+        )
+    })?;
+    let include_full_entry = matches!(request.import_kind, ImportKind::Namespace);
+    let requested_exports = requested_exports(request);
+    let mut reachable = reachable_exports(&graph, &requested_exports, include_full_entry);
+    let mut bundled = bundle_reachable_modules(&graph, &reachable).map_err(|error| {
+        error_with_context(
+            "bundle",
+            format!("failed to bundle reachable modules: {error}"),
+            context,
+            request,
+            vec![format!("entry_path: {}", entry_path.display())],
+        )
+    })?;
+    if bundled.trim().is_empty() && !include_full_entry {
+        reachable = reachable_exports(&graph, &[], true);
+        bundled = bundle_reachable_modules(&graph, &reachable).map_err(|error| {
+            error_with_context(
+                "bundle",
+                format!("failed to bundle fallback full module: {error}"),
+                context,
+                request,
+                vec![format!("entry_path: {}", entry_path.display())],
+            )
+        })?;
+    }
+    let minified = minify_source(&bundled).map_err(|error| {
+        error_with_context(
+            "minify",
+            format!("failed to minify bundled modules: {error}"),
+            context,
+            request,
+            vec![format!("entry_path: {}", entry_path.display())],
+        )
+    })?;
+    let compressed = compress_all(&minified).map_err(|error| {
+        error_with_context(
+            "compression",
+            format!("failed to compress minified output: {error}"),
+            context,
+            request,
+            Vec::new(),
+        )
+    })?;
+
+    Ok(ImportResult {
+        specifier: request.specifier.clone(),
+        raw_bytes: bundled.len() as u64,
+        minified_bytes: minified.len() as u64,
+        gzip_bytes: compressed.gzip_bytes,
+        brotli_bytes: compressed.brotli_bytes,
+        zstd_bytes: compressed.zstd_bytes,
+        cache_hit: false,
+        side_effects,
+        truly_treeshakeable: !side_effects && matches!(request.import_kind, ImportKind::Named),
+        is_cjs: false,
+        error: None,
+        diagnostics: Vec::new(),
+    })
+}
+
+fn requested_exports(request: &ImportRequest) -> Vec<String> {
+    match request.import_kind {
+        ImportKind::Named => request.named.clone(),
+        ImportKind::Default => vec!["default".to_owned()],
+        ImportKind::Namespace | ImportKind::Dynamic => Vec::new(),
+    }
+}
+
+fn analyze_static_entry(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    entry_path: PathBuf,
+    side_effects: bool,
+    is_cjs: bool,
+) -> Result<ImportResult, AnalysisError> {
     let source = fs::read_to_string(&entry_path).map_err(|error| {
         error_with_context(
             "entry_read",
