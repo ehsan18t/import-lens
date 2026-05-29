@@ -65,6 +65,12 @@ export interface CacheInvalidateAllMessage {
   type: "cache_invalidate_all";
 }
 
+export interface PrewarmPackageJsonMessage {
+  type: "prewarm_package_json";
+  package_json_path: string;
+  active_document_path: string;
+}
+
 export interface ShutdownMessage {
   type: "shutdown";
 }
@@ -74,4 +80,5 @@ export type ClientMessage =
   | BatchRequest
   | CacheInvalidateMessage
   | CacheInvalidateAllMessage
+  | PrewarmPackageJsonMessage
   | ShutdownMessage;

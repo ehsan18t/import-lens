@@ -224,6 +224,18 @@ export class DaemonManager implements vscode.Disposable {
     this.#client?.send({ type: "cache_invalidate_all" });
   }
 
+  prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {
+    if (!this.#client || this.#state !== "ready") {
+      return;
+    }
+
+    this.#client.send({
+      type: "prewarm_package_json",
+      package_json_path: packageJsonPath,
+      active_document_path: activeDocumentPath,
+    });
+  }
+
   async dispose(): Promise<void> {
     this.#isDisposed = true;
     if (this.#restartTimer) clearTimeout(this.#restartTimer);

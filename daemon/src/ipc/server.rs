@@ -4,6 +4,7 @@ use crate::{
         protocol::ClientMessage,
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
+    prefetch::Prefetcher,
     service::ImportLensService,
 };
 use std::{
@@ -31,6 +32,7 @@ pub async fn run_server(
 
     let mut decoder = FrameDecoder::default();
     let mut service = std::sync::Arc::new(ImportLensService::new(None, false));
+    let prefetcher = Prefetcher::new();
     let mut hello_received = false;
     let mut lifecycle = LifecycleState::new();
     let mut storage_path = storage_path;
@@ -69,6 +71,7 @@ pub async fn run_server(
                     }
                 }
                 ClientMessage::Batch(request) if hello_received => {
+                    prefetcher.cancel();
                     lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
                     let response = tokio::task::spawn_blocking(move || svc.handle_batch(request))
@@ -86,10 +89,18 @@ pub async fn run_server(
                 ClientMessage::CacheInvalidateAll(_) if hello_received => {
                     service.invalidate_all();
                 }
+                ClientMessage::PrewarmPackageJson(message) if hello_received => {
+                    prefetcher.prewarm_package_json(
+                        std::sync::Arc::clone(&service),
+                        PathBuf::from(message.package_json_path),
+                        PathBuf::from(message.active_document_path),
+                    );
+                }
                 ClientMessage::Shutdown(_) => {
                     return Ok(());
                 }
                 ClientMessage::Batch(request) => {
+                    prefetcher.cancel();
                     lifecycle.record_batch();
                     let response = tokio::task::spawn_blocking(move || {
                         ImportLensService::new(None, false).handle_batch(request)
@@ -102,7 +113,9 @@ pub async fn run_server(
                         return Ok(());
                     }
                 }
-                ClientMessage::CacheInvalidate(_) | ClientMessage::CacheInvalidateAll(_) => {}
+                ClientMessage::PrewarmPackageJson(_)
+                | ClientMessage::CacheInvalidate(_)
+                | ClientMessage::CacheInvalidateAll(_) => {}
             }
         }
     }
@@ -127,6 +140,7 @@ pub async fn run_server(
 
     let mut decoder = FrameDecoder::default();
     let mut service = std::sync::Arc::new(ImportLensService::new(None, false));
+    let prefetcher = Prefetcher::new();
     let mut hello_received = false;
     let mut lifecycle = LifecycleState::new();
     let mut storage_path = storage_path;
@@ -165,6 +179,7 @@ pub async fn run_server(
                     }
                 }
                 ClientMessage::Batch(request) if hello_received => {
+                    prefetcher.cancel();
                     lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
                     let response = tokio::task::spawn_blocking(move || svc.handle_batch(request))
@@ -182,10 +197,18 @@ pub async fn run_server(
                 ClientMessage::CacheInvalidateAll(_) if hello_received => {
                     service.invalidate_all();
                 }
+                ClientMessage::PrewarmPackageJson(message) if hello_received => {
+                    prefetcher.prewarm_package_json(
+                        std::sync::Arc::clone(&service),
+                        PathBuf::from(message.package_json_path),
+                        PathBuf::from(message.active_document_path),
+                    );
+                }
                 ClientMessage::Shutdown(_) => {
                     return Ok(());
                 }
                 ClientMessage::Batch(request) => {
+                    prefetcher.cancel();
                     lifecycle.record_batch();
                     let response = tokio::task::spawn_blocking(move || {
                         ImportLensService::new(None, false).handle_batch(request)
@@ -198,7 +221,9 @@ pub async fn run_server(
                         return Ok(());
                     }
                 }
-                ClientMessage::CacheInvalidate(_) | ClientMessage::CacheInvalidateAll(_) => {}
+                ClientMessage::PrewarmPackageJson(_)
+                | ClientMessage::CacheInvalidate(_)
+                | ClientMessage::CacheInvalidateAll(_) => {}
             }
         }
     }

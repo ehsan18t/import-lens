@@ -6,6 +6,7 @@ import { DocumentAnalysisController } from "./listener.js";
 import { languageSelector } from "./languages.js";
 import { ImportLensLogger } from "./logger.js";
 import { registerNodeModulesWatchers } from "./watcher.js";
+import { registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
 import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
@@ -93,6 +94,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   registerNodeModulesWatchers(context, daemon);
   const state = await daemon.start();
   statusBar.setStatus(state === "ready" ? "ready" : "unavailable");
+  registerPackageJsonPrewarm(context, daemon);
 
   if (vscode.window.activeTextEditor) {
     analysis.schedule(vscode.window.activeTextEditor.document);

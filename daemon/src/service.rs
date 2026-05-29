@@ -68,6 +68,27 @@ impl ImportLensService {
         self.cache.memory_len()
     }
 
+    pub fn prewarm_import<F>(
+        &self,
+        context: &AnalysisContext,
+        request: &ImportRequest,
+        should_continue: F,
+    ) where
+        F: Fn() -> bool,
+    {
+        let key = cache_key_for_import(request);
+
+        if self.cache.get(&key).is_some() || !should_continue() {
+            return;
+        }
+
+        let result = analyze_import(context, request);
+
+        if result.error.is_none() && should_continue() {
+            self.cache.insert(key, result);
+        }
+    }
+
     fn analyze_with_cache(
         &self,
         context: &AnalysisContext,

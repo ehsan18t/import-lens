@@ -86,6 +86,14 @@ pub struct CacheInvalidateAllMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrewarmPackageJsonMessage {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub package_json_path: String,
+    pub active_document_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownMessage {
     #[serde(rename = "type")]
     pub message_type: String,
@@ -97,6 +105,7 @@ pub enum ClientMessage {
     Batch(BatchRequest),
     CacheInvalidate(CacheInvalidateMessage),
     CacheInvalidateAll(CacheInvalidateAllMessage),
+    PrewarmPackageJson(PrewarmPackageJsonMessage),
     Shutdown(ShutdownMessage),
 }
 
@@ -116,6 +125,9 @@ impl<'de> Deserialize<'de> for ClientMessage {
                 .map_err(serde::de::Error::custom),
             Some("cache_invalidate_all") => serde_json::from_value(value)
                 .map(Self::CacheInvalidateAll)
+                .map_err(serde::de::Error::custom),
+            Some("prewarm_package_json") => serde_json::from_value(value)
+                .map(Self::PrewarmPackageJson)
                 .map_err(serde::de::Error::custom),
             Some("shutdown") => serde_json::from_value(value)
                 .map(Self::Shutdown)
