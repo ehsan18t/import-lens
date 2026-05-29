@@ -26,6 +26,15 @@ export const isNodeBuiltinSpecifier = (specifier: string): boolean => {
   return nodeBuiltinSpecifiers.has(normalized);
 };
 
-export const isRuntimePackageSpecifier = (specifier: string): boolean =>
-  !isRelativeSpecifier(specifier) && !isNodeBuiltinSpecifier(specifier);
+const isFrameworkVirtualSpecifier = (specifier: string): boolean =>
+  specifier.startsWith("astro:") ||
+  specifier.startsWith("virtual:") ||
+  specifier.startsWith("$") ||
+  specifier.startsWith("#") ||
+  specifier.startsWith("@/") ||
+  specifier.startsWith("~/");
 
+export const isRuntimePackageSpecifier = (specifier: string): boolean =>
+  !isRelativeSpecifier(specifier) &&
+  !isNodeBuiltinSpecifier(specifier) &&
+  !isFrameworkVirtualSpecifier(specifier);

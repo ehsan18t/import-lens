@@ -7,3 +7,5 @@ The default display mode uses VS Code inlay hints. Users can switch `importLens.
 When a package size is unavailable, hover the `unavailable` hint and use `Copy diagnostics` to copy the daemon's structured error context for debugging.
 
 Svelte support analyzes imports inside `<script>` blocks. Astro support analyzes frontmatter imports as server-side runtime and processed client `<script>` blocks as client runtime; server-side results are labeled with `server` in the size hint.
+
+Framework virtual modules and common app aliases such as `astro:*`, `virtual:*`, `$app/*`, `$env/*`, `$lib/*`, `#imports`, and `@/*` are ignored because they are not npm package dependencies.

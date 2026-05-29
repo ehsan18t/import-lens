@@ -315,6 +315,8 @@ This section documents the key architectural decisions made before implementatio
 
 **FR-003** (Critical) - The extension must skip Node.js built-in module imports, including those prefixed with `node:` and those matching known built-in names such as `fs`, `path`, `os`, `http`, and `crypto`.
 
+**FR-003a** (High) - The extension must skip framework virtual modules and common application aliases that are not npm package dependencies, including `astro:*`, `virtual:*`, `$app/*`, `$env/*`, `$lib/*`, `#imports`, `@/*`, and `~/*`.
+
 **FR-004** (High) - The extension must use `oxc-parser` (NAPI binding, npm package `oxc-parser`) to parse import information from the document buffer via the synchronous `parseSync()` function. It must not use the TypeScript Compiler API or spawn a separate process for parsing. The deprecated `@oxc-parser/wasm` package must not be used.
 
 **FR-005** (High) - The extension must use OXC's error recovery mode during parsing. When the user is mid-typing an incomplete import statement, the parser must extract as much structural information as possible rather than failing silently.

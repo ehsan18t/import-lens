@@ -16,3 +16,13 @@ test("isRuntimePackageSpecifier rejects relative paths and Node builtins", () =>
   assert.equal(isRuntimePackageSpecifier("lodash-es"), true);
 });
 
+test("isRuntimePackageSpecifier rejects framework virtual and app alias imports", () => {
+  assert.equal(isRuntimePackageSpecifier("astro:content"), false);
+  assert.equal(isRuntimePackageSpecifier("virtual:astro/icons"), false);
+  assert.equal(isRuntimePackageSpecifier("$app/environment"), false);
+  assert.equal(isRuntimePackageSpecifier("$env/static/public"), false);
+  assert.equal(isRuntimePackageSpecifier("$lib/server/config"), false);
+  assert.equal(isRuntimePackageSpecifier("#imports"), false);
+  assert.equal(isRuntimePackageSpecifier("@/components/Button"), false);
+  assert.equal(isRuntimePackageSpecifier("~/components/Button"), false);
+});
