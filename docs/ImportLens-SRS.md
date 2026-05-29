@@ -210,7 +210,7 @@ If neither a native binary nor a WASM binary is loadable, or if the environment 
 
 ### 3.3 Startup Sequence
 
-1. Extension activates on the `onLanguage:javascript`, `onLanguage:typescript`, `onLanguage:typescriptreact`, and `onLanguage:javascriptreact` events.
+1. Extension activates on the `onLanguage:javascript`, `onLanguage:typescript`, `onLanguage:typescriptreact`, `onLanguage:javascriptreact`, `onLanguage:svelte`, and `onLanguage:astro` events.
 2. The extension host checks for a native binary matching the current platform in the extension's `bin/` directory.
 3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
 4. If the hash matches, it spawns the daemon process and opens a socket connection. The socket path includes a window-unique identifier (NFR-014b).
@@ -224,18 +224,20 @@ If neither a native binary nor a WASM binary is loadable, or if the environment 
 On each daemon respawn, the extension host reads `<globalStoragePath>/importlens-recycles.json` before deciding whether to spawn, applying the recycle rate limit defined in NFR-004b.
 
 
-1. The user opens or edits a JS/TS file.
+1. The user opens or edits a supported JS/TS, JSX/TSX, Svelte, or Astro file.
 2. The document listener fires after a 300ms debounce.
-3. `oxc-parser` (NAPI binding) parses the document and extracts ESM import information directly from the `result.module.staticImports` array (no AST walk required).
-4. The extension filters imports to node_modules only, skipping local paths, `node:` builtins, and `import type` declarations.
-5. For each remaining import, the extension reads the installed package version from `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory.
-6. A single batched `BatchRequest` is serialised to MessagePack and sent over the socket.
-7. The daemon receives the batch and checks its `papaya` map for each import's cache key.
-8. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
-9. For each miss, the daemon runs the OXC pipeline: (a) construct a virtual entry module, (b) resolve the package entry point via `oxc_resolver`, (c) build the module graph by recursively parsing all reachable modules with `oxc_parser` and analysing them with `oxc_semantic`, (d) concatenate only the code reachable from the requested exports, (e) run `oxc_minifier` for dead code elimination, (f) apply `oxc_mangler` for identifier mangling, (g) emit the minified string via `oxc_codegen`, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
-10. Results are written to `papaya` (memory) and `redb` (disk).
-11. The daemon serialises the `BatchResponse` to MessagePack and sends it back.
-12. The extension host deserialises the response and updates decorations in the editor.
+3. The extension extracts parseable script regions for component files. Plain JS/TS and JSX/TSX files are parsed as one region; Svelte `<script>` blocks are parsed as component regions; Astro frontmatter is parsed as server runtime and processed Astro `<script>` blocks are parsed as client runtime.
+4. `oxc-parser` (NAPI binding) parses each script region and extracts ESM import information directly from the `result.module.staticImports`, `result.module.staticExports`, and `result.module.dynamicImports` arrays (no AST walk required).
+5. The extension maps region-relative import ranges back to absolute document positions for stable inlay hint, decoration, and CodeLens placement.
+6. The extension filters imports to node_modules only, skipping local paths, `node:` builtins, and `import type` declarations.
+7. For each remaining import, the extension reads the installed package version from `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory.
+8. A single batched `BatchRequest` is serialised to MessagePack and sent over the socket.
+9. The daemon receives the batch and checks its `papaya` map for each import's cache key.
+10. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
+11. For each miss, the daemon runs the OXC pipeline: (a) construct a virtual entry module, (b) resolve the package entry point via `oxc_resolver`, (c) build the module graph by recursively parsing all reachable modules with `oxc_parser` and analysing them with `oxc_semantic`, (d) concatenate only the code reachable from the requested exports, (e) run `oxc_minifier` for dead code elimination, (f) apply `oxc_mangler` for identifier mangling, (g) emit the minified string via `oxc_codegen`, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
+12. Results are written to `papaya` (memory) and `redb` (disk).
+13. The daemon serialises the `BatchResponse` to MessagePack and sends it back.
+14. The extension host deserialises the response and updates decorations in the editor.
 
 ---
 
@@ -318,6 +320,10 @@ This section documents the key architectural decisions made before implementatio
 **FR-005** (High) - The extension must use OXC's error recovery mode during parsing. When the user is mid-typing an incomplete import statement, the parser must extract as much structural information as possible rather than failing silently.
 
 **FR-006** (Critical) - The extension must debounce parse-and-request operations by the value configured in `importLens.debounceMs` (default 300ms) after the last document change event. Requests must not be sent on every keystroke.
+
+**FR-006a** (Critical) - The extension must support Svelte documents by extracting imports from every `<script>` block, including module-context and instance scripts. `<script lang="ts">` blocks must be parsed as TypeScript and all detected import positions must map back to the original `.svelte` document.
+
+**FR-006b** (High) - The extension must support Astro documents by extracting imports from frontmatter and processed client `<script>` blocks. Frontmatter imports must be marked as `server` runtime; processed client script imports must be marked as `client` runtime. Inline Astro scripts with non-processed attributes such as `is:inline` must not be treated as bundled imports.
 
 ### 5.2 Package Version Resolution
 
@@ -405,6 +411,8 @@ The virtual entry must never use `console.log` or any pattern that can be static
 - `inlayHint`: Uses the VS Code Inlay Hints API instead of end-of-line decorations. Displays the primary compression size as an inline hint after the import specifier. This mode integrates natively with VS Code's built-in inlay hint toggling and provides better performance than decoration-based rendering.
 
 **FR-031** (High) - When `side_effects: true` or `truly_treeshakeable: false`, the extension must display a warning indicator next to the size decoration indicating that the shown size may not reflect the actual shipped size.
+
+**FR-031a** (Medium) - When an import is detected from Astro frontmatter, the extension must label the displayed size with `server` and include the runtime in the hover tooltip so users do not confuse server-only dependency cost with client bundle cost.
 
 **FR-032** (High) - The extension must display a loading indicator next to imports that are currently being computed (cache miss in progress).
 
@@ -1109,12 +1117,25 @@ import-lens/
 │   ├── src/
 │   │   ├── extension.ts               # activate() / deactivate(); sends Shutdown on deactivate
 │   │   ├── listener.ts                # onDidChangeTextDocument, debounce
-│   │   ├── parser.ts                  # oxc-parser (NAPI) import extraction via parseSync()
-│   │   ├── resolver.ts                # package.json version resolution (handles scoped packages)
+│   │   ├── languages.ts               # VS Code language selector and supported language ids
+│   │   ├── analysis/
+│   │   │   ├── request.ts             # DetectedImport to BatchRequest item mapping
+│   │   │   └── state.ts               # Per-document import analysis state
+│   │   ├── imports/
+│   │   │   ├── parser.ts              # oxc-parser (NAPI) import extraction via parseSync()
+│   │   │   ├── scriptRegions.ts       # Svelte/Astro script region extraction and runtime labeling
+│   │   │   ├── resolver.ts            # package.json version resolution (handles scoped packages)
+│   │   │   ├── specifier.ts           # package/builtin/relative specifier helpers
+│   │   │   ├── positions.ts           # offset-to-position mapping helpers
+│   │   │   └── types.ts               # import detection data models
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
 │   │   │   ├── protocol.ts            # BatchRequest / BatchResponse / Hello / CacheInvalidate / Shutdown types
 │   │   │   └── codec.ts               # MessagePack encode/decode
+│   │   ├── daemon/
+│   │   │   ├── manager.ts             # native/WASM daemon lifecycle
+│   │   │   ├── platform.ts            # platform target mapping
+│   │   │   └── knownHashes.generated.ts # generated daemon binary hashes
 │   │   ├── watcher.ts                 # vscode.workspace.createFileSystemWatcher; sends CacheInvalidate IPC messages
 │   │   ├── ui/
 │   │   │   ├── decorations.ts         # End-of-line text decorations
@@ -1127,7 +1148,7 @@ import-lens/
 │   │   ├── logger.ts                  # OutputChannel-based diagnostic logger (FR-040)
 │   │   └── config.ts                  # VS Code settings access
 │   └── dist/
-│       └── extension.js               # tsdown bundle output
+│       └── extension.cjs              # tsdown bundle output
 │
 ├── daemon/                            # Rust daemon crate
 │   ├── Cargo.toml
