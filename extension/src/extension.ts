@@ -51,7 +51,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         void analysis.analyze(editor.document);
       }
     }),
-    vscode.commands.registerCommand("importLens.showReport", () => showReport(context, store)),
+    vscode.commands.registerCommand("importLens.showReport", () => void showReport(context, daemon!)),
     vscode.commands.registerCommand("importLens.showImportDetails", async (result: ImportResult, runtime: ImportRuntime = "component") => {
       if (result.error) {
         const action = await vscode.window.showWarningMessage(
