@@ -118,10 +118,16 @@ export class DocumentAnalysisController implements vscode.Disposable {
         return;
       }
 
-      const nextStates = states.map((state) => {
-        const result = response.imports.find((item) => item.specifier === state.detected.specifier);
+      let responseIndex = 0;
 
-        if (!result) {
+      const nextStates = states.map((state) => {
+        if (state.status === "missing") {
+          return state;
+        }
+
+        const result = response.imports[responseIndex++];
+
+        if (!result || result.specifier !== state.detected.specifier) {
           return state;
         }
 
