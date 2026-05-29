@@ -20,10 +20,14 @@ impl ImportCache {
 
     pub fn invalidate_package(&self, package_name: &str) {
         let entries = self.entries.pin();
-        let prefix = format!("{package_name}@");
+        let root_prefix = format!("{package_name}@");
+        let subpath_prefix = format!("{package_name}/");
         let keys = entries
             .iter()
-            .filter_map(|(key, _)| key.starts_with(&prefix).then(|| key.clone()))
+            .filter_map(|(key, _)| {
+                (key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix))
+                    .then(|| key.clone())
+            })
             .collect::<Vec<_>>();
 
         for key in keys {

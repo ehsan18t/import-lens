@@ -48,3 +48,28 @@ fn import_cache_invalidates_package_prefixes() {
     assert!(cache.get("react@18.3.1::default").is_none());
     assert!(cache.get("lodash-es@4.17.21::debounce").is_some());
 }
+
+#[test]
+fn import_cache_invalidates_subpath_entries() {
+    let cache = ImportCache::default();
+    cache.insert("svelte@5.0.0::*".to_owned(), result("svelte", false));
+    cache.insert(
+        "svelte/transition@5.0.0::fade".to_owned(),
+        result("svelte/transition", false),
+    );
+    cache.insert(
+        "svelte/store@5.0.0::writable".to_owned(),
+        result("svelte/store", false),
+    );
+    cache.insert(
+        "lodash-es@4.17.21::debounce".to_owned(),
+        result("lodash-es", false),
+    );
+
+    cache.invalidate_package("svelte");
+
+    assert!(cache.get("svelte@5.0.0::*").is_none());
+    assert!(cache.get("svelte/transition@5.0.0::fade").is_none());
+    assert!(cache.get("svelte/store@5.0.0::writable").is_none());
+    assert!(cache.get("lodash-es@4.17.21::debounce").is_some());
+}
