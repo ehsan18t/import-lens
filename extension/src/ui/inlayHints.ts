@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
-import type { ImportResult } from "../ipc/protocol.js";
 import { formatImportSize } from "./format.js";
 import { tooltipForResult } from "./tooltip.js";
 
@@ -24,20 +23,33 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
       return [];
     }
 
-    return this.#store
-      .get(document.uri)
-      .filter((state) => state.status === "ready" && Boolean(state.result))
-      .map((state) => {
-        const result = state.result as ImportResult;
-        const hint = new vscode.InlayHint(
-          new vscode.Position(state.detected.quoteEnd.line, state.detected.quoteEnd.character),
-          formatImportSize(result, config, state.detected.runtime),
-          undefined,
-        );
-        hint.paddingLeft = true;
-        hint.tooltip = tooltipForResult(result, state.detected.runtime);
-        return hint;
-      });
+    const hints: vscode.InlayHint[] = [];
+
+    for (const state of this.#store.get(document.uri)) {
+      const position = new vscode.Position(state.detected.quoteEnd.line, state.detected.quoteEnd.character);
+      let label: string | undefined;
+      let tooltip: vscode.MarkdownString | undefined;
+
+      if (state.status === "loading") {
+        label = "…";
+      } else if (state.status === "missing") {
+        label = state.message ?? "Package not found";
+      } else if (state.status === "ready" && state.result) {
+        label = formatImportSize(state.result, config, state.detected.runtime);
+        tooltip = tooltipForResult(state.result, state.detected.runtime);
+      }
+
+      if (!label) {
+        continue;
+      }
+
+      const hint = new vscode.InlayHint(position, label, undefined);
+      hint.paddingLeft = true;
+      hint.tooltip = tooltip;
+      hints.push(hint);
+    }
+
+    return hints;
   }
 
   dispose(): void {
