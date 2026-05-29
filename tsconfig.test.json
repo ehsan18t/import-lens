@@ -4,6 +4,7 @@
     "outDir": "./extension/test-dist",
     "rootDir": "./extension",
     "noEmit": false,
+    "declaration": false,
     "isolatedDeclarations": false
   },
   "include": [
@@ -11,4 +12,3 @@
     "extension/test/**/*"
   ]
 }
-
