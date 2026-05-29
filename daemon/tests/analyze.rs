@@ -24,6 +24,16 @@ fn write_package(workspace: &Path, name: &str, package_json: &str, source: &str)
     fs::write(package_root.join("index.js"), source).expect("package entry should be written");
 }
 
+fn write_package_file(workspace: &Path, package_name: &str, relative_path: &str, source: &str) {
+    let path = workspace
+        .join("node_modules")
+        .join(package_name)
+        .join(relative_path);
+    fs::create_dir_all(path.parent().expect("fixture file should have a parent"))
+        .expect("fixture directory should be created");
+    fs::write(path, source).expect("fixture file should be written");
+}
+
 #[test]
 fn analyze_import_computes_static_sizes_for_local_package_entry() {
     let workspace = temp_workspace();
@@ -90,4 +100,39 @@ fn analyze_import_returns_partial_error_result_on_missing_entry() {
     assert_eq!(result.raw_bytes, 0);
     assert_eq!(result.minified_bytes, 0);
     assert_eq!(result.gzip_bytes, 0);
+}
+
+#[test]
+fn analyze_import_resolves_dotted_nestjs_style_subpath() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "@nestjs/common",
+        r#"{"version":"11.1.24","sideEffects":true}"#,
+        "exports.DynamicModule = class DynamicModule {};",
+    );
+    write_package_file(
+        &workspace,
+        "@nestjs/common",
+        "interfaces/modules/dynamic-module.interface.js",
+        "exports.DynamicModule = class DynamicModule {};",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("app.module.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "@nestjs/common/interfaces/modules/dynamic-module.interface".to_owned(),
+        package_name: "@nestjs/common".to_owned(),
+        version: "11.1.24".to_owned(),
+        named: vec!["DynamicModule".to_owned()],
+        import_kind: ImportKind::Named,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(result.gzip_bytes > 0);
 }

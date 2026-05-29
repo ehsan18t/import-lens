@@ -165,16 +165,25 @@ fn subpath_for_request(request: &ImportRequest) -> Option<&str> {
 fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
     let candidates = [
         candidate.to_path_buf(),
-        candidate.with_extension("js"),
-        candidate.with_extension("mjs"),
+        append_extension(candidate, "js"),
+        append_extension(candidate, "mjs"),
+        append_extension(candidate, "cjs"),
         candidate.join("index.js"),
         candidate.join("index.mjs"),
+        candidate.join("index.cjs"),
     ];
 
     candidates
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| format!("package entry not found near {}", candidate.display()))
+}
+
+fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
+    let mut path = candidate.as_os_str().to_owned();
+    path.push(".");
+    path.push(extension);
+    PathBuf::from(path)
 }
 
 fn side_effects(package_json: &Value) -> bool {
