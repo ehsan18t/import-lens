@@ -94,7 +94,7 @@ writeFileSync(
 console.log(`Downloading ${bindingPackage} inside staging directory...`);
 const npmResult = spawnSync(
   "npm",
-  ["install", "--no-save", `${bindingPackage}@${manifest.dependencies["oxc-parser"]}`],
+  ["install", "--no-save", "--force", `${bindingPackage}@${manifest.dependencies["oxc-parser"]}`],
   {
     cwd: stagingRoot,
     stdio: "inherit",

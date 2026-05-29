@@ -2,9 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+        type: string
 
 jobs:
   build-and-package:
@@ -17,7 +19,7 @@ jobs:
             target: win32-x64
           - os: windows-latest
             target: win32-arm64
-          - os: macos-latest
+          - os: macos-13
             target: darwin-x64
           - os: macos-latest
             target: darwin-arm64
