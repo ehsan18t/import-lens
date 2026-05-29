@@ -491,7 +491,58 @@ fn side_effects(package_json: &Value) -> bool {
 }
 
 fn estimate_minified_source(source: &str) -> String {
-    source.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut stripped = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_string = None;
+
+    while let Some(c) = chars.next() {
+        if let Some(quote) = in_string {
+            stripped.push(c);
+            if c == '\\' {
+                if let Some(escaped) = chars.next() {
+                    stripped.push(escaped);
+                }
+            } else if c == quote {
+                in_string = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' | '`' => {
+                    in_string = Some(c);
+                    stripped.push(c);
+                }
+                '/' => {
+                    if let Some(&next) = chars.peek() {
+                        if next == '/' {
+                            chars.next();
+                            for comment_char in chars.by_ref() {
+                                if comment_char == '\n' {
+                                    stripped.push('\n');
+                                    break;
+                                }
+                            }
+                        } else if next == '*' {
+                            chars.next();
+                            let mut prev_star = false;
+                            for comment_char in chars.by_ref() {
+                                if prev_star && comment_char == '/' {
+                                    break;
+                                }
+                                prev_star = comment_char == '*';
+                            }
+                        } else {
+                            stripped.push(c);
+                        }
+                    } else {
+                        stripped.push(c);
+                    }
+                }
+                _ => stripped.push(c),
+            }
+        }
+    }
+
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn error_with_context(

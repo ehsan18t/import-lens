@@ -582,6 +582,46 @@ fn analyze_import_rejects_typescript_entry_files() {
 }
 
 #[test]
+fn analyze_import_strips_comments_for_minified_estimate() {
+    let workspace = temp_workspace();
+    let source = r#"
+        /*
+         * Huge copyright banner
+         * with lots of text to increase bytes
+         */
+        export const a = 1; // Inline comment
+        const b = "/* not a comment */";
+    "#;
+
+    write_package(
+        &workspace,
+        "comment-pkg",
+        r#"{"version":"1.0.0","main":"index.js"}"#,
+        source,
+    );
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "comment-pkg".to_owned(),
+        package_name: "comment-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(result.error.is_none());
+
+    let expected_stripped = r#"export const a = 1; const b = "/* not a comment */";"#;
+    assert_eq!(result.minified_bytes, expected_stripped.len() as u64);
+}
+
+#[test]
 fn analyze_import_rejects_files_over_size_limit() {
     let workspace = temp_workspace();
     write_package(
