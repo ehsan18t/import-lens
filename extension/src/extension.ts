@@ -85,6 +85,8 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       const nextConfig = getImportLensConfig();
       logger.setLevel(nextConfig.logLevel);
       decorations.refreshActiveEditor();
+      inlayHints.refresh();
+      codeLens.refresh();
     }),
   );
 

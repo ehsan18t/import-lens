@@ -52,6 +52,10 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
     return hints;
   }
 
+  refresh(): void {
+    this.#onDidChangeInlayHints.fire();
+  }
+
   dispose(): void {
     this.#subscription.dispose();
     this.#onDidChangeInlayHints.dispose();

@@ -38,6 +38,10 @@ export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vsco
       });
   }
 
+  refresh(): void {
+    this.#onDidChangeCodeLenses.fire();
+  }
+
   dispose(): void {
     this.#subscription.dispose();
     this.#onDidChangeCodeLenses.dispose();
