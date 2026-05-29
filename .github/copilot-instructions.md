@@ -15,14 +15,14 @@ Before writing ANY code, verify these versions. They are the most common source 
 
 | Dependency            | Pinned Version | Notes                                  |
 | --------------------- | -------------- | -------------------------------------- |
-| `oxc-parser` (npm)    | `0.126.0`      | NOT 0.123.0. Must match Rust crate.    |
-| `oxc_parser` (Rust)   | `~0.126`       | All OXC crates same version.           |
+| `oxc-parser` (npm)    | `0.133.0`      | NOT 0.123.0. Must match Rust crate.    |
+| `oxc_parser` (Rust)   | `~0.133`       | All OXC crates same version.           |
 | `oxc_resolver` (Rust) | `~11.19`       | Independent repo, independent version. |
 | `redb` (Rust)         | `^4`           | NOT v3. v4.0.0 minimum.                |
 | `papaya` (Rust)       | `~0.2`         | Lock-free, requires pin API.           |
-| `@types/vscode`       | `1.99.0`       | Matches `engines.vscode`.              |
+| `@types/vscode`       | `1.100.0`      | Matches `engines.vscode`.              |
 | `typescript`          | `6.0.3`        | TS 6.x, NOT 5.x.                       |
-| `tsdown`              | `0.21.9`       | Rolldown-powered bundler.              |
+| `tsdown`              | `0.22.1`       | Rolldown-powered bundler.              |
 | `@vscode/vsce`        | `3.9.1`        | Use `--no-dependencies` flag.          |
 
 ## Banned Packages — DO NOT USE
@@ -41,7 +41,7 @@ Before writing ANY code, verify these versions. They are the most common source 
 3. **Socket path**: Must include window-unique identifier (NFR-014b).
 4. **Length-prefix framing**: Every IPC message needs a 4-byte big-endian length header.
 5. **Shutdown sequence**: 3 steps — Shutdown IPC → 5s → SIGTERM → 2s → SIGKILL (Unix).
-6. **oxc-parser version**: 0.126.0, not 0.123.0.
+6. **oxc-parser version**: 0.133.0, not 0.123.0.
 7. **redb version**: v4.x, not v3.x. Must have schema versioning (FR-026a).
 8. **File watcher glob**: `**/node_modules/*/package.json` (single star), not double star.
 9. **sideEffects array**: Treat `["*.css"]` conservatively as `true` in v1.0.
