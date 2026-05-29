@@ -73,7 +73,7 @@ export const formatImportSize = (
   const suffix = formatWarningSuffix(result, options.showWarnings, runtime);
 
   if (options.display === "minimal" || options.display === "inlayHint") {
-    return `${compressed}${suffix}`;
+    return `${compressed} ${label}${suffix}`;
   }
 
   return `${compressed} ${label} · ${formatBytes(result.minified_bytes)} min${suffix}`;

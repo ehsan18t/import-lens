@@ -18,21 +18,21 @@ const result = {
 };
 
 test("formatImportSize supports minimal, standard, and verbose display modes", () => {
-  assert.equal(formatImportSize(result, { display: "minimal", compression: "brotli", showWarnings: true }), "1.5 kB");
+  assert.equal(formatImportSize(result, { display: "minimal", compression: "brotli", showWarnings: true }), "1.5 kB br");
   assert.equal(formatImportSize(result, { display: "standard", compression: "brotli", showWarnings: true }), "1.5 kB br · 5.3 kB min");
   assert.equal(formatImportSize(result, { display: "verbose", compression: "brotli", showWarnings: true }), "1.5 kB br · 1.8 kB gz · 1.6 kB zstd · 5.3 kB min");
 });
 
 test("formatImportSize shows unavailable and warning states", () => {
   assert.equal(formatImportSize({ ...result, error: "parse failed" }, { display: "standard", compression: "brotli", showWarnings: true }), "unavailable");
-  assert.equal(formatImportSize({ ...result, side_effects: true }, { display: "minimal", compression: "gzip", showWarnings: true }), "1.8 kB · approximate");
-  assert.equal(formatImportSize({ ...result, is_cjs: true }, { display: "minimal", compression: "zstd", showWarnings: true }), "1.6 kB · CJS");
+  assert.equal(formatImportSize({ ...result, side_effects: true }, { display: "minimal", compression: "gzip", showWarnings: true }), "1.8 kB gz · approximate");
+  assert.equal(formatImportSize({ ...result, is_cjs: true }, { display: "minimal", compression: "zstd", showWarnings: true }), "1.6 kB zstd · CJS");
 });
 
 test("formatImportSize labels server-side import runtime", () => {
   assert.equal(
     formatImportSize(result, { display: "minimal", compression: "brotli", showWarnings: true }, "server"),
-    "1.5 kB · server",
+    "1.5 kB br · server",
   );
   assert.equal(
     formatImportSize(
