@@ -19,7 +19,7 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
     pipe.connect().await?;
 
     let mut decoder = FrameDecoder::default();
-    let mut service = std::sync::Arc::new(ImportLensService::new());
+    let mut service = std::sync::Arc::new(ImportLensService::new(None, false));
     let mut hello_received = false;
     let mut buffer = [0_u8; 16 * 1024];
 
@@ -34,8 +34,11 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
             let message = decode_payload::<ClientMessage>(&payload)?;
 
             match message {
-                ClientMessage::Hello(_) => {
-                    service = std::sync::Arc::new(ImportLensService::new());
+                ClientMessage::Hello(hello) => {
+                    service = std::sync::Arc::new(ImportLensService::new(
+                        Some(PathBuf::from(hello.storage_path)),
+                        hello.enable_disk_cache,
+                    ));
                     hello_received = true;
                 }
                 ClientMessage::Batch(request) if hello_received => {
@@ -56,7 +59,7 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
                 }
                 ClientMessage::Batch(request) => {
                     let response = tokio::task::spawn_blocking(move || {
-                        ImportLensService::new().handle_batch(request)
+                        ImportLensService::new(None, false).handle_batch(request)
                     })
                     .await
                     .expect("spawn_blocking failed");

@@ -15,9 +15,9 @@ pub struct ImportLensService {
 }
 
 impl ImportLensService {
-    pub fn new() -> Self {
+    pub fn new(storage_path: Option<PathBuf>, enable_disk_cache: bool) -> Self {
         Self {
-            cache: ImportCache::default(),
+            cache: ImportCache::new(storage_path, enable_disk_cache),
         }
     }
 
