@@ -1,11 +1,10 @@
 import * as vscode from "vscode";
 
-export type ImportLensStatus = "ready" | "computing" | "wasm" | "unavailable";
+export type ImportLensStatus = "ready" | "computing" | "unavailable";
 
 const labels: Record<ImportLensStatus, string> = {
   ready: "ImportLens: Ready",
   computing: "ImportLens: Computing...",
-  wasm: "ImportLens: WASM mode",
   unavailable: "ImportLens: Unavailable",
 };
 
@@ -28,4 +27,3 @@ export class StatusBarController implements vscode.Disposable {
     this.#item.dispose();
   }
 }
-

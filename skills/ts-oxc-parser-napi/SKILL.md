@@ -1,6 +1,6 @@
 ---
 name: ts-oxc-parser-napi
-description: "Synchronous ESM import extraction using the oxc-parser NAPI binding (v0.126.0) in TypeScript. Use when implementing extension/src/parser.ts (FR-004, FR-005)."
+description: "Synchronous ESM import extraction using the oxc-parser NAPI binding (v0.133.0) in TypeScript. Use when implementing extension/src/parser.ts (FR-004, FR-005)."
 ---
 
 # Instructions
@@ -11,7 +11,7 @@ When parsing JavaScript or TypeScript files to extract imports in the extension 
 >
 > - Do **NOT** use `@oxc-parser/wasm`. It is officially deprecated and banned (§9.4.4).
 > - Do **NOT** use the TypeScript Compiler API.
-> - The npm `oxc-parser` version MUST be `0.126.0` — matching the Rust-side `oxc_parser` crate version. Both are released from the same OXC monorepo.
+> - The npm `oxc-parser` version MUST be `0.133.0` - matching the Rust-side `oxc_parser` crate version. Both are released from the same OXC monorepo.
 
 ## 1. Syntax
 

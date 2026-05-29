@@ -105,7 +105,7 @@ Priority levels:
 
 ImportLens is a standalone VS Code extension. It does not replace or wrap any existing extension. It complements bundler tooling (Vite, webpack, Rolldown, etc.) by surfacing import cost information at authoring time rather than after a build.
 
-Unlike existing calculators that spin up Node.js bundlers, ImportLens offloads all heavy computation to a decoupled Rust background process or WebAssembly worker. This guarantees editor stability and minimal memory overhead inside the extension host.
+Unlike existing calculators that spin up Node.js bundlers, ImportLens offloads all heavy computation to a decoupled Rust background process. This guarantees editor stability and minimal memory overhead inside the extension host. The daemon protocol is kept behind a transport boundary so a future WebAssembly worker can reuse it, but v1.0 ships native daemon binaries only.
 
 The extension introduces a background native process (the Rust daemon) which runs separately from the VS Code extension host. This separation is a deliberate design choice: the extension host is a shared Node.js process that also runs every other installed extension. Placing CPU-intensive work (parsing, tree-shaking, compression) inside the extension host would degrade the entire editor. The daemon runs in its own process with its own memory space, and a crash in the daemon does not affect VS Code.
 
@@ -131,11 +131,10 @@ At a high level, ImportLens:
 
 The extension targets the following environments:
 
-| Tier     | Environment                                                                                 | Mechanism                                        |
-| -------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| Native   | VS Code Desktop on win32-x64, win32-arm64, linux-x64, linux-arm64, darwin-x64, darwin-arm64 | Native Rust binary daemon                        |
-| WASM     | VS Code Desktop on unsupported native platforms (not VS Code for the Web; see C-004)        | WASM binary in a VS Code Worker                  |
-| Degraded | VS Code for the Web, or any environment where neither native nor WASM is available          | Extension-host-only parsing, no size computation |
+| Tier     | Environment                                                                                 | Mechanism                                                |
+| -------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Native   | VS Code Desktop on win32-x64, win32-arm64, linux-x64, linux-arm64, darwin-x64, darwin-arm64 | Native Rust binary daemon                                |
+| Degraded | VS Code for the Web, unsupported native platforms, or environments without a loadable daemon | Extension-host import detection only, no size computation |
 
 ### 2.5 Design and Implementation Constraints
 
@@ -160,7 +159,7 @@ The extension targets the following environments:
 
 ### 3.1 Architectural Overview
 
-The system has three layers: the extension host (TypeScript), the Rust daemon (native binary or WASM), and the local cache (in-memory plus persistent).
+The system has three layers: the extension host (TypeScript), the Rust daemon (native binary), and the local cache (in-memory plus persistent).
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -202,11 +201,11 @@ The system has three layers: the extension host (TypeScript), the Rust daemon (n
 **Tier 1 - Native (preferred):**
 The Rust daemon is compiled to a native binary for the host platform. The extension host communicates with it via a Unix domain socket (macOS/Linux) or a named pipe (Windows), using MessagePack framing. This is the fastest configuration.
 
-**Tier 2 - WASM (Desktop only):**
-The Rust daemon is compiled to `wasm32-wasip1-threads` and executed inside a VS Code Web Worker using the `@vscode/wasm-wasi-core` infrastructure. This tier is used on VS Code Desktop when no native binary is available for the current platform. It is NOT available on VS Code for the Web (see C-004). Performance is approximately 30% lower than native. The IPC layer is replaced by `postMessage`. Thread support requires `SharedArrayBuffer` and cross-origin isolation. See constraint C-004 in Section 13.1.
+**Tier 2 - Degraded:**
+If a native binary is unavailable or cannot be verified, or if the environment is VS Code for the Web where local `node_modules` access is unavailable, the extension operates in degraded mode. Import statements are detected where the extension host can parse them, but no size computation is performed. The UI shows a status bar indicator explaining that full analysis is unavailable.
 
-**Tier 3 - Degraded:**
-If neither a native binary nor a WASM binary is loadable, or if the environment is VS Code for the Web where local `node_modules` access is unavailable, the extension operates in degraded mode. Import statements are detected and parsed using `oxc-parser` running in the extension host, but no size computation is performed. The UI shows a status bar indicator explaining that full analysis is unavailable.
+**Post-v1 Candidate - WASM Desktop Fallback:**
+A WebAssembly daemon fallback may be added in v1.1 or later using the existing analysis transport boundary. It is not a v1.0 runtime path and must not be advertised or packaged until the `wasm32-wasip1-threads` build, VS Code Worker execution model, and release pipeline are proven end-to-end. See constraint C-004 in Section 13.1.
 
 ### 3.3 Startup Sequence
 
@@ -214,10 +213,9 @@ If neither a native binary nor a WASM binary is loadable, or if the environment 
 2. The extension host checks for a native binary matching the current platform in the extension's `bin/` directory.
 3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
 4. If the hash matches, it spawns the daemon process and opens a socket connection. The socket path includes a window-unique identifier (NFR-014b).
-5. If no native binary is found, it attempts to load the WASM binary from the extension's `wasm/` directory into a Worker.
-6. If that also fails, it enters degraded mode.
-7. The daemon loads its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and pre-warms the in-memory `papaya` cache.
-8. The extension is ready to accept requests.
+5. If no native binary is found, or if the binary cannot be verified or spawned, the extension enters degraded mode.
+6. The daemon loads its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and pre-warms the in-memory `papaya` cache.
+7. The extension is ready to accept requests.
 
 ### 3.4 Request Lifecycle
 
@@ -418,7 +416,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-032** (High) - The extension must display a loading indicator next to imports that are currently being computed (cache miss in progress).
 
-**FR-033** (High) - The extension must provide a status bar item showing the daemon's current state: `ImportLens: Ready`, `ImportLens: Computing...`, `ImportLens: WASM mode`, or `ImportLens: Unavailable`.
+**FR-033** (High) - The extension must provide a status bar item showing the daemon's current state: `ImportLens: Ready`, `ImportLens: Computing...`, or `ImportLens: Unavailable`.
 
 **FR-034** (High) - Changing the `importLens.compression` setting must immediately update all currently visible inline decorations to reflect the new format selection without requiring a file change or editor reload.
 
@@ -481,7 +479,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 | Socket disconnect without crash                            | Discard any stale MessagePack payloads currently in the receive buffer. Wait for the next document change event to trigger a fresh request cycle. Do not attempt immediate reconnection to avoid cascading retries on rapid edits.     |
 | node_modules folder deleted while extension is running     | The file watcher must detect the deletion. The extension host must send a `CacheInvalidateAll` message (see Section 10.1). The daemon must evict all entries from both `papaya` and `redb`. The extension host must update all affected decorations to "Package not found".    |
 | redb database corrupted on startup                         | Log the corruption, delete the corrupted database file, and create a fresh empty database. Continue operation using only the in-memory cache for the current session.                                                                  |
-| WASM Worker fails to initialise                            | Log the failure and enter degraded mode. Display `ImportLens: Unavailable` in the status bar.                                                                                                                                          |
+| Unsupported native platform or missing daemon binary       | Log the missing runtime and enter degraded mode. Display `ImportLens: Unavailable` in the status bar.                                                                                                                                  |
 | Daemon binary hash mismatch (NFR-014a)                    | Refuse to spawn the daemon. Log a security warning to the ImportLens output channel at `error` level. Enter degraded mode and display `ImportLens: Unavailable`. Do not show a user-facing error dialog. |
 | Daemon recycle loop detected (NFR-004b)                   | If more than 5 recycles occurred within any rolling 10-minute window (read from `importlens-recycles.json`), enter degraded mode, log a warning, and display `ImportLens: Unavailable`. Reset counter after a clean 30-minute session with no recycles. |
 | IPC socket path collision (multiple VS Code windows)      | Each window uses a unique socket path via `VSCODE_PID` or UUID at activation (NFR-014b). If the generated path already exists, generate a fresh UUID and retry once before entering degraded mode. |
@@ -857,11 +855,7 @@ Extension activates
     │       |
     │       ├─ Found → spawn process, open socket, send HELLO handshake
     │       │
-    │       └─ Not found → locate WASM binary in extension/wasm/import-lens-daemon.wasm
-    │               |
-    │               ├─ Found → instantiate in VS Code Worker, attach postMessage IPC
-    │               │
-    │               └─ Not found → enter degraded mode, show status bar warning
+    │       └─ Not found → enter degraded mode, show status bar warning
     |
     Daemon starts
         |
@@ -1029,9 +1023,8 @@ The extension is published as separate platform-specific VSIX packages. VS Code 
 | `darwin-arm64` | `aarch64-apple-darwin`                                  |
 | `win32-x64`    | `x86_64-pc-windows-msvc`                                |
 | `win32-arm64`  | `aarch64-pc-windows-msvc`                               |
-| `web`          | `wasm32-wasip1-threads` (WASM, Desktop only; see C-004) |
 
-> **Note:** `linux-armhf` (`armv7-unknown-linux-gnueabihf`) is deferred to v1.1. ARMv7 is increasingly uncommon for developer workstations. Adding it later requires only a new CI cross-compilation target and VSIX entry.
+> **Note:** `linux-armhf` (`armv7-unknown-linux-gnueabihf`) and the WASM fallback target are deferred to v1.1. ARMv7 is increasingly uncommon for developer workstations. Adding it later requires only a new CI cross-compilation target and VSIX entry. Adding WASM later requires a proven worker runtime and packaging path.
 
 ### 12.2 Estimated Size per User Download
 
@@ -1055,18 +1048,11 @@ codegen-units = 1
 lto = true
 panic = "abort"
 strip = true
-
-[profile.release-wasm]
-inherits = "release"
-opt-level = "z"
-lto = true
-strip = "symbols"
 ```
 
 ### 12.4 CI/CD Pipeline Requirements
 
 - The CI pipeline must compile the Rust daemon for all six native targets using cross-compilation.
-- The CI pipeline must compile the WASM target using `cargo build --target wasm32-wasip1-threads` followed by `wasm-opt -Oz`.
 - The CI pipeline must build each platform VSIX from a temporary staging directory whose manifest contains no `devDependencies` and only the runtime dependencies required by that target.
 - When pnpm is used, each VSIX build must stage physical copies of the bundled extension, target daemon binary, `oxc-parser`, `@oxc-project/types`, and the target `@oxc-parser/binding-*` package, then invoke `@vscode/vsce package --target <platform>` from the staging directory. This avoids publishing pnpm junctions and allows `vsce` to include the native parser runtime via its production dependency walker.
 - The CI pipeline must measure the size of each output VSIX and fail the publish step if any target exceeds 20 MB (enforcing AC-001 and NFR-007).
@@ -1085,7 +1071,7 @@ strip = "symbols"
 
 **C-003:** Rolldown's Rust embedding API (`rolldown_core` on crates.io) does not yet expose a stable public interface for programmatic use as a Rust library. Rolldown is therefore not used directly in this project. A custom module graph walker is implemented instead using OXC primitives. This constraint must be re-evaluated when Rolldown's Rust API stabilises. See Appendix C: Technology Watch.
 
-**C-004:** The WASM daemon binary targets `wasm32-wasip1-threads`, which is an experimental Rust/LLVM target. Thread support requires `SharedArrayBuffer` and cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`). The WASM binary must be compiled with an explicit `--max-memory` linker flag set to at least `67108864` (64 MB) to provide sufficient headroom for Rayon's thread stacks; larger values may be needed if the module graph walker exceeds this during deep dependency trees. In VS Code for the Web (browser), `SharedArrayBuffer` availability is not guaranteed; therefore, the WASM tier is restricted to VS Code Desktop only. VS Code for the Web falls to Tier 3 (degraded mode). The `wasi-threads` proposal used by this target is considered legacy; the industry is transitioning toward the Component Model. See Appendix C: Technology Watch.
+**C-004:** A WASM daemon fallback is deferred to v1.1 or later. The candidate target is `wasm32-wasip1-threads`, which is an experimental Rust/LLVM target. Thread support requires `SharedArrayBuffer` and cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`). Any future WASM binary must be compiled with an explicit `--max-memory` linker flag set to at least `67108864` (64 MB) to provide sufficient headroom for Rayon's thread stacks; larger values may be needed if the module graph walker exceeds this during deep dependency trees. VS Code for the Web remains degraded mode in v1.0 because browser `SharedArrayBuffer` availability and local `node_modules` access are not guaranteed. The `wasi-threads` proposal used by this target is considered legacy; the industry is transitioning toward the Component Model. See Appendix C: Technology Watch.
 
 ### 13.2 Out-of-Scope Decisions
 
@@ -1135,7 +1121,7 @@ import-lens/
 │   │   │   ├── protocol.ts            # BatchRequest / BatchResponse / Hello / CacheInvalidate / Shutdown types
 │   │   │   └── codec.ts               # MessagePack encode/decode
 │   │   ├── daemon/
-│   │   │   ├── manager.ts             # native/WASM daemon lifecycle
+│   │   │   ├── manager.ts             # daemon lifecycle and analysis transport coordination
 │   │   │   ├── platform.ts            # platform target mapping
 │   │   │   └── knownHashes.generated.ts # generated daemon binary hashes
 │   │   ├── watcher.ts                 # vscode.workspace.createFileSystemWatcher; sends CacheInvalidate IPC messages
@@ -1190,9 +1176,6 @@ import-lens/
 │   └── win32-arm64/
 │       └── import-lens-daemon.exe
 │
-├── wasm/                              # WASM fallback binary (gitignored, CI-populated)
-│   └── import-lens-daemon.wasm
-│
 └── tests/
     ├── fixtures/
     │   └── packages/                  # Pinned package.json fixtures for test stability
@@ -1237,9 +1220,9 @@ This table tracks components that are currently used with known limitations, or 
 | `oxc_mangler`                       | Separate crate (v0.133.x), recently split from `oxc_minifier`.                                                       | API stabilization, potential re-merge into `oxc_minifier`.                                                                                         | Minor import path changes if crates are merged.                                                                                                                                                                                   | Every OXC release     |
 | `oxc_resolver`                      | v11.20.0. Separate repository (`oxc-project/oxc-resolver`), versioned independently from the OXC monorepo. Currently on major version 11. | Major version bump (e.g. 12.x); breaking changes to `ResolverOptions` or the `resolve()` API. | May require `Cargo.toml` update and code changes in `resolve.rs`. Upgrade separately from the OXC monorepo batch and run integration suite before merging. | Each release          |
 | Rolldown Rust API (`rolldown_core`) | No stable public API. ImportLens uses a custom module graph walker instead.                                          | Stable embeddable Rust crate on crates.io with tree-shaking API.                                                                                   | Would replace the entire custom module graph walker (`graph.rs` + `treeshake.rs`), significantly reducing code and improving accuracy. This is the single highest-impact migration.                                               | Quarterly             |
-| `wasm32-wasip1-threads`             | Experimental Rust/LLVM target. Works on VS Code Desktop but requires `SharedArrayBuffer` and cross-origin isolation. | WASI Preview 2 / Component Model threading (`wasm32-wasip2`). The `wasi-threads` proposal is legacy; `shared-everything-threads` is the successor. | May require retargeting the WASM build when new standards stabilize. Current approach will continue working on VS Code Desktop.                                                                                                   | Semi-annually         |
-| `@vscode/wasm-wasi-core`            | Supports WASI Preview 1 with experimental thread support.                                                            | WASI Preview 2 support, Component Model integration, improved `SharedArrayBuffer` ergonomics.                                                      | Better thread reliability and broader environment support (including VS Code Web).                                                                                                                                                | Semi-annually         |
-| `oxc-parser` (npm, NAPI)            | v0.133.0. Active, replaces deprecated `@oxc-parser/wasm`. No WASM/browser support.                                   | Potential official WASM sub-export (e.g. `oxc-parser/wasm`) or Component Model-based distribution.                                                 | Would restore parsing capability in VS Code for the Web, upgrading it from Tier 3 (degraded) to Tier 2.                                                                                                                           | Quarterly             |
+| `wasm32-wasip1-threads`             | Experimental Rust/LLVM target. Deferred v1.1 candidate; not a v1.0 runtime path.                                     | WASI Preview 2 / Component Model threading (`wasm32-wasip2`). The `wasi-threads` proposal is legacy; `shared-everything-threads` is the successor. | May require retargeting before a future WASM fallback ships.                                                                                                                                                                       | Semi-annually         |
+| `@vscode/wasm-wasi-core`            | Supports WASI Preview 1 with experimental thread support. Deferred v1.1 candidate dependency.                       | WASI Preview 2 support, Component Model integration, improved `SharedArrayBuffer` ergonomics.                                                      | Better thread reliability and broader environment support, subject to VS Code Desktop and Web limitations.                                                                                                                        | Semi-annually         |
+| `oxc-parser` (npm, NAPI)            | v0.133.0. Active, replaces deprecated `@oxc-parser/wasm`. No WASM/browser support.                                   | Potential official WASM sub-export (e.g. `oxc-parser/wasm`) or Component Model-based distribution.                                                 | Would restore parsing capability in VS Code for the Web, upgrading it from degraded mode in a future release.                                                                                                                     | Quarterly             |
 | `papaya`                            | v0.2.4. Pre-1.0 but actively maintained. Uses seize-based GC.                                                        | 1.0 stable release; API changes to pinning semantics.                                                                                              | Minor migration effort if pinning API changes. Lock-free design is correct for the workload.                                                                                                                                      | Semi-annually         |
 | VS Code Inlay Hints API             | Stable. Used as an optional display mode.                                                                            | Enhanced styling support (colors, icons), positioning improvements.                                                                                | Richer size display within inlay hints. Currently limited to plain text.                                                                                                                                                          | With VS Code releases |
 | `redb`                              | v4.x stable. ACID, pure Rust.                                                                                        | Major version bumps; potential API changes.                                                                                                        | Migration effort proportional to API surface changes. File format is committed stable. Cache schema versioning (FR-026a) ensures seamless upgrades.                                                                               | Annually              |

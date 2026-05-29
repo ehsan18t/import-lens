@@ -1,15 +1,17 @@
 ---
 name: vscode-wasm-threads-target
-description: "WASM compilation targeting wasm32-wasip1-threads, wasm-opt optimization, and VS Code Worker execution limits. VS Code Desktop only — NOT VS Code for the Web. Use when implementing the WASM fallback tier (C-004)."
+description: "Deferred v1.1 WASM fallback research for wasm32-wasip1-threads, wasm-opt optimization, and VS Code Worker execution limits. VS Code Desktop only - NOT VS Code for the Web."
 ---
 
 # Instructions
 
-To run smoothly on VS Code Desktop when a native binary match is missing, we must invoke our daemon as a WebAssembly module (Tier 2).
+The v1.0 release is native-daemon only. Use this skill only when intentionally
+implementing the deferred v1.1 WASM fallback after updating the SRS and release
+pipeline requirements.
 
 ## 1. Rust Target Configuration
 
-You MUST compile the Rust daemon targeting `wasm32-wasip1-threads`.
+The candidate daemon target is `wasm32-wasip1-threads`.
 
 ```bash
 RUSTFLAGS="-C link-arg=--max-memory=4294967296" cargo build --target wasm32-wasip1-threads --release
@@ -29,4 +31,4 @@ This `.wasm` binary can **only** be executed via the `@vscode/wasm-wasi-core` ex
 
 It **will not work** in standard VS Code for the Web (e.g. github.dev) because native web browser execution currently cannot guarantee cross-origin isolation headers (`COOP`/`COEP`) which are strictly required to spawn threads and execute `SharedArrayBuffer`.
 
-When triggered in the web, the TypeScript daemon must instantly fall back to Tier 3 (Degraded Mode), omitting sizes silently. Do NOT log a crash — this behavior is expected.
+When triggered in the web, the TypeScript daemon must instantly fall back to degraded mode, omitting sizes silently. Do NOT log a crash - this behavior is expected.

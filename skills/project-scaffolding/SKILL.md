@@ -72,9 +72,6 @@ import-lens/
 │   ├── win32-x64/import-lens-daemon.exe
 │   └── win32-arm64/import-lens-daemon.exe
 │
-├── wasm/                              # WASM fallback (gitignored, CI-populated)
-│   └── import-lens-daemon.wasm
-│
 └── tests/
     ├── fixtures/packages/
     └── integration/
@@ -94,12 +91,12 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.89.0"
 ```
 
 ## 3. Daemon Cargo.toml — Pinned Versions
 
-All OXC crates MUST be pinned to `~0.126`. `oxc_resolver` is independent at `~11.19`.
+All OXC crates MUST be pinned to `~0.133`. `oxc_resolver` is independent at `~11.19`.
 
 ```toml
 [package]
@@ -110,15 +107,15 @@ rust-version.workspace = true
 
 [dependencies]
 # OXC suite — ALL must be same version
-oxc_parser = "~0.126"
+oxc_parser = "~0.133"
 oxc_resolver = "~11.19"
-oxc_semantic = "~0.126"
-oxc_transformer = "~0.126"
-oxc_minifier = "~0.126"
-oxc_mangler = "~0.126"
-oxc_codegen = "~0.126"
-oxc_allocator = "~0.126"
-oxc_span = "~0.126"
+oxc_semantic = "~0.133"
+oxc_transformer = "~0.133"
+oxc_minifier = "~0.133"
+oxc_mangler = "~0.133"
+oxc_codegen = "~0.133"
+oxc_allocator = "~0.133"
+oxc_span = "~0.133"
 
 # Caching
 papaya = "~0.2"
@@ -144,11 +141,6 @@ lto = true
 panic = "abort"
 strip = true
 
-[profile.release-wasm]
-inherits = "release"
-opt-level = "z"
-lto = true
-strip = "symbols"
 ```
 
 ## 4. package.json — Key Fields
@@ -159,9 +151,9 @@ strip = "symbols"
   "displayName": "ImportLens",
   "publisher": "<your-publisher-id>",
   "engines": {
-    "vscode": "^1.99.0"
+    "vscode": "^1.100.0"
   },
-  "main": "./extension/dist/extension.js",
+  "main": "./extension/dist/extension.cjs",
   "activationEvents": [
     "onLanguage:javascript",
     "onLanguage:typescript",
@@ -169,13 +161,13 @@ strip = "symbols"
     "onLanguage:javascriptreact"
   ],
   "dependencies": {
-    "oxc-parser": "0.126.0",
+    "oxc-parser": "0.133.0",
     "@msgpack/msgpack": "3.1.3"
   },
   "devDependencies": {
-    "tsdown": "0.21.9",
+    "tsdown": "0.22.1",
     "typescript": "6.0.3",
-    "@types/vscode": "1.99.0",
+    "@types/vscode": "1.100.0",
     "@vscode/vsce": "3.9.1"
   }
 }
@@ -183,8 +175,8 @@ strip = "symbols"
 
 > [!IMPORTANT]
 >
-> - `oxc-parser` is v0.126.0, NOT v0.123.0. The npm package MUST match the Rust crate version.
-> - `@types/vscode` MUST be 1.99.0, matching the minimum `engines.vscode`.
+> - `oxc-parser` is v0.133.0, NOT v0.123.0. The npm package MUST match the Rust crate version.
+> - `@types/vscode` MUST be 1.100.0, matching the minimum `engines.vscode`.
 > - `@vscode/vsce` MUST be 3.9.1. Use `--no-dependencies` when building VSIX.
 > - Do NOT use `@oxc-parser/wasm`, `dashmap`, `sled`, or `num_cpus` anywhere.
 
@@ -199,6 +191,6 @@ These must NEVER appear in `Cargo.toml` or `package.json`:
 
 ## Rules
 
-- The `bin/` and `wasm/` directories are gitignored and CI-populated.
+- The `bin/` directory is gitignored and CI-populated.
 - The extension must be bundled to a single file by `tsdown`. Only `oxc-parser` (NAPI) and `@msgpack/msgpack` are runtime dependencies.
 - The `vscode` module must always be marked as `external` in tsdown config.

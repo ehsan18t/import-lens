@@ -1,6 +1,6 @@
 ---
 name: ci-cross-compilation
-description: "CI/CD pipeline for cross-compiling Rust to 6 native targets + WASM, building platform-specific VSIXs under 20 MB, and running integration tests. Use when setting up GitHub Actions or CI configuration."
+description: "CI/CD pipeline for cross-compiling Rust to 6 native targets, building platform-specific VSIXs under 20 MB, and running integration tests. Use when setting up GitHub Actions or CI configuration."
 ---
 
 # Instructions
@@ -9,15 +9,14 @@ ImportLens distributes platform-specific VSIXs. Each contains only the binary fo
 
 ## 1. Target Matrix
 
-| VSIX Platform        | Rust Target                 | Binary Name               |
-| -------------------- | --------------------------- | ------------------------- |
-| `linux-x64`          | `x86_64-unknown-linux-gnu`  | `import-lens-daemon`      |
-| `linux-arm64`        | `aarch64-unknown-linux-gnu` | `import-lens-daemon`      |
-| `darwin-x64`         | `x86_64-apple-darwin`       | `import-lens-daemon`      |
-| `darwin-arm64`       | `aarch64-apple-darwin`      | `import-lens-daemon`      |
-| `win32-x64`          | `x86_64-pc-windows-msvc`    | `import-lens-daemon.exe`  |
-| `win32-arm64`        | `aarch64-pc-windows-msvc`   | `import-lens-daemon.exe`  |
-| `web` (Desktop WASM) | `wasm32-wasip1-threads`     | `import-lens-daemon.wasm` |
+| VSIX Platform  | Rust Target                 | Binary Name              |
+| -------------- | --------------------------- | ------------------------ |
+| `linux-x64`    | `x86_64-unknown-linux-gnu`  | `import-lens-daemon`     |
+| `linux-arm64`  | `aarch64-unknown-linux-gnu` | `import-lens-daemon`     |
+| `darwin-x64`   | `x86_64-apple-darwin`       | `import-lens-daemon`     |
+| `darwin-arm64` | `aarch64-apple-darwin`      | `import-lens-daemon`     |
+| `win32-x64`    | `x86_64-pc-windows-msvc`    | `import-lens-daemon.exe` |
+| `win32-arm64`  | `aarch64-pc-windows-msvc`   | `import-lens-daemon.exe` |
 
 ## 2. Release Profile (Cargo.toml)
 
@@ -30,12 +29,6 @@ codegen-units = 1      # Better LTO
 lto = true             # Link-Time Optimization
 panic = "abort"        # No unwinding overhead
 strip = true           # Strip debug symbols
-
-[profile.release-wasm]
-inherits = "release"
-opt-level = "z"
-lto = true
-strip = "symbols"
 ```
 
 ## 3. Native Compilation
@@ -52,17 +45,11 @@ cp target/<rust-target>/release/import-lens-daemon bin/<vsix-platform>/
 
 Use `cross` or platform-specific CI runners for cross-compilation.
 
-## 4. WASM Compilation
+## 4. Deferred WASM Fallback
 
-```bash
-# Build WASM target with max-memory flag for Rayon thread stacks
-RUSTFLAGS="-C link-arg=--max-memory=4294967296" \
-    cargo build --target wasm32-wasip1-threads --release -p import-lens-daemon
-
-# Optimize with wasm-opt (Binaryen)
-wasm-opt -Oz -o wasm/import-lens-daemon.wasm \
-    target/wasm32-wasip1-threads/release/import-lens-daemon.wasm
-```
+Do not add WASM to v1.0 CI or VSIX packaging. The candidate target is deferred
+to v1.1 and requires an SRS update plus end-to-end worker/runtime tests before
+it can become a release artifact.
 
 ## 5. Binary Hash Generation (NFR-014a)
 
@@ -120,4 +107,4 @@ Must pass BEFORE any VSIX is published:
 
 - Never publish a VSIX with a minifier version that fails the integration suite (C-001 fallback strategy).
 - linux-armhf (`armv7-unknown-linux-gnueabihf`) is deferred to v1.1.
-- The WASM binary runs ONLY on VS Code Desktop, NOT VS Code for the Web (C-004).
+- WASM fallback is deferred to v1.1 and must not be added to CI without an SRS update.

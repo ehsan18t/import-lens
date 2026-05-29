@@ -1,11 +1,11 @@
 ---
 name: rust-oxc-pipeline-runner
-description: "Orchestrating the native OXC AST pipeline: parse, transform, minify, mangle, and codegen. All crates pinned to v0.126.0. Use when implementing daemon/src/pipeline/ (FR-016–FR-019, FR-024)."
+description: "Orchestrating the native OXC AST pipeline: parse, transform, minify, mangle, and codegen. All crates pinned to v0.133.0. Use when implementing daemon/src/pipeline/ (FR-016-FR-019, FR-024)."
 ---
 
 # Instructions
 
-The OXC Pipeline (v0.126.0) requires a shared AST `Allocator` bound to a specific lifetime sequence.
+The OXC Pipeline (v0.133.0) requires a shared AST `Allocator` bound to a specific lifetime sequence.
 
 ## 1. Setup the Allocator
 
@@ -39,7 +39,7 @@ let mut program = ret.program;
 let minifier_options = MinifierOptions::default();
 Minifier::new(minifier_options).minify(&allocator, &mut program);
 
-// 4. Mangler (Now a separate crate from minifier in 0.126)
+// 4. Mangler (separate crate from minifier)
 let mut mangler = Mangler::default();
 mangler.mangle(&mut program);
 
@@ -53,4 +53,4 @@ let minified_string = Codegen::new().with_minify(true).build(&program).code;
 
 - The allocator **must not** be dropped before `Codegen::build()` completes.
 - Never use `oxc_transformer` to attempt tree shaking; it does not natively support DCE (Dead Code Elimination).
-- Always ensure `oxc_allocator`, `oxc_span`, `oxc_parser`, `oxc_semantic`, `oxc_codegen`, `oxc_minifier`, and `oxc_mangler` share the exact same version string (0.126.0), as AST node versions are un-stable between minor releases in OXC.
+- Always ensure `oxc_allocator`, `oxc_span`, `oxc_parser`, `oxc_semantic`, `oxc_codegen`, `oxc_minifier`, and `oxc_mangler` share the exact same version string (0.133.0), as AST node versions are unstable between minor releases in OXC.

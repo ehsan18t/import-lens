@@ -82,6 +82,6 @@ When implementing a specific area, load the relevant skill:
 | VS Code settings                    | `vscode-extension-settings`  |
 | File watcher, logging               | `ts-vscode-workspace`        |
 | Build config (TS, tsdown)           | `ts-build-configuration`     |
-| WASM target, Worker execution       | `vscode-wasm-threads-target` |
+| Future WASM target (deferred v1.1)  | `vscode-wasm-threads-target` |
 | Binary size optimization            | `rust-binary-optimization`   |
 | CI/CD, VSIX packaging               | `ci-cross-compilation`       |

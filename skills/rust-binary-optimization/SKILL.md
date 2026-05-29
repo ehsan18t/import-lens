@@ -1,6 +1,6 @@
 ---
 name: rust-binary-optimization
-description: "Cargo release profile settings, LTO, strip, panic=abort, and wasm-opt for achieving sub-20 MB VSIX size. Use when tuning binary size or debugging size regressions (NFR-007)."
+description: "Cargo release profile settings, LTO, strip, and panic=abort for achieving sub-20 MB VSIX size. Use when tuning binary size or debugging size regressions (NFR-007)."
 ---
 
 # Instructions
@@ -28,27 +28,11 @@ strip = true           # Strips all debug symbols and DWARF info
 | `panic`         | `"abort"` | Removes the entire unwinding machinery. Safe because the daemon exits on unrecoverable errors anyway.                                               |
 | `strip`         | `true`    | Strips debug symbols AND symbol table. Use `strip = "symbols"` if you need to keep the symbol table for profiling.                                  |
 
-## 2. WASM-Specific Profile
+## 2. Deferred WASM Optimization
 
-```toml
-[profile.release-wasm]
-inherits = "release"
-opt-level = "z"
-lto = true
-strip = "symbols"
-```
-
-After Cargo compilation, apply `wasm-opt` from the Binaryen toolchain:
-
-```bash
-wasm-opt -Oz -o output.wasm input.wasm
-```
-
-`wasm-opt -Oz` typically reduces WASM binary size by 15-30% through:
-
-- Dead code elimination
-- Constant folding
-- Stack-based IR optimization
+WASM packaging is not part of v1.0. Do not add a `release-wasm` Cargo profile
+or `wasm-opt` release gate until the deferred v1.1 WASM fallback is designed,
+implemented, tested, and documented in the SRS.
 
 ## 3. Dependency Auditing for Size
 
@@ -70,7 +54,6 @@ Common size offenders to watch:
 | Component                           | Expected Size |
 | ----------------------------------- | ------------- |
 | Native daemon (release, stripped)   | 5–10 MB       |
-| WASM daemon (wasm-opt -Oz)          | 3–7 MB        |
 | TypeScript bundle (tsdown minified) | < 500 KB      |
 | Total VSIX (compressed)             | 10–13 MB      |
 

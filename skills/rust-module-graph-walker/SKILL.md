@@ -30,7 +30,7 @@ export * from "lodash-es";
 
 ## 2. Tree/Reachability Walking
 
-Use `oxc_semantic` (v0.126.0) to trace AST scope bounds, build symbol tables, and trace reference identifiers across ES Module files.
+Use `oxc_semantic` (v0.133.0) to trace AST scope bounds, build symbol tables, and trace reference identifiers across ES Module files.
 
 ```rust
 use oxc_semantic::SemanticBuilder;
@@ -73,5 +73,5 @@ Before tree-shaking, read the `sideEffects` field from the package's `package.js
 ## Rules
 
 - Do NOT use the unstable `rolldown_core` Rust crate APIs (C-003).
-- All OXC crates (`oxc_parser`, `oxc_semantic`, `oxc_resolver`, etc.) must be pinned to the SAME version (0.126.0) except `oxc_resolver` which is independently versioned at v11.19.x.
+- All OXC crates (`oxc_parser`, `oxc_semantic`, `oxc_codegen`, etc.) must be pinned to the SAME version (0.133.0) except `oxc_resolver` which is independently versioned at v11.19.x.
 - Use explicit reachability bounds. The module graph walker assumes re-exports from virtual files are strictly preserved.
