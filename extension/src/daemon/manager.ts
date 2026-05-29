@@ -10,23 +10,33 @@ import type { BatchRequest, BatchResponse, HelloMessage } from "../ipc/protocol.
 import { protocolVersion } from "../ipc/protocol.js";
 import { daemonBinaryName, currentPlatformTarget } from "./platform.js";
 import { knownDaemonHashes } from "./knownHashes.generated.js";
+import { RecycleGuard } from "./recycleGuard.js";
+import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 
 export type DaemonState = "ready" | "unavailable";
+
+const STABLE_SESSION_RESET_MS = 60_000;
+const CLEAN_RECYCLE_SESSION_MS = 30 * 60 * 1000;
 
 export class DaemonManager implements vscode.Disposable {
   readonly #context: vscode.ExtensionContext;
   readonly #logger: ImportLensLogger;
+  readonly #recycleGuard: RecycleGuard;
   #process: ChildProcessWithoutNullStreams | null = null;
   #client: IpcClient | null = null;
   #state: DaemonState = "unavailable";
   #isDisposed = false;
-  #restarts = 0;
+  #restartAttempt = 0;
+  #crashTimes: number[] = [];
   #restartTimer: NodeJS.Timeout | null = null;
   #stabilityTimer: NodeJS.Timeout | null = null;
+  #cleanRecycleTimer: NodeJS.Timeout | null = null;
+  #disconnectTimer: NodeJS.Timeout | null = null;
 
   constructor(context: vscode.ExtensionContext, logger: ImportLensLogger) {
     this.#context = context;
     this.#logger = logger;
+    this.#recycleGuard = new RecycleGuard(context.globalStorageUri.fsPath);
   }
 
   get state(): DaemonState {
@@ -35,11 +45,18 @@ export class DaemonManager implements vscode.Disposable {
 
   async start(): Promise<DaemonState> {
     if (this.#isDisposed) return "unavailable";
+    if (this.#state === "ready" && this.#process && this.#client) return "ready";
 
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
     if (!workspaceRoot) {
       this.#logger.warn("No workspace folder is open; daemon unavailable.");
+      this.#state = "unavailable";
+      return this.#state;
+    }
+
+    if (await this.#recycleGuard.shouldEnterDegradedMode()) {
+      this.#logger.warn("Daemon recycle loop detected. ImportLens is entering unavailable mode.");
       this.#state = "unavailable";
       return this.#state;
     }
@@ -76,8 +93,7 @@ export class DaemonManager implements vscode.Disposable {
     ]);
 
     this.#process.once("exit", (code, signal) => {
-      this.#logger.warn(`Daemon exited with code ${code ?? "null"} signal ${signal ?? "null"}.`);
-      this.#handleCrash();
+      this.#handleProcessExit(code, signal);
     });
 
     try {
@@ -90,47 +106,106 @@ export class DaemonManager implements vscode.Disposable {
 
     this.#client.on("disconnect", (error) => {
       this.#logger.warn(`IPC disconnected: ${error instanceof Error ? error.message : String(error)}`);
-      this.#handleCrash();
+      this.#handleUnexpectedDisconnect();
     });
     this.#client.send(this.#hello(workspaceRoot));
     this.#state = "ready";
-
-    if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
-    this.#stabilityTimer = setTimeout(() => {
-      this.#restarts = 0;
-    }, 5000);
+    this.#armStabilityReset();
+    this.#armCleanRecycleReset();
 
     return this.#state;
   }
 
-  #handleCrash(): void {
+  #handleProcessExit(code: number | null, signal: NodeJS.Signals | null): void {
     if (this.#isDisposed || this.#restartTimer) return;
-    this.#cleanup();
+    this.#clearDisconnectTimer();
 
-    if (this.#restarts >= 5) {
-      this.#logger.error("Daemon crashed too many times. Giving up.");
+    const gracefulExit = code === 0 && signal === null;
+    const level = gracefulExit ? "info" : "warn";
+    this.#logger[level](`Daemon exited with code ${code ?? "null"} signal ${signal ?? "null"}.`);
+    this.#cleanup(false);
+
+    if (gracefulExit) {
+      this.#scheduleRestart(1000, "Daemon recycled; restarting in 1000ms.", "info");
+      return;
+    }
+
+    this.#handleCrash();
+  }
+
+  #handleUnexpectedDisconnect(): void {
+    if (this.#isDisposed || this.#restartTimer || this.#disconnectTimer) return;
+
+    this.#disconnectTimer = setTimeout(() => {
+      this.#disconnectTimer = null;
+
+      if (this.#isDisposed || this.#restartTimer) return;
+
+      this.#cleanup();
+      this.#handleCrash();
+    }, 100);
+  }
+
+  #handleCrash(): void {
+    const now = Date.now();
+    this.#crashTimes = recentCrashTimes([...this.#crashTimes, now], now);
+
+    if (shouldEnterCrashDegradedMode(this.#crashTimes, now)) {
+      this.#logger.error("Daemon crashed three times within 60 seconds. ImportLens is entering unavailable mode.");
       this.#state = "unavailable";
       return;
     }
 
-    this.#restarts++;
-    const delay = Math.min(250 * (2 ** this.#restarts), 10000);
-    this.#logger.warn(`Restarting daemon in ${delay}ms (attempt ${this.#restarts})...`);
+    this.#restartAttempt++;
+    const delay = restartDelayMs(this.#restartAttempt);
+    this.#scheduleRestart(delay, `Restarting daemon in ${delay}ms (attempt ${this.#restartAttempt})...`);
+  }
+
+  #scheduleRestart(delay: number, message: string, level: "info" | "warn" = "warn"): void {
+    this.#state = "unavailable";
+    this.#logger[level](message);
     this.#restartTimer = setTimeout(() => {
       this.#restartTimer = null;
       if (!this.#isDisposed) void this.start();
     }, delay);
   }
 
-  #cleanup(): void {
+  #cleanup(killProcess = true): void {
+    this.#clearDisconnectTimer();
     const client = this.#client;
-    const process = this.#process;
+    const childProcess = this.#process;
 
     this.#client = null;
     this.#process = null;
     client?.dispose();
-    process?.kill();
+
+    if (killProcess) {
+      childProcess?.kill();
+    }
+
     this.#state = "unavailable";
+  }
+
+  #clearDisconnectTimer(): void {
+    if (!this.#disconnectTimer) return;
+
+    clearTimeout(this.#disconnectTimer);
+    this.#disconnectTimer = null;
+  }
+
+  #armStabilityReset(): void {
+    if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
+    this.#stabilityTimer = setTimeout(() => {
+      this.#restartAttempt = 0;
+      this.#crashTimes = [];
+    }, STABLE_SESSION_RESET_MS);
+  }
+
+  #armCleanRecycleReset(): void {
+    if (this.#cleanRecycleTimer) clearTimeout(this.#cleanRecycleTimer);
+    this.#cleanRecycleTimer = setTimeout(() => {
+      void this.#recycleGuard.resetAfterCleanSession();
+    }, CLEAN_RECYCLE_SESSION_MS);
   }
 
   async sendBatch(request: BatchRequest): Promise<BatchResponse | null> {
@@ -153,9 +228,27 @@ export class DaemonManager implements vscode.Disposable {
     this.#isDisposed = true;
     if (this.#restartTimer) clearTimeout(this.#restartTimer);
     if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
-    
-    this.#client?.send({ type: "shutdown" });
-    this.#cleanup();
+    if (this.#cleanRecycleTimer) clearTimeout(this.#cleanRecycleTimer);
+    this.#clearDisconnectTimer();
+
+    const client = this.#client;
+    const childProcess = this.#process;
+
+    this.#client = null;
+    this.#process = null;
+    this.#state = "unavailable";
+
+    try {
+      client?.send({ type: "shutdown" });
+    } catch (error) {
+      this.#logger.warn(`Failed to send daemon shutdown: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (childProcess) {
+      await terminateProcess(childProcess);
+    }
+
+    client?.dispose();
   }
 
   async #verifyBinary(relativePath: string, binaryPath: string): Promise<boolean> {
@@ -194,3 +287,44 @@ export class DaemonManager implements vscode.Disposable {
     };
   }
 }
+
+const waitForExit = (
+  childProcess: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<boolean> => {
+  if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      childProcess.off("exit", onExit);
+      resolve(false);
+    }, timeoutMs);
+
+    childProcess.once("exit", onExit);
+  });
+};
+
+const terminateProcess = async (childProcess: ChildProcessWithoutNullStreams): Promise<void> => {
+  if (await waitForExit(childProcess, 5000)) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    childProcess.kill();
+    await waitForExit(childProcess, 2000);
+    return;
+  }
+
+  childProcess.kill("SIGTERM");
+
+  if (!(await waitForExit(childProcess, 2000))) {
+    childProcess.kill("SIGKILL");
+    await waitForExit(childProcess, 1000);
+  }
+};

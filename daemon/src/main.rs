@@ -6,6 +6,7 @@ use std::{env, error::Error, path::PathBuf};
 struct Args {
     pipe: Option<String>,
     workspace: Option<PathBuf>,
+    storage: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -17,7 +18,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .workspace
         .ok_or("missing required --workspace argument")?;
 
-    run_server(&pipe, workspace).await
+    run_server(&pipe, workspace, args.storage).await
 }
 
 fn configure_rayon_pool() {
@@ -39,9 +40,7 @@ where
         match arg.as_str() {
             "--pipe" => parsed.pipe = iterator.next(),
             "--workspace" => parsed.workspace = iterator.next().map(PathBuf::from),
-            "--storage" => {
-                let _ = iterator.next();
-            }
+            "--storage" => parsed.storage = iterator.next().map(PathBuf::from),
             unknown => return Err(format!("unknown argument: {unknown}").into()),
         }
     }

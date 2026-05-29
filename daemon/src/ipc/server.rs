@@ -3,16 +3,27 @@ use crate::{
         codec::{FrameDecoder, decode_payload, encode_frame},
         protocol::ClientMessage,
     },
+    lifecycle::{LifecycleState, record_recycle_timestamp},
     service::ImportLensService,
 };
-use std::{error::Error, path::PathBuf};
+use std::{
+    error::Error,
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const LIFECYCLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ServerOptions;
 
 #[cfg(windows)]
-pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(), Box<dyn Error>> {
+pub async fn run_server(
+    pipe_name: &str,
+    _workspace_root: PathBuf,
+    storage_path: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     let mut pipe = ServerOptions::new()
         .first_pipe_instance(true)
         .create(pipe_name)?;
@@ -21,10 +32,20 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
     let mut decoder = FrameDecoder::default();
     let mut service = std::sync::Arc::new(ImportLensService::new(None, false));
     let mut hello_received = false;
+    let mut lifecycle = LifecycleState::new();
+    let mut storage_path = storage_path;
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
-        let read = pipe.read(&mut buffer).await?;
+        let read = tokio::select! {
+            read = pipe.read(&mut buffer) => read?,
+            _ = tokio::time::sleep(LIFECYCLE_CHECK_INTERVAL) => {
+                if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
 
         if read == 0 {
             break;
@@ -35,18 +56,29 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
 
             match message {
                 ClientMessage::Hello(hello) => {
+                    let hello_storage_path = PathBuf::from(&hello.storage_path);
                     service = std::sync::Arc::new(ImportLensService::new(
-                        Some(PathBuf::from(hello.storage_path)),
+                        Some(hello_storage_path.clone()),
                         hello.enable_disk_cache,
                     ));
+                    storage_path = Some(hello_storage_path);
                     hello_received = true;
+
+                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                        return Ok(());
+                    }
                 }
                 ClientMessage::Batch(request) if hello_received => {
+                    lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
                     let response = tokio::task::spawn_blocking(move || svc.handle_batch(request))
                         .await
                         .expect("spawn_blocking failed");
                     pipe.write_all(&encode_frame(&response)?).await?;
+
+                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                        return Ok(());
+                    }
                 }
                 ClientMessage::CacheInvalidate(message) if hello_received => {
                     service.invalidate_package(&message.package_name);
@@ -58,12 +90,17 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
                     return Ok(());
                 }
                 ClientMessage::Batch(request) => {
+                    lifecycle.record_batch();
                     let response = tokio::task::spawn_blocking(move || {
                         ImportLensService::new(None, false).handle_batch(request)
                     })
                     .await
                     .expect("spawn_blocking failed");
                     pipe.write_all(&encode_frame(&response)?).await?;
+
+                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                        return Ok(());
+                    }
                 }
                 ClientMessage::CacheInvalidate(_) | ClientMessage::CacheInvalidateAll(_) => {}
             }
@@ -74,7 +111,11 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
 }
 
 #[cfg(not(windows))]
-pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(), Box<dyn Error>> {
+pub async fn run_server(
+    pipe_name: &str,
+    _workspace_root: PathBuf,
+    storage_path: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     use tokio::net::UnixListener;
 
     if std::fs::metadata(pipe_name).is_ok() {
@@ -87,10 +128,20 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
     let mut decoder = FrameDecoder::default();
     let mut service = std::sync::Arc::new(ImportLensService::new(None, false));
     let mut hello_received = false;
+    let mut lifecycle = LifecycleState::new();
+    let mut storage_path = storage_path;
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
-        let read = stream.read(&mut buffer).await?;
+        let read = tokio::select! {
+            read = stream.read(&mut buffer) => read?,
+            _ = tokio::time::sleep(LIFECYCLE_CHECK_INTERVAL) => {
+                if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
 
         if read == 0 {
             break;
@@ -101,18 +152,29 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
 
             match message {
                 ClientMessage::Hello(hello) => {
+                    let hello_storage_path = PathBuf::from(&hello.storage_path);
                     service = std::sync::Arc::new(ImportLensService::new(
-                        Some(PathBuf::from(hello.storage_path)),
+                        Some(hello_storage_path.clone()),
                         hello.enable_disk_cache,
                     ));
+                    storage_path = Some(hello_storage_path);
                     hello_received = true;
+
+                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                        return Ok(());
+                    }
                 }
                 ClientMessage::Batch(request) if hello_received => {
+                    lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
                     let response = tokio::task::spawn_blocking(move || svc.handle_batch(request))
                         .await
                         .expect("spawn_blocking failed");
                     stream.write_all(&encode_frame(&response)?).await?;
+
+                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                        return Ok(());
+                    }
                 }
                 ClientMessage::CacheInvalidate(message) if hello_received => {
                     service.invalidate_package(&message.package_name);
@@ -124,12 +186,17 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
                     return Ok(());
                 }
                 ClientMessage::Batch(request) => {
+                    lifecycle.record_batch();
                     let response = tokio::task::spawn_blocking(move || {
                         ImportLensService::new(None, false).handle_batch(request)
                     })
                     .await
                     .expect("spawn_blocking failed");
                     stream.write_all(&encode_frame(&response)?).await?;
+
+                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                        return Ok(());
+                    }
                 }
                 ClientMessage::CacheInvalidate(_) | ClientMessage::CacheInvalidateAll(_) => {}
             }
@@ -137,4 +204,23 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
     }
 
     Ok(())
+}
+
+fn recycle_if_needed(
+    lifecycle: &LifecycleState,
+    cache_len: usize,
+    storage_path: Option<&Path>,
+) -> bool {
+    let Some(reason) = lifecycle.should_recycle(Instant::now(), cache_len) else {
+        return false;
+    };
+
+    if let Some(storage_path) = storage_path {
+        if let Err(error) = record_recycle_timestamp(storage_path, SystemTime::now()) {
+            eprintln!("[import-lens-daemon] failed to record recycle timestamp: {error}");
+        }
+    }
+
+    eprintln!("[import-lens-daemon] lifecycle recycle requested: {reason:?}");
+    true
 }
