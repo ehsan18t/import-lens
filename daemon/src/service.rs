@@ -64,6 +64,10 @@ impl ImportLensService {
         self.cache.clear();
     }
 
+    pub fn cache_len(&self) -> usize {
+        self.cache.memory_len()
+    }
+
     fn analyze_with_cache(
         &self,
         context: &AnalysisContext,

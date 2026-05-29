@@ -19,10 +19,17 @@ impl Default for ImportCache {
 
 impl ImportCache {
     pub fn new(storage_path: Option<PathBuf>, enable_disk_cache: bool) -> Self {
-        Self {
-            memory: HashMap::new(),
-            disk: DiskCache::new(storage_path, enable_disk_cache),
+        let memory = HashMap::new();
+        let disk = DiskCache::new(storage_path, enable_disk_cache);
+
+        {
+            let pinned = memory.pin();
+            for (key, result) in disk.load_all() {
+                pinned.insert(key, result);
+            }
         }
+
+        Self { memory, disk }
     }
 
     pub fn get(&self, key: &str) -> Option<ImportResult> {
@@ -69,5 +76,9 @@ impl ImportCache {
     pub fn clear(&self) {
         self.disk.clear();
         self.memory.pin().clear();
+    }
+
+    pub fn memory_len(&self) -> usize {
+        self.memory.pin().len()
     }
 }
