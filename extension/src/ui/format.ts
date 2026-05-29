@@ -41,11 +41,11 @@ export const formatBytes = (bytes: number): string => {
 
 const formatWarningSuffix = (result: ImportResult, showWarnings: boolean): string => {
   if (result.is_cjs) {
-    return " CJS";
+    return " · CJS";
   }
 
   if (showWarnings && (result.side_effects || !result.truly_treeshakeable)) {
-    return " ⚠";
+    return " · approximate";
   }
 
   return "";
@@ -53,21 +53,21 @@ const formatWarningSuffix = (result: ImportResult, showWarnings: boolean): strin
 
 export const formatImportSize = (result: ImportResult, options: FormatOptions): string => {
   if (result.error) {
-    return "Size unavailable";
+    return "unavailable";
   }
 
   if (options.display === "verbose" || options.compression === "all") {
-    return `${formatBytes(result.minified_bytes)} min · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.brotli_bytes)} br · ${formatBytes(result.zstd_bytes)} zstd${formatWarningSuffix(result, options.showWarnings)}`;
+    return `${formatBytes(result.brotli_bytes)} br · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd · ${formatBytes(result.minified_bytes)} min${formatWarningSuffix(result, options.showWarnings)}`;
   }
 
   const compressedBytes = bytesForCompression(result, options.compression);
   const compressed = formatBytes(compressedBytes);
+  const label = labelForCompression(options.compression);
   const suffix = formatWarningSuffix(result, options.showWarnings);
 
   if (options.display === "minimal" || options.display === "inlayHint") {
     return `${compressed}${suffix}`;
   }
 
-  return `${formatBytes(result.minified_bytes)} → ${compressed} (${labelForCompression(options.compression)})${suffix}`;
+  return `${compressed} ${label} · ${formatBytes(result.minified_bytes)} min${suffix}`;
 };
-

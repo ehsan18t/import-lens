@@ -18,7 +18,7 @@ export const getImportLensConfig = (): ImportLensConfig => {
 
   return {
     enabled: config.get("enabled", true),
-    display: config.get<DisplayMode>("display", "standard"),
+    display: config.get<DisplayMode>("display", "inlayHint"),
     compression: config.get<CompressionFormat>("compression", "brotli"),
     debounceMs: config.get("debounceMs", 300),
     showWarnings: config.get("showWarnings", true),

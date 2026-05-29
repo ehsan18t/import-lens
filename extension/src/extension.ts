@@ -7,9 +7,10 @@ import { ImportLensLogger } from "./logger.js";
 import { registerNodeModulesWatchers } from "./watcher.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
 import { DecorationController } from "./ui/decorations.js";
-import { ImportLensInlayHintsProvider, tooltipForResult } from "./ui/inlayHints.js";
+import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
+import { tooltipForResult } from "./ui/tooltip.js";
 import type { ImportResult } from "./ipc/protocol.js";
 
 let daemon: DaemonManager | undefined;
@@ -68,4 +69,3 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 export const deactivate = async (): Promise<void> => {
   await daemon?.dispose();
 };
-

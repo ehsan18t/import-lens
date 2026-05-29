@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
 import { formatImportSize } from "./format.js";
+import { tooltipForMessage, tooltipForResult } from "./tooltip.js";
 
 export class DecorationController implements vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -12,7 +13,8 @@ export class DecorationController implements vscode.Disposable {
     this.#store = store;
     this.#decoration = vscode.window.createTextEditorDecorationType({
       after: {
-        margin: "0 0 0 1rem",
+        margin: "0 0 0 0.75rem",
+        fontStyle: "italic",
       },
       rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
     });
@@ -67,10 +69,11 @@ export class DecorationController implements vscode.Disposable {
 
     return {
       range: new vscode.Range(position, position),
+      hoverMessage: this.hoverForState(state),
       renderOptions: {
         after: {
           contentText: ` ${message}`,
-          color: new vscode.ThemeColor(state.status === "missing" ? "editorWarning.foreground" : "descriptionForeground"),
+          color: this.colorForState(state),
         },
       },
     };
@@ -92,5 +95,24 @@ export class DecorationController implements vscode.Disposable {
 
     return null;
   }
-}
 
+  private hoverForState(state: ImportAnalysisState): vscode.MarkdownString | undefined {
+    if (state.status === "missing") {
+      return tooltipForMessage("ImportLens", state.message ?? "Package not found");
+    }
+
+    if (state.status === "ready" && state.result) {
+      return tooltipForResult(state.result);
+    }
+
+    return undefined;
+  }
+
+  private colorForState(state: ImportAnalysisState): vscode.ThemeColor {
+    if (state.status === "missing" || state.result?.error) {
+      return new vscode.ThemeColor("editorWarning.foreground");
+    }
+
+    return new vscode.ThemeColor("descriptionForeground");
+  }
+}

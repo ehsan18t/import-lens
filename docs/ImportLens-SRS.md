@@ -396,12 +396,12 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 ### 5.6 User Interface
 
-**FR-029** (Critical) - The extension must display size information as an inline text decoration at the end of each import line by default.
+**FR-029** (Critical) - The extension must display size information as a native VS Code inlay hint by default. End-of-line text decorations remain available via `importLens.display: "standard"` or `importLens.display: "verbose"` for users who prefer line-end annotations.
 
 **FR-030** (Critical) - The display format must be configurable via `importLens.display` with four options:
 - `minimal`: `1.5 kB` (primary compression format only)
-- `standard`: `5.3 kB → 1.5 kB (br)` (minified size and primary compression size)
-- `verbose`: `5.3 kB min · 1.8 kB gz · 1.5 kB br · 1.6 kB zstd` (all three formats)
+- `standard`: `1.5 kB br · 5.3 kB min` (primary compression size and minified size)
+- `verbose`: `1.5 kB br · 1.8 kB gz · 1.6 kB zstd · 5.3 kB min` (all three formats)
 - `inlayHint`: Uses the VS Code Inlay Hints API instead of end-of-line decorations. Displays the primary compression size as an inline hint after the import specifier. This mode integrates natively with VS Code's built-in inlay hint toggling and provides better performance than decoration-based rendering.
 
 **FR-031** (High) - When `side_effects: true` or `truly_treeshakeable: false`, the extension must display a warning indicator next to the size decoration indicating that the shown size may not reflect the actual shipped size.
@@ -423,7 +423,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 | Setting key                  | Type    | Default    | Description                                                                                              |
 | ---------------------------- | ------- | ---------- | -------------------------------------------------------------------------------------------------------- |
 | `importLens.enabled`         | boolean | `true`     | Toggle the extension on or off                                                                           |
-| `importLens.display`         | enum    | `standard` | Display format: `minimal`, `standard`, `verbose`, or `inlayHint`                                         |
+| `importLens.display`         | enum    | `inlayHint` | Display format: `minimal`, `standard`, `verbose`, or `inlayHint`                                        |
 | `importLens.compression`     | enum    | `brotli`   | Primary compression format shown in minimal and standard modes. Options: `brotli`, `gzip`, `zstd`, `all` |
 | `importLens.debounceMs`      | number  | `300`      | Milliseconds to wait after the last keystroke before sending a request                                   |
 | `importLens.showWarnings`    | boolean | `true`     | Show warning indicator for non-tree-shakeable imports                                                    |
@@ -446,9 +446,9 @@ If the daemon closes the IPC socket cleanly before the 5-second timeout elapses,
 
 **FR-039a** (Medium) - When `importLens.useCodeLens` is set to `true`, the extension must register a `CodeLensProvider` for the relevant language selectors and render one `CodeLens` per import line, positioned on the line above the import statement. The lens must display the primary compression size and, when clicked, open the full size breakdown in a hover-style `MarkdownString` notification. The `useCodeLens` setting is independent of `importLens.display`; if both `inlayHint` display mode and `useCodeLens` are active simultaneously, the `inlayHint` mode takes precedence and the `CodeLensProvider` must not be registered. The `CodeLens` approach is noted as less space-efficient than end-of-line decorations (see D-011) but is retained as an option for users who prefer it.
 
-**FR-039** (High) - When `importLens.display` is set to `inlayHint`, the extension must register an `InlayHintsProvider` with VS Code for the relevant language selectors. The provider must return one `InlayHint` per import line, positioned after the closing quote of the import specifier, with `kind` set to `undefined` (no `InlayHintKind`). Import sizes are not parameters or types; using `InlayHintKind.Parameter` or `InlayHintKind.Type` would apply the wrong theme colours (`editorInlayHint.parameterForeground` or `editorInlayHint.typeForeground` respectively). An `undefined` kind falls through to the generic `editorInlayHint.foreground`/`editorInlayHint.background`, which theme authors expect for custom inlay hints. Each `InlayHint` must also set `tooltip` to a `MarkdownString` containing the full size breakdown (raw bytes, minified bytes, all three compressed sizes, `side_effects` status, and `is_cjs` indicator) so that users can hover for details.
+**FR-039** (High) - When `importLens.display` is set to `inlayHint`, the extension must register an `InlayHintsProvider` with VS Code for the relevant language selectors. The provider must return one `InlayHint` per import line, positioned after the closing quote of the import specifier, with `kind` set to `undefined` (no `InlayHintKind`) and `paddingLeft` enabled so the hint does not visually run into the string literal. Import sizes are not parameters or types; using `InlayHintKind.Parameter` or `InlayHintKind.Type` would apply the wrong theme colours (`editorInlayHint.parameterForeground` or `editorInlayHint.typeForeground` respectively). An `undefined` kind falls through to the generic `editorInlayHint.foreground`/`editorInlayHint.background`, which theme authors expect for custom inlay hints. Each `InlayHint` must also set `tooltip` to a `MarkdownString` containing the full size breakdown (raw bytes, minified bytes, all three compressed sizes, `side_effects` status, and `is_cjs` indicator) or the daemon error reason when a size is unavailable, so that users can hover for details.
 
-**FR-039b** (Medium) - The extension must include a note in its README and marketplace description that users relying on screen readers should use `importLens.display: "inlayHint"` mode. End-of-line decorations (the default mode) are not exposed to VS Code's accessibility APIs and are therefore invisible to screen readers. The `inlayHint` mode uses the VS Code Inlay Hints API, which is part of the document model and is screen-reader-accessible. The status bar item (FR-033) must always reflect the current operating tier regardless of display mode, as it is accessible to screen readers.
+**FR-039b** (Medium) - The extension must include a note in its README and marketplace description that the default `importLens.display: "inlayHint"` mode is preferred for screen-reader accessibility. End-of-line decorations are not exposed to VS Code's accessibility APIs and are therefore invisible to screen readers. The `inlayHint` mode uses the VS Code Inlay Hints API, which is part of the document model and is screen-reader-accessible. The status bar item (FR-033) must always reflect the current operating tier regardless of display mode, as it is accessible to screen readers.
 
 **FR-040** (High) - The extension must create a VS Code `OutputChannel` named `ImportLens` for structured diagnostic logging. Log messages must include ISO 8601 timestamps and a severity level. The verbosity is controlled by the `importLens.logLevel` setting.
 
@@ -1112,6 +1112,7 @@ import-lens/
 │   │   │   ├── inlayHints.ts          # InlayHintsProvider for inlayHint display mode
 │   │   │   ├── codelens.ts            # Code lens provider
 │   │   │   ├── statusbar.ts           # Status bar item
+│   │   │   ├── tooltip.ts             # Shared MarkdownString hover content
 │   │   │   └── report.ts              # Show Report webview
 │   │   ├── logger.ts                  # OutputChannel-based diagnostic logger (FR-040)
 │   │   └── config.ts                  # VS Code settings access

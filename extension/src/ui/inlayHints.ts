@@ -3,6 +3,7 @@ import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
 import type { ImportResult } from "../ipc/protocol.js";
 import { formatImportSize } from "./format.js";
+import { tooltipForResult } from "./tooltip.js";
 
 export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -33,6 +34,7 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
           formatImportSize(result, config),
           undefined,
         );
+        hint.paddingLeft = true;
         hint.tooltip = tooltipForResult(result);
         return hint;
       });
@@ -43,16 +45,3 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
     this.#onDidChangeInlayHints.dispose();
   }
 }
-
-export const tooltipForResult = (result: ImportResult): vscode.MarkdownString => {
-  const tooltip = new vscode.MarkdownString(undefined, true);
-  tooltip.appendMarkdown(`**${result.specifier}**\n\n`);
-  tooltip.appendMarkdown(`Raw: ${result.raw_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Minified: ${result.minified_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Gzip: ${result.gzip_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Brotli: ${result.brotli_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Zstd: ${result.zstd_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Side effects: ${result.side_effects ? "yes" : "no"}\n\n`);
-  tooltip.appendMarkdown(`CJS: ${result.is_cjs ? "yes" : "no"}`);
-  return tooltip;
-};

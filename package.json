@@ -59,7 +59,7 @@
             "verbose",
             "inlayHint"
           ],
-          "default": "standard",
+          "default": "inlayHint",
           "description": "Display format for import size annotations."
         },
         "importLens.compression": {
