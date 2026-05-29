@@ -1,8 +1,9 @@
 import type { ParserOptions } from "oxc-parser";
+import type { ImportRuntime } from "./types.js";
 
 export type ScriptLanguage = NonNullable<ParserOptions["lang"]>;
 
-export type ScriptRuntime = "component" | "server" | "client";
+export type ScriptRuntime = ImportRuntime;
 
 export interface ScriptRegion {
   filename: string;

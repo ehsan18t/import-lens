@@ -8,6 +8,7 @@ import {
   type StaticImportEntry,
 } from "oxc-parser";
 import { getPackageName, isRuntimePackageSpecifier } from "./specifier.js";
+import { scriptRegionsForDocument, type ScriptRegion } from "./scriptRegions.js";
 import type { DetectedImport } from "./types.js";
 import { positionAt, rangeFromOffsets } from "./positions.js";
 
@@ -18,46 +19,38 @@ const parserOptions: ParserOptions & { recovery?: boolean } = {
   recovery: true,
 };
 
-const languageFromFilename = (filename: string): ParserOptions["lang"] => {
-  if (filename.endsWith(".tsx")) {
-    return "tsx";
-  }
-
-  if (filename.endsWith(".ts")) {
-    return "ts";
-  }
-
-  if (filename.endsWith(".jsx")) {
-    return "jsx";
-  }
-
-  return "js";
-};
-
 const trimLiteralQuotes = (value: string): string => value.replace(/^['"`]|['"`]$/gu, "");
 
 const createDetectedImport = (
   source: string,
+  region: ScriptRegion,
   specifier: string,
   importKind: DetectedImport["importKind"],
   named: string[],
   start: number,
   end: number,
   quoteEndOffset: number,
-): DetectedImport => ({
-  specifier,
-  packageName: getPackageName(specifier),
-  named: [...named].sort(),
-  importKind,
-  line: positionAt(source, start).line,
-  quoteEnd: positionAt(source, quoteEndOffset),
-  statementRange: rangeFromOffsets(source, start, end),
-});
+): DetectedImport => {
+  const absoluteStart = region.offset + start;
+  const absoluteEnd = region.offset + end;
+  const absoluteQuoteEndOffset = region.offset + quoteEndOffset;
+
+  return {
+    specifier,
+    packageName: getPackageName(specifier),
+    named: [...named].sort(),
+    importKind,
+    runtime: region.runtime,
+    line: positionAt(source, absoluteStart).line,
+    quoteEnd: positionAt(source, absoluteQuoteEndOffset),
+    statementRange: rangeFromOffsets(source, absoluteStart, absoluteEnd),
+  };
+};
 
 const runtimeEntries = (entries: StaticImportEntry[]): StaticImportEntry[] =>
   entries.filter((entry) => !entry.isType);
 
-const importsFromStaticImport = (source: string, item: StaticImport): DetectedImport[] => {
+const importsFromStaticImport = (source: string, region: ScriptRegion, item: StaticImport): DetectedImport[] => {
   const specifier = item.moduleRequest.value;
 
   if (!isRuntimePackageSpecifier(specifier)) {
@@ -68,7 +61,7 @@ const importsFromStaticImport = (source: string, item: StaticImport): DetectedIm
 
   if (entries.length === 0 && item.entries.length === 0) {
     return [
-      createDetectedImport(source, specifier, "namespace", [], item.start, item.end, item.moduleRequest.end),
+      createDetectedImport(source, region, specifier, "namespace", [], item.start, item.end, item.moduleRequest.end),
     ];
   }
 
@@ -82,21 +75,27 @@ const importsFromStaticImport = (source: string, item: StaticImport): DetectedIm
     .map((entry) => entry.importName.name as string);
 
   if (entries.some((entry) => entry.importName.kind === ImportNameKind.Default)) {
-    imports.push(createDetectedImport(source, specifier, "default", [], item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "default", [], item.start, item.end, item.moduleRequest.end));
   }
 
   if (entries.some((entry) => entry.importName.kind === ImportNameKind.NamespaceObject)) {
-    imports.push(createDetectedImport(source, specifier, "namespace", [], item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "namespace", [], item.start, item.end, item.moduleRequest.end));
   }
 
   if (named.length > 0) {
-    imports.push(createDetectedImport(source, specifier, "named", named, item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "named", named, item.start, item.end, item.moduleRequest.end));
   }
 
   return imports;
 };
 
-const importFromStaticExport = (source: string, entry: StaticExportEntry, statementStart: number, statementEnd: number): DetectedImport | null => {
+const importFromStaticExport = (
+  source: string,
+  region: ScriptRegion,
+  entry: StaticExportEntry,
+  statementStart: number,
+  statementEnd: number,
+): DetectedImport | null => {
   if (entry.isType || !entry.moduleRequest) {
     return null;
   }
@@ -108,30 +107,30 @@ const importFromStaticExport = (source: string, entry: StaticExportEntry, statem
   }
 
   if (entry.importName.kind === ExportImportNameKind.All || entry.importName.kind === ExportImportNameKind.AllButDefault) {
-    return createDetectedImport(source, specifier, "namespace", [], statementStart, statementEnd, entry.moduleRequest.end);
+    return createDetectedImport(source, region, specifier, "namespace", [], statementStart, statementEnd, entry.moduleRequest.end);
   }
 
   if (entry.importName.kind === ExportImportNameKind.Name && entry.importName.name) {
-    return createDetectedImport(source, specifier, "named", [entry.importName.name], statementStart, statementEnd, entry.moduleRequest.end);
+    return createDetectedImport(source, region, specifier, "named", [entry.importName.name], statementStart, statementEnd, entry.moduleRequest.end);
   }
 
   return null;
 };
 
-export const extractRuntimeImports = (filename: string, source: string): DetectedImport[] => {
-  const parsed = parseSync(filename, source, {
+const importsFromRegion = (source: string, region: ScriptRegion): DetectedImport[] => {
+  const parsed = parseSync(region.filename, region.source, {
     ...parserOptions,
-    lang: languageFromFilename(filename),
+    lang: region.language,
   });
   const imports: DetectedImport[] = [];
 
   for (const item of parsed.module.staticImports) {
-    imports.push(...importsFromStaticImport(source, item));
+    imports.push(...importsFromStaticImport(source, region, item));
   }
 
   for (const item of parsed.module.staticExports) {
     for (const entry of item.entries) {
-      const detected = importFromStaticExport(source, entry, item.start, item.end);
+      const detected = importFromStaticExport(source, region, entry, item.start, item.end);
 
       if (detected) {
         imports.push(detected);
@@ -140,12 +139,18 @@ export const extractRuntimeImports = (filename: string, source: string): Detecte
   }
 
   for (const item of parsed.module.dynamicImports) {
-    const specifier = trimLiteralQuotes(source.slice(item.moduleRequest.start, item.moduleRequest.end));
+    const specifier = trimLiteralQuotes(region.source.slice(item.moduleRequest.start, item.moduleRequest.end));
 
     if (specifier && isRuntimePackageSpecifier(specifier)) {
-      imports.push(createDetectedImport(source, specifier, "dynamic", [], item.start, item.end, item.moduleRequest.end));
+      imports.push(createDetectedImport(source, region, specifier, "dynamic", [], item.start, item.end, item.moduleRequest.end));
     }
   }
+
+  return imports;
+};
+
+export const extractRuntimeImports = (filename: string, source: string): DetectedImport[] => {
+  const imports = scriptRegionsForDocument(filename, source).flatMap((region) => importsFromRegion(source, region));
 
   return imports.sort((left, right) => left.statementRange.start.line - right.statementRange.start.line);
 };

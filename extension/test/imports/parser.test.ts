@@ -57,3 +57,113 @@ test("extractRuntimeImports keeps runtime default imports and skips mixed type s
     [{ specifier: "dayjs", kind: "default", named: [] }],
   );
 });
+
+test("extractRuntimeImports detects imports inside Svelte TypeScript script blocks", () => {
+  const source = [
+    "<script lang=\"ts\">",
+    "  import dayjs, { type Dayjs } from 'dayjs';",
+    "  import utc from 'dayjs/plugin/utc';",
+    "</script>",
+    "<h1>{dayjs().format()}</h1>",
+  ].join("\n");
+
+  const imports = extractRuntimeImports("Component.svelte", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      named: item.named,
+      line: item.line,
+      quoteLine: item.quoteEnd.line,
+    })),
+    [
+      { specifier: "dayjs", kind: "default", named: [], line: 1, quoteLine: 1 },
+      { specifier: "dayjs/plugin/utc", kind: "default", named: [], line: 2, quoteLine: 2 },
+    ],
+  );
+});
+
+test("extractRuntimeImports detects imports from both Svelte module and instance scripts", () => {
+  const source = [
+    "<script context=\"module\">",
+    "  import { z } from 'zod';",
+    "</script>",
+    "<script>",
+    "  import dayjs from 'dayjs';",
+    "</script>",
+  ].join("\n");
+
+  const imports = extractRuntimeImports("Component.svelte", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({ specifier: item.specifier, kind: item.importKind, line: item.line })),
+    [
+      { specifier: "zod", kind: "named", line: 1 },
+      { specifier: "dayjs", kind: "default", line: 4 },
+    ],
+  );
+});
+
+test("extractRuntimeImports detects imports inside Astro frontmatter", () => {
+  const source = [
+    "---",
+    "import Icon from 'astro-icon';",
+    "import type { CollectionEntry } from 'astro:content';",
+    "---",
+    "<Icon name=\"home\" />",
+  ].join("\n");
+
+  const imports = extractRuntimeImports("Page.astro", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      runtime: item.runtime,
+      line: item.line,
+    })),
+    [{ specifier: "astro-icon", kind: "default", runtime: "server", line: 1 }],
+  );
+});
+
+test("extractRuntimeImports detects imports inside processed Astro client scripts", () => {
+  const source = [
+    "<h1>Demo</h1>",
+    "<script>",
+    "  import confetti from 'canvas-confetti';",
+    "</script>",
+    "<script is:inline>",
+    "  import ignored from 'not-bundled';",
+    "</script>",
+  ].join("\n");
+
+  const imports = extractRuntimeImports("Page.astro", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      runtime: item.runtime,
+      line: item.line,
+    })),
+    [{ specifier: "canvas-confetti", kind: "default", runtime: "client", line: 2 }],
+  );
+});
+
+test("extractRuntimeImports keeps Solid TSX on the plain parser path", () => {
+  const source = [
+    "import { createSignal } from 'solid-js';",
+    "export const Counter = () => {",
+    "  const [count, setCount] = createSignal(0);",
+    "  return <button onClick={() => setCount(count() + 1)}>{count()}</button>;",
+    "};",
+  ].join("\n");
+
+  const imports = extractRuntimeImports("Counter.tsx", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({ specifier: item.specifier, kind: item.importKind, line: item.line })),
+    [{ specifier: "solid-js", kind: "named", line: 0 }],
+  );
+});

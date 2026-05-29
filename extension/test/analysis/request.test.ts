@@ -8,6 +8,7 @@ const detected: DetectedImport = {
   packageName: "date-fns",
   named: ["format"],
   importKind: "named",
+  runtime: "component",
   line: 0,
   quoteEnd: { line: 0, character: 31 },
   statementRange: {
@@ -25,4 +26,3 @@ test("createImportRequest preserves subpath specifier and root package name", ()
     import_kind: "named",
   });
 });
-

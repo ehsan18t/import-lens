@@ -1,5 +1,7 @@
 import type { ImportKind } from "../ipc/protocol.js";
 
+export type ImportRuntime = "component" | "server" | "client";
+
 export interface SourcePosition {
   line: number;
   character: number;
@@ -15,6 +17,7 @@ export interface DetectedImport {
   packageName: string;
   named: string[];
   importKind: ImportKind;
+  runtime: ImportRuntime;
   line: number;
   quoteEnd: SourcePosition;
   statementRange: SourceRange;
@@ -35,4 +38,3 @@ export interface PackageResolutionMissing {
 }
 
 export type PackageResolution = PackageResolutionFound | PackageResolutionMissing;
-
