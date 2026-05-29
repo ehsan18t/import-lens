@@ -12,6 +12,8 @@ export class IpcClient extends EventEmitter {
   readonly #socket: net.Socket;
   readonly #decoder = new FrameDecoder();
   readonly #pending = new Map<number, PendingRequest>();
+  #closed = false;
+  #disposed = false;
 
   private constructor(socket: net.Socket) {
     super();
@@ -82,8 +84,9 @@ export class IpcClient extends EventEmitter {
   }
 
   dispose(): void {
+    this.#disposed = true;
     this.#socket.destroy();
-    this.#handleClose(new Error("IPC client disposed"));
+    this.#handleClose(new Error("IPC client disposed"), false);
   }
 
   #handleData(chunk: Buffer): void {
@@ -103,7 +106,12 @@ export class IpcClient extends EventEmitter {
     }
   }
 
-  #handleClose(error: Error): void {
+  #handleClose(error: Error, emitDisconnect = true): void {
+    if (this.#closed) {
+      return;
+    }
+
+    this.#closed = true;
     this.#decoder.reset();
 
     for (const pending of this.#pending.values()) {
@@ -111,7 +119,10 @@ export class IpcClient extends EventEmitter {
     }
 
     this.#pending.clear();
-    this.emit("disconnect", error);
+
+    if (emitDisconnect && !this.#disposed) {
+      this.emit("disconnect", error);
+    }
   }
 }
 
@@ -123,4 +134,3 @@ const isBatchResponse = (value: unknown): value is BatchResponse => {
   const candidate = value as Partial<BatchResponse>;
   return typeof candidate.version === "number" && typeof candidate.request_id === "number" && Array.isArray(candidate.imports);
 };
-

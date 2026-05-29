@@ -123,10 +123,13 @@ export class DaemonManager implements vscode.Disposable {
   }
 
   #cleanup(): void {
-    this.#client?.dispose();
+    const client = this.#client;
+    const process = this.#process;
+
     this.#client = null;
-    this.#process?.kill();
     this.#process = null;
+    client?.dispose();
+    process?.kill();
     this.#state = "unavailable";
   }
 
@@ -191,4 +194,3 @@ export class DaemonManager implements vscode.Disposable {
     };
   }
 }
-
