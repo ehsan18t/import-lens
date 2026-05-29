@@ -1,8 +1,9 @@
 import * as vscode from "vscode";
 import { AnalysisStore } from "./analysis/state.js";
-import { getImportLensConfig, languageSelector } from "./config.js";
+import { getImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
 import { DocumentAnalysisController } from "./listener.js";
+import { languageSelector } from "./languages.js";
 import { ImportLensLogger } from "./logger.js";
 import { registerNodeModulesWatchers } from "./watcher.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";

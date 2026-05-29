@@ -27,12 +27,3 @@ export const getImportLensConfig = (): ImportLensConfig => {
     logLevel: config.get<LogLevel>("logLevel", "error"),
   };
 };
-
-export const supportedLanguageIds: Set<string> = new Set(["javascript", "typescript", "typescriptreact", "javascriptreact"]);
-
-export const languageSelector: vscode.DocumentSelector = [
-  { language: "javascript", scheme: "file" },
-  { language: "typescript", scheme: "file" },
-  { language: "typescriptreact", scheme: "file" },
-  { language: "javascriptreact", scheme: "file" },
-];

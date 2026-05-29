@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
 import { createImportRequest } from "./analysis/request.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
-import { getImportLensConfig, supportedLanguageIds } from "./config.js";
+import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
 import { extractRuntimeImports } from "./imports/parser.js";
 import { resolveInstalledPackage } from "./imports/resolver.js";
+import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import type { StatusBarController } from "./ui/statusbar.js";
 import { protocolVersion } from "./ipc/protocol.js";
@@ -147,4 +148,3 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#timers.clear();
   }
 }
-

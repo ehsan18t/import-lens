@@ -21,6 +21,8 @@
     "onLanguage:typescript",
     "onLanguage:typescriptreact",
     "onLanguage:javascriptreact",
+    "onLanguage:svelte",
+    "onLanguage:astro",
     "onCommand:importLens.clearCache",
     "onCommand:importLens.showLogs",
     "onCommand:importLens.showReport",
