@@ -16,8 +16,8 @@ export class DocumentAnalysisController implements vscode.Disposable {
   readonly #logger: ImportLensLogger;
   readonly #statusBar: StatusBarController;
   readonly #timers = new Map<string, NodeJS.Timeout>();
+  readonly #latestRequestIds = new Map<string, number>();
   #requestId = 0;
-  #latestRequestId = 0;
 
   constructor(
     context: vscode.ExtensionContext,
@@ -34,6 +34,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
     context.subscriptions.push(
       vscode.workspace.onDidChangeTextDocument((event) => this.schedule(event.document)),
       vscode.workspace.onDidOpenTextDocument((document) => this.schedule(document)),
+      vscode.workspace.onDidCloseTextDocument((document) => this.disposeDocument(document)),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (editor) {
           this.schedule(editor.document);
@@ -99,7 +100,8 @@ export class DocumentAnalysisController implements vscode.Disposable {
     }
 
     const requestId = ++this.#requestId;
-    this.#latestRequestId = requestId;
+    const documentKey = document.uri.toString();
+    this.#latestRequestIds.set(documentKey, requestId);
     this.#statusBar.setStatus("computing");
 
     try {
@@ -114,7 +116,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
         imports: requestImports,
       });
 
-      if (!response || response.request_id !== this.#latestRequestId) {
+      if (!response || response.request_id !== this.#latestRequestIds.get(documentKey)) {
         return;
       }
 
@@ -150,11 +152,25 @@ export class DocumentAnalysisController implements vscode.Disposable {
     }
   }
 
+  private disposeDocument(document: vscode.TextDocument): void {
+    const key = document.uri.toString();
+    const timer = this.#timers.get(key);
+
+    if (timer) {
+      clearTimeout(timer);
+      this.#timers.delete(key);
+    }
+
+    this.#latestRequestIds.delete(key);
+    this.#store.clear(document.uri);
+  }
+
   dispose(): void {
     for (const timer of this.#timers.values()) {
       clearTimeout(timer);
     }
 
     this.#timers.clear();
+    this.#latestRequestIds.clear();
   }
 }
