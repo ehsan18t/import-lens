@@ -31,11 +31,11 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
         const result = state.result as ImportResult;
         const hint = new vscode.InlayHint(
           new vscode.Position(state.detected.quoteEnd.line, state.detected.quoteEnd.character),
-          formatImportSize(result, config),
+          formatImportSize(result, config, state.detected.runtime),
           undefined,
         );
         hint.paddingLeft = true;
-        hint.tooltip = tooltipForResult(result);
+        hint.tooltip = tooltipForResult(result, state.detected.runtime);
         return hint;
       });
   }

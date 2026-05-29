@@ -1,4 +1,5 @@
 import type { ImportResult } from "../ipc/protocol.js";
+import type { ImportRuntime } from "../imports/types.js";
 
 export type DisplayMode = "minimal" | "standard" | "verbose" | "inlayHint";
 
@@ -39,31 +40,37 @@ export const formatBytes = (bytes: number): string => {
   return `${(bytes / 1000).toFixed(1)} kB`;
 };
 
-const formatWarningSuffix = (result: ImportResult, showWarnings: boolean): string => {
+const formatWarningSuffix = (result: ImportResult, showWarnings: boolean, runtime: ImportRuntime): string => {
+  const runtimeSuffix = runtime === "server" ? " · server" : "";
+
   if (result.is_cjs) {
-    return " · CJS";
+    return `${runtimeSuffix} · CJS`;
   }
 
   if (showWarnings && (result.side_effects || !result.truly_treeshakeable)) {
-    return " · approximate";
+    return `${runtimeSuffix} · approximate`;
   }
 
-  return "";
+  return runtimeSuffix;
 };
 
-export const formatImportSize = (result: ImportResult, options: FormatOptions): string => {
+export const formatImportSize = (
+  result: ImportResult,
+  options: FormatOptions,
+  runtime: ImportRuntime = "component",
+): string => {
   if (result.error) {
     return "unavailable";
   }
 
   if (options.display === "verbose" || options.compression === "all") {
-    return `${formatBytes(result.brotli_bytes)} br · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd · ${formatBytes(result.minified_bytes)} min${formatWarningSuffix(result, options.showWarnings)}`;
+    return `${formatBytes(result.brotli_bytes)} br · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd · ${formatBytes(result.minified_bytes)} min${formatWarningSuffix(result, options.showWarnings, runtime)}`;
   }
 
   const compressedBytes = bytesForCompression(result, options.compression);
   const compressed = formatBytes(compressedBytes);
   const label = labelForCompression(options.compression);
-  const suffix = formatWarningSuffix(result, options.showWarnings);
+  const suffix = formatWarningSuffix(result, options.showWarnings, runtime);
 
   if (options.display === "minimal" || options.display === "inlayHint") {
     return `${compressed}${suffix}`;

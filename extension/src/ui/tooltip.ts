@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { ImportResult } from "../ipc/protocol.js";
+import type { ImportRuntime } from "../imports/types.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 
 const appendCopyDiagnosticsLink = (tooltip: vscode.MarkdownString, result: ImportResult): void => {
@@ -8,7 +9,10 @@ const appendCopyDiagnosticsLink = (tooltip: vscode.MarkdownString, result: Impor
   tooltip.appendMarkdown(`[$(copy) Copy diagnostics](command:${copyImportDiagnosticsCommand}?${args})`);
 };
 
-export const tooltipForResult = (result: ImportResult): vscode.MarkdownString => {
+export const tooltipForResult = (
+  result: ImportResult,
+  runtime: ImportRuntime = "component",
+): vscode.MarkdownString => {
   const tooltip = new vscode.MarkdownString(undefined, true);
   tooltip.appendMarkdown(`**${result.specifier}**\n\n`);
 
@@ -23,6 +27,7 @@ export const tooltipForResult = (result: ImportResult): vscode.MarkdownString =>
   tooltip.appendMarkdown(`Gzip: ${result.gzip_bytes} B\n\n`);
   tooltip.appendMarkdown(`Brotli: ${result.brotli_bytes} B\n\n`);
   tooltip.appendMarkdown(`Zstd: ${result.zstd_bytes} B\n\n`);
+  tooltip.appendMarkdown(`Runtime: ${runtime}\n\n`);
   tooltip.appendMarkdown(`Side effects: ${result.side_effects ? "yes" : "no"}\n\n`);
   tooltip.appendMarkdown(`CJS: ${result.is_cjs ? "yes" : "no"}`);
   return tooltip;

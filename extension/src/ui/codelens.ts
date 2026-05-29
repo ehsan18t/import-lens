@@ -31,9 +31,9 @@ export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vsco
         const result = state.result!;
 
         return new vscode.CodeLens(range, {
-          title: formatImportSize(result, config),
+          title: formatImportSize(result, config, state.detected.runtime),
           command: "importLens.showImportDetails",
-          arguments: [result],
+          arguments: [result, state.detected.runtime],
         });
       });
   }

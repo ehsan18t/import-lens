@@ -28,3 +28,18 @@ test("formatImportSize shows unavailable and warning states", () => {
   assert.equal(formatImportSize({ ...result, side_effects: true }, { display: "minimal", compression: "gzip", showWarnings: true }), "1.8 kB · approximate");
   assert.equal(formatImportSize({ ...result, is_cjs: true }, { display: "minimal", compression: "zstd", showWarnings: true }), "1.6 kB · CJS");
 });
+
+test("formatImportSize labels server-side import runtime", () => {
+  assert.equal(
+    formatImportSize(result, { display: "minimal", compression: "brotli", showWarnings: true }, "server"),
+    "1.5 kB · server",
+  );
+  assert.equal(
+    formatImportSize(
+      { ...result, side_effects: true },
+      { display: "standard", compression: "gzip", showWarnings: true },
+      "server",
+    ),
+    "1.8 kB gz · 5.3 kB min · server · approximate",
+  );
+});

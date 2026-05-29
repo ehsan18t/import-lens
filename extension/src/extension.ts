@@ -14,6 +14,7 @@ import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
 import type { ImportResult } from "./ipc/protocol.js";
+import type { ImportRuntime } from "./imports/types.js";
 
 let daemon: DaemonManager | undefined;
 
@@ -50,7 +51,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       }
     }),
     vscode.commands.registerCommand("importLens.showReport", () => showReport(context, store)),
-    vscode.commands.registerCommand("importLens.showImportDetails", async (result: ImportResult) => {
+    vscode.commands.registerCommand("importLens.showImportDetails", async (result: ImportResult, runtime: ImportRuntime = "component") => {
       if (result.error) {
         const action = await vscode.window.showWarningMessage(
           "ImportLens could not compute this import size.",
@@ -64,7 +65,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
-      void vscode.window.showInformationMessage(tooltipForResult(result).value);
+      void vscode.window.showInformationMessage(tooltipForResult(result, runtime).value);
     }),
     vscode.commands.registerCommand(copyImportDiagnosticsCommand, async (result?: ImportResult) => {
       if (!result) {

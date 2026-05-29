@@ -90,7 +90,7 @@ export class DecorationController implements vscode.Disposable {
 
     if (state.status === "ready" && state.result) {
       const config = getImportLensConfig();
-      return formatImportSize(state.result, config);
+      return formatImportSize(state.result, config, state.detected.runtime);
     }
 
     return null;
@@ -102,7 +102,7 @@ export class DecorationController implements vscode.Disposable {
     }
 
     if (state.status === "ready" && state.result) {
-      return tooltipForResult(state.result);
+      return tooltipForResult(state.result, state.detected.runtime);
     }
 
     return undefined;
