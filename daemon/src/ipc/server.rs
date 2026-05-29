@@ -19,7 +19,7 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
     pipe.connect().await?;
 
     let mut decoder = FrameDecoder::default();
-    let mut service = ImportLensService::new();
+    let mut service = std::sync::Arc::new(ImportLensService::new());
     let mut hello_received = false;
     let mut buffer = [0_u8; 16 * 1024];
 
@@ -35,11 +35,14 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
 
             match message {
                 ClientMessage::Hello(_) => {
-                    service = ImportLensService::new();
+                    service = std::sync::Arc::new(ImportLensService::new());
                     hello_received = true;
                 }
                 ClientMessage::Batch(request) if hello_received => {
-                    let response = service.handle_batch(request);
+                    let svc = std::sync::Arc::clone(&service);
+                    let response = tokio::task::spawn_blocking(move || svc.handle_batch(request))
+                        .await
+                        .expect("spawn_blocking failed");
                     pipe.write_all(&encode_frame(&response)?).await?;
                 }
                 ClientMessage::CacheInvalidate(message) if hello_received => {
@@ -52,7 +55,11 @@ pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(),
                     return Ok(());
                 }
                 ClientMessage::Batch(request) => {
-                    let response = ImportLensService::new().handle_batch(request);
+                    let response = tokio::task::spawn_blocking(move || {
+                        ImportLensService::new().handle_batch(request)
+                    })
+                    .await
+                    .expect("spawn_blocking failed");
                     pipe.write_all(&encode_frame(&response)?).await?;
                 }
                 ClientMessage::CacheInvalidate(_) | ClientMessage::CacheInvalidateAll(_) => {}
