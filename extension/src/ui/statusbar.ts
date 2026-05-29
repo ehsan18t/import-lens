@@ -15,6 +15,7 @@ export class StatusBarController implements vscode.Disposable {
   constructor() {
     this.#item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     this.#item.name = "ImportLens";
+    this.#item.command = "importLens.showLogs";
     this.#item.text = labels.unavailable;
     this.#item.show();
   }
