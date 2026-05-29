@@ -1,0 +1,11 @@
+node_modules/
+extension/dist/
+extension/test-dist/
+coverage/
+target/
+bin/
+wasm/
+*.vsix
+*.log
+.worktrees/
+

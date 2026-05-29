@@ -1,0 +1,45 @@
+{
+  "servers": {
+    "rust-analyzer": {
+      "command": "rust-analyzer-mcp"
+      // "description": "Provides integration with rust-analyzer, allowing AI assistants to analyze Rust code, get hover information, find definitions, references, and more. Written in Rust for optimal performance and native integration."
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp@latest"]
+      // "description": "Live documentation lookups for oxc, redb, papaya, tokio, rayon, VS Code API, tsdown, rmp-serde, flate2, brotli, zstd. Prefer over training data for current API signatures."
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "${workspaceFolder}"
+      ]
+      // "description": "Read/write project files during scaffolding and code generation."
+    },
+    "git": {
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "${workspaceFolder}"]
+      // "description": "Git operations: diff, log, commit, branch management during development."
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+      // "description": "GitHub API: create issues, PRs, manage releases, check CI status."
+    },
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-fetch"]
+      // "description": "Fetch web pages for crate docs, npm package pages, VS Code API references, OXC changelogs."
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequentialthinking"]
+      // "description": "Complex multi-step problem solving for architecture decisions, debugging pipeline issues, and planning implementation order."
+    }
+  }
+}

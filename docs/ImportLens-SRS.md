@@ -1,0 +1,1208 @@
+# Software Requirements Specification: ImportLens
+
+**VS Code Import Size Analyzer**
+
+| Field    | Value            |
+| -------- | ---------------- |
+| Version  | 1.6              |
+| Date     | 29 May 2026      |
+| Status   | Draft            |
+| Audience | Engineering Team |
+
+---
+
+## Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [Overall Description](#2-overall-description)
+3. [System Architecture](#3-system-architecture)
+4. [Architectural Alternatives and Rationale](#4-architectural-alternatives-and-rationale)
+5. [Functional Requirements](#5-functional-requirements)
+6. [Error Handling and Edge Cases](#6-error-handling-and-edge-cases)
+7. [Non-Functional Requirements](#7-non-functional-requirements)
+8. [Acceptance Criteria](#8-acceptance-criteria)
+9. [Technical Stack](#9-technical-stack)
+10. [Component Specifications](#10-component-specifications) (includes §10.7 Module Graph Walk Algorithm)
+11. [Data Models](#11-data-models)
+12. [Distribution and Packaging](#12-distribution-and-packaging)
+13. [Constraints and Assumptions](#13-constraints-and-assumptions)
+14. [Appendix A: File Structure](#14-appendix-a-file-structure)
+15. [Appendix B: Decision Log](#15-appendix-b-decision-log)
+16. [Appendix C: Technology Watch](#16-appendix-c-technology-watch)
+
+---
+
+## 1. Introduction
+
+### 1.1 Purpose
+
+This Software Requirements Specification defines the requirements for ImportLens, a Visual Studio Code extension that calculates and displays the real-world bundle cost of npm package imports directly inside the editor. The document covers functional behaviour, system architecture, technical stack decisions, performance requirements, and distribution constraints.
+
+The primary audience is the engineering team responsible for building and maintaining the extension.
+
+### 1.2 Scope
+
+ImportLens analyses import statements in JavaScript and TypeScript files and shows, inline next to each import, the actual post-tree-shake, minified, and compressed byte size that the import would add to a production bundle. The extension does this without running the user's build system, without modifying any project files, and without blocking the editor.
+
+The system performs real tree-shaking and minification inside a background Rust daemon process. Results are cached persistently so that repeat lookups are instant. The extension works for any project that uses npm packages, regardless of which bundler the project itself uses.
+
+**Out of scope for v1.0:**
+
+- Local relative imports (e.g. `import { util } from './helpers'`)
+- CSS, image, or other non-JS/TS asset imports
+- Monorepo cross-package imports where the dependency is not published to npm
+- Support for Yarn Plug-n-Play (PnP) without `node_modules`
+
+### 1.3 Definitions and Acronyms
+
+| Term         | Definition                                                                                                     |
+| ------------ | -------------------------------------------------------------------------------------------------------------- |
+| OXC          | The Oxidation Compiler, a suite of high-performance JS/TS tools written in Rust                                |
+| VSIX         | Visual Studio Extension package, the distribution unit for VS Code extensions                                  |
+| IPC          | Inter-Process Communication, the channel between the extension host and the Rust daemon                        |
+| MessagePack  | A binary serialization format used as the IPC encoding layer                                                   |
+| Unix socket  | A POSIX IPC endpoint used on macOS and Linux                                                                   |
+| Named pipe   | The Windows equivalent of a Unix socket, used for IPC on Win32 targets                                         |
+| Tree-shaking | Dead code elimination that retains only the symbols actually used by an import                                 |
+| redb         | An embedded, ACID-compliant key-value database written in pure Rust                                            |
+| papaya       | A lock-free concurrent hash map crate for Rust                                                                 |
+| WASM         | WebAssembly, a portable binary instruction format                                                              |
+| WASI         | WebAssembly System Interface, the ABI for running WASM outside a browser                                       |
+| ESM          | ECMAScript Modules, the static module format required for effective tree-shaking                               |
+| LTO          | Link-Time Optimization, a compiler setting that reduces Rust binary size                                       |
+| NAPI         | Node-API, the stable ABI for building native Node.js addons; used by `oxc-parser` for high-performance parsing |
+| NAPI-RS      | A framework for building compiled Node.js addons in Rust                                                       |
+| SRS          | Software Requirements Specification                                                                            |
+| FR           | Functional Requirement                                                                                         |
+| NFR          | Non-Functional Requirement                                                                                     |
+| AST          | Abstract Syntax Tree                                                                                           |
+| CJS          | CommonJS, the older Node.js module format that does not support static tree-shaking                            |
+
+### 1.4 Document Conventions
+
+Requirements are identified with a unique ID of the form `FR-NNN` for functional requirements and `NFR-NNN` for non-functional requirements. Each requirement is a single, testable statement.
+
+Priority levels:
+- **Critical:** Must ship in v1.0
+- **High:** Targeted for v1.0
+- **Medium:** v1.1 candidate
+
+### 1.5 References
+
+- OXC project documentation: https://oxc.rs
+- Rolldown bundler: https://rolldown.rs
+- redb database: https://github.com/cberner/redb
+- papaya crate: https://github.com/ibraheemdev/papaya
+- VS Code Extension API: https://code.visualstudio.com/api
+- MessagePack specification: https://msgpack.org
+- VS Code Platform-Specific Extensions: https://code.visualstudio.com/api/working-with-extensions/publishing-extension
+
+---
+
+## 2. Overall Description
+
+### 2.1 Product Perspective
+
+ImportLens is a standalone VS Code extension. It does not replace or wrap any existing extension. It complements bundler tooling (Vite, webpack, Rolldown, etc.) by surfacing import cost information at authoring time rather than after a build.
+
+Unlike existing calculators that spin up Node.js bundlers, ImportLens offloads all heavy computation to a decoupled Rust background process or WebAssembly worker. This guarantees editor stability and minimal memory overhead inside the extension host.
+
+The extension introduces a background native process (the Rust daemon) which runs separately from the VS Code extension host. This separation is a deliberate design choice: the extension host is a shared Node.js process that also runs every other installed extension. Placing CPU-intensive work (parsing, tree-shaking, compression) inside the extension host would degrade the entire editor. The daemon runs in its own process with its own memory space, and a crash in the daemon does not affect VS Code.
+
+### 2.2 Product Functions
+
+At a high level, ImportLens:
+
+1. Detects import statements in the currently active JS/TS file
+2. Filters to node_modules imports only
+3. Resolves the installed version of each package from the project's node_modules
+4. Sends a batched request to the background Rust daemon over a local socket
+5. Receives computed size data (raw, minified, and compressed) for each import
+6. Renders the size inline in the editor as end-of-line decorations or code lens annotations
+7. Caches all results so subsequent lookups are instantaneous
+
+### 2.3 User Classes
+
+**Primary user:** A JavaScript or TypeScript developer who imports npm packages and wants to understand the bundle cost of each import without leaving the editor or running a build.
+
+**Secondary user:** A team lead or architect who reviews code with bundle size awareness as part of code review or dependency auditing.
+
+### 2.4 Operating Environment
+
+The extension targets the following environments:
+
+| Tier     | Environment                                                                                 | Mechanism                                        |
+| -------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| Native   | VS Code Desktop on win32-x64, win32-arm64, linux-x64, linux-arm64, darwin-x64, darwin-arm64 | Native Rust binary daemon                        |
+| WASM     | VS Code Desktop on unsupported native platforms (not VS Code for the Web; see C-004)        | WASM binary in a VS Code Worker                  |
+| Degraded | VS Code for the Web, or any environment where neither native nor WASM is available          | Extension-host-only parsing, no size computation |
+
+### 2.5 Design and Implementation Constraints
+
+- The extension must not modify any file in the user's workspace.
+- The extension must not require the user to install any external tools (no separate CLI install step).
+- The Rust daemon must be a self-contained binary with no runtime dependencies on Node.js, Python, or any other interpreter.
+- All IPC communication must be local only. No network requests are made as part of size computation.
+- The extension host component must be written in TypeScript 6.x and compiled to a single bundled JS file using `tsdown`. The minimum supported VS Code version is 1.100.0, declared via `"engines": { "vscode": "^1.100.0" }` in `package.json`.
+- The `tsconfig.json` must use TypeScript 6.x conventions: `module: "esnext"`, an explicit `types` array (not auto-include; currently `["node", "vscode"]`), `moduleResolution: "bundler"`, and `target: "es2025"`. Legacy module formats (`amd`, `umd`, `systemjs`) and legacy `moduleResolution: "node"` (Node10) must not be used.
+- The native daemon must be compiled separately for each target platform and distributed as a platform-specific VSIX.
+- The published VSIX for any single platform target must not exceed 20 MB.
+
+### 2.6 Assumptions and Dependencies
+
+- The user's project has a `node_modules` directory populated by a package manager (npm, yarn, or pnpm with hoisting).
+- Each importable package has a `package.json` in its `node_modules/<package>/` directory containing at least a `version` field.
+- Packages that expose ESM entry points (via the `exports` or `module` field in `package.json`) will produce accurate tree-shaken sizes. CommonJS-only packages will produce approximate sizes with a visible warning.
+
+---
+
+## 3. System Architecture
+
+### 3.1 Architectural Overview
+
+The system has three layers: the extension host (TypeScript), the Rust daemon (native binary or WASM), and the local cache (in-memory plus persistent).
+
+```
+┌────────────────────────────────────────────────────────┐
+│                    VS Code Editor                      │
+│                                                        │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │              Extension Host (Node.js)           │   │
+│  │                                                 │   │
+│  │  ┌────────────────────┐  ┌──────────────────┐   │   │
+│  │  │  Document Listener │  │  Decoration      │   │   │
+│  │  │  (debounced 300ms) │  │  Renderer        │   │   │
+│  │  └────────┬───────────┘  └────────┬─────────┘   │   │
+│  │           │ oxc-parser (NAPI)     │ sizes       │   │
+│  │  ┌────────▼───────────────────────▼─────────┐   │   │
+│  │  │       IPC Client (MessagePack)           │   │   │
+│  │  └────────────────────┬─────────────────────┘   │   │
+│  └───────────────────────│─────────────────────────┘   │
+└──────────────────────────│─────────────────────────────┘
+                           │ Unix socket / Named pipe
+┌──────────────────────────▼──────────────────────────────┐
+│                  Rust Daemon Process                    │
+│                                                         │
+│  ┌───────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │  papaya   │  │  OXC         │  │  Compression     │  │
+│  │  (in-mem  │  │  Pipeline    │  │  flate2 (gzip)   │  │
+│  │   cache)  │  │  parse       │  │  brotli          │  │
+│  └─────┬─────┘  │  resolve     │  │  zstd            │  │
+│        │        │  semantic    │  └──────────────────┘  │
+│  ┌─────▼─────┐  │  tree-shake  │                        │
+│  │  redb     │  │  minify      │                        │
+│  │ (persist. │  │  mangle      │                        │
+│  │   cache)  │  │  codegen     │                        │
+│  └───────────┘  └──────────────┘                        │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 3.2 Deployment Tiers
+
+**Tier 1 - Native (preferred):**
+The Rust daemon is compiled to a native binary for the host platform. The extension host communicates with it via a Unix domain socket (macOS/Linux) or a named pipe (Windows), using MessagePack framing. This is the fastest configuration.
+
+**Tier 2 - WASM (Desktop only):**
+The Rust daemon is compiled to `wasm32-wasip1-threads` and executed inside a VS Code Web Worker using the `@vscode/wasm-wasi-core` infrastructure. This tier is used on VS Code Desktop when no native binary is available for the current platform. It is NOT available on VS Code for the Web (see C-004). Performance is approximately 30% lower than native. The IPC layer is replaced by `postMessage`. Thread support requires `SharedArrayBuffer` and cross-origin isolation. See constraint C-004 in Section 13.1.
+
+**Tier 3 - Degraded:**
+If neither a native binary nor a WASM binary is loadable, or if the environment is VS Code for the Web where local `node_modules` access is unavailable, the extension operates in degraded mode. Import statements are detected and parsed using `oxc-parser` running in the extension host, but no size computation is performed. The UI shows a status bar indicator explaining that full analysis is unavailable.
+
+### 3.3 Startup Sequence
+
+1. Extension activates on the `onLanguage:javascript`, `onLanguage:typescript`, `onLanguage:typescriptreact`, and `onLanguage:javascriptreact` events.
+2. The extension host checks for a native binary matching the current platform in the extension's `bin/` directory.
+3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
+4. If the hash matches, it spawns the daemon process and opens a socket connection. The socket path includes a window-unique identifier (NFR-014b).
+5. If no native binary is found, it attempts to load the WASM binary from the extension's `wasm/` directory into a Worker.
+6. If that also fails, it enters degraded mode.
+7. The daemon loads its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and pre-warms the in-memory `papaya` cache.
+8. The extension is ready to accept requests.
+
+### 3.4 Request Lifecycle
+
+On each daemon respawn, the extension host reads `<globalStoragePath>/importlens-recycles.json` before deciding whether to spawn, applying the recycle rate limit defined in NFR-004b.
+
+
+1. The user opens or edits a JS/TS file.
+2. The document listener fires after a 300ms debounce.
+3. `oxc-parser` (NAPI binding) parses the document and extracts ESM import information directly from the `result.module.staticImports` array (no AST walk required).
+4. The extension filters imports to node_modules only, skipping local paths, `node:` builtins, and `import type` declarations.
+5. For each remaining import, the extension reads the installed package version from `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory.
+6. A single batched `BatchRequest` is serialised to MessagePack and sent over the socket.
+7. The daemon receives the batch and checks its `papaya` map for each import's cache key.
+8. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
+9. For each miss, the daemon runs the OXC pipeline: (a) construct a virtual entry module, (b) resolve the package entry point via `oxc_resolver`, (c) build the module graph by recursively parsing all reachable modules with `oxc_parser` and analysing them with `oxc_semantic`, (d) concatenate only the code reachable from the requested exports, (e) run `oxc_minifier` for dead code elimination, (f) apply `oxc_mangler` for identifier mangling, (g) emit the minified string via `oxc_codegen`, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
+10. Results are written to `papaya` (memory) and `redb` (disk).
+11. The daemon serialises the `BatchResponse` to MessagePack and sends it back.
+12. The extension host deserialises the response and updates decorations in the editor.
+
+---
+
+## 4. Architectural Alternatives and Rationale
+
+This section documents the key architectural decisions made before implementation and the alternatives that were evaluated. The primary constraint driving all decisions was a hard 20 MB per-platform VSIX size limit.
+
+### 4.1 Bundler and Pipeline Selection
+
+**Evaluated:** Rspack, Rolldown, ESBuild, and OXC.
+
+**Rspack and Rolldown rejected:** Both are Rust-powered tools, but they expose Node.js APIs rather than embeddable Rust crates. Using either would require spawning an additional Node.js subprocess from within the Rust daemon, which eliminates the performance and isolation advantages of writing the daemon in Rust.
+
+**ESBuild rejected:** ESBuild is written in Go and requires managing a separate WASM execution layer to use programmatically from Rust. This adds complexity and an additional binary dependency.
+
+**OXC selected:** OXC provides pure, embeddable Rust crates (`oxc_parser`, `oxc_resolver`, `oxc_transformer`, `oxc_minifier`) that compile into a single binary. All pipeline stages share the same in-memory AST, eliminating re-parsing between steps. OXC is the engine used internally by Rolldown and Vite 8.
+
+### 4.2 Minifier Selection
+
+**Evaluated:** SWC Core, Terser, and OXC Minifier.
+
+**Terser rejected:** Terser is a JavaScript tool and would require a Node.js subprocess from within the Rust daemon, contradicting the native-first architecture.
+
+**SWC Core rejected:** SWC produces slightly better compression ratios but its platform-specific binary is approximately 25 to 27 MB depending on the target. Including SWC would push every platform VSIX over the 20 MB hard limit.
+
+**OXC Minifier selected:** It is currently in alpha status and produces results that may vary by 1 to 2 percent from SWC. For a size estimation tool, this variance is acceptable. See Section 13.1 for the constraint documentation.
+
+### 4.3 Extension-Side Parsing
+
+**Evaluated:** Regular expressions, TypeScript Compiler API, and OXC WASM Parser.
+
+**Regular expressions rejected:** They fail on multi-line imports, re-exports, and complex TypeScript syntax patterns.
+
+**TypeScript Compiler API rejected:** It introduces heavy initialization overhead, requires the `typescript` npm package as a runtime dependency, and does not work in VS Code for the Web.
+
+**OXC Parser selected (NAPI):** `oxc-parser` is the actively maintained OXC parser package for Node.js. It uses native NAPI bindings for high performance. The deprecated `@oxc-parser/wasm` is not used because it is officially unmaintained, handles malformed and partially typed code via error recovery, and returns ECMAScript module information directly in a structured `result.module.staticImports` array without requiring an AST traversal. On VS Code Desktop, it is loaded as a native dependency. In VS Code for the Web (degraded mode), parsing is unavailable as NAPI bindings do not run in browser environments.
+
+### 4.4 IPC Encoding
+
+**Evaluated:** JSON, Protocol Buffers, and MessagePack.
+
+**JSON rejected:** JSON is verbose and slower to deserialise. On every debounce cycle the overhead compounds.
+
+**Protocol Buffers rejected:** The schema definition and code generation overhead is disproportionate for a small, well-defined two-message protocol.
+
+**MessagePack selected:** MessagePack payloads are typically 20-40% smaller than equivalent JSON. In the Rust `rmp-serde` path, deserialization is consistently faster than JSON. In the Node.js extension host, the performance advantage is modest for small payloads but meaningful for batch responses containing 20+ import results. `rmp-serde` on the Rust side integrates directly with `serde` at zero additional cost.
+
+### 4.5 Process Isolation Strategy
+
+**Evaluated:** napi-rs native addon and separate daemon process.
+
+**napi-rs native addon rejected:** A panic or memory safety violation in a native addon crashes the entire VS Code extension host process, which would close every other running extension. This risk is unacceptable for a background computation tool.
+
+**Separate daemon process selected:** The daemon runs in its own process. A crash is contained, detected by the extension host, and handled with automatic restart and backoff as defined in FR-015.
+
+---
+
+## 5. Functional Requirements
+
+### 5.1 Import Detection and Syntax Handling
+
+**FR-001** (Critical) - The extension must detect and correctly process the following ESM import formats in the active document:
+
+| Format                              | Example                                       | Handling                                                                                                                                                                                              |
+| ----------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Named imports                       | `import { debounce } from 'lodash-es'`        | Extract only the requested named exports and compute their isolated size                                                                                                                              |
+| Default imports                     | `import React from 'react'`                   | Evaluate the default export of the module                                                                                                                                                             |
+| Namespace imports                   | `import * as _ from 'lodash-es'`              | Evaluate the entire module size since all exports are requested                                                                                                                                       |
+| Dynamic imports                     | `import('date-fns')`                          | Evaluate the full module entry size                                                                                                                                                                   |
+| Dynamic imports with named bindings | `const { format } = await import('date-fns')` | **v1.0 limitation:** Treated as full module entry size (same as bare `import('date-fns')`). Named bindings on dynamic imports require runtime analysis that is not feasible with static AST analysis. |
+| Re-exports                          | `export { format } from 'date-fns'`           | Treat equivalently to a named import of the same specifier                                                                                                                                            |
+| Type-only imports                   | `import type { Foo } from 'bar'`              | Identify and immediately discard; zero runtime cost, must not be sent to daemon                                                                                                                       |
+
+**FR-002** (Critical) - The extension must skip relative imports (those beginning with `./` or `../`).
+
+**FR-003** (Critical) - The extension must skip Node.js built-in module imports, including those prefixed with `node:` and those matching known built-in names such as `fs`, `path`, `os`, `http`, and `crypto`.
+
+**FR-004** (High) - The extension must use `oxc-parser` (NAPI binding, npm package `oxc-parser`) to parse import information from the document buffer via the synchronous `parseSync()` function. It must not use the TypeScript Compiler API or spawn a separate process for parsing. The deprecated `@oxc-parser/wasm` package must not be used.
+
+**FR-005** (High) - The extension must use OXC's error recovery mode during parsing. When the user is mid-typing an incomplete import statement, the parser must extract as much structural information as possible rather than failing silently.
+
+**FR-006** (Critical) - The extension must debounce parse-and-request operations by the value configured in `importLens.debounceMs` (default 300ms) after the last document change event. Requests must not be sent on every keystroke.
+
+### 5.2 Package Version Resolution
+
+**FR-007** (Critical) - Before sending a request to the daemon, the extension must resolve the installed version of each package by reading `node_modules/<package>/package.json` and extracting the `version` field. For scoped packages (e.g. `@babel/core`), the path is `node_modules/@<scope>/<name>/package.json`. The `<package>` identifier in all cache keys and IPC messages includes the full scope prefix when present.
+
+**FR-008** (High) - The `oxc_resolver` must start module resolution from the `active_document_path` supplied in `BatchRequest`, not from the workspace root. Starting from the file being edited ensures that `oxc_resolver`'s upward traversal through the directory tree matches Node's own resolution algorithm exactly. This is critical in NPM Workspaces, Yarn Workspaces, and nested PNPM layouts where a package inside `packages/app-a/` may have its own `node_modules/` with a different version of a dependency than the root-level hoisted copy.
+
+**FR-009** (High) - If a package cannot be found in `node_modules`, the extension must display a subtle "Package not found" decoration on that import line and must not send it to the daemon.
+
+### 5.3 Daemon Communication
+
+**FR-010** (Critical) - The IPC protocol must use MessagePack as the serialization format on both the TypeScript and Rust sides.
+
+**FR-011** (Critical) - Messages must be length-prefixed with a 4-byte big-endian unsigned integer representing the byte length of the MessagePack payload that follows. This allows the socket to handle concurrent in-flight requests without message boundary ambiguity.
+
+**FR-012** (Critical) - The extension must send all imports from a single debounce cycle as a single `BatchRequest`, not one request per import line.
+
+**FR-013** (High) - The extension must implement request cancellation using the `request_id` field present in both `BatchRequest` and `BatchResponse`. Each debounce cycle must increment a monotonic counter and send it as `request_id`. If a response arrives whose `request_id` does not match the most recently sent request, the extension must discard it without updating decorations. This makes cancellation unambiguous regardless of response timing; timing-based heuristics must not be used.
+
+**FR-013a** (High) - When the daemon encounters a computation error for one or more imports in a batch, it must return a partial `BatchResponse` containing successful results for all other imports in the same batch. For each failed import, the `ImportResult.error` field must be set to a non-null string describing the failure reason, and all numeric size fields must be set to `0`. The extension host must render a subtle "Size unavailable" decoration for imports whose `ImportResult.error` is non-null, and must not show a user-visible error dialog. The extension host must log the error string to the ImportLens output channel at `warn` level.
+
+**FR-014** (High) - On socket disconnect, the extension must discard any stale MessagePack payloads currently in the receive buffer and wait for the next document change event to trigger a fresh request cycle.
+
+**FR-015** (High) - If the daemon process crashes, the extension must detect the disconnection, wait 1 second, and attempt to restart the daemon. On subsequent failures, it must apply exponential backoff (1s, 2s, 4s, 8s, capped at 30s). After three consecutive failures within 60 seconds, it must enter degraded mode and display a status bar notification.
+
+### 5.4 Size Computation
+
+**FR-016** (Critical) - For each cache-miss import, the daemon must construct a virtual ESM entry file in memory using re-export semantics:
+- Named imports: `export { <namedExports> } from '<package>'`
+- Default imports: `export { default } from '<package>'`
+- Namespace imports: `export * from '<package>'`
+- Dynamic imports: resolve the package entry point directly without a virtual file
+
+The virtual entry must never use `console.log` or any pattern that can be statically eliminated by a tree-shaker.
+
+**FR-017** (Critical) - The daemon must use `oxc_resolver` to resolve the package entry point from `node_modules`. The resolver must use the following `exports` condition set, in priority order: `["module", "import", "default"]`. This selects the ESM path when available, which is required for accurate tree-shaking. The `"require"` condition must not be in the set; its presence would cause `oxc_resolver` to prefer CJS paths on packages that publish both. If no ESM entry can be resolved, the daemon falls back to the `"main"` field and sets `is_cjs: true` in the response. The resolver must also respect the `"browser"` field for packages that use it as an ESM entry alias. The `"module"` top-level field (used by older packages before the `exports` map existed) is respected as a lower-priority fallback after `exports` map resolution.
+
+**FR-018** (Critical) - The daemon must perform tree-shaking using a custom module graph walker built on OXC primitives. The pipeline is:
+1. Construct a virtual ESM entry module (as defined in FR-016).
+2. Resolve the package entry point via `oxc_resolver`.
+3. Recursively parse all reachable modules using `oxc_parser`, building the module graph.
+4. Run `oxc_semantic` on each parsed module to produce scope trees, symbol tables, and binding information.
+5. Walk the module graph from the virtual entry's requested exports, marking all transitively reachable code.
+6. Concatenate only the reachable code into a single in-memory source.
+7. Before concatenating reachable code, the daemon must run `oxc_transformer` on each parsed module to strip TypeScript types and transform JSX. This produces plain JavaScript ASTs that can be processed by `oxc_minifier`. `oxc_transformer` does NOT perform tree-shaking; it only handles syntax lowering.
+8. When concatenating reachable modules into a single source, the daemon must apply scope renaming to prevent collisions between identically-named bindings in different module scopes (e.g. two modules both declaring `const x = ...`). Each module's local bindings must be prefixed with a module-unique identifier before concatenation. This is a significant engineering effort and must be accounted for in the implementation timeline. See Section 10.7 for the module graph walk algorithm.
+
+**FR-019** (Critical) - The daemon must use `oxc_minifier` to perform dead code elimination and constant folding on the tree-shaken output, then apply `oxc_mangler` for identifier mangling, and finally use `oxc_codegen` (with `minify: true`) to emit the minified JavaScript string. The `oxc_codegen` step is required because the minifier operates on the AST; the codegen converts the AST back to a string for compression.
+
+**FR-020** (Critical) - After minification, the daemon must compute three compressed sizes in parallel: gzip using `flate2` at level 6, Brotli using the `brotli` crate at level 4, and zstd using the `zstd` crate at level 3.
+
+**FR-021** (Critical) - The daemon must read the `sideEffects` field from the package's `package.json` before tree-shaking. The field is handled as follows:
+- If the field is `true` or absent: the response must set `side_effects: true`. Tree-shaking proceeds conservatively (no module pruning based on side-effect analysis).
+- If the field is `false`: aggressive tree-shaking is permitted; the response sets `side_effects: false`.
+- If the field is an array of glob patterns (e.g., `["*.css", "dist/polyfill.js"]`): the daemon must treat this conservatively as `side_effects: true` for v1.0 and include a note in the response. Full glob-array evaluation is deferred to v1.1.
+
+**FR-022** (High) - The daemon must detect when a package is not genuinely tree-shakeable by comparing the named-export size against the full-package size. If the named-export size is within 5% of the full-package size, `truly_treeshakeable` must be set to `false` in the response.
+
+**FR-023** (High) - The daemon must process all imports in a single `BatchRequest` concurrently using a Rayon thread pool. The thread pool must be sized to `max(1, available_parallelism - 2)` to leave headroom for VS Code's renderer and extension host threads. This is configured via `rayon::ThreadPoolBuilder::new().num_threads(std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(1)).build_global()`. The `num_cpus` crate must not be used; `std::thread::available_parallelism()` (stable since Rust 1.59) is the stdlib replacement and correctly respects cgroup limits.
+
+**FR-024** (Critical) - The Rust daemon must operate exclusively via static AST analysis. It is prohibited from evaluating, executing, or interpreting any code found within third-party packages. No `eval`, subprocess execution, or dynamic code loading of any kind is permitted.
+
+### 5.5 Caching
+
+**FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. The cache key must be the string `<package>@<version>::<named_exports_sorted_and_joined>`. Cache hits must be returned without running any computation.
+
+**FR-026** (Critical) - When `importLens.enableDiskCache` is `true` (the default), the daemon must persist the in-memory cache to a `redb` database stored in the VS Code global storage directory. On startup, the daemon must load all entries from `redb` into `papaya`.
+
+**FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer (initially `1`). On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration).
+
+**FR-027** (High) - The TypeScript extension host must watch `node_modules` for package version changes using VS Code's native `vscode.workspace.createFileSystemWatcher` API with two glob patterns: `**/node_modules/*/package.json` for regular packages and `**/node_modules/@*/*/package.json` for scoped packages (e.g. `@babel/core`). Both watchers must be registered at activation and both must send `CacheInvalidate` messages to the daemon when they fire. The `notify` Rust crate must not be used for this purpose. On Linux, a Rust process watching `node_modules` directly would register one `inotify` file descriptor per directory, which on kernels before 5.11 could rapidly exhaust the system-wide `inotify` limit (`fs.inotify.max_user_watches`, which defaulted to 8,192 prior to kernel 5.11). Since kernel 5.11 (February 2021), the default is dynamically scaled based on available memory (up to 1,048,576 on 64-bit systems with >=128 GB RAM), but the old default persists on older kernels and in constrained containers. Regardless of kernel version, VS Code's file watcher already manages file descriptor budgets safely for all extensions combined, making it the correct abstraction. When the watcher fires for a given package, the extension host must send a `CacheInvalidate` message over the existing IPC socket to the daemon. On receiving this message, the daemon must evict all cache entries for that package from both `papaya` and `redb`. When an entire `node_modules` directory is deleted or more than 20 packages are invalidated in a single burst, the extension host must send a single `CacheInvalidateAll` message instead of individual per-package messages. See Section 10.1 for the `CacheInvalidateAllMessage` schema.
+
+**FR-028** (Medium) - When a user opens or saves a `package.json` file in the workspace, the daemon must pre-calculate and cache the sizes of the default export and the namespace export (`*`) for each dependency listed in that file's `dependencies` and `devDependencies` objects. These two export variants are the most common and cover the majority of real-world import patterns. Pre-warm tasks must run on a dedicated secondary Rayon thread pool configured with half the threads of the primary pool, so that the primary pool remains fully available for real user requests. Because Rayon does not expose OS-level thread priority, reduced pool size is the correct mechanism for deprioritisation. Pre-warm work must stop immediately when a real BatchRequest arrives.
+
+### 5.6 User Interface
+
+**FR-029** (Critical) - The extension must display size information as an inline text decoration at the end of each import line by default.
+
+**FR-030** (Critical) - The display format must be configurable via `importLens.display` with four options:
+- `minimal`: `1.5 kB` (primary compression format only)
+- `standard`: `5.3 kB → 1.5 kB (br)` (minified size and primary compression size)
+- `verbose`: `5.3 kB min · 1.8 kB gz · 1.5 kB br · 1.6 kB zstd` (all three formats)
+- `inlayHint`: Uses the VS Code Inlay Hints API instead of end-of-line decorations. Displays the primary compression size as an inline hint after the import specifier. This mode integrates natively with VS Code's built-in inlay hint toggling and provides better performance than decoration-based rendering.
+
+**FR-031** (High) - When `side_effects: true` or `truly_treeshakeable: false`, the extension must display a warning indicator next to the size decoration indicating that the shown size may not reflect the actual shipped size.
+
+**FR-032** (High) - The extension must display a loading indicator next to imports that are currently being computed (cache miss in progress).
+
+**FR-033** (High) - The extension must provide a status bar item showing the daemon's current state: `ImportLens: Ready`, `ImportLens: Computing...`, `ImportLens: WASM mode`, or `ImportLens: Unavailable`.
+
+**FR-034** (High) - Changing the `importLens.compression` setting must immediately update all currently visible inline decorations to reflect the new format selection without requiring a file change or editor reload.
+
+**FR-035** (Medium) - The extension must provide a command `ImportLens: Clear Cache` that evicts all entries from both `papaya` and `redb` and triggers a fresh computation for the active document.
+
+**FR-036** (Medium) - The extension must provide a command `ImportLens: Show Report` that opens a webview panel listing all imports in the workspace along with their sizes, sorted by brotli size descending.
+
+### 5.7 Configuration
+
+**FR-037** (Critical) - The extension must expose the following user-configurable settings via the VS Code settings panel:
+
+| Setting key                  | Type    | Default    | Description                                                                                              |
+| ---------------------------- | ------- | ---------- | -------------------------------------------------------------------------------------------------------- |
+| `importLens.enabled`         | boolean | `true`     | Toggle the extension on or off                                                                           |
+| `importLens.display`         | enum    | `standard` | Display format: `minimal`, `standard`, `verbose`, or `inlayHint`                                         |
+| `importLens.compression`     | enum    | `brotli`   | Primary compression format shown in minimal and standard modes. Options: `brotli`, `gzip`, `zstd`, `all` |
+| `importLens.debounceMs`      | number  | `300`      | Milliseconds to wait after the last keystroke before sending a request                                   |
+| `importLens.showWarnings`    | boolean | `true`     | Show warning indicator for non-tree-shakeable imports                                                    |
+| `importLens.useCodeLens`     | boolean | `false`    | Use code lens above the line instead of end-of-line decorations                                          |
+| `importLens.enableDiskCache` | boolean | `true`     | Persist computed sizes to disk via redb across editor restarts                                           |
+| `importLens.logLevel`        | enum    | `error`    | Logging verbosity for the ImportLens output channel. Options: `error`, `warn`, `info`, `debug`           |
+
+### 5.8 Daemon Lifecycle
+
+**FR-038** (High) - On extension deactivation (or VS Code window close), the extension host must send a `Shutdown` message over the IPC socket. On receiving this message, the daemon must:
+1. Stop accepting new requests.
+2. Flush all pending `papaya` entries to `redb`.
+3. Close the `redb` database.
+4. Remove the Unix socket file (macOS/Linux) or release the named pipe (Windows).
+5. Exit the process cleanly within 5 seconds.
+
+If the daemon closes the IPC socket cleanly before the 5-second timeout elapses, the extension host must treat that as a successful exit and skip the escalation sequence below. If the daemon does not exit within 5 seconds of the `Shutdown` message, the extension host must send `SIGTERM` (Unix) or call `TerminateProcess` (Windows) to request termination. If the daemon still has not exited after an additional 2 seconds following the `SIGTERM`, the extension host must send `SIGKILL` (Unix) to forcefully terminate it. (`SIGTERM` can be caught or ignored by the process; `SIGKILL` cannot.) On Windows, `TerminateProcess` is already unconditional and no second step is needed.
+
+### 5.9 Diagnostics and Logging
+
+**FR-039a** (Medium) - When `importLens.useCodeLens` is set to `true`, the extension must register a `CodeLensProvider` for the relevant language selectors and render one `CodeLens` per import line, positioned on the line above the import statement. The lens must display the primary compression size and, when clicked, open the full size breakdown in a hover-style `MarkdownString` notification. The `useCodeLens` setting is independent of `importLens.display`; if both `inlayHint` display mode and `useCodeLens` are active simultaneously, the `inlayHint` mode takes precedence and the `CodeLensProvider` must not be registered. The `CodeLens` approach is noted as less space-efficient than end-of-line decorations (see D-011) but is retained as an option for users who prefer it.
+
+**FR-039** (High) - When `importLens.display` is set to `inlayHint`, the extension must register an `InlayHintsProvider` with VS Code for the relevant language selectors. The provider must return one `InlayHint` per import line, positioned after the closing quote of the import specifier, with `kind` set to `undefined` (no `InlayHintKind`). Import sizes are not parameters or types; using `InlayHintKind.Parameter` or `InlayHintKind.Type` would apply the wrong theme colours (`editorInlayHint.parameterForeground` or `editorInlayHint.typeForeground` respectively). An `undefined` kind falls through to the generic `editorInlayHint.foreground`/`editorInlayHint.background`, which theme authors expect for custom inlay hints. Each `InlayHint` must also set `tooltip` to a `MarkdownString` containing the full size breakdown (raw bytes, minified bytes, all three compressed sizes, `side_effects` status, and `is_cjs` indicator) so that users can hover for details.
+
+**FR-039b** (Medium) - The extension must include a note in its README and marketplace description that users relying on screen readers should use `importLens.display: "inlayHint"` mode. End-of-line decorations (the default mode) are not exposed to VS Code's accessibility APIs and are therefore invisible to screen readers. The `inlayHint` mode uses the VS Code Inlay Hints API, which is part of the document model and is screen-reader-accessible. The status bar item (FR-033) must always reflect the current operating tier regardless of display mode, as it is accessible to screen readers.
+
+**FR-040** (High) - The extension must create a VS Code `OutputChannel` named `ImportLens` for structured diagnostic logging. Log messages must include ISO 8601 timestamps and a severity level. The verbosity is controlled by the `importLens.logLevel` setting.
+
+**FR-041** (High) - The extension must provide a command `ImportLens: Show Logs` that focuses the `ImportLens` output channel in the VS Code panel. This command must be available from the Command Palette at all times, regardless of the extension's current operating tier.
+
+---
+
+## 6. Error Handling and Edge Cases
+
+The system must handle all failure conditions gracefully. No error scenario may produce an uncaught exception in the extension host or a visible error dialog unless explicitly noted below.
+
+| Scenario                                                   | Required Behaviour                                                                                                                                                                                                                     |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Package not installed in node_modules                      | Display a subtle "Package not found" decoration on that import line. Do not send the import to the daemon. Do not display an error dialog.                                                                                             |
+| Corrupted or malformed `package.json` in node_modules      | Fall back to computing the raw directory size of the package folder. Display an `(approx)` suffix on the size decoration to indicate the fallback method was used.                                                                     |
+| Malformed or incomplete import syntax (user is mid-typing) | Use OXC parser error recovery mode to extract as much structural information as possible. Render partial results if a package name can be identified. Suppress decorations silently if no package name can be resolved.                |
+| Daemon crash                                               | Detect the process exit, wait 1 second, and restart the daemon. Apply exponential backoff on repeated failures (1s, 2s, 4s, 8s, max 30s). After three crashes within 60 seconds, enter degraded mode and display a status bar warning. |
+| Socket disconnect without crash                            | Discard any stale MessagePack payloads currently in the receive buffer. Wait for the next document change event to trigger a fresh request cycle. Do not attempt immediate reconnection to avoid cascading retries on rapid edits.     |
+| node_modules folder deleted while extension is running     | The file watcher must detect the deletion. The extension host must send a `CacheInvalidateAll` message (see Section 10.1). The daemon must evict all entries from both `papaya` and `redb`. The extension host must update all affected decorations to "Package not found".    |
+| redb database corrupted on startup                         | Log the corruption, delete the corrupted database file, and create a fresh empty database. Continue operation using only the in-memory cache for the current session.                                                                  |
+| WASM Worker fails to initialise                            | Log the failure and enter degraded mode. Display `ImportLens: Unavailable` in the status bar.                                                                                                                                          |
+| Daemon binary hash mismatch (NFR-014a)                    | Refuse to spawn the daemon. Log a security warning to the ImportLens output channel at `error` level. Enter degraded mode and display `ImportLens: Unavailable`. Do not show a user-facing error dialog. |
+| Daemon recycle loop detected (NFR-004b)                   | If more than 5 recycles occurred within any rolling 10-minute window (read from `importlens-recycles.json`), enter degraded mode, log a warning, and display `ImportLens: Unavailable`. Reset counter after a clean 30-minute session with no recycles. |
+| IPC socket path collision (multiple VS Code windows)      | Each window uses a unique socket path via `VSCODE_PID` or UUID at activation (NFR-014b). If the generated path already exists, generate a fresh UUID and retry once before entering degraded mode. |
+
+---
+
+## 7. Non-Functional Requirements
+
+### 7.1 Performance
+
+**NFR-001** (Critical) - The extension must never block the VS Code extension host main thread. All IPC communication, file system reads, and cache lookups must be fully asynchronous.
+
+**NFR-002** (Critical) - Cache hit response time, measured from the moment the debounce fires to the moment decorations are rendered, must be under 50ms on a mid-range developer machine (equivalent to an Apple M2 or Intel Core i7-12th Gen).
+
+**NFR-003** (Critical) - Cache miss computation time for a single named export from a typical npm package (under 500 kB unpacked) must complete within 500ms on the same reference machine.
+
+**NFR-004** (High) - The Rust daemon must consume no more than 100 MB of resident memory during idle operation with the cache populated. During active computation of a batch of 20 imports, peak memory usage must not exceed 400 MB.
+
+**NFR-004a** (High) - The daemon must implement a silent lifecycle recycle to prevent long-term memory fragmentation. Because developers leave VS Code open for days or weeks, even a well-behaved Rust process accumulates allocator fragmentation over time. The daemon must monitor two conditions and gracefully restart itself when either is met: (a) the daemon has been continuously running for more than 4 hours without an active `BatchRequest` in the last 15 minutes. For the purposes of this timer, only `BatchRequest` processing counts as active; `CacheInvalidate` messages, `HelloMessage` handshake, and pre-warm jobs do not reset the idle timer, or (b) the `papaya` in-memory cache exceeds 200,000 entries (approximately 80 to 100 MB at ~500 bytes per entry, consistent with the 100 MB idle memory limit in NFR-004). A graceful restart must: flush all in-memory `papaya` entries to `redb` before exiting, exit cleanly (no signal kill), and rely on the extension host's existing watchdog (FR-015) to respawn it. The restart must be silent to the user; no status bar change or notification must appear unless the restart fails.
+
+**NFR-004b** (High) - The extension host must detect runaway recycle loops, which would never trigger the crash-based degraded mode in FR-015 because graceful recycles exit with code 0. On each daemon respawn, the extension host must read a recycle counter from a small side file at `<globalStoragePath>/importlens-recycles.json`. The daemon must increment this counter and write the current Unix timestamp before beginning its graceful exit. The extension host must enter degraded mode if the counter shows more than 5 recycles within any rolling 10-minute window, log a warning to the ImportLens output channel, and display `ImportLens: Unavailable` in the status bar. The counter file must be reset to zero on a successful session lasting longer than 30 minutes without a recycle.
+
+**NFR-004c** (High) - When a lifecycle recycle is triggered (NFR-004a), the daemon must abort any in-progress pre-warm jobs (FR-028) immediately before beginning the flush-and-exit sequence. Pre-warm jobs are low-priority background work; they must not delay a recycle. Any pre-warm entries that were computed but not yet written to `papaya` at the time of abort are discarded. They will be recomputed in the next session when the relevant `package.json` is opened again.
+
+**NFR-005** (High) - The daemon must start and be ready to accept connections within 500ms of being spawned.
+
+**NFR-006** (High) - The Node.js extension host memory footprint must remain flat during rapid, continuous typing over a sustained 5-minute period. This must be verifiable via memory profiling as defined in AC-005.
+
+### 7.2 Distribution Size
+
+**NFR-007** (Critical) - The published VSIX for any single platform target must not exceed 20 MB. This constraint applies to every target listed in Section 12.1 individually. This is a hard gate: the CI pipeline must fail the publish step if any VSIX exceeds this size.
+
+### 7.3 Reliability
+
+**NFR-008** (Critical) - A panic or crash in the Rust daemon must not crash VS Code or any other extension. The daemon must run in a separate process.
+
+**NFR-009** (High) - The `redb` persistent cache must be ACID-compliant. A hard shutdown such as power loss or `kill -9` must not corrupt the database. On next startup, the database must be readable and consistent.
+
+**NFR-010** (High) - If the daemon is unavailable, the extension must degrade gracefully. Import statements must still be detected and highlighted normally. The size decorations must simply be absent, not replaced with error text in the editing area.
+
+### 7.4 Security
+
+**NFR-011** (Critical) - The daemon must make no outbound network connections. All module resolution must be performed against the local `node_modules` directory only.
+
+**NFR-012** (Critical) - The daemon must operate exclusively via static AST analysis and is prohibited from executing any code found within third-party packages. No subprocess execution, `eval`, dynamic loading, or script interpretation of package contents is permitted under any circumstance.
+
+**NFR-013** (Critical) - The daemon must operate with read-only access limited to the specific workspace directory and its descendant `node_modules` folders. It must not read files outside the workspace tree and must not write any files other than its own cache database in the VS Code global storage directory.
+
+**NFR-014** (High) - The IPC socket or named pipe must be created with permissions that restrict access to the current user only (mode `0600` on Unix systems).
+
+**NFR-014a** (High) - Before spawning the daemon, the extension host must verify the binary's integrity by computing a SHA-256 hash of the daemon executable and comparing it against a known-good hash embedded in the extension package. If the hash does not match, the extension must refuse to spawn the daemon, log a security warning to the `ImportLens` output channel, and enter degraded mode. This prevents execution of tampered binaries.
+
+**NFR-014b** (High) - The IPC socket path (Unix) or named pipe name (Windows) must include a component unique to the VS Code window instance (e.g., the `VSCODE_PID` environment variable or a UUID generated at extension activation) to prevent collisions when multiple VS Code windows are open in different workspaces. Each window must communicate with its own dedicated daemon instance.
+
+### 7.5 Maintainability
+
+**NFR-015** (High) - The Rust daemon crate must be structured so that the compression step, the OXC pipeline step, and the cache layer are each in separate Rust modules with clearly defined interfaces. Adding a new compression format must require changes in a single file only.
+
+**NFR-016** (High) - The TypeScript extension host must be compiled to a single bundled output file using `tsdown`. It must have no runtime npm dependencies other than `oxc-parser` (NAPI binding) and `@msgpack/msgpack`.
+
+**NFR-017** (Medium) - The codebase must achieve at least 70% unit test line coverage on the Rust daemon's core computation logic. Integration tests must cover at least five real-world npm packages: lodash-es, date-fns, zod, react, and uuid. Each package must be pinned to a specific version and its full `node_modules` snapshot must be committed to the repository under `tests/fixtures/packages/<package>@<version>/`. Integration tests must resolve against these local snapshots, not against a live npm registry. This prevents test flakiness caused by upstream package updates that change tree-shaken output.
+
+### 7.6 Extensibility
+
+**NFR-018** (Medium) - The `BatchRequest` and `BatchResponse` MessagePack schemas must include a `version` field (integer). The daemon must reject requests with an unrecognised version number and respond with an error batch response to enable future protocol versioning without breaking older clients.
+
+---
+
+## 8. Acceptance Criteria
+
+The following criteria constitute the definition of done for the v1.0 release. All five criteria must pass before a release VSIX is published to the VS Code Marketplace.
+
+**AC-001 - Size limit compliance:** The extension installs successfully on each target platform and the installed VSIX does not exceed 20 MB for any single platform target.
+
+**AC-002 - Latency requirement:** Typing a new import statement displays the correct size decoration within 500ms on the first attempt (cache miss). On subsequent attempts using the same import in the same session, the decoration renders in under 50ms (cache hit). Both measurements are taken on the reference machine defined in NFR-002.
+
+**AC-003 - Missing package handling:** Deleting the `node_modules` folder while the extension is running updates all affected import decorations to display "Package not found" without throwing an uncaught error or crashing the daemon.
+
+**AC-004 - Settings reactivity:** Changing the `importLens.compression` setting immediately updates all currently visible inline decorations to reflect the new format selection. No file change, save, or editor reload is required.
+
+**AC-005 - Memory stability:** A memory profile of the Node.js extension host process taken before and after 5 minutes of continuous rapid typing in a JS/TS file confirms that the extension host heap does not grow continuously. The heap must return to within 10% of its pre-typing baseline between typing bursts.
+
+---
+
+## 9. Technical Stack
+
+### 9.1 Extension Host (TypeScript)
+
+| Component     | Technology                                        | Rationale                                                                                                                                                                                                                             |
+| ------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Language      | TypeScript 6.x (v6.0.3)                           | Bridge release before the Go-based TS 7.0. Uses `module: "esnext"`, `target: "es2025"`, and an explicit `types` array (`["node", "vscode"]`) in `tsconfig.json`. Avoids all legacy patterns deprecated in TS 6 to ease future TS 7 migration. |
+| Bundler       | tsdown (Rolldown-based)                           | Produces single-file output, fast builds                                                                                                                                                                                              |
+| Import parser | `oxc-parser` (NAPI)                               | Returns ESM import info directly via `result.module.staticImports` without AST walk; uses native NAPI bindings for high performance; handles malformed syntax via error recovery. The deprecated `@oxc-parser/wasm` must not be used. |
+| IPC encoding  | `@msgpack/msgpack`                                | Payloads typically 20-40% smaller than JSON; meaningful improvement for batch responses of 20+ imports                                                                                                                                |
+| IPC transport | Unix socket (macOS/Linux) or Named pipe (Windows) | Multiplexed, no stdout pollution                                                                                                                                                                                                      |
+| File watching | `vscode.workspace.createFileSystemWatcher`        | Native VS Code API; manages inotify/FSEvents limits safely across all extensions; used to detect package.json changes in node_modules and trigger daemon cache invalidation                                                           |
+| Telemetry     | `vscode.env.createTelemetryLogger` (v1.1 target) | Anonymised usage telemetry (cache hit rate, tier distribution, recycle frequency). Opt-out respects VS Code global telemetry setting. Instrumentation scaffolding may be added in v1.0 with reporting deferred to v1.1.              |
+
+### 9.2 Rust Daemon
+
+| Component                  | Crate                        | Rationale                                                                                                                                                                                                                              |
+| -------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Module resolution          | `oxc_resolver` (v11.x)       | Production-ready, 30x faster than webpack's enhanced-resolve, used by Rolldown and Nuxt. Note: lives in a separate repository (`oxc-project/oxc-resolver`), versioned independently from the main OXC monorepo.                        |
+| Parsing                    | `oxc_parser` (v0.133.x)      | ~3x faster parsing throughput than SWC on JS/TS input, arena-allocated AST, production-ready                                                                                                                                           |
+| Semantic analysis          | `oxc_semantic` (v0.133.x)    | Produces scope trees, symbol tables, and binding information for each parsed module. Required for accurate tree-shaking reachability analysis.                                                                                         |
+| Tree-shaking               | Custom module graph walker   | Built on `oxc_parser` + `oxc_resolver` + `oxc_semantic`. OXC does NOT provide a standalone tree-shaker; the daemon must implement module graph construction, cross-module reachability analysis, and side-effect tracking. See FR-018. |
+| TypeScript / JSX transform | `oxc_transformer` (v0.133.x) | Strips TypeScript types and transforms JSX before minification. Does NOT perform tree-shaking.                                                                                                                                         |
+| Minification (DCE)         | `oxc_minifier` (v0.133.x)    | Dead code elimination, constant folding, branch pruning. Alpha status, acceptable for size estimation within 1-2% variance.                                                                                                            |
+| Identifier mangling        | `oxc_mangler` (v0.133.x)     | Separate crate from `oxc_minifier` (split during the 0.12x refactor). Handles scope-aware variable renaming and base54 name generation. May re-merge into `oxc_minifier`; see Appendix C.                                                                                                     |
+| Code generation            | `oxc_codegen` (v0.133.x)     | Converts the minified AST back to a JavaScript string. Required because `oxc_minifier` operates on the AST, not on text. Supports `minify: true` for whitespace removal.                                                               |
+| Gzip compression           | `flate2`                     | Stable, widely used, level 6 default                                                                                                                                                                                                   |
+| Brotli compression         | `brotli` crate               | Level 4 balances speed and ratio for real-time use                                                                                                                                                                                     |
+| Zstd compression           | `zstd` crate                 | Level 3 provides best speed-to-ratio balance                                                                                                                                                                                           |
+| In-memory cache            | `papaya` (v0.2.x)            | Lock-free, deadlock-safe, optimised for read-heavy workloads. Uses a pinning API (`map.pin()`) rather than traditional lock guards.                                                                                                    |
+| Persistent cache           | `redb` (v4.x)                | Stable release, pure Rust, ACID, copy-on-write B-trees                                                                                                                                                                                 |
+| Concurrency                | `rayon` (v1.12.x)            | Work-stealing thread pool for parallel batch processing. Note: `rayon::join` accepts exactly 2 closures; 3+ parallel tasks require nested `rayon::join` or `rayon::scope`.                                                             |
+| IPC serialization          | `rmp-serde` (v1.3.x)         | MessagePack integration with serde, no extra dependencies                                                                                                                                                                              |
+| Async runtime              | `tokio`                      | Async socket server for handling concurrent IPC requests                                                                                                                                                                               |
+
+### 9.3 Minifier Maturity Note
+
+`oxc_minifier` is currently in alpha status (v0.133.0). For a bundle size estimation tool, a size estimate that is off by 1 to 2 percent due to an alpha minifier is harmless. The team must monitor `oxc_minifier` release notes and run the integration test suite against each OXC release to catch any regressions. See constraint C-001 in Section 13.1.
+
+### 9.4 Dependency Manifest (Pinned Versions)
+
+> **This table is the authoritative source of truth for all dependency versions.** All `Cargo.toml` and `package.json` files must use these exact versions (or compatible semver ranges) at project initialization. This prevents AI agents and developers from using outdated or deprecated packages. Last audited: **29 May 2026.**
+
+#### 9.4.1 Rust Crates (`Cargo.toml`)
+
+| Crate             | Pinned Version | Semver Range | Stability        | Notes                                                                                                                                                                                      |
+| ----------------- | -------------- | ------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `oxc_parser`      | 0.133.0        | `~0.133`     | ✅ Stable API     | Pin to `~0.133` to stay on same minor. All OXC crates must use the same version.                                                                                                           |
+| `oxc_resolver`    | 11.19.1        | `~11.19`     | ✅ Stable         | Separate repo from OXC monorepo; versioned independently.                                                                                                                                  |
+| `oxc_semantic`    | 0.133.0        | `~0.133`     | ✅ Stable API     | Must match `oxc_parser` version.                                                                                                                                                           |
+| `oxc_transformer` | 0.133.0        | `~0.133`     | ✅ Stable API     | TS/JSX stripping only. Does NOT tree-shake.                                                                                                                                                |
+| `oxc_minifier`    | 0.133.0        | `~0.133`     | ⚠️ Alpha          | See C-001. Pin tightly; test on every update.                                                                                                                                              |
+| `oxc_mangler`     | 0.133.0        | `~0.133`     | ⚠️ Recently split | Was part of `oxc_minifier`. May re-merge.                                                                                                                                                  |
+| `oxc_codegen`     | 0.133.0        | `~0.133`     | ✅ Stable API     | Required for AST → string. Use `minify: true`.                                                                                                                                             |
+| `oxc_allocator`   | 0.133.0        | `~0.133`     | ✅ Stable         | Arena allocator. Must match parser version.                                                                                                                                                |
+| `oxc_span`        | 0.133.0        | `~0.133`     | ✅ Stable         | Source locations. Must match parser version.                                                                                                                                               |
+| `papaya`          | 0.2.4          | `~0.2`       | Pre-1.0        | Uses pinning API (`map.pin()`). Recycle triggers at 200,000 cached entries (NFR-004a). Watch for breaking changes.                                                                         |
+| `redb`            | 4.1.0          | `^4`         | ✅ Stable (1.0+)  | ACID, committed file format. Upgraded from v3 to v4 (April 2026). The redb file format is committed stable; the v3→v4 migration must be handled via cache schema versioning (see FR-026a). |
+| `rayon`           | 1.12.0         | `^1.12`      | ✅ Stable         | `join()` takes exactly 2 closures. Use nested calls for 3+.                                                                                                                                |
+| `rmp-serde`       | 1.3.1          | `^1.3`       | ✅ Stable         | MessagePack ↔ serde.                                                                                                                                                                       |
+| `serde`           | 1.0.228        | `^1`         | ✅ Stable         | With `derive` feature.                                                                                                                                                                     |
+| `serde_json`      | 1.0.x          | `^1`         | ✅ Stable         | Structured parsing for `package.json` metadata and small lifecycle files such as `importlens-recycles.json`; avoids ad hoc string parsing.                                                 |
+| `tokio`           | 1.52.3         | `^1.52`      | ✅ Stable         | Features: `rt-multi-thread`, `net`, `io-util`, `macros`.                                                                                                                                   |
+| `flate2`          | 1.1.9          | `^1.1`       | ✅ Stable         | Gzip level 6.                                                                                                                                                                              |
+| `brotli`          | 8.0.3          | `^8`         | ✅ Stable         | Brotli level 4.                                                                                                                                                                            |
+| `zstd`            | 0.13.3         | `~0.13`      | ✅ Stable API     | Zstd level 3.                                                                                                                                                                              |
+| ~~`num_cpus`~~    | N/A            | N/A          | Removed        | Replaced by `std::thread::available_parallelism()` (stable since Rust 1.59). The `num_cpus` crate is in maintenance mode and provides no value over the stdlib.                            |
+
+#### 9.4.2 npm Packages (`package.json`)
+
+| Package            | Pinned Version | Category        | Notes                                                                                                                                                                                                                                                                                                              |
+| ------------------ | -------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `oxc-parser`       | 0.133.0        | `dependency`    | NAPI binding. Must match the Rust-side `oxc_parser` crate version (both are released from the same OXC monorepo on the same cadence). **NOT** `@oxc-parser/wasm` (deprecated).                                                                                                                                     |
+| `@msgpack/msgpack` | 3.1.3          | `dependency`    | MessagePack encode/decode.                                                                                                                                                                                                                                                                                         |
+| `tsdown`           | 0.22.1         | `devDependency` | Rolldown-based bundler. Output: single-file `extension.js`.                                                                                                                                                                                                                                                        |
+| `typescript`       | 6.0.3          | `devDependency` | Bridge release to TS 7.0. Type checking only; not a runtime dep. **tsconfig must use**: `module: \"esnext\"`, `target: \"es2025\"`, `types: [\"node\", \"vscode\"]` (explicit), `moduleResolution: \"bundler\"`. Do NOT use TS 5.x.                                                                                       |
+| `@types/vscode`    | 1.100.0         | `devDependency` | Intentionally pinned to the minimum supported VS Code version, not the latest release. The extension's `package.json` must declare `"engines": { "vscode": "^1.100.0" }`. All VS Code APIs used by ImportLens (InlayHintsProvider, FileSystemWatcher, OutputChannel, TelemetryLogger, etc.) are available in 1.100+. VS Code 1.100 was released in April 2025; as of May 2026 it is well within the installed base for active developers. This version is intentionally pinned to match `@types/vscode` and is not the latest; bumping further requires a deliberate decision. |
+| `@types/node`      | 22.15.3        | `devDependency` | Explicit Node ambient types for VS Code extension-host APIs used by ImportLens (`fs/promises`, `net`, `child_process`, `crypto`, `path`, and Node's built-in test runner). This keeps `types` explicit instead of relying on TypeScript auto-inclusion. |
+| `@vscode/vsce`     | 3.9.1          | `devDependency` | VSIX packaging and publishing. Use `--no-dependencies` flag when building VSIX for bundled extensions.                                                                                                                                                                                                             |
+
+#### 9.4.3 Build Tools
+
+| Tool                  | Version                 | Purpose                  | Notes                                                              |
+| --------------------- | ----------------------- | ------------------------ | ------------------------------------------------------------------ |
+| Rust toolchain        | >= 1.85.0 (Edition 2024) | Daemon compilation       | MSRV. Required for `edition = "2024"` in `Cargo.toml`. Current stable is 1.95.0; CI should pin a specific stable version rather than `stable` for reproducible builds. |
+| `wasm-opt` (Binaryen) | 123                     | WASM binary optimization | Run with `-Oz` after `cargo build --target wasm32-wasip1-threads`. |
+| `cargo-cross`         | latest                  | Cross-compilation        | For building all 6 native targets in CI.                           |
+| Node.js               | >= 20 LTS                | Extension development    | Required by VS Code extension host.                                |
+
+#### 9.4.4 Deprecated / Banned Packages
+
+> **These packages must NOT be used anywhere in the project.** Any appearance in `Cargo.toml`, `package.json`, or source code is a build error.
+
+| Package                  | Reason                                                        | Replacement                                                     |
+| ------------------------ | ------------------------------------------------------------- | --------------------------------------------------------------- |
+| `@oxc-parser/wasm` (npm) | Officially deprecated. No longer maintained.                  | `oxc-parser` (NAPI, v0.133.0)                                   |
+| `sled` (Rust)            | Never shipped 1.0. Unstable on-disk format.                   | `redb` (v4.x, stable format)                                    |
+| `dashmap` (Rust)         | Deadlock risk with sharded RwLock under read-heavy workloads. | `papaya` (v0.2.x, lock-free)                                    |
+| `num_cpus` (Rust)        | Maintenance mode since June 2023. Superseded by stdlib.       | `std::thread::available_parallelism()` (stable since Rust 1.59) |
+
+---
+
+## 10. Component Specifications
+
+### 10.1 IPC Message Schemas
+
+#### BatchRequest
+
+```typescript
+interface BatchRequest {
+  version: number;              // Protocol version, currently 1
+  request_id: number;           // Monotonic counter incremented per debounce cycle.
+                                // The daemon echoes this value in BatchResponse.
+                                // The extension host discards responses whose
+                                // request_id does not match the most recently sent value.
+  active_document_path: string; // Absolute path to the file currently being edited.
+                                // oxc_resolver starts upward traversal from this path,
+                                // not from the workspace root, to correctly resolve
+                                // nested node_modules in monorepos (e.g. PNPM workspaces
+                                // where packages/app-a has its own node_modules with a
+                                // different version than the root-level hoisted copy).
+  imports: ImportRequest[];
+}
+
+interface ImportRequest {
+  specifier: string;         // Full import specifier including subpath, e.g. "date-fns/format"
+  package: string;           // Root package name only, e.g. "date-fns" (used for node_modules lookup)
+  version: string;           // Installed version read from root package.json, e.g. "3.6.0"
+  named: string[];           // Named exports requested; empty for default/namespace/dynamic
+  import_kind: "named" | "default" | "namespace" | "dynamic";
+}
+```
+
+#### BatchResponse
+
+```typescript
+interface BatchResponse {
+  version: number;
+  request_id: number;           // Echoed from the corresponding BatchRequest.
+                                // Extension host uses this to discard stale responses.
+  imports: ImportResult[];
+}
+
+interface ImportResult {
+  specifier: string;
+  raw_bytes: number;              // Unpacked size of the relevant module files
+  minified_bytes: number;         // After OXC tree-shake and minification
+  gzip_bytes: number;             // flate2 level 6
+  brotli_bytes: number;           // brotli level 4
+  zstd_bytes: number;             // zstd level 3
+  cache_hit: boolean;
+  side_effects: boolean;          // true if sideEffects field is absent or true
+  truly_treeshakeable: boolean;   // false if named export size is within 5% of full package size
+  is_cjs: boolean;                // true if the package has no ESM entry; size is approximate
+  error: string | null;           // Non-null if computation failed for this import
+}
+```
+
+#### HelloMessage
+
+Sent by the extension host immediately after opening the socket connection. The daemon must not process any `BatchRequest` until a valid `HelloMessage` has been received.
+
+```typescript
+interface HelloMessage {
+  type: "hello";
+  version: number;              // Protocol version, currently 1
+  workspace_root: string;       // Absolute path to the workspace root
+  enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
+  log_level: "error" | "warn" | "info" | "debug";
+}
+```
+
+#### CacheInvalidateMessage
+
+Sent by the extension host when the file watcher detects a change in `node_modules`. The daemon must evict all matching cache entries from both `papaya` and `redb`.
+
+```typescript
+interface CacheInvalidateMessage {
+  type: "cache_invalidate";
+  package: string;              // Package name (including scope prefix for scoped packages, e.g. "@babel/core")
+}
+```
+
+#### CacheInvalidateAllMessage
+
+Sent by the extension host when the entire `node_modules` tree is deleted or replaced (e.g. after `rm -rf node_modules` or a fresh `npm install` that changes multiple package versions simultaneously). The daemon must evict all entries from both `papaya` and `redb`. The extension host must send this message instead of individual `CacheInvalidateMessage` calls when more than 20 packages are invalidated in a single file-watcher event burst, to avoid saturating the IPC socket with hundreds of small messages.
+
+```typescript
+interface CacheInvalidateAllMessage {
+  type: "cache_invalidate_all";
+}
+```
+
+#### ShutdownMessage
+
+Sent by the extension host on extension deactivation. The daemon must flush caches and exit. See FR-038.
+
+```typescript
+interface ShutdownMessage {
+  type: "shutdown";
+}
+```
+
+### 10.2 Cache Key Format
+
+The cache key for both `papaya` and `redb` is a UTF-8 string:
+
+```
+<package>@<version>::<export1>,<export2>,...<exportN>
+```
+
+Exports are sorted lexicographically before joining to ensure import order does not create duplicate entries. For namespace and default imports, the key uses the sentinel values `*` and `default` respectively.
+
+For subpath imports (e.g. `import { format } from 'date-fns/format'`), the full specifier including the subpath is used as the package component of the key. Subpath imports are treated as distinct cache entries from their root package because they resolve to different entry points and produce different tree-shaken outputs. The subpath is preserved verbatim; no normalisation is applied.
+
+```
+lodash-es@4.17.21::debounce,throttle
+lodash-es@4.17.21::*
+react@18.3.1::default
+date-fns@3.6.0::dynamic
+date-fns/format@3.6.0::default
+@babel/core@7.24.0::default
+@tanstack/react-query@5.28.0::useQuery,useMutation
+```
+
+The `specifier` field in `ImportRequest` must carry the full subpath (e.g. `"date-fns/format"`) so the daemon can resolve the correct entry point via `oxc_resolver`. The `package` field carries the root package name only (e.g. `"date-fns"`) for `node_modules` lookup purposes. The `version` field is read from the root package's `package.json` regardless of subpath, since subpaths do not have independent versions.
+
+### 10.3 Virtual Entry Module
+
+For each cache miss, the daemon constructs an in-memory virtual file. The pattern varies by import kind:
+
+```javascript
+// Named imports
+export { debounce, throttle } from 'lodash-es';
+
+// Default import
+export { default } from 'react';
+
+// Namespace import
+export * from 'lodash-es';
+
+// Dynamic import: the package entry point is resolved directly
+// and passed to the OXC pipeline without a virtual entry file
+```
+
+Re-exports are semantically unambiguous to tree-shakers. The bundler cannot drop a named export from an entry module regardless of how aggressive dead code elimination is.
+
+### 10.4 Compression Pipeline
+
+After codegen emits the minified JavaScript string, the three compression steps run in parallel using nested `rayon::join` calls:
+
+```rust
+// rayon::join accepts exactly 2 closures.
+// For 3 parallel tasks, nest the second join inside the first.
+let (gzip_bytes, (brotli_bytes, zstd_bytes)) = rayon::join(
+    || gzip_compress(&minified_string, 6),
+    || rayon::join(
+        || brotli_compress(&minified_string, 4),
+        || zstd_compress(&minified_string, 3),
+    ),
+);
+```
+
+```
+minified_string (from oxc_codegen)
+    ├─► flate2::GzEncoder (level 6) ────► gzip_bytes
+    └─► rayon::join
+        ├─► brotli::enc (level 4) ──────► brotli_bytes
+        └─► zstd::encode (level 3) ─────► zstd_bytes
+```
+
+All three results are collected before the response is sent.
+
+### 10.5 Daemon Startup and Lifecycle
+
+```
+Extension activates
+    |
+    ├─ Locate native binary in extension/bin/<platform>/import-lens-daemon
+    │       |
+    │       ├─ Found → spawn process, open socket, send HELLO handshake
+    │       │
+    │       └─ Not found → locate WASM binary in extension/wasm/import-lens-daemon.wasm
+    │               |
+    │               ├─ Found → instantiate in VS Code Worker, attach postMessage IPC
+    │               │
+    │               └─ Not found → enter degraded mode, show status bar warning
+    |
+    Daemon starts
+        |
+        ├─ Read <globalStoragePath>/importlens-recycles.json (NFR-004b)
+        │   └─ If recycle rate exceeds threshold: enter degraded mode immediately
+        ├─ Open redb database at <globalStoragePath>/importlens.redb
+        │   └─ If corrupted: delete, create fresh, log warning
+        ├─ Load all entries from redb into papaya (in-memory cache)
+        └─ Begin listening on socket / named pipe
+```
+
+### 10.6 Tree-Shakeability Detection
+
+After computing the size of the requested named exports, the daemon performs a second OXC pass to compute the full-package size. If:
+
+```
+named_export_size / full_package_size >= 0.95
+```
+
+then `truly_treeshakeable` is set to `false`. This catches packages that declare `"sideEffects": false` in `package.json` but whose internal module graph does not actually support granular export isolation.
+
+### 10.7 Module Graph Walk Algorithm
+
+This section specifies the algorithm that `graph.rs` and `treeshake.rs` must implement. It exists to resolve ambiguities that FR-018 leaves open at the implementation level.
+
+**Data structures**
+
+```
+ModuleGraph {
+  modules: HashMap<AbsolutePath, Module>,
+  entry: AbsolutePath,
+}
+
+Module {
+  path: AbsolutePath,
+  ast: OxcAst,              // produced by oxc_parser
+  semantic: OxcSemantic,    // produced by oxc_semantic
+  imports: Vec<ModuleEdge>, // resolved import statements
+  exports: Vec<ExportDef>,  // named, default, re-export
+  transformed_src: String,  // output of oxc_transformer (TS stripped, JSX lowered)
+}
+
+ModuleEdge {
+  specifier: String,        // raw specifier as written in source
+  resolved: AbsolutePath,   // result of oxc_resolver
+  kind: ImportKind,         // Static | Dynamic
+}
+```
+
+**Graph construction (graph.rs)**
+
+```
+fn build_graph(entry_path, resolver) -> ModuleGraph:
+  graph = ModuleGraph::new()
+  queue = [entry_path]
+  visited = HashSet::new()
+
+  while queue is not empty:
+    path = queue.pop()
+    if path in visited: continue      // handles circular dependencies
+    visited.insert(path)
+
+    source = fs::read(path)
+    ast = oxc_parser::parse(source)
+    semantic = oxc_semantic::build(ast)
+    imports = collect_static_imports(ast)
+
+    resolved_edges = []
+    for import in imports:
+      match resolver.resolve(import.specifier, from = path):
+        Ok(resolved_path) =>
+          resolved_edges.push(ModuleEdge { specifier, resolved: resolved_path })
+          if resolved_path not in visited:
+            queue.push(resolved_path)
+        Err(e) =>
+          // log at debug level; treat as external (no graph edge)
+
+    graph.insert(path, Module { path, ast, semantic, imports: resolved_edges, ... })
+
+  return graph
+```
+
+The visited-set check on every dequeue prevents infinite loops on circular dependencies. A module that is visited twice (A imports B imports A) will have its edges walked once; the second encounter is a no-op.
+
+**Reachability walk (treeshake.rs)**
+
+```
+fn mark_reachable(graph, entry_exports) -> HashSet<(AbsolutePath, SymbolId)>:
+  reachable = HashSet::new()
+  worklist = entry_exports.map(|e| (graph.entry, e.symbol_id))
+
+  while worklist is not empty:
+    (module_path, symbol_id) = worklist.pop()
+    key = (module_path, symbol_id)
+    if key in reachable: continue
+    reachable.insert(key)
+
+    // follow re-exports and bindings through the semantic graph
+    for binding in graph[module_path].semantic.references_of(symbol_id):
+      match binding:
+        ReExport { from_module, from_symbol } =>
+          worklist.push((resolved_path_of(from_module), from_symbol))
+        ImportBinding { from_module, from_symbol } =>
+          worklist.push((resolved_path_of(from_module), from_symbol))
+        LocalBinding { .. } =>
+          // symbol is defined locally; no further traversal needed
+
+  return reachable
+```
+
+**Scope renaming before concatenation**
+
+Before concatenating module sources, each module's local bindings must be renamed to a module-unique prefix to prevent collisions. The prefix is derived from the module's index in topological order: `__m{N}_{originalName}`. Renaming is applied to the `transformed_src` string using `oxc_semantic`'s symbol table to locate all binding sites. Only module-scope bindings require renaming; function-scope and block-scope bindings are already isolated by their enclosing scope.
+
+**Side-effect handling**
+
+If `sideEffects: false` is set in the package's `package.json`, modules that contribute no reachable symbols are excluded from concatenation entirely. If `sideEffects` is absent, `true`, or an array, all parsed modules are included in concatenation regardless of reachability, and only the minification step removes dead code. This is conservative but correct.
+
+---
+
+## 11. Data Models
+
+### 11.1 Persistent Cache Schema (redb)
+
+The `redb` database contains one table:
+
+| Table name   | Key type                                      | Value type                                   |
+| ------------ | --------------------------------------------- | -------------------------------------------- |
+| `size_cache` | `&str` (cache key as defined in Section 10.2) | `&[u8]` (MessagePack-encoded `CachedResult`) |
+
+`CachedResult` Rust struct:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct CachedResult {
+    raw_bytes: u64,
+    minified_bytes: u64,
+    gzip_bytes: u64,
+    brotli_bytes: u64,
+    zstd_bytes: u64,
+    side_effects: bool,
+    truly_treeshakeable: bool,
+    is_cjs: bool,
+    computed_at: u64,        // Unix timestamp in seconds
+}
+```
+
+### 11.2 Configuration Storage
+
+User configuration is stored by VS Code in the user's `settings.json` and accessed via `workspace.getConfiguration('importLens')`. The daemon does not read VS Code settings directly; the extension host passes relevant configuration values in the `HELLO` handshake message at startup.
+
+---
+
+## 12. Distribution and Packaging
+
+### 12.1 Platform-Specific VSIX Strategy
+
+The extension is published as separate platform-specific VSIX packages. VS Code automatically selects and installs the package matching the user's platform.
+
+| VSIX target    | Daemon binary                                           |
+| -------------- | ------------------------------------------------------- |
+| `linux-x64`    | `x86_64-unknown-linux-gnu`                              |
+| `linux-arm64`  | `aarch64-unknown-linux-gnu`                             |
+| `darwin-x64`   | `x86_64-apple-darwin`                                   |
+| `darwin-arm64` | `aarch64-apple-darwin`                                  |
+| `win32-x64`    | `x86_64-pc-windows-msvc`                                |
+| `win32-arm64`  | `aarch64-pc-windows-msvc`                               |
+| `web`          | `wasm32-wasip1-threads` (WASM, Desktop only; see C-004) |
+
+> **Note:** `linux-armhf` (`armv7-unknown-linux-gnueabihf`) is deferred to v1.1. ARMv7 is increasingly uncommon for developer workstations. Adding it later requires only a new CI cross-compilation target and VSIX entry.
+
+### 12.2 Estimated Size per User Download
+
+| Component                                        | Uncompressed               | In VSIX (compressed)     |
+| ------------------------------------------------ | -------------------------- | ------------------------ |
+| Native Rust daemon (OXC pipeline, stripped, LTO) | ~12-15 MB                  | ~9-11 MB                 |
+| `oxc-parser` NAPI binary                         | ~2 MB                      | ~1 MB                    |
+| `@msgpack/msgpack`                               | ~200 kB                    | ~80 kB                   |
+| Extension TypeScript bundle (tsdown output)      | ~800 kB                    | ~350 kB                  |
+| Metadata, icons, manifests                       | ~50 kB                     | ~20 kB                   |
+| **Total per-platform VSIX**                      | **~15-18 MB uncompressed** | **~10-13 MB compressed** |
+
+All platform targets fall within the 20 MB hard limit defined in NFR-007. The switch from `@oxc-parser/wasm` (~9 MB) to `oxc-parser` NAPI (~2 MB) provides significant headroom.
+
+### 12.3 Cargo.toml Release Profile
+
+```toml
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+strip = "symbols"
+```
+
+### 12.4 CI/CD Pipeline Requirements
+
+- The CI pipeline must compile the Rust daemon for all six native targets using cross-compilation.
+- The CI pipeline must compile the WASM target using `cargo build --target wasm32-wasip1-threads` followed by `wasm-opt -Oz`.
+- The CI pipeline must build each platform VSIX using `@vscode/vsce package --target <platform> --no-dependencies` to exclude devDependencies and ensure the VSIX contains only bundled runtime artifacts.
+- The CI pipeline must measure the size of each output VSIX and fail the publish step if any target exceeds 20 MB (enforcing AC-001 and NFR-007).
+- Each platform VSIX must be built and published in the same CI run to ensure version consistency across all targets.
+- The integration test suite and all five acceptance criteria must pass before any VSIX is published.
+
+---
+
+## 13. Constraints and Assumptions
+
+### 13.1 Technical Constraints
+
+**C-001:** `oxc_minifier` is currently in alpha status (v0.133.0 as of April 2026). The team accepts this for v1.0 because size estimation accuracy of approximately plus or minus 2 percent is acceptable for an inline hint tool. The team must adopt a stable release of `oxc_minifier` when one becomes available and re-run the integration test suite to confirm no accuracy regressions. **Fallback strategy:** If `oxc_minifier` exhibits correctness regressions in the integration test suite, the team must pin to the last known-good version and file an upstream issue. No release VSIX will ship with a minifier version that fails the integration suite. As a last resort, the daemon may skip minification entirely and report only raw + compressed sizes, with a `(no-minify)` suffix on decorations.
+
+**C-002:** The `oxc-parser` npm package (NAPI binding, v0.133.0) uses native bindings and does NOT work in browser environments. The deprecated `@oxc-parser/wasm` package must not be used due to its deprecated status. For VS Code for the Web, the extension enters degraded mode with no parsing capability. The Rust-side `oxc_parser` crate version (v0.133.0) and the npm `oxc-parser` package version are released from the same OXC monorepo on the same cadence; both must be pinned to the same version.
+
+**C-003:** Rolldown's Rust embedding API (`rolldown_core` on crates.io) does not yet expose a stable public interface for programmatic use as a Rust library. Rolldown is therefore not used directly in this project. A custom module graph walker is implemented instead using OXC primitives. This constraint must be re-evaluated when Rolldown's Rust API stabilises. See Appendix C: Technology Watch.
+
+**C-004:** The WASM daemon binary targets `wasm32-wasip1-threads`, which is an experimental Rust/LLVM target. Thread support requires `SharedArrayBuffer` and cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`). The WASM binary must be compiled with an explicit `--max-memory` linker flag set to at least `67108864` (64 MB) to provide sufficient headroom for Rayon's thread stacks; larger values may be needed if the module graph walker exceeds this during deep dependency trees. In VS Code for the Web (browser), `SharedArrayBuffer` availability is not guaranteed; therefore, the WASM tier is restricted to VS Code Desktop only. VS Code for the Web falls to Tier 3 (degraded mode). The `wasi-threads` proposal used by this target is considered legacy; the industry is transitioning toward the Component Model. See Appendix C: Technology Watch.
+
+### 13.2 Out-of-Scope Decisions
+
+- **napi-rs native addon:** Rejected because a panic in a native addon crashes the entire VS Code extension host. See Section 4.5.
+- **SWC minifier:** Rejected because its binary adds approximately 25 to 27 MB per target, violating NFR-007. See Section 4.2.
+- **JSON over IPC:** Rejected in favour of MessagePack for performance reasons. See Section 4.4.
+- **ESBuild:** Rejected because it is written in Go and requires managing a separate WASM execution layer from Rust. See Section 4.1.
+- **`@oxc-parser/wasm`:** Deprecated npm package. Replaced by `oxc-parser` (NAPI). See Section 4.3.
+
+### 13.3 Assumptions
+
+- Users have npm, yarn, or pnpm with hoisting installed and have run a package install command. The extension does not install packages itself.
+- The VS Code global storage path is writable. If it is not, the persistent cache is skipped gracefully and all results are held in memory for the duration of the session.
+- Packages shipping only CommonJS will produce less accurate tree-shaken sizes. The extension will display a `CJS` indicator next to the size for these packages.
+- The extension assumes `node_modules` is fully installed. It will not trigger or assist with package installation.
+- The user's environment is VS Code Desktop for full functionality. VS Code for the Web provides degraded mode only.
+
+---
+
+## 14. Appendix A: File Structure
+
+```
+import-lens/
+├── package.json
+├── tsconfig.json
+├── tsdown.config.ts
+├── Cargo.toml                         # Workspace root
+├── Cargo.lock
+│
+├── extension/                         # TypeScript extension host
+│   ├── src/
+│   │   ├── extension.ts               # activate() / deactivate(); sends Shutdown on deactivate
+│   │   ├── listener.ts                # onDidChangeTextDocument, debounce
+│   │   ├── parser.ts                  # oxc-parser (NAPI) import extraction via parseSync()
+│   │   ├── resolver.ts                # package.json version resolution (handles scoped packages)
+│   │   ├── ipc/
+│   │   │   ├── client.ts              # Socket/pipe connection management
+│   │   │   ├── protocol.ts            # BatchRequest / BatchResponse / Hello / CacheInvalidate / Shutdown types
+│   │   │   └── codec.ts               # MessagePack encode/decode
+│   │   ├── watcher.ts                 # vscode.workspace.createFileSystemWatcher; sends CacheInvalidate IPC messages
+│   │   ├── ui/
+│   │   │   ├── decorations.ts         # End-of-line text decorations
+│   │   │   ├── inlayHints.ts          # InlayHintsProvider for inlayHint display mode
+│   │   │   ├── codelens.ts            # Code lens provider
+│   │   │   ├── statusbar.ts           # Status bar item
+│   │   │   └── report.ts              # Show Report webview
+│   │   ├── logger.ts                  # OutputChannel-based diagnostic logger (FR-040)
+│   │   └── config.ts                  # VS Code settings access
+│   └── dist/
+│       └── extension.js               # tsdown bundle output
+│
+├── daemon/                            # Rust daemon crate
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs                    # Entry point, socket server, Tokio runtime
+│       ├── ipc/
+│       │   ├── mod.rs
+│       │   ├── server.rs              # Unix socket / named pipe listener
+│       │   └── protocol.rs            # All IPC message serde types (Hello/Batch/CacheInvalidate/Shutdown)
+│       ├── pipeline/
+│       │   ├── mod.rs
+│       │   ├── resolve.rs             # oxc_resolver usage
+│       │   ├── graph.rs               # Module graph walker (oxc_parser + oxc_resolver + oxc_semantic)
+│       │   ├── treeshake.rs           # Reachability analysis and dead code marking
+│       │   ├── transform.rs           # oxc_transformer (TypeScript / JSX stripping)
+│       │   ├── minify.rs              # oxc_minifier + oxc_mangler usage
+│       │   ├── codegen.rs             # oxc_codegen AST-to-string emission
+│       │   └── compress.rs            # flate2 + brotli + zstd (nested rayon::join)
+│       ├── cache/
+│       │   ├── mod.rs
+│       │   ├── memory.rs              # papaya HashMap (pinning API)
+│       │   └── persistent.rs          # redb read/write
+│       ├── lifecycle.rs                # Graceful shutdown, self-recycle (NFR-004a), recycle counter write (NFR-004b)
+│       └── prefetch.rs                # Background pre-warm logic
+│
+├── bin/                               # Native daemon binaries (gitignored, CI-populated)
+│   ├── linux-x64/
+│   │   └── import-lens-daemon
+│   ├── linux-arm64/
+│   │   └── import-lens-daemon
+│   ├── darwin-x64/
+│   │   └── import-lens-daemon
+│   ├── darwin-arm64/
+│   │   └── import-lens-daemon
+│   ├── win32-x64/
+│   │   └── import-lens-daemon.exe
+│   └── win32-arm64/
+│       └── import-lens-daemon.exe
+│
+├── wasm/                              # WASM fallback binary (gitignored, CI-populated)
+│   └── import-lens-daemon.wasm
+│
+└── tests/
+    ├── fixtures/
+    │   └── packages/                  # Pinned package.json fixtures for test stability
+    └── integration/
+        ├── lodash_es.test.ts
+        ├── date_fns.test.ts
+        ├── zod.test.ts
+        ├── react.test.ts
+        └── uuid.test.ts
+```
+
+---
+
+## 15. Appendix B: Decision Log
+
+| ID    | Decision                                                                                  | Rationale                                                                                                                                                                                                                                                                                             | Alternatives Considered                                                                                                                                             |
+| ----- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D-001 | Separate daemon process over napi-rs native addon                                         | A panic in a native addon crashes the VS Code extension host. A separate process isolates failures completely.                                                                                                                                                                                        | napi-rs native addon (rejected: crash risk to editor)                                                                                                               |
+| D-002 | OXC for the full pipeline (parse, resolve, semantic, tree-shake, minify, mangle, codegen) | Single AST representation shared across all stages eliminates re-parsing overhead. All OXC crates are embeddable in Rust. OXC is used internally by Rolldown and Vite 8. Note: OXC does not provide a standalone tree-shaker; a custom module graph walker is required.                               | Rolldown Rust API (rejected: no stable embedding API); ESBuild (rejected: written in Go, requires separate WASM layer from Rust)                                    |
+| D-003 | oxc_minifier over swc_core                                                                | SWC platform binaries are approximately 25 to 27 MB per target, violating the 20 MB VSIX limit. For size estimation, 1-2% accuracy variance is acceptable.                                                                                                                                            | swc_core (rejected: distribution size); Terser (rejected: requires Node.js subprocess)                                                                              |
+| D-004 | MessagePack over JSON for IPC                                                             | Payloads typically 20-40% smaller than JSON. In the Rust rmp-serde path, deserialization is consistently faster. Meaningful for batch responses of 20+ imports.                                                                                                                                       | JSON (rejected: performance); Protocol Buffers (rejected: schema overhead disproportionate for a two-message protocol)                                              |
+| D-005 | `oxc-parser` (NAPI) over TypeScript Compiler API                                          | Returns ESM import info directly via `result.module.staticImports` without AST traversal. No `typescript` package dependency. Handles malformed code via error recovery. Uses native NAPI bindings for high performance. The deprecated `@oxc-parser/wasm` package is not used.                       | TypeScript Compiler API (rejected: heavy, not WASM-compatible); `@oxc-parser/wasm` (rejected: deprecated); Regex (rejected: fails on multi-line and complex syntax) |
+| D-006 | papaya over DashMap for in-memory cache                                                   | papaya is lock-free and deadlock-safe. DashMap uses sharded RwLock which can deadlock when holding references. The import size workload is read-heavy after initial warmup.                                                                                                                           | DashMap (rejected: locking semantics risk for read-heavy pattern)                                                                                                   |
+| D-007 | redb over sled for persistent cache                                                       | redb hit 1.0 stable with a committed stable file format. sled has never shipped 1.0 and its on-disk format remains unstable.                                                                                                                                                                          | sled (rejected: not stable); rusqlite/SQLite (viable but adds a C FFI dependency)                                                                                   |
+| D-008 | Three compression formats (gzip, brotli, zstd)                                            | All three are in common production use as of 2026. CDNs serve all three. Running them in parallel with nested rayon::join adds negligible latency.                                                                                                                                                    | Gzip only (rejected: brotli and zstd offer meaningfully better ratios); Brotli only (rejected: zstd is now mainstream)                                              |
+| D-009 | Platform-specific VSIX distribution                                                       | Users download only the binary for their own platform. Each VSIX is 10-13 MB rather than a single 120+ MB universal package.                                                                                                                                                                          | Universal VSIX (rejected: unacceptable total size); Runtime download of daemon binary (rejected: requires network at activation)                                    |
+| D-010 | Custom module graph walker over Rolldown embedding                                        | Rolldown does not expose a stable Rust API (C-003). Building a custom walker from `oxc_parser` + `oxc_resolver` + `oxc_semantic` provides full control over reachability analysis and side-effect tracking.                                                                                           | Rolldown Rust API (rejected: unstable); Skip tree-shaking (rejected: inaccurate sizes for named imports)                                                            |
+| D-011 | Inlay Hints API as a display mode                                                         | VS Code Inlay Hints API is the modern, performant standard for inline hints. It supports native user toggling and integrates better than decoration-based rendering.                                                                                                                                  | EditorDecorationType only (viable but less performant); CodeLens only (rejected: takes full line, less space-efficient)                                             |
+| D-012 | TypeScript 6.x over TypeScript 5.x                                                        | TS 6.0 is the current stable release (March 2026). It modernizes tsconfig defaults, requires explicit ambient type inclusion (`types: ["node", "vscode"]` for this extension), deprecates legacy patterns, and serves as the migration bridge to the native Go-based TS 7.0. Starting on TS 6 now avoids a painful double-migration later. | TypeScript 5.x (rejected: legacy defaults, will require migration to 6.x before 7.x anyway)                                                                         |
+| D-013 | `request_id` field in BatchRequest/BatchResponse for cancellation | Timing-based heuristics for discarding stale responses are fragile when two requests are fired within milliseconds of each other. An explicit monotonic ID makes the discard decision unambiguous at zero protocol cost. | Timing-only approach (rejected: race condition on fast edits); sequence number on daemon side only (rejected: daemon has no state to track which request is current) |
+| D-014 | `CacheInvalidateAll` as a distinct message type | Sending one `CacheInvalidate` per package when `node_modules` is deleted would produce hundreds of IPC messages in a large project. A single bulk message is more efficient and avoids buffer pressure on the socket. The 20-package threshold is a pragmatic cutoff; below it, per-package messages give the daemon more granular invalidation information. | Always use bulk (rejected: loses granularity for small changes); always use per-package (rejected: floods socket on full reinstall) |
+
+---
+
+## 16. Appendix C: Technology Watch
+
+This table tracks components that are currently used with known limitations, or where a better alternative exists but is not yet stable enough for production use. Each item should be re-evaluated at the specified cadence.
+
+| Component                           | Current State                                                                                                        | Watch For                                                                                                                                          | Impact on ImportLens                                                                                                                                                                                                              | Re-evaluate           |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| `oxc_minifier`                      | Alpha (v0.133.0). Produces 1-2% variance from SWC.                                                                   | Stable 1.0 release.                                                                                                                                | Adopt stable release; re-run integration suite to confirm no regressions. A stable minifier removes the need for C-001 fallback strategy.                                                                                         | Every OXC release     |
+| `oxc_mangler`                       | Separate crate (v0.133.x), recently split from `oxc_minifier`.                                                       | API stabilization, potential re-merge into `oxc_minifier`.                                                                                         | Minor import path changes if crates are merged.                                                                                                                                                                                   | Every OXC release     |
+| `oxc_resolver`                      | v11.20.0. Separate repository (`oxc-project/oxc-resolver`), versioned independently from the OXC monorepo. Currently on major version 11. | Major version bump (e.g. 12.x); breaking changes to `ResolverOptions` or the `resolve()` API. | May require `Cargo.toml` update and code changes in `resolve.rs`. Upgrade separately from the OXC monorepo batch and run integration suite before merging. | Each release          |
+| Rolldown Rust API (`rolldown_core`) | No stable public API. ImportLens uses a custom module graph walker instead.                                          | Stable embeddable Rust crate on crates.io with tree-shaking API.                                                                                   | Would replace the entire custom module graph walker (`graph.rs` + `treeshake.rs`), significantly reducing code and improving accuracy. This is the single highest-impact migration.                                               | Quarterly             |
+| `wasm32-wasip1-threads`             | Experimental Rust/LLVM target. Works on VS Code Desktop but requires `SharedArrayBuffer` and cross-origin isolation. | WASI Preview 2 / Component Model threading (`wasm32-wasip2`). The `wasi-threads` proposal is legacy; `shared-everything-threads` is the successor. | May require retargeting the WASM build when new standards stabilize. Current approach will continue working on VS Code Desktop.                                                                                                   | Semi-annually         |
+| `@vscode/wasm-wasi-core`            | Supports WASI Preview 1 with experimental thread support.                                                            | WASI Preview 2 support, Component Model integration, improved `SharedArrayBuffer` ergonomics.                                                      | Better thread reliability and broader environment support (including VS Code Web).                                                                                                                                                | Semi-annually         |
+| `oxc-parser` (npm, NAPI)            | v0.133.0. Active, replaces deprecated `@oxc-parser/wasm`. No WASM/browser support.                                   | Potential official WASM sub-export (e.g. `oxc-parser/wasm`) or Component Model-based distribution.                                                 | Would restore parsing capability in VS Code for the Web, upgrading it from Tier 3 (degraded) to Tier 2.                                                                                                                           | Quarterly             |
+| `papaya`                            | v0.2.4. Pre-1.0 but actively maintained. Uses seize-based GC.                                                        | 1.0 stable release; API changes to pinning semantics.                                                                                              | Minor migration effort if pinning API changes. Lock-free design is correct for the workload.                                                                                                                                      | Semi-annually         |
+| VS Code Inlay Hints API             | Stable. Used as an optional display mode.                                                                            | Enhanced styling support (colors, icons), positioning improvements.                                                                                | Richer size display within inlay hints. Currently limited to plain text.                                                                                                                                                          | With VS Code releases |
+| `redb`                              | v4.x stable. ACID, pure Rust.                                                                                        | Major version bumps; potential API changes.                                                                                                        | Migration effort proportional to API surface changes. File format is committed stable. Cache schema versioning (FR-026a) ensures seamless upgrades.                                                                               | Annually              |
+| TypeScript 7.0 ("Corsa")            | Not yet released. Native Go-based compiler rewrite by Microsoft. TS 6.x is the bridge release.                       | Stable release on npm. Expected to provide 10x+ type-checking speedup.                                                                             | Requires `tsconfig.json` to already use TS 6 modern defaults (which ImportLens does). Migration should be straightforward: update `devDependency`, run `tsc --noEmit`, fix any new diagnostics. No runtime code changes expected. | On release            |
+| VS Code engine version (`engines.vscode`) | Currently `^1.100.0`. All required APIs (InlayHintsProvider, FileSystemWatcher, TelemetryLogger, etc.) available at this version. | New stable APIs that would benefit ImportLens: richer decoration API, improved CodeLens rendering, enhanced inlay hint styling. | Raise `engines.vscode` and `@types/vscode` in tandem. Any bump excludes users on older VS Code versions; evaluate installed-base data before bumping. | Annually              |

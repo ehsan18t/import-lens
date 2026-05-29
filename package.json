@@ -1,0 +1,141 @@
+{
+  "name": "import-lens",
+  "displayName": "ImportLens",
+  "description": "VS Code import size analyzer backed by a native Rust daemon.",
+  "version": "0.1.0",
+  "publisher": "importlens",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.3",
+  "main": "./extension/dist/extension.cjs",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascriptreact",
+    "onCommand:importLens.clearCache",
+    "onCommand:importLens.showLogs",
+    "onCommand:importLens.showReport"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "importLens.clearCache",
+        "title": "ImportLens: Clear Cache",
+        "category": "ImportLens"
+      },
+      {
+        "command": "importLens.showLogs",
+        "title": "ImportLens: Show Logs",
+        "category": "ImportLens"
+      },
+      {
+        "command": "importLens.showReport",
+        "title": "ImportLens: Show Report",
+        "category": "ImportLens"
+      }
+    ],
+    "configuration": {
+      "title": "ImportLens",
+      "properties": {
+        "importLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Toggle ImportLens on or off."
+        },
+        "importLens.display": {
+          "type": "string",
+          "enum": [
+            "minimal",
+            "standard",
+            "verbose",
+            "inlayHint"
+          ],
+          "default": "standard",
+          "description": "Display format for import size annotations."
+        },
+        "importLens.compression": {
+          "type": "string",
+          "enum": [
+            "brotli",
+            "gzip",
+            "zstd",
+            "all"
+          ],
+          "default": "brotli",
+          "description": "Primary compression format shown in minimal and standard displays."
+        },
+        "importLens.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "minimum": 50,
+          "maximum": 5000,
+          "description": "Milliseconds to wait after the last document change before analyzing imports."
+        },
+        "importLens.showWarnings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show warning indicators for imports that may not tree-shake accurately."
+        },
+        "importLens.useCodeLens": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use CodeLens instead of end-of-line decorations. Ignored when display is inlayHint."
+        },
+        "importLens.enableDiskCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Persist computed sizes to disk across editor restarts."
+        },
+        "importLens.logLevel": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warn",
+            "info",
+            "debug"
+          ],
+          "default": "error",
+          "description": "Logging verbosity for the ImportLens output channel."
+        }
+      }
+    }
+  },
+  "files": [
+    "extension/dist/extension.cjs",
+    "bin/",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "pnpm test:ts && pnpm test:rust",
+    "test:ts": "tsc -p tsconfig.test.json && node --test \"extension/test-dist/**/*.test.js\"",
+    "test:rust": "cargo test --workspace",
+    "build:daemon": "cargo build -p import-lens-daemon --release",
+    "copy:daemon:win32-x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/copy-daemon.ps1 -Target win32-x64",
+    "hash:daemon": "node scripts/generate-daemon-hashes.mjs",
+    "package:win32-x64": "pnpm build && pnpm build:daemon && pnpm copy:daemon:win32-x64 && pnpm hash:daemon && vsce package --target win32-x64 --no-dependencies"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "3.1.3",
+    "oxc-parser": "0.133.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.3",
+    "@types/vscode": "1.100.0",
+    "@vscode/vsce": "3.9.1",
+    "tsdown": "0.22.1",
+    "typescript": "6.0.3"
+  }
+}
+
