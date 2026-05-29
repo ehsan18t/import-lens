@@ -540,3 +540,43 @@ fn analyze_import_resolves_top_level_condition_map_exports() {
     assert!(result.raw_bytes > 0);
     assert_eq!(result.is_cjs, false);
 }
+
+#[test]
+fn analyze_import_rejects_typescript_entry_files() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "ts-pkg",
+        r#"{"version":"1.0.0","main":"src/index.ts"}"#,
+        "// js entry",
+    );
+    write_package_file(
+        &workspace,
+        "ts-pkg",
+        "src/index.ts",
+        "export const x: number = 42;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "ts-pkg".to_owned(),
+        package_name: "ts-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(result.error.is_some());
+    assert!(
+        result
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("TypeScript source file")
+    );
+}

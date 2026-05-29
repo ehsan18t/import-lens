@@ -415,7 +415,7 @@ fn resolve_file_candidate(
         candidate.join("index.cjs"),
     ];
 
-    candidates
+    let found_path = candidates
         .iter()
         .find(|path| path.is_file())
         .cloned()
@@ -430,7 +430,23 @@ fn resolve_file_candidate(
                     .map(|path| format!("candidate: {}", path.display()))
                     .collect(),
             )
-        })
+        })?;
+
+    let path_str = found_path.to_string_lossy();
+    if path_str.ends_with(".ts") || path_str.ends_with(".tsx") {
+        return Err(error_with_context(
+            "entry_resolution",
+            format!(
+                "resolved entry is a TypeScript source file ({}) which cannot be analyzed",
+                found_path.display()
+            ),
+            context,
+            request,
+            vec![format!("resolved_entry: {}", found_path.display())],
+        ));
+    }
+
+    Ok(found_path)
 }
 
 fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
