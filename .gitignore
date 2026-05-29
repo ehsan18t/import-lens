@@ -9,3 +9,5 @@ wasm/
 *.log
 .worktrees/
 .vsix-staging/
+
+daemon/tests/fixtures/packages/

@@ -3,6 +3,7 @@ use import_lens_daemon::pipeline::analyze::{AnalysisContext, analyze_import};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Once,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -32,6 +33,156 @@ fn write_package_file(workspace: &Path, package_name: &str, relative_path: &str,
     fs::create_dir_all(path.parent().expect("fixture file should have a parent"))
         .expect("fixture directory should be created");
     fs::write(path, source).expect("fixture file should be written");
+}
+
+static FIXTURES_EXTRACTED: Once = Once::new();
+
+fn extract_fixture_archives() {
+    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures");
+        
+    let archive = fixtures_dir.join("packages.zip");
+    let target = fixtures_dir.join("packages");
+
+    if archive.exists() && !target.exists() {
+        let file = fs::File::open(&archive).expect("fixture archive should be readable");
+        let mut zip =
+            zip::ZipArchive::new(file).expect("fixture archive should be a valid zip");
+        zip.extract(&target)
+            .expect("fixture archive should extract successfully");
+    }
+}
+
+fn fixture_workspace(name: &str) -> PathBuf {
+    FIXTURES_EXTRACTED.call_once(extract_fixture_archives);
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("packages")
+        .join(name)
+}
+
+fn import_request(
+    specifier: &str,
+    package_name: &str,
+    version: &str,
+    import_kind: ImportKind,
+    named: &[&str],
+) -> ImportRequest {
+    ImportRequest {
+        specifier: specifier.to_owned(),
+        package_name: package_name.to_owned(),
+        version: version.to_owned(),
+        named: named.iter().map(|name| (*name).to_owned()).collect(),
+        import_kind,
+    }
+}
+
+fn fixture_context(fixture: &Path) -> AnalysisContext {
+    AnalysisContext {
+        workspace_root: fixture.to_path_buf(),
+        active_document_path: fixture.join("src").join("app.ts"),
+    }
+}
+
+fn assert_named_import_is_smaller_than_namespace_import(
+    fixture_name: &str,
+    package_name: &str,
+    version: &str,
+    named_export: &str,
+) {
+    let fixture = fixture_workspace(fixture_name);
+    let context = fixture_context(&fixture);
+
+    let named = analyze_import(
+        &context,
+        &import_request(
+            package_name,
+            package_name,
+            version,
+            ImportKind::Named,
+            &[named_export],
+        ),
+    );
+    let namespace = analyze_import(
+        &context,
+        &import_request(
+            package_name,
+            package_name,
+            version,
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+
+    assert_eq!(named.error, None);
+    assert_eq!(namespace.error, None);
+    assert!(named.brotli_bytes > 0);
+    assert!(namespace.brotli_bytes > 0);
+    assert!(
+        named.brotli_bytes < namespace.brotli_bytes,
+        "named import should be smaller than namespace import: named={named:?}, namespace={namespace:?}",
+    );
+}
+
+#[test]
+fn analyze_lodash_named_import_is_smaller_than_namespace_import() {
+    assert_named_import_is_smaller_than_namespace_import(
+        "lodash-es@4.17.21",
+        "lodash-es",
+        "4.17.21",
+        "debounce",
+    );
+}
+
+#[test]
+fn analyze_date_fns_named_import_is_smaller_than_namespace_import() {
+    assert_named_import_is_smaller_than_namespace_import(
+        "date-fns@4.1.0",
+        "date-fns",
+        "4.1.0",
+        "format",
+    );
+}
+
+#[test]
+fn analyze_uuid_named_import_is_smaller_than_namespace_import() {
+    assert_named_import_is_smaller_than_namespace_import("uuid@13.0.0", "uuid", "13.0.0", "v4");
+}
+
+#[test]
+fn analyze_react_default_import_is_conservative_commonjs() {
+    let fixture = fixture_workspace("react@19.2.3");
+    let context = fixture_context(&fixture);
+    let result = analyze_import(
+        &context,
+        &import_request("react", "react", "19.2.3", ImportKind::Default, &[]),
+    );
+
+    assert_eq!(result.error, None);
+    assert!(result.brotli_bytes > 0);
+    assert!(result.side_effects);
+    assert!(!result.truly_treeshakeable);
+    assert!(
+        result.is_cjs,
+        "react default entry should be reported as conservative CommonJS: {result:?}",
+    );
+}
+
+#[test]
+fn analyze_zod_namespace_import_measures_full_module_entry() {
+    let fixture = fixture_workspace("zod@4.1.13");
+    let context = fixture_context(&fixture);
+    let result = analyze_import(
+        &context,
+        &import_request("zod", "zod", "4.1.13", ImportKind::Namespace, &[]),
+    );
+
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(result.brotli_bytes > 0);
+    assert!(!result.truly_treeshakeable);
 }
 
 #[test]
