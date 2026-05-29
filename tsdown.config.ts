@@ -9,7 +9,9 @@ export default defineConfig({
   sourcemap: false,
   dts: false,
   deps: {
-    neverBundle: ["vscode"],
+    alwaysBundle: ["@msgpack/msgpack"],
+    neverBundle: ["vscode", "oxc-parser"],
+    onlyBundle: ["@msgpack/msgpack"],
   },
   outputOptions: {
     entryFileNames: "extension.cjs",
