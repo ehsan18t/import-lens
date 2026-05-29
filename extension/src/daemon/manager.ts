@@ -19,6 +19,10 @@ export class DaemonManager implements vscode.Disposable {
   #process: ChildProcessWithoutNullStreams | null = null;
   #client: IpcClient | null = null;
   #state: DaemonState = "unavailable";
+  #isDisposed = false;
+  #restarts = 0;
+  #restartTimer: NodeJS.Timeout | null = null;
+  #stabilityTimer: NodeJS.Timeout | null = null;
 
   constructor(context: vscode.ExtensionContext, logger: ImportLensLogger) {
     this.#context = context;
@@ -30,6 +34,8 @@ export class DaemonManager implements vscode.Disposable {
   }
 
   async start(): Promise<DaemonState> {
+    if (this.#isDisposed) return "unavailable";
+
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
     if (!workspaceRoot) {
@@ -71,20 +77,57 @@ export class DaemonManager implements vscode.Disposable {
 
     this.#process.once("exit", (code, signal) => {
       this.#logger.warn(`Daemon exited with code ${code ?? "null"} signal ${signal ?? "null"}.`);
-      this.#client?.dispose();
-      this.#client = null;
-      this.#process = null;
-      this.#state = "unavailable";
+      this.#handleCrash();
     });
 
-    this.#client = await IpcClient.connect(pipeName);
+    try {
+      this.#client = await IpcClient.connect(pipeName);
+    } catch (error) {
+      this.#logger.warn(`Failed to connect to daemon: ${error instanceof Error ? error.message : String(error)}`);
+      this.#handleCrash();
+      return this.#state;
+    }
+
     this.#client.on("disconnect", (error) => {
       this.#logger.warn(`IPC disconnected: ${error instanceof Error ? error.message : String(error)}`);
-      this.#state = "unavailable";
+      this.#handleCrash();
     });
     this.#client.send(this.#hello(workspaceRoot));
     this.#state = "ready";
+
+    if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
+    this.#stabilityTimer = setTimeout(() => {
+      this.#restarts = 0;
+    }, 5000);
+
     return this.#state;
+  }
+
+  #handleCrash(): void {
+    if (this.#isDisposed || this.#restartTimer) return;
+    this.#cleanup();
+
+    if (this.#restarts >= 5) {
+      this.#logger.error("Daemon crashed too many times. Giving up.");
+      this.#state = "unavailable";
+      return;
+    }
+
+    this.#restarts++;
+    const delay = Math.min(250 * (2 ** this.#restarts), 10000);
+    this.#logger.warn(`Restarting daemon in ${delay}ms (attempt ${this.#restarts})...`);
+    this.#restartTimer = setTimeout(() => {
+      this.#restartTimer = null;
+      if (!this.#isDisposed) void this.start();
+    }, delay);
+  }
+
+  #cleanup(): void {
+    this.#client?.dispose();
+    this.#client = null;
+    this.#process?.kill();
+    this.#process = null;
+    this.#state = "unavailable";
   }
 
   async sendBatch(request: BatchRequest): Promise<BatchResponse | null> {
@@ -104,9 +147,12 @@ export class DaemonManager implements vscode.Disposable {
   }
 
   async dispose(): Promise<void> {
+    this.#isDisposed = true;
+    if (this.#restartTimer) clearTimeout(this.#restartTimer);
+    if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
+    
     this.#client?.send({ type: "shutdown" });
-    this.#client?.dispose();
-    this.#process?.kill();
+    this.#cleanup();
   }
 
   async #verifyBinary(relativePath: string, binaryPath: string): Promise<boolean> {
