@@ -169,18 +169,18 @@ git commit -m "feat: register component documents for analysis" -m "Add Svelte a
 ### Task 2: Extract Component Script Regions
 
 **Files:**
-- Create: `extension/src/imports/scriptBlocks.ts`
+- Create: `extension/src/imports/scriptRegions.ts`
 - Modify: `extension/src/imports/parser.ts`
-- Test: `extension/test/imports/scriptBlocks.test.ts`
+- Test: `extension/test/imports/scriptRegions.test.ts`
 
 - [ ] **Step 1: Write failing script region extraction tests**
 
-Create `extension/test/imports/scriptBlocks.test.ts`:
+Create `extension/test/imports/scriptRegions.test.ts`:
 
 ```typescript
 import assert from "node:assert/strict";
 import test from "node:test";
-import { scriptRegionsForDocument } from "../../src/imports/scriptBlocks.js";
+import { scriptRegionsForDocument } from "../../src/imports/scriptRegions.js";
 
 test("scriptRegionsForDocument extracts Svelte TypeScript script content with absolute offset", () => {
   const source = [
@@ -269,11 +269,11 @@ Run:
 pnpm test:ts
 ```
 
-Expected: TypeScript fails because `extension/src/imports/scriptBlocks.ts` does not exist.
+Expected: TypeScript fails because `extension/src/imports/scriptRegions.ts` does not exist.
 
 - [ ] **Step 3: Implement script region extraction**
 
-Create `extension/src/imports/scriptBlocks.ts`:
+Create `extension/src/imports/scriptRegions.ts`:
 
 ```typescript
 import type { ParserOptions } from "oxc-parser";
@@ -414,7 +414,7 @@ Expected: script region tests pass; parser tests may still fail for Svelte/Astro
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add extension/src/imports/scriptBlocks.ts extension/test/imports/scriptBlocks.test.ts
+git add extension/src/imports/scriptRegions.ts extension/test/imports/scriptRegions.test.ts
 git commit -m "feat: extract component script regions" -m "Add a lightweight script region extractor for plain JS/TS files, Svelte scripts, Astro frontmatter, and processed Astro client scripts with absolute document offsets and runtime metadata."
 ```
 
@@ -557,7 +557,7 @@ Expected: component parser tests fail because `extractRuntimeImports()` still pa
 In `extension/src/imports/parser.ts`:
 
 1. Import `ScriptRegion` and `scriptRegionsForDocument`.
-2. Remove the local `languageFromFilename` function if Task 2 already moved that responsibility to `scriptBlocks.ts`.
+2. Remove the local `languageFromFilename` function if Task 2 already moved that responsibility to `scriptRegions.ts`.
 3. Change `createDetectedImport()` to accept an offset and use absolute offsets.
 4. Add `runtime` to `DetectedImport` and set it from the script region.
 5. Parse each script region separately and combine results.
@@ -565,7 +565,7 @@ In `extension/src/imports/parser.ts`:
 Use this shape:
 
 ```typescript
-import { scriptRegionsForDocument, type ScriptRegion } from "./scriptBlocks.js";
+import { scriptRegionsForDocument, type ScriptRegion } from "./scriptRegions.js";
 ```
 
 Change `createDetectedImport()`:
