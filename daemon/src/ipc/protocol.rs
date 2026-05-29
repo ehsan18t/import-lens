@@ -25,6 +25,7 @@ pub struct ImportRequest {
 pub struct BatchRequest {
     pub version: u32,
     pub request_id: u64,
+    pub workspace_root: String,
     pub active_document_path: String,
     pub imports: Vec<ImportRequest>,
 }

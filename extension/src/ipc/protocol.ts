@@ -15,6 +15,7 @@ export interface ImportRequest {
 export interface BatchRequest {
   version: number;
   request_id: number;
+  workspace_root: string;
   active_document_path: string;
   imports: ImportRequest[];
 }

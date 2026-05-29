@@ -34,6 +34,7 @@ fn batch(workspace: &Path, request_id: u64) -> BatchRequest {
     BatchRequest {
         version: 1,
         request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
         active_document_path: workspace
             .join("src")
             .join("index.ts")
@@ -53,7 +54,7 @@ fn batch(workspace: &Path, request_id: u64) -> BatchRequest {
 fn service_processes_batch_and_serves_second_request_from_cache() {
     let workspace = temp_workspace();
     write_package(&workspace);
-    let service = ImportLensService::new(workspace.clone());
+    let service = ImportLensService::new();
 
     let first = service.handle_batch(batch(&workspace, 7));
     let second = service.handle_batch(batch(&workspace, 8));
@@ -69,7 +70,7 @@ fn service_processes_batch_and_serves_second_request_from_cache() {
 fn service_cache_invalidation_removes_matching_package_entries() {
     let workspace = temp_workspace();
     write_package(&workspace);
-    let service = ImportLensService::new(workspace.clone());
+    let service = ImportLensService::new();
 
     let _ = service.handle_batch(batch(&workspace, 1));
     service.invalidate_package("tiny-lib");

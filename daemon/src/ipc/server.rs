@@ -12,14 +12,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ServerOptions;
 
 #[cfg(windows)]
-pub async fn run_server(pipe_name: &str, workspace_root: PathBuf) -> Result<(), Box<dyn Error>> {
+pub async fn run_server(pipe_name: &str, _workspace_root: PathBuf) -> Result<(), Box<dyn Error>> {
     let mut pipe = ServerOptions::new()
         .first_pipe_instance(true)
         .create(pipe_name)?;
     pipe.connect().await?;
 
     let mut decoder = FrameDecoder::default();
-    let mut service = ImportLensService::new(workspace_root);
+    let mut service = ImportLensService::new();
     let mut hello_received = false;
     let mut buffer = [0_u8; 16 * 1024];
 
@@ -34,8 +34,8 @@ pub async fn run_server(pipe_name: &str, workspace_root: PathBuf) -> Result<(), 
             let message = decode_payload::<ClientMessage>(&payload)?;
 
             match message {
-                ClientMessage::Hello(hello) => {
-                    service = ImportLensService::new(PathBuf::from(hello.workspace_root));
+                ClientMessage::Hello(_) => {
+                    service = ImportLensService::new();
                     hello_received = true;
                 }
                 ClientMessage::Batch(request) if hello_received => {
@@ -52,7 +52,7 @@ pub async fn run_server(pipe_name: &str, workspace_root: PathBuf) -> Result<(), 
                     return Ok(());
                 }
                 ClientMessage::Batch(request) => {
-                    let response = ImportLensService::new(PathBuf::new()).handle_batch(request);
+                    let response = ImportLensService::new().handle_batch(request);
                     pipe.write_all(&encode_frame(&response)?).await?;
                 }
                 ClientMessage::CacheInvalidate(_) | ClientMessage::CacheInvalidateAll(_) => {}

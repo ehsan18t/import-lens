@@ -103,9 +103,13 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#statusBar.setStatus("computing");
 
     try {
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+      const workspaceRoot = workspaceFolder?.uri.fsPath ?? document.uri.fsPath;
+
       const response = await this.#daemon.sendBatch({
         version: protocolVersion,
         request_id: requestId,
+        workspace_root: workspaceRoot,
         active_document_path: document.fileName,
         imports: requestImports,
       });

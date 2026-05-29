@@ -11,14 +11,12 @@ use std::path::PathBuf;
 
 #[derive(Debug, Default)]
 pub struct ImportLensService {
-    workspace_root: PathBuf,
     cache: ImportCache,
 }
 
 impl ImportLensService {
-    pub fn new(workspace_root: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
-            workspace_root,
             cache: ImportCache::default(),
         }
     }
@@ -42,7 +40,7 @@ impl ImportLensService {
         }
 
         let context = AnalysisContext {
-            workspace_root: self.workspace_root.clone(),
+            workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
         let imports = request
