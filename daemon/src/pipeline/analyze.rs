@@ -41,6 +41,31 @@ fn analyze_import_inner(
     let manifest = find_package_manifest(context, request)?;
     let side_effects = side_effects(&manifest.json);
     let (entry_path, is_cjs) = resolve_entry_path(&manifest, context, request)?;
+
+    let metadata = fs::metadata(&entry_path).map_err(|error| {
+        error_with_context(
+            "entry_metadata",
+            format!(
+                "failed to stat package entry {}: {error}",
+                entry_path.display()
+            ),
+            context,
+            request,
+            vec![format!("entry_path: {}", entry_path.display())],
+        )
+    })?;
+
+    let max_size = 5 * 1024 * 1024;
+    if metadata.len() > max_size {
+        return Err(error_with_context(
+            "file_size_limit",
+            format!("file size {} exceeds 5MB limit", metadata.len()),
+            context,
+            request,
+            vec![format!("entry_path: {}", entry_path.display())],
+        ));
+    }
+
     let source = fs::read_to_string(&entry_path).map_err(|error| {
         error_with_context(
             "entry_read",

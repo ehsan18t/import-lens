@@ -580,3 +580,40 @@ fn analyze_import_rejects_typescript_entry_files() {
             .contains("TypeScript source file")
     );
 }
+
+#[test]
+fn analyze_import_rejects_files_over_size_limit() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "huge-pkg",
+        r#"{"version":"1.0.0","main":"index.js"}"#,
+        "// this will be replaced",
+    );
+
+    // Create a 6MB file
+    let path = workspace
+        .join("node_modules")
+        .join("huge-pkg")
+        .join("index.js");
+    let data = vec![b'a'; 6 * 1024 * 1024];
+    fs::write(&path, &data).expect("huge file should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "huge-pkg".to_owned(),
+        package_name: "huge-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(result.error.is_some());
+    assert!(result.error.as_ref().unwrap().contains("exceeds 5MB limit"));
+}
