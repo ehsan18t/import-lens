@@ -1,5 +1,12 @@
 import * as vscode from "vscode";
 import type { ImportResult } from "../ipc/protocol.js";
+import { copyImportDiagnosticsCommand } from "./diagnostics.js";
+
+const appendCopyDiagnosticsLink = (tooltip: vscode.MarkdownString, result: ImportResult): void => {
+  const args = encodeURIComponent(JSON.stringify([result]));
+  tooltip.isTrusted = { enabledCommands: [copyImportDiagnosticsCommand] };
+  tooltip.appendMarkdown(`[$(copy) Copy diagnostics](command:${copyImportDiagnosticsCommand}?${args})`);
+};
 
 export const tooltipForResult = (result: ImportResult): vscode.MarkdownString => {
   const tooltip = new vscode.MarkdownString(undefined, true);
@@ -7,7 +14,7 @@ export const tooltipForResult = (result: ImportResult): vscode.MarkdownString =>
 
   if (result.error) {
     tooltip.appendMarkdown("ImportLens could not compute this import size.\n\n");
-    tooltip.appendText(result.error);
+    appendCopyDiagnosticsLink(tooltip, result);
     return tooltip;
   }
 

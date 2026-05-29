@@ -337,7 +337,7 @@ This section documents the key architectural decisions made before implementatio
 
 **FR-013** (High) - The extension must implement request cancellation using the `request_id` field present in both `BatchRequest` and `BatchResponse`. Each debounce cycle must increment a monotonic counter and send it as `request_id`. If a response arrives whose `request_id` does not match the most recently sent request, the extension must discard it without updating decorations. This makes cancellation unambiguous regardless of response timing; timing-based heuristics must not be used.
 
-**FR-013a** (High) - When the daemon encounters a computation error for one or more imports in a batch, it must return a partial `BatchResponse` containing successful results for all other imports in the same batch. For each failed import, the `ImportResult.error` field must be set to a non-null string describing the failure reason, and all numeric size fields must be set to `0`. The extension host must render a subtle "Size unavailable" decoration for imports whose `ImportResult.error` is non-null, and must not show a user-visible error dialog. The extension host must log the error string to the ImportLens output channel at `warn` level.
+**FR-013a** (High) - When the daemon encounters a computation error for one or more imports in a batch, it must return a partial `BatchResponse` containing successful results for all other imports in the same batch. For each failed import, the `ImportResult.error` field must be set to a non-null string describing the failure reason, `ImportResult.diagnostics` must include at least one structured diagnostic entry with the failing stage and real daemon context, and all numeric size fields must be set to `0`. The extension host must render a subtle "Size unavailable" decoration for imports whose `ImportResult.error` is non-null, and must not show a user-visible error dialog. The extension host must keep raw diagnostic details out of the inline UI while making them copyable from the hover.
 
 **FR-014** (High) - On socket disconnect, the extension must discard any stale MessagePack payloads currently in the receive buffer and wait for the next document change event to trigger a fresh request cycle.
 
@@ -446,13 +446,15 @@ If the daemon closes the IPC socket cleanly before the 5-second timeout elapses,
 
 **FR-039a** (Medium) - When `importLens.useCodeLens` is set to `true`, the extension must register a `CodeLensProvider` for the relevant language selectors and render one `CodeLens` per import line, positioned on the line above the import statement. The lens must display the primary compression size and, when clicked, open the full size breakdown in a hover-style `MarkdownString` notification. The `useCodeLens` setting is independent of `importLens.display`; if both `inlayHint` display mode and `useCodeLens` are active simultaneously, the `inlayHint` mode takes precedence and the `CodeLensProvider` must not be registered. The `CodeLens` approach is noted as less space-efficient than end-of-line decorations (see D-011) but is retained as an option for users who prefer it.
 
-**FR-039** (High) - When `importLens.display` is set to `inlayHint`, the extension must register an `InlayHintsProvider` with VS Code for the relevant language selectors. The provider must return one `InlayHint` per import line, positioned after the closing quote of the import specifier, with `kind` set to `undefined` (no `InlayHintKind`) and `paddingLeft` enabled so the hint does not visually run into the string literal. Import sizes are not parameters or types; using `InlayHintKind.Parameter` or `InlayHintKind.Type` would apply the wrong theme colours (`editorInlayHint.parameterForeground` or `editorInlayHint.typeForeground` respectively). An `undefined` kind falls through to the generic `editorInlayHint.foreground`/`editorInlayHint.background`, which theme authors expect for custom inlay hints. Each `InlayHint` must also set `tooltip` to a `MarkdownString` containing the full size breakdown (raw bytes, minified bytes, all three compressed sizes, `side_effects` status, and `is_cjs` indicator) or the daemon error reason when a size is unavailable, so that users can hover for details.
+**FR-039** (High) - When `importLens.display` is set to `inlayHint`, the extension must register an `InlayHintsProvider` with VS Code for the relevant language selectors. The provider must return one `InlayHint` per import line, positioned after the closing quote of the import specifier, with `kind` set to `undefined` (no `InlayHintKind`) and `paddingLeft` enabled so the hint does not visually run into the string literal. Import sizes are not parameters or types; using `InlayHintKind.Parameter` or `InlayHintKind.Type` would apply the wrong theme colours (`editorInlayHint.parameterForeground` or `editorInlayHint.typeForeground` respectively). An `undefined` kind falls through to the generic `editorInlayHint.foreground`/`editorInlayHint.background`, which theme authors expect for custom inlay hints. Each `InlayHint` must also set `tooltip` to a `MarkdownString` containing the full size breakdown (raw bytes, minified bytes, all three compressed sizes, `side_effects` status, and `is_cjs` indicator). When a size is unavailable, the tooltip must show a compact unavailable message and a trusted `Copy diagnostics` command link instead of rendering raw daemon logs inline.
 
 **FR-039b** (Medium) - The extension must include a note in its README and marketplace description that the default `importLens.display: "inlayHint"` mode is preferred for screen-reader accessibility. End-of-line decorations are not exposed to VS Code's accessibility APIs and are therefore invisible to screen readers. The `inlayHint` mode uses the VS Code Inlay Hints API, which is part of the document model and is screen-reader-accessible. The status bar item (FR-033) must always reflect the current operating tier regardless of display mode, as it is accessible to screen readers.
 
 **FR-040** (High) - The extension must create a VS Code `OutputChannel` named `ImportLens` for structured diagnostic logging. Log messages must include ISO 8601 timestamps and a severity level. The verbosity is controlled by the `importLens.logLevel` setting.
 
 **FR-041** (High) - The extension must provide a command `ImportLens: Show Logs` that focuses the `ImportLens` output channel in the VS Code panel. This command must be available from the Command Palette at all times, regardless of the extension's current operating tier.
+
+**FR-041a** (High) - The extension must provide a trusted hover command link and registered command `ImportLens: Copy Import Diagnostics`. When invoked from a failed import hover, it must copy the full `ImportResult.error` and `ImportResult.diagnostics` payload for that package to the clipboard. The hover must not display those raw diagnostics directly.
 
 ---
 
@@ -710,6 +712,13 @@ interface ImportResult {
   truly_treeshakeable: boolean;   // false if named export size is within 5% of full package size
   is_cjs: boolean;                // true if the package has no ESM entry; size is approximate
   error: string | null;           // Non-null if computation failed for this import
+  diagnostics: ImportDiagnostic[]; // Structured daemon diagnostics for copy/debug flows
+}
+
+interface ImportDiagnostic {
+  stage: string;                   // Failing pipeline stage, e.g. "entry_resolution"
+  message: string;                 // Exact daemon failure message for this stage
+  details: string[];               // Context such as active path, package, and candidates
 }
 ```
 
@@ -1113,6 +1122,7 @@ import-lens/
 │   │   │   ├── codelens.ts            # Code lens provider
 │   │   │   ├── statusbar.ts           # Status bar item
 │   │   │   ├── tooltip.ts             # Shared MarkdownString hover content
+│   │   │   ├── diagnostics.ts         # Clipboard formatting for ImportResult diagnostics
 │   │   │   └── report.ts              # Show Report webview
 │   │   ├── logger.ts                  # OutputChannel-based diagnostic logger (FR-040)
 │   │   └── config.ts                  # VS Code settings access

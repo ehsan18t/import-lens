@@ -23,7 +23,8 @@
     "onLanguage:javascriptreact",
     "onCommand:importLens.clearCache",
     "onCommand:importLens.showLogs",
-    "onCommand:importLens.showReport"
+    "onCommand:importLens.showReport",
+    "onCommand:importLens.copyImportDiagnostics"
   ],
   "contributes": {
     "commands": [
@@ -40,6 +41,11 @@
       {
         "command": "importLens.showReport",
         "title": "ImportLens: Show Report",
+        "category": "ImportLens"
+      },
+      {
+        "command": "importLens.copyImportDiagnostics",
+        "title": "ImportLens: Copy Import Diagnostics",
         "category": "ImportLens"
       }
     ],

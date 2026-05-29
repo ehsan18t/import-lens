@@ -1,6 +1,9 @@
 use crate::{
     cache::{key::cache_key_for_import, memory::ImportCache},
-    ipc::protocol::{BatchRequest, BatchResponse, ImportRequest, ImportResult, PROTOCOL_VERSION},
+    ipc::protocol::{
+        BatchRequest, BatchResponse, ImportDiagnostic, ImportRequest, ImportResult,
+        PROTOCOL_VERSION,
+    },
     pipeline::analyze::{AnalysisContext, analyze_import},
 };
 use rayon::prelude::*;
@@ -96,6 +99,11 @@ fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
         side_effects: true,
         truly_treeshakeable: false,
         is_cjs: false,
-        error: Some(message),
+        error: Some(message.clone()),
+        diagnostics: vec![ImportDiagnostic {
+            stage: "protocol".to_owned(),
+            message,
+            details: vec![format!("specifier: {}", request.specifier)],
+        }],
     }
 }

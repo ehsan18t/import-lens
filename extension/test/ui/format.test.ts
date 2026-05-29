@@ -14,6 +14,7 @@ const result = {
   truly_treeshakeable: true,
   is_cjs: false,
   error: null,
+  diagnostics: [],
 };
 
 test("formatImportSize supports minimal, standard, and verbose display modes", () => {

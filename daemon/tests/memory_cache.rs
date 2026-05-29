@@ -14,6 +14,7 @@ fn result(specifier: &str, cache_hit: bool) -> ImportResult {
         truly_treeshakeable: true,
         is_cjs: false,
         error: None,
+        diagnostics: Vec::new(),
     }
 }
 

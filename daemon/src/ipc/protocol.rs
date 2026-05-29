@@ -42,6 +42,14 @@ pub struct ImportResult {
     pub truly_treeshakeable: bool,
     pub is_cjs: bool,
     pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportDiagnostic {
+    pub stage: String,
+    pub message: String,
+    pub details: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

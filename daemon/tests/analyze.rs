@@ -100,6 +100,14 @@ fn analyze_import_returns_partial_error_result_on_missing_entry() {
     assert_eq!(result.raw_bytes, 0);
     assert_eq!(result.minified_bytes, 0);
     assert_eq!(result.gzip_bytes, 0);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].stage, "entry_resolution");
+    assert!(
+        result.diagnostics[0]
+            .details
+            .iter()
+            .any(|detail| detail.contains("candidate:"))
+    );
 }
 
 #[test]

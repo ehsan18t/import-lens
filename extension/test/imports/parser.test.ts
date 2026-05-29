@@ -43,3 +43,17 @@ test("extractRuntimeImports skips relative imports and Node builtins", () => {
   assert.deepEqual(imports.map((item) => item.specifier), ["lodash-es"]);
 });
 
+test("extractRuntimeImports keeps runtime default imports and skips mixed type specifiers", () => {
+  const source = "import dayjs, { type Dayjs } from 'dayjs';";
+
+  const imports = extractRuntimeImports("sample.ts", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      named: item.named,
+    })),
+    [{ specifier: "dayjs", kind: "default", named: [] }],
+  );
+});

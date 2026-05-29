@@ -7,6 +7,7 @@ import { ImportLensLogger } from "./logger.js";
 import { registerNodeModulesWatchers } from "./watcher.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
 import { DecorationController } from "./ui/decorations.js";
+import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
@@ -14,6 +15,11 @@ import { tooltipForResult } from "./ui/tooltip.js";
 import type { ImportResult } from "./ipc/protocol.js";
 
 let daemon: DaemonManager | undefined;
+
+const copyImportDiagnostics = async (result: ImportResult): Promise<void> => {
+  await vscode.env.clipboard.writeText(formatImportDiagnostics(result));
+  void vscode.window.showInformationMessage("ImportLens diagnostics copied.");
+};
 
 export const activate = async (context: vscode.ExtensionContext): Promise<void> => {
   const config = getImportLensConfig();
@@ -43,8 +49,31 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       }
     }),
     vscode.commands.registerCommand("importLens.showReport", () => showReport(context, store)),
-    vscode.commands.registerCommand("importLens.showImportDetails", (result: ImportResult) => {
+    vscode.commands.registerCommand("importLens.showImportDetails", async (result: ImportResult) => {
+      if (result.error) {
+        const action = await vscode.window.showWarningMessage(
+          "ImportLens could not compute this import size.",
+          "Copy diagnostics",
+        );
+
+        if (action === "Copy diagnostics") {
+          await copyImportDiagnostics(result);
+        }
+
+        return;
+      }
+
       void vscode.window.showInformationMessage(tooltipForResult(result).value);
+    }),
+    vscode.commands.registerCommand(copyImportDiagnosticsCommand, async (result?: ImportResult) => {
+      if (!result) {
+        void vscode.window.showWarningMessage(
+          "No ImportLens diagnostics are available for the active command context.",
+        );
+        return;
+      }
+
+      await copyImportDiagnostics(result);
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration("importLens")) {

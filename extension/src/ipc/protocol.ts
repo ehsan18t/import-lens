@@ -31,6 +31,13 @@ export interface ImportResult {
   truly_treeshakeable: boolean;
   is_cjs: boolean;
   error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
+export interface ImportDiagnostic {
+  stage: string;
+  message: string;
+  details: string[];
 }
 
 export interface BatchResponse {
@@ -67,4 +74,3 @@ export type ClientMessage =
   | CacheInvalidateMessage
   | CacheInvalidateAllMessage
   | ShutdownMessage;
-

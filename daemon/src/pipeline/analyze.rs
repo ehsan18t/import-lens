@@ -1,5 +1,5 @@
 use crate::{
-    ipc::protocol::{ImportKind, ImportRequest, ImportResult},
+    ipc::protocol::{ImportDiagnostic, ImportKind, ImportRequest, ImportResult},
     pipeline::compress::compress_all,
 };
 use serde_json::Value;
@@ -20,6 +20,13 @@ struct PackageManifest {
     json: Value,
 }
 
+#[derive(Debug, Clone)]
+struct AnalysisError {
+    stage: &'static str,
+    message: String,
+    details: Vec<String>,
+}
+
 pub fn analyze_import(context: &AnalysisContext, request: &ImportRequest) -> ImportResult {
     match analyze_import_inner(context, request) {
         Ok(result) => result,
@@ -30,19 +37,32 @@ pub fn analyze_import(context: &AnalysisContext, request: &ImportRequest) -> Imp
 fn analyze_import_inner(
     context: &AnalysisContext,
     request: &ImportRequest,
-) -> Result<ImportResult, String> {
-    let manifest = find_package_manifest(context, &request.package_name)?;
+) -> Result<ImportResult, AnalysisError> {
+    let manifest = find_package_manifest(context, request)?;
     let side_effects = side_effects(&manifest.json);
-    let (entry_path, is_cjs) = resolve_entry_path(&manifest, request)?;
+    let (entry_path, is_cjs) = resolve_entry_path(&manifest, context, request)?;
     let source = fs::read_to_string(&entry_path).map_err(|error| {
-        format!(
-            "failed to read package entry {}: {error}",
-            entry_path.display()
+        error_with_context(
+            "entry_read",
+            format!(
+                "failed to read package entry {}: {error}",
+                entry_path.display()
+            ),
+            context,
+            request,
+            vec![format!("entry_path: {}", entry_path.display())],
         )
     })?;
     let minified = estimate_minified_source(&source);
-    let compressed = compress_all(&minified)
-        .map_err(|error| format!("failed to compress minified output: {error}"))?;
+    let compressed = compress_all(&minified).map_err(|error| {
+        error_with_context(
+            "compression",
+            format!("failed to compress minified output: {error}"),
+            context,
+            request,
+            Vec::new(),
+        )
+    })?;
     let raw_bytes = source.len() as u64;
     let minified_bytes = minified.len() as u64;
 
@@ -60,10 +80,11 @@ fn analyze_import_inner(
             && matches!(request.import_kind, ImportKind::Named),
         is_cjs,
         error: None,
+        diagnostics: Vec::new(),
     })
 }
 
-fn error_result(request: &ImportRequest, message: String) -> ImportResult {
+fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
     ImportResult {
         specifier: request.specifier.clone(),
         raw_bytes: 0,
@@ -75,32 +96,64 @@ fn error_result(request: &ImportRequest, message: String) -> ImportResult {
         side_effects: true,
         truly_treeshakeable: false,
         is_cjs: false,
-        error: Some(message),
+        error: Some(error.message.clone()),
+        diagnostics: vec![ImportDiagnostic {
+            stage: error.stage.to_owned(),
+            message: error.message,
+            details: error.details,
+        }],
     }
 }
 
 fn find_package_manifest(
     context: &AnalysisContext,
-    package_name: &str,
-) -> Result<PackageManifest, String> {
-    validate_package_name(package_name)?;
+    request: &ImportRequest,
+) -> Result<PackageManifest, AnalysisError> {
+    validate_package_name(&request.package_name).map_err(|message| {
+        error_with_context("package_validation", message, context, request, Vec::new())
+    })?;
 
     let mut current = context
         .active_document_path
         .parent()
-        .ok_or_else(|| "active document path has no parent directory".to_owned())?
+        .ok_or_else(|| {
+            error_with_context(
+                "package_resolution",
+                "active document path has no parent directory",
+                context,
+                request,
+                Vec::new(),
+            )
+        })?
         .to_path_buf();
+    let mut checked_paths = Vec::new();
 
     loop {
-        let package_root = current.join("node_modules").join(package_name);
+        let package_root = current.join("node_modules").join(&request.package_name);
         let package_json_path = package_root.join("package.json");
+        checked_paths.push(format!("checked: {}", package_json_path.display()));
 
         if package_json_path.exists() {
             let json = serde_json::from_str::<Value>(
-                &fs::read_to_string(&package_json_path)
-                    .map_err(|error| format!("failed to read package manifest: {error}"))?,
+                &fs::read_to_string(&package_json_path).map_err(|error| {
+                    error_with_context(
+                        "package_manifest",
+                        format!("failed to read package manifest: {error}"),
+                        context,
+                        request,
+                        vec![format!("manifest_path: {}", package_json_path.display())],
+                    )
+                })?,
             )
-            .map_err(|error| format!("failed to parse package manifest: {error}"))?;
+            .map_err(|error| {
+                error_with_context(
+                    "package_manifest",
+                    format!("failed to parse package manifest: {error}"),
+                    context,
+                    request,
+                    vec![format!("manifest_path: {}", package_json_path.display())],
+                )
+            })?;
             return Ok(PackageManifest {
                 root: package_root,
                 json,
@@ -112,7 +165,13 @@ fn find_package_manifest(
         }
     }
 
-    Err(format!("package manifest not found for {package_name}"))
+    Err(error_with_context(
+        "package_resolution",
+        format!("package manifest not found for {}", request.package_name),
+        context,
+        request,
+        checked_paths,
+    ))
 }
 
 fn validate_package_name(package_name: &str) -> Result<(), String> {
@@ -143,25 +202,31 @@ fn is_safe_package_segment(segment: &str) -> bool {
 
 fn resolve_entry_path(
     manifest: &PackageManifest,
+    context: &AnalysisContext,
     request: &ImportRequest,
-) -> Result<(PathBuf, bool), String> {
+) -> Result<(PathBuf, bool), AnalysisError> {
     if let Some(subpath) = subpath_for_request(request) {
-        return resolve_file_candidate(&manifest.root.join(subpath)).map(|path| (path, false));
+        return resolve_file_candidate(&manifest.root.join(subpath), context, request)
+            .map(|path| (path, false));
     }
 
     if let Some(module) = manifest.json.get("module").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(module)).map(|path| (path, false));
+        return resolve_file_candidate(&manifest.root.join(module), context, request)
+            .map(|path| (path, false));
     }
 
     if let Some(browser) = manifest.json.get("browser").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(browser)).map(|path| (path, false));
+        return resolve_file_candidate(&manifest.root.join(browser), context, request)
+            .map(|path| (path, false));
     }
 
     if let Some(main) = manifest.json.get("main").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(main)).map(|path| (path, true));
+        return resolve_file_candidate(&manifest.root.join(main), context, request)
+            .map(|path| (path, true));
     }
 
-    resolve_file_candidate(&manifest.root.join("index.js")).map(|path| (path, true))
+    resolve_file_candidate(&manifest.root.join("index.js"), context, request)
+        .map(|path| (path, true))
 }
 
 fn subpath_for_request(request: &ImportRequest) -> Option<&str> {
@@ -171,8 +236,12 @@ fn subpath_for_request(request: &ImportRequest) -> Option<&str> {
         .and_then(|value| value.strip_prefix('/'))
 }
 
-fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
-    let candidates = [
+fn resolve_file_candidate(
+    candidate: &Path,
+    context: &AnalysisContext,
+    request: &ImportRequest,
+) -> Result<PathBuf, AnalysisError> {
+    let candidates = vec![
         candidate.to_path_buf(),
         append_extension(candidate, "js"),
         append_extension(candidate, "mjs"),
@@ -183,9 +252,21 @@ fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
     ];
 
     candidates
-        .into_iter()
+        .iter()
         .find(|path| path.is_file())
-        .ok_or_else(|| format!("package entry not found near {}", candidate.display()))
+        .cloned()
+        .ok_or_else(|| {
+            error_with_context(
+                "entry_resolution",
+                format!("package entry not found near {}", candidate.display()),
+                context,
+                request,
+                candidates
+                    .iter()
+                    .map(|path| format!("candidate: {}", path.display()))
+                    .collect(),
+            )
+        })
 }
 
 fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
@@ -206,4 +287,29 @@ fn side_effects(package_json: &Value) -> bool {
 
 fn estimate_minified_source(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn error_with_context(
+    stage: &'static str,
+    message: impl Into<String>,
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    details: Vec<String>,
+) -> AnalysisError {
+    let mut context_details = vec![
+        format!("specifier: {}", request.specifier),
+        format!("package: {}", request.package_name),
+        format!(
+            "active_document_path: {}",
+            context.active_document_path.display()
+        ),
+        format!("workspace_root: {}", context.workspace_root.display()),
+    ];
+    context_details.extend(details);
+
+    AnalysisError {
+        stage,
+        message: message.into(),
+        details: context_details,
+    }
 }
