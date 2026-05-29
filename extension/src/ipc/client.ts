@@ -57,11 +57,27 @@ export class IpcClient extends EventEmitter {
     this.#socket.write(encodeFrame(message));
   }
 
-  requestBatch(request: BatchRequest): Promise<BatchResponse> {
+  requestBatch(request: BatchRequest, timeoutMs = 10000): Promise<BatchResponse> {
     this.send(request);
 
     return new Promise((resolve, reject) => {
-      this.#pending.set(request.request_id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (this.#pending.has(request.request_id)) {
+          this.#pending.delete(request.request_id);
+          reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
+
+      this.#pending.set(request.request_id, {
+        resolve: (response) => {
+          clearTimeout(timer);
+          resolve(response);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
     });
   }
 
