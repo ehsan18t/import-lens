@@ -5,18 +5,11 @@ echo "Building inside Docker container..."
 
 pnpm install --frozen-lockfile
 pnpm check
-pnpm test:scripts
-pnpm test:rust
+pnpm test
+pnpm test:performance
 
 for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-  node scripts/build-daemon.mjs "$target" --zigbuild
-  pnpm run "copy:daemon:$target"
-done
-
-for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-  node scripts/generate-daemon-hashes.mjs "$target"
-  pnpm build
-  node scripts/package-vsix.mjs "$target"
+  node scripts/package-target.mjs "$target" --zigbuild
 done
 
 version=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")

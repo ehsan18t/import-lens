@@ -15,6 +15,10 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  PNPM_VERSION: 10.33.3
+  RUST_VERSION: 1.89.0
+
 jobs:
   validate:
     name: Validate
@@ -26,7 +30,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10.33.3
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -36,14 +40,22 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install 1.89.0 --profile minimal
-          rustup default 1.89.0
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
 
       - name: Verify release version
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           node -e "const pkg = require('./package.json'); if (pkg.version !== process.env.RELEASE_VERSION) { console.error(`package.json version ${pkg.version} does not match release input ${process.env.RELEASE_VERSION}`); process.exit(1); }"
+
+      - name: Verify release icon
+        run: |
+          node -e "const fs = require('node:fs'); const pkg = require('./package.json'); if (pkg.icon && !fs.existsSync(pkg.icon)) { console.error(`release icon is declared at ${pkg.icon}, but the file does not exist`); process.exit(1); }"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -57,32 +69,26 @@ jobs:
       - name: Run tests
         run: pnpm test
 
-  package:
-    name: Package ${{ matrix.target }}
+      - name: Run performance smoke test
+        env:
+          IMPORT_LENS_PERF_MULTIPLIER: 8
+        run: pnpm test:performance
+
+      - name: Check Rust coverage
+        run: pnpm coverage:rust
+
+  package-windows:
+    name: Package Windows ${{ matrix.target }}
     needs: validate
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: win32-x64
-            os: windows-latest
             rust-target: x86_64-pc-windows-msvc
           - target: win32-arm64
-            os: windows-11-arm
             rust-target: aarch64-pc-windows-msvc
-          - target: linux-x64
-            os: ubuntu-24.04
-            rust-target: x86_64-unknown-linux-gnu
-          - target: linux-arm64
-            os: ubuntu-24.04-arm
-            rust-target: aarch64-unknown-linux-gnu
-          - target: darwin-x64
-            os: macos-15-intel
-            rust-target: x86_64-apple-darwin
-          - target: darwin-arm64
-            os: macos-15
-            rust-target: aarch64-apple-darwin
 
     steps:
       - name: Checkout
@@ -91,7 +97,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10.33.3
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -100,10 +106,10 @@ jobs:
           cache: pnpm
 
       - name: Install Rust
-        shell: bash
+        shell: pwsh
         run: |
-          rustup toolchain install 1.89.0 --profile minimal --target "${{ matrix.rust-target }}"
-          rustup default 1.89.0
+          rustup toolchain install "$env:RUST_VERSION" --profile minimal --target "${{ matrix.rust-target }}"
+          rustup default "$env:RUST_VERSION"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -111,12 +117,44 @@ jobs:
       - name: Package VSIX
         run: pnpm run package:${{ matrix.target }}
 
-      - name: Check VSIX size
-        run: pnpm assert:vsix-size "import-lens-${{ matrix.target }}-${{ inputs.version }}.vsix"
-
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
         with:
           name: import-lens-${{ matrix.target }}-${{ inputs.version }}
           path: import-lens-${{ matrix.target }}-${{ inputs.version }}.vsix
+          if-no-files-found: error
+
+  package-unix-cross:
+    name: Package Linux and macOS
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build package artifacts in Docker
+        env:
+          IMPORT_LENS_PERF_MULTIPLIER: 8
+        run: pnpm docker:build
+
+      - name: Upload Linux and macOS VSIX artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-lens-unix-${{ inputs.version }}
+          path: |
+            import-lens-linux-x64-${{ inputs.version }}.vsix
+            import-lens-linux-arm64-${{ inputs.version }}.vsix
+            import-lens-darwin-x64-${{ inputs.version }}.vsix
+            import-lens-darwin-arm64-${{ inputs.version }}.vsix
           if-no-files-found: error

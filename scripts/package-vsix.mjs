@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,14 +52,8 @@ const run = (command, args, cwd) => {
   }
 };
 
-const createStagedManifest = (manifest, bindingPackage) => ({
-  ...manifest,
-  dependencies: {
-    [bindingPackage]: manifest.dependencies[bindingPackage] ?? manifest.dependencies["oxc-parser"],
-    "oxc-parser": manifest.dependencies["oxc-parser"],
-  },
-  devDependencies: undefined,
-  files: [
+const createStagedManifest = (manifest, bindingPackage) => {
+  const files = [
     "extension/dist/extension.cjs",
     "bin/",
     "node_modules/oxc-parser/",
@@ -67,9 +61,23 @@ const createStagedManifest = (manifest, bindingPackage) => ({
     "node_modules/@oxc-project/types/",
     "README.md",
     "package.json",
-  ],
-  scripts: undefined,
-});
+  ];
+
+  if (manifest.icon) {
+    files.push(manifest.icon);
+  }
+
+  return {
+    ...manifest,
+    dependencies: {
+      [bindingPackage]: manifest.dependencies[bindingPackage] ?? manifest.dependencies["oxc-parser"],
+      "oxc-parser": manifest.dependencies["oxc-parser"],
+    },
+    devDependencies: undefined,
+    files,
+    scripts: undefined,
+  };
+};
 
 if (!target) {
   fail("Usage: node scripts/package-vsix.mjs <target>");
@@ -103,6 +111,16 @@ copyPath(
   path.join(stagingRoot, "extension", "dist", "extension.cjs"),
 );
 copyPath(path.join(repoRoot, "bin", target), path.join(stagingRoot, "bin", target));
+
+if (manifest.icon) {
+  const iconPath = path.join(repoRoot, manifest.icon);
+
+  if (!existsSync(iconPath)) {
+    fail(`Extension icon is declared at ${manifest.icon}, but the file does not exist.`);
+  }
+
+  copyPath(iconPath, path.join(stagingRoot, manifest.icon));
+}
 
 const vsceBinary = require.resolve("@vscode/vsce/vsce");
 const result = spawnSync(

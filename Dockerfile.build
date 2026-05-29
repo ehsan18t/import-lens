@@ -1,0 +1,48 @@
+FROM node:22-bookworm
+
+ARG RUST_VERSION=1.89.0
+ARG PNPM_VERSION=10.33.3
+ARG ZIG_VERSION=0.14.1
+ARG CARGO_ZIGBUILD_VERSION=0.22.3
+
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:/opt/zig:${PATH}
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    build-essential \
+    ca-certificates \
+    curl \
+    git \
+    make \
+    pkg-config \
+    python3 \
+    xz-utils \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+  | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION}
+
+RUN rustup target add \
+  x86_64-unknown-linux-gnu \
+  aarch64-unknown-linux-gnu \
+  x86_64-apple-darwin \
+  aarch64-apple-darwin
+
+RUN corepack enable \
+  && corepack prepare pnpm@${PNPM_VERSION} --activate
+
+RUN curl --proto '=https' --tlsv1.2 -fsSL \
+    https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz \
+    -o /tmp/zig.tar.xz \
+  && mkdir -p /opt/zig \
+  && tar -xJf /tmp/zig.tar.xz --strip-components=1 -C /opt/zig \
+  && rm /tmp/zig.tar.xz
+
+RUN cargo install cargo-zigbuild --version ${CARGO_ZIGBUILD_VERSION} --locked
+
+WORKDIR /workspace
+
+ENTRYPOINT ["bash", "scripts/docker-build-entrypoint.sh"]

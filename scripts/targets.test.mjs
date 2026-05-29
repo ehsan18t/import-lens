@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   artifactPathForTarget,
   cargoBuildArgsForTarget,
+  cargoZigbuildArgsForTarget,
   platformTargets,
   targetInfo,
   vsixNameForTarget,
@@ -50,6 +51,17 @@ test("cargoBuildArgsForTarget uses explicit Rust target triples", () => {
     "--release",
     "--target",
     "x86_64-apple-darwin",
+  ]);
+});
+
+test("cargoZigbuildArgsForTarget uses explicit Rust target triples", () => {
+  assert.deepEqual(cargoZigbuildArgsForTarget("linux-arm64"), [
+    "zigbuild",
+    "-p",
+    "import-lens-daemon",
+    "--release",
+    "--target",
+    "aarch64-unknown-linux-gnu",
   ]);
 });
 
