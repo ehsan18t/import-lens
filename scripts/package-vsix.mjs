@@ -12,6 +12,11 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const target = process.argv[2];
 const platformBindings = new Map([
   ["win32-x64", "@oxc-parser/binding-win32-x64-msvc"],
+  ["win32-arm64", "@oxc-parser/binding-win32-arm64-msvc"],
+  ["linux-x64", "@oxc-parser/binding-linux-x64-gnu"],
+  ["linux-arm64", "@oxc-parser/binding-linux-arm64-gnu"],
+  ["darwin-x64", "@oxc-parser/binding-darwin-x64"],
+  ["darwin-arm64", "@oxc-parser/binding-darwin-arm64"],
 ]);
 
 const fail = (message) => {
@@ -85,6 +90,22 @@ writeFileSync(
   path.join(stagingRoot, "package.json"),
   `${JSON.stringify(createStagedManifest(manifest, bindingPackage), null, 2)}\n`,
 );
+
+console.log(`Downloading ${bindingPackage} inside staging directory...`);
+const npmResult = spawnSync(
+  "npm",
+  ["install", "--no-save", `${bindingPackage}@${manifest.dependencies["oxc-parser"]}`],
+  {
+    cwd: stagingRoot,
+    stdio: "inherit",
+    shell: true,
+  }
+);
+
+if (npmResult.status !== 0) {
+  fail(`Failed to download ${bindingPackage}`);
+}
+
 copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));
 copyPath(
   path.join(repoRoot, "extension", "dist", "extension.cjs"),
@@ -94,10 +115,7 @@ copyPath(path.join(repoRoot, "bin", target), path.join(stagingRoot, "bin", targe
 const oxcParserRoot = packageRoot("oxc-parser", [repoRoot]);
 
 copyPath(oxcParserRoot, path.join(stagingRoot, "node_modules", "oxc-parser"));
-copyPath(
-  packageRoot(bindingPackage, [repoRoot]),
-  path.join(stagingRoot, "node_modules", "@oxc-parser", path.basename(bindingPackage)),
-);
+// The bindingPackage was already downloaded into stagingRoot/node_modules by npm install!
 copyPath(
   packageRoot("@oxc-project/types", [oxcParserRoot]),
   path.join(stagingRoot, "node_modules", "@oxc-project", "types"),
