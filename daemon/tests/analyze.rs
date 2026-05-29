@@ -136,3 +136,78 @@ fn analyze_import_resolves_dotted_nestjs_style_subpath() {
     assert!(result.raw_bytes > 0);
     assert!(result.gzip_bytes > 0);
 }
+
+#[test]
+fn analyze_import_resolves_package_from_active_document_tree() {
+    let repo = temp_workspace();
+    let backend = repo.join("ensurily-backend");
+    let frontend = repo.join("ensurily-frontend");
+    fs::create_dir_all(&frontend).expect("sibling workspace should be created");
+    write_package(
+        &backend,
+        "dayjs",
+        r#"{"version":"1.11.13","sideEffects":false}"#,
+        "module.exports = require('./dayjs.min');",
+    );
+    write_package_file(
+        &backend,
+        "dayjs",
+        "plugin/utc.js",
+        "module.exports = function utc() {};",
+    );
+    let context = AnalysisContext {
+        workspace_root: frontend,
+        active_document_path: backend.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "dayjs/plugin/utc".to_owned(),
+        package_name: "dayjs".to_owned(),
+        version: "1.11.13".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&repo).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(result.gzip_bytes > 0);
+}
+
+#[test]
+fn analyze_import_rejects_unsafe_package_names() {
+    let workspace = temp_workspace();
+    fs::create_dir_all(workspace.join("outside")).expect("outside fixture should be created");
+    fs::write(
+        workspace.join("outside").join("package.json"),
+        r#"{"version":"1.0.0","main":"index.js"}"#,
+    )
+    .expect("outside manifest should be written");
+    fs::write(
+        workspace.join("outside").join("index.js"),
+        "module.exports = 1;",
+    )
+    .expect("outside entry should be written");
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "../outside".to_owned(),
+        package_name: "../outside".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(
+        result
+            .error
+            .expect("unsafe package name should produce an error")
+            .contains("unsafe package name")
+    );
+}

@@ -323,7 +323,7 @@ This section documents the key architectural decisions made before implementatio
 
 **FR-007** (Critical) - Before sending a request to the daemon, the extension must resolve the installed version of each package by reading `node_modules/<package>/package.json` and extracting the `version` field. For scoped packages (e.g. `@babel/core`), the path is `node_modules/@<scope>/<name>/package.json`. The `<package>` identifier in all cache keys and IPC messages includes the full scope prefix when present.
 
-**FR-008** (High) - The `oxc_resolver` must start module resolution from the `active_document_path` supplied in `BatchRequest`, not from the workspace root. Starting from the file being edited ensures that `oxc_resolver`'s upward traversal through the directory tree matches Node's own resolution algorithm exactly. This is critical in NPM Workspaces, Yarn Workspaces, and nested PNPM layouts where a package inside `packages/app-a/` may have its own `node_modules/` with a different version of a dependency than the root-level hoisted copy.
+**FR-008** (High) - The daemon resolver must start package discovery and module resolution from the `active_document_path` supplied in `BatchRequest`, not from the workspace root. Starting from the file being edited ensures that upward traversal through the directory tree matches Node's own resolution algorithm exactly. This is critical in multi-root VS Code windows, NPM Workspaces, Yarn Workspaces, and nested PNPM layouts where a package inside `packages/app-a/` may have its own `node_modules/` with a different version of a dependency than the root-level hoisted copy. The daemon must validate package identifiers before building filesystem paths and must reject identifiers containing traversal or platform path separators.
 
 **FR-009** (High) - If a package cannot be found in `node_modules`, the extension must display a subtle "Package not found" decoration on that import line and must not send it to the daemon.
 
@@ -516,7 +516,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 **NFR-012** (Critical) - The daemon must operate exclusively via static AST analysis and is prohibited from executing any code found within third-party packages. No subprocess execution, `eval`, dynamic loading, or script interpretation of package contents is permitted under any circumstance.
 
-**NFR-013** (Critical) - The daemon must operate with read-only access limited to the specific workspace directory and its descendant `node_modules` folders. It must not read files outside the workspace tree and must not write any files other than its own cache database in the VS Code global storage directory.
+**NFR-013** (Critical) - The daemon must operate with read-only access limited to `node_modules` packages discovered by walking upward from the active document path. It must not use the first VS Code workspace folder as a hard read boundary, because multi-root windows and nested package workspaces can place the active document in a different dependency tree. The daemon must not write any files other than its own cache database in the VS Code global storage directory.
 
 **NFR-014** (High) - The IPC socket or named pipe must be created with permissions that restrict access to the current user only (mode `0600` on Unix systems).
 

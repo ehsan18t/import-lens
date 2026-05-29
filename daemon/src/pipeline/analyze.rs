@@ -83,6 +83,8 @@ fn find_package_manifest(
     context: &AnalysisContext,
     package_name: &str,
 ) -> Result<PackageManifest, String> {
+    validate_package_name(package_name)?;
+
     let mut current = context
         .active_document_path
         .parent()
@@ -94,7 +96,6 @@ fn find_package_manifest(
         let package_json_path = package_root.join("package.json");
 
         if package_json_path.exists() {
-            ensure_inside_workspace(&context.workspace_root, &package_json_path)?;
             let json = serde_json::from_str::<Value>(
                 &fs::read_to_string(&package_json_path)
                     .map_err(|error| format!("failed to read package manifest: {error}"))?,
@@ -114,22 +115,30 @@ fn find_package_manifest(
     Err(format!("package manifest not found for {package_name}"))
 }
 
-fn ensure_inside_workspace(workspace_root: &Path, candidate: &Path) -> Result<(), String> {
-    let workspace_root = workspace_root
-        .canonicalize()
-        .map_err(|error| format!("failed to canonicalize workspace root: {error}"))?;
-    let candidate = candidate
-        .canonicalize()
-        .map_err(|error| format!("failed to canonicalize candidate path: {error}"))?;
+fn validate_package_name(package_name: &str) -> Result<(), String> {
+    let parts = package_name.split('/').collect::<Vec<_>>();
+    let is_valid = if package_name.starts_with('@') {
+        parts.len() == 2
+            && parts[0].len() > 1
+            && is_safe_package_segment(parts[0])
+            && is_safe_package_segment(parts[1])
+    } else {
+        parts.len() == 1 && is_safe_package_segment(parts[0])
+    };
 
-    if candidate.starts_with(&workspace_root) {
+    if is_valid {
         return Ok(());
     }
 
-    Err(format!(
-        "refusing to read package outside workspace: {}",
-        candidate.display()
-    ))
+    Err(format!("unsafe package name: {package_name}"))
+}
+
+fn is_safe_package_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains('\\')
+        && !segment.contains(':')
 }
 
 fn resolve_entry_path(
