@@ -1,4 +1,4 @@
-FROM rust:1.85.0-slim-bookworm
+FROM rust:1.89.0-slim-bookworm
 
 # Install required tools for zigbuild and Node.js
 RUN apt-get update && apt-get install -y \
@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y \
 # Install Node.js (v22) and pnpm
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
-    && corepack enable pnpm
+    && corepack enable \
+    && corepack prepare pnpm@10.33.3 --activate
 
 # Install zig (required by cargo-zigbuild)
 RUN curl -L "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz" -o zig.tar.xz \
@@ -22,7 +23,7 @@ RUN curl -L "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
     && rm zig.tar.xz
 
 # Install cargo-zigbuild
-RUN cargo install cargo-zigbuild
+RUN cargo install cargo-zigbuild --version 0.21.8 --locked
 
 # Add target architectures for cross-compilation
 RUN rustup target add \

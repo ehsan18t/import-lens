@@ -1,0 +1,11 @@
+.git
+.vsix-staging
+bin
+coverage
+extension/dist
+extension/test-dist
+node_modules
+target
+wasm
+*.log
+*.vsix

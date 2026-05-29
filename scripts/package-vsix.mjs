@@ -5,19 +5,12 @@ import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { targetInfo, vsixNameForTarget } from "./targets.mjs";
 
 const require = createRequire(import.meta.url);
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const target = process.argv[2];
-const platformBindings = new Map([
-  ["win32-x64", "@oxc-parser/binding-win32-x64-msvc"],
-  ["win32-arm64", "@oxc-parser/binding-win32-arm64-msvc"],
-  ["linux-x64", "@oxc-parser/binding-linux-x64-gnu"],
-  ["linux-arm64", "@oxc-parser/binding-linux-arm64-gnu"],
-  ["darwin-x64", "@oxc-parser/binding-darwin-x64"],
-  ["darwin-arm64", "@oxc-parser/binding-darwin-arm64"],
-]);
 
 const fail = (message) => {
   console.error(message);
@@ -42,13 +35,27 @@ const copyPath = (sourcePath, destinationPath) => {
   });
 };
 
-const packageRoot = (packageName, paths) =>
-  path.dirname(require.resolve(`${packageName}/package.json`, { paths }));
+const run = (command, args, cwd) => {
+  const executable = process.platform === "win32" ? "cmd.exe" : command;
+  const executableArgs = process.platform === "win32" ? ["/d", "/s", "/c", command, ...args] : args;
+  const result = spawnSync(executable, executableArgs, {
+    cwd,
+    stdio: "inherit",
+  });
+
+  if (result.error) {
+    fail(result.error.message);
+  }
+
+  if (result.status !== 0) {
+    fail(`${command} ${args.join(" ")} failed with exit code ${result.status ?? "unknown"}`);
+  }
+};
 
 const createStagedManifest = (manifest, bindingPackage) => ({
   ...manifest,
   dependencies: {
-    [bindingPackage]: manifest.dependencies[bindingPackage],
+    [bindingPackage]: manifest.dependencies[bindingPackage] ?? manifest.dependencies["oxc-parser"],
     "oxc-parser": manifest.dependencies["oxc-parser"],
   },
   devDependencies: undefined,
@@ -68,16 +75,12 @@ if (!target) {
   fail("Usage: node scripts/package-vsix.mjs <target>");
 }
 
-const bindingPackage = platformBindings.get(target);
-
-if (!bindingPackage) {
-  fail(`Unsupported VSIX target: ${target}`);
-}
+const bindingPackage = targetInfo(target).oxcParserBinding;
 
 const manifestPath = path.join(repoRoot, "package.json");
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 const stagingRoot = path.join(repoRoot, ".vsix-staging", target);
-const outputPath = path.join(repoRoot, `${manifest.name}-${target}-${manifest.version}.vsix`);
+const outputPath = path.join(repoRoot, vsixNameForTarget(manifest, target));
 
 assertInsideRepo(stagingRoot);
 assertInsideRepo(outputPath);
@@ -92,19 +95,7 @@ writeFileSync(
 );
 
 console.log(`Downloading ${bindingPackage} inside staging directory...`);
-const npmResult = spawnSync(
-  "npm",
-  ["install", "--no-save", "--force", `${bindingPackage}@${manifest.dependencies["oxc-parser"]}`],
-  {
-    cwd: stagingRoot,
-    stdio: "inherit",
-    shell: true,
-  }
-);
-
-if (npmResult.status !== 0) {
-  fail(`Failed to download ${bindingPackage}`);
-}
+run("pnpm", ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoisted"], stagingRoot);
 
 copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));
 copyPath(
@@ -112,19 +103,11 @@ copyPath(
   path.join(stagingRoot, "extension", "dist", "extension.cjs"),
 );
 copyPath(path.join(repoRoot, "bin", target), path.join(stagingRoot, "bin", target));
-const oxcParserRoot = packageRoot("oxc-parser", [repoRoot]);
-
-copyPath(oxcParserRoot, path.join(stagingRoot, "node_modules", "oxc-parser"));
-// The bindingPackage was already downloaded into stagingRoot/node_modules by npm install!
-copyPath(
-  packageRoot("@oxc-project/types", [oxcParserRoot]),
-  path.join(stagingRoot, "node_modules", "@oxc-project", "types"),
-);
 
 const vsceBinary = require.resolve("@vscode/vsce/vsce");
 const result = spawnSync(
   process.execPath,
-  [vsceBinary, "package", "--target", target, "--out", outputPath],
+  [vsceBinary, "package", "--target", target, "--out", outputPath, "--allow-missing-repository"],
   {
     cwd: stagingRoot,
     stdio: "inherit",

@@ -1,0 +1,12 @@
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.cross
+    image: import-lens-builder
+    init: true
+    environment:
+      CI: "true"
+    volumes:
+      - .:/workspace
+      - /workspace/node_modules

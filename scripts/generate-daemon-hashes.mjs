@@ -2,22 +2,18 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { platformTargets, targetInfo } from "./targets.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = dirname(scriptDir);
-const targets = [
-  ["win32-x64", "import-lens-daemon.exe"],
-  ["win32-arm64", "import-lens-daemon.exe"],
-  ["linux-x64", "import-lens-daemon"],
-  ["linux-arm64", "import-lens-daemon"],
-  ["darwin-x64", "import-lens-daemon"],
-  ["darwin-arm64", "import-lens-daemon"],
-];
+const requestedTargets = process.argv.slice(2);
+const selectedTargets = requestedTargets.length > 0 ? requestedTargets : platformTargets;
 
 const hashes = {};
 
-for (const [target, binary] of targets) {
-  const relativePath = `bin/${target}/${binary}`;
+for (const target of selectedTargets) {
+  const { binaryName } = targetInfo(target);
+  const relativePath = `bin/${target}/${binaryName}`;
   const absolutePath = join(repoRoot, relativePath);
 
   if (!existsSync(absolutePath)) {
@@ -37,4 +33,3 @@ writeFileSync(
 );
 
 console.log(`Wrote ${Object.keys(hashes).length} daemon hash entr${Object.keys(hashes).length === 1 ? "y" : "ies"} to ${outputPath}`);
-

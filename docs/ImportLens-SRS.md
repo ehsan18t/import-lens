@@ -651,7 +651,7 @@ The following criteria constitute the definition of done for the v1.0 release. A
 
 | Tool                  | Version                 | Purpose                  | Notes                                                              |
 | --------------------- | ----------------------- | ------------------------ | ------------------------------------------------------------------ |
-| Rust toolchain        | >= 1.85.0 (Edition 2024) | Daemon compilation       | MSRV. Required for `edition = "2024"` in `Cargo.toml`. Current stable is 1.95.0; CI should pin a specific stable version rather than `stable` for reproducible builds. |
+| Rust toolchain        | >= 1.89.0 (Edition 2024) | Daemon compilation       | MSRV. Required by the locked dependency graph (`redb` v4.x) and `edition = "2024"` in `Cargo.toml`. Current stable is 1.95.0; CI should pin a specific stable version rather than `stable` for reproducible builds. |
 | `wasm-opt` (Binaryen) | 123                     | WASM binary optimization | Run with `-Oz` after `cargo build --target wasm32-wasip1-threads`. |
 | `cargo-cross`         | latest                  | Cross-compilation        | For building all 6 native targets in CI.                           |
 | Node.js               | >= 20 LTS                | Extension development    | Required by VS Code extension host.                                |
