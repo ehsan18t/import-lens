@@ -205,8 +205,51 @@ fn resolve_entry_path(
     context: &AnalysisContext,
     request: &ImportRequest,
 ) -> Result<(PathBuf, bool), AnalysisError> {
-    if let Some(subpath) = subpath_for_request(request) {
-        return resolve_file_candidate(&manifest.root.join(subpath), context, request)
+    let subpath = subpath_for_request(request);
+    let exports_key = match subpath {
+        Some(sub) => format!("./{sub}"),
+        None => ".".to_owned(),
+    };
+
+    // When the exports field is present it is the authoritative source for entry
+    // resolution per the Node.js package specification.  Legacy fields (module,
+    // browser, main) are only consulted when exports is absent.
+    if let Some(exports) = manifest.json.get("exports") {
+        if let Some((relative, is_cjs)) = resolve_exports_entry(exports, &exports_key) {
+            return resolve_file_candidate(&manifest.root.join(&relative), context, request)
+                .map(|path| (path, is_cjs));
+        }
+
+        // Wildcard pattern fallback: try "./*" when the exact key is not found.
+        if subpath.is_some() {
+            if let Some(pattern_target) = resolve_exports_wildcard(exports, subpath.unwrap()) {
+                let is_cjs = path_looks_cjs(&pattern_target);
+                return resolve_file_candidate(
+                    &manifest.root.join(&pattern_target),
+                    context,
+                    request,
+                )
+                .map(|path| (path, is_cjs));
+            }
+        }
+
+        // exports is present but neither exact key nor wildcard matched.
+        return Err(error_with_context(
+            "entry_resolution",
+            format!(
+                "subpath '{}' is not defined in the exports map of {}",
+                exports_key, request.package_name
+            ),
+            context,
+            request,
+            vec![format!("exports_key: {exports_key}")],
+        ));
+    }
+
+    // --- Legacy resolution (no exports field) ---
+
+    if let Some(sub) = subpath {
+        return resolve_file_candidate(&manifest.root.join(sub), context, request)
             .map(|path| (path, false));
     }
 
@@ -227,6 +270,127 @@ fn resolve_entry_path(
 
     resolve_file_candidate(&manifest.root.join("index.js"), context, request)
         .map(|path| (path, true))
+}
+
+/// Condition keys tried in priority order.  `require` is intentionally absent
+/// so we prefer ESM paths which are required for accurate tree-shaking.
+const CONDITION_PRIORITY: &[&str] = &["module", "import", "browser", "default"];
+
+/// Resolve an exact key from the `exports` field of package.json.
+///
+/// Returns `Some((relative_path, is_cjs))` on success.
+fn resolve_exports_entry(exports: &Value, key: &str) -> Option<(String, bool)> {
+    // String shorthand: `"exports": "./dist/index.mjs"`
+    // This implicitly maps the root entry `"."`.
+    if key == "." {
+        if let Some(target) = exports.as_str() {
+            return Some((target.to_owned(), path_looks_cjs(target)));
+        }
+    }
+
+    // Object map: `"exports": { ".": ..., "./transition": ... }`
+    if let Some(map) = exports.as_object() {
+        // Determine whether the top-level keys are subpath keys (start with ".")
+        // or condition keys (like "import", "default").  When a package has only
+        // the root entry it may use conditions directly at the top level:
+        //   "exports": { "import": "./index.mjs", "require": "./index.cjs" }
+        let is_condition_map = map.keys().next().is_some_and(|k| !k.starts_with('.'));
+
+        if is_condition_map && key == "." {
+            return resolve_condition_value(exports);
+        }
+
+        if let Some(target) = map.get(key) {
+            return resolve_export_target(target);
+        }
+    }
+
+    // Array at top level: `"exports": [{ "import": "..." }, "./fallback.js"]`
+    if key == "." {
+        if let Some(arr) = exports.as_array() {
+            return resolve_array_fallback(arr);
+        }
+    }
+
+    None
+}
+
+/// Resolve a single export target which may be a string, a condition object, or
+/// an array of fallbacks.
+fn resolve_export_target(target: &Value) -> Option<(String, bool)> {
+    if let Some(s) = target.as_str() {
+        return Some((s.to_owned(), path_looks_cjs(s)));
+    }
+
+    if target.is_object() {
+        return resolve_condition_value(target);
+    }
+
+    if let Some(arr) = target.as_array() {
+        return resolve_array_fallback(arr);
+    }
+
+    None
+}
+
+/// Walk a condition object (`{ "import": "...", "default": "..." }`) using the
+/// priority list and return the first matching target.
+fn resolve_condition_value(value: &Value) -> Option<(String, bool)> {
+    let map = value.as_object()?;
+
+    for &condition in CONDITION_PRIORITY {
+        if let Some(target) = map.get(condition) {
+            if let Some(s) = target.as_str() {
+                let is_cjs = condition == "require" || path_looks_cjs(s);
+                return Some((s.to_owned(), is_cjs));
+            }
+            // Nested condition or array inside a condition key.
+            if let Some(result) = resolve_export_target(target) {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+/// Try each element of an array until one resolves.
+fn resolve_array_fallback(arr: &[Value]) -> Option<(String, bool)> {
+    for item in arr {
+        if let Some(result) = resolve_export_target(item) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+/// Resolve a subpath through wildcard patterns in the exports map.
+///
+/// Given `"./*"` → `"./dist/*.js"` and a subpath `"utils/foo"`, this produces
+/// `"./dist/utils/foo.js"`.
+fn resolve_exports_wildcard(exports: &Value, subpath: &str) -> Option<String> {
+    let map = exports.as_object()?;
+
+    for (pattern, target) in map {
+        let Some(without_prefix) = pattern.strip_prefix("./") else {
+            continue;
+        };
+        let Some(stem) = without_prefix.strip_suffix('*') else {
+            continue;
+        };
+        if let Some(remainder) = subpath.strip_prefix(stem) {
+            if let Some((resolved, _)) = resolve_export_target(target) {
+                return Some(resolved.replace('*', remainder));
+            }
+        }
+    }
+
+    None
+}
+
+/// Heuristic: does this relative path look like a CommonJS file?
+fn path_looks_cjs(path: &str) -> bool {
+    path.ends_with(".cjs")
 }
 
 fn subpath_for_request(request: &ImportRequest) -> Option<&str> {

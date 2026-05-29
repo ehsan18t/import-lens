@@ -219,3 +219,324 @@ fn analyze_import_rejects_unsafe_package_names() {
             .contains("unsafe package name")
     );
 }
+
+#[test]
+fn analyze_import_resolves_subpath_via_exports_map() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "svelte",
+        r#"{
+            "version": "5.0.0",
+            "exports": {
+                ".": { "import": "./src/index.js" },
+                "./transition": { "import": "./src/transition/index.js", "default": "./src/transition/index-server.js" }
+            }
+        }"#,
+        "export const noop = 1;",
+    );
+    write_package_file(
+        &workspace,
+        "svelte",
+        "src/transition/index.js",
+        "export function fade(node) { return {}; }",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("App.svelte"),
+    };
+    let request = ImportRequest {
+        specifier: "svelte/transition".to_owned(),
+        package_name: "svelte".to_owned(),
+        version: "5.0.0".to_owned(),
+        named: vec!["fade".to_owned()],
+        import_kind: ImportKind::Named,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert_eq!(result.is_cjs, false);
+}
+
+#[test]
+fn analyze_import_resolves_root_entry_via_exports_dot() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "modern-pkg",
+        r#"{
+            "version": "2.0.0",
+            "main": "lib/cjs.js",
+            "exports": {
+                ".": { "import": "./esm/index.mjs", "require": "./lib/cjs.js" }
+            }
+        }"#,
+        "// legacy entry",
+    );
+    write_package_file(
+        &workspace,
+        "modern-pkg",
+        "esm/index.mjs",
+        "export const value = 42;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "modern-pkg".to_owned(),
+        package_name: "modern-pkg".to_owned(),
+        version: "2.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert_eq!(result.is_cjs, false);
+}
+
+#[test]
+fn analyze_import_resolves_string_shorthand_exports() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "simple-esm",
+        r#"{"version": "1.0.0", "exports": "./dist/index.mjs"}"#,
+        "// should not be used",
+    );
+    write_package_file(
+        &workspace,
+        "simple-esm",
+        "dist/index.mjs",
+        "export const greeting = 'hello';",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("app.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "simple-esm".to_owned(),
+        package_name: "simple-esm".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+}
+
+#[test]
+fn analyze_import_resolves_conditional_exports_with_nested_conditions() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "cond-pkg",
+        r#"{
+            "version": "3.0.0",
+            "exports": {
+                "./utils": {
+                    "browser": { "import": "./browser/utils.mjs" },
+                    "default": "./node/utils.js"
+                }
+            }
+        }"#,
+        "// root",
+    );
+    write_package_file(
+        &workspace,
+        "cond-pkg",
+        "browser/utils.mjs",
+        "export const platform = 'browser';",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "cond-pkg/utils".to_owned(),
+        package_name: "cond-pkg".to_owned(),
+        version: "3.0.0".to_owned(),
+        named: vec!["platform".to_owned()],
+        import_kind: ImportKind::Named,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+}
+
+#[test]
+fn analyze_import_resolves_wildcard_exports_pattern() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "wildcard-pkg",
+        r#"{
+            "version": "1.0.0",
+            "exports": {
+                ".": "./index.js",
+                "./*": "./dist/*.js"
+            }
+        }"#,
+        "export const root = 1;",
+    );
+    write_package_file(
+        &workspace,
+        "wildcard-pkg",
+        "dist/helpers.js",
+        "export function help() {}",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "wildcard-pkg/helpers".to_owned(),
+        package_name: "wildcard-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+}
+
+#[test]
+fn analyze_import_errors_on_unmapped_subpath_when_exports_present() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "strict-pkg",
+        r#"{
+            "version": "1.0.0",
+            "exports": {
+                ".": "./index.js",
+                "./allowed": "./allowed.js"
+            }
+        }"#,
+        "export const root = 1;",
+    );
+    write_package_file(
+        &workspace,
+        "strict-pkg",
+        "internal/secret.js",
+        "export const secret = 42;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "strict-pkg/internal/secret".to_owned(),
+        package_name: "strict-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(result.error.is_some());
+    assert!(
+        result
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("not defined in the exports map")
+    );
+}
+
+#[test]
+fn analyze_import_resolves_array_fallback_exports() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "array-pkg",
+        r#"{
+            "version": "1.0.0",
+            "exports": {
+                ".": [{ "import": "./esm/index.mjs" }, "./fallback.js"]
+            }
+        }"#,
+        "// fallback entry",
+    );
+    write_package_file(
+        &workspace,
+        "array-pkg",
+        "esm/index.mjs",
+        "export const value = 'array-resolved';",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("app.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "array-pkg".to_owned(),
+        package_name: "array-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+}
+
+#[test]
+fn analyze_import_resolves_top_level_condition_map_exports() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "condtop-pkg",
+        r#"{
+            "version": "1.0.0",
+            "exports": { "import": "./esm/index.mjs", "require": "./cjs/index.cjs" }
+        }"#,
+        "// should not be used",
+    );
+    write_package_file(
+        &workspace,
+        "condtop-pkg",
+        "esm/index.mjs",
+        "export const topLevel = true;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "condtop-pkg".to_owned(),
+        package_name: "condtop-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Default,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert_eq!(result.is_cjs, false);
+}
