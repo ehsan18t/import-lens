@@ -1,6 +1,21 @@
-use std::path::PathBuf;
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{
+    Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression, Program, Statement,
+};
+use oxc_parser::Parser;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::{SourceType, Span};
+use oxc_syntax::module_record::{
+    ExportEntry, ExportExportName, ExportImportName, ExportLocalName, ImportEntry,
+    ImportImportName, ModuleRecord as OxcModuleRecord,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModuleId(pub usize);
 
 #[derive(Debug, Clone)]
@@ -10,6 +25,8 @@ pub struct ModuleRecord {
     pub source: String,
     pub imports: Vec<ImportEdge>,
     pub exports: Vec<ExportRecord>,
+    pub reexports: Vec<ReExportRecord>,
+    pub star_exports: Vec<StarExportRecord>,
     pub has_top_level_side_effects: bool,
 }
 
@@ -24,9 +41,562 @@ pub struct ImportEdge {
 pub struct ExportRecord {
     pub exported_name: String,
     pub local_name: String,
+    pub statement_start: usize,
+    pub statement_end: usize,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
+pub struct ReExportRecord {
+    pub specifier: String,
+    pub resolved_path: PathBuf,
+    pub imported_name: String,
+    pub exported_name: String,
+    pub statement_start: usize,
+    pub statement_end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StarExportRecord {
+    pub specifier: String,
+    pub resolved_path: PathBuf,
+    pub statement_start: usize,
+    pub statement_end: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModuleGraph {
+    pub entry_id: ModuleId,
     pub modules: Vec<ModuleRecord>,
+    path_to_id: HashMap<PathBuf, ModuleId>,
+}
+
+impl Default for ModuleGraph {
+    fn default() -> Self {
+        Self {
+            entry_id: ModuleId(0),
+            modules: Vec::new(),
+            path_to_id: HashMap::new(),
+        }
+    }
+}
+
+impl ModuleGraph {
+    pub fn entry_module(&self) -> Option<&ModuleRecord> {
+        self.module_by_id(self.entry_id)
+    }
+
+    pub fn module_by_id(&self, id: ModuleId) -> Option<&ModuleRecord> {
+        self.modules.get(id.0)
+    }
+
+    pub fn module_id_by_path(&self, path: &Path) -> Option<ModuleId> {
+        self.path_to_id.get(path).copied()
+    }
+}
+
+pub fn build_module_graph(entry_path: &Path) -> Result<ModuleGraph, String> {
+    let entry_path = normalize_existing_path(entry_path)?;
+    let mut builder = ModuleGraphBuilder::default();
+    let entry_id = builder.load_module(&entry_path)?;
+    builder.graph.entry_id = entry_id;
+
+    Ok(builder.graph)
+}
+
+#[derive(Default)]
+struct ModuleGraphBuilder {
+    graph: ModuleGraph,
+}
+
+impl ModuleGraphBuilder {
+    fn load_module(&mut self, path: &Path) -> Result<ModuleId, String> {
+        let path = normalize_existing_path(path)?;
+        if let Some(existing) = self.graph.path_to_id.get(&path) {
+            return Ok(*existing);
+        }
+
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read module {}: {error}", path.display()))?;
+        let parsed = parse_module(&path, &source)?;
+        let id = ModuleId(self.graph.modules.len());
+        let next_paths = parsed
+            .imports
+            .iter()
+            .map(|edge| edge.resolved_path.clone())
+            .chain(
+                parsed
+                    .reexports
+                    .iter()
+                    .map(|edge| edge.resolved_path.clone()),
+            )
+            .chain(
+                parsed
+                    .star_exports
+                    .iter()
+                    .map(|edge| edge.resolved_path.clone()),
+            )
+            .collect::<Vec<_>>();
+
+        self.graph.path_to_id.insert(path.clone(), id);
+        self.graph.modules.push(ModuleRecord {
+            id,
+            path,
+            source,
+            imports: parsed.imports,
+            exports: parsed.exports,
+            reexports: parsed.reexports,
+            star_exports: parsed.star_exports,
+            has_top_level_side_effects: parsed.has_top_level_side_effects,
+        });
+
+        for next_path in next_paths {
+            self.load_module(&next_path)?;
+        }
+
+        Ok(id)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedModule {
+    imports: Vec<ImportEdge>,
+    exports: Vec<ExportRecord>,
+    reexports: Vec<ReExportRecord>,
+    star_exports: Vec<StarExportRecord>,
+    has_top_level_side_effects: bool,
+}
+
+fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+
+    if parsed.panicked || !parsed.errors.is_empty() {
+        return Err(format!(
+            "failed to parse module {}; errors: {}",
+            path.display(),
+            parsed
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    let semantic = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
+    if !semantic.errors.is_empty() {
+        return Err(format!(
+            "semantic validation failed for {}; errors: {}",
+            path.display(),
+            semantic
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    Ok(ParsedModule {
+        imports: import_edges(path, &parsed.module_record)?,
+        exports: export_records(&parsed.module_record),
+        reexports: reexport_records(path, &parsed.module_record)?,
+        star_exports: star_export_records(path, &parsed.module_record)?,
+        has_top_level_side_effects: has_top_level_side_effects(&parsed.program),
+    })
+}
+
+fn import_edges(
+    path: &Path,
+    module_record: &OxcModuleRecord<'_>,
+) -> Result<Vec<ImportEdge>, String> {
+    let mut imports = Vec::new();
+    let mut binding_import_specifiers = HashSet::new();
+
+    for entry in module_record
+        .import_entries
+        .iter()
+        .filter(|entry| !entry.is_type)
+    {
+        let specifier = entry.module_request.name.as_str().to_owned();
+        binding_import_specifiers.insert(specifier.clone());
+        if let Some(resolved_path) = resolve_relative_module(path, &specifier)? {
+            push_import_name(&mut imports, specifier, resolved_path, import_name(entry));
+        }
+    }
+
+    for (specifier, requested_modules) in &module_record.requested_modules {
+        if binding_import_specifiers.contains(specifier.as_str()) {
+            continue;
+        }
+
+        let is_side_effect_import = requested_modules
+            .iter()
+            .any(|request| request.is_import && !request.is_type);
+        if !is_side_effect_import {
+            continue;
+        }
+
+        if let Some(resolved_path) = resolve_relative_module(path, specifier.as_str())? {
+            imports.push(ImportEdge {
+                specifier: specifier.as_str().to_owned(),
+                resolved_path,
+                imported_names: Vec::new(),
+            });
+        }
+    }
+
+    Ok(imports)
+}
+
+fn push_import_name(
+    imports: &mut Vec<ImportEdge>,
+    specifier: String,
+    resolved_path: PathBuf,
+    imported_name: String,
+) {
+    if let Some(edge) = imports
+        .iter_mut()
+        .find(|edge| edge.specifier == specifier && edge.resolved_path == resolved_path)
+    {
+        if !edge.imported_names.contains(&imported_name) {
+            edge.imported_names.push(imported_name);
+        }
+        return;
+    }
+
+    imports.push(ImportEdge {
+        specifier,
+        resolved_path,
+        imported_names: vec![imported_name],
+    });
+}
+
+fn import_name(entry: &ImportEntry<'_>) -> String {
+    match &entry.import_name {
+        ImportImportName::Name(name) => name.name.as_str().to_owned(),
+        ImportImportName::NamespaceObject => "*".to_owned(),
+        ImportImportName::Default(_) => "default".to_owned(),
+    }
+}
+
+fn export_records(module_record: &OxcModuleRecord<'_>) -> Vec<ExportRecord> {
+    module_record
+        .local_export_entries
+        .iter()
+        .filter(|entry| !entry.is_type)
+        .filter_map(|entry| {
+            let exported_name = export_export_name(&entry.export_name)?;
+            let local_name =
+                export_local_name(&entry.local_name).unwrap_or_else(|| exported_name.clone());
+            Some(ExportRecord {
+                exported_name,
+                local_name,
+                statement_start: span_start(entry.statement_span),
+                statement_end: span_end(entry.statement_span),
+            })
+        })
+        .collect()
+}
+
+fn reexport_records(
+    path: &Path,
+    module_record: &OxcModuleRecord<'_>,
+) -> Result<Vec<ReExportRecord>, String> {
+    module_record
+        .indirect_export_entries
+        .iter()
+        .filter(|entry| !entry.is_type)
+        .filter_map(|entry| reexport_record(path, entry).transpose())
+        .collect()
+}
+
+fn reexport_record(path: &Path, entry: &ExportEntry<'_>) -> Result<Option<ReExportRecord>, String> {
+    let Some(module_request) = &entry.module_request else {
+        return Ok(None);
+    };
+    let Some(resolved_path) = resolve_relative_module(path, module_request.name.as_str())? else {
+        return Ok(None);
+    };
+    let Some(exported_name) = export_export_name(&entry.export_name) else {
+        return Ok(None);
+    };
+    let Some(imported_name) = export_import_name(&entry.import_name) else {
+        return Ok(None);
+    };
+
+    Ok(Some(ReExportRecord {
+        specifier: module_request.name.as_str().to_owned(),
+        resolved_path,
+        imported_name,
+        exported_name,
+        statement_start: span_start(entry.statement_span),
+        statement_end: span_end(entry.statement_span),
+    }))
+}
+
+fn star_export_records(
+    path: &Path,
+    module_record: &OxcModuleRecord<'_>,
+) -> Result<Vec<StarExportRecord>, String> {
+    module_record
+        .star_export_entries
+        .iter()
+        .filter(|entry| !entry.is_type)
+        .filter_map(|entry| {
+            let module_request = entry.module_request.as_ref()?;
+            let resolved_path =
+                resolve_relative_module(path, module_request.name.as_str()).transpose()?;
+            Some(resolved_path.map(|resolved_path| StarExportRecord {
+                specifier: module_request.name.as_str().to_owned(),
+                resolved_path,
+                statement_start: span_start(entry.statement_span),
+                statement_end: span_end(entry.statement_span),
+            }))
+        })
+        .collect()
+}
+
+fn export_import_name(name: &ExportImportName<'_>) -> Option<String> {
+    match name {
+        ExportImportName::Name(name) => Some(name.name.as_str().to_owned()),
+        ExportImportName::All => Some("*".to_owned()),
+        ExportImportName::AllButDefault | ExportImportName::Null => None,
+    }
+}
+
+fn export_export_name(name: &ExportExportName<'_>) -> Option<String> {
+    match name {
+        ExportExportName::Name(name) => Some(name.name.as_str().to_owned()),
+        ExportExportName::Default(_) => Some("default".to_owned()),
+        ExportExportName::Null => None,
+    }
+}
+
+fn export_local_name(name: &ExportLocalName<'_>) -> Option<String> {
+    match name {
+        ExportLocalName::Name(name) | ExportLocalName::Default(name) => {
+            Some(name.name.as_str().to_owned())
+        }
+        ExportLocalName::Null => None,
+    }
+}
+
+fn resolve_relative_module(from_path: &Path, specifier: &str) -> Result<Option<PathBuf>, String> {
+    if !specifier.starts_with('.') {
+        return Ok(None);
+    }
+
+    let from_dir = from_path.parent().ok_or_else(|| {
+        format!(
+            "module path has no parent directory: {}",
+            from_path.display()
+        )
+    })?;
+    let candidate = from_dir.join(specifier);
+    let candidates = [
+        candidate.clone(),
+        append_extension(&candidate, "js"),
+        append_extension(&candidate, "mjs"),
+        append_extension(&candidate, "cjs"),
+        append_extension(&candidate, "jsx"),
+        append_extension(&candidate, "ts"),
+        append_extension(&candidate, "tsx"),
+        candidate.join("index.js"),
+        candidate.join("index.mjs"),
+        candidate.join("index.cjs"),
+        candidate.join("index.jsx"),
+        candidate.join("index.ts"),
+        candidate.join("index.tsx"),
+    ];
+
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .map(|path| normalize_existing_path(path).map(Some))
+        .unwrap_or_else(|| {
+            let checked = candidates
+                .iter()
+                .map(|path| format!("candidate: {}", path.display()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(format!(
+                "failed to resolve relative module '{specifier}' from {}; {checked}",
+                from_path.display()
+            ))
+        })
+}
+
+fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
+    let mut path = candidate.as_os_str().to_owned();
+    path.push(".");
+    path.push(extension);
+    PathBuf::from(path)
+}
+
+fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
+    fs::canonicalize(path)
+        .map_err(|error| format!("failed to resolve path {}: {error}", path.display()))
+}
+
+fn has_top_level_side_effects(program: &Program<'_>) -> bool {
+    program.body.iter().any(statement_has_top_level_side_effect)
+}
+
+fn statement_has_top_level_side_effect(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::EmptyStatement(_) => false,
+        Statement::ImportDeclaration(_) | Statement::ExportAllDeclaration(_) => false,
+        Statement::ExportNamedDeclaration(declaration) => declaration
+            .declaration
+            .as_ref()
+            .is_some_and(declaration_has_side_effect),
+        Statement::ExportDefaultDeclaration(declaration) => {
+            export_default_has_side_effect(&declaration.declaration)
+        }
+        Statement::FunctionDeclaration(_) => false,
+        Statement::ClassDeclaration(class) => class_has_static_block(class),
+        Statement::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().any(|declaration| {
+                declaration
+                    .init
+                    .as_ref()
+                    .is_some_and(expression_has_side_effect)
+            })
+        }
+        Statement::TSTypeAliasDeclaration(_)
+        | Statement::TSInterfaceDeclaration(_)
+        | Statement::TSEnumDeclaration(_)
+        | Statement::TSModuleDeclaration(_)
+        | Statement::TSGlobalDeclaration(_)
+        | Statement::TSImportEqualsDeclaration(_)
+        | Statement::TSExportAssignment(_)
+        | Statement::TSNamespaceExportDeclaration(_) => false,
+        Statement::ExpressionStatement(_)
+        | Statement::DebuggerStatement(_)
+        | Statement::DoWhileStatement(_)
+        | Statement::ForInStatement(_)
+        | Statement::ForOfStatement(_)
+        | Statement::ForStatement(_)
+        | Statement::IfStatement(_)
+        | Statement::LabeledStatement(_)
+        | Statement::ReturnStatement(_)
+        | Statement::SwitchStatement(_)
+        | Statement::ThrowStatement(_)
+        | Statement::TryStatement(_)
+        | Statement::WhileStatement(_)
+        | Statement::WithStatement(_)
+        | Statement::BreakStatement(_)
+        | Statement::ContinueStatement(_)
+        | Statement::BlockStatement(_) => true,
+    }
+}
+
+fn declaration_has_side_effect(declaration: &Declaration<'_>) -> bool {
+    match declaration {
+        Declaration::FunctionDeclaration(_) => false,
+        Declaration::ClassDeclaration(class) => class_has_static_block(class),
+        Declaration::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().any(|declaration| {
+                declaration
+                    .init
+                    .as_ref()
+                    .is_some_and(expression_has_side_effect)
+            })
+        }
+        Declaration::TSTypeAliasDeclaration(_)
+        | Declaration::TSInterfaceDeclaration(_)
+        | Declaration::TSEnumDeclaration(_)
+        | Declaration::TSModuleDeclaration(_)
+        | Declaration::TSGlobalDeclaration(_)
+        | Declaration::TSImportEqualsDeclaration(_) => false,
+    }
+}
+
+fn export_default_has_side_effect(declaration: &ExportDefaultDeclarationKind<'_>) -> bool {
+    match declaration {
+        ExportDefaultDeclarationKind::FunctionDeclaration(_) => false,
+        ExportDefaultDeclarationKind::ClassDeclaration(class) => class_has_static_block(class),
+        ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => false,
+        ExportDefaultDeclarationKind::BooleanLiteral(_)
+        | ExportDefaultDeclarationKind::NullLiteral(_)
+        | ExportDefaultDeclarationKind::NumericLiteral(_)
+        | ExportDefaultDeclarationKind::BigIntLiteral(_)
+        | ExportDefaultDeclarationKind::RegExpLiteral(_)
+        | ExportDefaultDeclarationKind::StringLiteral(_)
+        | ExportDefaultDeclarationKind::Identifier(_)
+        | ExportDefaultDeclarationKind::MetaProperty(_)
+        | ExportDefaultDeclarationKind::ThisExpression(_)
+        | ExportDefaultDeclarationKind::Super(_)
+        | ExportDefaultDeclarationKind::FunctionExpression(_)
+        | ExportDefaultDeclarationKind::ArrowFunctionExpression(_) => false,
+        ExportDefaultDeclarationKind::ClassExpression(class) => class_has_static_block(class),
+        ExportDefaultDeclarationKind::TemplateLiteral(_)
+        | ExportDefaultDeclarationKind::ArrayExpression(_)
+        | ExportDefaultDeclarationKind::AssignmentExpression(_)
+        | ExportDefaultDeclarationKind::AwaitExpression(_)
+        | ExportDefaultDeclarationKind::BinaryExpression(_)
+        | ExportDefaultDeclarationKind::CallExpression(_)
+        | ExportDefaultDeclarationKind::ChainExpression(_)
+        | ExportDefaultDeclarationKind::ConditionalExpression(_)
+        | ExportDefaultDeclarationKind::ImportExpression(_)
+        | ExportDefaultDeclarationKind::LogicalExpression(_)
+        | ExportDefaultDeclarationKind::NewExpression(_)
+        | ExportDefaultDeclarationKind::ObjectExpression(_)
+        | ExportDefaultDeclarationKind::ParenthesizedExpression(_)
+        | ExportDefaultDeclarationKind::SequenceExpression(_)
+        | ExportDefaultDeclarationKind::TaggedTemplateExpression(_)
+        | ExportDefaultDeclarationKind::UnaryExpression(_)
+        | ExportDefaultDeclarationKind::UpdateExpression(_)
+        | ExportDefaultDeclarationKind::YieldExpression(_)
+        | ExportDefaultDeclarationKind::PrivateInExpression(_)
+        | ExportDefaultDeclarationKind::JSXElement(_)
+        | ExportDefaultDeclarationKind::JSXFragment(_)
+        | ExportDefaultDeclarationKind::TSAsExpression(_)
+        | ExportDefaultDeclarationKind::TSSatisfiesExpression(_)
+        | ExportDefaultDeclarationKind::TSTypeAssertion(_)
+        | ExportDefaultDeclarationKind::TSNonNullExpression(_)
+        | ExportDefaultDeclarationKind::TSInstantiationExpression(_)
+        | ExportDefaultDeclarationKind::ComputedMemberExpression(_)
+        | ExportDefaultDeclarationKind::StaticMemberExpression(_)
+        | ExportDefaultDeclarationKind::PrivateFieldExpression(_)
+        | ExportDefaultDeclarationKind::V8IntrinsicExpression(_) => true,
+    }
+}
+
+fn expression_has_side_effect(expression: &Expression<'_>) -> bool {
+    !matches!(
+        expression,
+        Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::Identifier(_)
+            | Expression::MetaProperty(_)
+            | Expression::ThisExpression(_)
+            | Expression::Super(_)
+            | Expression::FunctionExpression(_)
+            | Expression::ArrowFunctionExpression(_)
+    )
+}
+
+fn class_has_static_block(class: &Class<'_>) -> bool {
+    class
+        .body
+        .body
+        .iter()
+        .any(|element| matches!(element, ClassElement::StaticBlock(_)))
+}
+
+fn span_start(span: Span) -> usize {
+    span.start as usize
+}
+
+fn span_end(span: Span) -> usize {
+    span.end as usize
 }

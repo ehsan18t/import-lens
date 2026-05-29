@@ -375,6 +375,7 @@ dependencies = [
  "oxc_resolver",
  "oxc_semantic",
  "oxc_span",
+ "oxc_syntax",
  "oxc_transformer",
  "papaya",
  "rayon",
