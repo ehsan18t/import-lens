@@ -8,9 +8,10 @@ export default defineConfig({
   minify: true,
   sourcemap: false,
   dts: false,
-  external: ["vscode"],
+  deps: {
+    neverBundle: ["vscode"],
+  },
   outputOptions: {
     entryFileNames: "extension.cjs",
   },
 });
-

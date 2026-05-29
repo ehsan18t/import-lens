@@ -721,6 +721,7 @@ interface HelloMessage {
   type: "hello";
   version: number;              // Protocol version, currently 1
   workspace_root: string;       // Absolute path to the workspace root
+  storage_path: string;         // Absolute VS Code globalStoragePath for cache and lifecycle files
   enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
   log_level: "error" | "warn" | "info" | "debug";
 }
@@ -990,7 +991,7 @@ struct CachedResult {
 
 ### 11.2 Configuration Storage
 
-User configuration is stored by VS Code in the user's `settings.json` and accessed via `workspace.getConfiguration('importLens')`. The daemon does not read VS Code settings directly; the extension host passes relevant configuration values in the `HELLO` handshake message at startup.
+User configuration is stored by VS Code in the user's `settings.json` and accessed via `workspace.getConfiguration('importLens')`. The daemon does not read VS Code settings directly; the extension host passes relevant configuration values and the VS Code `globalStoragePath` in the `HELLO` handshake message at startup.
 
 ---
 

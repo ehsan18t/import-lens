@@ -124,7 +124,7 @@
     "build:daemon": "cargo build -p import-lens-daemon --release",
     "copy:daemon:win32-x64": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/copy-daemon.ps1 -Target win32-x64",
     "hash:daemon": "node scripts/generate-daemon-hashes.mjs",
-    "package:win32-x64": "pnpm build && pnpm build:daemon && pnpm copy:daemon:win32-x64 && pnpm hash:daemon && vsce package --target win32-x64 --no-dependencies"
+    "package:win32-x64": "pnpm build:daemon && pnpm copy:daemon:win32-x64 && pnpm hash:daemon && pnpm build && vsce package --target win32-x64 --no-dependencies"
   },
   "dependencies": {
     "@msgpack/msgpack": "3.1.3",
@@ -138,4 +138,3 @@
     "typescript": "6.0.3"
   }
 }
-

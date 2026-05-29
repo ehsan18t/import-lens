@@ -1,0 +1,62 @@
+import path from "node:path";
+import * as vscode from "vscode";
+import type { DaemonManager } from "./daemon/manager.js";
+import { getPackageName } from "./imports/specifier.js";
+
+export const registerNodeModulesWatchers = (context: vscode.ExtensionContext, daemon: DaemonManager): void => {
+  const pending = new Set<string>();
+  let timer: NodeJS.Timeout | undefined;
+
+  const flush = (): void => {
+    const packages = [...pending];
+    pending.clear();
+
+    if (packages.length > 20) {
+      daemon.invalidateAll();
+      return;
+    }
+
+    for (const packageName of packages) {
+      daemon.invalidatePackage(packageName);
+    }
+  };
+
+  const queue = (uri: vscode.Uri): void => {
+    const packageName = packageNameFromPackageJsonPath(uri.fsPath);
+
+    if (!packageName) {
+      daemon.invalidateAll();
+      return;
+    }
+
+    pending.add(packageName);
+
+    if (timer) {
+      clearTimeout(timer);
+    }
+
+    timer = setTimeout(flush, 250);
+  };
+
+  for (const pattern of ["**/node_modules/*/package.json", "**/node_modules/@*/*/package.json"]) {
+    const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+    watcher.onDidCreate(queue, undefined, context.subscriptions);
+    watcher.onDidChange(queue, undefined, context.subscriptions);
+    watcher.onDidDelete(queue, undefined, context.subscriptions);
+    context.subscriptions.push(watcher);
+  }
+};
+
+const packageNameFromPackageJsonPath = (packageJsonPath: string): string | null => {
+  const normalized = packageJsonPath.split(path.sep).join("/");
+  const marker = "/node_modules/";
+  const index = normalized.lastIndexOf(marker);
+
+  if (index === -1) {
+    return null;
+  }
+
+  const afterNodeModules = normalized.slice(index + marker.length).replace(/\/package\.json$/u, "");
+  return getPackageName(afterNodeModules);
+};
+
