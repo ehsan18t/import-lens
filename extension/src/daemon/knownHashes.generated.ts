@@ -1,3 +1,3 @@
 export const knownDaemonHashes: Readonly<Record<string, string>> = {
-  "bin/win32-x64/import-lens-daemon.exe": "ece2c81728448fb01a62cd2320974723a1066a4a9642f2ef59ae71f044f5baa0"
+  "bin/win32-x64/import-lens-daemon.exe": "6b3a000aeef206f4c66203fce156a2eaa4bec3e65b986b5e7f8a1533a97538ba"
 };

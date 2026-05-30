@@ -10,12 +10,20 @@ pub fn bundle_reachable_modules(
 ) -> Result<String, String> {
     let included = collect_included_modules(graph, reachable);
     let mut source = String::new();
+    let mut deduplicated_external_imports = HashMap::new();
 
     for module in graph
         .modules
         .iter()
         .filter(|module| included.contains_key(&module.id))
     {
+        for ext in &module.external_imports {
+            deduplicated_external_imports
+                .entry(ext.specifier.clone())
+                .or_insert_with(Vec::new)
+                .push(ext.clone());
+        }
+
         let keep_all_exports = included.get(&module.id).copied().unwrap_or(false);
         let rewritten = rewrite_module(graph, module, reachable, keep_all_exports)?;
         if !rewritten.trim().is_empty() {
@@ -24,7 +32,58 @@ pub fn bundle_reachable_modules(
         }
     }
 
-    Ok(source)
+    let mut synthetic_imports = String::new();
+    let mut specifiers: Vec<_> = deduplicated_external_imports.keys().collect();
+    specifiers.sort();
+
+    for specifier in specifiers {
+        let edges = deduplicated_external_imports.get(specifier).unwrap();
+        let mut default_local = None;
+        let mut namespace_local = None;
+        let mut named_imports = Vec::new();
+
+        for edge in edges {
+            if edge.imported_name.is_empty() {
+                continue;
+            } else if edge.imported_name == "default" {
+                default_local = Some(edge.local_name.clone());
+            } else if edge.imported_name == "*" {
+                namespace_local = Some(edge.local_name.clone());
+            } else {
+                if edge.imported_name == edge.local_name {
+                    named_imports.push(edge.imported_name.clone());
+                } else {
+                    named_imports.push(format!("{} as {}", edge.imported_name, edge.local_name));
+                }
+            }
+        }
+
+        let has_bindings =
+            default_local.is_some() || namespace_local.is_some() || !named_imports.is_empty();
+
+        if let Some(local) = default_local {
+            synthetic_imports.push_str(&format!("import {} from '{}';\n", local, specifier));
+        }
+        if let Some(local) = namespace_local {
+            synthetic_imports.push_str(&format!("import * as {} from '{}';\n", local, specifier));
+        }
+        if !named_imports.is_empty() {
+            named_imports.sort();
+            named_imports.dedup();
+            synthetic_imports.push_str(&format!(
+                "import {{ {} }} from '{}';\n",
+                named_imports.join(", "),
+                specifier
+            ));
+        }
+
+        if !has_bindings {
+            synthetic_imports.push_str(&format!("import '{}';\n", specifier));
+        }
+    }
+
+    synthetic_imports.push_str(&source);
+    Ok(synthetic_imports)
 }
 
 fn collect_included_modules(
@@ -89,11 +148,8 @@ fn rewrite_module(
 ) -> Result<String, String> {
     let mut replacements = Vec::new();
 
-    for import in &module.imports {
-        replacements.push(Replacement::remove(
-            import.statement_start,
-            import.statement_end,
-        ));
+    for import_span in &module.import_statement_spans {
+        replacements.push(Replacement::remove(import_span.0, import_span.1));
     }
     for reexport in &module.reexports {
         replacements.push(Replacement::remove(

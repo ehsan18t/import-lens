@@ -76,3 +76,35 @@ fn minify_source_removes_whitespace_and_preserves_parseability() {
     assert!(minified.len() < "const value = 1 + 1;\nconsole.log(value);\n".len());
     assert_parseable(&minified);
 }
+
+#[test]
+fn bundle_hoists_and_deduplicates_external_imports() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "export { left } from './left.js';\nexport { right } from './right.js';",
+    );
+    write_source(
+        &root,
+        "left.js",
+        "import React from 'react';\nimport { forwardRef } from 'react';\nexport const left = forwardRef(() => React.createElement('div'));",
+    );
+    write_source(
+        &root,
+        "right.js",
+        "import { forwardRef, useState } from 'react';\nimport * as ReactNamespace from 'react';\nimport { forwardRef as fr } from 'react';\nimport 'react';\nexport const right = fr(() => ReactNamespace.createElement('div'));",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["left".to_owned(), "right".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+
+    println!("BUNDLED:\n{}", bundled);
+    assert!(bundled.starts_with("import React from 'react';\nimport * as ReactNamespace from 'react';\nimport { forwardRef, forwardRef as fr, useState } from 'react';\n"));
+
+    // Ensure the AST parses without any redeclaration errors from oxc
+    assert_parseable(&bundled);
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+}

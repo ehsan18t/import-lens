@@ -25,6 +25,8 @@ pub struct ModuleRecord {
     pub path: PathBuf,
     pub source: String,
     pub imports: Vec<ImportEdge>,
+    pub external_imports: Vec<ExternalImportEdge>,
+    pub import_statement_spans: Vec<(usize, usize)>,
     pub exports: Vec<ExportRecord>,
     pub reexports: Vec<ReExportRecord>,
     pub star_exports: Vec<StarExportRecord>,
@@ -38,6 +40,15 @@ pub struct ImportEdge {
     pub resolved_path: PathBuf,
     pub imported_names: Vec<String>,
     pub imported_bindings: Vec<ImportedBinding>,
+    pub statement_start: usize,
+    pub statement_end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalImportEdge {
+    pub specifier: String,
+    pub imported_name: String,
+    pub local_name: String,
     pub statement_start: usize,
     pub statement_end: usize,
 }
@@ -154,6 +165,8 @@ impl ModuleGraphBuilder {
             path,
             source,
             imports: parsed.imports,
+            external_imports: parsed.external_imports,
+            import_statement_spans: parsed.import_statement_spans,
             exports: parsed.exports,
             reexports: parsed.reexports,
             star_exports: parsed.star_exports,
@@ -172,6 +185,8 @@ impl ModuleGraphBuilder {
 #[derive(Debug, Default)]
 struct ParsedModule {
     imports: Vec<ImportEdge>,
+    external_imports: Vec<ExternalImportEdge>,
+    import_statement_spans: Vec<(usize, usize)>,
     exports: Vec<ExportRecord>,
     reexports: Vec<ReExportRecord>,
     star_exports: Vec<StarExportRecord>,
@@ -213,8 +228,12 @@ fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
         ));
     }
 
+    let (imports, external_imports, import_statement_spans) =
+        import_edges(path, &parsed.module_record)?;
     Ok(ParsedModule {
-        imports: import_edges(path, &parsed.module_record)?,
+        imports,
+        external_imports,
+        import_statement_spans,
         exports: export_records(&parsed.module_record),
         reexports: reexport_records(path, &parsed.module_record)?,
         star_exports: star_export_records(path, &parsed.module_record)?,
@@ -226,9 +245,32 @@ fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
 fn import_edges(
     path: &Path,
     module_record: &OxcModuleRecord<'_>,
-) -> Result<Vec<ImportEdge>, String> {
+) -> Result<
+    (
+        Vec<ImportEdge>,
+        Vec<ExternalImportEdge>,
+        Vec<(usize, usize)>,
+    ),
+    String,
+> {
     let mut imports = Vec::new();
+    let mut external_imports = Vec::new();
+    let mut import_statement_spans = Vec::new();
     let mut binding_import_specifiers = HashSet::new();
+
+    for requested_modules in module_record.requested_modules.values() {
+        for request in requested_modules {
+            if request.is_import && !request.is_type {
+                let span = (
+                    span_start(request.statement_span),
+                    span_end(request.statement_span),
+                );
+                if !import_statement_spans.contains(&span) {
+                    import_statement_spans.push(span);
+                }
+            }
+        }
+    }
 
     for entry in module_record
         .import_entries
@@ -237,15 +279,25 @@ fn import_edges(
     {
         let specifier = entry.module_request.name.as_str().to_owned();
         binding_import_specifiers.insert(specifier.clone());
+        let imported_name = import_name(entry);
+        let local_name = entry.local_name.name.as_str().to_owned();
         if let Some(resolved_path) = resolve_relative_module(path, &specifier)? {
             push_import_binding(
                 &mut imports,
                 specifier,
                 resolved_path,
-                import_name(entry),
-                entry.local_name.name.as_str().to_owned(),
+                imported_name,
+                local_name,
                 entry.statement_span,
             );
+        } else {
+            external_imports.push(ExternalImportEdge {
+                specifier,
+                imported_name,
+                local_name,
+                statement_start: span_start(entry.statement_span),
+                statement_end: span_end(entry.statement_span),
+            });
         }
     }
 
@@ -261,19 +313,28 @@ fn import_edges(
             continue;
         }
 
+        let statement_span = requested_modules[0].statement_span;
         if let Some(resolved_path) = resolve_relative_module(path, specifier.as_str())? {
             imports.push(ImportEdge {
                 specifier: specifier.as_str().to_owned(),
                 resolved_path,
                 imported_names: Vec::new(),
                 imported_bindings: Vec::new(),
-                statement_start: span_start(requested_modules[0].statement_span),
-                statement_end: span_end(requested_modules[0].statement_span),
+                statement_start: span_start(statement_span),
+                statement_end: span_end(statement_span),
+            });
+        } else {
+            external_imports.push(ExternalImportEdge {
+                specifier: specifier.as_str().to_owned(),
+                imported_name: String::new(),
+                local_name: String::new(),
+                statement_start: span_start(statement_span),
+                statement_end: span_end(statement_span),
             });
         }
     }
 
-    Ok(imports)
+    Ok((imports, external_imports, import_statement_spans))
 }
 
 fn push_import_binding(

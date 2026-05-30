@@ -41,14 +41,13 @@ fn extract_fixture_archives() {
     let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures");
-        
+
     let archive = fixtures_dir.join("packages.zip");
     let target = fixtures_dir.join("packages");
 
     if archive.exists() && !target.exists() {
         let file = fs::File::open(&archive).expect("fixture archive should be readable");
-        let mut zip =
-            zip::ZipArchive::new(file).expect("fixture archive should be a valid zip");
+        let mut zip = zip::ZipArchive::new(file).expect("fixture archive should be a valid zip");
         zip.extract(&target)
             .expect("fixture archive should extract successfully");
     }
