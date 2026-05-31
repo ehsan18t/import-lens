@@ -23,20 +23,10 @@ impl ImportLensService {
 
     pub fn handle_batch(&self, request: BatchRequest) -> BatchResponse {
         if request.version != PROTOCOL_VERSION {
-            return BatchResponse {
-                version: PROTOCOL_VERSION,
-                request_id: request.request_id,
-                imports: request
-                    .imports
-                    .iter()
-                    .map(|item| {
-                        protocol_error(
-                            item,
-                            format!("unsupported protocol version {}", request.version),
-                        )
-                    })
-                    .collect(),
-            };
+            return protocol_error_batch_response(
+                &request,
+                format!("unsupported protocol version {}", request.version),
+            );
         }
 
         let context = AnalysisContext {
@@ -107,6 +97,18 @@ impl ImportLensService {
         }
 
         result
+    }
+}
+
+pub fn protocol_error_batch_response(request: &BatchRequest, message: String) -> BatchResponse {
+    BatchResponse {
+        version: PROTOCOL_VERSION,
+        request_id: request.request_id,
+        imports: request
+            .imports
+            .iter()
+            .map(|item| protocol_error(item, message.clone()))
+            .collect(),
     }
 }
 

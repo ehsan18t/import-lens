@@ -1,6 +1,6 @@
 use import_lens_daemon::{
     ipc::protocol::{BatchRequest, ImportKind, ImportRequest},
-    service::ImportLensService,
+    service::{ImportLensService, protocol_error_batch_response},
 };
 use std::{
     fs,
@@ -78,4 +78,23 @@ fn service_cache_invalidation_removes_matching_package_entries() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!after_invalidate.imports[0].cache_hit);
+}
+
+#[test]
+fn protocol_error_batch_response_rejects_all_imports_without_analysis() {
+    let workspace = temp_workspace();
+    let response = protocol_error_batch_response(
+        &batch(&workspace, 42),
+        "hello message not received".to_owned(),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 42);
+    assert_eq!(response.imports.len(), 1);
+    assert_eq!(
+        response.imports[0].error.as_deref(),
+        Some("hello message not received")
+    );
+    assert_eq!(response.imports[0].diagnostics[0].stage, "protocol");
+    assert_eq!(response.imports[0].raw_bytes, 0);
 }

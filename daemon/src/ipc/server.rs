@@ -5,7 +5,7 @@ use crate::{
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
     prefetch::Prefetcher,
-    service::ImportLensService,
+    service::{ImportLensService, protocol_error_batch_response},
 };
 use std::{
     error::Error,
@@ -104,7 +104,7 @@ where
                         return Ok(());
                     }
                 }
-                ClientMessage::Batch(request) => {
+                ClientMessage::Batch(request) if hello_received => {
                     prefetcher.cancel();
                     lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
@@ -116,6 +116,13 @@ where
                     if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
                         return Ok(());
                     }
+                }
+                ClientMessage::Batch(request) => {
+                    let response = protocol_error_batch_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    );
+                    stream.write_all(&encode_frame(&response)?).await?;
                 }
                 ClientMessage::CacheInvalidate(message) if hello_received => {
                     service.invalidate_package(&message.package_name);
