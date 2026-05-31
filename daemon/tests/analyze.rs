@@ -355,6 +355,82 @@ fn analyze_import_reports_side_effect_array_conservatively() {
 }
 
 #[test]
+fn analyze_import_reports_missing_named_export_without_failing_result() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "missing-export-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "export const present = 1;\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "missing-export-lib",
+            "missing-export-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["missing"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "exports"
+                && diagnostic.message.contains("missing")),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_namespace_import_reports_oxc_fallback_diagnostic() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "fallback-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "export const value = ;\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "fallback-lib",
+            "fallback-lib",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "oxc_fallback"
+                && diagnostic.message.contains("static entry")),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_import_returns_partial_error_result_on_missing_entry() {
     let workspace = temp_workspace();
     write_package(

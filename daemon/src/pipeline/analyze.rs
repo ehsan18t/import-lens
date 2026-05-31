@@ -3,13 +3,17 @@ use crate::{
     pipeline::{
         bundle::bundle_reachable_modules,
         compress::compress_all,
-        graph::build_module_graph,
+        graph::{ModuleGraph, ModuleId, build_module_graph},
         minify::minify_source,
         reachability::reachable_exports,
         resolver::{SideEffectsMode, resolve_package_entry},
     },
 };
-use std::{fs, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone)]
 pub struct AnalysisContext {
@@ -75,6 +79,7 @@ fn analyze_import_inner(
         ));
     }
 
+    let mut fallback_diagnostics = Vec::new();
     if !is_cjs
         && matches!(
             request.import_kind,
@@ -83,12 +88,16 @@ fn analyze_import_inner(
     {
         match analyze_with_oxc_pipeline(context, request, entry_path.clone(), side_effects_mode) {
             Ok(result) => return Ok(result),
-            Err(_) if matches!(request.import_kind, ImportKind::Namespace) => {}
+            Err(error) if matches!(request.import_kind, ImportKind::Namespace) => {
+                fallback_diagnostics.push(oxc_fallback_diagnostic(error));
+            }
             Err(error) => return Err(error),
         }
     }
 
-    analyze_static_entry(context, request, entry_path, side_effects_mode, is_cjs)
+    let mut result = analyze_static_entry(context, request, entry_path, side_effects_mode, is_cjs)?;
+    result.diagnostics.extend(fallback_diagnostics);
+    Ok(result)
 }
 
 fn analyze_with_oxc_pipeline(
@@ -150,6 +159,9 @@ fn analyze_with_oxc_pipeline(
         )
     })?;
 
+    let mut diagnostics = side_effect_diagnostics(side_effects_mode, &entry_path);
+    diagnostics.extend(missing_export_diagnostics(request, &graph));
+
     Ok(ImportResult {
         specifier: request.specifier.clone(),
         raw_bytes: bundled.len() as u64,
@@ -167,7 +179,7 @@ fn analyze_with_oxc_pipeline(
         ),
         is_cjs: false,
         error: None,
-        diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path),
+        diagnostics,
     })
 }
 
@@ -259,7 +271,7 @@ fn analyze_static_entry(
 
 fn side_effect_diagnostics(
     side_effects_mode: SideEffectsMode,
-    entry_path: &std::path::Path,
+    entry_path: &Path,
 ) -> Vec<ImportDiagnostic> {
     if side_effects_mode != SideEffectsMode::Array {
         return Vec::new();
@@ -273,6 +285,100 @@ fn side_effect_diagnostics(
             format!("entry_path: {}", entry_path.display()),
         ],
     }]
+}
+
+fn oxc_fallback_diagnostic(error: AnalysisError) -> ImportDiagnostic {
+    let mut details = vec![format!("failed_stage: {}", error.stage)];
+    details.extend(error.details);
+
+    ImportDiagnostic {
+        stage: "oxc_fallback".to_owned(),
+        message: format!(
+            "OXC pipeline failed; using static entry sizing: {}",
+            error.message
+        ),
+        details,
+    }
+}
+
+fn missing_export_diagnostics(
+    request: &ImportRequest,
+    graph: &ModuleGraph,
+) -> Vec<ImportDiagnostic> {
+    if !matches!(request.import_kind, ImportKind::Named) {
+        return Vec::new();
+    }
+
+    let missing = request
+        .named
+        .iter()
+        .filter(|exported_name| {
+            !graph_exports_name(graph, graph.entry_id, exported_name, &mut HashSet::new())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return Vec::new();
+    }
+
+    vec![ImportDiagnostic {
+        stage: "exports".to_owned(),
+        message: format!("named export(s) not found: {}", missing.join(", ")),
+        details: vec![
+            format!("specifier: {}", request.specifier),
+            format!("missing_exports: {}", missing.join(", ")),
+        ],
+    }]
+}
+
+fn graph_exports_name(
+    graph: &ModuleGraph,
+    module_id: ModuleId,
+    exported_name: &str,
+    visited: &mut HashSet<(ModuleId, String)>,
+) -> bool {
+    if !visited.insert((module_id, exported_name.to_owned())) {
+        return false;
+    }
+
+    let Some(module) = graph.module_by_id(module_id) else {
+        return false;
+    };
+
+    if module
+        .exports
+        .iter()
+        .any(|export| export.exported_name == exported_name)
+    {
+        return true;
+    }
+
+    for reexport in module
+        .reexports
+        .iter()
+        .filter(|reexport| reexport.exported_name == exported_name)
+    {
+        if reexport.imported_name == "*" {
+            return true;
+        }
+
+        if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path)
+            && graph_exports_name(graph, target_id, &reexport.imported_name, visited)
+        {
+            return true;
+        }
+    }
+
+    for star_export in &module.star_exports {
+        if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path)
+            && graph_exports_name(graph, target_id, exported_name, visited)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
