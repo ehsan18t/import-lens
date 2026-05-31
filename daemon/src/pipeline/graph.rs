@@ -17,6 +17,27 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const MAX_GRAPH_MODULES: usize = 2_000;
+pub const MAX_MODULE_SOURCE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_GRAPH_SOURCE_BYTES: usize = 50 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphLimits {
+    pub max_modules: usize,
+    pub max_module_source_bytes: usize,
+    pub max_graph_source_bytes: usize,
+}
+
+impl Default for GraphLimits {
+    fn default() -> Self {
+        Self {
+            max_modules: MAX_GRAPH_MODULES,
+            max_module_source_bytes: MAX_MODULE_SOURCE_BYTES,
+            max_graph_source_bytes: MAX_GRAPH_SOURCE_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModuleId(pub usize);
 
@@ -118,17 +139,35 @@ impl ModuleGraph {
 }
 
 pub fn build_module_graph(entry_path: &Path) -> Result<ModuleGraph, String> {
+    build_module_graph_with_limits(entry_path, GraphLimits::default())
+}
+
+pub fn build_module_graph_with_limits(
+    entry_path: &Path,
+    limits: GraphLimits,
+) -> Result<ModuleGraph, String> {
     let entry_path = normalize_existing_path(entry_path)?;
-    let mut builder = ModuleGraphBuilder::default();
+    let mut builder = ModuleGraphBuilder::new(limits);
     let entry_id = builder.load_module(&entry_path)?;
     builder.graph.entry_id = entry_id;
 
     Ok(builder.graph)
 }
 
-#[derive(Default)]
 struct ModuleGraphBuilder {
     graph: ModuleGraph,
+    limits: GraphLimits,
+    graph_source_bytes: usize,
+}
+
+impl ModuleGraphBuilder {
+    fn new(limits: GraphLimits) -> Self {
+        Self {
+            graph: ModuleGraph::default(),
+            limits,
+            graph_source_bytes: 0,
+        }
+    }
 }
 
 impl ModuleGraphBuilder {
@@ -137,9 +176,43 @@ impl ModuleGraphBuilder {
         if let Some(existing) = self.graph.path_to_id.get(&path) {
             return Ok(*existing);
         }
+        if self.graph.modules.len() >= self.limits.max_modules {
+            return Err(format!(
+                "module count limit exceeded while loading {}; limit: {}",
+                path.display(),
+                self.limits.max_modules
+            ));
+        }
 
         let source = fs::read_to_string(&path)
             .map_err(|error| format!("failed to read module {}: {error}", path.display()))?;
+        let source_bytes = source.len();
+        if source_bytes > self.limits.max_module_source_bytes {
+            return Err(format!(
+                "module source size {} exceeds limit {} in {}",
+                source_bytes,
+                self.limits.max_module_source_bytes,
+                path.display()
+            ));
+        }
+        let next_graph_source_bytes =
+            self.graph_source_bytes
+                .checked_add(source_bytes)
+                .ok_or_else(|| {
+                    format!(
+                        "graph source size overflow while loading {}",
+                        path.display()
+                    )
+                })?;
+        if next_graph_source_bytes > self.limits.max_graph_source_bytes {
+            return Err(format!(
+                "graph source size {} exceeds limit {} while loading {}",
+                next_graph_source_bytes,
+                self.limits.max_graph_source_bytes,
+                path.display()
+            ));
+        }
+
         let parsed = parse_module(&path, &source)?;
         let id = ModuleId(self.graph.modules.len());
         let next_paths = parsed
@@ -161,6 +234,7 @@ impl ModuleGraphBuilder {
             .collect::<Vec<_>>();
 
         self.graph.path_to_id.insert(path.clone(), id);
+        self.graph_source_bytes = next_graph_source_bytes;
         self.graph.modules.push(ModuleRecord {
             id,
             path,
