@@ -15,6 +15,8 @@ fn result(specifier: &str, cache_hit: bool) -> ImportResult {
         is_cjs: false,
         error: None,
         diagnostics: Vec::new(),
+        module_breakdown: None,
+        shared_bytes: None,
     }
 }
 

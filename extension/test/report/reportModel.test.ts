@@ -59,3 +59,20 @@ test("buildReportRows includes warning rows without size results", () => {
   assert.equal(rows[0].warning, "Package not found");
   assert.equal(rows[0].brotliBytes, 0);
 });
+
+test("buildReportRows summarizes the largest module contributors", () => {
+  const rows = buildReportRows([
+    {
+      ...item("tiny-lib", 100),
+      result: {
+        ...result("tiny-lib", 100),
+        module_breakdown: [
+          { path: "/workspace/node_modules/tiny-lib/large.js", bytes: 1200 },
+          { path: "/workspace/node_modules/tiny-lib/small.js", bytes: 80 },
+        ],
+      },
+    },
+  ]);
+
+  assert.equal(rows[0].topModules, "large.js (1200 B), small.js (80 B)");
+});

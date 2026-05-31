@@ -6,7 +6,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { IpcClient } from "../../src/ipc/client.js";
 import { encodeFrame } from "../../src/ipc/codec.js";
-import type { BatchRequest, BatchResponse, ImportResult } from "../../src/ipc/protocol.js";
+import type {
+  BatchRequest,
+  BatchResponse,
+  EnumerateExportsRequest,
+  EnumerateExportsResponse,
+  ImportResult,
+} from "../../src/ipc/protocol.js";
 
 const testPipeName = (): string => {
   const unique = `import-lens-ipc-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -71,6 +77,17 @@ const batchRequest = (requestId: number): BatchRequest => ({
   active_document_path: "/workspace/src/app.ts",
   imports: [],
   streaming: true,
+});
+
+const exportsRequest = (requestId: number): EnumerateExportsRequest => ({
+  type: "enumerate_exports",
+  version: 2,
+  request_id: requestId,
+  workspace_root: "/workspace",
+  active_document_path: "/workspace/src/app.ts",
+  specifier: "tiny-lib",
+  package: "tiny-lib",
+  package_version: "1.0.0",
 });
 
 test("IpcClient.dispose does not emit disconnect for intentional disposal", async () => {
@@ -176,6 +193,40 @@ test("IpcClient emits streaming partials and resolves final batch response", asy
     assert.equal(response.imports.length, 1);
     assert.equal(partials.length, 1);
     assert.deepEqual(partials[0]?.indexes, [0]);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+test("IpcClient resolves export enumeration responses independently from batches", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const exportsResponse: EnumerateExportsResponse = {
+    version: 2,
+    request_id: 101,
+    specifier: "tiny-lib",
+    exports: ["alpha", "beta"],
+    error: null,
+    diagnostics: [],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    setTimeout(() => {
+      socket.write(encodeFrame(exportsResponse));
+    }, 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const response = await client.requestExports(exportsRequest(101));
+
+    assert.deepEqual(response.exports, ["alpha", "beta"]);
+    assert.equal(response.request_id, 101);
     client.dispose();
   } finally {
     destroySockets(sockets);

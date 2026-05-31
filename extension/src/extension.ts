@@ -8,6 +8,7 @@ import { ImportLensLogger } from "./logger.js";
 import { registerNodeModulesWatchers } from "./watcher.js";
 import { registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
+import { ImportMemberCompletionProvider } from "./ui/completions.js";
 import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
@@ -34,9 +35,11 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const codeLens = new ImportLensCodeLensProvider(store);
 
   daemon = new DaemonManager(context, logger);
+  const completions = new ImportMemberCompletionProvider(daemon);
   context.subscriptions.push(logger, store, statusBar, decorations, inlayHints, codeLens, daemon);
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(languageSelector, inlayHints));
   context.subscriptions.push(vscode.languages.registerCodeLensProvider(languageSelector, codeLens));
+  context.subscriptions.push(vscode.languages.registerCompletionItemProvider(languageSelector, completions, "{", ","));
 
   const analysis = new DocumentAnalysisController(context, store, daemon, logger, statusBar);
   context.subscriptions.push(analysis);

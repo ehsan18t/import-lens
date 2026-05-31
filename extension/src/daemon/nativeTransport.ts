@@ -5,7 +5,13 @@ import path from "node:path";
 import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
 import { IpcClient } from "../ipc/client.js";
-import type { BatchRequest, BatchResponse, HelloMessage } from "../ipc/protocol.js";
+import type {
+  BatchRequest,
+  BatchResponse,
+  EnumerateExportsRequest,
+  EnumerateExportsResponse,
+  HelloMessage,
+} from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { currentPlatformTarget, daemonBinaryName } from "./platform.js";
@@ -213,6 +219,14 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
 
     return this.#client.requestBatch(request, 10000, onPartial);
+  }
+
+  async enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      return null;
+    }
+
+    return this.#client.requestExports(request);
   }
 
   invalidatePackage(packageName: string): void {

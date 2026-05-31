@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { BatchRequest, BatchResponse } from "../../src/ipc/protocol.js";
+import type {
+  BatchRequest,
+  BatchResponse,
+  EnumerateExportsRequest,
+  EnumerateExportsResponse,
+} from "../../src/ipc/protocol.js";
 import { TransportCoordinator, type AnalysisTransport, type DaemonState } from "../../src/daemon/transport.js";
 
 class FakeTransport implements AnalysisTransport {
@@ -28,6 +33,18 @@ class FakeTransport implements AnalysisTransport {
       version: request.version,
       request_id: request.request_id,
       imports: [],
+    };
+  }
+
+  async enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse> {
+    this.calls.push(`exports:${request.request_id}:${request.specifier}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      specifier: request.specifier,
+      exports: ["alpha"],
+      error: null,
+      diagnostics: [],
     };
   }
 
@@ -60,6 +77,7 @@ test("TransportCoordinator selects the first ready transport and delegates reque
 
   assert.equal(await coordinator.start(), "ready");
   await coordinator.sendBatch(batch(7));
+  await coordinator.enumerateExports(exportsRequest(8));
   coordinator.invalidatePackage("react");
   coordinator.prewarmPackageJson("/workspace/package.json", "/workspace/package.json");
 
@@ -67,6 +85,7 @@ test("TransportCoordinator selects the first ready transport and delegates reque
   assert.deepEqual(ready.calls, [
     "start",
     "batch:7",
+    "exports:8:tiny-lib",
     "invalidate:react",
     "prewarm:/workspace/package.json",
   ]);
@@ -98,4 +117,15 @@ const batch = (requestId: number): BatchRequest => ({
   workspace_root: "/workspace",
   active_document_path: "/workspace/src/app.ts",
   imports: [],
+});
+
+const exportsRequest = (requestId: number): EnumerateExportsRequest => ({
+  type: "enumerate_exports",
+  version: 2,
+  request_id: requestId,
+  workspace_root: "/workspace",
+  active_document_path: "/workspace/src/app.ts",
+  specifier: "tiny-lib",
+  package: "tiny-lib",
+  package_version: "1.0.0",
 });

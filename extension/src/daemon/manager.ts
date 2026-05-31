@@ -1,5 +1,10 @@
 import type * as vscode from "vscode";
-import type { BatchRequest, BatchResponse } from "../ipc/protocol.js";
+import type {
+  BatchRequest,
+  BatchResponse,
+  EnumerateExportsRequest,
+  EnumerateExportsResponse,
+} from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { NativeDaemonTransport } from "./nativeTransport.js";
 import { TransportCoordinator, type DaemonState } from "./transport.js";
@@ -23,6 +28,10 @@ export class DaemonManager implements vscode.Disposable {
 
   sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null> {
     return this.#transport.sendBatch(request, onPartial);
+  }
+
+  enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
+    return this.#transport.enumerateExports(request);
   }
 
   invalidatePackage(packageName: string): void {

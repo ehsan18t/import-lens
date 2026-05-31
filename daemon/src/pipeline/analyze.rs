@@ -1,5 +1,7 @@
 use crate::{
-    ipc::protocol::{ImportDiagnostic, ImportKind, ImportRequest, ImportResult},
+    ipc::protocol::{
+        ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ModuleContribution,
+    },
     pipeline::{
         bundle::bundle_reachable_modules,
         compress::compress_all,
@@ -210,6 +212,8 @@ fn analyze_with_oxc_pipeline(
         is_cjs: false,
         error: None,
         diagnostics,
+        module_breakdown: Some(module_breakdown(&graph, &reachable)),
+        shared_bytes: None,
     })
 }
 
@@ -296,7 +300,33 @@ fn analyze_static_entry(
         is_cjs,
         error: None,
         diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path),
+        module_breakdown: None,
+        shared_bytes: None,
     })
+}
+
+fn module_breakdown(
+    graph: &ModuleGraph,
+    reachable: &crate::pipeline::reachability::ReachableExports,
+) -> Vec<ModuleContribution> {
+    let mut contributions = graph
+        .modules
+        .iter()
+        .filter(|module| reachable.contains_module(&module.path))
+        .map(|module| ModuleContribution {
+            path: module.path.to_string_lossy().to_string(),
+            bytes: module.source.len() as u64,
+        })
+        .collect::<Vec<_>>();
+
+    contributions.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    contributions.truncate(10);
+    contributions
 }
 
 fn side_effect_diagnostics(
@@ -429,6 +459,8 @@ fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
             message: error.message,
             details: error.details,
         }],
+        module_breakdown: None,
+        shared_bytes: None,
     }
 }
 

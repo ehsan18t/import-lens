@@ -215,6 +215,13 @@ fn analyze_import_computes_static_sizes_for_local_package_entry() {
     assert!(result.gzip_bytes > 0);
     assert!(!result.side_effects);
     assert!(!result.is_cjs);
+    assert!(
+        result
+            .module_breakdown
+            .as_ref()
+            .is_some_and(|breakdown| breakdown.iter().any(|item| item.path.contains("tiny-lib"))),
+        "{result:?}",
+    );
 }
 
 #[test]

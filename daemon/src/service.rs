@@ -1,15 +1,18 @@
 use crate::{
     cache::{key::cache_key_for_import, memory::ImportCache},
     ipc::protocol::{
-        BatchRequest, BatchResponse, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
-        PROTOCOL_VERSION,
+        BatchRequest, BatchResponse, EnumerateExportsRequest, EnumerateExportsResponse,
+        ImportDiagnostic, ImportKind, ImportRequest, ImportResult, PROTOCOL_VERSION,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
-    pipeline::graph::{clear_module_graph_cache, invalidate_module_graph_cache_for_package},
-    pipeline::resolver::ResolvedPackage,
+    pipeline::graph::{
+        ModuleGraph, ModuleId, build_module_graph_cached, clear_module_graph_cache,
+        invalidate_module_graph_cache_for_package,
+    },
+    pipeline::resolver::{ResolvedPackage, resolve_package_entry},
 };
 use rayon::prelude::*;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 #[derive(Debug, Default)]
 pub struct ImportLensService {
@@ -86,6 +89,88 @@ impl ImportLensService {
             indexes: None,
         });
         responses
+    }
+
+    pub fn enumerate_exports(&self, request: EnumerateExportsRequest) -> EnumerateExportsResponse {
+        if !(2..=PROTOCOL_VERSION).contains(&request.version) {
+            return EnumerateExportsResponse {
+                version: request.version.min(PROTOCOL_VERSION),
+                request_id: request.request_id,
+                specifier: request.specifier,
+                exports: Vec::new(),
+                error: Some(format!("unsupported protocol version {}", request.version)),
+                diagnostics: Vec::new(),
+            };
+        }
+
+        let context = AnalysisContext {
+            workspace_root: PathBuf::from(&request.workspace_root),
+            active_document_path: PathBuf::from(&request.active_document_path),
+        };
+        let import_request = ImportRequest {
+            specifier: request.specifier.clone(),
+            package_name: request.package_name,
+            version: request.package_version,
+            named: Vec::new(),
+            import_kind: ImportKind::Namespace,
+        };
+
+        let resolved = match resolve_package_entry(&context.active_document_path, &import_request) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return EnumerateExportsResponse {
+                    version: request.version,
+                    request_id: request.request_id,
+                    specifier: request.specifier,
+                    exports: Vec::new(),
+                    error: Some(error.clone()),
+                    diagnostics: vec![ImportDiagnostic {
+                        stage: "entry_resolution".to_owned(),
+                        message: error,
+                        details: Vec::new(),
+                    }],
+                };
+            }
+        };
+
+        let graph = match build_module_graph_cached(&resolved.entry_path) {
+            Ok(graph) => graph,
+            Err(error) => {
+                return EnumerateExportsResponse {
+                    version: request.version,
+                    request_id: request.request_id,
+                    specifier: request.specifier,
+                    exports: Vec::new(),
+                    error: Some(error.clone()),
+                    diagnostics: vec![ImportDiagnostic {
+                        stage: "module_graph".to_owned(),
+                        message: error,
+                        details: vec![format!("entry_path: {}", resolved.entry_path.display())],
+                    }],
+                };
+            }
+        };
+
+        let mut exports = enumerate_graph_exports(&graph);
+        exports.sort();
+        exports.dedup();
+
+        EnumerateExportsResponse {
+            version: request.version,
+            request_id: request.request_id,
+            specifier: request.specifier,
+            exports,
+            error: None,
+            diagnostics: graph
+                .diagnostics
+                .iter()
+                .map(|diagnostic| ImportDiagnostic {
+                    stage: diagnostic.stage.clone(),
+                    message: diagnostic.message.clone(),
+                    details: diagnostic.details.clone(),
+                })
+                .collect(),
+        }
     }
 
     pub fn invalidate_package(&self, package_name: &str) {
@@ -208,8 +293,75 @@ pub fn protocol_error_batch_response(request: &BatchRequest, message: String) ->
     }
 }
 
+pub fn protocol_error_exports_response(
+    request: &EnumerateExportsRequest,
+    message: String,
+) -> EnumerateExportsResponse {
+    EnumerateExportsResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        specifier: request.specifier.clone(),
+        exports: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: vec![ImportDiagnostic {
+            stage: "protocol".to_owned(),
+            message,
+            details: vec![format!("specifier: {}", request.specifier)],
+        }],
+    }
+}
+
 fn is_supported_protocol_version(version: u32) -> bool {
     (1..=PROTOCOL_VERSION).contains(&version)
+}
+
+fn enumerate_graph_exports(graph: &ModuleGraph) -> Vec<String> {
+    let mut exports = Vec::new();
+    collect_module_exports(
+        graph,
+        graph.entry_id,
+        true,
+        &mut HashSet::new(),
+        &mut exports,
+    );
+    exports
+}
+
+fn collect_module_exports(
+    graph: &ModuleGraph,
+    module_id: ModuleId,
+    include_default: bool,
+    visited: &mut HashSet<ModuleId>,
+    exports: &mut Vec<String>,
+) {
+    if !visited.insert(module_id) {
+        return;
+    }
+
+    let Some(module) = graph.module_by_id(module_id) else {
+        return;
+    };
+
+    exports.extend(
+        module
+            .exports
+            .iter()
+            .filter(|export| include_default || export.exported_name != "default")
+            .map(|export| export.exported_name.clone()),
+    );
+    exports.extend(
+        module
+            .reexports
+            .iter()
+            .filter(|reexport| include_default || reexport.exported_name != "default")
+            .map(|reexport| reexport.exported_name.clone()),
+    );
+
+    for star_export in &module.star_exports {
+        if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path) {
+            collect_module_exports(graph, target_id, false, visited, exports);
+        }
+    }
 }
 
 fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
@@ -230,5 +382,7 @@ fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
             message,
             details: vec![format!("specifier: {}", request.specifier)],
         }],
+        module_breakdown: None,
+        shared_bytes: None,
     }
 }

@@ -46,6 +46,8 @@ fn result(specifier: &str) -> ImportResult {
             message: "cached".to_owned(),
             details: Vec::new(),
         }],
+        module_breakdown: None,
+        shared_bytes: None,
     }
 }
 

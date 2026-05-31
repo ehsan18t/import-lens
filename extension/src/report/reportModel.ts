@@ -20,6 +20,7 @@ export interface WorkspaceReportRow {
   gzipBytes: number;
   brotliBytes: number;
   zstdBytes: number;
+  topModules: string;
   warning: string;
 }
 
@@ -38,6 +39,7 @@ export const buildReportRows = (items: readonly WorkspaceReportItem[]): Workspac
         gzipBytes: result?.gzip_bytes ?? 0,
         brotliBytes: result?.brotli_bytes ?? 0,
         zstdBytes: result?.zstd_bytes ?? 0,
+        topModules: moduleBreakdownSummary(result),
         warning: warningForItem(item),
       };
     })
@@ -56,6 +58,15 @@ export const buildReportRows = (items: readonly WorkspaceReportItem[]): Workspac
 const relativeSourceFile = (workspaceRoot: string, sourceFile: string): string => {
   const relative = path.relative(workspaceRoot, sourceFile);
   return (relative || sourceFile).split(path.sep).join("/");
+};
+
+const moduleBreakdownSummary = (result: ImportResult | undefined): string => {
+  const modules = result?.module_breakdown ?? [];
+
+  return modules
+    .slice(0, 3)
+    .map((module) => `${path.basename(module.path)} (${module.bytes} B)`)
+    .join(", ");
 };
 
 const warningForItem = (item: WorkspaceReportItem): string => {

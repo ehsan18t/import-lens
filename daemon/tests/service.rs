@@ -1,6 +1,8 @@
 use import_lens_daemon::{
-    ipc::protocol::{BatchRequest, ImportKind, ImportRequest},
-    service::{ImportLensService, protocol_error_batch_response},
+    ipc::protocol::{
+        BatchRequest, EnumerateExportsRequest, ImportKind, ImportRequest, PROTOCOL_VERSION,
+    },
+    service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
 };
 use std::{
     fs,
@@ -28,6 +30,28 @@ fn write_package(workspace: &Path) {
     .expect("package manifest should be written");
     fs::write(package_root.join("index.js"), "export const value = 1;")
         .expect("entry should be written");
+}
+
+fn write_export_package(workspace: &Path) {
+    let package_root = workspace.join("node_modules").join("exports-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "export const local = 1;\nexport { alpha as renamed } from './alpha.js';\nexport * from './more.js';",
+    )
+    .expect("entry should be written");
+    fs::write(package_root.join("alpha.js"), "export const alpha = 1;")
+        .expect("alpha module should be written");
+    fs::write(
+        package_root.join("more.js"),
+        "export const beta = 2;\nexport default 3;",
+    )
+    .expect("more module should be written");
 }
 
 fn write_effectful_package(workspace: &Path) {
@@ -88,6 +112,23 @@ fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -
             import_kind,
         }],
         streaming: false,
+    }
+}
+
+fn enumerate_exports_request(workspace: &Path, request_id: u64) -> EnumerateExportsRequest {
+    EnumerateExportsRequest {
+        message_type: "enumerate_exports".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        specifier: "exports-lib".to_owned(),
+        package_name: "exports-lib".to_owned(),
+        package_version: "1.0.0".to_owned(),
     }
 }
 
@@ -156,6 +197,36 @@ fn service_streams_indexed_partials_before_final_response() {
 }
 
 #[test]
+fn service_enumerates_entry_exports_for_completion() {
+    let workspace = temp_workspace();
+    write_export_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.enumerate_exports(enumerate_exports_request(&workspace, 11));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 11);
+    assert_eq!(response.error, None);
+    assert_eq!(response.exports, vec!["beta", "local", "renamed"]);
+}
+
+#[test]
+fn service_rejects_v1_export_enumeration_requests() {
+    let workspace = temp_workspace();
+    write_export_package(&workspace);
+    let service = ImportLensService::new(None, false);
+    let mut request = enumerate_exports_request(&workspace, 12);
+    request.version = 1;
+
+    let response = service.enumerate_exports(request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 12);
+    assert!(response.error.is_some());
+    assert!(response.exports.is_empty());
+}
+
+#[test]
 fn protocol_error_batch_response_rejects_all_imports_without_analysis() {
     let workspace = temp_workspace();
     let response = protocol_error_batch_response(
@@ -172,4 +243,22 @@ fn protocol_error_batch_response_rejects_all_imports_without_analysis() {
     );
     assert_eq!(response.imports[0].diagnostics[0].stage, "protocol");
     assert_eq!(response.imports[0].raw_bytes, 0);
+}
+
+#[test]
+fn protocol_error_exports_response_returns_request_scoped_error() {
+    let workspace = temp_workspace();
+    let response = protocol_error_exports_response(
+        &enumerate_exports_request(&workspace, 13),
+        "hello message not received".to_owned(),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 13);
+    assert_eq!(response.exports, Vec::<String>::new());
+    assert_eq!(
+        response.error.as_deref(),
+        Some("hello message not received")
+    );
+    assert_eq!(response.diagnostics[0].stage, "protocol");
 }

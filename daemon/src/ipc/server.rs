@@ -5,7 +5,7 @@ use crate::{
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
     prefetch::Prefetcher,
-    service::{ImportLensService, protocol_error_batch_response},
+    service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
 };
 use std::{
     error::Error,
@@ -148,6 +148,21 @@ where
                         PathBuf::from(message.package_json_path),
                         PathBuf::from(message.active_document_path),
                     );
+                }
+                ClientMessage::EnumerateExports(request) if hello_received => {
+                    let svc = std::sync::Arc::clone(&service);
+                    let response =
+                        tokio::task::spawn_blocking(move || svc.enumerate_exports(request))
+                            .await
+                            .expect("spawn_blocking failed");
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::EnumerateExports(request) => {
+                    let response = protocol_error_exports_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    );
+                    stream.write_all(&encode_frame(&response)?).await?;
                 }
                 ClientMessage::Shutdown(_) => {
                     return Ok(());

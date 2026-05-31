@@ -1,18 +1,30 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
-import type { BatchRequest, BatchResponse, ClientMessage } from "./protocol.js";
+import type {
+  BatchRequest,
+  BatchResponse,
+  ClientMessage,
+  EnumerateExportsRequest,
+  EnumerateExportsResponse,
+} from "./protocol.js";
 import { FrameDecoder, encodeFrame } from "./codec.js";
 
-interface PendingRequest {
+interface PendingBatchRequest {
   resolve: (response: BatchResponse) => void;
   reject: (error: Error) => void;
   onPartial?: (response: BatchResponse) => void;
 }
 
+interface PendingExportsRequest {
+  resolve: (response: EnumerateExportsResponse) => void;
+  reject: (error: Error) => void;
+}
+
 export class IpcClient extends EventEmitter {
   readonly #socket: net.Socket;
   readonly #decoder = new FrameDecoder();
-  readonly #pending = new Map<number, PendingRequest>();
+  readonly #batchPending = new Map<number, PendingBatchRequest>();
+  readonly #exportsPending = new Map<number, PendingExportsRequest>();
   #closed = false;
   #disposed = false;
 
@@ -67,13 +79,13 @@ export class IpcClient extends EventEmitter {
   ): Promise<BatchResponse> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (this.#pending.has(request.request_id)) {
-          this.#pending.delete(request.request_id);
+        if (this.#batchPending.has(request.request_id)) {
+          this.#batchPending.delete(request.request_id);
           reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
         }
       }, timeoutMs);
 
-      this.#pending.set(request.request_id, {
+      this.#batchPending.set(request.request_id, {
         resolve: (response) => {
           clearTimeout(timer);
           resolve(response);
@@ -83,6 +95,32 @@ export class IpcClient extends EventEmitter {
           reject(error);
         },
         onPartial,
+      });
+      this.send(request);
+    });
+  }
+
+  requestExports(
+    request: EnumerateExportsRequest,
+    timeoutMs = 10000,
+  ): Promise<EnumerateExportsResponse> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.#exportsPending.has(request.request_id)) {
+          this.#exportsPending.delete(request.request_id);
+          reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
+
+      this.#exportsPending.set(request.request_id, {
+        resolve: (response) => {
+          clearTimeout(timer);
+          resolve(response);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
       });
       this.send(request);
     });
@@ -105,23 +143,34 @@ export class IpcClient extends EventEmitter {
     }
 
     for (const message of messages) {
-      if (!isBatchResponse(message)) {
+      if (isBatchResponse(message)) {
+        const pending = this.#batchPending.get(message.request_id);
+
+        if (!pending) {
+          continue;
+        }
+
+        if (isStreamingPartial(message)) {
+          pending.onPartial?.(message);
+          this.emit("batchPartial", message);
+          continue;
+        }
+
+        this.#batchPending.delete(message.request_id);
+        pending.resolve(message);
         continue;
       }
 
-      const pending = this.#pending.get(message.request_id);
+      if (!isEnumerateExportsResponse(message)) {
+        continue;
+      }
 
+      const pending = this.#exportsPending.get(message.request_id);
       if (!pending) {
         continue;
       }
 
-      if (isStreamingPartial(message)) {
-        pending.onPartial?.(message);
-        this.emit("batchPartial", message);
-        continue;
-      }
-
-      this.#pending.delete(message.request_id);
+      this.#exportsPending.delete(message.request_id);
       pending.resolve(message);
     }
   }
@@ -134,11 +183,16 @@ export class IpcClient extends EventEmitter {
     this.#closed = true;
     this.#decoder.reset();
 
-    for (const pending of this.#pending.values()) {
+    for (const pending of this.#batchPending.values()) {
       pending.reject(error);
     }
 
-    this.#pending.clear();
+    for (const pending of this.#exportsPending.values()) {
+      pending.reject(error);
+    }
+
+    this.#batchPending.clear();
+    this.#exportsPending.clear();
 
     if (emitDisconnect && !this.#disposed) {
       this.emit("disconnect", error);
@@ -162,3 +216,20 @@ const isBatchResponse = (value: unknown): value is BatchResponse => {
 
 const isStreamingPartial = (response: BatchResponse): boolean =>
   Array.isArray(response.indexes) && response.indexes.length > 0;
+
+const isEnumerateExportsResponse = (value: unknown): value is EnumerateExportsResponse => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<EnumerateExportsResponse>;
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    typeof candidate.specifier === "string" &&
+    Array.isArray(candidate.exports) &&
+    candidate.exports.every((exportedName) => typeof exportedName === "string") &&
+    (candidate.error === null || typeof candidate.error === "string") &&
+    Array.isArray(candidate.diagnostics)
+  );
+};

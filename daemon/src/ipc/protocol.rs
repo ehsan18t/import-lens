@@ -46,6 +46,10 @@ pub struct ImportResult {
     pub is_cjs: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_breakdown: Option<Vec<ModuleContribution>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +57,12 @@ pub struct ImportDiagnostic {
     pub stage: String,
     pub message: String,
     pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleContribution {
+    pub path: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +108,30 @@ pub struct PrewarmPackageJsonMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumerateExportsRequest {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub workspace_root: String,
+    pub active_document_path: String,
+    pub specifier: String,
+    #[serde(rename = "package")]
+    pub package_name: String,
+    pub package_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumerateExportsResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub specifier: String,
+    pub exports: Vec<String>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownMessage {
     #[serde(rename = "type")]
     pub message_type: String,
@@ -110,6 +144,7 @@ pub enum ClientMessage {
     CacheInvalidate(CacheInvalidateMessage),
     CacheInvalidateAll(CacheInvalidateAllMessage),
     PrewarmPackageJson(PrewarmPackageJsonMessage),
+    EnumerateExports(EnumerateExportsRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -132,6 +167,9 @@ impl<'de> Deserialize<'de> for ClientMessage {
                 .map_err(serde::de::Error::custom),
             Some("prewarm_package_json") => serde_json::from_value(value)
                 .map(Self::PrewarmPackageJson)
+                .map_err(serde::de::Error::custom),
+            Some("enumerate_exports") => serde_json::from_value(value)
+                .map(Self::EnumerateExports)
                 .map_err(serde::de::Error::custom),
             Some("shutdown") => serde_json::from_value(value)
                 .map(Self::Shutdown)

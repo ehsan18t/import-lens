@@ -34,12 +34,19 @@ export interface ImportResult {
   is_cjs: boolean;
   error: string | null;
   diagnostics: ImportDiagnostic[];
+  module_breakdown?: ModuleContribution[];
+  shared_bytes?: number;
 }
 
 export interface ImportDiagnostic {
   stage: string;
   message: string;
   details: string[];
+}
+
+export interface ModuleContribution {
+  path: string;
+  bytes: number;
 }
 
 export interface BatchResponse {
@@ -73,6 +80,26 @@ export interface PrewarmPackageJsonMessage {
   active_document_path: string;
 }
 
+export interface EnumerateExportsRequest {
+  type: "enumerate_exports";
+  version: number;
+  request_id: number;
+  workspace_root: string;
+  active_document_path: string;
+  specifier: string;
+  package: string;
+  package_version: string;
+}
+
+export interface EnumerateExportsResponse {
+  version: number;
+  request_id: number;
+  specifier: string;
+  exports: string[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
 export interface ShutdownMessage {
   type: "shutdown";
 }
@@ -83,4 +110,5 @@ export type ClientMessage =
   | CacheInvalidateMessage
   | CacheInvalidateAllMessage
   | PrewarmPackageJsonMessage
+  | EnumerateExportsRequest
   | ShutdownMessage;
