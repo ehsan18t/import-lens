@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { ImportResult } from "../ipc/protocol.js";
 import type { ImportRuntime } from "../imports/types.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
+import { formatBytes } from "./format.js";
 
 const appendCopyDiagnosticsLink = (tooltip: vscode.MarkdownString, result: ImportResult): void => {
   const args = encodeURIComponent(JSON.stringify([result]));
@@ -22,11 +23,11 @@ export const tooltipForResult = (
     return tooltip;
   }
 
-  tooltip.appendMarkdown(`Raw: ${result.raw_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Minified: ${result.minified_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Gzip: ${result.gzip_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Brotli: ${result.brotli_bytes} B\n\n`);
-  tooltip.appendMarkdown(`Zstd: ${result.zstd_bytes} B\n\n`);
+  tooltip.appendMarkdown(`Raw: ${formatBytes(result.raw_bytes)}\n\n`);
+  tooltip.appendMarkdown(`Minified: ${formatBytes(result.minified_bytes)}\n\n`);
+  tooltip.appendMarkdown(`Gzip: ${formatBytes(result.gzip_bytes)}\n\n`);
+  tooltip.appendMarkdown(`Brotli: ${formatBytes(result.brotli_bytes)}\n\n`);
+  tooltip.appendMarkdown(`Zstd: ${formatBytes(result.zstd_bytes)}\n\n`);
   tooltip.appendMarkdown(`Runtime: ${runtime}\n\n`);
   tooltip.appendMarkdown(`Side effects: ${result.side_effects ? "yes" : "no"}\n\n`);
   tooltip.appendMarkdown(`CJS: ${result.is_cjs ? "yes" : "no"}`);
