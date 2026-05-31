@@ -698,6 +698,46 @@ fn analyze_commonjs_module_exports_object_reports_named_exports() {
 }
 
 #[test]
+fn analyze_import_reports_circular_dependency_diagnostics() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "cycle-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "import { child } from './child.js';\nexport const value = child;",
+    );
+    write_package_file(
+        &workspace,
+        "cycle-lib",
+        "child.js",
+        "import { value } from './index.js';\nexport const child = value || 1;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "cycle-lib".to_owned(),
+        package_name: "cycle-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "circular_dependency"),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_import_rejects_unsafe_package_names() {
     let workspace = temp_workspace();
     fs::create_dir_all(workspace.join("outside")).expect("outside fixture should be created");

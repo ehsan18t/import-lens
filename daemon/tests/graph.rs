@@ -225,3 +225,37 @@ fn graph_keeps_builtins_and_unresolved_peers_external_with_diagnostics() {
         graph.diagnostics
     );
 }
+
+#[test]
+fn graph_does_not_report_shared_dependency_as_cycle() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { one } from './one.js';\nimport { two } from './two.js';\nexport const value = one + two;",
+    );
+    write_source(
+        &root,
+        "one.js",
+        "import { shared } from './shared.js';\nexport const one = shared;",
+    );
+    write_source(
+        &root,
+        "two.js",
+        "import { shared } from './shared.js';\nexport const two = shared;",
+    );
+    write_source(&root, "shared.js", "export const shared = 1;");
+
+    let graph =
+        build_module_graph(&root.join("entry.js")).expect("graph should allow shared dependencies");
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+    assert!(
+        !graph
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "circular_dependency"),
+        "{:?}",
+        graph.diagnostics
+    );
+}

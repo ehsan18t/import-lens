@@ -262,6 +262,8 @@ struct ModuleGraphBuilder {
     graph_source_bytes: usize,
     resolver: Resolver,
     dependency_paths: HashSet<PathBuf>,
+    circular_edges: HashSet<(PathBuf, PathBuf)>,
+    loading_paths: HashSet<PathBuf>,
 }
 
 impl ModuleGraphBuilder {
@@ -272,14 +274,39 @@ impl ModuleGraphBuilder {
             graph_source_bytes: 0,
             resolver: module_resolver(),
             dependency_paths: HashSet::new(),
+            circular_edges: HashSet::new(),
+            loading_paths: HashSet::new(),
         }
     }
 }
 
 impl ModuleGraphBuilder {
     fn load_module(&mut self, path: &Path) -> Result<ModuleId, String> {
+        self.load_module_from(path, None)
+    }
+
+    fn load_module_from(
+        &mut self,
+        path: &Path,
+        importer: Option<&Path>,
+    ) -> Result<ModuleId, String> {
         let path = normalize_existing_path(path)?;
         if let Some(existing) = self.graph.path_to_id.get(&path) {
+            if self.loading_paths.contains(&path)
+                && let Some(importer) = importer
+            {
+                let importer = normalize_existing_path(importer)?;
+                if self.circular_edges.insert((importer.clone(), path.clone())) {
+                    self.graph.diagnostics.push(GraphDiagnostic {
+                        stage: "circular_dependency".to_owned(),
+                        message: "circular module dependency detected".to_owned(),
+                        details: vec![
+                            format!("from_path: {}", importer.display()),
+                            format!("to_path: {}", path.display()),
+                        ],
+                    });
+                }
+            }
             return Ok(*existing);
         }
         if self.graph.modules.len() >= self.limits.max_modules {
@@ -345,10 +372,11 @@ impl ModuleGraphBuilder {
             .collect::<Vec<_>>();
 
         self.graph.path_to_id.insert(path.clone(), id);
+        self.loading_paths.insert(path.clone());
         self.graph_source_bytes = next_graph_source_bytes;
         self.graph.modules.push(ModuleRecord {
             id,
-            path,
+            path: path.clone(),
             source,
             imports: parsed.imports,
             external_imports: parsed.external_imports,
@@ -362,9 +390,10 @@ impl ModuleGraphBuilder {
         });
 
         for next_path in next_paths {
-            self.load_module(&next_path)?;
+            self.load_module_from(&next_path, Some(&path))?;
         }
 
+        self.loading_paths.remove(&path);
         Ok(id)
     }
 }
