@@ -68,6 +68,6 @@ test("cargoZigbuildArgsForTarget uses explicit Rust target triples", () => {
 test("vsixNameForTarget includes package name, platform target, and version", () => {
   assert.equal(
     vsixNameForTarget({ name: "import-lens", version: "0.1.0" }, "win32-x64"),
-    "import-lens-win32-x64-0.1.0.vsix",
+    "builds/import-lens-win32-x64-0.1.0.vsix",
   );
 });
