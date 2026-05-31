@@ -16,7 +16,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
+
+static GRAPH_CACHE: OnceLock<papaya::HashMap<PathBuf, ModuleGraph>> = OnceLock::new();
 
 pub const MAX_GRAPH_MODULES: usize = 2_000;
 pub const MAX_MODULE_SOURCE_BYTES: usize = 5 * 1024 * 1024;
@@ -176,6 +179,47 @@ fn module_resolver() -> Resolver {
 
 pub fn build_module_graph(entry_path: &Path) -> Result<ModuleGraph, String> {
     build_module_graph_with_limits(entry_path, GraphLimits::default())
+}
+
+pub fn build_module_graph_cached(entry_path: &Path) -> Result<ModuleGraph, String> {
+    let entry_path = normalize_existing_path(entry_path)?;
+    let cache = GRAPH_CACHE.get_or_init(papaya::HashMap::new);
+    let pinned = cache.pin();
+    if let Some(graph) = pinned.get(&entry_path) {
+        return Ok(graph.clone());
+    }
+
+    let graph = build_module_graph(&entry_path)?;
+    pinned.insert(entry_path, graph.clone());
+    Ok(graph)
+}
+
+pub fn invalidate_module_graph_cache_for_package(package_name: &str) {
+    let Some(cache) = GRAPH_CACHE.get() else {
+        return;
+    };
+
+    let package_segment = format!("node_modules/{package_name}/");
+    let pinned = cache.pin();
+    let keys = pinned
+        .iter()
+        .filter(|(path, _)| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .contains(&package_segment)
+        })
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+
+    for key in keys {
+        pinned.remove(&key);
+    }
+}
+
+pub fn clear_module_graph_cache() {
+    if let Some(cache) = GRAPH_CACHE.get() {
+        cache.pin().clear();
+    }
 }
 
 pub fn build_module_graph_with_limits(

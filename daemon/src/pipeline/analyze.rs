@@ -3,10 +3,10 @@ use crate::{
     pipeline::{
         bundle::bundle_reachable_modules,
         compress::compress_all,
-        graph::{ModuleGraph, ModuleId, build_module_graph},
+        graph::{ModuleGraph, ModuleId, build_module_graph_cached},
         minify::minify_source,
         reachability::reachable_exports,
-        resolver::{SideEffectsMode, resolve_package_entry},
+        resolver::{ResolvedPackage, SideEffectsMode, resolve_package_entry},
     },
 };
 use std::{
@@ -35,22 +35,47 @@ pub fn analyze_import(context: &AnalysisContext, request: &ImportRequest) -> Imp
     }
 }
 
+pub fn analyze_resolved_import(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    resolved: ResolvedPackage,
+) -> ImportResult {
+    match analyze_import_inner_resolved(context, request, resolved) {
+        Ok(result) => result,
+        Err(error) => error_result(request, error),
+    }
+}
+
 fn analyze_import_inner(
     context: &AnalysisContext,
     request: &ImportRequest,
 ) -> Result<ImportResult, AnalysisError> {
-    let resolved =
-        resolve_package_entry(&context.active_document_path, request).map_err(|message| {
-            let stage = if message.contains("unsafe package name") {
-                "package_validation"
-            } else if message.contains("package manifest not found") {
-                "package_resolution"
-            } else {
-                "entry_resolution"
-            };
-            let details = resolver_details(&message);
-            error_with_context(stage, message, context, request, details)
-        })?;
+    let resolved = resolve_import_package(context, request)?;
+    analyze_import_inner_resolved(context, request, resolved)
+}
+
+fn resolve_import_package(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+) -> Result<ResolvedPackage, AnalysisError> {
+    resolve_package_entry(&context.active_document_path, request).map_err(|message| {
+        let stage = if message.contains("unsafe package name") {
+            "package_validation"
+        } else if message.contains("package manifest not found") {
+            "package_resolution"
+        } else {
+            "entry_resolution"
+        };
+        let details = resolver_details(&message);
+        error_with_context(stage, message, context, request, details)
+    })
+}
+
+fn analyze_import_inner_resolved(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    resolved: ResolvedPackage,
+) -> Result<ImportResult, AnalysisError> {
     let side_effects_mode = resolved.side_effects;
     let entry_path = resolved.entry_path;
     let is_cjs = resolved.is_cjs;
@@ -107,7 +132,7 @@ fn analyze_with_oxc_pipeline(
     side_effects_mode: SideEffectsMode,
 ) -> Result<ImportResult, AnalysisError> {
     let side_effects = side_effects_mode.has_side_effects();
-    let graph = build_module_graph(&entry_path).map_err(|error| {
+    let graph = build_module_graph_cached(&entry_path).map_err(|error| {
         error_with_context(
             "module_graph",
             format!("failed to build module graph: {error}"),

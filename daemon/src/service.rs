@@ -1,10 +1,12 @@
 use crate::{
     cache::{key::cache_key_for_import, memory::ImportCache},
     ipc::protocol::{
-        BatchRequest, BatchResponse, ImportDiagnostic, ImportRequest, ImportResult,
+        BatchRequest, BatchResponse, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
         PROTOCOL_VERSION,
     },
-    pipeline::analyze::{AnalysisContext, analyze_import},
+    pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
+    pipeline::graph::{clear_module_graph_cache, invalidate_module_graph_cache_for_package},
+    pipeline::resolver::ResolvedPackage,
 };
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -48,10 +50,12 @@ impl ImportLensService {
 
     pub fn invalidate_package(&self, package_name: &str) {
         self.cache.invalidate_package(package_name);
+        invalidate_module_graph_cache_for_package(package_name);
     }
 
     pub fn invalidate_all(&self) {
         self.cache.clear();
+        clear_module_graph_cache();
     }
 
     pub fn cache_len(&self) -> usize {
@@ -75,6 +79,30 @@ impl ImportLensService {
         let result = analyze_import(context, request);
 
         if result.error.is_none() && should_continue() {
+            self.cache_full_variant_alias(request, &result);
+            self.cache.insert(key, result);
+        }
+    }
+
+    pub fn prewarm_resolved_import<F>(
+        &self,
+        context: &AnalysisContext,
+        request: &ImportRequest,
+        resolved: ResolvedPackage,
+        should_continue: F,
+    ) where
+        F: Fn() -> bool,
+    {
+        let key = cache_key_for_import(request);
+
+        if self.cache.get(&key).is_some() || !should_continue() {
+            return;
+        }
+
+        let result = analyze_resolved_import(context, request, resolved);
+
+        if result.error.is_none() && should_continue() {
+            self.cache_full_variant_alias(request, &result);
             self.cache.insert(key, result);
         }
     }
@@ -93,10 +121,37 @@ impl ImportLensService {
         let result = analyze_import(context, request);
 
         if result.error.is_none() {
+            self.cache_full_variant_alias(request, &result);
             self.cache.insert(key, result.clone());
         }
 
         result
+    }
+
+    fn cache_full_variant_alias(&self, request: &ImportRequest, result: &ImportResult) {
+        if !result.side_effects
+            || result.is_cjs
+            || matches!(
+                request.import_kind,
+                ImportKind::Namespace | ImportKind::Dynamic
+            )
+        {
+            return;
+        }
+
+        let mut namespace_request = request.clone();
+        namespace_request.import_kind = ImportKind::Namespace;
+        namespace_request.named.clear();
+        let namespace_key = cache_key_for_import(&namespace_request);
+
+        if self.cache.get(&namespace_key).is_some() {
+            return;
+        }
+
+        let mut namespace_result = result.clone();
+        namespace_result.cache_hit = false;
+        namespace_result.truly_treeshakeable = false;
+        self.cache.insert(namespace_key, namespace_result);
     }
 }
 

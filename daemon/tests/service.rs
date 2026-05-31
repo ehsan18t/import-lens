@@ -30,6 +30,21 @@ fn write_package(workspace: &Path) {
         .expect("entry should be written");
 }
 
+fn write_effectful_package(workspace: &Path) {
+    let package_root = workspace.join("node_modules").join("effectful-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":true}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "export const value = 1;\nexport const other = 2;",
+    )
+    .expect("entry should be written");
+}
+
 fn batch(workspace: &Path, request_id: u64) -> BatchRequest {
     BatchRequest {
         version: 1,
@@ -46,6 +61,30 @@ fn batch(workspace: &Path, request_id: u64) -> BatchRequest {
             version: "1.0.0".to_owned(),
             named: vec!["value".to_owned()],
             import_kind: ImportKind::Named,
+        }],
+    }
+}
+
+fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -> BatchRequest {
+    BatchRequest {
+        version: 1,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![ImportRequest {
+            specifier: "effectful-lib".to_owned(),
+            package_name: "effectful-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: if matches!(import_kind, ImportKind::Named) {
+                vec!["value".to_owned()]
+            } else {
+                Vec::new()
+            },
+            import_kind,
         }],
     }
 }
@@ -78,6 +117,21 @@ fn service_cache_invalidation_removes_matching_package_entries() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!after_invalidate.imports[0].cache_hit);
+}
+
+#[test]
+fn service_caches_full_package_variant_for_conservative_named_imports() {
+    let workspace = temp_workspace();
+    write_effectful_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let named = service.handle_batch(effectful_batch(&workspace, 1, ImportKind::Named));
+    let namespace = service.handle_batch(effectful_batch(&workspace, 2, ImportKind::Namespace));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(!named.imports[0].cache_hit);
+    assert!(namespace.imports[0].cache_hit);
+    assert_eq!(named.imports[0].raw_bytes, namespace.imports[0].raw_bytes);
 }
 
 #[test]

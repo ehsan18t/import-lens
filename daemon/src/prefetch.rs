@@ -20,6 +20,12 @@ use std::{
 
 static PREWARM_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
+#[derive(Debug, Clone)]
+struct PrewarmJob {
+    request: ImportRequest,
+    resolved: ResolvedPackage,
+}
+
 #[derive(Debug, Default)]
 pub struct CancellationToken {
     generation: AtomicU64,
@@ -106,6 +112,18 @@ pub fn package_json_prewarm_requests(
     package_json_path: &Path,
     active_document_path: &Path,
 ) -> Result<Vec<ImportRequest>, String> {
+    Ok(
+        package_json_prewarm_jobs(package_json_path, active_document_path)?
+            .into_iter()
+            .map(|job| job.request)
+            .collect(),
+    )
+}
+
+fn package_json_prewarm_jobs(
+    package_json_path: &Path,
+    active_document_path: &Path,
+) -> Result<Vec<PrewarmJob>, String> {
     let contents = fs::read_to_string(package_json_path).map_err(|error| {
         format!(
             "failed to read package.json {}: {error}",
@@ -115,20 +133,26 @@ pub fn package_json_prewarm_requests(
     let mut requests = Vec::new();
 
     for package_name in package_json_dependency_names(&contents)? {
-        let Some(version) = installed_package_version(active_document_path, &package_name) else {
+        let Some(resolved) = installed_package(active_document_path, &package_name) else {
+            continue;
+        };
+        let Some(version) = resolved
+            .package_json
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             continue;
         };
 
-        requests.push(prewarm_request(
-            &package_name,
-            &version,
-            ImportKind::Default,
-        ));
-        requests.push(prewarm_request(
-            &package_name,
-            &version,
-            ImportKind::Namespace,
-        ));
+        requests.push(PrewarmJob {
+            request: prewarm_request(&package_name, &version, ImportKind::Default),
+            resolved: resolved.clone(),
+        });
+        requests.push(PrewarmJob {
+            request: prewarm_request(&package_name, &version, ImportKind::Namespace),
+            resolved,
+        });
     }
 
     Ok(requests)
@@ -145,12 +169,11 @@ fn run_prewarm_job(
         return;
     }
 
-    let Ok(requests) = package_json_prewarm_requests(&package_json_path, &active_document_path)
-    else {
+    let Ok(jobs) = package_json_prewarm_jobs(&package_json_path, &active_document_path) else {
         return;
     };
 
-    if requests.is_empty() || !cancellation.is_current(generation) {
+    if jobs.is_empty() || !cancellation.is_current(generation) {
         return;
     }
 
@@ -163,9 +186,14 @@ fn run_prewarm_job(
     };
 
     let run = || {
-        requests.par_iter().for_each(|request| {
+        jobs.par_iter().for_each(|job| {
             if cancellation.is_current(generation) {
-                service.prewarm_import(&context, request, || cancellation.is_current(generation));
+                service.prewarm_resolved_import(
+                    &context,
+                    &job.request,
+                    job.resolved.clone(),
+                    || cancellation.is_current(generation),
+                );
             }
         });
     };
@@ -180,15 +208,9 @@ fn run_prewarm_job(
     pool.install(run);
 }
 
-fn installed_package_version(active_document_path: &Path, package_name: &str) -> Option<String> {
+fn installed_package(active_document_path: &Path, package_name: &str) -> Option<ResolvedPackage> {
     let request = prewarm_request(package_name, "", ImportKind::Namespace);
-    let ResolvedPackage { package_json, .. } =
-        resolve_package_entry(active_document_path, &request).ok()?;
-
-    package_json
-        .get("version")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    resolve_package_entry(active_document_path, &request).ok()
 }
 
 fn prewarm_request(package_name: &str, version: &str, import_kind: ImportKind) -> ImportRequest {
