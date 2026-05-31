@@ -1,6 +1,8 @@
 use import_lens_daemon::ipc::codec::{FrameDecoder, decode_payload, encode_frame};
 use import_lens_daemon::ipc::protocol::{ClientMessage, ShutdownMessage};
 
+const OVERSIZED_FRAME_BYTES: usize = (32 * 1024 * 1024) + 1;
+
 #[test]
 fn encode_frame_writes_big_endian_payload_length() {
     let frame = encode_frame(&ShutdownMessage {
@@ -41,5 +43,21 @@ fn frame_decoder_buffers_partial_frames() {
         ClientMessage::Shutdown(ShutdownMessage {
             message_type: "shutdown".to_owned()
         })
+    );
+}
+
+#[test]
+fn frame_decoder_rejects_oversized_frames_before_buffering_payload() {
+    let mut decoder = FrameDecoder::default();
+    let mut header = Vec::new();
+    header.extend_from_slice(&(OVERSIZED_FRAME_BYTES as u32).to_be_bytes());
+
+    let error = decoder
+        .push(&header)
+        .expect_err("oversized frame should be rejected");
+
+    assert!(
+        error.to_string().contains("too large"),
+        "unexpected error: {error}"
     );
 }

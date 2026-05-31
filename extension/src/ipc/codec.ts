@@ -1,9 +1,14 @@
 import { decode, encode } from "@msgpack/msgpack";
 
 const frameHeaderBytes = 4;
+const maxFrameBytes = 32 * 1024 * 1024;
 
 export const encodeFrame = (message: unknown): Buffer => {
   const payload = Buffer.from(encode(message));
+  if (payload.length > maxFrameBytes) {
+    throw new RangeError(`IPC frame is too large: ${payload.length} bytes`);
+  }
+
   const frame = Buffer.allocUnsafe(frameHeaderBytes + payload.length);
   frame.writeUInt32BE(payload.length, 0);
   payload.copy(frame, frameHeaderBytes);
@@ -19,6 +24,11 @@ export class FrameDecoder {
 
     while (this.#buffer.length >= frameHeaderBytes) {
       const payloadLength = this.#buffer.readUInt32BE(0);
+      if (payloadLength > maxFrameBytes) {
+        this.reset();
+        throw new RangeError(`IPC frame is too large: ${payloadLength} bytes`);
+      }
+
       const frameLength = frameHeaderBytes + payloadLength;
 
       if (this.#buffer.length < frameLength) {
@@ -37,4 +47,3 @@ export class FrameDecoder {
     this.#buffer = Buffer.alloc(0);
   }
 }
-

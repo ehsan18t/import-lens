@@ -90,7 +90,16 @@ export class IpcClient extends EventEmitter {
   }
 
   #handleData(chunk: Buffer): void {
-    for (const message of this.#decoder.push(chunk)) {
+    let messages: unknown[];
+
+    try {
+      messages = this.#decoder.push(chunk);
+    } catch (error) {
+      this.#handleClose(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+
+    for (const message of messages) {
       if (!isBatchResponse(message)) {
         continue;
       }

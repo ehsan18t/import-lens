@@ -2,6 +2,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{error::Error, fmt};
 
 const FRAME_HEADER_BYTES: usize = 4;
+const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum IpcCodecError {
@@ -34,6 +35,9 @@ pub struct FrameDecoder {
 pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, IpcCodecError> {
     let payload = rmp_serde::to_vec_named(message)
         .map_err(|error| IpcCodecError::MessagePackEncode(error.to_string()))?;
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(IpcCodecError::FrameTooLarge(payload.len()));
+    }
     let payload_len =
         u32::try_from(payload.len()).map_err(|_| IpcCodecError::FrameTooLarge(payload.len()))?;
     let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
@@ -62,7 +66,14 @@ impl FrameDecoder {
                     .try_into()
                     .expect("frame header slice is exactly 4 bytes"),
             ) as usize;
-            let frame_len = FRAME_HEADER_BYTES + payload_len;
+            if payload_len > MAX_FRAME_BYTES {
+                self.buffer.clear();
+                return Err(IpcCodecError::FrameTooLarge(payload_len));
+            }
+
+            let frame_len = FRAME_HEADER_BYTES
+                .checked_add(payload_len)
+                .ok_or(IpcCodecError::FrameTooLarge(payload_len))?;
 
             if self.buffer.len() < frame_len {
                 break;
