@@ -25,102 +25,15 @@ pub async fn run_server(
     _workspace_root: PathBuf,
     storage_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut pipe = ServerOptions::new()
+    let pipe = ServerOptions::new()
         .first_pipe_instance(true)
         .create(pipe_name)?;
     pipe.connect().await?;
 
-    let mut decoder = FrameDecoder::default();
-    let mut service = std::sync::Arc::new(ImportLensService::new(None, false));
+    let service = std::sync::Arc::new(ImportLensService::new(None, false));
     let prefetcher = Prefetcher::new();
-    let mut hello_received = false;
-    let mut lifecycle = LifecycleState::new();
-    let mut storage_path = storage_path;
-    let mut buffer = [0_u8; 16 * 1024];
 
-    loop {
-        let read = tokio::select! {
-            read = pipe.read(&mut buffer) => read?,
-            _ = tokio::time::sleep(LIFECYCLE_CHECK_INTERVAL) => {
-                if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        if read == 0 {
-            break;
-        }
-
-        for payload in decoder.push(&buffer[..read])? {
-            let message = decode_payload::<ClientMessage>(&payload)?;
-
-            match message {
-                ClientMessage::Hello(hello) => {
-                    let hello_storage_path = PathBuf::from(&hello.storage_path);
-                    service = std::sync::Arc::new(ImportLensService::new(
-                        Some(hello_storage_path.clone()),
-                        hello.enable_disk_cache,
-                    ));
-                    storage_path = Some(hello_storage_path);
-                    hello_received = true;
-
-                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
-                        return Ok(());
-                    }
-                }
-                ClientMessage::Batch(request) if hello_received => {
-                    prefetcher.cancel();
-                    lifecycle.record_batch();
-                    let svc = std::sync::Arc::clone(&service);
-                    let response = tokio::task::spawn_blocking(move || svc.handle_batch(request))
-                        .await
-                        .expect("spawn_blocking failed");
-                    pipe.write_all(&encode_frame(&response)?).await?;
-
-                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
-                        return Ok(());
-                    }
-                }
-                ClientMessage::CacheInvalidate(message) if hello_received => {
-                    service.invalidate_package(&message.package_name);
-                }
-                ClientMessage::CacheInvalidateAll(_) if hello_received => {
-                    service.invalidate_all();
-                }
-                ClientMessage::PrewarmPackageJson(message) if hello_received => {
-                    prefetcher.prewarm_package_json(
-                        std::sync::Arc::clone(&service),
-                        PathBuf::from(message.package_json_path),
-                        PathBuf::from(message.active_document_path),
-                    );
-                }
-                ClientMessage::Shutdown(_) => {
-                    return Ok(());
-                }
-                ClientMessage::Batch(request) => {
-                    prefetcher.cancel();
-                    lifecycle.record_batch();
-                    let response = tokio::task::spawn_blocking(move || {
-                        ImportLensService::new(None, false).handle_batch(request)
-                    })
-                    .await
-                    .expect("spawn_blocking failed");
-                    pipe.write_all(&encode_frame(&response)?).await?;
-
-                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
-                        return Ok(());
-                    }
-                }
-                ClientMessage::PrewarmPackageJson(_)
-                | ClientMessage::CacheInvalidate(_)
-                | ClientMessage::CacheInvalidateAll(_) => {}
-            }
-        }
-    }
-
-    Ok(())
+    handle_connection(pipe, storage_path, service, prefetcher).await
 }
 
 #[cfg(not(windows))]
@@ -136,11 +49,24 @@ pub async fn run_server(
     }
 
     let listener = UnixListener::bind(pipe_name)?;
-    let (mut stream, _) = listener.accept().await?;
+    let (stream, _) = listener.accept().await?;
 
-    let mut decoder = FrameDecoder::default();
-    let mut service = std::sync::Arc::new(ImportLensService::new(None, false));
+    let service = std::sync::Arc::new(ImportLensService::new(None, false));
     let prefetcher = Prefetcher::new();
+
+    handle_connection(stream, storage_path, service, prefetcher).await
+}
+
+async fn handle_connection<S>(
+    mut stream: S,
+    storage_path: Option<PathBuf>,
+    mut service: std::sync::Arc<ImportLensService>,
+    prefetcher: Prefetcher,
+) -> Result<(), Box<dyn Error>>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let mut decoder = FrameDecoder::default();
     let mut hello_received = false;
     let mut lifecycle = LifecycleState::new();
     let mut storage_path = storage_path;
