@@ -1,7 +1,6 @@
 use crate::pipeline::graph::{ModuleGraph, ModuleId};
 use std::{
     collections::HashSet,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -20,22 +19,16 @@ impl ReachableExports {
     }
 
     pub fn contains_module_symbol(&self, path: &Path, exported_name: &str) -> bool {
-        let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         self.symbols
-            .contains(&(normalized.clone(), exported_name.to_owned()))
-            || self
-                .symbols
-                .contains(&(path.to_path_buf(), exported_name.to_owned()))
+            .contains(&(path.to_path_buf(), exported_name.to_owned()))
     }
 
     pub fn contains_module(&self, path: &Path) -> bool {
-        let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.modules.contains(&normalized) || self.modules.contains(path)
+        self.modules.contains(path)
     }
 
     pub fn is_full_module(&self, path: &Path) -> bool {
-        let normalized = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.full_modules.contains(&normalized) || self.full_modules.contains(path)
+        self.full_modules.contains(path)
     }
 }
 

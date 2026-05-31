@@ -15,7 +15,7 @@ fn temp_workspace() -> PathBuf {
         .as_nanos();
     let path = std::env::temp_dir().join(format!("import-lens-graph-{suffix}"));
     fs::create_dir_all(&path).expect("temp graph workspace should be created");
-    path
+    fs::canonicalize(&path).expect("temp graph workspace should be canonicalized")
 }
 
 fn write_source(root: &Path, relative_path: &str, source: &str) {
