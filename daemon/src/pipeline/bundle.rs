@@ -151,6 +151,9 @@ fn rewrite_module(
     for import_span in &module.import_statement_spans {
         replacements.push(Replacement::remove(import_span.0, import_span.1));
     }
+    for export_span in &module.export_specifier_statement_spans {
+        replacements.push(Replacement::remove(export_span.0, export_span.1));
+    }
     for reexport in &module.reexports {
         replacements.push(Replacement::remove(
             reexport.statement_start,
@@ -197,8 +200,7 @@ fn rewrite_module(
         }
     }
 
-    let without_module_syntax =
-        strip_remaining_export_specifiers(&apply_replacements(&module.source, replacements)?);
+    let without_module_syntax = apply_replacements(&module.source, replacements)?;
     let renames = rename_map(graph, module)?;
     let mut rewritten = replace_identifiers(&without_module_syntax, &renames);
     let anchors = usage_anchors(module, reachable, keep_all_exports);
@@ -395,36 +397,6 @@ fn apply_replacements(source: &str, mut replacements: Vec<Replacement>) -> Resul
     Ok(output)
 }
 
-fn strip_remaining_export_specifiers(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut output = String::with_capacity(source.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if starts_with_keyword(source, index, "export")
-            && matches!(
-                next_significant_byte(source, index + "export".len()),
-                Some(b'{' | b'*')
-            )
-        {
-            index += "export".len();
-            while index < bytes.len() {
-                let byte = bytes[index];
-                index += 1;
-                if byte == b';' {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        output.push(bytes[index] as char);
-        index += 1;
-    }
-
-    output
-}
-
 fn usage_anchors(
     module: &ModuleRecord,
     reachable: &ReachableExports,
@@ -485,8 +457,7 @@ fn replace_identifiers(source: &str, renames: &HashMap<String, String>) -> Strin
                 }
             }
             _ => {
-                output.push(byte as char);
-                index += 1;
+                index = copy_next_char(source, index, &mut output);
             }
         }
     }
@@ -497,21 +468,6 @@ fn replace_identifiers(source: &str, renames: &HashMap<String, String>) -> Strin
 fn should_replace_identifier(source: &str, start: usize, end: usize) -> bool {
     previous_significant_byte(source, start) != Some(b'.')
         && next_significant_byte(source, end) != Some(b':')
-}
-
-fn starts_with_keyword(source: &str, index: usize, keyword: &str) -> bool {
-    let bytes = source.as_bytes();
-    let keyword_bytes = keyword.as_bytes();
-    if bytes.get(index..index + keyword_bytes.len()) != Some(keyword_bytes) {
-        return false;
-    }
-    let before = index
-        .checked_sub(1)
-        .and_then(|previous| bytes.get(previous))
-        .copied();
-    let after = bytes.get(index + keyword_bytes.len()).copied();
-    before.is_none_or(|byte| !is_identifier_continue(byte))
-        && after.is_none_or(|byte| !is_identifier_continue(byte))
 }
 
 fn previous_significant_byte(source: &str, start: usize) -> Option<u8> {
@@ -534,15 +490,14 @@ fn copy_quoted(source: &str, start: usize, quote: u8, output: &mut String) -> us
     let mut index = start;
     while index < bytes.len() {
         let byte = bytes[index];
-        output.push(byte as char);
-        index += 1;
+        index = next_char_end(source, index);
         if byte == b'\\' && index < bytes.len() {
-            output.push(bytes[index] as char);
-            index += 1;
+            index = next_char_end(source, index);
         } else if byte == quote {
             break;
         }
     }
+    output.push_str(&source[start..index]);
     index
 }
 
@@ -551,12 +506,12 @@ fn copy_line_comment(source: &str, start: usize, output: &mut String) -> usize {
     let mut index = start;
     while index < bytes.len() {
         let byte = bytes[index];
-        output.push(byte as char);
         index += 1;
         if byte == b'\n' {
             break;
         }
     }
+    output.push_str(&source[start..index]);
     index
 }
 
@@ -565,15 +520,28 @@ fn copy_block_comment(source: &str, start: usize, output: &mut String) -> usize 
     let mut index = start;
     while index < bytes.len() {
         let byte = bytes[index];
-        output.push(byte as char);
         index += 1;
         if byte == b'*' && bytes.get(index) == Some(&b'/') {
-            output.push('/');
             index += 1;
             break;
         }
     }
+    output.push_str(&source[start..index]);
     index
+}
+
+fn copy_next_char(source: &str, start: usize, output: &mut String) -> usize {
+    let end = next_char_end(source, start);
+    output.push_str(&source[start..end]);
+    end
+}
+
+fn next_char_end(source: &str, start: usize) -> usize {
+    source[start..]
+        .chars()
+        .next()
+        .map(|character| start + character.len_utf8())
+        .unwrap_or(start + 1)
 }
 
 fn module_binding_name(module_id: ModuleId, name: &str) -> String {

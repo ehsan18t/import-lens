@@ -108,3 +108,50 @@ fn bundle_hoists_and_deduplicates_external_imports() {
     assert_parseable(&bundled);
     fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
 }
+
+#[test]
+fn bundle_preserves_unicode_strings_and_comments() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export { value } from './unicode.js';");
+    write_source(
+        &root,
+        "unicode.js",
+        "const word = \"café ☕\";\nconst note = `emoji 🚀`;\n/* привет */\nexport const value = `${word}:${note}`;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["value".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+
+    assert!(bundled.contains("café ☕"), "{bundled}");
+    assert!(bundled.contains("emoji 🚀"), "{bundled}");
+    assert!(bundled.contains("привет"), "{bundled}");
+    assert_parseable(&bundled);
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+}
+
+#[test]
+fn bundle_removes_no_semicolon_export_specifier_without_dropping_following_code() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export { value } from './lib.js';");
+    write_source(
+        &root,
+        "lib.js",
+        "export {}\nconst side = 1;\nexport const value = side;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["value".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+
+    assert!(bundled.contains("__il_m1_side = 1"), "{bundled}");
+    assert!(
+        bundled.contains("__il_m1_value = __il_m1_side"),
+        "{bundled}"
+    );
+    assert!(!bundled.contains("export {}"), "{bundled}");
+    assert_parseable(&bundled);
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+}

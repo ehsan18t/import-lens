@@ -49,6 +49,7 @@ pub struct ModuleRecord {
     pub imports: Vec<ImportEdge>,
     pub external_imports: Vec<ExternalImportEdge>,
     pub import_statement_spans: Vec<(usize, usize)>,
+    pub export_specifier_statement_spans: Vec<(usize, usize)>,
     pub exports: Vec<ExportRecord>,
     pub reexports: Vec<ReExportRecord>,
     pub star_exports: Vec<StarExportRecord>,
@@ -195,15 +196,15 @@ impl ModuleGraphBuilder {
                 path.display()
             ));
         }
-        let next_graph_source_bytes =
-            self.graph_source_bytes
-                .checked_add(source_bytes)
-                .ok_or_else(|| {
-                    format!(
-                        "graph source size overflow while loading {}",
-                        path.display()
-                    )
-                })?;
+        let next_graph_source_bytes = self
+            .graph_source_bytes
+            .checked_add(source_bytes)
+            .ok_or_else(|| {
+                format!(
+                    "graph source size overflow while loading {}",
+                    path.display()
+                )
+            })?;
         if next_graph_source_bytes > self.limits.max_graph_source_bytes {
             return Err(format!(
                 "graph source size {} exceeds limit {} while loading {}",
@@ -242,6 +243,7 @@ impl ModuleGraphBuilder {
             imports: parsed.imports,
             external_imports: parsed.external_imports,
             import_statement_spans: parsed.import_statement_spans,
+            export_specifier_statement_spans: parsed.export_specifier_statement_spans,
             exports: parsed.exports,
             reexports: parsed.reexports,
             star_exports: parsed.star_exports,
@@ -262,6 +264,7 @@ struct ParsedModule {
     imports: Vec<ImportEdge>,
     external_imports: Vec<ExternalImportEdge>,
     import_statement_spans: Vec<(usize, usize)>,
+    export_specifier_statement_spans: Vec<(usize, usize)>,
     exports: Vec<ExportRecord>,
     reexports: Vec<ReExportRecord>,
     star_exports: Vec<StarExportRecord>,
@@ -308,6 +311,7 @@ fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
         imports: edges_result.imports,
         external_imports: edges_result.external_imports,
         import_statement_spans: edges_result.import_statement_spans,
+        export_specifier_statement_spans: export_specifier_statement_spans(&parsed.program),
         exports: export_records(&parsed.module_record),
         reexports: reexport_records(path, &parsed.module_record)?,
         star_exports: star_export_records(path, &parsed.module_record)?,
@@ -407,7 +411,11 @@ fn import_edges(
         }
     }
 
-    Ok(ImportEdgesResult { imports, external_imports, import_statement_spans })
+    Ok(ImportEdgesResult {
+        imports,
+        external_imports,
+        import_statement_spans,
+    })
 }
 
 fn push_import_binding(
@@ -561,6 +569,22 @@ fn export_local_name(name: &ExportLocalName<'_>) -> Option<String> {
     }
 }
 
+fn export_specifier_statement_spans(program: &Program<'_>) -> Vec<(usize, usize)> {
+    let mut spans = program
+        .body
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::ExportNamedDeclaration(export) if export.declaration.is_none() => {
+                Some((span_start(export.span), span_end(export.span)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    spans.sort();
+    spans.dedup();
+    spans
+}
+
 fn local_bindings(program: &Program<'_>) -> Vec<String> {
     let mut bindings = Vec::new();
     for statement in &program.body {
@@ -700,8 +724,6 @@ fn resolve_relative_module(from_path: &Path, specifier: &str) -> Result<Option<P
             ))
         })
 }
-
-
 
 fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(path)

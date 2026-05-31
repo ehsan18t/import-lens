@@ -131,7 +131,11 @@ fn graph_rejects_single_module_above_source_limit() {
 #[test]
 fn graph_rejects_total_source_above_limit() {
     let root = temp_workspace();
-    write_source(&root, "entry.js", "import './one.js';\nexport const value = 1;");
+    write_source(
+        &root,
+        "entry.js",
+        "import './one.js';\nexport const value = 1;",
+    );
     write_source(&root, "one.js", "export const one = 'large enough';");
 
     let error = build_module_graph_with_limits(
