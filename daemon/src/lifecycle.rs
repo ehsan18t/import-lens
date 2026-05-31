@@ -8,6 +8,7 @@ use std::{
 pub const CACHE_RECYCLE_ENTRY_LIMIT: usize = 200_000;
 const UPTIME_RECYCLE_AFTER: Duration = Duration::from_secs(4 * 60 * 60);
 const IDLE_RECYCLE_AFTER: Duration = Duration::from_secs(15 * 60);
+const RECYCLE_DETECTION_WINDOW: Duration = Duration::from_secs(10 * 60);
 const RECYCLE_FILE_NAME: &str = "importlens-recycles.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,10 +79,17 @@ pub fn record_recycle_timestamp(storage_path: &Path, now: SystemTime) -> io::Res
         .and_then(|contents| serde_json::from_str::<RecycleFile>(&contents).ok())
         .unwrap_or_default();
 
-    file.recycles.push(unix_millis(now));
+    let now_millis = unix_millis(now);
+    let cutoff = now_millis.saturating_sub(duration_millis(RECYCLE_DETECTION_WINDOW));
+    file.recycles.retain(|timestamp| *timestamp >= cutoff);
+    file.recycles.push(now_millis);
     file.recycles.sort_unstable();
 
     fs::write(path, serde_json::to_string(&file)?)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn unix_millis(now: SystemTime) -> u64 {

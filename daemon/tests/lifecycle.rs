@@ -72,3 +72,22 @@ fn record_recycle_timestamp_appends_millisecond_epoch_values() {
     fs::remove_dir_all(storage_path).expect("temp storage should be removed");
     assert_eq!(contents, "{\"recycles\":[1000,2000]}");
 }
+
+#[test]
+fn record_recycle_timestamp_prunes_entries_outside_ten_minute_window() {
+    let storage_path = temp_storage();
+    fs::write(
+        recycle_file(&storage_path),
+        r#"{"recycles":[1000,610000,620000]}"#,
+    )
+    .expect("existing recycle file should be written");
+
+    record_recycle_timestamp(&storage_path, UNIX_EPOCH + Duration::from_millis(620001))
+        .expect("recycle should be recorded");
+
+    let contents =
+        fs::read_to_string(recycle_file(&storage_path)).expect("recycle file should be readable");
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+    assert_eq!(contents, "{\"recycles\":[610000,620000,620001]}");
+}

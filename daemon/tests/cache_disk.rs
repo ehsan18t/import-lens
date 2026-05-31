@@ -6,13 +6,15 @@ use redb::{Database, ReadableDatabase, TableDefinition};
 use std::{
     fs,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CURRENT_SCHEMA_VERSION: u64 = 1;
+const CURRENT_SCHEMA_VERSION: u64 = 2;
 
 fn temp_storage() -> PathBuf {
     let suffix = SystemTime::now()
@@ -175,6 +177,20 @@ fn disk_cache_clear_removes_disk_and_memory_entries() {
     assert_eq!(cache.memory_len(), 0);
     assert!(cache.get("react@18.3.1::default").is_none());
     drop(cache);
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
+fn disk_cache_tracks_recent_entries_for_startup_prewarm() {
+    let storage_path = temp_storage();
+
+    let cache = ImportCache::new(Some(storage_path.clone()), true);
+    cache.insert("left@1.0.0::default".to_owned(), result("left"));
+    thread::sleep(Duration::from_millis(2));
+    cache.insert("right@1.0.0::*".to_owned(), result("right"));
+
+    assert_eq!(cache.recent_keys(1), vec!["right@1.0.0::*".to_owned()]);
 
     fs::remove_dir_all(storage_path).expect("temp storage should be removed");
 }

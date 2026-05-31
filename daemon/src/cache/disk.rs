@@ -3,13 +3,15 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const CACHE_DB_FILE_NAME: &str = "importlens.redb";
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
+const RECENTS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_recents");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CURRENT_SCHEMA_VERSION: u64 = 1;
+const CURRENT_SCHEMA_VERSION: u64 = 2;
 
 #[derive(Debug, Default)]
 pub struct DiskCache {
@@ -41,6 +43,7 @@ impl DiskCache {
         let bytes = value.value();
         let mut result: ImportResult = rmp_serde::from_slice(bytes).ok()?;
         result.cache_hit = true;
+        self.touch(key);
         Some(result)
     }
 
@@ -101,8 +104,63 @@ impl DiskCache {
             if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
                 let _ = table.insert(key, bytes.as_slice());
             }
+            if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
+                let _ = recents.insert(key, unix_millis_now());
+            }
             let _ = write_txn.commit();
         }
+    }
+
+    pub fn touch(&self, key: &str) {
+        let db = match self.db.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
+
+        if let Ok(write_txn) = db.begin_write() {
+            if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
+                let _ = recents.insert(key, unix_millis_now());
+            }
+            let _ = write_txn.commit();
+        }
+    }
+
+    pub fn recent_keys(&self, limit: usize) -> Vec<String> {
+        let db = match self.db.as_ref() {
+            Some(db) => db,
+            None => return Vec::new(),
+        };
+        let read_txn = match db.begin_read() {
+            Ok(txn) => txn,
+            Err(error) => {
+                CacheLogger::warn(format!("failed to begin recent cache read: {error}"));
+                return Vec::new();
+            }
+        };
+        let recents = match read_txn.open_table(RECENTS_TABLE) {
+            Ok(table) => table,
+            Err(error) => {
+                CacheLogger::warn(format!("failed to open recent cache table: {error}"));
+                return Vec::new();
+            }
+        };
+        let iter = match recents.iter() {
+            Ok(iter) => iter,
+            Err(error) => {
+                CacheLogger::warn(format!("failed to iterate recent cache table: {error}"));
+                return Vec::new();
+            }
+        };
+        let mut keys = iter
+            .filter_map(|entry| {
+                let (key, timestamp) = entry.ok()?;
+                Some((key.value().to_owned(), timestamp.value()))
+            })
+            .collect::<Vec<_>>();
+
+        keys.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        keys.truncate(limit);
+        keys.into_iter().map(|(key, _)| key).collect()
     }
 
     pub fn invalidate_package(&self, package_name: &str) {
@@ -138,6 +196,9 @@ impl DiskCache {
 
                 for key in keys_to_remove {
                     let _ = table.remove(key.as_str());
+                    if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
+                        let _ = recents.remove(key.as_str());
+                    }
                 }
             }
             let _ = write_txn.commit();
@@ -160,6 +221,17 @@ impl DiskCache {
                 }
                 for key in keys_to_remove {
                     let _ = table.remove(key.as_str());
+                }
+            }
+            if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
+                let mut keys_to_remove = Vec::new();
+                if let Ok(iter) = recents.iter() {
+                    for (key, _) in iter.flatten() {
+                        keys_to_remove.push(key.value().to_owned());
+                    }
+                }
+                for key in keys_to_remove {
+                    let _ = recents.remove(key.as_str());
                 }
             }
             let _ = write_txn.commit();
@@ -269,11 +341,24 @@ impl DiskCache {
                 .open_table(CACHE_TABLE)
                 .map_err(|error| format!("failed to open cache table: {error}"))?;
         }
+        {
+            write_txn
+                .open_table(RECENTS_TABLE)
+                .map_err(|error| format!("failed to open recent cache table: {error}"))?;
+        }
 
         write_txn
             .commit()
             .map_err(|error| format!("failed to commit schema transaction: {error}"))
     }
+}
+
+fn unix_millis_now() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 struct CacheLogger;

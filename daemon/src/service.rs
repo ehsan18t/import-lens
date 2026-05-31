@@ -225,6 +225,10 @@ impl ImportLensService {
         self.cache.memory_len()
     }
 
+    pub fn recent_cache_keys(&self, limit: usize) -> Vec<String> {
+        self.cache.recent_keys(limit)
+    }
+
     pub fn prewarm_import<F>(
         &self,
         context: &AnalysisContext,

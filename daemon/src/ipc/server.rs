@@ -96,12 +96,17 @@ where
             match message {
                 ClientMessage::Hello(hello) => {
                     let hello_storage_path = PathBuf::from(&hello.storage_path);
+                    let hello_workspace_root = PathBuf::from(&hello.workspace_root);
                     service = std::sync::Arc::new(ImportLensService::new(
                         Some(hello_storage_path.clone()),
                         hello.enable_disk_cache,
                     ));
                     storage_path = Some(hello_storage_path);
                     hello_received = true;
+                    prefetcher.prewarm_recent_cache_entries(
+                        std::sync::Arc::clone(&service),
+                        hello_workspace_root,
+                    );
 
                     if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
                         return Ok(());

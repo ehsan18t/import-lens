@@ -19,6 +19,7 @@ use std::{
 };
 
 static PREWARM_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+const RECENT_PREWARM_LIMIT: usize = 20;
 
 #[derive(Debug, Clone)]
 struct PrewarmJob {
@@ -82,6 +83,21 @@ impl Prefetcher {
                     cancellation,
                     generation,
                 );
+            });
+    }
+
+    pub fn prewarm_recent_cache_entries(
+        &self,
+        service: Arc<ImportLensService>,
+        workspace_root: PathBuf,
+    ) {
+        let cancellation = Arc::clone(&self.cancellation);
+        let generation = cancellation.next_generation();
+
+        let _ = thread::Builder::new()
+            .name("import-lens-recent-prewarm".to_owned())
+            .spawn(move || {
+                run_recent_prewarm_job(service, workspace_root, cancellation, generation);
             });
     }
 }
@@ -208,9 +224,113 @@ fn run_prewarm_job(
     pool.install(run);
 }
 
+fn run_recent_prewarm_job(
+    service: Arc<ImportLensService>,
+    workspace_root: PathBuf,
+    cancellation: Arc<CancellationToken>,
+    generation: u64,
+) {
+    if !cancellation.is_current(generation) {
+        return;
+    }
+
+    let active_document_path = workspace_root.join("package.json");
+    let jobs = service
+        .recent_cache_keys(RECENT_PREWARM_LIMIT)
+        .into_iter()
+        .filter_map(|key| cached_import_request_from_key(&key))
+        .filter_map(|request| {
+            let resolved = resolve_package_entry(&active_document_path, &request).ok()?;
+            Some(PrewarmJob { request, resolved })
+        })
+        .collect::<Vec<_>>();
+
+    if jobs.is_empty() || !cancellation.is_current(generation) {
+        return;
+    }
+
+    let context = AnalysisContext {
+        workspace_root,
+        active_document_path,
+    };
+    let run = || {
+        jobs.par_iter().for_each(|job| {
+            if cancellation.is_current(generation) {
+                service.prewarm_resolved_import(
+                    &context,
+                    &job.request,
+                    job.resolved.clone(),
+                    || cancellation.is_current(generation),
+                );
+            }
+        });
+    };
+
+    let pool = PREWARM_POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(prewarm_thread_count())
+            .build()
+            .expect("failed to build prewarm thread pool")
+    });
+
+    pool.install(run);
+}
+
 fn installed_package(active_document_path: &Path, package_name: &str) -> Option<ResolvedPackage> {
     let request = prewarm_request(package_name, "", ImportKind::Namespace);
     resolve_package_entry(active_document_path, &request).ok()
+}
+
+pub fn cached_import_request_from_key(key: &str) -> Option<ImportRequest> {
+    let (specifier_and_version, exports) = key.split_once("::")?;
+    let version_separator = specifier_and_version.rfind('@')?;
+    if version_separator == 0 {
+        return None;
+    }
+
+    let specifier = &specifier_and_version[..version_separator];
+    let version = &specifier_and_version[version_separator + 1..];
+    if specifier.is_empty() || version.is_empty() || exports.is_empty() {
+        return None;
+    }
+
+    let (import_kind, named) = match exports {
+        "default" => (ImportKind::Default, Vec::new()),
+        "*" => (ImportKind::Namespace, Vec::new()),
+        "dynamic" => (ImportKind::Dynamic, Vec::new()),
+        named => (
+            ImportKind::Named,
+            named
+                .split(',')
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ),
+    };
+
+    Some(ImportRequest {
+        specifier: specifier.to_owned(),
+        package_name: package_name_from_specifier(specifier),
+        version: version.to_owned(),
+        named,
+        import_kind,
+    })
+}
+
+fn package_name_from_specifier(specifier: &str) -> String {
+    if specifier.starts_with('@') {
+        let mut parts = specifier.split('/');
+        return match (parts.next(), parts.next()) {
+            (Some(scope), Some(name)) => format!("{scope}/{name}"),
+            _ => specifier.to_owned(),
+        };
+    }
+
+    specifier
+        .split('/')
+        .next()
+        .map(str::to_owned)
+        .unwrap_or_else(|| specifier.to_owned())
 }
 
 fn prewarm_request(package_name: &str, version: &str, import_kind: ImportKind) -> ImportRequest {

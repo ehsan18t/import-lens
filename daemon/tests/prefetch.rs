@@ -1,6 +1,9 @@
 use import_lens_daemon::{
     ipc::protocol::ImportKind,
-    prefetch::{CancellationToken, package_json_dependency_names, package_json_prewarm_requests},
+    prefetch::{
+        CancellationToken, cached_import_request_from_key, package_json_dependency_names,
+        package_json_prewarm_requests,
+    },
 };
 use std::{
     fs,
@@ -100,4 +103,25 @@ fn cancellation_token_invalidates_existing_jobs() {
     token.cancel();
 
     assert!(!token.is_current(generation));
+}
+
+#[test]
+fn cached_import_request_from_key_parses_recent_cache_keys() {
+    let default = cached_import_request_from_key("react@19.2.3::default")
+        .expect("default cache key should parse");
+    let namespace = cached_import_request_from_key("@scope/pkg@1.0.0::*")
+        .expect("namespace cache key should parse");
+    let named = cached_import_request_from_key("lodash-es@4.17.21::debounce,throttle")
+        .expect("named cache key should parse");
+
+    assert_eq!(default.specifier, "react");
+    assert_eq!(default.version, "19.2.3");
+    assert_eq!(default.import_kind, ImportKind::Default);
+    assert_eq!(namespace.package_name, "@scope/pkg");
+    assert_eq!(namespace.import_kind, ImportKind::Namespace);
+    assert_eq!(
+        named.named,
+        vec!["debounce".to_owned(), "throttle".to_owned()]
+    );
+    assert!(cached_import_request_from_key("bad-key").is_none());
 }

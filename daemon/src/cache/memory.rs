@@ -37,6 +37,7 @@ impl ImportCache {
         if let Some(result) = memory.get(key) {
             let mut result = result.clone();
             result.cache_hit = true;
+            self.disk.touch(key);
             return Some(result);
         }
 
@@ -78,5 +79,9 @@ impl ImportCache {
 
     pub fn memory_len(&self) -> usize {
         self.memory.pin().len()
+    }
+
+    pub fn recent_keys(&self, limit: usize) -> Vec<String> {
+        self.disk.recent_keys(limit)
     }
 }
