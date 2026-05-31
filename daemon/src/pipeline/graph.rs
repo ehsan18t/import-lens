@@ -1,3 +1,4 @@
+use crate::pipeline::resolver::append_extension;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression,
@@ -626,12 +627,7 @@ fn resolve_relative_module(from_path: &Path, specifier: &str) -> Result<Option<P
         })
 }
 
-fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
-    let mut path = candidate.as_os_str().to_owned();
-    path.push(".");
-    path.push(extension);
-    PathBuf::from(path)
-}
+
 
 fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(path)

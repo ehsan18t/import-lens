@@ -264,7 +264,7 @@ fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
     Ok(found_path)
 }
 
-fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
+pub(crate) fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
     let mut path = candidate.as_os_str().to_owned();
     path.push(".");
     path.push(extension);
