@@ -151,3 +151,77 @@ fn graph_rejects_total_source_above_limit() {
     fs::remove_dir_all(root).expect("temp graph workspace should be removed");
     assert!(error.contains("graph source"));
 }
+
+#[test]
+fn graph_resolves_bare_transitive_dependency_modules() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "packages/main/index.js",
+        "import { helper } from 'dep-lib';\nexport const value = helper();",
+    );
+    write_source(
+        &root,
+        "node_modules/dep-lib/package.json",
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+    );
+    write_source(
+        &root,
+        "node_modules/dep-lib/index.js",
+        "export const helper = () => 42;",
+    );
+
+    let graph = build_module_graph(&root.join("packages/main/index.js"))
+        .expect("graph should resolve bare dependency");
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+    assert!(
+        graph
+            .modules
+            .iter()
+            .any(|module| module.path.to_string_lossy().contains("dep-lib")),
+        "{graph:?}",
+    );
+    assert!(
+        graph
+            .dependency_paths
+            .iter()
+            .any(|path| path.to_string_lossy().contains("dep-lib")),
+        "{:?}",
+        graph.dependency_paths
+    );
+    assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+}
+
+#[test]
+fn graph_keeps_builtins_and_unresolved_peers_external_with_diagnostics() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import fs from 'node:fs';\nimport peer from 'missing-peer';\nexport const value = fs && peer;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js"))
+        .expect("graph should keep externals instead of failing");
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+    let entry = graph.entry_module().expect("entry module should exist");
+    assert_eq!(entry.external_imports.len(), 2);
+    assert!(
+        graph
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("node:fs")),
+        "{:?}",
+        graph.diagnostics
+    );
+    assert!(
+        graph
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("missing-peer")),
+        "{:?}",
+        graph.diagnostics
+    );
+}

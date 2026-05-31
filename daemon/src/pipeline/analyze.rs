@@ -160,6 +160,11 @@ fn analyze_with_oxc_pipeline(
     })?;
 
     let mut diagnostics = side_effect_diagnostics(side_effects_mode, &entry_path);
+    diagnostics.extend(graph.diagnostics.iter().map(|diagnostic| ImportDiagnostic {
+        stage: diagnostic.stage.clone(),
+        message: diagnostic.message.clone(),
+        details: diagnostic.details.clone(),
+    }));
     diagnostics.extend(missing_export_diagnostics(request, &graph));
 
     Ok(ImportResult {

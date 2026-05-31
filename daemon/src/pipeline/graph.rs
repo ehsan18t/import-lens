@@ -5,6 +5,7 @@ use oxc_ast::ast::{
     Program, Statement,
 };
 use oxc_parser::Parser;
+use oxc_resolver::{ResolveOptions, Resolver};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{SourceType, Span};
 use oxc_syntax::module_record::{
@@ -55,6 +56,13 @@ pub struct ModuleRecord {
     pub star_exports: Vec<StarExportRecord>,
     pub local_bindings: Vec<String>,
     pub has_top_level_side_effects: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphDiagnostic {
+    pub stage: String,
+    pub message: String,
+    pub details: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +120,8 @@ pub struct StarExportRecord {
 pub struct ModuleGraph {
     pub entry_id: ModuleId,
     pub modules: Vec<ModuleRecord>,
+    pub diagnostics: Vec<GraphDiagnostic>,
+    pub dependency_paths: Vec<PathBuf>,
     path_to_id: HashMap<PathBuf, ModuleId>,
 }
 
@@ -120,6 +130,8 @@ impl Default for ModuleGraph {
         Self {
             entry_id: ModuleId(0),
             modules: Vec::new(),
+            diagnostics: Vec::new(),
+            dependency_paths: Vec::new(),
             path_to_id: HashMap::new(),
         }
     }
@@ -139,6 +151,29 @@ impl ModuleGraph {
     }
 }
 
+fn module_resolver() -> Resolver {
+    Resolver::new(ResolveOptions {
+        alias_fields: vec![vec!["browser".to_owned()]],
+        condition_names: vec![
+            "module".to_owned(),
+            "import".to_owned(),
+            "default".to_owned(),
+        ],
+        extensions: vec![
+            ".js".to_owned(),
+            ".mjs".to_owned(),
+            ".cjs".to_owned(),
+            ".jsx".to_owned(),
+            ".ts".to_owned(),
+            ".tsx".to_owned(),
+        ],
+        main_fields: vec!["browser".to_owned(), "module".to_owned(), "main".to_owned()],
+        module_type: true,
+        node_path: false,
+        ..ResolveOptions::default()
+    })
+}
+
 pub fn build_module_graph(entry_path: &Path) -> Result<ModuleGraph, String> {
     build_module_graph_with_limits(entry_path, GraphLimits::default())
 }
@@ -151,6 +186,8 @@ pub fn build_module_graph_with_limits(
     let mut builder = ModuleGraphBuilder::new(limits);
     let entry_id = builder.load_module(&entry_path)?;
     builder.graph.entry_id = entry_id;
+    builder.graph.dependency_paths = builder.dependency_paths.into_iter().collect();
+    builder.graph.dependency_paths.sort();
 
     Ok(builder.graph)
 }
@@ -159,6 +196,8 @@ struct ModuleGraphBuilder {
     graph: ModuleGraph,
     limits: GraphLimits,
     graph_source_bytes: usize,
+    resolver: Resolver,
+    dependency_paths: HashSet<PathBuf>,
 }
 
 impl ModuleGraphBuilder {
@@ -167,6 +206,8 @@ impl ModuleGraphBuilder {
             graph: ModuleGraph::default(),
             limits,
             graph_source_bytes: 0,
+            resolver: module_resolver(),
+            dependency_paths: HashSet::new(),
         }
     }
 }
@@ -214,7 +255,12 @@ impl ModuleGraphBuilder {
             ));
         }
 
-        let parsed = parse_module(&path, &source)?;
+        let mut resolver_context = ModuleResolverContext {
+            resolver: &self.resolver,
+            diagnostics: &mut self.graph.diagnostics,
+            dependency_paths: &mut self.dependency_paths,
+        };
+        let parsed = parse_module(&path, &source, &mut resolver_context)?;
         let id = ModuleId(self.graph.modules.len());
         let next_paths = parsed
             .imports
@@ -272,7 +318,22 @@ struct ParsedModule {
     has_top_level_side_effects: bool,
 }
 
-fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
+struct ModuleResolverContext<'a> {
+    resolver: &'a Resolver,
+    diagnostics: &'a mut Vec<GraphDiagnostic>,
+    dependency_paths: &'a mut HashSet<PathBuf>,
+}
+
+enum ModuleResolution {
+    Internal(PathBuf),
+    External,
+}
+
+fn parse_module(
+    path: &Path,
+    source: &str,
+    resolver_context: &mut ModuleResolverContext<'_>,
+) -> Result<ParsedModule, String> {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -306,15 +367,15 @@ fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
         ));
     }
 
-    let edges_result = import_edges(path, &parsed.module_record)?;
+    let edges_result = import_edges(path, &parsed.module_record, resolver_context)?;
     Ok(ParsedModule {
         imports: edges_result.imports,
         external_imports: edges_result.external_imports,
         import_statement_spans: edges_result.import_statement_spans,
         export_specifier_statement_spans: export_specifier_statement_spans(&parsed.program),
         exports: export_records(&parsed.module_record),
-        reexports: reexport_records(path, &parsed.module_record)?,
-        star_exports: star_export_records(path, &parsed.module_record)?,
+        reexports: reexport_records(path, &parsed.module_record, resolver_context)?,
+        star_exports: star_export_records(path, &parsed.module_record, resolver_context)?,
         local_bindings: local_bindings(&parsed.program),
         has_top_level_side_effects: has_top_level_side_effects(&parsed.program),
     })
@@ -329,6 +390,7 @@ struct ImportEdgesResult {
 fn import_edges(
     path: &Path,
     module_record: &OxcModuleRecord<'_>,
+    resolver_context: &mut ModuleResolverContext<'_>,
 ) -> Result<ImportEdgesResult, String> {
     let mut imports = Vec::new();
     let mut external_imports = Vec::new();
@@ -358,23 +420,26 @@ fn import_edges(
         binding_import_specifiers.insert(specifier.clone());
         let imported_name = import_name(entry);
         let local_name = entry.local_name.name.as_str().to_owned();
-        if let Some(resolved_path) = resolve_relative_module(path, &specifier)? {
-            push_import_binding(
-                &mut imports,
-                specifier,
-                resolved_path,
-                imported_name,
-                local_name,
-                entry.statement_span,
-            );
-        } else {
-            external_imports.push(ExternalImportEdge {
-                specifier,
-                imported_name,
-                local_name,
-                statement_start: span_start(entry.statement_span),
-                statement_end: span_end(entry.statement_span),
-            });
+        match resolve_module(path, &specifier, resolver_context)? {
+            ModuleResolution::Internal(resolved_path) => {
+                push_import_binding(
+                    &mut imports,
+                    specifier,
+                    resolved_path,
+                    imported_name,
+                    local_name,
+                    entry.statement_span,
+                );
+            }
+            ModuleResolution::External => {
+                external_imports.push(ExternalImportEdge {
+                    specifier,
+                    imported_name,
+                    local_name,
+                    statement_start: span_start(entry.statement_span),
+                    statement_end: span_end(entry.statement_span),
+                });
+            }
         }
     }
 
@@ -391,23 +456,26 @@ fn import_edges(
         }
 
         let statement_span = requested_modules[0].statement_span;
-        if let Some(resolved_path) = resolve_relative_module(path, specifier.as_str())? {
-            imports.push(ImportEdge {
-                specifier: specifier.as_str().to_owned(),
-                resolved_path,
-                imported_names: Vec::new(),
-                imported_bindings: Vec::new(),
-                statement_start: span_start(statement_span),
-                statement_end: span_end(statement_span),
-            });
-        } else {
-            external_imports.push(ExternalImportEdge {
-                specifier: specifier.as_str().to_owned(),
-                imported_name: String::new(),
-                local_name: String::new(),
-                statement_start: span_start(statement_span),
-                statement_end: span_end(statement_span),
-            });
+        match resolve_module(path, specifier.as_str(), resolver_context)? {
+            ModuleResolution::Internal(resolved_path) => {
+                imports.push(ImportEdge {
+                    specifier: specifier.as_str().to_owned(),
+                    resolved_path,
+                    imported_names: Vec::new(),
+                    imported_bindings: Vec::new(),
+                    statement_start: span_start(statement_span),
+                    statement_end: span_end(statement_span),
+                });
+            }
+            ModuleResolution::External => {
+                external_imports.push(ExternalImportEdge {
+                    specifier: specifier.as_str().to_owned(),
+                    imported_name: String::new(),
+                    local_name: String::new(),
+                    statement_start: span_start(statement_span),
+                    statement_end: span_end(statement_span),
+                });
+            }
         }
     }
 
@@ -489,21 +557,28 @@ fn export_records(module_record: &OxcModuleRecord<'_>) -> Vec<ExportRecord> {
 fn reexport_records(
     path: &Path,
     module_record: &OxcModuleRecord<'_>,
+    resolver_context: &mut ModuleResolverContext<'_>,
 ) -> Result<Vec<ReExportRecord>, String> {
     module_record
         .indirect_export_entries
         .iter()
         .filter(|entry| !entry.is_type)
-        .filter_map(|entry| reexport_record(path, entry).transpose())
+        .filter_map(|entry| reexport_record(path, entry, resolver_context).transpose())
         .collect()
 }
 
-fn reexport_record(path: &Path, entry: &ExportEntry<'_>) -> Result<Option<ReExportRecord>, String> {
+fn reexport_record(
+    path: &Path,
+    entry: &ExportEntry<'_>,
+    resolver_context: &mut ModuleResolverContext<'_>,
+) -> Result<Option<ReExportRecord>, String> {
     let Some(module_request) = &entry.module_request else {
         return Ok(None);
     };
-    let Some(resolved_path) = resolve_relative_module(path, module_request.name.as_str())? else {
-        return Ok(None);
+    let resolved_path = match resolve_module(path, module_request.name.as_str(), resolver_context)?
+    {
+        ModuleResolution::Internal(resolved_path) => resolved_path,
+        ModuleResolution::External => return Ok(None),
     };
     let Some(exported_name) = export_export_name(&entry.export_name) else {
         return Ok(None);
@@ -525,6 +600,7 @@ fn reexport_record(path: &Path, entry: &ExportEntry<'_>) -> Result<Option<ReExpo
 fn star_export_records(
     path: &Path,
     module_record: &OxcModuleRecord<'_>,
+    resolver_context: &mut ModuleResolverContext<'_>,
 ) -> Result<Vec<StarExportRecord>, String> {
     module_record
         .star_export_entries
@@ -533,8 +609,12 @@ fn star_export_records(
         .filter_map(|entry| {
             let module_request = entry.module_request.as_ref()?;
             let resolved_path =
-                resolve_relative_module(path, module_request.name.as_str()).transpose()?;
-            Some(resolved_path.map(|resolved_path| StarExportRecord {
+                match resolve_module(path, module_request.name.as_str(), resolver_context) {
+                    Ok(ModuleResolution::Internal(resolved_path)) => resolved_path,
+                    Ok(ModuleResolution::External) => return None,
+                    Err(error) => return Some(Err(error)),
+                };
+            Some(Ok(StarExportRecord {
                 specifier: module_request.name.as_str().to_owned(),
                 resolved_path,
                 statement_start: span_start(entry.statement_span),
@@ -695,11 +775,77 @@ fn collect_binding_pattern(pattern: &BindingPattern<'_>, bindings: &mut Vec<Stri
     }
 }
 
-fn resolve_relative_module(from_path: &Path, specifier: &str) -> Result<Option<PathBuf>, String> {
-    if !specifier.starts_with('.') {
-        return Ok(None);
+fn resolve_module(
+    from_path: &Path,
+    specifier: &str,
+    resolver_context: &mut ModuleResolverContext<'_>,
+) -> Result<ModuleResolution, String> {
+    if specifier.starts_with('.') {
+        return resolve_relative_module(from_path, specifier).map(ModuleResolution::Internal);
     }
 
+    if is_node_builtin_specifier(specifier) {
+        push_resolution_diagnostic(
+            resolver_context,
+            from_path,
+            specifier,
+            format!("module '{specifier}' is a Node builtin and was kept external"),
+        );
+        return Ok(ModuleResolution::External);
+    }
+
+    let from_dir = from_path.parent().ok_or_else(|| {
+        format!(
+            "module path has no parent directory: {}",
+            from_path.display()
+        )
+    })?;
+
+    let resolution = match resolver_context.resolver.resolve(from_dir, specifier) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            push_resolution_diagnostic(
+                resolver_context,
+                from_path,
+                specifier,
+                format!("failed to resolve external peer '{specifier}': {error}"),
+            );
+            return Ok(ModuleResolution::External);
+        }
+    };
+
+    if resolution.query().is_some() || resolution.fragment().is_some() {
+        push_resolution_diagnostic(
+            resolver_context,
+            from_path,
+            specifier,
+            format!("resolved module '{specifier}' contains unsupported query or fragment"),
+        );
+        return Ok(ModuleResolution::External);
+    }
+
+    let resolved_path = resolution.into_path_buf();
+    if !resolved_path.is_file() {
+        push_resolution_diagnostic(
+            resolver_context,
+            from_path,
+            specifier,
+            format!(
+                "resolved module '{specifier}' is not a file: {}",
+                resolved_path.display()
+            ),
+        );
+        return Ok(ModuleResolution::External);
+    }
+
+    let resolved_path = normalize_existing_path(&resolved_path)?;
+    resolver_context
+        .dependency_paths
+        .insert(resolved_path.clone());
+    Ok(ModuleResolution::Internal(resolved_path))
+}
+
+fn resolve_relative_module(from_path: &Path, specifier: &str) -> Result<PathBuf, String> {
     let from_dir = from_path.parent().ok_or_else(|| {
         format!(
             "module path has no parent directory: {}",
@@ -726,7 +872,7 @@ fn resolve_relative_module(from_path: &Path, specifier: &str) -> Result<Option<P
     candidates
         .iter()
         .find(|path| path.is_file())
-        .map(|path| normalize_existing_path(path).map(Some))
+        .map(|path| normalize_existing_path(path))
         .unwrap_or_else(|| {
             let checked = candidates
                 .iter()
@@ -738,6 +884,68 @@ fn resolve_relative_module(from_path: &Path, specifier: &str) -> Result<Option<P
                 from_path.display()
             ))
         })
+}
+
+fn push_resolution_diagnostic(
+    resolver_context: &mut ModuleResolverContext<'_>,
+    from_path: &Path,
+    specifier: &str,
+    message: String,
+) {
+    resolver_context.diagnostics.push(GraphDiagnostic {
+        stage: "module_resolution".to_owned(),
+        message,
+        details: vec![
+            format!("from_path: {}", from_path.display()),
+            format!("specifier: {specifier}"),
+        ],
+    });
+}
+
+fn is_node_builtin_specifier(specifier: &str) -> bool {
+    let bare = specifier.strip_prefix("node:").unwrap_or(specifier);
+    matches!(
+        bare,
+        "assert"
+            | "async_hooks"
+            | "buffer"
+            | "child_process"
+            | "cluster"
+            | "console"
+            | "constants"
+            | "crypto"
+            | "dgram"
+            | "diagnostics_channel"
+            | "dns"
+            | "domain"
+            | "events"
+            | "fs"
+            | "http"
+            | "http2"
+            | "https"
+            | "inspector"
+            | "module"
+            | "net"
+            | "os"
+            | "path"
+            | "perf_hooks"
+            | "process"
+            | "punycode"
+            | "querystring"
+            | "readline"
+            | "repl"
+            | "stream"
+            | "string_decoder"
+            | "timers"
+            | "tls"
+            | "tty"
+            | "url"
+            | "util"
+            | "v8"
+            | "vm"
+            | "worker_threads"
+            | "zlib"
+    )
 }
 
 fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
