@@ -97,6 +97,7 @@ assertInsideRepo(outputPath);
 rmSync(stagingRoot, { force: true, recursive: true });
 rmSync(outputPath, { force: true });
 mkdirSync(stagingRoot, { recursive: true });
+mkdirSync(path.dirname(outputPath), { recursive: true });
 
 writeFileSync(
   path.join(stagingRoot, "package.json"),

@@ -119,4 +119,4 @@ export const cargoZigbuildArgsForTarget = (platformTarget) => {
 };
 
 export const vsixNameForTarget = (manifest, platformTarget) =>
-  `${manifest.name}-${platformTarget}-${manifest.version}.vsix`;
+  `builds/${manifest.name}-${platformTarget}-${manifest.version}.vsix`;

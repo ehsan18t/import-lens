@@ -11,3 +11,4 @@ wasm/
 .vsix-staging/
 
 daemon/tests/fixtures/packages/
+builds/

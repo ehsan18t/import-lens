@@ -121,7 +121,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: import-lens-${{ matrix.target }}-${{ inputs.version }}
-          path: import-lens-${{ matrix.target }}-${{ inputs.version }}.vsix
+          path: builds/import-lens-${{ matrix.target }}-${{ inputs.version }}.vsix
           if-no-files-found: error
 
   package-unix-cross:
@@ -153,8 +153,8 @@ jobs:
         with:
           name: import-lens-unix-${{ inputs.version }}
           path: |
-            import-lens-linux-x64-${{ inputs.version }}.vsix
-            import-lens-linux-arm64-${{ inputs.version }}.vsix
-            import-lens-darwin-x64-${{ inputs.version }}.vsix
-            import-lens-darwin-arm64-${{ inputs.version }}.vsix
+            builds/import-lens-linux-x64-${{ inputs.version }}.vsix
+            builds/import-lens-linux-arm64-${{ inputs.version }}.vsix
+            builds/import-lens-darwin-x64-${{ inputs.version }}.vsix
+            builds/import-lens-darwin-arm64-${{ inputs.version }}.vsix
           if-no-files-found: error
