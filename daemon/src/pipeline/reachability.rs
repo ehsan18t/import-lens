@@ -30,6 +30,12 @@ impl ReachableExports {
     pub fn is_full_module(&self, path: &Path) -> bool {
         self.full_modules.contains(path)
     }
+
+    pub fn merge_from(&mut self, other: &ReachableExports) {
+        self.symbols.extend(other.symbols.iter().cloned());
+        self.modules.extend(other.modules.iter().cloned());
+        self.full_modules.extend(other.full_modules.iter().cloned());
+    }
 }
 
 pub fn reachable_exports(

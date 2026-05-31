@@ -6,6 +6,8 @@ import type {
   ClientMessage,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeRequest,
+  FileSizeResponse,
 } from "./protocol.js";
 import { FrameDecoder, encodeFrame } from "./codec.js";
 
@@ -20,11 +22,17 @@ interface PendingExportsRequest {
   reject: (error: Error) => void;
 }
 
+interface PendingFileSizeRequest {
+  resolve: (response: FileSizeResponse) => void;
+  reject: (error: Error) => void;
+}
+
 export class IpcClient extends EventEmitter {
   readonly #socket: net.Socket;
   readonly #decoder = new FrameDecoder();
   readonly #batchPending = new Map<number, PendingBatchRequest>();
   readonly #exportsPending = new Map<number, PendingExportsRequest>();
+  readonly #fileSizePending = new Map<number, PendingFileSizeRequest>();
   #closed = false;
   #disposed = false;
 
@@ -126,6 +134,32 @@ export class IpcClient extends EventEmitter {
     });
   }
 
+  requestFileSize(
+    request: FileSizeRequest,
+    timeoutMs = 10000,
+  ): Promise<FileSizeResponse> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.#fileSizePending.has(request.request_id)) {
+          this.#fileSizePending.delete(request.request_id);
+          reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
+
+      this.#fileSizePending.set(request.request_id, {
+        resolve: (response) => {
+          clearTimeout(timer);
+          resolve(response);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      this.send(request);
+    });
+  }
+
   dispose(): void {
     this.#disposed = true;
     this.#socket.destroy();
@@ -143,6 +177,17 @@ export class IpcClient extends EventEmitter {
     }
 
     for (const message of messages) {
+      if (isFileSizeResponse(message)) {
+        const pending = this.#fileSizePending.get(message.request_id);
+        if (!pending) {
+          continue;
+        }
+
+        this.#fileSizePending.delete(message.request_id);
+        pending.resolve(message);
+        continue;
+      }
+
       if (isBatchResponse(message)) {
         const pending = this.#batchPending.get(message.request_id);
 
@@ -191,8 +236,13 @@ export class IpcClient extends EventEmitter {
       pending.reject(error);
     }
 
+    for (const pending of this.#fileSizePending.values()) {
+      pending.reject(error);
+    }
+
     this.#batchPending.clear();
     this.#exportsPending.clear();
+    this.#fileSizePending.clear();
 
     if (emitDisconnect && !this.#disposed) {
       this.emit("disconnect", error);
@@ -229,6 +279,26 @@ const isEnumerateExportsResponse = (value: unknown): value is EnumerateExportsRe
     typeof candidate.specifier === "string" &&
     Array.isArray(candidate.exports) &&
     candidate.exports.every((exportedName) => typeof exportedName === "string") &&
+    (candidate.error === null || typeof candidate.error === "string") &&
+    Array.isArray(candidate.diagnostics)
+  );
+};
+
+const isFileSizeResponse = (value: unknown): value is FileSizeResponse => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<FileSizeResponse>;
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    typeof candidate.raw_bytes === "number" &&
+    typeof candidate.minified_bytes === "number" &&
+    typeof candidate.gzip_bytes === "number" &&
+    typeof candidate.brotli_bytes === "number" &&
+    typeof candidate.zstd_bytes === "number" &&
+    Array.isArray(candidate.imports) &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics)
   );

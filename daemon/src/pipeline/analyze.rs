@@ -3,7 +3,7 @@ use crate::{
         ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ModuleContribution,
     },
     pipeline::{
-        bundle::bundle_reachable_modules,
+        bundle::{bundle_reachable_modules, included_module_ids},
         compress::compress_all,
         graph::{ModuleGraph, ModuleId, build_module_graph_cached},
         minify::minify_source,
@@ -309,10 +309,11 @@ fn module_breakdown(
     graph: &ModuleGraph,
     reachable: &crate::pipeline::reachability::ReachableExports,
 ) -> Vec<ModuleContribution> {
+    let included = included_module_ids(graph, reachable);
     let mut contributions = graph
         .modules
         .iter()
-        .filter(|module| reachable.contains_module(&module.path))
+        .filter(|module| included.contains_key(&module.id))
         .map(|module| ModuleContribution {
             path: module.path.to_string_lossy().to_string(),
             bytes: module.source.len() as u64,

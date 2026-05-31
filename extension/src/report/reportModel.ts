@@ -20,6 +20,7 @@ export interface WorkspaceReportRow {
   gzipBytes: number;
   brotliBytes: number;
   zstdBytes: number;
+  sharedBytes: number;
   topModules: string;
   warning: string;
 }
@@ -39,6 +40,7 @@ export const buildReportRows = (items: readonly WorkspaceReportItem[]): Workspac
         gzipBytes: result?.gzip_bytes ?? 0,
         brotliBytes: result?.brotli_bytes ?? 0,
         zstdBytes: result?.zstd_bytes ?? 0,
+        sharedBytes: result?.shared_bytes ?? 0,
         topModules: moduleBreakdownSummary(result),
         warning: warningForItem(item),
       };

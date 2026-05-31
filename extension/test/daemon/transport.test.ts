@@ -5,6 +5,8 @@ import type {
   BatchResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeRequest,
+  FileSizeResponse,
 } from "../../src/ipc/protocol.js";
 import { TransportCoordinator, type AnalysisTransport, type DaemonState } from "../../src/daemon/transport.js";
 
@@ -48,6 +50,22 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
+  async requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse> {
+    this.calls.push(`fileSize:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      raw_bytes: 10,
+      minified_bytes: 8,
+      gzip_bytes: 6,
+      brotli_bytes: 5,
+      zstd_bytes: 6,
+      imports: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
   invalidatePackage(packageName: string): void {
     this.calls.push(`invalidate:${packageName}`);
   }
@@ -78,6 +96,7 @@ test("TransportCoordinator selects the first ready transport and delegates reque
   assert.equal(await coordinator.start(), "ready");
   await coordinator.sendBatch(batch(7));
   await coordinator.enumerateExports(exportsRequest(8));
+  await coordinator.requestFileSize(fileSizeRequest(9));
   coordinator.invalidatePackage("react");
   coordinator.prewarmPackageJson("/workspace/package.json", "/workspace/package.json");
 
@@ -86,6 +105,7 @@ test("TransportCoordinator selects the first ready transport and delegates reque
     "start",
     "batch:7",
     "exports:8:tiny-lib",
+    "fileSize:9",
     "invalidate:react",
     "prewarm:/workspace/package.json",
   ]);
@@ -128,4 +148,13 @@ const exportsRequest = (requestId: number): EnumerateExportsRequest => ({
   specifier: "tiny-lib",
   package: "tiny-lib",
   package_version: "1.0.0",
+});
+
+const fileSizeRequest = (requestId: number): FileSizeRequest => ({
+  type: "file_size",
+  version: 2,
+  request_id: requestId,
+  workspace_root: "/workspace",
+  active_document_path: "/workspace/src/app.ts",
+  imports: [],
 });

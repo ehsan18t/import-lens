@@ -2,9 +2,11 @@ use crate::{
     cache::{key::cache_key_for_import, memory::ImportCache},
     ipc::protocol::{
         BatchRequest, BatchResponse, EnumerateExportsRequest, EnumerateExportsResponse,
-        ImportDiagnostic, ImportKind, ImportRequest, ImportResult, PROTOCOL_VERSION,
+        FileSizeRequest, FileSizeResponse, ImportDiagnostic, ImportKind, ImportRequest,
+        ImportResult, PROTOCOL_VERSION,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
+    pipeline::file_size::{annotate_shared_bytes, compute_file_size},
     pipeline::graph::{
         ModuleGraph, ModuleId, build_module_graph_cached, clear_module_graph_cache,
         invalidate_module_graph_cache_for_package,
@@ -38,11 +40,12 @@ impl ImportLensService {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
-        let imports = request
+        let mut imports = request
             .imports
             .par_iter()
             .map(|item| self.analyze_with_cache(&context, item))
-            .collect();
+            .collect::<Vec<_>>();
+        annotate_shared_bytes(&mut imports);
 
         BatchResponse {
             version: request.version,
@@ -81,6 +84,7 @@ impl ImportLensService {
                 indexes: Some(vec![index]),
             });
         }
+        annotate_shared_bytes(&mut imports);
 
         responses.push(BatchResponse {
             version: request.version,
@@ -89,6 +93,40 @@ impl ImportLensService {
             indexes: None,
         });
         responses
+    }
+
+    pub fn handle_file_size(&self, request: FileSizeRequest) -> FileSizeResponse {
+        if !(2..=PROTOCOL_VERSION).contains(&request.version) {
+            return protocol_error_file_size_response(
+                &request,
+                format!("unsupported protocol version {}", request.version),
+            );
+        }
+
+        let context = AnalysisContext {
+            workspace_root: PathBuf::from(&request.workspace_root),
+            active_document_path: PathBuf::from(&request.active_document_path),
+        };
+        let mut imports = request
+            .imports
+            .par_iter()
+            .map(|item| self.analyze_with_cache(&context, item))
+            .collect::<Vec<_>>();
+        annotate_shared_bytes(&mut imports);
+        let file_size = compute_file_size(&context, &request.imports);
+
+        FileSizeResponse {
+            version: request.version,
+            request_id: request.request_id,
+            raw_bytes: file_size.raw_bytes,
+            minified_bytes: file_size.minified_bytes,
+            gzip_bytes: file_size.gzip_bytes,
+            brotli_bytes: file_size.brotli_bytes,
+            zstd_bytes: file_size.zstd_bytes,
+            imports,
+            error: file_size.error,
+            diagnostics: file_size.diagnostics,
+        }
     }
 
     pub fn enumerate_exports(&self, request: EnumerateExportsRequest) -> EnumerateExportsResponse {
@@ -307,6 +345,32 @@ pub fn protocol_error_exports_response(
             stage: "protocol".to_owned(),
             message,
             details: vec![format!("specifier: {}", request.specifier)],
+        }],
+    }
+}
+
+pub fn protocol_error_file_size_response(
+    request: &FileSizeRequest,
+    message: String,
+) -> FileSizeResponse {
+    FileSizeResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        raw_bytes: 0,
+        minified_bytes: 0,
+        gzip_bytes: 0,
+        brotli_bytes: 0,
+        zstd_bytes: 0,
+        imports: request
+            .imports
+            .iter()
+            .map(|item| protocol_error(item, message.clone()))
+            .collect(),
+        error: Some(message.clone()),
+        diagnostics: vec![ImportDiagnostic {
+            stage: "protocol".to_owned(),
+            message,
+            details: Vec::new(),
         }],
     }
 }

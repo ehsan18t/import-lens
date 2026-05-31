@@ -12,7 +12,7 @@ pub fn bundle_reachable_modules(
     graph: &ModuleGraph,
     reachable: &ReachableExports,
 ) -> Result<String, String> {
-    let included = collect_included_modules(graph, reachable);
+    let included = included_module_ids(graph, reachable);
     let mut source = String::new();
     let mut deduplicated_external_imports = HashMap::new();
 
@@ -90,7 +90,7 @@ pub fn bundle_reachable_modules(
     Ok(synthetic_imports)
 }
 
-fn collect_included_modules(
+pub fn included_module_ids(
     graph: &ModuleGraph,
     reachable: &ReachableExports,
 ) -> HashMap<ModuleId, bool> {

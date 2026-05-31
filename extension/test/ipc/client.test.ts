@@ -11,6 +11,8 @@ import type {
   BatchResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeRequest,
+  FileSizeResponse,
   ImportResult,
 } from "../../src/ipc/protocol.js";
 
@@ -88,6 +90,15 @@ const exportsRequest = (requestId: number): EnumerateExportsRequest => ({
   specifier: "tiny-lib",
   package: "tiny-lib",
   package_version: "1.0.0",
+});
+
+const fileSizeRequest = (requestId: number): FileSizeRequest => ({
+  type: "file_size",
+  version: 2,
+  request_id: requestId,
+  workspace_root: "/workspace",
+  active_document_path: "/workspace/src/app.ts",
+  imports: [],
 });
 
 test("IpcClient.dispose does not emit disconnect for intentional disposal", async () => {
@@ -227,6 +238,44 @@ test("IpcClient resolves export enumeration responses independently from batches
 
     assert.deepEqual(response.exports, ["alpha", "beta"]);
     assert.equal(response.request_id, 101);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+test("IpcClient resolves file size responses independently from batches", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const fileSizeResponse: FileSizeResponse = {
+    version: 2,
+    request_id: 102,
+    raw_bytes: 100,
+    minified_bytes: 80,
+    gzip_bytes: 50,
+    brotli_bytes: 40,
+    zstd_bytes: 45,
+    imports: [],
+    error: null,
+    diagnostics: [],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    setTimeout(() => {
+      socket.write(encodeFrame(fileSizeResponse));
+    }, 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const response = await client.requestFileSize(fileSizeRequest(102));
+
+    assert.equal(response.brotli_bytes, 40);
+    assert.equal(response.request_id, 102);
     client.dispose();
   } finally {
     destroySockets(sockets);

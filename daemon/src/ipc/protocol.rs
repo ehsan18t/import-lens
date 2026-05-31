@@ -132,6 +132,31 @@ pub struct EnumerateExportsResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSizeRequest {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub workspace_root: String,
+    pub active_document_path: String,
+    pub imports: Vec<ImportRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSizeResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub raw_bytes: u64,
+    pub minified_bytes: u64,
+    pub gzip_bytes: u64,
+    pub brotli_bytes: u64,
+    pub zstd_bytes: u64,
+    pub imports: Vec<ImportResult>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownMessage {
     #[serde(rename = "type")]
     pub message_type: String,
@@ -145,6 +170,7 @@ pub enum ClientMessage {
     CacheInvalidateAll(CacheInvalidateAllMessage),
     PrewarmPackageJson(PrewarmPackageJsonMessage),
     EnumerateExports(EnumerateExportsRequest),
+    FileSize(FileSizeRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -170,6 +196,9 @@ impl<'de> Deserialize<'de> for ClientMessage {
                 .map_err(serde::de::Error::custom),
             Some("enumerate_exports") => serde_json::from_value(value)
                 .map(Self::EnumerateExports)
+                .map_err(serde::de::Error::custom),
+            Some("file_size") => serde_json::from_value(value)
+                .map(Self::FileSize)
                 .map_err(serde::de::Error::custom),
             Some("shutdown") => serde_json::from_value(value)
                 .map(Self::Shutdown)

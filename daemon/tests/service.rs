@@ -1,6 +1,7 @@
 use import_lens_daemon::{
     ipc::protocol::{
-        BatchRequest, EnumerateExportsRequest, ImportKind, ImportRequest, PROTOCOL_VERSION,
+        BatchRequest, EnumerateExportsRequest, FileSizeRequest, ImportKind, ImportRequest,
+        PROTOCOL_VERSION,
     },
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
 };
@@ -52,6 +53,37 @@ fn write_export_package(workspace: &Path) {
         "export const beta = 2;\nexport default 3;",
     )
     .expect("more module should be written");
+}
+
+fn write_shared_packages(workspace: &Path) {
+    let util_root = workspace.join("node_modules").join("shared-util");
+    fs::create_dir_all(&util_root).expect("shared util root should be created");
+    fs::write(
+        util_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("shared util manifest should be written");
+    fs::write(
+        util_root.join("index.js"),
+        "export const util = 'shared utility payload';",
+    )
+    .expect("shared util entry should be written");
+
+    for package_name in ["left-lib", "right-lib"] {
+        let package_root = workspace.join("node_modules").join(package_name);
+        fs::create_dir_all(&package_root).expect("package root should be created");
+        fs::write(
+            package_root.join("package.json"),
+            r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        )
+        .expect("package manifest should be written");
+        let export_name = package_name.replace("-lib", "").replace('-', "_");
+        fs::write(
+            package_root.join("index.js"),
+            format!("import {{ util }} from 'shared-util';\nexport const {export_name} = util;"),
+        )
+        .expect("package entry should be written");
+    }
 }
 
 fn write_effectful_package(workspace: &Path) {
@@ -112,6 +144,49 @@ fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -
             import_kind,
         }],
         streaming: false,
+    }
+}
+
+fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
+    BatchRequest {
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![
+            ImportRequest {
+                specifier: "left-lib".to_owned(),
+                package_name: "left-lib".to_owned(),
+                version: "1.0.0".to_owned(),
+                named: vec!["left".to_owned()],
+                import_kind: ImportKind::Named,
+            },
+            ImportRequest {
+                specifier: "right-lib".to_owned(),
+                package_name: "right-lib".to_owned(),
+                version: "1.0.0".to_owned(),
+                named: vec!["right".to_owned()],
+                import_kind: ImportKind::Named,
+            },
+        ],
+        streaming: false,
+    }
+}
+
+fn file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
+    let batch = shared_batch(workspace, request_id);
+
+    FileSizeRequest {
+        message_type: "file_size".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: batch.workspace_root,
+        active_document_path: batch.active_document_path,
+        imports: batch.imports,
     }
 }
 
@@ -208,6 +283,57 @@ fn service_enumerates_entry_exports_for_completion() {
     assert_eq!(response.request_id, 11);
     assert_eq!(response.error, None);
     assert_eq!(response.exports, vec!["beta", "local", "renamed"]);
+}
+
+#[test]
+fn service_marks_shared_transitive_modules_in_batch_results() {
+    let workspace = temp_workspace();
+    write_shared_packages(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_batch(shared_batch(&workspace, 21));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(response.imports.len(), 2);
+    assert!(
+        response
+            .imports
+            .iter()
+            .all(|result| result.shared_bytes.is_some_and(|bytes| bytes > 0)),
+        "{response:?}",
+    );
+}
+
+#[test]
+fn service_computes_file_size_with_shared_module_deduplication() {
+    let workspace = temp_workspace();
+    write_shared_packages(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let batch = service.handle_batch(shared_batch(&workspace, 22));
+    let file_size = service.handle_file_size(file_size_request(&workspace, 23));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let summed_raw = batch
+        .imports
+        .iter()
+        .map(|result| result.raw_bytes)
+        .sum::<u64>();
+    assert_eq!(file_size.request_id, 23);
+    assert_eq!(file_size.error, None);
+    assert!(file_size.raw_bytes > 0);
+    assert!(
+        file_size.raw_bytes < summed_raw,
+        "{file_size:?} >= {summed_raw}"
+    );
+    assert_eq!(file_size.imports.len(), 2);
+    assert!(
+        file_size
+            .imports
+            .iter()
+            .all(|result| result.shared_bytes.is_some_and(|bytes| bytes > 0)),
+        "{file_size:?}",
+    );
 }
 
 #[test]

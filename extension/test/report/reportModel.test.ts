@@ -76,3 +76,17 @@ test("buildReportRows summarizes the largest module contributors", () => {
 
   assert.equal(rows[0].topModules, "large.js (1200 B), small.js (80 B)");
 });
+
+test("buildReportRows carries shared file bytes", () => {
+  const rows = buildReportRows([
+    {
+      ...item("tiny-lib", 100),
+      result: {
+        ...result("tiny-lib", 100),
+        shared_bytes: 25,
+      },
+    },
+  ]);
+
+  assert.equal(rows[0].sharedBytes, 25);
+});

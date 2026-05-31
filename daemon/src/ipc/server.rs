@@ -5,7 +5,10 @@ use crate::{
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
     prefetch::Prefetcher,
-    service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
+    service::{
+        ImportLensService, protocol_error_batch_response, protocol_error_exports_response,
+        protocol_error_file_size_response,
+    },
 };
 use std::{
     error::Error,
@@ -159,6 +162,21 @@ where
                 }
                 ClientMessage::EnumerateExports(request) => {
                     let response = protocol_error_exports_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    );
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::FileSize(request) if hello_received => {
+                    let svc = std::sync::Arc::clone(&service);
+                    let response =
+                        tokio::task::spawn_blocking(move || svc.handle_file_size(request))
+                            .await
+                            .expect("spawn_blocking failed");
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::FileSize(request) => {
+                    let response = protocol_error_file_size_response(
                         &request,
                         "hello message not received".to_owned(),
                     );

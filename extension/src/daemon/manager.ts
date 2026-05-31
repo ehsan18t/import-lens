@@ -4,6 +4,8 @@ import type {
   BatchResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeRequest,
+  FileSizeResponse,
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { NativeDaemonTransport } from "./nativeTransport.js";
@@ -32,6 +34,10 @@ export class DaemonManager implements vscode.Disposable {
 
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
     return this.#transport.enumerateExports(request);
+  }
+
+  requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null> {
+    return this.#transport.requestFileSize(request);
   }
 
   invalidatePackage(packageName: string): void {

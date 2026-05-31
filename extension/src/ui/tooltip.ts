@@ -28,6 +28,9 @@ export const tooltipForResult = (
   tooltip.appendMarkdown(`Gzip: ${formatBytes(result.gzip_bytes)}\n\n`);
   tooltip.appendMarkdown(`Brotli: ${formatBytes(result.brotli_bytes)}\n\n`);
   tooltip.appendMarkdown(`Zstd: ${formatBytes(result.zstd_bytes)}\n\n`);
+  if (result.shared_bytes && result.shared_bytes > 0) {
+    tooltip.appendMarkdown(`Shared in file: ${formatBytes(result.shared_bytes)}\n\n`);
+  }
   tooltip.appendMarkdown(`Runtime: ${runtime}\n\n`);
   tooltip.appendMarkdown(`Side effects: ${result.side_effects ? "yes" : "no"}\n\n`);
   tooltip.appendMarkdown(`CJS: ${result.is_cjs ? "yes" : "no"}`);

@@ -141,6 +141,26 @@ impl Default for ModuleGraph {
 }
 
 impl ModuleGraph {
+    pub fn from_parts(
+        entry_id: ModuleId,
+        modules: Vec<ModuleRecord>,
+        diagnostics: Vec<GraphDiagnostic>,
+        dependency_paths: Vec<PathBuf>,
+    ) -> Self {
+        let path_to_id = modules
+            .iter()
+            .map(|module| (module.path.clone(), module.id))
+            .collect();
+
+        Self {
+            entry_id,
+            modules,
+            diagnostics,
+            dependency_paths,
+            path_to_id,
+        }
+    }
+
     pub fn entry_module(&self) -> Option<&ModuleRecord> {
         self.module_by_id(self.entry_id)
     }

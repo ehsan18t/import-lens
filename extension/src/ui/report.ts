@@ -30,6 +30,7 @@ export const showReport = async (
 <td>${formatBytes(row.gzipBytes)}</td>
 <td>${formatBytes(row.brotliBytes)}</td>
 <td>${formatBytes(row.zstdBytes)}</td>
+<td>${formatBytes(row.sharedBytes)}</td>
 <td>${escapeHtml(row.topModules)}</td>
 <td>${escapeHtml(row.warning)}</td>
 </tr>`)
@@ -51,8 +52,8 @@ th{font-weight:600}
 <body>
 <h1>ImportLens Workspace Report</h1>
 <table>
-<thead><tr><th>Package</th><th>Import</th><th>Source</th><th>Line</th><th>Runtime</th><th>Minified</th><th>Gzip</th><th>Brotli</th><th>Zstd</th><th>Top Modules</th><th>Warning</th></tr></thead>
-<tbody>${rows || `<tr><td class="empty" colspan="11">No package imports found.</td></tr>`}</tbody>
+<thead><tr><th>Package</th><th>Import</th><th>Source</th><th>Line</th><th>Runtime</th><th>Minified</th><th>Gzip</th><th>Brotli</th><th>Zstd</th><th>Shared</th><th>Top Modules</th><th>Warning</th></tr></thead>
+<tbody>${rows || `<tr><td class="empty" colspan="12">No package imports found.</td></tr>`}</tbody>
 </table>
 </body>
 </html>`;

@@ -10,6 +10,8 @@ import type {
   BatchResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeRequest,
+  FileSizeResponse,
   HelloMessage,
 } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
@@ -227,6 +229,14 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
 
     return this.#client.requestExports(request);
+  }
+
+  async requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      return null;
+    }
+
+    return this.#client.requestFileSize(request);
   }
 
   invalidatePackage(packageName: string): void {

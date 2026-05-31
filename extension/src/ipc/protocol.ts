@@ -100,6 +100,28 @@ export interface EnumerateExportsResponse {
   diagnostics: ImportDiagnostic[];
 }
 
+export interface FileSizeRequest {
+  type: "file_size";
+  version: number;
+  request_id: number;
+  workspace_root: string;
+  active_document_path: string;
+  imports: ImportRequest[];
+}
+
+export interface FileSizeResponse {
+  version: number;
+  request_id: number;
+  raw_bytes: number;
+  minified_bytes: number;
+  gzip_bytes: number;
+  brotli_bytes: number;
+  zstd_bytes: number;
+  imports: ImportResult[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
 export interface ShutdownMessage {
   type: "shutdown";
 }
@@ -111,4 +133,5 @@ export type ClientMessage =
   | CacheInvalidateAllMessage
   | PrewarmPackageJsonMessage
   | EnumerateExportsRequest
+  | FileSizeRequest
   | ShutdownMessage;

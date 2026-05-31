@@ -3,6 +3,8 @@ import type {
   BatchResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeRequest,
+  FileSizeResponse,
 } from "../ipc/protocol.js";
 
 export type DaemonState = "ready" | "unavailable";
@@ -12,6 +14,7 @@ export interface AnalysisTransport {
   start(): Promise<DaemonState>;
   sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null>;
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null>;
+  requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null>;
   invalidatePackage(packageName: string): void;
   invalidateAll(): void;
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void;
@@ -54,6 +57,10 @@ export class TransportCoordinator implements AnalysisTransport {
 
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
     return this.#activeTransport?.enumerateExports(request) ?? Promise.resolve(null);
+  }
+
+  requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null> {
+    return this.#activeTransport?.requestFileSize(request) ?? Promise.resolve(null);
   }
 
   invalidatePackage(packageName: string): void {
