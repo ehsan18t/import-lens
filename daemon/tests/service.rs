@@ -62,6 +62,7 @@ fn batch(workspace: &Path, request_id: u64) -> BatchRequest {
             named: vec!["value".to_owned()],
             import_kind: ImportKind::Named,
         }],
+        streaming: false,
     }
 }
 
@@ -86,6 +87,7 @@ fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -
             },
             import_kind,
         }],
+        streaming: false,
     }
 }
 
@@ -132,6 +134,25 @@ fn service_caches_full_package_variant_for_conservative_named_imports() {
     assert!(!named.imports[0].cache_hit);
     assert!(namespace.imports[0].cache_hit);
     assert_eq!(named.imports[0].raw_bytes, namespace.imports[0].raw_bytes);
+}
+
+#[test]
+fn service_streams_indexed_partials_before_final_response() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new(None, false);
+    let mut request = batch(&workspace, 9);
+    request.version = 2;
+    request.streaming = true;
+
+    let responses = service.handle_batch_streaming(request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0].indexes, Some(vec![0]));
+    assert_eq!(responses[0].imports.len(), 1);
+    assert_eq!(responses[1].indexes, None);
+    assert_eq!(responses[1].imports.len(), 1);
 }
 
 #[test]

@@ -6,6 +6,7 @@ import { FrameDecoder, encodeFrame } from "./codec.js";
 interface PendingRequest {
   resolve: (response: BatchResponse) => void;
   reject: (error: Error) => void;
+  onPartial?: (response: BatchResponse) => void;
 }
 
 export class IpcClient extends EventEmitter {
@@ -59,9 +60,11 @@ export class IpcClient extends EventEmitter {
     this.#socket.write(encodeFrame(message));
   }
 
-  requestBatch(request: BatchRequest, timeoutMs = 10000): Promise<BatchResponse> {
-    this.send(request);
-
+  requestBatch(
+    request: BatchRequest,
+    timeoutMs = 10000,
+    onPartial?: (response: BatchResponse) => void,
+  ): Promise<BatchResponse> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.#pending.has(request.request_id)) {
@@ -79,7 +82,9 @@ export class IpcClient extends EventEmitter {
           clearTimeout(timer);
           reject(error);
         },
+        onPartial,
       });
+      this.send(request);
     });
   }
 
@@ -107,6 +112,12 @@ export class IpcClient extends EventEmitter {
       const pending = this.#pending.get(message.request_id);
 
       if (!pending) {
+        continue;
+      }
+
+      if (isStreamingPartial(message)) {
+        pending.onPartial?.(message);
+        this.emit("batchPartial", message);
         continue;
       }
 
@@ -141,5 +152,13 @@ const isBatchResponse = (value: unknown): value is BatchResponse => {
   }
 
   const candidate = value as Partial<BatchResponse>;
-  return typeof candidate.version === "number" && typeof candidate.request_id === "number" && Array.isArray(candidate.imports);
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    Array.isArray(candidate.imports) &&
+    (candidate.indexes === undefined || candidate.indexes.every((index) => typeof index === "number"))
+  );
 };
+
+const isStreamingPartial = (response: BatchResponse): boolean =>
+  Array.isArray(response.indexes) && response.indexes.length > 0;

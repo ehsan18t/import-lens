@@ -1,4 +1,4 @@
-export const protocolVersion = 1;
+export const protocolVersion = 2;
 
 export type ImportKind = "named" | "default" | "namespace" | "dynamic";
 
@@ -18,6 +18,7 @@ export interface BatchRequest {
   workspace_root: string;
   active_document_path: string;
   imports: ImportRequest[];
+  streaming?: boolean;
 }
 
 export interface ImportResult {
@@ -45,6 +46,7 @@ export interface BatchResponse {
   version: number;
   request_id: number;
   imports: ImportResult[];
+  indexes?: number[];
 }
 
 export interface HelloMessage {

@@ -9,7 +9,7 @@ import { resolveInstalledPackage } from "./imports/resolver.js";
 import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import type { StatusBarController } from "./ui/statusbar.js";
-import { protocolVersion } from "./ipc/protocol.js";
+import { protocolVersion, type BatchResponse } from "./ipc/protocol.js";
 
 export class DocumentAnalysisController implements vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -77,6 +77,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
     const states: ImportAnalysisState[] = [];
     const requestImports = [];
+    const requestStateIndexes: number[] = [];
 
     for (const detected of imports) {
       const resolution = await resolveInstalledPackage(detected.specifier, document.fileName);
@@ -91,10 +92,12 @@ export class DocumentAnalysisController implements vscode.Disposable {
       }
 
       states.push({ detected, status: "loading" });
+      requestStateIndexes.push(states.length - 1);
       requestImports.push(createImportRequest(detected, resolution.version));
     }
 
-    this.#store.set(document.uri, states);
+    let currentStates = states;
+    this.#store.set(document.uri, currentStates);
 
     if (requestImports.length === 0) {
       return;
@@ -114,13 +117,48 @@ export class DocumentAnalysisController implements vscode.Disposable {
       const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
       const workspaceRoot = workspaceFolder?.uri.fsPath ?? document.uri.fsPath;
 
-      const response = await this.#daemon.sendBatch({
-        version: protocolVersion,
-        request_id: requestId,
-        workspace_root: workspaceRoot,
-        active_document_path: document.fileName,
-        imports: requestImports,
-      });
+      const applyPartial = (partial: BatchResponse): void => {
+        if (partial.request_id !== this.#latestRequestIds.get(documentKey) || !partial.indexes) {
+          return;
+        }
+
+        const nextStates = [...currentStates];
+
+        partial.indexes.forEach((requestImportIndex, partialIndex) => {
+          const stateIndex = requestStateIndexes[requestImportIndex];
+          const state = stateIndex === undefined ? undefined : nextStates[stateIndex];
+          const result = partial.imports[partialIndex];
+
+          if (!state || state.status === "missing" || !result || result.specifier !== state.detected.specifier) {
+            return;
+          }
+
+          if (result.error) {
+            this.#logger.warn(`${result.specifier}: ${result.error}`);
+          }
+
+          nextStates[stateIndex] = {
+            detected: state.detected,
+            status: "ready",
+            result,
+          };
+        });
+
+        currentStates = nextStates;
+        this.#store.set(document.uri, currentStates);
+      };
+
+      const response = await this.#daemon.sendBatch(
+        {
+          version: protocolVersion,
+          request_id: requestId,
+          workspace_root: workspaceRoot,
+          active_document_path: document.fileName,
+          imports: requestImports,
+          streaming: true,
+        },
+        applyPartial,
+      );
 
       if (!response || response.request_id !== this.#latestRequestIds.get(documentKey)) {
         return;

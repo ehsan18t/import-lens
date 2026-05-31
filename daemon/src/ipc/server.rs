@@ -108,10 +108,22 @@ where
                     prefetcher.cancel();
                     lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
-                    let response = tokio::task::spawn_blocking(move || svc.handle_batch(request))
+                    if request.version >= 2 && request.streaming {
+                        let responses = tokio::task::spawn_blocking(move || {
+                            svc.handle_batch_streaming(request)
+                        })
                         .await
                         .expect("spawn_blocking failed");
-                    stream.write_all(&encode_frame(&response)?).await?;
+                        for response in responses {
+                            stream.write_all(&encode_frame(&response)?).await?;
+                        }
+                    } else {
+                        let response =
+                            tokio::task::spawn_blocking(move || svc.handle_batch(request))
+                                .await
+                                .expect("spawn_blocking failed");
+                        stream.write_all(&encode_frame(&response)?).await?;
+                    }
 
                     if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
                         return Ok(());

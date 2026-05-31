@@ -24,7 +24,7 @@ impl ImportLensService {
     }
 
     pub fn handle_batch(&self, request: BatchRequest) -> BatchResponse {
-        if request.version != PROTOCOL_VERSION {
+        if !is_supported_protocol_version(request.version) {
             return protocol_error_batch_response(
                 &request,
                 format!("unsupported protocol version {}", request.version),
@@ -42,10 +42,50 @@ impl ImportLensService {
             .collect();
 
         BatchResponse {
-            version: PROTOCOL_VERSION,
+            version: request.version,
             request_id: request.request_id,
             imports,
+            indexes: None,
         }
+    }
+
+    pub fn handle_batch_streaming(&self, request: BatchRequest) -> Vec<BatchResponse> {
+        if !is_supported_protocol_version(request.version) {
+            return vec![protocol_error_batch_response(
+                &request,
+                format!("unsupported protocol version {}", request.version),
+            )];
+        }
+
+        if request.version < 2 || !request.streaming {
+            return vec![self.handle_batch(request)];
+        }
+
+        let context = AnalysisContext {
+            workspace_root: PathBuf::from(&request.workspace_root),
+            active_document_path: PathBuf::from(&request.active_document_path),
+        };
+        let mut imports = Vec::with_capacity(request.imports.len());
+        let mut responses = Vec::with_capacity(request.imports.len() + 1);
+
+        for (index, item) in request.imports.iter().enumerate() {
+            let result = self.analyze_with_cache(&context, item);
+            imports.push(result.clone());
+            responses.push(BatchResponse {
+                version: request.version,
+                request_id: request.request_id,
+                imports: vec![result],
+                indexes: Some(vec![index]),
+            });
+        }
+
+        responses.push(BatchResponse {
+            version: request.version,
+            request_id: request.request_id,
+            imports,
+            indexes: None,
+        });
+        responses
     }
 
     pub fn invalidate_package(&self, package_name: &str) {
@@ -157,14 +197,19 @@ impl ImportLensService {
 
 pub fn protocol_error_batch_response(request: &BatchRequest, message: String) -> BatchResponse {
     BatchResponse {
-        version: PROTOCOL_VERSION,
+        version: request.version.min(PROTOCOL_VERSION),
         request_id: request.request_id,
         imports: request
             .imports
             .iter()
             .map(|item| protocol_error(item, message.clone()))
             .collect(),
+        indexes: None,
     }
+}
+
+fn is_supported_protocol_version(version: u32) -> bool {
+    (1..=PROTOCOL_VERSION).contains(&version)
 }
 
 fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {

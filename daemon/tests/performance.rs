@@ -43,6 +43,7 @@ fn uuid_batch(workspace: &Path, request_id: u64) -> BatchRequest {
             named: vec!["v4".to_owned()],
             import_kind: ImportKind::Named,
         }],
+        streaming: false,
     }
 }
 

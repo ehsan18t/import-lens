@@ -207,12 +207,12 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }, CLEAN_RECYCLE_SESSION_MS);
   }
 
-  async sendBatch(request: BatchRequest): Promise<BatchResponse | null> {
+  async sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null> {
     if (!this.#client || this.#state !== "ready") {
       return null;
     }
 
-    return this.#client.requestBatch(request);
+    return this.#client.requestBatch(request, 10000, onPartial);
   }
 
   invalidatePackage(packageName: string): void {

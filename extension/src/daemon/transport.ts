@@ -5,7 +5,7 @@ export type DaemonState = "ready" | "unavailable";
 export interface AnalysisTransport {
   readonly state: DaemonState;
   start(): Promise<DaemonState>;
-  sendBatch(request: BatchRequest): Promise<BatchResponse | null>;
+  sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null>;
   invalidatePackage(packageName: string): void;
   invalidateAll(): void;
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void;
@@ -42,8 +42,8 @@ export class TransportCoordinator implements AnalysisTransport {
     return this.#state;
   }
 
-  sendBatch(request: BatchRequest): Promise<BatchResponse | null> {
-    return this.#activeTransport?.sendBatch(request) ?? Promise.resolve(null);
+  sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null> {
+    return this.#activeTransport?.sendBatch(request, onPartial) ?? Promise.resolve(null);
   }
 
   invalidatePackage(packageName: string): void {
