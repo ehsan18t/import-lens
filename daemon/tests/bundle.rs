@@ -4,6 +4,7 @@ use import_lens_daemon::pipeline::{
 };
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
+use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use std::{
     fs,
@@ -35,6 +36,25 @@ fn assert_parseable(source: &str) {
     assert!(
         !parsed.panicked && parsed.errors.is_empty(),
         "generated source should parse cleanly: {source}"
+    );
+}
+
+fn assert_semantic_valid(source: &str) {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+
+    assert!(
+        !parsed.panicked && parsed.errors.is_empty(),
+        "generated source should parse cleanly: {source}"
+    );
+
+    let semantic = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
+    assert!(
+        semantic.errors.is_empty(),
+        "generated source should pass semantic checks: {source}\nerrors: {:?}",
+        semantic.errors
     );
 }
 
@@ -153,5 +173,57 @@ fn bundle_removes_no_semicolon_export_specifier_without_dropping_following_code(
     );
     assert!(!bundled.contains("export {}"), "{bundled}");
     assert_parseable(&bundled);
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+}
+
+#[test]
+fn bundle_renames_destructured_bindings_to_avoid_collisions() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "export { left } from './left.js';\nexport { right } from './right.js';",
+    );
+    write_source(
+        &root,
+        "left.js",
+        "const [value, ...rest] = [1, 2];\nexport const left = value + rest.length;",
+    );
+    write_source(
+        &root,
+        "right.js",
+        "const { value, ...rest } = { value: 2, extra: 3 };\nexport const right = value + rest.extra;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["left".to_owned(), "right".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+
+    assert!(bundled.contains("__il_m1_value"), "{bundled}");
+    assert!(bundled.contains("__il_m2_value"), "{bundled}");
+    assert_semantic_valid(&bundled);
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+}
+
+#[test]
+fn bundle_preserves_object_shorthand_and_string_literals_when_renaming() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export { result } from './lib.js';");
+    write_source(
+        &root,
+        "lib.js",
+        "const source = { value: 1 };\nconst { value } = source;\nconst text = \"value\";\nconst object = { value, text };\nexport const result = object.value;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["result".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+
+    assert!(bundled.contains("{ value: __il_m1_value }"), "{bundled}");
+    assert!(bundled.contains("\"value\""), "{bundled}");
+    assert!(!bundled.contains("\"__il_m1_value\""), "{bundled}");
+    assert_semantic_valid(&bundled);
     fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
 }

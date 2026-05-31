@@ -2,6 +2,10 @@ use crate::pipeline::{
     graph::{ModuleGraph, ModuleId, ModuleRecord},
     reachability::ReachableExports,
 };
+use oxc_allocator::Allocator;
+use oxc_parser::Parser;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::{SourceType, Span};
 use std::collections::{HashMap, HashSet};
 
 pub fn bundle_reachable_modules(
@@ -200,9 +204,11 @@ fn rewrite_module(
         }
     }
 
-    let without_module_syntax = apply_replacements(&module.source, replacements)?;
     let renames = rename_map(graph, module)?;
-    let mut rewritten = replace_identifiers(&without_module_syntax, &renames);
+    let rename_replacements = semantic_rename_replacements(module, &renames, &replacements)?;
+    replacements.extend(rename_replacements);
+
+    let mut rewritten = apply_replacements(&module.source, replacements)?;
     let anchors = usage_anchors(module, reachable, keep_all_exports);
     if !anchors.is_empty() {
         rewritten.push_str("\n;");
@@ -232,8 +238,22 @@ fn transform_export_statement(
     }
 
     if let Some(after_default) = trimmed.strip_prefix("export default") {
-        let replacement = default_export_replacement(module.id, after_default);
-        return Ok(vec![Replacement::replace(start, end, replacement)]);
+        let default_end = export_start + "export default".len();
+        let trimmed_after_default = after_default.trim_start();
+        let whitespace_len = after_default.len() - trimmed_after_default.len();
+        if is_named_default_declaration(trimmed_after_default) {
+            return Ok(vec![Replacement::remove(
+                export_start,
+                default_end + whitespace_len,
+            )]);
+        }
+
+        let default_name = module_binding_name(module.id, "default");
+        return Ok(vec![Replacement::replace(
+            export_start,
+            default_end,
+            format!("const {default_name} ="),
+        )]);
     }
 
     if trimmed.starts_with("export ") {
@@ -246,25 +266,16 @@ fn transform_export_statement(
     Ok(Vec::new())
 }
 
-fn default_export_replacement(module_id: ModuleId, after_default: &str) -> String {
-    let default_name = module_binding_name(module_id, "default");
-    let trimmed = after_default.trim_start();
-
-    if let Some(after_function) = trimmed.strip_prefix("function") {
-        if after_function.trim_start().starts_with('(') {
-            return format!("const {default_name} = function{after_function}");
-        }
-        return format!("function{after_function}");
+fn is_named_default_declaration(trimmed_after_default: &str) -> bool {
+    if let Some(after_function) = trimmed_after_default.strip_prefix("function") {
+        return !after_function.trim_start().starts_with('(');
     }
 
-    if let Some(after_class) = trimmed.strip_prefix("class") {
-        if after_class.trim_start().starts_with('{') {
-            return format!("const {default_name} = class{after_class}");
-        }
-        return format!("class{after_class}");
+    if let Some(after_class) = trimmed_after_default.strip_prefix("class") {
+        return !after_class.trim_start().starts_with('{');
     }
 
-    format!("const {default_name} = {trimmed}")
+    false
 }
 
 fn rename_map(
@@ -333,6 +344,116 @@ fn resolve_export_binding(
     }
 
     None
+}
+
+fn semantic_rename_replacements(
+    module: &ModuleRecord,
+    renames: &HashMap<String, String>,
+    protected_replacements: &[Replacement],
+) -> Result<Vec<Replacement>, String> {
+    if renames.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(&module.path).unwrap_or_else(|_| SourceType::mjs());
+    let parsed = Parser::new(&allocator, &module.source, source_type).parse();
+    if parsed.panicked || !parsed.errors.is_empty() {
+        return Err(format!(
+            "failed to parse module for renaming {}; errors: {}",
+            module.path.display(),
+            parsed
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    let semantic = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
+    if !semantic.errors.is_empty() {
+        return Err(format!(
+            "semantic validation failed for renaming {}; errors: {}",
+            module.path.display(),
+            semantic
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    let semantic = semantic.semantic;
+    let scoping = semantic.scoping();
+    let mut replacements = Vec::new();
+    let mut seen_spans = HashSet::new();
+
+    for symbol_id in scoping.iter_bindings_in(scoping.root_scope_id()) {
+        let symbol_name = scoping.symbol_name(symbol_id);
+        let Some(new_name) = renames.get(symbol_name) else {
+            continue;
+        };
+
+        push_semantic_rename(
+            &module.source,
+            scoping.symbol_span(symbol_id),
+            new_name,
+            protected_replacements,
+            &mut seen_spans,
+            &mut replacements,
+        )?;
+
+        for reference in semantic.symbol_references(symbol_id) {
+            push_semantic_rename(
+                &module.source,
+                semantic.reference_span(reference),
+                new_name,
+                protected_replacements,
+                &mut seen_spans,
+                &mut replacements,
+            )?;
+        }
+    }
+
+    Ok(replacements)
+}
+
+fn push_semantic_rename(
+    source: &str,
+    span: Span,
+    new_name: &str,
+    protected_replacements: &[Replacement],
+    seen_spans: &mut HashSet<(usize, usize)>,
+    replacements: &mut Vec<Replacement>,
+) -> Result<(), String> {
+    let start = span.start as usize;
+    let end = span.end as usize;
+    let Some(original_name) = source.get(start..end) else {
+        return Err(format!("invalid semantic rename span {start}..{end}"));
+    };
+    if !seen_spans.insert((start, end))
+        || span_overlaps_replacements(start, end, protected_replacements)
+    {
+        return Ok(());
+    }
+
+    let value = if is_object_shorthand_occurrence(source, start, end) {
+        format!("{original_name}: {new_name}")
+    } else {
+        new_name.to_owned()
+    };
+    replacements.push(Replacement::replace(start, end, value));
+    Ok(())
+}
+
+fn span_overlaps_replacements(start: usize, end: usize, replacements: &[Replacement]) -> bool {
+    replacements
+        .iter()
+        .any(|replacement| start < replacement.end && end > replacement.start)
 }
 
 #[derive(Debug)]
@@ -414,60 +535,10 @@ fn usage_anchors(
     anchors
 }
 
-fn replace_identifiers(source: &str, renames: &HashMap<String, String>) -> String {
-    if renames.is_empty() {
-        return source.to_owned();
-    }
-
-    let bytes = source.as_bytes();
-    let mut output = String::with_capacity(source.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        let byte = bytes[index];
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                let next = copy_quoted(source, index, byte, &mut output);
-                index = next;
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                let next = copy_line_comment(source, index, &mut output);
-                index = next;
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                let next = copy_block_comment(source, index, &mut output);
-                index = next;
-            }
-            _ if is_identifier_start(byte) => {
-                let start = index;
-                index += 1;
-                while index < bytes.len() && is_identifier_continue(bytes[index]) {
-                    index += 1;
-                }
-                let identifier = &source[start..index];
-                if should_replace_identifier(source, start, index) {
-                    output.push_str(
-                        renames
-                            .get(identifier)
-                            .map(String::as_str)
-                            .unwrap_or(identifier),
-                    );
-                } else {
-                    output.push_str(identifier);
-                }
-            }
-            _ => {
-                index = copy_next_char(source, index, &mut output);
-            }
-        }
-    }
-
-    output
-}
-
-fn should_replace_identifier(source: &str, start: usize, end: usize) -> bool {
-    previous_significant_byte(source, start) != Some(b'.')
-        && next_significant_byte(source, end) != Some(b':')
+fn is_object_shorthand_occurrence(source: &str, start: usize, end: usize) -> bool {
+    enclosing_delimiter(source, start) == Some(b'{')
+        && matches!(previous_significant_byte(source, start), Some(b'{' | b','))
+        && matches!(next_significant_byte(source, end), Some(b'}' | b',' | b'='))
 }
 
 fn previous_significant_byte(source: &str, start: usize) -> Option<u8> {
@@ -485,9 +556,57 @@ fn next_significant_byte(source: &str, end: usize) -> Option<u8> {
         .find(|byte| !byte.is_ascii_whitespace())
 }
 
-fn copy_quoted(source: &str, start: usize, quote: u8, output: &mut String) -> usize {
+fn enclosing_delimiter(source: &str, position: usize) -> Option<u8> {
     let bytes = source.as_bytes();
-    let mut index = start;
+    let mut stack = Vec::new();
+    let mut index = 0;
+
+    while index < position && index < bytes.len() {
+        let byte = bytes[index];
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                index = skip_quoted(source, index, byte);
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index = skip_line_comment(source, index);
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index = skip_block_comment(source, index);
+            }
+            b'{' | b'[' | b'(' => {
+                stack.push(byte);
+                index += 1;
+            }
+            b'}' => {
+                pop_matching_delimiter(&mut stack, b'{');
+                index += 1;
+            }
+            b']' => {
+                pop_matching_delimiter(&mut stack, b'[');
+                index += 1;
+            }
+            b')' => {
+                pop_matching_delimiter(&mut stack, b'(');
+                index += 1;
+            }
+            _ => {
+                index = next_char_end(source, index);
+            }
+        }
+    }
+
+    stack.last().copied()
+}
+
+fn pop_matching_delimiter(stack: &mut Vec<u8>, expected: u8) {
+    if stack.last() == Some(&expected) {
+        stack.pop();
+    }
+}
+
+fn skip_quoted(source: &str, start: usize, quote: u8) -> usize {
+    let bytes = source.as_bytes();
+    let mut index = start + 1;
     while index < bytes.len() {
         let byte = bytes[index];
         index = next_char_end(source, index);
@@ -497,11 +616,10 @@ fn copy_quoted(source: &str, start: usize, quote: u8, output: &mut String) -> us
             break;
         }
     }
-    output.push_str(&source[start..index]);
     index
 }
 
-fn copy_line_comment(source: &str, start: usize, output: &mut String) -> usize {
+fn skip_line_comment(source: &str, start: usize) -> usize {
     let bytes = source.as_bytes();
     let mut index = start;
     while index < bytes.len() {
@@ -511,11 +629,10 @@ fn copy_line_comment(source: &str, start: usize, output: &mut String) -> usize {
             break;
         }
     }
-    output.push_str(&source[start..index]);
     index
 }
 
-fn copy_block_comment(source: &str, start: usize, output: &mut String) -> usize {
+fn skip_block_comment(source: &str, start: usize) -> usize {
     let bytes = source.as_bytes();
     let mut index = start;
     while index < bytes.len() {
@@ -526,14 +643,7 @@ fn copy_block_comment(source: &str, start: usize, output: &mut String) -> usize 
             break;
         }
     }
-    output.push_str(&source[start..index]);
     index
-}
-
-fn copy_next_char(source: &str, start: usize, output: &mut String) -> usize {
-    let end = next_char_end(source, start);
-    output.push_str(&source[start..end]);
-    end
 }
 
 fn next_char_end(source: &str, start: usize) -> usize {

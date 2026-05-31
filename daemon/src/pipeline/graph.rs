@@ -676,7 +676,22 @@ fn collect_binding_pattern(pattern: &BindingPattern<'_>, bindings: &mut Vec<Stri
         BindingPattern::AssignmentPattern(assignment) => {
             collect_binding_pattern(&assignment.left, bindings);
         }
-        BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_) => {}
+        BindingPattern::ObjectPattern(object) => {
+            for property in &object.properties {
+                collect_binding_pattern(&property.value, bindings);
+            }
+            if let Some(rest) = &object.rest {
+                collect_binding_pattern(&rest.argument, bindings);
+            }
+        }
+        BindingPattern::ArrayPattern(array) => {
+            for element in array.elements.iter().flatten() {
+                collect_binding_pattern(element, bindings);
+            }
+            if let Some(rest) = &array.rest {
+                collect_binding_pattern(&rest.argument, bindings);
+            }
+        }
     }
 }
 
