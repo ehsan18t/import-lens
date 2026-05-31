@@ -114,19 +114,26 @@ impl DiskCache {
         };
 
         let root_prefix = format!("{package_name}@");
+        let root_end = format!("{package_name}@\u{10FFFF}");
         let subpath_prefix = format!("{package_name}/");
+        let subpath_end = format!("{package_name}/\u{10FFFF}");
 
         if let Ok(write_txn) = db.begin_write() {
             if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
                 let mut keys_to_remove = Vec::new();
 
-                if let Ok(iter) = table.iter() {
-                    for (key, _) in iter.flatten() {
-                        let key_str = key.value();
-                        if key_str.starts_with(&root_prefix)
-                            || key_str.starts_with(&subpath_prefix)
-                        {
-                            keys_to_remove.push(key_str.to_owned());
+                if let Ok(iter) = table.range(root_prefix.as_str()..root_end.as_str()) {
+                    for result in iter {
+                        if let Ok((key, _)) = result {
+                            keys_to_remove.push(key.value().to_owned());
+                        }
+                    }
+                }
+
+                if let Ok(iter) = table.range(subpath_prefix.as_str()..subpath_end.as_str()) {
+                    for result in iter {
+                        if let Ok((key, _)) = result {
+                            keys_to_remove.push(key.value().to_owned());
                         }
                     }
                 }
