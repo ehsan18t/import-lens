@@ -49,10 +49,11 @@ fn graph_marks_only_requested_named_export_reachable() {
     ]);
 
     let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let lib_path = root.join("lib.js");
 
     fs::remove_dir_all(root).expect("temp graph workspace should be removed");
-    assert!(reachable.contains_symbol("used"));
-    assert!(!reachable.contains_symbol("unused"));
+    assert!(reachable.contains_module_symbol(&lib_path, "used"));
+    assert!(!reachable.contains_module_symbol(&lib_path, "unused"));
 }
 
 #[test]
@@ -63,10 +64,11 @@ fn graph_marks_all_entry_exports_reachable_for_full_module_imports() {
     )]);
 
     let reachable = reachable_exports(&graph, &[], true);
+    let entry_path = root.join("entry.js");
 
     fs::remove_dir_all(root).expect("temp graph workspace should be removed");
-    assert!(reachable.contains_symbol("used"));
-    assert!(reachable.contains_symbol("unused"));
+    assert!(reachable.contains_module_symbol(&entry_path, "used"));
+    assert!(reachable.contains_module_symbol(&entry_path, "unused"));
 }
 
 #[test]
@@ -76,10 +78,11 @@ fn graph_keeps_side_effect_only_imports_reachable() {
         ("setup.js", "globalThis.__importLensSetup = true;"),
     ]);
     let setup_path = root.join("setup.js");
+    let entry_path = root.join("entry.js");
 
     let reachable = reachable_exports(&graph, &["value".to_owned()], false);
 
-    assert!(reachable.contains_symbol("value"));
+    assert!(reachable.contains_module_symbol(&entry_path, "value"));
     assert!(reachable.contains_module(&setup_path));
     fs::remove_dir_all(root).expect("temp graph workspace should be removed");
 }
@@ -206,7 +209,9 @@ fn graph_keeps_builtins_and_unresolved_peers_external_with_diagnostics() {
         .expect("graph should keep externals instead of failing");
 
     fs::remove_dir_all(root).expect("temp graph workspace should be removed");
-    let entry = graph.entry_module().expect("entry module should exist");
+    let entry = graph
+        .module_by_id(graph.entry_id)
+        .expect("entry module should exist");
     assert_eq!(entry.external_imports.len(), 2);
     assert!(
         graph

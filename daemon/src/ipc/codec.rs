@@ -85,8 +85,4 @@ impl FrameDecoder {
 
         Ok(frames)
     }
-
-    pub fn reset(&mut self) {
-        self.buffer.clear();
-    }
 }

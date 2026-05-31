@@ -1,9 +1,6 @@
 use crate::pipeline::resolver::append_extension;
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{
-    BindingPattern, Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression,
-    Program, Statement,
-};
+use oxc_ast::ast::{BindingPattern, Declaration, ExportDefaultDeclarationKind, Program, Statement};
 use oxc_parser::Parser;
 use oxc_resolver::{ResolveOptions, Resolver};
 use oxc_semantic::SemanticBuilder;
@@ -58,7 +55,6 @@ pub struct ModuleRecord {
     pub reexports: Vec<ReExportRecord>,
     pub star_exports: Vec<StarExportRecord>,
     pub local_bindings: Vec<String>,
-    pub has_top_level_side_effects: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -74,8 +70,6 @@ pub struct ImportEdge {
     pub resolved_path: PathBuf,
     pub imported_names: Vec<String>,
     pub imported_bindings: Vec<ImportedBinding>,
-    pub statement_start: usize,
-    pub statement_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -83,8 +77,6 @@ pub struct ExternalImportEdge {
     pub specifier: String,
     pub imported_name: String,
     pub local_name: String,
-    pub statement_start: usize,
-    pub statement_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -159,10 +151,6 @@ impl ModuleGraph {
             dependency_paths,
             path_to_id,
         }
-    }
-
-    pub fn entry_module(&self) -> Option<&ModuleRecord> {
-        self.module_by_id(self.entry_id)
     }
 
     pub fn module_by_id(&self, id: ModuleId) -> Option<&ModuleRecord> {
@@ -386,7 +374,6 @@ impl ModuleGraphBuilder {
             reexports: parsed.reexports,
             star_exports: parsed.star_exports,
             local_bindings: parsed.local_bindings,
-            has_top_level_side_effects: parsed.has_top_level_side_effects,
         });
 
         for next_path in next_paths {
@@ -408,7 +395,6 @@ struct ParsedModule {
     reexports: Vec<ReExportRecord>,
     star_exports: Vec<StarExportRecord>,
     local_bindings: Vec<String>,
-    has_top_level_side_effects: bool,
 }
 
 struct ModuleResolverContext<'a> {
@@ -470,7 +456,6 @@ fn parse_module(
         reexports: reexport_records(path, &parsed.module_record, resolver_context)?,
         star_exports: star_export_records(path, &parsed.module_record, resolver_context)?,
         local_bindings: local_bindings(&parsed.program),
-        has_top_level_side_effects: has_top_level_side_effects(&parsed.program),
     })
 }
 
@@ -521,7 +506,6 @@ fn import_edges(
                     resolved_path,
                     imported_name,
                     local_name,
-                    entry.statement_span,
                 );
             }
             ModuleResolution::External => {
@@ -529,8 +513,6 @@ fn import_edges(
                     specifier,
                     imported_name,
                     local_name,
-                    statement_start: span_start(entry.statement_span),
-                    statement_end: span_end(entry.statement_span),
                 });
             }
         }
@@ -548,7 +530,6 @@ fn import_edges(
             continue;
         }
 
-        let statement_span = requested_modules[0].statement_span;
         match resolve_module(path, specifier.as_str(), resolver_context)? {
             ModuleResolution::Internal(resolved_path) => {
                 imports.push(ImportEdge {
@@ -556,8 +537,6 @@ fn import_edges(
                     resolved_path,
                     imported_names: Vec::new(),
                     imported_bindings: Vec::new(),
-                    statement_start: span_start(statement_span),
-                    statement_end: span_end(statement_span),
                 });
             }
             ModuleResolution::External => {
@@ -565,8 +544,6 @@ fn import_edges(
                     specifier: specifier.as_str().to_owned(),
                     imported_name: String::new(),
                     local_name: String::new(),
-                    statement_start: span_start(statement_span),
-                    statement_end: span_end(statement_span),
                 });
             }
         }
@@ -585,7 +562,6 @@ fn push_import_binding(
     resolved_path: PathBuf,
     imported_name: String,
     local_name: String,
-    statement_span: Span,
 ) {
     if let Some(edge) = imports
         .iter_mut()
@@ -615,8 +591,6 @@ fn push_import_binding(
             imported_name,
             local_name,
         }],
-        statement_start: span_start(statement_span),
-        statement_end: span_end(statement_span),
     });
 }
 
@@ -1044,157 +1018,6 @@ pub fn is_node_builtin_specifier(specifier: &str) -> bool {
 fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(path)
         .map_err(|error| format!("failed to resolve path {}: {error}", path.display()))
-}
-
-fn has_top_level_side_effects(program: &Program<'_>) -> bool {
-    program.body.iter().any(statement_has_top_level_side_effect)
-}
-
-fn statement_has_top_level_side_effect(statement: &Statement<'_>) -> bool {
-    match statement {
-        Statement::EmptyStatement(_) => false,
-        Statement::ImportDeclaration(_) | Statement::ExportAllDeclaration(_) => false,
-        Statement::ExportNamedDeclaration(declaration) => declaration
-            .declaration
-            .as_ref()
-            .is_some_and(declaration_has_side_effect),
-        Statement::ExportDefaultDeclaration(declaration) => {
-            export_default_has_side_effect(&declaration.declaration)
-        }
-        Statement::FunctionDeclaration(_) => false,
-        Statement::ClassDeclaration(class) => class_has_static_block(class),
-        Statement::VariableDeclaration(declaration) => {
-            declaration.declarations.iter().any(|declaration| {
-                declaration
-                    .init
-                    .as_ref()
-                    .is_some_and(expression_has_side_effect)
-            })
-        }
-        Statement::TSTypeAliasDeclaration(_)
-        | Statement::TSInterfaceDeclaration(_)
-        | Statement::TSEnumDeclaration(_)
-        | Statement::TSModuleDeclaration(_)
-        | Statement::TSGlobalDeclaration(_)
-        | Statement::TSImportEqualsDeclaration(_)
-        | Statement::TSExportAssignment(_)
-        | Statement::TSNamespaceExportDeclaration(_) => false,
-        Statement::ExpressionStatement(_)
-        | Statement::DebuggerStatement(_)
-        | Statement::DoWhileStatement(_)
-        | Statement::ForInStatement(_)
-        | Statement::ForOfStatement(_)
-        | Statement::ForStatement(_)
-        | Statement::IfStatement(_)
-        | Statement::LabeledStatement(_)
-        | Statement::ReturnStatement(_)
-        | Statement::SwitchStatement(_)
-        | Statement::ThrowStatement(_)
-        | Statement::TryStatement(_)
-        | Statement::WhileStatement(_)
-        | Statement::WithStatement(_)
-        | Statement::BreakStatement(_)
-        | Statement::ContinueStatement(_)
-        | Statement::BlockStatement(_) => true,
-    }
-}
-
-fn declaration_has_side_effect(declaration: &Declaration<'_>) -> bool {
-    match declaration {
-        Declaration::FunctionDeclaration(_) => false,
-        Declaration::ClassDeclaration(class) => class_has_static_block(class),
-        Declaration::VariableDeclaration(declaration) => {
-            declaration.declarations.iter().any(|declaration| {
-                declaration
-                    .init
-                    .as_ref()
-                    .is_some_and(expression_has_side_effect)
-            })
-        }
-        Declaration::TSTypeAliasDeclaration(_)
-        | Declaration::TSInterfaceDeclaration(_)
-        | Declaration::TSEnumDeclaration(_)
-        | Declaration::TSModuleDeclaration(_)
-        | Declaration::TSGlobalDeclaration(_)
-        | Declaration::TSImportEqualsDeclaration(_) => false,
-    }
-}
-
-fn export_default_has_side_effect(declaration: &ExportDefaultDeclarationKind<'_>) -> bool {
-    match declaration {
-        ExportDefaultDeclarationKind::FunctionDeclaration(_) => false,
-        ExportDefaultDeclarationKind::ClassDeclaration(class) => class_has_static_block(class),
-        ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => false,
-        ExportDefaultDeclarationKind::BooleanLiteral(_)
-        | ExportDefaultDeclarationKind::NullLiteral(_)
-        | ExportDefaultDeclarationKind::NumericLiteral(_)
-        | ExportDefaultDeclarationKind::BigIntLiteral(_)
-        | ExportDefaultDeclarationKind::RegExpLiteral(_)
-        | ExportDefaultDeclarationKind::StringLiteral(_)
-        | ExportDefaultDeclarationKind::Identifier(_)
-        | ExportDefaultDeclarationKind::MetaProperty(_)
-        | ExportDefaultDeclarationKind::ThisExpression(_)
-        | ExportDefaultDeclarationKind::Super(_)
-        | ExportDefaultDeclarationKind::FunctionExpression(_)
-        | ExportDefaultDeclarationKind::ArrowFunctionExpression(_) => false,
-        ExportDefaultDeclarationKind::ClassExpression(class) => class_has_static_block(class),
-        ExportDefaultDeclarationKind::TemplateLiteral(_)
-        | ExportDefaultDeclarationKind::ArrayExpression(_)
-        | ExportDefaultDeclarationKind::AssignmentExpression(_)
-        | ExportDefaultDeclarationKind::AwaitExpression(_)
-        | ExportDefaultDeclarationKind::BinaryExpression(_)
-        | ExportDefaultDeclarationKind::CallExpression(_)
-        | ExportDefaultDeclarationKind::ChainExpression(_)
-        | ExportDefaultDeclarationKind::ConditionalExpression(_)
-        | ExportDefaultDeclarationKind::ImportExpression(_)
-        | ExportDefaultDeclarationKind::LogicalExpression(_)
-        | ExportDefaultDeclarationKind::NewExpression(_)
-        | ExportDefaultDeclarationKind::ObjectExpression(_)
-        | ExportDefaultDeclarationKind::ParenthesizedExpression(_)
-        | ExportDefaultDeclarationKind::SequenceExpression(_)
-        | ExportDefaultDeclarationKind::TaggedTemplateExpression(_)
-        | ExportDefaultDeclarationKind::UnaryExpression(_)
-        | ExportDefaultDeclarationKind::UpdateExpression(_)
-        | ExportDefaultDeclarationKind::YieldExpression(_)
-        | ExportDefaultDeclarationKind::PrivateInExpression(_)
-        | ExportDefaultDeclarationKind::JSXElement(_)
-        | ExportDefaultDeclarationKind::JSXFragment(_)
-        | ExportDefaultDeclarationKind::TSAsExpression(_)
-        | ExportDefaultDeclarationKind::TSSatisfiesExpression(_)
-        | ExportDefaultDeclarationKind::TSTypeAssertion(_)
-        | ExportDefaultDeclarationKind::TSNonNullExpression(_)
-        | ExportDefaultDeclarationKind::TSInstantiationExpression(_)
-        | ExportDefaultDeclarationKind::ComputedMemberExpression(_)
-        | ExportDefaultDeclarationKind::StaticMemberExpression(_)
-        | ExportDefaultDeclarationKind::PrivateFieldExpression(_)
-        | ExportDefaultDeclarationKind::V8IntrinsicExpression(_) => true,
-    }
-}
-
-fn expression_has_side_effect(expression: &Expression<'_>) -> bool {
-    !matches!(
-        expression,
-        Expression::BooleanLiteral(_)
-            | Expression::NullLiteral(_)
-            | Expression::NumericLiteral(_)
-            | Expression::BigIntLiteral(_)
-            | Expression::RegExpLiteral(_)
-            | Expression::StringLiteral(_)
-            | Expression::Identifier(_)
-            | Expression::MetaProperty(_)
-            | Expression::ThisExpression(_)
-            | Expression::Super(_)
-            | Expression::FunctionExpression(_)
-            | Expression::ArrowFunctionExpression(_)
-    )
-}
-
-fn class_has_static_block(class: &Class<'_>) -> bool {
-    class
-        .body
-        .body
-        .iter()
-        .any(|element| matches!(element, ClassElement::StaticBlock(_)))
 }
 
 fn span_start(span: Span) -> usize {

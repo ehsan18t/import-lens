@@ -12,12 +12,6 @@ pub struct ReachableExports {
 }
 
 impl ReachableExports {
-    pub fn contains_symbol(&self, exported_name: &str) -> bool {
-        self.symbols
-            .iter()
-            .any(|(_, symbol)| symbol == exported_name)
-    }
-
     pub fn contains_module_symbol(&self, path: &Path, exported_name: &str) -> bool {
         self.symbols
             .contains(&(path.to_path_buf(), exported_name.to_owned()))

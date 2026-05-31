@@ -56,21 +56,21 @@ impl DiskCache {
         let read_txn = match db.begin_read() {
             Ok(txn) => txn,
             Err(error) => {
-                CacheLogger::warn(format!("failed to begin cache preload read: {error}"));
+                cache_warn(format!("failed to begin cache preload read: {error}"));
                 return Vec::new();
             }
         };
         let table = match read_txn.open_table(CACHE_TABLE) {
             Ok(table) => table,
             Err(error) => {
-                CacheLogger::warn(format!("failed to open cache table for preload: {error}"));
+                cache_warn(format!("failed to open cache table for preload: {error}"));
                 return Vec::new();
             }
         };
         let iter = match table.iter() {
             Ok(iter) => iter,
             Err(error) => {
-                CacheLogger::warn(format!(
+                cache_warn(format!(
                     "failed to iterate cache table for preload: {error}"
                 ));
                 return Vec::new();
@@ -133,21 +133,21 @@ impl DiskCache {
         let read_txn = match db.begin_read() {
             Ok(txn) => txn,
             Err(error) => {
-                CacheLogger::warn(format!("failed to begin recent cache read: {error}"));
+                cache_warn(format!("failed to begin recent cache read: {error}"));
                 return Vec::new();
             }
         };
         let recents = match read_txn.open_table(RECENTS_TABLE) {
             Ok(table) => table,
             Err(error) => {
-                CacheLogger::warn(format!("failed to open recent cache table: {error}"));
+                cache_warn(format!("failed to open recent cache table: {error}"));
                 return Vec::new();
             }
         };
         let iter = match recents.iter() {
             Ok(iter) => iter,
             Err(error) => {
-                CacheLogger::warn(format!("failed to iterate recent cache table: {error}"));
+                cache_warn(format!("failed to iterate recent cache table: {error}"));
                 return Vec::new();
             }
         };
@@ -240,7 +240,7 @@ impl DiskCache {
 
     fn open_database(storage_path: &Path) -> Option<Database> {
         if let Err(error) = fs::create_dir_all(storage_path) {
-            CacheLogger::warn(format!(
+            cache_warn(format!(
                 "failed to create cache directory {}: {error}",
                 storage_path.display()
             ));
@@ -251,7 +251,7 @@ impl DiskCache {
         let db = match Database::create(&db_path) {
             Ok(db) => db,
             Err(error) => {
-                CacheLogger::warn(format!(
+                cache_warn(format!(
                     "failed to open cache database {}: {error}",
                     db_path.display()
                 ));
@@ -262,7 +262,7 @@ impl DiskCache {
         match Self::ensure_schema(&db) {
             Ok(()) => Some(db),
             Err(error) => {
-                CacheLogger::warn(format!(
+                cache_warn(format!(
                     "cache database {} is unusable: {error}",
                     db_path.display()
                 ));
@@ -275,7 +275,7 @@ impl DiskCache {
     fn recreate_database(db_path: &Path) -> Option<Database> {
         if let Err(error) = fs::remove_file(db_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                CacheLogger::warn(format!(
+                cache_warn(format!(
                     "failed to delete cache database {}: {error}",
                     db_path.display()
                 ));
@@ -286,7 +286,7 @@ impl DiskCache {
         let db = match Database::create(db_path) {
             Ok(db) => db,
             Err(error) => {
-                CacheLogger::warn(format!(
+                cache_warn(format!(
                     "failed to recreate cache database {}: {error}",
                     db_path.display()
                 ));
@@ -295,7 +295,7 @@ impl DiskCache {
         };
 
         if let Err(error) = Self::ensure_schema(&db) {
-            CacheLogger::warn(format!(
+            cache_warn(format!(
                 "failed to initialize cache database {}: {error}",
                 db_path.display()
             ));
@@ -361,10 +361,6 @@ fn unix_millis_now() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-struct CacheLogger;
-
-impl CacheLogger {
-    fn warn(message: String) {
-        eprintln!("[import-lens-daemon] cache warning: {message}");
-    }
+fn cache_warn(message: String) {
+    eprintln!("[import-lens-daemon] cache warning: {message}");
 }
