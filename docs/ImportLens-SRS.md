@@ -151,7 +151,7 @@ The extension targets the following environments:
 
 - The user's project has a `node_modules` directory populated by a package manager (npm, yarn, or pnpm with hoisting).
 - Each importable package has a `package.json` in its `node_modules/<package>/` directory containing at least a `version` field.
-- Packages that expose ESM entry points (via the `exports` or `module` field in `package.json`) will produce accurate tree-shaken sizes. CommonJS-only packages will produce approximate sizes with a visible warning.
+- Packages that expose ESM entry points (via the `exports` or `module` field in `package.json`) will produce accurate tree-shaken sizes. CommonJS-only packages are analyzed statically where possible and produce approximate sizes with a visible warning when the daemon must fall back.
 
 ---
 
@@ -214,7 +214,7 @@ A WebAssembly daemon fallback may be added in v1.1 or later using the existing a
 3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
 4. If the hash matches, it spawns the daemon process and opens a socket connection. The socket path includes a window-unique identifier (NFR-014b).
 5. If no native binary is found, or if the binary cannot be verified or spawned, the extension enters degraded mode.
-6. The daemon loads its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and pre-warms the in-memory `papaya` cache.
+6. The daemon loads its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and preloads valid size entries into the in-memory `papaya` cache.
 7. The extension is ready to accept requests.
 
 ### 3.4 Request Lifecycle
@@ -229,13 +229,13 @@ On each daemon respawn, the extension host reads `<globalStoragePath>/importlens
 5. The extension maps region-relative import ranges back to absolute document positions for stable inlay hint, decoration, and CodeLens placement.
 6. The extension filters imports to node_modules only, skipping local paths, `node:` builtins, and `import type` declarations.
 7. For each remaining import, the extension reads the installed package version from `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory.
-8. A single batched `BatchRequest` is serialised to MessagePack and sent over the socket.
-9. The daemon receives the batch and checks its `papaya` map for each import's cache key.
+8. A single batched `BatchRequest` is serialised to MessagePack and sent over the socket. Protocol v2 clients may set `streaming: true` to receive indexed partial responses as individual imports finish.
+9. The daemon receives the batch, verifies that the connection has completed the `HelloMessage` handshake, and checks its `papaya` map for each import's cache key.
 10. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
-11. For each miss, the daemon runs the OXC pipeline: (a) construct a virtual entry module, (b) resolve the package entry point via `oxc_resolver`, (c) build the module graph by recursively parsing all reachable modules with `oxc_parser` and analysing them with `oxc_semantic`, (d) concatenate only the code reachable from the requested exports, (e) run `oxc_minifier` for dead code elimination, (f) apply `oxc_mangler` for identifier mangling, (g) emit the minified string via `oxc_codegen`, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
+11. For each miss, the daemon runs the OXC pipeline: (a) construct a virtual entry module, (b) resolve the package entry point via `oxc_resolver`, (c) build the module graph by recursively parsing reachable relative and bare transitive imports with `oxc_parser` and analysing them with `oxc_semantic`, (d) concatenate reachable code or the full parsed graph when side-effect metadata requires conservative analysis, (e) run `oxc_minifier` for dead code elimination, (f) apply `oxc_mangler` for identifier mangling, (g) emit the minified string via `oxc_codegen`, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
 12. Results are written to `papaya` (memory) and `redb` (disk).
-13. The daemon serialises the `BatchResponse` to MessagePack and sends it back.
-14. The extension host deserialises the response and updates decorations in the editor.
+13. The daemon serialises one full `BatchResponse` for protocol v1/full-batch requests, or a sequence of indexed partial `BatchResponse` frames followed by a full response for protocol v2 streaming requests.
+14. The extension host deserialises responses, discards stale `request_id` values, and updates decorations progressively without regressing newer results.
 
 ---
 
@@ -279,7 +279,7 @@ This section documents the key architectural decisions made before implementatio
 
 **JSON rejected:** JSON is verbose and slower to deserialise. On every debounce cycle the overhead compounds.
 
-**Protocol Buffers rejected:** The schema definition and code generation overhead is disproportionate for a small, well-defined two-message protocol.
+**Protocol Buffers rejected:** The schema definition and code generation overhead is disproportionate for a small, well-defined local IPC protocol.
 
 **MessagePack selected:** MessagePack payloads are typically 20-40% smaller than equivalent JSON. In the Rust `rmp-serde` path, deserialization is consistently faster than JSON. In the Node.js extension host, the performance advantage is modest for small payloads but meaningful for batch responses containing 20+ import results. `rmp-serde` on the Rust side integrates directly with `serde` at zero additional cost.
 
@@ -337,13 +337,15 @@ This section documents the key architectural decisions made before implementatio
 
 **FR-010** (Critical) - The IPC protocol must use MessagePack as the serialization format on both the TypeScript and Rust sides.
 
-**FR-011** (Critical) - Messages must be length-prefixed with a 4-byte big-endian unsigned integer representing the byte length of the MessagePack payload that follows. This allows the socket to handle concurrent in-flight requests without message boundary ambiguity.
+**FR-011** (Critical) - Messages must be length-prefixed with a 4-byte big-endian unsigned integer representing the byte length of the MessagePack payload that follows. This allows the socket to handle concurrent in-flight requests without message boundary ambiguity. Both the TypeScript and Rust decoders must reject frames larger than 32 MiB and must validate frame length arithmetic before allocating a payload buffer.
 
 **FR-012** (Critical) - The extension must send all imports from a single debounce cycle as a single `BatchRequest`, not one request per import line.
 
 **FR-013** (High) - The extension must implement request cancellation using the `request_id` field present in both `BatchRequest` and `BatchResponse`. Each debounce cycle must increment a monotonic counter and send it as `request_id`. If a response arrives whose `request_id` does not match the most recently sent request, the extension must discard it without updating decorations. This makes cancellation unambiguous regardless of response timing; timing-based heuristics must not be used.
 
 **FR-013a** (High) - When the daemon encounters a computation error for one or more imports in a batch, it must return a partial `BatchResponse` containing successful results for all other imports in the same batch. For each failed import, the `ImportResult.error` field must be set to a non-null string describing the failure reason, `ImportResult.diagnostics` must include at least one structured diagnostic entry with the failing stage and real daemon context, and all numeric size fields must be set to `0`. The extension host must render a subtle "Size unavailable" decoration for imports whose `ImportResult.error` is non-null, and must not show a user-visible error dialog. The extension host must keep raw diagnostic details out of the inline UI while making them copyable from the hover.
+
+**FR-013b** (High) - Protocol v2 clients may request streaming batch responses by setting `BatchRequest.streaming: true`. In streaming mode, the daemon must emit partial `BatchResponse` frames as import results become available and set `BatchResponse.indexes` to the zero-based import indexes represented by that frame. This index list is required because duplicate specifiers can appear multiple times in one file. A final full-batch `BatchResponse` must still be emitted for compatibility with existing request-state handling. Protocol v1 clients and v2 clients without `streaming: true` receive only a full batch response.
 
 **FR-014** (High) - On socket disconnect, the extension must discard any stale MessagePack payloads currently in the receive buffer and wait for the next document change event to trigger a fresh request cycle.
 
@@ -359,26 +361,27 @@ This section documents the key architectural decisions made before implementatio
 
 The virtual entry must never use `console.log` or any pattern that can be statically eliminated by a tree-shaker.
 
-**FR-017** (Critical) - The daemon must use `oxc_resolver` to resolve the package entry point from `node_modules`. The resolver must use the following `exports` condition set, in priority order: `["module", "import", "default"]`. This selects the ESM path when available, which is required for accurate tree-shaking. The `"require"` condition must not be in the set; its presence would cause `oxc_resolver` to prefer CJS paths on packages that publish both. If no ESM entry can be resolved, the daemon falls back to the `"main"` field and sets `is_cjs: true` in the response. The resolver must also respect the `"browser"` field for packages that use it as an ESM entry alias. The `"module"` top-level field (used by older packages before the `exports` map existed) is respected as a lower-priority fallback after `exports` map resolution.
+**FR-017** (Critical) - The daemon must use `oxc_resolver` to resolve the package entry point from `node_modules`. The resolver must use the following `exports` condition set, in priority order: `["module", "import", "default"]`. This selects the ESM path when available, which is required for accurate tree-shaking. The `"require"` condition must not be in the set; its presence would cause `oxc_resolver` to prefer CJS paths on packages that publish both. If no ESM entry can be resolved, the daemon falls back to the `"main"` field and sets `is_cjs: true` in the response. The resolver must also respect the `"browser"` field for packages that use it as an ESM entry alias. The `"module"` top-level field (used by older packages before the `exports` map existed) is respected as a lower-priority fallback after `exports` map resolution. During module graph construction, every relative and bare transitive ESM import must be resolved from the importing module's path with the same resolver semantics. Node builtins, unresolved peers, and other externals must remain outside the graph and must produce structured diagnostics rather than failing the whole import when partial analysis can continue.
 
 **FR-018** (Critical) - The daemon must perform tree-shaking using a custom module graph walker built on OXC primitives. The pipeline is:
 1. Construct a virtual ESM entry module (as defined in FR-016).
 2. Resolve the package entry point via `oxc_resolver`.
-3. Recursively parse all reachable modules using `oxc_parser`, building the module graph.
+3. Recursively parse all reachable modules using `oxc_parser`, building the module graph. Graph construction must enforce hard limits of 2,000 modules, 5 MiB per module source file, and 50 MiB total graph source bytes.
 4. Run `oxc_semantic` on each parsed module to produce scope trees, symbol tables, and binding information.
 5. Walk the module graph from the virtual entry's requested exports, marking all transitively reachable code.
 6. Concatenate only the reachable code into a single in-memory source.
 7. Before concatenating reachable code, the daemon must run `oxc_transformer` on each parsed module to strip TypeScript types and transform JSX. This produces plain JavaScript ASTs that can be processed by `oxc_minifier`. `oxc_transformer` does NOT perform tree-shaking; it only handles syntax lowering.
-8. When concatenating reachable modules into a single source, the daemon must apply scope renaming to prevent collisions between identically-named bindings in different module scopes (e.g. two modules both declaring `const x = ...`). Each module's local bindings must be prefixed with a module-unique identifier before concatenation. This is a significant engineering effort and must be accounted for in the implementation timeline. See Section 10.7 for the module graph walk algorithm.
+8. When concatenating reachable modules into a single source, the daemon must apply scope renaming to prevent collisions between identically-named bindings in different module scopes (e.g. two modules both declaring `const x = ...`). Renaming must be based on semantic binding and reference spans, not ad hoc string replacement, and must preserve object shorthand, object destructuring, array destructuring, and rest binding semantics. See Section 10.7 for the module graph walk algorithm.
+9. Circular dependency edges must be detected during graph construction and reported as `circular_dependency` diagnostics on affected import results. Cycles must not cause infinite traversal or duplicate module inclusion.
 
 **FR-019** (Critical) - The daemon must use `oxc_minifier` to perform dead code elimination and constant folding on the tree-shaken output, then apply `oxc_mangler` for identifier mangling, and finally use `oxc_codegen` (with `minify: true`) to emit the minified JavaScript string. The `oxc_codegen` step is required because the minifier operates on the AST; the codegen converts the AST back to a string for compression.
 
 **FR-020** (Critical) - After minification, the daemon must compute three compressed sizes in parallel: gzip using `flate2` at level 6, Brotli using the `brotli` crate at level 4, and zstd using the `zstd` crate at level 3.
 
 **FR-021** (Critical) - The daemon must read the `sideEffects` field from the package's `package.json` before tree-shaking. The field is handled as follows:
-- If the field is `true` or absent: the response must set `side_effects: true`. Tree-shaking proceeds conservatively (no module pruning based on side-effect analysis).
-- If the field is `false`: aggressive tree-shaking is permitted; the response sets `side_effects: false`.
-- If the field is an array of glob patterns (e.g., `["*.css", "dist/polyfill.js"]`): the daemon must treat this conservatively as `side_effects: true` for v1.0 and include a note in the response. Full glob-array evaluation is deferred to v1.1.
+- If the field is `true` or absent: the response must set `side_effects: true`, include the full parsed graph for named/default imports, and set `truly_treeshakeable: false`.
+- If the field is `false`: aggressive module pruning is permitted; the response sets `side_effects: false`.
+- If the field is an array of glob patterns (e.g., `["*.css", "dist/polyfill.js"]`): the daemon must treat this conservatively as `side_effects: true`, include the full parsed graph, set `truly_treeshakeable: false`, and add a structured diagnostic explaining that glob-array side-effect evaluation is not performed in v1.0. Full glob-array evaluation is deferred to v1.1.
 
 **FR-022** (High) - The daemon must detect when a package is not genuinely tree-shakeable by comparing the named-export size against the full-package size. If the named-export size is within 5% of the full-package size, `truly_treeshakeable` must be set to `false` in the response.
 
@@ -386,19 +389,23 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-024** (Critical) - The Rust daemon must operate exclusively via static AST analysis. It is prohibited from evaluating, executing, or interpreting any code found within third-party packages. No `eval`, subprocess execution, or dynamic code loading of any kind is permitted.
 
-**Implementation status note (Windows alpha):** The first compiling Windows implementation includes a conservative static-entry analyzer in `daemon/src/pipeline/analyze.rs` so the VS Code extension and daemon can run end-to-end while the custom OXC module graph walker is being completed. This analyzer reads local package entry files, estimates minified size by whitespace compaction, computes gzip/Brotli/zstd sizes, and marks uncertain results conservatively. Its entry resolver consults the `exports` field in `package.json` when present, supporting string shorthand, subpath maps, conditional objects (with condition priority `module` → `import` → `browser` → `default`), wildcard patterns with substitution, and array fallbacks. When `exports` is absent, the legacy fallback chain (`module` → `browser` → `main` → `index.js`) and the filesystem-probing subpath resolver (which appends candidate extensions `.js`, `.mjs`, `.cjs` instead of replacing existing dotted suffixes) are used. It does **not** satisfy FR-018 or FR-019 for a v1.0 release. Before publishing a release VSIX, the OXC graph walker, minifier, mangle, and codegen pipeline required by FR-018 and FR-019 must replace or sit in front of this fallback.
+**FR-024a** (High) - CommonJS support must be implemented through static analysis only. For CJS entry points, the daemon may scan literal relative `require()` calls and common export shapes such as `exports.foo`, `module.exports.foo`, `module.exports = { foo }`, and default-like `module.exports = function/class`. Dynamic `require()`, unsupported export shapes, and unresolved CJS dependencies must fall back to conservative entry sizing with `cjs_fallback` or `cjs_resolution` diagnostics. The daemon must never use `oxc_transformer` as a CJS-to-ESM converter because the pinned OXC transformer does not provide that conversion path.
+
+**Implementation status note (Windows alpha):** The current Windows alpha runs the OXC graph pipeline for ESM entries and uses the CommonJS static analyzer described in FR-024a for CJS entries. When static graph analysis cannot safely proceed, the daemon returns conservative static-entry estimates with structured diagnostics instead of throwing away partial successful results.
 
 ### 5.5 Caching
 
-**FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. The cache key must be the string `<package>@<version>::<named_exports_sorted_and_joined>`. Cache hits must be returned without running any computation.
+**FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. The cache key must be the string `<specifier>@<version>::<named_exports_sorted_and_joined>`, where `<specifier>` preserves subpaths such as `date-fns/format`. Cache hits must be returned without running any computation.
 
 **FR-026** (Critical) - When `importLens.enableDiskCache` is `true` (the default), the daemon must persist the in-memory cache to a `redb` database stored in the VS Code global storage directory. On startup, the daemon must load all entries from `redb` into `papaya`.
 
-**FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer (initially `1`). On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration).
+**FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer. The current schema version is `2`. On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration and protocol-result shape changes).
+
+**FR-026b** (Medium) - The daemon must track recent cache usage in persistent metadata so that startup can prewarm the most useful entries. Each successful disk insert or disk hit must update the recent-entry timestamp for the corresponding cache key. On handshake completion, the daemon must prewarm up to the 20 most recent valid entries after resolving them from the active workspace dependency tree.
 
 **FR-027** (High) - The TypeScript extension host must watch `node_modules` for package version changes using VS Code's native `vscode.workspace.createFileSystemWatcher` API with two glob patterns: `**/node_modules/*/package.json` for regular packages and `**/node_modules/@*/*/package.json` for scoped packages (e.g. `@babel/core`). Both watchers must be registered at activation and both must send `CacheInvalidate` messages to the daemon when they fire. The `notify` Rust crate must not be used for this purpose. On Linux, a Rust process watching `node_modules` directly would register one `inotify` file descriptor per directory, which on kernels before 5.11 could rapidly exhaust the system-wide `inotify` limit (`fs.inotify.max_user_watches`, which defaulted to 8,192 prior to kernel 5.11). Since kernel 5.11 (February 2021), the default is dynamically scaled based on available memory (up to 1,048,576 on 64-bit systems with >=128 GB RAM), but the old default persists on older kernels and in constrained containers. Regardless of kernel version, VS Code's file watcher already manages file descriptor budgets safely for all extensions combined, making it the correct abstraction. When the watcher fires for a given package, the extension host must send a `CacheInvalidate` message over the existing IPC socket to the daemon. On receiving this message, the daemon must evict all cache entries for that package from both `papaya` and `redb`. When an entire `node_modules` directory is deleted or more than 20 packages are invalidated in a single burst, the extension host must send a single `CacheInvalidateAll` message instead of individual per-package messages. See Section 10.1 for the `CacheInvalidateAllMessage` schema.
 
-**FR-028** (Medium) - When a user opens or saves a `package.json` file in the workspace, the daemon must pre-calculate and cache the sizes of the default export and the namespace export (`*`) for each dependency listed in that file's `dependencies` and `devDependencies` objects. These two export variants are the most common and cover the majority of real-world import patterns. Pre-warm tasks must run on a dedicated secondary Rayon thread pool configured with half the threads of the primary pool, so that the primary pool remains fully available for real user requests. Because Rayon does not expose OS-level thread priority, reduced pool size is the correct mechanism for deprioritisation. Pre-warm work must stop immediately when a real BatchRequest arrives.
+**FR-028** (Medium) - When a user opens or saves a `package.json` file in the workspace, the daemon must pre-calculate and cache the sizes of the default export and the namespace export (`*`) for each dependency listed in that file's `dependencies` and `devDependencies` objects. These two export variants are the most common and cover the majority of real-world import patterns. Pre-warm tasks must run on a dedicated secondary Rayon thread pool configured with half the threads of the primary pool, so that the primary pool remains fully available for real user requests. Because Rayon does not expose OS-level thread priority, reduced pool size is the correct mechanism for deprioritisation. Pre-warm work must stop immediately when a real `BatchRequest` arrives and must reuse already-resolved package entries rather than resolving the same package twice.
 
 ### 5.6 User Interface
 
@@ -423,6 +430,10 @@ The virtual entry must never use `console.log` or any pattern that can be static
 **FR-035** (Medium) - The extension must provide a command `ImportLens: Clear Cache` that evicts all entries from both `papaya` and `redb` and triggers a fresh computation for the active document.
 
 **FR-036** (Medium) - The extension must provide a command `ImportLens: Show Report` that opens a webview panel listing all imports in the workspace along with their sizes, sorted by brotli size descending.
+
+**FR-036a** (Medium) - Report rows and hover tooltips must surface file-level sharing information when the daemon returns it. `ImportResult.module_breakdown` contains the top 10 module contributors for an import. `ImportResult.shared_bytes` contains the number of raw module bytes shared with at least one other import in the same file. The report must expose both the top contributors and shared-byte value without changing the inline decoration format.
+
+**FR-036b** (Medium) - The extension must provide named-import member completions for existing ESM import clauses. When the cursor is inside `import { ... } from "specifier"`, the completion provider must request `EnumerateExportsRequest` from the daemon and offer cached named exports from the resolved graph. Completion requests must be best-effort and must fail silently in degraded mode.
 
 ### 5.7 Configuration
 
@@ -477,8 +488,12 @@ The system must handle all failure conditions gracefully. No error scenario may 
 | Malformed or incomplete import syntax (user is mid-typing) | Use OXC parser error recovery mode to extract as much structural information as possible. Render partial results if a package name can be identified. Suppress decorations silently if no package name can be resolved.                |
 | Daemon crash                                               | Detect the process exit, wait 1 second, and restart the daemon. Apply exponential backoff on repeated failures (1s, 2s, 4s, 8s, max 30s). After three crashes within 60 seconds, enter degraded mode and display a status bar warning. |
 | Socket disconnect without crash                            | Discard any stale MessagePack payloads currently in the receive buffer. Wait for the next document change event to trigger a fresh request cycle. Do not attempt immediate reconnection to avoid cascading retries on rapid edits.     |
+| IPC frame larger than 32 MiB                               | Reject the frame before allocation, close or reset the affected request path, and log a diagnostic. The extension must not attempt to decode the oversized payload.                                                                    |
+| Batch-like request sent before `HelloMessage`              | Do not process the request. `BatchRequest` receives per-import protocol errors; `EnumerateExportsRequest` and `FileSizeRequest` receive protocol error responses. Invalidation and prewarm messages are ignored until hello.          |
 | node_modules folder deleted while extension is running     | The file watcher must detect the deletion. The extension host must send a `CacheInvalidateAll` message (see Section 10.1). The daemon must evict all entries from both `papaya` and `redb`. The extension host must update all affected decorations to "Package not found".    |
 | redb database corrupted on startup                         | Log the corruption, delete the corrupted database file, and create a fresh empty database. Continue operation using only the in-memory cache for the current session.                                                                  |
+| Requested named export missing from a package              | Return a normal `ImportResult` when partial sizing can continue, include a `missing_export` diagnostic naming the export, and keep the raw diagnostic details in hover-copy output rather than inline UI.                              |
+| Namespace import needs conservative fallback               | Return the best available static size, include an OXC fallback diagnostic, and keep successful imports from the same batch intact.                                                                                                    |
 | Unsupported native platform or missing daemon binary       | Log the missing runtime and enter degraded mode. Display `ImportLens: Unavailable` in the status bar.                                                                                                                                  |
 | Daemon binary hash mismatch (NFR-014a)                    | Refuse to spawn the daemon. Log a security warning to the ImportLens output channel at `error` level. Enter degraded mode and display `ImportLens: Unavailable`. Do not show a user-facing error dialog. |
 | Daemon recycle loop detected (NFR-004b)                   | If more than 5 recycles occurred within any rolling 10-minute window (read from `importlens-recycles.json`), enter degraded mode, log a warning, and display `ImportLens: Unavailable`. Reset counter after a clean 30-minute session with no recycles. |
@@ -544,7 +559,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 ### 7.6 Extensibility
 
-**NFR-018** (Medium) - The `BatchRequest` and `BatchResponse` MessagePack schemas must include a `version` field (integer). The daemon must reject requests with an unrecognised version number and respond with an error batch response to enable future protocol versioning without breaking older clients.
+**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v2 is the current native protocol and adds streaming batch responses, export enumeration, file-level shared sizing, module breakdowns, and per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse` compatibility must be preserved.
 
 ---
 
@@ -675,11 +690,12 @@ The following criteria constitute the definition of done for the v1.0 release. A
 
 ```typescript
 interface BatchRequest {
-  version: number;              // Protocol version, currently 1
+  version: number;              // Protocol version, currently 2
   request_id: number;           // Monotonic counter incremented per debounce cycle.
                                 // The daemon echoes this value in BatchResponse.
                                 // The extension host discards responses whose
                                 // request_id does not match the most recently sent value.
+  workspace_root: string;       // Absolute path to the active workspace root.
   active_document_path: string; // Absolute path to the file currently being edited.
                                 // oxc_resolver starts upward traversal from this path,
                                 // not from the workspace root, to correctly resolve
@@ -687,6 +703,7 @@ interface BatchRequest {
                                 // where packages/app-a has its own node_modules with a
                                 // different version than the root-level hoisted copy).
   imports: ImportRequest[];
+  streaming?: boolean;          // Protocol v2 only; request indexed partial responses.
 }
 
 interface ImportRequest {
@@ -706,6 +723,8 @@ interface BatchResponse {
   request_id: number;           // Echoed from the corresponding BatchRequest.
                                 // Extension host uses this to discard stale responses.
   imports: ImportResult[];
+  indexes?: number[];           // Protocol v2 streaming partials: import indexes represented
+                                // by this frame. Omitted on full-batch responses.
 }
 
 interface ImportResult {
@@ -716,17 +735,25 @@ interface ImportResult {
   brotli_bytes: number;           // brotli level 4
   zstd_bytes: number;             // zstd level 3
   cache_hit: boolean;
-  side_effects: boolean;          // true if sideEffects field is absent or true
+  side_effects: boolean;          // true if sideEffects field is absent, true, or an array
   truly_treeshakeable: boolean;   // false if named export size is within 5% of full package size
+                                  // or sideEffects metadata forces conservative full-graph analysis
   is_cjs: boolean;                // true if the package has no ESM entry; size is approximate
   error: string | null;           // Non-null if computation failed for this import
   diagnostics: ImportDiagnostic[]; // Structured daemon diagnostics for copy/debug flows
+  module_breakdown?: ModuleContribution[]; // Top 10 module contributors by raw bytes
+  shared_bytes?: number;          // Raw bytes shared with another import in the same file
 }
 
 interface ImportDiagnostic {
   stage: string;                   // Failing pipeline stage, e.g. "entry_resolution"
   message: string;                 // Exact daemon failure message for this stage
   details: string[];               // Context such as active path, package, and candidates
+}
+
+interface ModuleContribution {
+  path: string;                     // Canonical module path when known
+  bytes: number;                    // Raw source bytes attributed to that module
 }
 ```
 
@@ -737,13 +764,15 @@ Sent by the extension host immediately after opening the socket connection. The 
 ```typescript
 interface HelloMessage {
   type: "hello";
-  version: number;              // Protocol version, currently 1
+  version: number;              // Protocol version, currently 2
   workspace_root: string;       // Absolute path to the workspace root
   storage_path: string;         // Absolute VS Code globalStoragePath for cache and lifecycle files
   enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
   log_level: "error" | "warn" | "info" | "debug";
 }
 ```
+
+After accepting a valid `HelloMessage`, the daemon starts best-effort recent-cache prewarm work for the active workspace. Protocol-bearing requests sent before hello receive protocol errors or are ignored as specified in Section 6.
 
 #### CacheInvalidateMessage
 
@@ -766,6 +795,72 @@ interface CacheInvalidateAllMessage {
 }
 ```
 
+#### PrewarmPackageJsonMessage
+
+Sent by the extension host when a workspace `package.json` is opened or saved.
+
+```typescript
+interface PrewarmPackageJsonMessage {
+  type: "prewarm_package_json";
+  package_json_path: string;
+  active_document_path: string;
+}
+```
+
+#### EnumerateExportsRequest / EnumerateExportsResponse
+
+Used by the named-import completion provider. This protocol v2 request asks the daemon to resolve a package and return statically-known named exports from the cached or newly-built graph.
+
+```typescript
+interface EnumerateExportsRequest {
+  type: "enumerate_exports";
+  version: number;
+  request_id: number;
+  workspace_root: string;
+  active_document_path: string;
+  specifier: string;
+  package: string;
+  package_version: string;
+}
+
+interface EnumerateExportsResponse {
+  version: number;
+  request_id: number;
+  specifier: string;
+  exports: string[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+```
+
+#### FileSizeRequest / FileSizeResponse
+
+Used when the extension needs a file-level total that deduplicates modules shared by multiple imports in the same document. The daemon unions graph-backed ESM modules by canonical path, computes combined sizes once, and returns the original imports annotated with `shared_bytes` when possible.
+
+```typescript
+interface FileSizeRequest {
+  type: "file_size";
+  version: number;
+  request_id: number;
+  workspace_root: string;
+  active_document_path: string;
+  imports: ImportRequest[];
+}
+
+interface FileSizeResponse {
+  version: number;
+  request_id: number;
+  raw_bytes: number;
+  minified_bytes: number;
+  gzip_bytes: number;
+  brotli_bytes: number;
+  zstd_bytes: number;
+  imports: ImportResult[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+```
+
 #### ShutdownMessage
 
 Sent by the extension host on extension deactivation. The daemon must flush caches and exit. See FR-038.
@@ -778,10 +873,10 @@ interface ShutdownMessage {
 
 ### 10.2 Cache Key Format
 
-The cache key for both `papaya` and `redb` is a UTF-8 string:
+The cache key for both `papaya` and `redb` size entries is a UTF-8 string:
 
 ```
-<package>@<version>::<export1>,<export2>,...<exportN>
+<specifier>@<version>::<export1>,<export2>,...<exportN>
 ```
 
 Exports are sorted lexicographically before joining to ensure import order does not create duplicate entries. For namespace and default imports, the key uses the sentinel values `*` and `default` respectively.
@@ -853,7 +948,7 @@ Extension activates
     |
     ├─ Locate native binary in extension/bin/<platform>/import-lens-daemon
     │       |
-    │       ├─ Found → spawn process, open socket, send HELLO handshake
+    │       ├─ Found → spawn process, open socket, send HelloMessage handshake
     │       │
     │       └─ Not found → enter degraded mode, show status bar warning
     |
@@ -864,22 +959,23 @@ Extension activates
         ├─ Open redb database at <globalStoragePath>/importlens.redb
         │   └─ If corrupted: delete, create fresh, log warning
         ├─ Load all entries from redb into papaya (in-memory cache)
-        └─ Begin listening on socket / named pipe
+        ├─ Begin listening on socket / named pipe
+        └─ After hello, prewarm up to 20 recent valid cache entries
 ```
 
 ### 10.6 Tree-Shakeability Detection
 
-After computing the size of the requested named exports, the daemon performs a second OXC pass to compute the full-package size. If:
+After computing the size of the requested named exports, the daemon computes the full-package variant. If:
 
 ```
 named_export_size / full_package_size >= 0.95
 ```
 
-then `truly_treeshakeable` is set to `false`. This catches packages that declare `"sideEffects": false` in `package.json` but whose internal module graph does not actually support granular export isolation.
+then `truly_treeshakeable` is set to `false`. This catches packages that declare `"sideEffects": false` in `package.json` but whose internal module graph does not actually support granular export isolation. The flag is also `false` when `sideEffects` is absent, `true`, or an array because the daemon must include the full parsed graph conservatively.
 
 ### 10.7 Module Graph Walk Algorithm
 
-This section specifies the algorithm that `graph.rs` and `treeshake.rs` must implement. It exists to resolve ambiguities that FR-018 leaves open at the implementation level.
+This section specifies the algorithm that `graph.rs` and `reachability.rs` must implement. It exists to resolve ambiguities that FR-018 leaves open at the implementation level.
 
 **Data structures**
 
@@ -887,6 +983,8 @@ This section specifies the algorithm that `graph.rs` and `treeshake.rs` must imp
 ModuleGraph {
   modules: HashMap<AbsolutePath, Module>,
   entry: AbsolutePath,
+  dependency_paths: Vec<AbsolutePath>,
+  diagnostics: Vec<GraphDiagnostic>,
 }
 
 Module {
@@ -894,6 +992,7 @@ Module {
   ast: OxcAst,              // produced by oxc_parser
   semantic: OxcSemantic,    // produced by oxc_semantic
   imports: Vec<ModuleEdge>, // resolved import statements
+  external_imports: Vec<ExternalImportEdge>,
   exports: Vec<ExportDef>,  // named, default, re-export
   transformed_src: String,  // output of oxc_transformer (TS stripped, JSX lowered)
 }
@@ -902,6 +1001,12 @@ ModuleEdge {
   specifier: String,        // raw specifier as written in source
   resolved: AbsolutePath,   // result of oxc_resolver
   kind: ImportKind,         // Static | Dynamic
+}
+
+ExternalImportEdge {
+  specifier: String,        // raw specifier for builtin, peer, or unresolved external
+  imported_name: String,
+  local_name: String,
 }
 ```
 
@@ -912,13 +1017,20 @@ fn build_graph(entry_path, resolver) -> ModuleGraph:
   graph = ModuleGraph::new()
   queue = [entry_path]
   visited = HashSet::new()
+  active_stack = HashSet::new()
+  total_source_bytes = 0
 
   while queue is not empty:
     path = queue.pop()
     if path in visited: continue      // handles circular dependencies
+    if graph.module_count == 2000: fail("module count limit exceeded")
     visited.insert(path)
+    active_stack.insert(path)
 
     source = fs::read(path)
+    if source.byte_length > 5 MiB: fail("module source size limit exceeded")
+    total_source_bytes += source.byte_length
+    if total_source_bytes > 50 MiB: fail("graph source size limit exceeded")
     ast = oxc_parser::parse(source)
     semantic = oxc_semantic::build(ast)
     imports = collect_static_imports(ast)
@@ -928,19 +1040,24 @@ fn build_graph(entry_path, resolver) -> ModuleGraph:
       match resolver.resolve(import.specifier, from = path):
         Ok(resolved_path) =>
           resolved_edges.push(ModuleEdge { specifier, resolved: resolved_path })
-          if resolved_path not in visited:
+          if resolved_path in active_stack:
+            graph.diagnostics.push(circular_dependency(path, resolved_path))
+          else if resolved_path not in visited:
             queue.push(resolved_path)
         Err(e) =>
-          // log at debug level; treat as external (no graph edge)
+          // Treat Node builtins, unresolved peers, and unsupported externals as external
+          // and keep a structured diagnostic instead of failing the whole import.
+          graph.diagnostics.push(external_resolution(import.specifier, path, e))
 
     graph.insert(path, Module { path, ast, semantic, imports: resolved_edges, ... })
+    active_stack.remove(path)
 
   return graph
 ```
 
-The visited-set check on every dequeue prevents infinite loops on circular dependencies. A module that is visited twice (A imports B imports A) will have its edges walked once; the second encounter is a no-op.
+The visited-set check on every dequeue prevents infinite loops on circular dependencies. A module that is visited twice (A imports B imports A) will have its edges walked once; the back-edge is recorded as a `circular_dependency` diagnostic and the second encounter is a no-op. Shared diamond dependencies must not be reported as cycles.
 
-**Reachability walk (treeshake.rs)**
+**Reachability walk (reachability.rs)**
 
 ```
 fn mark_reachable(graph, entry_exports) -> HashSet<(AbsolutePath, SymbolId)>:
@@ -968,11 +1085,15 @@ fn mark_reachable(graph, entry_exports) -> HashSet<(AbsolutePath, SymbolId)>:
 
 **Scope renaming before concatenation**
 
-Before concatenating module sources, each module's local bindings must be renamed to a module-unique prefix to prevent collisions. The prefix is derived from the module's index in topological order: `__m{N}_{originalName}`. Renaming is applied to the `transformed_src` string using `oxc_semantic`'s symbol table to locate all binding sites. Only module-scope bindings require renaming; function-scope and block-scope bindings are already isolated by their enclosing scope.
+Before concatenating module sources, each module's local bindings must be renamed to a module-unique prefix to prevent collisions. The prefix is derived from the module's index in topological order: `__m{N}_{originalName}`. Renaming is applied to source slices using `oxc_semantic` binding and reference spans. The renamer must preserve UTF-8 boundaries, object shorthand, object destructuring, array destructuring, and rest binding semantics.
 
 **Side-effect handling**
 
 If `sideEffects: false` is set in the package's `package.json`, modules that contribute no reachable symbols are excluded from concatenation entirely. If `sideEffects` is absent, `true`, or an array, all parsed modules are included in concatenation regardless of reachability, and only the minification step removes dead code. This is conservative but correct.
+
+**Graph cache**
+
+The daemon may keep parsed module graphs in a side in-memory cache keyed by canonical entry path. This cache is an optimization only: size results remain keyed by `<specifier>@<version>::<exports>` and persisted in `redb`; graph cache misses must not change user-visible results.
 
 ---
 
@@ -980,32 +1101,19 @@ If `sideEffects: false` is set in the package's `package.json`, modules that con
 
 ### 11.1 Persistent Cache Schema (redb)
 
-The `redb` database contains one table:
+The `redb` database schema version is `2` and contains these tables:
 
-| Table name   | Key type                                      | Value type                                   |
-| ------------ | --------------------------------------------- | -------------------------------------------- |
-| `size_cache` | `&str` (cache key as defined in Section 10.2) | `&[u8]` (MessagePack-encoded `CachedResult`) |
+| Table name      | Key type                                      | Value type                                      |
+| --------------- | --------------------------------------------- | ----------------------------------------------- |
+| `metadata`      | `&str`                                        | `u64` (`schema_version`)                        |
+| `size_cache`    | `&str` (cache key as defined in Section 10.2) | `&[u8]` (MessagePack-encoded `ImportResult`)    |
+| `cache_recents` | `&str` (cache key as defined in Section 10.2) | `u64` (last-used Unix timestamp in milliseconds) |
 
-`CachedResult` Rust struct:
-
-```rust
-#[derive(Serialize, Deserialize)]
-struct CachedResult {
-    raw_bytes: u64,
-    minified_bytes: u64,
-    gzip_bytes: u64,
-    brotli_bytes: u64,
-    zstd_bytes: u64,
-    side_effects: bool,
-    truly_treeshakeable: bool,
-    is_cjs: bool,
-    computed_at: u64,        // Unix timestamp in seconds
-}
-```
+`size_cache` values persist the same `ImportResult` shape returned over IPC, including optional `module_breakdown` fields when available. The daemon normalizes `cache_hit` to `false` before writing and sets it to `true` when serving a disk hit. `cache_recents` is updated on insert and disk hit, and is used to select up to 20 recent entries for best-effort startup prewarm after hello.
 
 ### 11.2 Configuration Storage
 
-User configuration is stored by VS Code in the user's `settings.json` and accessed via `workspace.getConfiguration('importLens')`. The daemon does not read VS Code settings directly; the extension host passes relevant configuration values and the VS Code `globalStoragePath` in the `HELLO` handshake message at startup.
+User configuration is stored by VS Code in the user's `settings.json` and accessed via `workspace.getConfiguration('importLens')`. The daemon does not read VS Code settings directly; the extension host passes relevant configuration values and the VS Code `globalStoragePath` in the `HelloMessage` handshake at startup.
 
 ---
 
@@ -1085,7 +1193,7 @@ strip = true
 
 - Users have npm, yarn, or pnpm with hoisting installed and have run a package install command. The extension does not install packages itself.
 - The VS Code global storage path is writable. If it is not, the persistent cache is skipped gracefully and all results are held in memory for the duration of the session.
-- Packages shipping only CommonJS will produce less accurate tree-shaken sizes. The extension will display a `CJS` indicator next to the size for these packages.
+- Packages shipping only CommonJS are analyzed statically where possible. Literal relative `require()` graphs and common export forms produce better approximations, but dynamic or unsupported CJS still falls back conservatively. The extension will display a `CJS` indicator next to the size for these packages.
 - The extension assumes `node_modules` is fully installed. It will not trigger or assist with package installation.
 - The user's environment is VS Code Desktop for full functionality. VS Code for the Web provides degraded mode only.
 
@@ -1118,17 +1226,24 @@ import-lens/
 │   │   │   └── types.ts               # import detection data models
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
-│   │   │   ├── protocol.ts            # BatchRequest / BatchResponse / Hello / CacheInvalidate / Shutdown types
+│   │   │   ├── protocol.ts            # Protocol v2 IPC types
 │   │   │   └── codec.ts               # MessagePack encode/decode
 │   │   ├── daemon/
 │   │   │   ├── manager.ts             # daemon lifecycle and analysis transport coordination
 │   │   │   ├── platform.ts            # platform target mapping
 │   │   │   └── knownHashes.generated.ts # generated daemon binary hashes
+│   │   ├── prewarm/
+│   │   │   ├── packageJson.ts         # package.json open/save prewarm registration
+│   │   │   └── packageJsonHelpers.ts  # dependency extraction helpers
+│   │   ├── report/
+│   │   │   ├── reportModel.ts         # Workspace report rows, module breakdown, shared bytes
+│   │   │   └── workspaceScanner.ts    # Workspace import scanner for report command
 │   │   ├── watcher.ts                 # vscode.workspace.createFileSystemWatcher; sends CacheInvalidate IPC messages
 │   │   ├── ui/
 │   │   │   ├── decorations.ts         # End-of-line text decorations
 │   │   │   ├── inlayHints.ts          # InlayHintsProvider for inlayHint display mode
 │   │   │   ├── codelens.ts            # Code lens provider
+│   │   │   ├── completions.ts         # Named import member completion provider
 │   │   │   ├── statusbar.ts           # Status bar item
 │   │   │   ├── tooltip.ts             # Shared MarkdownString hover content
 │   │   │   ├── diagnostics.ts         # Clipboard formatting for ImportResult diagnostics
@@ -1142,23 +1257,27 @@ import-lens/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs                    # Entry point, socket server, Tokio runtime
+│       ├── service.rs                 # Request handlers and protocol-level response helpers
 │       ├── ipc/
 │       │   ├── mod.rs
+│       │   ├── codec.rs               # MessagePack length-prefix codec
 │       │   ├── server.rs              # Unix socket / named pipe listener
-│       │   └── protocol.rs            # All IPC message serde types (Hello/Batch/CacheInvalidate/Shutdown)
+│       │   └── protocol.rs            # Protocol v2 serde types
 │       ├── pipeline/
 │       │   ├── mod.rs
-│       │   ├── resolve.rs             # oxc_resolver usage
+│       │   ├── resolver.rs            # oxc_resolver usage
 │       │   ├── graph.rs               # Module graph walker (oxc_parser + oxc_resolver + oxc_semantic)
-│       │   ├── treeshake.rs           # Reachability analysis and dead code marking
-│       │   ├── transform.rs           # oxc_transformer (TypeScript / JSX stripping)
-│       │   ├── minify.rs              # oxc_minifier + oxc_mangler usage
-│       │   ├── codegen.rs             # oxc_codegen AST-to-string emission
+│       │   ├── reachability.rs        # Reachability analysis and dead code marking
+│       │   ├── bundle.rs              # UTF-8-safe module concatenation and renaming
+│       │   ├── cjs.rs                 # Static CommonJS graph analysis
+│       │   ├── file_size.rs           # File-level shared import cost computation
+│       │   ├── minify.rs              # oxc_minifier + oxc_mangler + oxc_codegen usage
 │       │   └── compress.rs            # flate2 + brotli + zstd (nested rayon::join)
 │       ├── cache/
 │       │   ├── mod.rs
+│       │   ├── key.rs                 # Cache key formatting
 │       │   ├── memory.rs              # papaya HashMap (pinning API)
-│       │   └── persistent.rs          # redb read/write
+│       │   └── disk.rs                # redb read/write
 │       ├── lifecycle.rs                # Graceful shutdown, self-recycle (NFR-004a), recycle counter write (NFR-004b)
 │       └── prefetch.rs                # Background pre-warm logic
 │
@@ -1196,7 +1315,7 @@ import-lens/
 | D-001 | Separate daemon process over napi-rs native addon                                         | A panic in a native addon crashes the VS Code extension host. A separate process isolates failures completely.                                                                                                                                                                                        | napi-rs native addon (rejected: crash risk to editor)                                                                                                               |
 | D-002 | OXC for the full pipeline (parse, resolve, semantic, tree-shake, minify, mangle, codegen) | Single AST representation shared across all stages eliminates re-parsing overhead. All OXC crates are embeddable in Rust. OXC is used internally by Rolldown and Vite 8. Note: OXC does not provide a standalone tree-shaker; a custom module graph walker is required.                               | Rolldown Rust API (rejected: no stable embedding API); ESBuild (rejected: written in Go, requires separate WASM layer from Rust)                                    |
 | D-003 | oxc_minifier over swc_core                                                                | SWC platform binaries are approximately 25 to 27 MB per target, violating the 20 MB VSIX limit. For size estimation, 1-2% accuracy variance is acceptable.                                                                                                                                            | swc_core (rejected: distribution size); Terser (rejected: requires Node.js subprocess)                                                                              |
-| D-004 | MessagePack over JSON for IPC                                                             | Payloads typically 20-40% smaller than JSON. In the Rust rmp-serde path, deserialization is consistently faster. Meaningful for batch responses of 20+ imports.                                                                                                                                       | JSON (rejected: performance); Protocol Buffers (rejected: schema overhead disproportionate for a two-message protocol)                                              |
+| D-004 | MessagePack over JSON for IPC                                                             | Payloads typically 20-40% smaller than JSON. In the Rust rmp-serde path, deserialization is consistently faster. Meaningful for batch responses of 20+ imports.                                                                                                                                       | JSON (rejected: performance); Protocol Buffers (rejected: schema overhead disproportionate for this local IPC protocol)                                              |
 | D-005 | `oxc-parser` (NAPI) over TypeScript Compiler API                                          | Returns ESM import info directly via `result.module.staticImports` without AST traversal. No `typescript` package dependency. Handles malformed code via error recovery. Uses native NAPI bindings for high performance. The deprecated `@oxc-parser/wasm` package is not used.                       | TypeScript Compiler API (rejected: heavy, not WASM-compatible); `@oxc-parser/wasm` (rejected: deprecated); Regex (rejected: fails on multi-line and complex syntax) |
 | D-006 | papaya over DashMap for in-memory cache                                                   | papaya is lock-free and deadlock-safe. DashMap uses sharded RwLock which can deadlock when holding references. The import size workload is read-heavy after initial warmup.                                                                                                                           | DashMap (rejected: locking semantics risk for read-heavy pattern)                                                                                                   |
 | D-007 | redb over sled for persistent cache                                                       | redb hit 1.0 stable with a committed stable file format. sled has never shipped 1.0 and its on-disk format remains unstable.                                                                                                                                                                          | sled (rejected: not stable); rusqlite/SQLite (viable but adds a C FFI dependency)                                                                                   |
@@ -1218,8 +1337,8 @@ This table tracks components that are currently used with known limitations, or 
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
 | `oxc_minifier`                      | Alpha (v0.133.0). Produces 1-2% variance from SWC.                                                                   | Stable 1.0 release.                                                                                                                                | Adopt stable release; re-run integration suite to confirm no regressions. A stable minifier removes the need for C-001 fallback strategy.                                                                                         | Every OXC release     |
 | `oxc_mangler`                       | Separate crate (v0.133.x), recently split from `oxc_minifier`.                                                       | API stabilization, potential re-merge into `oxc_minifier`.                                                                                         | Minor import path changes if crates are merged.                                                                                                                                                                                   | Every OXC release     |
-| `oxc_resolver`                      | v11.20.0. Separate repository (`oxc-project/oxc-resolver`), versioned independently from the OXC monorepo. Currently on major version 11. | Major version bump (e.g. 12.x); breaking changes to `ResolverOptions` or the `resolve()` API. | May require `Cargo.toml` update and code changes in `resolve.rs`. Upgrade separately from the OXC monorepo batch and run integration suite before merging. | Each release          |
-| Rolldown Rust API (`rolldown_core`) | No stable public API. ImportLens uses a custom module graph walker instead.                                          | Stable embeddable Rust crate on crates.io with tree-shaking API.                                                                                   | Would replace the entire custom module graph walker (`graph.rs` + `treeshake.rs`), significantly reducing code and improving accuracy. This is the single highest-impact migration.                                               | Quarterly             |
+| `oxc_resolver`                      | v11.20.0. Separate repository (`oxc-project/oxc-resolver`), versioned independently from the OXC monorepo. Currently on major version 11. | Major version bump (e.g. 12.x); breaking changes to `ResolverOptions` or the `resolve()` API. | May require `Cargo.toml` update and code changes in `resolver.rs`. Upgrade separately from the OXC monorepo batch and run integration suite before merging. | Each release          |
+| Rolldown Rust API (`rolldown_core`) | No stable public API. ImportLens uses a custom module graph walker instead.                                          | Stable embeddable Rust crate on crates.io with tree-shaking API.                                                                                   | Would replace the custom module graph and reachability code (`graph.rs` + `reachability.rs`), significantly reducing code and improving accuracy. This is the single highest-impact migration.                                               | Quarterly             |
 | `wasm32-wasip1-threads`             | Experimental Rust/LLVM target. Deferred v1.1 candidate; not a v1.0 runtime path.                                     | WASI Preview 2 / Component Model threading (`wasm32-wasip2`). The `wasi-threads` proposal is legacy; `shared-everything-threads` is the successor. | May require retargeting before a future WASM fallback ships.                                                                                                                                                                       | Semi-annually         |
 | `@vscode/wasm-wasi-core`            | Supports WASI Preview 1 with experimental thread support. Deferred v1.1 candidate dependency.                       | WASI Preview 2 support, Component Model integration, improved `SharedArrayBuffer` ergonomics.                                                      | Better thread reliability and broader environment support, subject to VS Code Desktop and Web limitations.                                                                                                                        | Semi-annually         |
 | `oxc-parser` (npm, NAPI)            | v0.133.0. Active, replaces deprecated `@oxc-parser/wasm`. No WASM/browser support.                                   | Potential official WASM sub-export (e.g. `oxc-parser/wasm`) or Component Model-based distribution.                                                 | Would restore parsing capability in VS Code for the Web, upgrading it from degraded mode in a future release.                                                                                                                     | Quarterly             |
