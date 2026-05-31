@@ -11,12 +11,10 @@ const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadat
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CURRENT_SCHEMA_VERSION: u64 = 1;
 
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DiskCache {
     db: Option<Database>,
 }
-
 
 impl DiskCache {
     pub fn new(storage_path: Option<PathBuf>, enabled: bool) -> Self {

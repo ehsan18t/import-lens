@@ -2,7 +2,11 @@ use import_lens_daemon::{
     ipc::protocol::{BatchRequest, ImportKind, ImportRequest, PROTOCOL_VERSION},
     service::ImportLensService,
 };
-use std::{env, path::{Path, PathBuf}, time::Instant};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 fn fixture_workspace(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
