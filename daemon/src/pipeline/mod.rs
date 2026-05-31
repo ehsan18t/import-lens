@@ -1,5 +1,6 @@
 pub mod analyze;
 pub mod bundle;
+pub mod cjs;
 pub mod compress;
 pub mod file_size;
 pub mod graph;

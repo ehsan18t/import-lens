@@ -966,7 +966,7 @@ fn push_resolution_diagnostic(
     });
 }
 
-fn is_node_builtin_specifier(specifier: &str) -> bool {
+pub fn is_node_builtin_specifier(specifier: &str) -> bool {
     let bare = specifier.strip_prefix("node:").unwrap_or(specifier);
     matches!(
         bare,

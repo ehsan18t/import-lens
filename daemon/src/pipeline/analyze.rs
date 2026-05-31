@@ -4,6 +4,7 @@ use crate::{
     },
     pipeline::{
         bundle::{bundle_reachable_modules, included_module_ids},
+        cjs::{CjsGraphAnalysis, analyze_cjs_graph},
         compress::compress_all,
         graph::{ModuleGraph, ModuleId, build_module_graph_cached},
         minify::minify_source,
@@ -107,6 +108,13 @@ fn analyze_import_inner_resolved(
     }
 
     let mut fallback_diagnostics = Vec::new();
+    if is_cjs {
+        match analyze_with_cjs_graph(request, &entry_path) {
+            Ok(result) => return Ok(result),
+            Err(diagnostics) => fallback_diagnostics.extend(diagnostics),
+        }
+    }
+
     if !is_cjs
         && matches!(
             request.import_kind,
@@ -125,6 +133,73 @@ fn analyze_import_inner_resolved(
     let mut result = analyze_static_entry(context, request, entry_path, side_effects_mode, is_cjs)?;
     result.diagnostics.extend(fallback_diagnostics);
     Ok(result)
+}
+
+fn analyze_with_cjs_graph(
+    request: &ImportRequest,
+    entry_path: &Path,
+) -> Result<ImportResult, Vec<ImportDiagnostic>> {
+    let graph = analyze_cjs_graph(entry_path).map_err(|error| {
+        vec![ImportDiagnostic {
+            stage: "cjs_fallback".to_owned(),
+            message: format!("CommonJS static analysis failed; using static entry sizing: {error}"),
+            details: vec![format!("entry_path: {}", entry_path.display())],
+        }]
+    })?;
+
+    if graph.unsupported {
+        let mut diagnostics = graph.diagnostics;
+        diagnostics.push(cjs_fallback_diagnostic(
+            "unsupported dynamic CommonJS require; using static entry sizing".to_owned(),
+            entry_path,
+        ));
+        return Err(diagnostics);
+    }
+    if graph.exports.is_empty() {
+        let mut diagnostics = graph.diagnostics;
+        diagnostics.push(cjs_fallback_diagnostic(
+            "unsupported CommonJS export shape; using static entry sizing".to_owned(),
+            entry_path,
+        ));
+        return Err(diagnostics);
+    }
+
+    Ok(cjs_graph_result(request, graph))
+}
+
+fn cjs_graph_result(request: &ImportRequest, graph: CjsGraphAnalysis) -> ImportResult {
+    let minified = minify_source(&graph.source, true)
+        .unwrap_or_else(|_| estimate_minified_source(&graph.source));
+    let compressed = compress_all(&minified);
+    let mut diagnostics = graph.diagnostics;
+    diagnostics.extend(missing_cjs_export_diagnostics(request, &graph.exports));
+
+    match compressed {
+        Ok(compressed) => ImportResult {
+            specifier: request.specifier.clone(),
+            raw_bytes: graph.source.len() as u64,
+            minified_bytes: minified.len() as u64,
+            gzip_bytes: compressed.gzip_bytes,
+            brotli_bytes: compressed.brotli_bytes,
+            zstd_bytes: compressed.zstd_bytes,
+            cache_hit: false,
+            side_effects: true,
+            truly_treeshakeable: false,
+            is_cjs: true,
+            error: None,
+            diagnostics,
+            module_breakdown: Some(graph.module_breakdown),
+            shared_bytes: None,
+        },
+        Err(error) => error_result(
+            request,
+            AnalysisError {
+                stage: "compression",
+                message: format!("failed to compress CommonJS graph: {error}"),
+                details: Vec::new(),
+            },
+        ),
+    }
 }
 
 fn analyze_with_oxc_pipeline(
@@ -362,6 +437,14 @@ fn oxc_fallback_diagnostic(error: AnalysisError) -> ImportDiagnostic {
     }
 }
 
+fn cjs_fallback_diagnostic(message: String, entry_path: &Path) -> ImportDiagnostic {
+    ImportDiagnostic {
+        stage: "cjs_fallback".to_owned(),
+        message,
+        details: vec![format!("entry_path: {}", entry_path.display())],
+    }
+}
+
 fn missing_export_diagnostics(
     request: &ImportRequest,
     graph: &ModuleGraph,
@@ -386,6 +469,35 @@ fn missing_export_diagnostics(
     vec![ImportDiagnostic {
         stage: "exports".to_owned(),
         message: format!("named export(s) not found: {}", missing.join(", ")),
+        details: vec![
+            format!("specifier: {}", request.specifier),
+            format!("missing_exports: {}", missing.join(", ")),
+        ],
+    }]
+}
+
+fn missing_cjs_export_diagnostics(
+    request: &ImportRequest,
+    exports: &[String],
+) -> Vec<ImportDiagnostic> {
+    if !matches!(request.import_kind, ImportKind::Named) {
+        return Vec::new();
+    }
+
+    let missing = request
+        .named
+        .iter()
+        .filter(|name| !exports.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return Vec::new();
+    }
+
+    vec![ImportDiagnostic {
+        stage: "exports".to_owned(),
+        message: format!("named CommonJS export(s) not found: {}", missing.join(", ")),
         details: vec![
             format!("specifier: {}", request.specifier),
             format!("missing_exports: {}", missing.join(", ")),

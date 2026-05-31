@@ -554,6 +554,150 @@ fn analyze_import_resolves_package_from_active_document_tree() {
 }
 
 #[test]
+fn analyze_commonjs_literal_require_graph_includes_required_modules() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "cjs-graph-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+    write_package_file(
+        &workspace,
+        "cjs-graph-lib",
+        "index.cjs",
+        "const helper = require('./helper.cjs');\nexports.used = helper.used;",
+    );
+    write_package_file(
+        &workspace,
+        "cjs-graph-lib",
+        "helper.cjs",
+        "exports.used = 'required helper payload';",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "cjs-graph-lib".to_owned(),
+        package_name: "cjs-graph-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["used".to_owned()],
+        import_kind: ImportKind::Named,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.is_cjs);
+    assert!(result.raw_bytes > 0);
+    assert!(
+        result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("helper.cjs"))
+        }),
+        "{result:?}",
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "cjs_fallback"),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_commonjs_dynamic_require_uses_static_fallback_diagnostic() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "dynamic-cjs-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+    write_package_file(
+        &workspace,
+        "dynamic-cjs-lib",
+        "index.cjs",
+        "const name = './helper.cjs';\nconst helper = require(name);\nexports.used = helper.used;",
+    );
+    write_package_file(
+        &workspace,
+        "dynamic-cjs-lib",
+        "helper.cjs",
+        "exports.used = 'dynamic helper payload';",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "dynamic-cjs-lib".to_owned(),
+        package_name: "dynamic-cjs-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["used".to_owned()],
+        import_kind: ImportKind::Named,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.is_cjs);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "cjs_fallback"),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_commonjs_module_exports_object_reports_named_exports() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "object-cjs-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+    write_package_file(
+        &workspace,
+        "object-cjs-lib",
+        "index.cjs",
+        "const value = 1;\nmodule.exports = { value, alias: value };",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "object-cjs-lib".to_owned(),
+        package_name: "object-cjs-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["alias".to_owned()],
+        import_kind: ImportKind::Named,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.is_cjs);
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "exports"),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_import_rejects_unsafe_package_names() {
     let workspace = temp_workspace();
     fs::create_dir_all(workspace.join("outside")).expect("outside fixture should be created");
