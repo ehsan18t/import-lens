@@ -42,6 +42,10 @@ pub fn reachable_exports(
         reachable: ReachableExports::default(),
         visiting_symbols: HashSet::new(),
         visiting_modules: HashSet::new(),
+        processed_symbols: HashSet::new(),
+        processed_full_modules: HashSet::new(),
+        processed_side_effect_modules: HashSet::new(),
+        processed_side_effect_imports: HashSet::new(),
     };
 
     if include_full_entry || requested_exports.iter().any(|name| name == "*") {
@@ -62,11 +66,18 @@ struct ReachabilityMarker<'a> {
     reachable: ReachableExports,
     visiting_symbols: HashSet<(ModuleId, String)>,
     visiting_modules: HashSet<ModuleId>,
+    processed_symbols: HashSet<(ModuleId, String)>,
+    processed_full_modules: HashSet<ModuleId>,
+    processed_side_effect_modules: HashSet<ModuleId>,
+    processed_side_effect_imports: HashSet<ModuleId>,
 }
 
 impl ReachabilityMarker<'_> {
     fn mark_export(&mut self, module_id: ModuleId, exported_name: &str) {
         let key = (module_id, exported_name.to_owned());
+        if self.processed_symbols.contains(&key) {
+            return;
+        }
         if !self.visiting_symbols.insert(key.clone()) {
             return;
         }
@@ -125,9 +136,13 @@ impl ReachabilityMarker<'_> {
 
         self.include_side_effect_imports(module_id);
         self.visiting_symbols.remove(&key);
+        self.processed_symbols.insert(key);
     }
 
     fn mark_module_full(&mut self, module_id: ModuleId) {
+        if self.processed_full_modules.contains(&module_id) {
+            return;
+        }
         if !self.visiting_modules.insert(module_id) {
             return;
         }
@@ -165,9 +180,14 @@ impl ReachabilityMarker<'_> {
 
         self.include_side_effect_imports(module_id);
         self.visiting_modules.remove(&module_id);
+        self.processed_full_modules.insert(module_id);
     }
 
     fn include_side_effect_imports(&mut self, module_id: ModuleId) {
+        if !self.processed_side_effect_imports.insert(module_id) {
+            return;
+        }
+
         let Some(module) = self.graph.module_by_id(module_id) else {
             return;
         };
@@ -184,6 +204,9 @@ impl ReachabilityMarker<'_> {
     }
 
     fn mark_side_effect_module(&mut self, module_id: ModuleId) {
+        if self.processed_side_effect_modules.contains(&module_id) {
+            return;
+        }
         if !self.visiting_modules.insert(module_id) {
             return;
         }
@@ -191,6 +214,7 @@ impl ReachabilityMarker<'_> {
         self.mark_module_reachable(module_id);
         self.include_side_effect_imports(module_id);
         self.visiting_modules.remove(&module_id);
+        self.processed_side_effect_modules.insert(module_id);
     }
 
     fn mark_module_reachable(&mut self, module_id: ModuleId) {
