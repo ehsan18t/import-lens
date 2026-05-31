@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && corepack enable \
-    && corepack prepare pnpm@10.33.3 --activate
+    && corepack prepare pnpm@11.5.0 --activate
 
 # Install zig (required by cargo-zigbuild)
 RUN curl -L "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz" -o zig.tar.xz \
