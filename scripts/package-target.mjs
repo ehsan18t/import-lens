@@ -17,11 +17,10 @@ const fail = (message) => {
 };
 
 const run = (command, commandArgs) => {
-  const result = spawnSync(command, commandArgs, {
-    cwd: repoRoot,
-    shell: process.platform === "win32" && command === "pnpm",
-    stdio: "inherit",
-  });
+  const needsShell = process.platform === "win32" && command === "pnpm";
+  const result = needsShell
+    ? spawnSync(`${command} ${commandArgs.join(" ")}`, { cwd: repoRoot, shell: true, stdio: "inherit" })
+    : spawnSync(command, commandArgs, { cwd: repoRoot, stdio: "inherit" });
 
   if (result.error) {
     fail(result.error.message);

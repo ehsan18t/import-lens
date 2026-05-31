@@ -36,12 +36,10 @@ const copyPath = (sourcePath, destinationPath) => {
 };
 
 const run = (command, args, cwd) => {
-  const executable = process.platform === "win32" ? "cmd.exe" : command;
-  const executableArgs = process.platform === "win32" ? ["/d", "/s", "/c", command, ...args] : args;
-  const result = spawnSync(executable, executableArgs, {
-    cwd,
-    stdio: "inherit",
-  });
+  const needsShell = process.platform === "win32" && command === "pnpm";
+  const result = needsShell
+    ? spawnSync(`${command} ${args.join(" ")}`, { cwd, shell: true, stdio: "inherit" })
+    : spawnSync(command, args, { cwd, stdio: "inherit" });
 
   if (result.error) {
     fail(result.error.message);
@@ -90,6 +88,9 @@ const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 const stagingRoot = path.join(repoRoot, ".vsix-staging", target);
 const outputPath = path.join(repoRoot, vsixNameForTarget(manifest, target));
 
+// Resolve vsce binary *before* the staging pnpm install, which may strip devDependencies.
+const vsceBinary = require.resolve("@vscode/vsce/vsce");
+
 assertInsideRepo(stagingRoot);
 assertInsideRepo(outputPath);
 
@@ -103,7 +104,7 @@ writeFileSync(
 );
 
 console.log(`Downloading ${bindingPackage} inside staging directory...`);
-run("pnpm", ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoisted"], stagingRoot);
+run("pnpm", ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoisted", "--ignore-workspace"], stagingRoot);
 
 copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));
 copyPath(
@@ -122,7 +123,7 @@ if (manifest.icon) {
   copyPath(iconPath, path.join(stagingRoot, manifest.icon));
 }
 
-const vsceBinary = require.resolve("@vscode/vsce/vsce");
+
 const result = spawnSync(
   process.execPath,
   [vsceBinary, "package", "--target", target, "--out", outputPath, "--allow-missing-repository"],
