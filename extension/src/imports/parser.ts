@@ -3,7 +3,7 @@ import {
   ImportNameKind,
   parseSync,
   type ParserOptions,
-  type StaticExportEntry,
+  type StaticExport,
   type StaticImport,
   type StaticImportEntry,
 } from "oxc-parser";
@@ -102,32 +102,30 @@ const importsFromStaticImport = (source: string, region: ScriptRegion, item: Sta
   return imports;
 };
 
-const importFromStaticExport = (
-  source: string,
-  region: ScriptRegion,
-  entry: StaticExportEntry,
-  statementStart: number,
-  statementEnd: number,
-): DetectedImport | null => {
-  if (entry.isType || !entry.moduleRequest) {
-    return null;
+const importsFromStaticExport = (source: string, region: ScriptRegion, item: StaticExport): DetectedImport[] => {
+  if (item.entries.length === 0) {
+    return [];
   }
 
-  const specifier = entry.moduleRequest.value;
-
-  if (!isRuntimePackageSpecifier(specifier)) {
-    return null;
+  const specifier = item.entries[0]?.moduleRequest?.value;
+  if (!specifier || !isRuntimePackageSpecifier(specifier)) {
+    return [];
   }
 
-  if (entry.importName.kind === ExportImportNameKind.All || entry.importName.kind === ExportImportNameKind.AllButDefault) {
-    return createDetectedImport(source, region, specifier, "namespace", [], statementStart, statementEnd, entry.moduleRequest.end);
+  const imports: DetectedImport[] = [];
+  const named = item.entries
+    .filter((entry) => entry.importName.kind === ExportImportNameKind.Name && entry.importName.name)
+    .map((entry) => entry.importName.name as string);
+
+  if (item.entries.some((entry) => entry.importName.kind === ExportImportNameKind.All || entry.importName.kind === ExportImportNameKind.AllButDefault)) {
+    imports.push(createDetectedImport(source, region, specifier, "namespace", [], item.start, item.end, item.entries[0].moduleRequest!.end));
   }
 
-  if (entry.importName.kind === ExportImportNameKind.Name && entry.importName.name) {
-    return createDetectedImport(source, region, specifier, "named", [entry.importName.name], statementStart, statementEnd, entry.moduleRequest.end);
+  if (named.length > 0) {
+    imports.push(createDetectedImport(source, region, specifier, "named", named, item.start, item.end, item.entries[0].moduleRequest!.end));
   }
 
-  return null;
+  return imports;
 };
 
 const importsFromRegion = (source: string, region: ScriptRegion): DetectedImport[] => {
@@ -142,13 +140,7 @@ const importsFromRegion = (source: string, region: ScriptRegion): DetectedImport
   }
 
   for (const item of parsed.module.staticExports) {
-    for (const entry of item.entries) {
-      const detected = importFromStaticExport(source, region, entry, item.start, item.end);
-
-      if (detected) {
-        imports.push(detected);
-      }
-    }
+    imports.push(...importsFromStaticExport(source, region, item));
   }
 
   for (const item of parsed.module.dynamicImports) {

@@ -9,6 +9,7 @@ test("extractRuntimeImports handles static imports, re-exports, dynamic imports,
     "import * as dateFns from 'date-fns';",
     "export { z } from 'zod';",
     "const lazy = import('uuid');",
+    "export { a, b } from 'pkg';",
   ].join("\n");
 
   const imports = extractRuntimeImports("sample.tsx", source);
@@ -26,6 +27,7 @@ test("extractRuntimeImports handles static imports, re-exports, dynamic imports,
       { specifier: "date-fns", kind: "namespace", named: [], line: 2 },
       { specifier: "zod", kind: "named", named: ["z"], line: 3 },
       { specifier: "uuid", kind: "dynamic", named: [], line: 4 },
+      { specifier: "pkg", kind: "named", named: ["a", "b"], line: 5 },
     ],
   );
 });
