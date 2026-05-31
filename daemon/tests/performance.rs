@@ -2,7 +2,7 @@ use import_lens_daemon::{
     ipc::protocol::{BatchRequest, ImportKind, ImportRequest, PROTOCOL_VERSION},
     service::ImportLensService,
 };
-use std::{env, path::PathBuf, time::Instant};
+use std::{env, path::{Path, PathBuf}, time::Instant};
 
 fn fixture_workspace(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,7 +22,7 @@ fn threshold_ms(base_ms: u128) -> u128 {
     base_ms * multiplier
 }
 
-fn uuid_batch(workspace: &PathBuf, request_id: u64) -> BatchRequest {
+fn uuid_batch(workspace: &Path, request_id: u64) -> BatchRequest {
     BatchRequest {
         version: PROTOCOL_VERSION,
         request_id,
