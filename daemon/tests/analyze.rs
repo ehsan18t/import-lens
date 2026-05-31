@@ -218,6 +218,143 @@ fn analyze_import_computes_static_sizes_for_local_package_entry() {
 }
 
 #[test]
+fn analyze_import_uses_full_graph_when_side_effects_true() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "effectful-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":true}"#,
+        "export const used = 1;\nexport const unused = heavy();\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let named = analyze_import(
+        &context,
+        &import_request(
+            "effectful-lib",
+            "effectful-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+    let namespace = analyze_import(
+        &context,
+        &import_request(
+            "effectful-lib",
+            "effectful-lib",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(named.error, None);
+    assert_eq!(namespace.error, None);
+    assert_eq!(named.raw_bytes, namespace.raw_bytes);
+    assert!(named.side_effects);
+    assert!(!named.truly_treeshakeable);
+}
+
+#[test]
+fn analyze_import_uses_full_graph_when_side_effects_missing() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "implicit-effects-lib",
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+        "export const used = 1;\nexport const unused = heavy();\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let named = analyze_import(
+        &context,
+        &import_request(
+            "implicit-effects-lib",
+            "implicit-effects-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+    let namespace = analyze_import(
+        &context,
+        &import_request(
+            "implicit-effects-lib",
+            "implicit-effects-lib",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(named.error, None);
+    assert_eq!(namespace.error, None);
+    assert_eq!(named.raw_bytes, namespace.raw_bytes);
+    assert!(named.side_effects);
+    assert!(!named.truly_treeshakeable);
+}
+
+#[test]
+fn analyze_import_reports_side_effect_array_conservatively() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "array-effects-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "export const used = 1;\nexport const unused = heavy();\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let named = analyze_import(
+        &context,
+        &import_request(
+            "array-effects-lib",
+            "array-effects-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+    let namespace = analyze_import(
+        &context,
+        &import_request(
+            "array-effects-lib",
+            "array-effects-lib",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(named.error, None);
+    assert_eq!(namespace.error, None);
+    assert_eq!(named.raw_bytes, namespace.raw_bytes);
+    assert!(named.side_effects);
+    assert!(!named.truly_treeshakeable);
+    assert!(
+        named
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "side_effects"
+                && diagnostic.message.contains("array")),
+        "{named:?}",
+    );
+}
+
+#[test]
 fn analyze_import_returns_partial_error_result_on_missing_entry() {
     let workspace = temp_workspace();
     write_package(

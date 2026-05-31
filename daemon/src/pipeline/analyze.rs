@@ -1,8 +1,12 @@
 use crate::{
     ipc::protocol::{ImportDiagnostic, ImportKind, ImportRequest, ImportResult},
     pipeline::{
-        bundle::bundle_reachable_modules, compress::compress_all, graph::build_module_graph,
-        minify::minify_source, reachability::reachable_exports, resolver::resolve_package_entry,
+        bundle::bundle_reachable_modules,
+        compress::compress_all,
+        graph::build_module_graph,
+        minify::minify_source,
+        reachability::reachable_exports,
+        resolver::{SideEffectsMode, resolve_package_entry},
     },
 };
 use std::{fs, path::PathBuf};
@@ -43,7 +47,7 @@ fn analyze_import_inner(
             let details = resolver_details(&message);
             error_with_context(stage, message, context, request, details)
         })?;
-    let side_effects = resolved.side_effects;
+    let side_effects_mode = resolved.side_effects;
     let entry_path = resolved.entry_path;
     let is_cjs = resolved.is_cjs;
 
@@ -77,22 +81,23 @@ fn analyze_import_inner(
             ImportKind::Named | ImportKind::Default | ImportKind::Namespace
         )
     {
-        match analyze_with_oxc_pipeline(context, request, entry_path.clone(), side_effects) {
+        match analyze_with_oxc_pipeline(context, request, entry_path.clone(), side_effects_mode) {
             Ok(result) => return Ok(result),
             Err(_) if matches!(request.import_kind, ImportKind::Namespace) => {}
             Err(error) => return Err(error),
         }
     }
 
-    analyze_static_entry(context, request, entry_path, side_effects, is_cjs)
+    analyze_static_entry(context, request, entry_path, side_effects_mode, is_cjs)
 }
 
 fn analyze_with_oxc_pipeline(
     context: &AnalysisContext,
     request: &ImportRequest,
     entry_path: PathBuf,
-    side_effects: bool,
+    side_effects_mode: SideEffectsMode,
 ) -> Result<ImportResult, AnalysisError> {
+    let side_effects = side_effects_mode.has_side_effects();
     let graph = build_module_graph(&entry_path).map_err(|error| {
         error_with_context(
             "module_graph",
@@ -102,7 +107,7 @@ fn analyze_with_oxc_pipeline(
             vec![format!("entry_path: {}", entry_path.display())],
         )
     })?;
-    let include_full_entry = matches!(request.import_kind, ImportKind::Namespace);
+    let include_full_entry = side_effects || matches!(request.import_kind, ImportKind::Namespace);
     let requested_exports = requested_exports(request);
     let mut reachable = reachable_exports(&graph, &requested_exports, include_full_entry);
     let mut bundled = bundle_reachable_modules(&graph, &reachable).map_err(|error| {
@@ -162,7 +167,7 @@ fn analyze_with_oxc_pipeline(
         ),
         is_cjs: false,
         error: None,
-        diagnostics: Vec::new(),
+        diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path),
     })
 }
 
@@ -204,9 +209,10 @@ fn analyze_static_entry(
     context: &AnalysisContext,
     request: &ImportRequest,
     entry_path: PathBuf,
-    side_effects: bool,
+    side_effects_mode: SideEffectsMode,
     is_cjs: bool,
 ) -> Result<ImportResult, AnalysisError> {
+    let side_effects = side_effects_mode.has_side_effects();
     let source = fs::read_to_string(&entry_path).map_err(|error| {
         error_with_context(
             "entry_read",
@@ -247,8 +253,26 @@ fn analyze_static_entry(
             && matches!(request.import_kind, ImportKind::Named),
         is_cjs,
         error: None,
-        diagnostics: Vec::new(),
+        diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path),
     })
+}
+
+fn side_effect_diagnostics(
+    side_effects_mode: SideEffectsMode,
+    entry_path: &std::path::Path,
+) -> Vec<ImportDiagnostic> {
+    if side_effects_mode != SideEffectsMode::Array {
+        return Vec::new();
+    }
+
+    vec![ImportDiagnostic {
+        stage: "side_effects".to_owned(),
+        message: "package sideEffects array requires conservative full-graph analysis".to_owned(),
+        details: vec![
+            "sideEffects: array".to_owned(),
+            format!("entry_path: {}", entry_path.display()),
+        ],
+    }]
 }
 
 fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {

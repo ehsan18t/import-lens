@@ -12,7 +12,22 @@ pub struct ResolvedPackage {
     pub package_json: Value,
     pub entry_path: PathBuf,
     pub is_cjs: bool,
-    pub side_effects: bool,
+    pub side_effects: SideEffectsMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideEffectsMode {
+    False,
+    True,
+    Array,
+    Missing,
+    Unknown,
+}
+
+impl SideEffectsMode {
+    pub fn has_side_effects(self) -> bool {
+        !matches!(self, Self::False)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +60,7 @@ pub fn resolve_package_entry(
 
     Ok(ResolvedPackage {
         package_root: manifest.root,
-        side_effects: side_effects(&manifest.json),
+        side_effects: side_effects_mode(&manifest.json),
         package_json: manifest.json,
         entry_path,
         is_cjs,
@@ -271,12 +286,13 @@ pub(crate) fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn side_effects(package_json: &Value) -> bool {
+fn side_effects_mode(package_json: &Value) -> SideEffectsMode {
     match package_json.get("sideEffects") {
-        Some(Value::Bool(value)) => *value,
-        Some(Value::Array(_)) => true,
-        Some(_) => true,
-        None => true,
+        Some(Value::Bool(false)) => SideEffectsMode::False,
+        Some(Value::Bool(true)) => SideEffectsMode::True,
+        Some(Value::Array(_)) => SideEffectsMode::Array,
+        Some(_) => SideEffectsMode::Unknown,
+        None => SideEffectsMode::Missing,
     }
 }
 
