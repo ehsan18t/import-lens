@@ -70,8 +70,8 @@ fn bundle_renames_module_scoped_bindings_to_avoid_collisions() {
 
 #[test]
 fn minify_source_removes_whitespace_and_preserves_parseability() {
-    let minified =
-        minify_source("const value = 1 + 1;\nconsole.log(value);\n").expect("source should minify");
+    let minified = minify_source("const value = 1 + 1;\nconsole.log(value);\n", false)
+        .expect("source should minify");
 
     assert!(minified.len() < "const value = 1 + 1;\nconsole.log(value);\n".len());
     assert_parseable(&minified);

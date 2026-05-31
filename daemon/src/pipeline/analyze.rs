@@ -126,7 +126,7 @@ fn analyze_with_oxc_pipeline(
             )
         })?;
     }
-    let minified = minify_source(&bundled).map_err(|error| {
+    let minified = minify_source(&bundled, false).map_err(|error| {
         error_with_context(
             "minify",
             format!("failed to minify bundled modules: {error}"),
@@ -154,7 +154,12 @@ fn analyze_with_oxc_pipeline(
         zstd_bytes: compressed.zstd_bytes,
         cache_hit: false,
         side_effects,
-        truly_treeshakeable: !side_effects && matches!(request.import_kind, ImportKind::Named),
+        truly_treeshakeable: is_truly_treeshakeable(
+            request,
+            side_effects,
+            &graph,
+            bundled.len() as u64,
+        ),
         is_cjs: false,
         error: None,
         diagnostics: Vec::new(),
@@ -167,6 +172,32 @@ fn requested_exports(request: &ImportRequest) -> Vec<String> {
         ImportKind::Default => vec!["default".to_owned()],
         ImportKind::Namespace | ImportKind::Dynamic => Vec::new(),
     }
+}
+
+fn is_truly_treeshakeable(
+    request: &ImportRequest,
+    side_effects: bool,
+    graph: &crate::pipeline::graph::ModuleGraph,
+    bundled_len: u64,
+) -> bool {
+    if side_effects || !matches!(request.import_kind, ImportKind::Named) {
+        return false;
+    }
+
+    // To check if genuinely tree-shakeable, we compare against the full module size.
+    let reachable_full = reachable_exports(graph, &[], true);
+    let Ok(bundled_full) = bundle_reachable_modules(graph, &reachable_full) else {
+        return false;
+    };
+
+    let full_len = bundled_full.len() as u64;
+    if full_len == 0 {
+        return false;
+    }
+
+    // If the tree-shaken size is within 5% of the full size, it's not truly tree-shakeable
+    let ratio = (bundled_len as f64) / (full_len as f64);
+    ratio <= 0.95
 }
 
 fn analyze_static_entry(
@@ -188,7 +219,8 @@ fn analyze_static_entry(
             vec![format!("entry_path: {}", entry_path.display())],
         )
     })?;
-    let minified = estimate_minified_source(&source);
+    let minified =
+        minify_source(&source, is_cjs).unwrap_or_else(|_| estimate_minified_source(&source));
     let compressed = compress_all(&minified).map_err(|error| {
         error_with_context(
             "compression",
