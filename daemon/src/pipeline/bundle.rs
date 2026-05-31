@@ -203,6 +203,7 @@ fn rewrite_module(
     let mut rewritten = replace_identifiers(&without_module_syntax, &renames);
     let anchors = usage_anchors(module, reachable, keep_all_exports);
     if !anchors.is_empty() {
+        rewritten.push_str("\n;");
         rewritten.push_str(&anchors);
     }
 
