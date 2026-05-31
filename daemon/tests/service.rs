@@ -61,9 +61,9 @@ fn service_processes_batch_and_serves_second_request_from_cache() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(first.request_id, 7);
-    assert_eq!(first.imports[0].cache_hit, false);
+    assert!(!first.imports[0].cache_hit);
     assert_eq!(second.request_id, 8);
-    assert_eq!(second.imports[0].cache_hit, true);
+    assert!(second.imports[0].cache_hit);
 }
 
 #[test]
@@ -77,5 +77,5 @@ fn service_cache_invalidation_removes_matching_package_entries() {
     let after_invalidate = service.handle_batch(batch(&workspace, 2));
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(after_invalidate.imports[0].cache_hit, false);
+    assert!(!after_invalidate.imports[0].cache_hit);
 }

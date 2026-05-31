@@ -228,12 +228,11 @@ fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
         ));
     }
 
-    let (imports, external_imports, import_statement_spans) =
-        import_edges(path, &parsed.module_record)?;
+    let edges_result = import_edges(path, &parsed.module_record)?;
     Ok(ParsedModule {
-        imports,
-        external_imports,
-        import_statement_spans,
+        imports: edges_result.imports,
+        external_imports: edges_result.external_imports,
+        import_statement_spans: edges_result.import_statement_spans,
         exports: export_records(&parsed.module_record),
         reexports: reexport_records(path, &parsed.module_record)?,
         star_exports: star_export_records(path, &parsed.module_record)?,
@@ -242,17 +241,16 @@ fn parse_module(path: &Path, source: &str) -> Result<ParsedModule, String> {
     })
 }
 
+struct ImportEdgesResult {
+    imports: Vec<ImportEdge>,
+    external_imports: Vec<ExternalImportEdge>,
+    import_statement_spans: Vec<(usize, usize)>,
+}
+
 fn import_edges(
     path: &Path,
     module_record: &OxcModuleRecord<'_>,
-) -> Result<
-    (
-        Vec<ImportEdge>,
-        Vec<ExternalImportEdge>,
-        Vec<(usize, usize)>,
-    ),
-    String,
-> {
+) -> Result<ImportEdgesResult, String> {
     let mut imports = Vec::new();
     let mut external_imports = Vec::new();
     let mut import_statement_spans = Vec::new();
@@ -334,7 +332,7 @@ fn import_edges(
         }
     }
 
-    Ok((imports, external_imports, import_statement_spans))
+    Ok(ImportEdgesResult { imports, external_imports, import_statement_spans })
 }
 
 fn push_import_binding(

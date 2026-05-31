@@ -107,8 +107,8 @@ fn resolve_legacy_fallback(
 ) -> Result<(PathBuf, bool), String> {
     let subpath = subpath_for_request(request);
     if manifest.json.get("exports").is_some() {
-        if subpath.is_some() {
-            let exports_key = format!("./{}", subpath.expect("subpath should exist"));
+        if let Some(sub) = subpath {
+            let exports_key = format!("./{sub}");
             return Err(format!(
                 "subpath '{}' is not defined in the exports map of {}",
                 exports_key, request.package_name
@@ -227,7 +227,7 @@ fn entry_matches_manifest_esm_field(manifest: &PackageManifest, entry_path: &Pat
 }
 
 fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
-    let candidates = vec![
+    let candidates = [
         candidate.to_path_buf(),
         append_extension(candidate, "js"),
         append_extension(candidate, "mjs"),

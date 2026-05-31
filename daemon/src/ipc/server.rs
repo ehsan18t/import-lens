@@ -240,11 +240,10 @@ fn recycle_if_needed(
         return false;
     };
 
-    if let Some(storage_path) = storage_path {
-        if let Err(error) = record_recycle_timestamp(storage_path, SystemTime::now()) {
+    if let Some(storage_path) = storage_path
+        && let Err(error) = record_recycle_timestamp(storage_path, SystemTime::now()) {
             eprintln!("[import-lens-daemon] failed to record recycle timestamp: {error}");
         }
-    }
 
     eprintln!("[import-lens-daemon] lifecycle recycle requested: {reason:?}");
     true

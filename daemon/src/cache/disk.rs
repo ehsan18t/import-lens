@@ -12,15 +12,11 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CURRENT_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug)]
+#[derive(Default)]
 pub struct DiskCache {
     db: Option<Database>,
 }
 
-impl Default for DiskCache {
-    fn default() -> Self {
-        Self { db: None }
-    }
-}
 
 impl DiskCache {
     pub fn new(storage_path: Option<PathBuf>, enabled: bool) -> Self {
@@ -125,14 +121,12 @@ impl DiskCache {
                 let mut keys_to_remove = Vec::new();
 
                 if let Ok(iter) = table.iter() {
-                    for result in iter {
-                        if let Ok((key, _)) = result {
-                            let key_str = key.value();
-                            if key_str.starts_with(&root_prefix)
-                                || key_str.starts_with(&subpath_prefix)
-                            {
-                                keys_to_remove.push(key_str.to_owned());
-                            }
+                    for (key, _) in iter.flatten() {
+                        let key_str = key.value();
+                        if key_str.starts_with(&root_prefix)
+                            || key_str.starts_with(&subpath_prefix)
+                        {
+                            keys_to_remove.push(key_str.to_owned());
                         }
                     }
                 }
@@ -155,10 +149,8 @@ impl DiskCache {
             if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
                 let mut keys_to_remove = Vec::new();
                 if let Ok(iter) = table.iter() {
-                    for result in iter {
-                        if let Ok((key, _)) = result {
-                            keys_to_remove.push(key.value().to_owned());
-                        }
+                    for (key, _) in iter.flatten() {
+                        keys_to_remove.push(key.value().to_owned());
                     }
                 }
                 for key in keys_to_remove {
@@ -210,8 +202,8 @@ impl DiskCache {
                     "failed to delete cache database {}: {error}",
                     db_path.display()
                 ));
-                return None;
             }
+            return None;
         }
 
         let db = match Database::create(db_path) {

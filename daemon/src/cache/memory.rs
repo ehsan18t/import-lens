@@ -62,10 +62,10 @@ impl ImportCache {
         let subpath_prefix = format!("{package_name}/");
         let keys = memory
             .iter()
-            .filter_map(|(key, _)| {
-                (key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix))
-                    .then(|| key.clone())
+            .filter(|(key, _)| {
+                key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix)
             })
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
 
         for key in keys {

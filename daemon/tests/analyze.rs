@@ -213,8 +213,8 @@ fn analyze_import_computes_static_sizes_for_local_package_entry() {
     assert!(result.raw_bytes > 0);
     assert!(result.minified_bytes > 0);
     assert!(result.gzip_bytes > 0);
-    assert_eq!(result.side_effects, false);
-    assert_eq!(result.is_cjs, false);
+    assert!(!result.side_effects);
+    assert!(!result.is_cjs);
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn analyze_import_resolves_subpath_via_exports_map() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
     assert!(result.raw_bytes > 0);
-    assert_eq!(result.is_cjs, false);
+    assert!(!result.is_cjs);
 }
 
 #[test]
@@ -449,7 +449,7 @@ fn analyze_import_resolves_root_entry_via_exports_dot() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
     assert!(result.raw_bytes > 0);
-    assert_eq!(result.is_cjs, false);
+    assert!(!result.is_cjs);
 }
 
 #[test]
@@ -688,7 +688,7 @@ fn analyze_import_resolves_top_level_condition_map_exports() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
     assert!(result.raw_bytes > 0);
-    assert_eq!(result.is_cjs, false);
+    assert!(!result.is_cjs);
 }
 
 #[test]

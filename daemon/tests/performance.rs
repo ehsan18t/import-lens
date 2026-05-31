@@ -56,9 +56,9 @@ fn fixture_miss_and_cache_hit_stay_under_release_thresholds() {
     let hit_ms = hit_start.elapsed().as_millis();
 
     assert_eq!(miss.imports[0].error, None);
-    assert_eq!(miss.imports[0].cache_hit, false);
+    assert!(!miss.imports[0].cache_hit);
     assert_eq!(hit.imports[0].error, None);
-    assert_eq!(hit.imports[0].cache_hit, true);
+    assert!(hit.imports[0].cache_hit);
 
     assert!(
         miss_ms <= threshold_ms(500),
