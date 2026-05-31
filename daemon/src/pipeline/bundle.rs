@@ -316,8 +316,10 @@ fn resolve_export_binding(
         .iter()
         .filter(|reexport| reexport.exported_name == exported_name)
     {
-        let target_id = graph.module_id_by_path(&reexport.resolved_path)?;
-        return resolve_export_binding(graph, target_id, &reexport.imported_name);
+        if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path)
+            && let Some(binding) = resolve_export_binding(graph, target_id, &reexport.imported_name) {
+                return Some(binding);
+            }
     }
 
     for star_export in &module.star_exports {
