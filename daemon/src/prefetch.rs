@@ -12,11 +12,13 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     thread,
 };
+
+static PREWARM_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 #[derive(Debug, Default)]
 pub struct CancellationToken {
@@ -168,13 +170,14 @@ fn run_prewarm_job(
         });
     };
 
-    match ThreadPoolBuilder::new()
-        .num_threads(prewarm_thread_count())
-        .build()
-    {
-        Ok(pool) => pool.install(run),
-        Err(_) => run(),
-    }
+    let pool = PREWARM_POOL.get_or_init(|| {
+        ThreadPoolBuilder::new()
+            .num_threads(prewarm_thread_count())
+            .build()
+            .expect("failed to build prewarm thread pool")
+    });
+
+    pool.install(run);
 }
 
 fn installed_package_version(active_document_path: &Path, package_name: &str) -> Option<String> {

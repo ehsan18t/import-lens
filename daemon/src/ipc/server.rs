@@ -104,7 +104,7 @@ where
                         return Ok(());
                     }
                 }
-                ClientMessage::Batch(request) if hello_received => {
+                ClientMessage::Batch(request) => {
                     prefetcher.cancel();
                     lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
@@ -133,20 +133,6 @@ where
                 ClientMessage::Shutdown(_) => {
                     return Ok(());
                 }
-                ClientMessage::Batch(request) => {
-                    prefetcher.cancel();
-                    lifecycle.record_batch();
-                    let response = tokio::task::spawn_blocking(move || {
-                        ImportLensService::new(None, false).handle_batch(request)
-                    })
-                    .await
-                    .expect("spawn_blocking failed");
-                    stream.write_all(&encode_frame(&response)?).await?;
-
-                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
-                        return Ok(());
-                    }
-                }
                 ClientMessage::PrewarmPackageJson(_)
                 | ClientMessage::CacheInvalidate(_)
                 | ClientMessage::CacheInvalidateAll(_) => {}
@@ -167,9 +153,10 @@ fn recycle_if_needed(
     };
 
     if let Some(storage_path) = storage_path
-        && let Err(error) = record_recycle_timestamp(storage_path, SystemTime::now()) {
-            eprintln!("[import-lens-daemon] failed to record recycle timestamp: {error}");
-        }
+        && let Err(error) = record_recycle_timestamp(storage_path, SystemTime::now())
+    {
+        eprintln!("[import-lens-daemon] failed to record recycle timestamp: {error}");
+    }
 
     eprintln!("[import-lens-daemon] lifecycle recycle requested: {reason:?}");
     true
