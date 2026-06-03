@@ -11,18 +11,13 @@ pub enum ImportKind {
     Dynamic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportRuntime {
+    #[default]
     Component,
     Client,
     Server,
-}
-
-impl Default for ImportRuntime {
-    fn default() -> Self {
-        Self::Component
-    }
 }
 
 impl ImportRuntime {

@@ -8,7 +8,7 @@ use crate::{
         compress::compress_all,
         graph::{ModuleGraph, ModuleId, build_module_graph_cached_with_runtime},
         minify::{minify_source, minify_source_with_markers},
-        reachability::reachable_exports,
+        reachability::{reachable_exports, requested_exports},
         resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
     },
 };
@@ -311,14 +311,6 @@ fn analyze_with_oxc_pipeline(
         shared_bytes: None,
         internal_contributions: bundled.contributions,
     })
-}
-
-fn requested_exports(request: &ImportRequest) -> Vec<String> {
-    match request.import_kind {
-        ImportKind::Named => request.named.clone(),
-        ImportKind::Default => vec!["default".to_owned()],
-        ImportKind::Namespace | ImportKind::Dynamic => Vec::new(),
-    }
 }
 
 fn is_truly_treeshakeable(

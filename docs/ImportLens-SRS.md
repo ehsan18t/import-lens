@@ -229,7 +229,7 @@ On each daemon respawn, the extension host reads `<globalStoragePath>/importlens
 5. The extension maps region-relative import ranges back to absolute document positions for stable inlay hint, decoration, and CodeLens placement.
 6. The extension filters imports to node_modules only, skipping local paths, `node:` builtins, and `import type` declarations.
 7. For each remaining import, the extension reads the installed package version from `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory. If the package directory exists but the manifest is malformed or lacks a string `version`, the extension sends the request with an unknown-version sentinel so the daemon can return an approximate fallback instead of marking the import missing.
-8. A single batched `BatchRequest` is serialised to MessagePack and sent over the socket. Protocol v2 clients may set `streaming: true` to receive indexed partial responses as individual imports finish.
+8. A single batched `BatchRequest` is serialised to MessagePack and sent over the socket. Protocol v2+ clients may set `streaming: true` to receive indexed partial responses as individual imports finish.
 9. The daemon receives the batch, verifies that the connection has completed the `HelloMessage` handshake, and checks its `papaya` map for each import's cache key.
 10. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
 11. For each miss, the daemon runs the OXC pipeline: (a) construct a virtual entry module, (b) resolve the package entry point via `oxc_resolver`, (c) build the module graph by recursively parsing reachable relative and bare transitive imports with `oxc_parser` and analysing them with `oxc_semantic`, (d) concatenate reachable code or the full parsed graph when side-effect metadata requires conservative analysis, (e) run `oxc_minifier` for dead code elimination, (f) apply `oxc_mangler` for identifier mangling, (g) emit the minified string via `oxc_codegen`, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
@@ -397,7 +397,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 ### 5.5 Caching
 
-**FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. The cache key must be the string `<specifier>@<version>::<named_exports_sorted_and_joined>`, where `<specifier>` preserves subpaths such as `date-fns/format`. Cache hits must be returned without running any computation.
+**FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. Cache keys must use the structured v3 identity format described in Section 10.2, including analyzer version, package identity, runtime profile, import kind, sorted named exports, resolved package paths when known, and relevant file fingerprints. Valid cache hits must be returned without running any computation.
 
 **FR-026** (Critical) - When `importLens.enableDiskCache` is `true` (the default), the daemon must persist computed cache entries to a `redb` database stored in the VS Code global storage directory. On startup, the daemon must preload only the configured bounded recent-entry set into `papaya`; other valid disk entries remain available through lazy disk lookup and are promoted into memory on first hit.
 
@@ -563,7 +563,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 ### 7.6 Extensibility
 
-**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v2 is the current native protocol and adds streaming batch responses, export enumeration, file-level shared sizing, module breakdowns, and per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse` compatibility must be preserved.
+**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v3 is the current native protocol and adds runtime-aware imports on top of v2 streaming batch responses, export enumeration, file-level shared sizing, module breakdowns, and per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse` compatibility and v2 request compatibility must be preserved where the missing fields have safe defaults.
 
 ---
 
@@ -694,7 +694,7 @@ The following criteria constitute the definition of done for the v1.0 release. A
 
 ```typescript
 interface BatchRequest {
-  version: number;              // Protocol version, currently 2
+  version: number;              // Protocol version, currently 3
   request_id: number;           // Monotonic counter incremented per debounce cycle.
                                 // The daemon echoes this value in BatchResponse.
                                 // The extension host discards responses whose
@@ -707,15 +707,16 @@ interface BatchRequest {
                                 // where packages/app-a has its own node_modules with a
                                 // different version than the root-level hoisted copy).
   imports: ImportRequest[];
-  streaming?: boolean;          // Protocol v2 only; request indexed partial responses.
+  streaming?: boolean;          // Protocol v2+; request indexed partial responses.
 }
 
 interface ImportRequest {
   specifier: string;         // Full import specifier including subpath, e.g. "date-fns/format"
   package: string;           // Root package name only, e.g. "date-fns" (used for node_modules lookup)
-  version: string;           // Installed version read from root package.json, e.g. "3.6.0"
+  version: string;           // Installed version read from root package.json, e.g. "3.6.0"; "unknown" for malformed/versionless manifest fallback
   named: string[];           // Named exports requested; empty for default/namespace/dynamic
   import_kind: "named" | "default" | "namespace" | "dynamic";
+  runtime: "component" | "client" | "server"; // Protocol v3; defaults to "component" when omitted by older clients
 }
 ```
 
@@ -727,7 +728,7 @@ interface BatchResponse {
   request_id: number;           // Echoed from the corresponding BatchRequest.
                                 // Extension host uses this to discard stale responses.
   imports: ImportResult[];
-  indexes?: number[];           // Protocol v2 streaming partials: import indexes represented
+  indexes?: number[];           // Protocol v2+ streaming partials: import indexes represented
                                 // by this frame. Omitted on full-batch responses.
 }
 
@@ -813,7 +814,7 @@ interface PrewarmPackageJsonMessage {
 
 #### EnumerateExportsRequest / EnumerateExportsResponse
 
-Used by the named-import completion provider. This protocol v2 request asks the daemon to resolve a package and return statically-known named exports from the cached or newly-built graph.
+Used by the named-import completion provider. This protocol v2+ request asks the daemon to resolve a package and return statically-known named exports from the cached or newly-built graph.
 
 ```typescript
 interface EnumerateExportsRequest {
@@ -877,25 +878,13 @@ interface ShutdownMessage {
 
 ### 10.2 Cache Key Format
 
-The cache key for both `papaya` and `redb` size entries is a UTF-8 string:
+The cache key for both `papaya` and `redb` size entries is a UTF-8 string using the v3 prefix and a hex-encoded MessagePack `CacheIdentityV3` payload:
 
 ```
-<specifier>@<version>::<export1>,<export2>,...<exportN>
+v3:<hex-msgpack-cache-identity>
 ```
 
-Exports are sorted lexicographically before joining to ensure import order does not create duplicate entries. For namespace and default imports, the key uses the sentinel values `*` and `default` respectively.
-
-For subpath imports (e.g. `import { format } from 'date-fns/format'`), the full specifier including the subpath is used as the package component of the key. Subpath imports are treated as distinct cache entries from their root package because they resolve to different entry points and produce different tree-shaken outputs. The subpath is preserved verbatim; no normalisation is applied.
-
-```
-lodash-es@4.17.21::debounce,throttle
-lodash-es@4.17.21::*
-react@18.3.1::default
-date-fns@3.6.0::dynamic
-date-fns/format@3.6.0::default
-@babel/core@7.24.0::default
-@tanstack/react-query@5.28.0::useQuery,useMutation
-```
+The identity payload contains `analyzer_version`, `specifier`, root `package_name`, `package_version`, optional canonical `package_root`, optional canonical `entry_path`, `runtime`, `import_kind`, sorted/deduplicated `named_exports`, and manifest/entry fingerprints when available. Sorting named exports ensures import order does not create duplicate entries. Namespace, default, and dynamic imports are distinguished by `import_kind`, so a named export literally called `"dynamic"` cannot collide with dynamic-import analysis.
 
 The `specifier` field in `ImportRequest` must carry the full subpath (e.g. `"date-fns/format"`) so the daemon can resolve the correct entry point via `oxc_resolver`. The `package` field carries the root package name only (e.g. `"date-fns"`) for `node_modules` lookup purposes. The `version` field is read from the root package's `package.json` regardless of subpath, since subpaths do not have independent versions.
 
@@ -1098,7 +1087,7 @@ If `sideEffects: false` is set in the package's `package.json`, modules that con
 
 **Graph cache**
 
-The daemon may keep parsed module graphs in a side in-memory cache keyed by canonical entry path. This cache is an optimization only: size results remain keyed by `<specifier>@<version>::<exports>` and persisted in `redb`; graph cache misses must not change user-visible results.
+The daemon may keep parsed module graphs in a side in-memory cache keyed by canonical entry path and resolver/runtime profile. This cache is an optimization only: size results remain keyed by the structured v3 cache identity and persisted in `redb`; graph cache misses must not change user-visible results.
 
 ---
 
@@ -1231,7 +1220,7 @@ import-lens/
 │   │   │   └── types.ts               # import detection data models
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
-│   │   │   ├── protocol.ts            # Protocol v2 IPC types
+│   │   │   ├── protocol.ts            # Protocol v3 IPC types
 │   │   │   └── codec.ts               # MessagePack encode/decode
 │   │   ├── daemon/
 │   │   │   ├── manager.ts             # daemon lifecycle and analysis transport coordination
@@ -1267,7 +1256,7 @@ import-lens/
 │       │   ├── mod.rs
 │       │   ├── codec.rs               # MessagePack length-prefix codec
 │       │   ├── server.rs              # Unix socket / named pipe listener
-│       │   └── protocol.rs            # Protocol v2 serde types
+│       │   └── protocol.rs            # Protocol v3 serde types
 │       ├── pipeline/
 │       │   ├── mod.rs
 │       │   ├── resolver.rs            # oxc_resolver usage

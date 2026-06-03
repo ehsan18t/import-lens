@@ -1,4 +1,7 @@
-use crate::pipeline::graph::{ModuleGraph, ModuleId};
+use crate::{
+    ipc::protocol::{ImportKind, ImportRequest},
+    pipeline::graph::{ModuleGraph, ModuleId},
+};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -73,6 +76,14 @@ pub fn reachable_exports(
     }
 
     marker.reachable
+}
+
+pub fn requested_exports(request: &ImportRequest) -> Vec<String> {
+    match request.import_kind {
+        ImportKind::Named => request.named.clone(),
+        ImportKind::Default => vec!["default".to_owned()],
+        ImportKind::Namespace | ImportKind::Dynamic => Vec::new(),
+    }
 }
 
 struct ReachabilityMarker<'a> {

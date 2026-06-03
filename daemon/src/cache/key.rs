@@ -147,7 +147,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return None;
     }
 

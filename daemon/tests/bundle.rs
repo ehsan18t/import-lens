@@ -163,7 +163,6 @@ fn bundle_hoists_and_deduplicates_external_imports() {
     let bundled =
         bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
 
-    println!("BUNDLED:\n{}", bundled);
     assert!(bundled.starts_with("import React from 'react';\nimport * as ReactNamespace from 'react';\nimport { forwardRef, forwardRef as fr, useState } from 'react';\n"));
 
     // Ensure the AST parses without any redeclaration errors from oxc

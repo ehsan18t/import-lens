@@ -9,7 +9,7 @@ use crate::{
         compress::compress_all,
         graph::{ModuleGraph, ModuleId, ModuleRecord, build_module_graph_cached_with_runtime},
         minify::minify_source_with_markers,
-        reachability::{ReachableExports, reachable_exports},
+        reachability::{ReachableExports, reachable_exports, requested_exports},
         resolver::resolve_package_entry,
     },
 };
@@ -203,14 +203,6 @@ pub fn compute_file_size(
         zstd_bytes: compressed.zstd_bytes,
         error: None,
         diagnostics,
-    }
-}
-
-fn requested_exports(request: &ImportRequest) -> Vec<String> {
-    match request.import_kind {
-        ImportKind::Named => request.named.clone(),
-        ImportKind::Default => vec!["default".to_owned()],
-        ImportKind::Namespace | ImportKind::Dynamic => Vec::new(),
     }
 }
 
