@@ -87,6 +87,7 @@ const request = (specifier: string): ImportRequest => ({
   version: "1.0.0",
   named: [],
   import_kind: "namespace",
+  runtime: "component",
 });
 
 const scanned = (specifier: string, sourceFile: string): ScannedImport => ({

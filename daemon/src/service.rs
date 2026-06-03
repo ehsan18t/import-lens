@@ -3,7 +3,7 @@ use crate::{
     ipc::protocol::{
         BatchRequest, BatchResponse, EnumerateExportsRequest, EnumerateExportsResponse,
         FileSizeRequest, FileSizeResponse, ImportDiagnostic, ImportKind, ImportRequest,
-        ImportResult, PROTOCOL_VERSION,
+        ImportResult, ImportRuntime, PROTOCOL_VERSION,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
@@ -151,6 +151,7 @@ impl ImportLensService {
             version: request.package_version,
             named: Vec::new(),
             import_kind: ImportKind::Namespace,
+            runtime: ImportRuntime::Component,
         };
 
         let resolved = match resolve_package_entry(&context.active_document_path, &import_request) {

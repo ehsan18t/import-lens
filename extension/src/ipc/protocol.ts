@@ -1,6 +1,8 @@
-export const protocolVersion = 2;
+export const protocolVersion = 3;
 
 export type ImportKind = "named" | "default" | "namespace" | "dynamic";
+
+export type ImportRuntime = "component" | "client" | "server";
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -10,6 +12,7 @@ export interface ImportRequest {
   version: string;
   named: string[];
   import_kind: ImportKind;
+  runtime: ImportRuntime;
 }
 
 export interface BatchRequest {

@@ -1,5 +1,5 @@
 use import_lens_daemon::cache::key::cache_key_for_import;
-use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest};
+use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
 
 #[test]
 fn cache_key_sorts_named_exports() {
@@ -9,6 +9,7 @@ fn cache_key_sorts_named_exports() {
         version: "4.17.21".to_owned(),
         named: vec!["throttle".to_owned(), "debounce".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     assert_eq!(
@@ -25,6 +26,7 @@ fn cache_key_uses_sentinels_for_default_namespace_and_dynamic() {
         version: "18.3.1".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
     let namespace_request = ImportRequest {
         specifier: "lodash-es".to_owned(),
@@ -32,6 +34,7 @@ fn cache_key_uses_sentinels_for_default_namespace_and_dynamic() {
         version: "4.17.21".to_owned(),
         named: vec![],
         import_kind: ImportKind::Namespace,
+        runtime: ImportRuntime::Component,
     };
     let dynamic_request = ImportRequest {
         specifier: "date-fns".to_owned(),
@@ -39,6 +42,7 @@ fn cache_key_uses_sentinels_for_default_namespace_and_dynamic() {
         version: "3.6.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Dynamic,
+        runtime: ImportRuntime::Component,
     };
 
     assert_eq!(
@@ -63,6 +67,7 @@ fn cache_key_preserves_subpath_specifier_component() {
         version: "3.6.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     assert_eq!(

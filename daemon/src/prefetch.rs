@@ -1,5 +1,5 @@
 use crate::{
-    ipc::protocol::{ImportKind, ImportRequest},
+    ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
         resolver::{ResolvedPackage, resolve_package_entry},
@@ -314,6 +314,7 @@ pub fn cached_import_request_from_key(key: &str) -> Option<ImportRequest> {
         version: version.to_owned(),
         named,
         import_kind,
+        runtime: ImportRuntime::Component,
     })
 }
 
@@ -340,6 +341,7 @@ fn prewarm_request(package_name: &str, version: &str, import_kind: ImportKind) -
         version: version.to_owned(),
         named: Vec::new(),
         import_kind,
+        runtime: ImportRuntime::Component,
     }
 }
 

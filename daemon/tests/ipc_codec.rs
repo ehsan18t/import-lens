@@ -1,5 +1,7 @@
 use import_lens_daemon::ipc::codec::{FrameDecoder, decode_payload, encode_frame};
-use import_lens_daemon::ipc::protocol::{ClientMessage, ShutdownMessage};
+use import_lens_daemon::ipc::protocol::{
+    ClientMessage, ImportKind, ImportRequest, ShutdownMessage,
+};
 
 const OVERSIZED_FRAME_BYTES: usize = (32 * 1024 * 1024) + 1;
 
@@ -60,4 +62,23 @@ fn frame_decoder_rejects_oversized_frames_before_buffering_payload() {
         error.to_string().contains("too large"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn import_request_defaults_missing_runtime_to_component() {
+    let payload = rmp_serde::to_vec(&serde_json::json!({
+        "specifier": "tiny-lib",
+        "package": "tiny-lib",
+        "version": "1.0.0",
+        "named": ["value"],
+        "import_kind": "named"
+    }))
+    .expect("legacy request should encode");
+
+    let request: ImportRequest =
+        rmp_serde::from_slice(&payload).expect("legacy request should decode");
+
+    assert_eq!(request.specifier, "tiny-lib");
+    assert_eq!(request.import_kind, ImportKind::Named);
+    assert_eq!(request.runtime.as_str(), "component");
 }

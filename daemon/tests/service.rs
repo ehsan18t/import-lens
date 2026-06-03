@@ -1,7 +1,7 @@
 use import_lens_daemon::{
     ipc::protocol::{
         BatchRequest, EnumerateExportsRequest, FileSizeRequest, ImportKind, ImportRequest,
-        PROTOCOL_VERSION,
+        ImportRuntime, PROTOCOL_VERSION,
     },
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
 };
@@ -117,6 +117,7 @@ fn batch(workspace: &Path, request_id: u64) -> BatchRequest {
             version: "1.0.0".to_owned(),
             named: vec!["value".to_owned()],
             import_kind: ImportKind::Named,
+            runtime: ImportRuntime::Component,
         }],
         streaming: false,
     }
@@ -142,6 +143,7 @@ fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -
                 Vec::new()
             },
             import_kind,
+            runtime: ImportRuntime::Component,
         }],
         streaming: false,
     }
@@ -164,6 +166,7 @@ fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
                 version: "1.0.0".to_owned(),
                 named: vec!["left".to_owned()],
                 import_kind: ImportKind::Named,
+                runtime: ImportRuntime::Component,
             },
             ImportRequest {
                 specifier: "right-lib".to_owned(),
@@ -171,6 +174,7 @@ fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
                 version: "1.0.0".to_owned(),
                 named: vec!["right".to_owned()],
                 import_kind: ImportKind::Named,
+                runtime: ImportRuntime::Component,
             },
         ],
         streaming: false,

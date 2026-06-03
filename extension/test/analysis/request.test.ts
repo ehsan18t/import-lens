@@ -24,5 +24,17 @@ test("createImportRequest preserves subpath specifier and root package name", ()
     version: "3.6.0",
     named: ["format"],
     import_kind: "named",
+    runtime: "component",
+  });
+});
+
+test("createImportRequest preserves detected import runtime", () => {
+  assert.deepEqual(createImportRequest({ ...detected, runtime: "server" }, "3.6.0"), {
+    specifier: "date-fns/format",
+    package: "date-fns",
+    version: "3.6.0",
+    named: ["format"],
+    import_kind: "named",
+    runtime: "server",
   });
 });

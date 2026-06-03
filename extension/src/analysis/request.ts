@@ -7,5 +7,5 @@ export const createImportRequest = (detected: DetectedImport, version: string): 
   version,
   named: detected.named,
   import_kind: detected.importKind,
+  runtime: detected.runtime,
 });
-

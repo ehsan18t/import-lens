@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -11,6 +11,30 @@ pub enum ImportKind {
     Dynamic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportRuntime {
+    Component,
+    Client,
+    Server,
+}
+
+impl Default for ImportRuntime {
+    fn default() -> Self {
+        Self::Component
+    }
+}
+
+impl ImportRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Component => "component",
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportRequest {
     pub specifier: String,
@@ -19,6 +43,8 @@ pub struct ImportRequest {
     pub version: String,
     pub named: Vec<String>,
     pub import_kind: ImportKind,
+    #[serde(default)]
+    pub runtime: ImportRuntime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest};
+use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
 use import_lens_daemon::pipeline::analyze::{AnalysisContext, analyze_import};
 use std::{
     fs,
@@ -75,6 +75,7 @@ fn import_request(
         version: version.to_owned(),
         named: named.iter().map(|name| (*name).to_owned()).collect(),
         import_kind,
+        runtime: ImportRuntime::Component,
     }
 }
 
@@ -204,6 +205,7 @@ fn analyze_import_computes_static_sizes_for_local_package_entry() {
         version: "1.0.0".to_owned(),
         named: vec!["used".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -456,6 +458,7 @@ fn analyze_import_returns_partial_error_result_on_missing_entry() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -505,6 +508,7 @@ fn analyze_import_resolves_dotted_nestjs_style_subpath() {
         version: "11.1.24".to_owned(),
         named: vec!["DynamicModule".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -543,6 +547,7 @@ fn analyze_import_resolves_package_from_active_document_tree() {
         version: "1.11.13".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -584,6 +589,7 @@ fn analyze_commonjs_literal_require_graph_includes_required_modules() {
         version: "1.0.0".to_owned(),
         named: vec!["used".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -640,6 +646,7 @@ fn analyze_commonjs_dynamic_require_uses_static_fallback_diagnostic() {
         version: "1.0.0".to_owned(),
         named: vec!["used".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -681,6 +688,7 @@ fn analyze_commonjs_module_exports_object_reports_named_exports() {
         version: "1.0.0".to_owned(),
         named: vec!["alias".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -722,6 +730,7 @@ fn analyze_import_reports_circular_dependency_diagnostics() {
         version: "1.0.0".to_owned(),
         named: vec!["value".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -761,6 +770,7 @@ fn analyze_import_rejects_unsafe_package_names() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -805,6 +815,7 @@ fn analyze_import_resolves_subpath_via_exports_map() {
         version: "5.0.0".to_owned(),
         named: vec!["fade".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -846,6 +857,7 @@ fn analyze_import_resolves_root_entry_via_exports_dot() {
         version: "2.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -881,6 +893,7 @@ fn analyze_import_resolves_string_shorthand_exports() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -923,6 +936,7 @@ fn analyze_import_resolves_conditional_exports_with_nested_conditions() {
         version: "3.0.0".to_owned(),
         named: vec!["platform".to_owned()],
         import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -963,6 +977,7 @@ fn analyze_import_resolves_wildcard_exports_pattern() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -1003,6 +1018,7 @@ fn analyze_import_errors_on_unmapped_subpath_when_exports_present() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -1048,6 +1064,7 @@ fn analyze_import_resolves_array_fallback_exports() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -1085,6 +1102,7 @@ fn analyze_import_resolves_top_level_condition_map_exports() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -1120,6 +1138,7 @@ fn analyze_import_rejects_typescript_entry_files() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -1164,6 +1183,7 @@ fn analyze_import_strips_comments_for_minified_estimate() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
@@ -1203,6 +1223,7 @@ fn analyze_import_rejects_files_over_size_limit() {
         version: "1.0.0".to_owned(),
         named: vec![],
         import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);

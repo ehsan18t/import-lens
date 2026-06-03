@@ -1,5 +1,5 @@
 use import_lens_daemon::{
-    ipc::protocol::{BatchRequest, ImportKind, ImportRequest, PROTOCOL_VERSION},
+    ipc::protocol::{BatchRequest, ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION},
     service::ImportLensService,
 };
 use std::{
@@ -42,6 +42,7 @@ fn uuid_batch(workspace: &Path, request_id: u64) -> BatchRequest {
             version: "13.0.0".to_owned(),
             named: vec!["v4".to_owned()],
             import_kind: ImportKind::Named,
+            runtime: ImportRuntime::Component,
         }],
         streaming: false,
     }
