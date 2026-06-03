@@ -58,44 +58,48 @@ impl ImportLensService {
         }
     }
 
-    pub fn handle_batch_streaming(&self, request: BatchRequest) -> Vec<BatchResponse> {
+    pub fn handle_batch_streaming<F>(&self, request: BatchRequest, emit_partial: F) -> BatchResponse
+    where
+        F: Fn(BatchResponse) + Sync,
+    {
         if !is_supported_protocol_version(request.version) {
-            return vec![protocol_error_batch_response(
+            return protocol_error_batch_response(
                 &request,
                 format!("unsupported protocol version {}", request.version),
-            )];
+            );
         }
 
         if request.version < 2 || !request.streaming {
-            return vec![self.handle_batch(request)];
+            return self.handle_batch(request);
         }
 
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
-        let mut imports = Vec::with_capacity(request.imports.len());
-        let mut responses = Vec::with_capacity(request.imports.len() + 1);
-
-        for (index, item) in request.imports.iter().enumerate() {
-            let result = self.analyze_with_cache(&context, item);
-            imports.push(result.clone());
-            responses.push(BatchResponse {
-                version: request.version,
-                request_id: request.request_id,
-                imports: vec![result],
-                indexes: Some(vec![index]),
-            });
-        }
+        let mut imports = request
+            .imports
+            .par_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let result = self.analyze_with_cache(&context, item);
+                emit_partial(BatchResponse {
+                    version: request.version,
+                    request_id: request.request_id,
+                    imports: vec![result.clone()],
+                    indexes: Some(vec![index]),
+                });
+                result
+            })
+            .collect::<Vec<_>>();
         annotate_shared_bytes(&mut imports);
 
-        responses.push(BatchResponse {
+        BatchResponse {
             version: request.version,
             request_id: request.request_id,
             imports,
             indexes: None,
-        });
-        responses
+        }
     }
 
     pub fn handle_file_size(&self, request: FileSizeRequest) -> FileSizeResponse {

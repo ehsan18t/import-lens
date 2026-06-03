@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 const LIFECYCLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -117,14 +118,17 @@ where
                     lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
                     if request.version >= 2 && request.streaming {
-                        let responses = tokio::task::spawn_blocking(move || {
-                            svc.handle_batch_streaming(request)
-                        })
-                        .await
-                        .expect("spawn_blocking failed");
-                        for response in responses {
+                        let (partial_tx, mut partial_rx) = mpsc::unbounded_channel();
+                        let response_handle = tokio::task::spawn_blocking(move || {
+                            svc.handle_batch_streaming(request, move |partial| {
+                                let _ = partial_tx.send(partial);
+                            })
+                        });
+                        while let Some(response) = partial_rx.recv().await {
                             stream.write_all(&encode_frame(&response)?).await?;
                         }
+                        let response = response_handle.await.expect("spawn_blocking failed");
+                        stream.write_all(&encode_frame(&response)?).await?;
                     } else {
                         let response =
                             tokio::task::spawn_blocking(move || svc.handle_batch(request))
@@ -217,4 +221,259 @@ fn recycle_if_needed(
 
     eprintln!("[import-lens-daemon] lifecycle recycle requested: {reason:?}");
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{
+        codec::{FrameDecoder, decode_payload, encode_frame},
+        protocol::{
+            BatchRequest, BatchResponse, HelloMessage, ImportKind, ImportRequest, ImportRuntime,
+            PROTOCOL_VERSION, ShutdownMessage,
+        },
+    };
+    use std::{
+        collections::VecDeque,
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+
+    struct ResponseReader {
+        decoder: FrameDecoder,
+        pending: VecDeque<BatchResponse>,
+    }
+
+    impl ResponseReader {
+        fn new() -> Self {
+            Self {
+                decoder: FrameDecoder::default(),
+                pending: VecDeque::new(),
+            }
+        }
+
+        async fn read_response(&mut self, stream: &mut DuplexStream) -> BatchResponse {
+            if let Some(response) = self.pending.pop_front() {
+                return response;
+            }
+
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("server response should be readable");
+                assert!(read > 0, "server closed before writing response");
+                for payload in self
+                    .decoder
+                    .push(&buffer[..read])
+                    .expect("server frame should decode")
+                {
+                    self.pending.push_back(
+                        decode_payload::<BatchResponse>(&payload)
+                            .expect("batch response should decode"),
+                    );
+                }
+                if let Some(response) = self.pending.pop_front() {
+                    return response;
+                }
+            }
+        }
+    }
+
+    fn temp_workspace() -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("import-lens-server-{suffix}"));
+        fs::create_dir_all(path.join("src")).expect("temp workspace should be created");
+        path
+    }
+
+    fn write_tiny_package(workspace: &Path) {
+        let package_root = workspace.join("node_modules").join("tiny-stream-lib");
+        fs::create_dir_all(&package_root).expect("package root should be created");
+        fs::write(
+            package_root.join("package.json"),
+            r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        )
+        .expect("package manifest should be written");
+        fs::write(package_root.join("index.js"), "export const value = 1;")
+            .expect("entry should be written");
+    }
+
+    fn write_heavy_package(workspace: &Path) {
+        let package_root = workspace.join("node_modules").join("heavy-stream-lib");
+        fs::create_dir_all(&package_root).expect("package root should be created");
+        fs::write(
+            package_root.join("package.json"),
+            r#"{"version":"1.0.0","module":"index.js","sideEffects":true}"#,
+        )
+        .expect("package manifest should be written");
+
+        let mut entry = String::new();
+        for index in 0..8 {
+            entry.push_str(&format!("import './payload-{index}.js';\n"));
+            fs::write(
+                package_root.join(format!("payload-{index}.js")),
+                format!(
+                    "globalThis.__importLensPayload{index} = '{}';\n",
+                    "x".repeat(1024 * 1024)
+                ),
+            )
+            .expect("payload module should be written");
+        }
+        entry.push_str("export const value = 1;\n");
+        fs::write(package_root.join("index.js"), entry).expect("entry should be written");
+    }
+
+    fn hello(workspace: &Path) -> HelloMessage {
+        HelloMessage {
+            message_type: "hello".to_owned(),
+            version: PROTOCOL_VERSION,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            storage_path: workspace.join(".import-lens").to_string_lossy().to_string(),
+            enable_disk_cache: false,
+            log_level: "error".to_owned(),
+        }
+    }
+
+    fn streaming_batch(workspace: &Path, request_id: u64) -> BatchRequest {
+        let active_document_path = workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string();
+
+        BatchRequest {
+            version: PROTOCOL_VERSION,
+            request_id,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            active_document_path,
+            imports: vec![
+                ImportRequest {
+                    specifier: "tiny-stream-lib".to_owned(),
+                    package_name: "tiny-stream-lib".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    named: vec!["value".to_owned()],
+                    import_kind: ImportKind::Named,
+                    runtime: ImportRuntime::Component,
+                },
+                ImportRequest {
+                    specifier: "heavy-stream-lib".to_owned(),
+                    package_name: "heavy-stream-lib".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    named: vec!["value".to_owned()],
+                    import_kind: ImportKind::Named,
+                    runtime: ImportRuntime::Component,
+                },
+            ],
+            streaming: true,
+        }
+    }
+
+    fn cache_warmup_batch(workspace: &Path, request_id: u64) -> BatchRequest {
+        let mut batch = streaming_batch(workspace, request_id);
+        batch.imports.truncate(1);
+        batch.streaming = false;
+        batch
+    }
+
+    #[tokio::test]
+    async fn server_writes_streaming_partial_frame_before_final_response() {
+        let workspace = temp_workspace();
+        write_tiny_package(&workspace);
+        write_heavy_package(&workspace);
+
+        let (mut client_stream, server_stream) = duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            handle_connection(
+                server_stream,
+                None,
+                Arc::new(ImportLensService::new(None, false)),
+                Prefetcher::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        });
+        let mut reader = ResponseReader::new();
+
+        client_stream
+            .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+            .await
+            .expect("hello should be written");
+        client_stream
+            .write_all(
+                &encode_frame(&cache_warmup_batch(&workspace, 1))
+                    .expect("warmup request should encode"),
+            )
+            .await
+            .expect("warmup should be written");
+        let warmup = reader.read_response(&mut client_stream).await;
+        assert_eq!(warmup.request_id, 1);
+        assert_eq!(warmup.indexes, None);
+
+        client_stream
+            .write_all(
+                &encode_frame(&streaming_batch(&workspace, 2))
+                    .expect("streaming request should encode"),
+            )
+            .await
+            .expect("streaming request should be written");
+        let first_partial = tokio::time::timeout(
+            Duration::from_millis(200),
+            reader.read_response(&mut client_stream),
+        )
+        .await
+        .expect("cached import partial should arrive before the heavy import finishes");
+        assert_eq!(first_partial.request_id, 2);
+        assert_eq!(first_partial.indexes, Some(vec![0]));
+        assert_eq!(first_partial.imports.len(), 1);
+
+        let early_final = tokio::time::timeout(
+            Duration::from_millis(20),
+            reader.read_response(&mut client_stream),
+        )
+        .await;
+        assert!(
+            early_final.is_err(),
+            "final response should not be buffered with the first partial",
+        );
+
+        let second_partial = tokio::time::timeout(
+            Duration::from_secs(10),
+            reader.read_response(&mut client_stream),
+        )
+        .await
+        .expect("heavy import partial should arrive");
+        assert_eq!(second_partial.indexes, Some(vec![1]));
+
+        let final_response = tokio::time::timeout(
+            Duration::from_secs(10),
+            reader.read_response(&mut client_stream),
+        )
+        .await
+        .expect("final response should arrive");
+        assert_eq!(final_response.indexes, None);
+        assert_eq!(final_response.imports.len(), 2);
+
+        client_stream
+            .write_all(
+                &encode_frame(&ShutdownMessage {
+                    message_type: "shutdown".to_owned(),
+                })
+                .expect("shutdown should encode"),
+            )
+            .await
+            .expect("shutdown should be written");
+        server
+            .await
+            .expect("server task should join")
+            .expect("server should exit cleanly");
+        fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    }
 }

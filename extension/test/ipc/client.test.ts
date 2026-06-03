@@ -211,6 +211,50 @@ test("IpcClient emits streaming partials and resolves final batch response", asy
   }
 });
 
+test("IpcClient ignores stale streaming partials for other request IDs", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const stalePartial: BatchResponse = {
+    version: 2,
+    request_id: 98,
+    imports: [emptyResult("stale-lib")],
+    indexes: [0],
+  };
+  const final: BatchResponse = {
+    version: 2,
+    request_id: 99,
+    imports: [emptyResult("react")],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    setTimeout(() => {
+      socket.write(encodeFrame(stalePartial));
+      socket.write(encodeFrame(final));
+    }, 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const partials: BatchResponse[] = [];
+    client.on("batchPartial", (response: BatchResponse) => {
+      partials.push(response);
+    });
+
+    const response = await client.requestBatch(batchRequest(99));
+
+    assert.equal(response.request_id, 99);
+    assert.equal(response.imports.length, 1);
+    assert.equal(partials.length, 0);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
 test("IpcClient resolves export enumeration responses independently from batches", async () => {
   const pipeName = testPipeName();
   const sockets = new Set<net.Socket>();

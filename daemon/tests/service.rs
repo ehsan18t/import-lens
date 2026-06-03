@@ -8,6 +8,7 @@ use import_lens_daemon::{
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -643,14 +644,23 @@ fn service_streams_indexed_partials_before_final_response() {
     request.version = 2;
     request.streaming = true;
 
-    let responses = service.handle_batch_streaming(request);
+    let partials = Mutex::new(Vec::new());
+    let final_response = service.handle_batch_streaming(request, |partial| {
+        partials
+            .lock()
+            .expect("partials lock should not be poisoned")
+            .push(partial);
+    });
+    let responses = partials
+        .into_inner()
+        .expect("partials lock should not be poisoned");
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(responses.len(), 2);
+    assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].indexes, Some(vec![0]));
     assert_eq!(responses[0].imports.len(), 1);
-    assert_eq!(responses[1].indexes, None);
-    assert_eq!(responses[1].imports.len(), 1);
+    assert_eq!(final_response.indexes, None);
+    assert_eq!(final_response.imports.len(), 1);
 }
 
 #[test]
