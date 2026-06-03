@@ -26,8 +26,16 @@ fn write_source(root: &Path, relative_path: &str, source: &str) {
 }
 
 fn request(package_name: &str, runtime: ImportRuntime) -> ImportRequest {
+    request_for_specifier(package_name, package_name, runtime)
+}
+
+fn request_for_specifier(
+    specifier: &str,
+    package_name: &str,
+    runtime: ImportRuntime,
+) -> ImportRequest {
     ImportRequest {
-        specifier: package_name.to_owned(),
+        specifier: specifier.to_owned(),
         package_name: package_name.to_owned(),
         version: "1.0.0".to_owned(),
         named: Vec::new(),
@@ -103,4 +111,103 @@ fn resolver_uses_node_condition_for_server_runtime_exports() {
 
     fs::remove_dir_all(root).expect("temp resolver workspace should be removed");
     assert!(resolved.entry_path.ends_with("node.js"), "{resolved:?}");
+}
+
+#[test]
+fn resolver_keeps_import_condition_file_with_require_string_as_esm() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "node_modules/string-import-pkg/package.json",
+        r#"{"version":"1.0.0","exports":{"import":"./index.js","default":"./index.cjs"}}"#,
+    );
+    write_source(
+        &root,
+        "node_modules/string-import-pkg/index.js",
+        r#"export const text = "literal require("; "#,
+    );
+    write_source(
+        &root,
+        "node_modules/string-import-pkg/index.cjs",
+        "exports.text = 'commonjs';",
+    );
+
+    let resolved = resolve_package_entry(
+        &root.join("src").join("app.ts"),
+        &request("string-import-pkg", ImportRuntime::Component),
+    )
+    .expect("import condition entry should resolve");
+
+    fs::remove_dir_all(root).expect("temp resolver workspace should be removed");
+    assert!(resolved.entry_path.ends_with("index.js"), "{resolved:?}");
+    assert!(!resolved.is_cjs, "{resolved:?}");
+}
+
+#[test]
+fn resolver_marks_commonjs_type_js_subpath_as_cjs() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "node_modules/typed-cjs-pkg/package.json",
+        r#"{"version":"1.0.0","type":"commonjs"}"#,
+    );
+    write_source(
+        &root,
+        "node_modules/typed-cjs-pkg/subpath.js",
+        "const value = 1;",
+    );
+
+    let resolved = resolve_package_entry(
+        &root.join("src").join("app.ts"),
+        &request_for_specifier(
+            "typed-cjs-pkg/subpath",
+            "typed-cjs-pkg",
+            ImportRuntime::Component,
+        ),
+    )
+    .expect("CommonJS typed subpath should resolve");
+
+    fs::remove_dir_all(root).expect("temp resolver workspace should be removed");
+    assert!(resolved.entry_path.ends_with("subpath.js"), "{resolved:?}");
+    assert!(resolved.is_cjs, "{resolved:?}");
+}
+
+#[test]
+fn resolver_keeps_mjs_and_module_type_entries_as_esm() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "node_modules/mjs-pkg/package.json",
+        r#"{"version":"1.0.0","main":"index.mjs"}"#,
+    );
+    write_source(
+        &root,
+        "node_modules/mjs-pkg/index.mjs",
+        r#"export const text = "module.exports";"#,
+    );
+    write_source(
+        &root,
+        "node_modules/module-type-pkg/package.json",
+        r#"{"version":"1.0.0","type":"module","main":"index.js"}"#,
+    );
+    write_source(
+        &root,
+        "node_modules/module-type-pkg/index.js",
+        r#"export const text = "require("; "#,
+    );
+
+    let mjs = resolve_package_entry(
+        &root.join("src").join("app.ts"),
+        &request("mjs-pkg", ImportRuntime::Component),
+    )
+    .expect(".mjs entry should resolve");
+    let module_type = resolve_package_entry(
+        &root.join("src").join("app.ts"),
+        &request("module-type-pkg", ImportRuntime::Component),
+    )
+    .expect("module type entry should resolve");
+
+    fs::remove_dir_all(root).expect("temp resolver workspace should be removed");
+    assert!(!mjs.is_cjs, "{mjs:?}");
+    assert!(!module_type.is_cjs, "{module_type:?}");
 }

@@ -450,12 +450,11 @@ fn missing_export_diagnostics(
     request: &ImportRequest,
     graph: &ModuleGraph,
 ) -> Vec<ImportDiagnostic> {
-    if !matches!(request.import_kind, ImportKind::Named) {
+    let Some(requested_exports) = diagnostic_requested_exports(request) else {
         return Vec::new();
-    }
+    };
 
-    let missing = request
-        .named
+    let missing = requested_exports
         .iter()
         .filter(|exported_name| {
             !graph_exports_name(graph, graph.entry_id, exported_name, &mut HashSet::new())
@@ -469,7 +468,7 @@ fn missing_export_diagnostics(
 
     vec![ImportDiagnostic {
         stage: "exports".to_owned(),
-        message: format!("named export(s) not found: {}", missing.join(", ")),
+        message: missing_export_message(request, &missing),
         details: vec![
             format!("specifier: {}", request.specifier),
             format!("missing_exports: {}", missing.join(", ")),
@@ -481,12 +480,11 @@ fn missing_cjs_export_diagnostics(
     request: &ImportRequest,
     exports: &[String],
 ) -> Vec<ImportDiagnostic> {
-    if !matches!(request.import_kind, ImportKind::Named) {
+    let Some(requested_exports) = diagnostic_requested_exports(request) else {
         return Vec::new();
-    }
+    };
 
-    let missing = request
-        .named
+    let missing = requested_exports
         .iter()
         .filter(|name| !exports.contains(name))
         .cloned()
@@ -498,12 +496,34 @@ fn missing_cjs_export_diagnostics(
 
     vec![ImportDiagnostic {
         stage: "exports".to_owned(),
-        message: format!("named CommonJS export(s) not found: {}", missing.join(", ")),
+        message: missing_cjs_export_message(request, &missing),
         details: vec![
             format!("specifier: {}", request.specifier),
             format!("missing_exports: {}", missing.join(", ")),
         ],
     }]
+}
+
+fn diagnostic_requested_exports(request: &ImportRequest) -> Option<Vec<String>> {
+    match request.import_kind {
+        ImportKind::Named => Some(request.named.clone()),
+        ImportKind::Default => Some(vec!["default".to_owned()]),
+        ImportKind::Namespace | ImportKind::Dynamic => None,
+    }
+}
+
+fn missing_export_message(request: &ImportRequest, missing: &[String]) -> String {
+    match request.import_kind {
+        ImportKind::Default => "default export not found".to_owned(),
+        _ => format!("named export(s) not found: {}", missing.join(", ")),
+    }
+}
+
+fn missing_cjs_export_message(request: &ImportRequest, missing: &[String]) -> String {
+    match request.import_kind {
+        ImportKind::Default => "default CommonJS export not found".to_owned(),
+        _ => format!("named CommonJS export(s) not found: {}", missing.join(", ")),
+    }
 }
 
 fn graph_exports_name(

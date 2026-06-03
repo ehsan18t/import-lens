@@ -109,7 +109,8 @@ fn resolve_legacy_fallback(
         }
 
         if let Some(main) = manifest.json.get("main").and_then(Value::as_str) {
-            return resolve_file_candidate(&manifest.root.join(main)).map(|path| (path, true));
+            return resolve_file_candidate(&manifest.root.join(main))
+                .map(|path| classify_resolved_entry(manifest, path, false));
         }
 
         return Err(format!(
@@ -118,22 +119,27 @@ fn resolve_legacy_fallback(
     }
 
     if let Some(sub) = subpath {
-        return resolve_file_candidate(&manifest.root.join(sub)).map(|path| (path, false));
+        return resolve_file_candidate(&manifest.root.join(sub))
+            .map(|path| classify_resolved_entry(manifest, path, false));
     }
 
     if let Some(module) = manifest.json.get("module").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(module)).map(|path| (path, false));
+        return resolve_file_candidate(&manifest.root.join(module))
+            .map(|path| classify_resolved_entry(manifest, path, false));
     }
 
     if let Some(browser) = manifest.json.get("browser").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(browser)).map(|path| (path, false));
+        return resolve_file_candidate(&manifest.root.join(browser))
+            .map(|path| classify_resolved_entry(manifest, path, false));
     }
 
     if let Some(main) = manifest.json.get("main").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(main)).map(|path| (path, true));
+        return resolve_file_candidate(&manifest.root.join(main))
+            .map(|path| classify_resolved_entry(manifest, path, false));
     }
 
-    resolve_file_candidate(&manifest.root.join("index.js")).map(|path| (path, true))
+    resolve_file_candidate(&manifest.root.join("index.js"))
+        .map(|path| classify_resolved_entry(manifest, path, false))
 }
 
 fn validate_declared_entry_resolution(
@@ -275,24 +281,51 @@ fn entry_matches_manifest_esm_field(manifest: &PackageManifest, entry_path: &Pat
         .any(|candidate| candidate == entry_path)
 }
 
+fn classify_resolved_entry(
+    manifest: &PackageManifest,
+    entry_path: PathBuf,
+    resolver_is_cjs: bool,
+) -> (PathBuf, bool) {
+    let is_cjs = resolved_entry_is_commonjs(manifest, &entry_path, resolver_is_cjs);
+    (entry_path, is_cjs)
+}
+
 fn resolved_entry_is_commonjs(
     manifest: &PackageManifest,
     entry_path: &Path,
     resolver_is_cjs: bool,
 ) -> bool {
+    let Some(extension) = path_extension(entry_path) else {
+        return resolver_is_cjs;
+    };
+
+    if extension == "cjs" {
+        return true;
+    }
+    if extension == "mjs" {
+        return false;
+    }
     if entry_matches_manifest_esm_field(manifest, entry_path) {
         return false;
     }
-
-    let path_str = entry_path.to_string_lossy();
-    if resolver_is_cjs || path_looks_cjs(&path_str) {
-        return true;
-    }
-    if path_str.ends_with(".mjs") || package_type(&manifest.json) == Some("module") {
+    if entry_matches_exports_condition(manifest, entry_path, &["browser", "import"]) {
         return false;
     }
+    if entry_matches_exports_condition(manifest, entry_path, &["require"]) {
+        return true;
+    }
 
-    entry_matches_manifest_main_field(manifest, entry_path) || entry_looks_commonjs(entry_path)
+    match package_type(&manifest.json) {
+        Some("module") => return false,
+        Some("commonjs") => return true,
+        _ => {}
+    }
+
+    resolver_is_cjs || entry_matches_manifest_main_field(manifest, entry_path) || extension == "js"
+}
+
+fn path_extension(path: &Path) -> Option<&str> {
+    path.extension().and_then(|extension| extension.to_str())
 }
 
 fn entry_matches_manifest_main_field(manifest: &PackageManifest, entry_path: &Path) -> bool {
@@ -306,6 +339,55 @@ fn entry_matches_manifest_main_field(manifest: &PackageManifest, entry_path: &Pa
 
 fn package_type(package_json: &Value) -> Option<&str> {
     package_json.get("type").and_then(Value::as_str)
+}
+
+fn entry_matches_exports_condition(
+    manifest: &PackageManifest,
+    entry_path: &Path,
+    conditions: &[&str],
+) -> bool {
+    manifest.json.get("exports").is_some_and(|exports| {
+        exports_condition_points_to_entry(exports, manifest, entry_path, conditions)
+    })
+}
+
+fn exports_condition_points_to_entry(
+    value: &Value,
+    manifest: &PackageManifest,
+    entry_path: &Path,
+    conditions: &[&str],
+) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+
+    map.iter().any(|(key, child)| {
+        if conditions.contains(&key.as_str())
+            && exports_target_points_to_entry(child, manifest, entry_path)
+        {
+            return true;
+        }
+
+        exports_condition_points_to_entry(child, manifest, entry_path, conditions)
+    })
+}
+
+fn exports_target_points_to_entry(
+    value: &Value,
+    manifest: &PackageManifest,
+    entry_path: &Path,
+) -> bool {
+    match value {
+        Value::String(target) => resolve_manifest_file_candidate(manifest, target)
+            .is_ok_and(|candidate| candidate == entry_path),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| exports_target_points_to_entry(item, manifest, entry_path)),
+        Value::Object(map) => map
+            .values()
+            .any(|item| exports_target_points_to_entry(item, manifest, entry_path)),
+        _ => false,
+    }
 }
 
 fn resolve_manifest_file_candidate(
@@ -467,15 +549,4 @@ fn subpath_for_request(request: &ImportRequest) -> Option<&str> {
 
 fn path_looks_cjs(path: &str) -> bool {
     path.ends_with(".cjs")
-}
-
-fn entry_looks_commonjs(entry_path: &Path) -> bool {
-    let Ok(source) = fs::read_to_string(entry_path) else {
-        return false;
-    };
-
-    source.contains("module.exports")
-        || source.contains("exports.")
-        || source.contains("require(")
-        || source.contains("require (")
 }

@@ -402,6 +402,89 @@ fn analyze_import_reports_missing_named_export_without_failing_result() {
 }
 
 #[test]
+fn analyze_import_reports_missing_esm_default_export_without_failing_result() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "missing-default-esm-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "export const present = 1;\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "missing-default-esm-lib",
+            "missing-default-esm-lib",
+            "1.0.0",
+            ImportKind::Default,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "exports"
+                && diagnostic.message.contains("default")),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_import_reports_missing_cjs_default_export_without_failing_result() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "missing-default-cjs-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+    write_package_file(
+        &workspace,
+        "missing-default-cjs-lib",
+        "index.cjs",
+        "exports.present = 1;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "missing-default-cjs-lib",
+            "missing-default-cjs-lib",
+            "1.0.0",
+            ImportKind::Default,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.is_cjs);
+    assert!(result.raw_bytes > 0);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "exports"
+                && diagnostic.message.contains("default")),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_namespace_import_reports_oxc_fallback_diagnostic() {
     let workspace = temp_workspace();
     write_package(
