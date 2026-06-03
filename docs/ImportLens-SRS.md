@@ -214,7 +214,7 @@ A WebAssembly daemon fallback may be added in v1.1 or later using the existing a
 3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
 4. If the hash matches, it spawns the daemon process, pipes daemon stdout/stderr into the ImportLens output channel according to the configured log level, opens a socket connection, and sends a versioned `HelloMessage`. The socket path includes a window-unique identifier (NFR-014b).
 5. If no native binary is found, or if the binary cannot be verified, spawned, connected, or sent a hello message, the extension disposes any partial IPC client state, terminates the spawned daemon process when it is still alive, and enters the restart/degraded-mode path defined in FR-015.
-6. The daemon loads its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and preloads valid size entries into the in-memory `papaya` cache.
+6. The daemon opens its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and preloads only a bounded set of recent valid size entries into the in-memory `papaya` cache.
 7. The extension is ready to accept requests.
 
 ### 3.4 Request Lifecycle
@@ -399,11 +399,11 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. The cache key must be the string `<specifier>@<version>::<named_exports_sorted_and_joined>`, where `<specifier>` preserves subpaths such as `date-fns/format`. Cache hits must be returned without running any computation.
 
-**FR-026** (Critical) - When `importLens.enableDiskCache` is `true` (the default), the daemon must persist the in-memory cache to a `redb` database stored in the VS Code global storage directory. On startup, the daemon must load all entries from `redb` into `papaya`.
+**FR-026** (Critical) - When `importLens.enableDiskCache` is `true` (the default), the daemon must persist computed cache entries to a `redb` database stored in the VS Code global storage directory. On startup, the daemon must preload only the configured bounded recent-entry set into `papaya`; other valid disk entries remain available through lazy disk lookup and are promoted into memory on first hit.
 
-**FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer. The current schema version is `2`. On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration and protocol-result shape changes).
+**FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer. The current schema version is `3`. On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration and protocol-result shape changes).
 
-**FR-026b** (Medium) - The daemon must track recent cache usage in persistent metadata so that startup can prewarm the most useful entries. Each successful disk insert or disk hit must update the recent-entry timestamp for the corresponding cache key. On handshake completion, the daemon must prewarm up to the 20 most recent valid entries after resolving them from the active workspace dependency tree.
+**FR-026b** (Medium) - The daemon must track recent cache usage in persistent metadata so that startup can prewarm the most useful entries. Each successful disk insert must update the recent-entry timestamp for the corresponding cache key. Disk and memory hits may batch or debounce recency updates to avoid synchronous redb writes on every hot memory hit, but pending recency updates must be flushed during normal shutdown/drop. On handshake completion, the daemon must prewarm up to the 20 most recent valid entries after resolving them from the active workspace dependency tree.
 
 **FR-027** (High) - The TypeScript extension host must watch `node_modules` for package version changes using VS Code's native `vscode.workspace.createFileSystemWatcher` API with two glob patterns: `**/node_modules/*/package.json` for regular packages and `**/node_modules/@*/*/package.json` for scoped packages (e.g. `@babel/core`). Both watchers must be registered at activation and both must send `CacheInvalidate` messages to the daemon when they fire. The `notify` Rust crate must not be used for this purpose. On Linux, a Rust process watching `node_modules` directly would register one `inotify` file descriptor per directory, which on kernels before 5.11 could rapidly exhaust the system-wide `inotify` limit (`fs.inotify.max_user_watches`, which defaulted to 8,192 prior to kernel 5.11). Since kernel 5.11 (February 2021), the default is dynamically scaled based on available memory (up to 1,048,576 on 64-bit systems with >=128 GB RAM), but the old default persists on older kernels and in constrained containers. Regardless of kernel version, VS Code's file watcher already manages file descriptor budgets safely for all extensions combined, making it the correct abstraction. When the watcher fires for a given package, the extension host must send a `CacheInvalidate` message over the existing IPC socket to the daemon. On receiving this message, the daemon must evict all cache entries for that package from both `papaya` and `redb`. When an entire `node_modules` directory is deleted or more than 20 packages are invalidated in a single burst, the extension host must send a single `CacheInvalidateAll` message instead of individual per-package messages. See Section 10.1 for the `CacheInvalidateAllMessage` schema.
 
@@ -962,7 +962,8 @@ Extension activates
         │   └─ If recycle rate exceeds threshold: enter degraded mode immediately
         ├─ Open redb database at <globalStoragePath>/importlens.redb
         │   └─ If corrupted: delete, create fresh, log warning
-        ├─ Load all entries from redb into papaya (in-memory cache)
+        ├─ Preload at most the configured recent valid entries into papaya
+        ├─ Serve other disk entries lazily and promote them into memory on hit
         ├─ Begin listening on socket / named pipe
         └─ After hello, prewarm up to 20 recent valid cache entries
 ```
@@ -1105,15 +1106,15 @@ The daemon may keep parsed module graphs in a side in-memory cache keyed by cano
 
 ### 11.1 Persistent Cache Schema (redb)
 
-The `redb` database schema version is `2` and contains these tables:
+The `redb` database schema version is `3` and contains these tables:
 
 | Table name      | Key type                                      | Value type                                      |
 | --------------- | --------------------------------------------- | ----------------------------------------------- |
 | `metadata`      | `&str`                                        | `u64` (`schema_version`)                        |
-| `size_cache`    | `&str` (cache key as defined in Section 10.2) | `&[u8]` (MessagePack-encoded `ImportResult`)    |
+| `size_cache`    | `&str` (cache key as defined in Section 10.2) | `&[u8]` (MessagePack-encoded cache envelope)     |
 | `cache_recents` | `&str` (cache key as defined in Section 10.2) | `u64` (last-used Unix timestamp in milliseconds) |
 
-`size_cache` values persist the same `ImportResult` shape returned over IPC, including optional `module_breakdown` fields when available. The daemon normalizes `cache_hit` to `false` before writing and sets it to `true` when serving a disk hit. `cache_recents` is updated on insert and disk hit, and is used to select up to 20 recent entries for best-effort startup prewarm after hello.
+`size_cache` values persist an internal cache envelope containing the public `ImportResult`, analyzer version, package identity, dependency fingerprints, and full contribution list needed for accurate shared-byte accounting. The daemon normalizes `cache_hit` to `false` before writing and sets it to `true` when serving a memory or disk hit. `cache_recents` is updated on insert and through batched/debounced hit touches, and is used to select up to 20 recent entries for bounded startup preload and best-effort prewarm after hello.
 
 ### 11.2 Configuration Storage
 

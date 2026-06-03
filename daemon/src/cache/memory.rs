@@ -8,6 +8,8 @@ use crate::{
 use papaya::HashMap;
 use std::path::PathBuf;
 
+pub const RECENT_PRELOAD_LIMIT: usize = 20;
+
 #[derive(Debug, Clone)]
 pub struct CachedImport {
     pub result: ImportResult,
@@ -31,12 +33,20 @@ impl Default for ImportCache {
 
 impl ImportCache {
     pub fn new(storage_path: Option<PathBuf>, enable_disk_cache: bool) -> Self {
+        Self::new_with_recent_preload_limit(storage_path, enable_disk_cache, RECENT_PRELOAD_LIMIT)
+    }
+
+    pub fn new_with_recent_preload_limit(
+        storage_path: Option<PathBuf>,
+        enable_disk_cache: bool,
+        recent_preload_limit: usize,
+    ) -> Self {
         let memory = HashMap::new();
         let disk = DiskCache::new(storage_path, enable_disk_cache);
 
         {
             let pinned = memory.pin();
-            for (key, cached) in disk.load_all() {
+            for (key, cached) in disk.load_recent(recent_preload_limit) {
                 pinned.insert(key, cached);
             }
         }
@@ -112,5 +122,9 @@ impl ImportCache {
 
     pub fn recent_keys(&self, limit: usize) -> Vec<String> {
         self.disk.recent_keys(limit)
+    }
+
+    pub fn pending_recency_touch_count(&self) -> usize {
+        self.disk.pending_touch_len()
     }
 }

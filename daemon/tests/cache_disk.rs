@@ -12,6 +12,7 @@ use std::{
 };
 
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
+const RECENTS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_recents");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CURRENT_SCHEMA_VERSION: u64 = 3;
@@ -68,6 +69,20 @@ fn read_schema_version(storage_path: &Path) -> u64 {
         .value()
 }
 
+fn read_recent_timestamp(storage_path: &Path, key: &str) -> u64 {
+    let db = Database::open(db_path(storage_path)).expect("cache database should open");
+    let read_txn = db.begin_read().expect("read transaction should begin");
+    let table = read_txn
+        .open_table(RECENTS_TABLE)
+        .expect("recents table should exist");
+
+    table
+        .get(key)
+        .expect("recent key should be readable")
+        .expect("recent key should exist")
+        .value()
+}
+
 fn write_database_with_schema(storage_path: &Path, schema_version: u64) {
     let db = Database::create(db_path(storage_path)).expect("cache database should be created");
     let write_txn = db.begin_write().expect("write transaction should begin");
@@ -89,6 +104,40 @@ fn write_database_with_schema(storage_path: &Path, schema_version: u64) {
         cache
             .insert("react@18.3.1::default", bytes.as_slice())
             .expect("cache entry should be written");
+    }
+
+    write_txn.commit().expect("database should commit");
+}
+
+fn write_corrupt_cache_entry(storage_path: &Path, key: &str) {
+    let db = Database::create(db_path(storage_path)).expect("cache database should be created");
+    let write_txn = db.begin_write().expect("write transaction should begin");
+
+    {
+        let mut metadata = write_txn
+            .open_table(METADATA_TABLE)
+            .expect("metadata table should open");
+        metadata
+            .insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION)
+            .expect("schema version should be written");
+    }
+
+    {
+        let mut cache = write_txn
+            .open_table(CACHE_TABLE)
+            .expect("cache table should open");
+        cache
+            .insert(key, b"not-messagepack".as_slice())
+            .expect("corrupt cache entry should be written");
+    }
+
+    {
+        let mut recents = write_txn
+            .open_table(RECENTS_TABLE)
+            .expect("recents table should open");
+        recents
+            .insert(key, 1)
+            .expect("recent key should be written");
     }
 
     write_txn.commit().expect("database should commit");
@@ -124,6 +173,97 @@ fn disk_cache_preloads_entries_into_memory_on_startup() {
             .expect("cache entry should be preloaded")
             .cache_hit
     );
+    drop(cache);
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
+fn disk_cache_preloads_at_most_recent_entry_limit() {
+    let storage_path = temp_storage();
+
+    {
+        let cache = ImportCache::new(Some(storage_path.clone()), true);
+        for index in 0..5 {
+            cache.insert(format!("pkg-{index}@1.0.0::default"), result("pkg"));
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    let cache = ImportCache::new_with_recent_preload_limit(Some(storage_path.clone()), true, 2);
+
+    assert_eq!(cache.memory_len(), 2);
+    drop(cache);
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
+fn disk_cache_lazy_hit_populates_memory_cache() {
+    let storage_path = temp_storage();
+
+    {
+        let cache = ImportCache::new(Some(storage_path.clone()), true);
+        cache.insert("react@18.3.1::default".to_owned(), result("react"));
+    }
+
+    let cache = ImportCache::new_with_recent_preload_limit(Some(storage_path.clone()), true, 0);
+
+    assert_eq!(cache.memory_len(), 0);
+    assert!(
+        cache
+            .get("react@18.3.1::default")
+            .expect("lazy disk hit should return result")
+            .cache_hit
+    );
+    assert_eq!(cache.memory_len(), 1);
+    drop(cache);
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
+fn disk_cache_coalesces_repeated_memory_hit_recency_writes() {
+    let storage_path = temp_storage();
+    let key = "react@18.3.1::default";
+
+    {
+        let cache = ImportCache::new(Some(storage_path.clone()), true);
+        cache.insert(key.to_owned(), result("react"));
+    }
+    let first_timestamp = read_recent_timestamp(&storage_path, key);
+    thread::sleep(Duration::from_millis(2));
+
+    {
+        let cache = ImportCache::new_with_recent_preload_limit(Some(storage_path.clone()), true, 1);
+        for _ in 0..3 {
+            assert!(
+                cache
+                    .get(key)
+                    .expect("memory hit should return result")
+                    .cache_hit
+            );
+        }
+
+        assert_eq!(cache.pending_recency_touch_count(), 1);
+    }
+
+    assert!(read_recent_timestamp(&storage_path, key) > first_timestamp);
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
+fn disk_cache_skips_corrupt_entries_without_poisoning_memory() {
+    let storage_path = temp_storage();
+    let key = "corrupt@1.0.0::default";
+    write_corrupt_cache_entry(&storage_path, key);
+
+    let cache = ImportCache::new_with_recent_preload_limit(Some(storage_path.clone()), true, 1);
+
+    assert_eq!(cache.memory_len(), 0);
+    assert!(cache.get(key).is_none());
+    assert_eq!(cache.memory_len(), 0);
     drop(cache);
 
     fs::remove_dir_all(storage_path).expect("temp storage should be removed");

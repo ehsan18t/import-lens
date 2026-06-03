@@ -9,8 +9,10 @@ use crate::{
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +22,7 @@ const RECENTS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_re
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CURRENT_SCHEMA_VERSION: u64 = 3;
+const RECENCY_TOUCH_FLUSH_BATCH: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEnvelope {
@@ -33,81 +36,67 @@ struct CacheEnvelope {
 #[derive(Debug, Default)]
 pub struct DiskCache {
     db: Option<Database>,
+    pending_touches: Mutex<HashMap<String, u64>>,
 }
 
 impl DiskCache {
     pub fn new(storage_path: Option<PathBuf>, enabled: bool) -> Self {
         if !enabled {
-            return Self { db: None };
+            return Self::disabled();
         }
 
         let storage_path = match storage_path {
             Some(path) => path,
-            None => return Self { db: None },
+            None => return Self::disabled(),
         };
 
         Self {
             db: Self::open_database(&storage_path),
+            pending_touches: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<CachedImport> {
+        self.get_entry(key, true)
+    }
+
+    pub fn load_recent(&self, limit: usize) -> Vec<(String, CachedImport)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        self.recent_keys(limit)
+            .into_iter()
+            .filter_map(|key| self.get_entry(&key, false).map(|cached| (key, cached)))
+            .collect()
+    }
+
+    fn get_entry(&self, key: &str, touch: bool) -> Option<CachedImport> {
         let db = self.db.as_ref()?;
         let read_txn = db.begin_read().ok()?;
         let table = read_txn.open_table(CACHE_TABLE).ok()?;
         let value = table.get(key).ok()??;
 
         let bytes = value.value();
-        let cached = decode_cached_result(bytes)?;
+        let cached = match decode_cached_result(bytes) {
+            Some(cached) => cached,
+            None => {
+                drop(table);
+                drop(read_txn);
+                self.remove(key);
+                return None;
+            }
+        };
         if !fingerprints_are_current(&cached.dependency_fingerprints) {
             drop(table);
             drop(read_txn);
             self.remove(key);
             return None;
         }
-        self.touch(key);
+        if touch {
+            self.touch(key);
+        }
         Some(cached)
-    }
-
-    pub fn load_all(&self) -> Vec<(String, CachedImport)> {
-        let db = match self.db.as_ref() {
-            Some(db) => db,
-            None => return Vec::new(),
-        };
-
-        let read_txn = match db.begin_read() {
-            Ok(txn) => txn,
-            Err(error) => {
-                cache_warn(format!("failed to begin cache preload read: {error}"));
-                return Vec::new();
-            }
-        };
-        let table = match read_txn.open_table(CACHE_TABLE) {
-            Ok(table) => table,
-            Err(error) => {
-                cache_warn(format!("failed to open cache table for preload: {error}"));
-                return Vec::new();
-            }
-        };
-        let iter = match table.iter() {
-            Ok(iter) => iter,
-            Err(error) => {
-                cache_warn(format!(
-                    "failed to iterate cache table for preload: {error}"
-                ));
-                return Vec::new();
-            }
-        };
-
-        iter.filter_map(|entry| {
-            let (key, value) = entry.ok()?;
-            let cached = decode_cached_result(value.value())?;
-            if !fingerprints_are_current(&cached.dependency_fingerprints) {
-                return None;
-            }
-            Some((key.value().to_owned(), cached))
-        })
-        .collect()
     }
 
     pub fn insert(&self, key: &str, cached: &CachedImport) {
@@ -134,9 +123,37 @@ impl DiskCache {
             }
             let _ = write_txn.commit();
         }
+        self.remove_pending_touch(key);
     }
 
     pub fn touch(&self, key: &str) {
+        if self.db.is_none() {
+            return;
+        }
+
+        let should_flush = match self.pending_touches.lock() {
+            Ok(mut pending_touches) => {
+                pending_touches.insert(key.to_owned(), unix_millis_now());
+                pending_touches.len() >= RECENCY_TOUCH_FLUSH_BATCH
+            }
+            Err(_) => return,
+        };
+
+        if should_flush {
+            self.flush_pending_touches();
+        }
+    }
+
+    pub fn flush_pending_touches(&self) {
+        let pending_touches = match self.pending_touches.lock() {
+            Ok(mut pending_touches) => {
+                if pending_touches.is_empty() {
+                    return;
+                }
+                std::mem::take(&mut *pending_touches)
+            }
+            Err(_) => return,
+        };
         let db = match self.db.as_ref() {
             Some(db) => db,
             None => return,
@@ -144,10 +161,19 @@ impl DiskCache {
 
         if let Ok(write_txn) = db.begin_write() {
             if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
-                let _ = recents.insert(key, unix_millis_now());
+                for (key, timestamp) in pending_touches {
+                    let _ = recents.insert(key.as_str(), timestamp);
+                }
             }
             let _ = write_txn.commit();
         }
+    }
+
+    pub fn pending_touch_len(&self) -> usize {
+        self.pending_touches
+            .lock()
+            .map(|pending_touches| pending_touches.len())
+            .unwrap_or(0)
     }
 
     pub fn remove(&self, key: &str) {
@@ -168,6 +194,8 @@ impl DiskCache {
     }
 
     pub fn recent_keys(&self, limit: usize) -> Vec<String> {
+        self.flush_pending_touches();
+
         let db = match self.db.as_ref() {
             Some(db) => db,
             None => return Vec::new(),
@@ -230,6 +258,7 @@ impl DiskCache {
                     if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
                         let _ = recents.remove(key.as_str());
                     }
+                    self.remove_pending_touch(&key);
                 }
             }
             let _ = write_txn.commit();
@@ -266,6 +295,26 @@ impl DiskCache {
                 }
             }
             let _ = write_txn.commit();
+        }
+        self.clear_pending_touches();
+    }
+
+    fn disabled() -> Self {
+        Self {
+            db: None,
+            pending_touches: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn remove_pending_touch(&self, key: &str) {
+        if let Ok(mut pending_touches) = self.pending_touches.lock() {
+            pending_touches.remove(key);
+        }
+    }
+
+    fn clear_pending_touches(&self) {
+        if let Ok(mut pending_touches) = self.pending_touches.lock() {
+            pending_touches.clear();
         }
     }
 
@@ -381,6 +430,12 @@ impl DiskCache {
         write_txn
             .commit()
             .map_err(|error| format!("failed to commit schema transaction: {error}"))
+    }
+}
+
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        self.flush_pending_touches();
     }
 }
 

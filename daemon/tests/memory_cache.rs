@@ -38,6 +38,20 @@ fn import_cache_returns_cache_hit_clone_without_mutating_stored_value() {
 }
 
 #[test]
+fn import_cache_does_not_track_recency_touches_when_disk_cache_is_disabled() {
+    let cache = ImportCache::new(None, false);
+    cache.insert("react@18.3.1::default".to_owned(), result("react", false));
+
+    assert!(
+        cache
+            .get("react@18.3.1::default")
+            .expect("cache entry should exist")
+            .cache_hit
+    );
+    assert_eq!(cache.pending_recency_touch_count(), 0);
+}
+
+#[test]
 fn import_cache_invalidates_package_prefixes() {
     let cache = ImportCache::default();
     cache.insert("react@18.3.1::default".to_owned(), result("react", false));
