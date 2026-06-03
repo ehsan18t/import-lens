@@ -201,6 +201,42 @@ fn find_package_manifest(
     active_document_path: &Path,
     request: &ImportRequest,
 ) -> Result<PackageManifest, String> {
+    let package_root = find_package_root(active_document_path, &request.package_name)?;
+    let package_json_path = package_root.join("package.json");
+    let json = serde_json::from_str::<Value>(&fs::read_to_string(&package_json_path).map_err(
+        |error| {
+            format!(
+                "failed to read package manifest {}: {error}",
+                package_json_path.display()
+            )
+        },
+    )?)
+    .map_err(|error| {
+        format!(
+            "failed to parse package manifest {}: {error}",
+            package_json_path.display()
+        )
+    })?;
+
+    if !json.get("version").is_some_and(Value::is_string) {
+        return Err(format!(
+            "package manifest {} is missing a string version",
+            package_json_path.display()
+        ));
+    }
+
+    Ok(PackageManifest {
+        root: package_root,
+        json,
+    })
+}
+
+pub fn find_package_root(
+    active_document_path: &Path,
+    package_name: &str,
+) -> Result<PathBuf, String> {
+    validate_package_name(package_name)?;
+
     let mut current = active_document_path
         .parent()
         .ok_or_else(|| "active document path has no parent directory".to_owned())?
@@ -208,30 +244,12 @@ fn find_package_manifest(
     let mut checked_paths = Vec::new();
 
     loop {
-        let package_root = current.join("node_modules").join(&request.package_name);
+        let package_root = current.join("node_modules").join(package_name);
         let package_json_path = package_root.join("package.json");
         checked_paths.push(format!("checked: {}", package_json_path.display()));
 
         if package_json_path.exists() {
-            let json = serde_json::from_str::<Value>(
-                &fs::read_to_string(&package_json_path).map_err(|error| {
-                    format!(
-                        "failed to read package manifest {}: {error}",
-                        package_json_path.display()
-                    )
-                })?,
-            )
-            .map_err(|error| {
-                format!(
-                    "failed to parse package manifest {}: {error}",
-                    package_json_path.display()
-                )
-            })?;
-
-            return Ok(PackageManifest {
-                root: package_root,
-                json,
-            });
+            return Ok(package_root);
         }
 
         if !current.pop() {
@@ -241,7 +259,7 @@ fn find_package_manifest(
 
     Err(format!(
         "package manifest not found for {}; {}",
-        request.package_name,
+        package_name,
         checked_paths.join("; ")
     ))
 }

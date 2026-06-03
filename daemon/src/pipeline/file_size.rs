@@ -5,6 +5,7 @@ use crate::{
     pipeline::{
         analyze::AnalysisContext,
         bundle::bundle_reachable_modules_with_metadata,
+        cjs::analyze_cjs_graph_with_runtime,
         compress::compress_all,
         graph::{ModuleGraph, ModuleId, ModuleRecord, build_module_graph_cached_with_runtime},
         minify::minify_source_with_markers,
@@ -64,6 +65,7 @@ pub fn compute_file_size(
     let mut combined_modules = Vec::new();
     let mut seen_paths = HashSet::new();
     let mut combined_reachable = ReachableExports::default();
+    let mut conservative_sources = Vec::new();
     let mut diagnostics = Vec::new();
 
     for request in requests {
@@ -82,9 +84,44 @@ pub fn compute_file_size(
         if resolved.is_cjs {
             diagnostics.push(diagnostic(
                 "file_size",
-                "CommonJS imports are not graph-backed for file-level deduplication".to_owned(),
+                "CommonJS import included conservatively without file-level deduplication"
+                    .to_owned(),
                 vec![format!("specifier: {}", request.specifier)],
             ));
+            match analyze_cjs_graph_with_runtime(&resolved.entry_path, request.runtime) {
+                Ok(graph) => {
+                    diagnostics.extend(graph.diagnostics);
+                    if graph.unsupported {
+                        diagnostics.push(diagnostic(
+                            "file_size",
+                            "CommonJS graph contains unsupported dynamic require; included known files conservatively".to_owned(),
+                            vec![format!("specifier: {}", request.specifier)],
+                        ));
+                    }
+                    conservative_sources.push(graph.source);
+                }
+                Err(error) => {
+                    diagnostics.push(diagnostic(
+                        "file_size",
+                        format!(
+                            "CommonJS graph failed; included entry file conservatively: {error}"
+                        ),
+                        vec![format!("entry_path: {}", resolved.entry_path.display())],
+                    ));
+                    match std::fs::read_to_string(&resolved.entry_path) {
+                        Ok(source) => {
+                            conservative_sources.push(format!(";(() => {{\n{source}\n}})();"))
+                        }
+                        Err(read_error) => diagnostics.push(diagnostic(
+                            "file_size",
+                            format!(
+                                "failed to read CommonJS entry for file-size fallback: {read_error}"
+                            ),
+                            vec![format!("entry_path: {}", resolved.entry_path.display())],
+                        )),
+                    }
+                }
+            }
             continue;
         }
 
@@ -116,25 +153,40 @@ pub fn compute_file_size(
         merge_graph_modules(&mut combined_modules, &mut seen_paths, &graph);
     }
 
-    if combined_modules.is_empty() {
+    if combined_modules.is_empty() && conservative_sources.is_empty() {
         return FileSizeComputation {
             diagnostics,
             ..FileSizeComputation::default()
         };
     }
 
-    let combined_graph = ModuleGraph::from_parts(
-        ModuleId(0),
-        combined_modules,
-        Vec::new(),
-        seen_paths.into_iter().collect(),
-    );
-    let bundled = match bundle_reachable_modules_with_metadata(&combined_graph, &combined_reachable)
-    {
-        Ok(bundled) => bundled,
-        Err(error) => return error_computation("bundle", error, diagnostics),
-    };
-    let minified = match minify_source_with_markers(&bundled.minifier_source, false) {
+    let mut source = String::new();
+    let mut minifier_source = String::new();
+
+    if !combined_modules.is_empty() {
+        let combined_graph = ModuleGraph::from_parts(
+            ModuleId(0),
+            combined_modules,
+            Vec::new(),
+            seen_paths.into_iter().collect(),
+        );
+        let bundled =
+            match bundle_reachable_modules_with_metadata(&combined_graph, &combined_reachable) {
+                Ok(bundled) => bundled,
+                Err(error) => return error_computation("bundle", error, diagnostics),
+            };
+        source.push_str(&bundled.source);
+        minifier_source.push_str(&bundled.minifier_source);
+    }
+
+    for conservative_source in conservative_sources {
+        source.push_str(&conservative_source);
+        source.push('\n');
+        minifier_source.push_str(&conservative_source);
+        minifier_source.push('\n');
+    }
+
+    let minified = match minify_source_with_markers(&minifier_source, false) {
         Ok(minified) => minified,
         Err(error) => return error_computation("minify", error, diagnostics),
     };
@@ -144,7 +196,7 @@ pub fn compute_file_size(
     };
 
     FileSizeComputation {
-        raw_bytes: bundled.source.len() as u64,
+        raw_bytes: source.len() as u64,
         minified_bytes: minified.len() as u64,
         gzip_bytes: compressed.gzip_bytes,
         brotli_bytes: compressed.brotli_bytes,

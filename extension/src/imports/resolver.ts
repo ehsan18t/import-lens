@@ -3,6 +3,8 @@ import path from "node:path";
 import { getPackageName } from "./specifier.js";
 import type { PackageResolution } from "./types.js";
 
+const unknownPackageVersion = "unknown";
+
 const fileExists = async (filePath: string): Promise<boolean> => {
   try {
     await access(filePath);
@@ -42,22 +44,23 @@ export const resolveInstalledPackage = async (specifier: string, activeDocumentP
     try {
       const packageJson = JSON.parse(await readFile(packageJsonPath, "utf8")) as { version?: unknown };
 
-      if (typeof packageJson.version !== "string") {
-        return { ok: false, packageName, reason: "invalid_package_json" };
-      }
-
       return {
         ok: true,
         packageName,
         packageRoot,
         packageJsonPath,
-        version: packageJson.version,
+        version: typeof packageJson.version === "string" ? packageJson.version : unknownPackageVersion,
       };
     } catch {
-      return { ok: false, packageName, reason: "invalid_package_json" };
+      return {
+        ok: true,
+        packageName,
+        packageRoot,
+        packageJsonPath,
+        version: unknownPackageVersion,
+      };
     }
   }
 
   return { ok: false, packageName, reason: "package_not_found" };
 };
-

@@ -485,6 +485,86 @@ fn analyze_import_reports_missing_cjs_default_export_without_failing_result() {
 }
 
 #[test]
+fn analyze_invalid_package_json_returns_approximate_directory_size() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "invalid-manifest-lib",
+        "{ invalid json",
+        "export const value = 1;",
+    );
+    write_package_file(
+        &workspace,
+        "invalid-manifest-lib",
+        "node_modules/ignored/index.js",
+        &"x".repeat(2048),
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "invalid-manifest-lib".to_owned(),
+        package_name: "invalid-manifest-lib".to_owned(),
+        version: "unknown".to_owned(),
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0, "{result:?}");
+    assert!(result.raw_bytes < 2048, "{result:?}");
+    assert_eq!(result.minified_bytes, result.raw_bytes);
+    assert_eq!(result.brotli_bytes, result.raw_bytes);
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "manifest_fallback" && diagnostic.message.contains("(approx)")
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_versionless_package_json_returns_approximate_directory_size() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "versionless-lib",
+        r#"{"module":"index.js","sideEffects":false}"#,
+        "export const value = 1;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "versionless-lib".to_owned(),
+        package_name: "versionless-lib".to_owned(),
+        version: "unknown".to_owned(),
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0, "{result:?}");
+    assert_eq!(result.gzip_bytes, result.raw_bytes);
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "manifest_fallback" && diagnostic.message.contains("version")
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_namespace_import_reports_oxc_fallback_diagnostic() {
     let workspace = temp_workspace();
     write_package(

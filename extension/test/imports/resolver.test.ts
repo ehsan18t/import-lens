@@ -62,3 +62,46 @@ test("resolveInstalledPackage reports package_not_found without throwing", async
   }
 });
 
+test("resolveInstalledPackage keeps malformed package manifest requestable for daemon fallback", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "import-lens-resolver-"));
+
+  try {
+    const packageDir = path.join(root, "node_modules", "broken-json");
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(path.join(packageDir, "package.json"), "{ invalid json", "utf8");
+
+    const result = await resolveInstalledPackage("broken-json", path.join(root, "src", "index.ts"));
+
+    assert.deepEqual(result, {
+      ok: true,
+      packageName: "broken-json",
+      packageJsonPath: path.join(packageDir, "package.json"),
+      packageRoot: packageDir,
+      version: "unknown",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveInstalledPackage keeps versionless package manifest requestable for daemon fallback", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "import-lens-resolver-"));
+
+  try {
+    const packageDir = path.join(root, "node_modules", "versionless");
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(path.join(packageDir, "package.json"), JSON.stringify({ module: "index.js" }), "utf8");
+
+    const result = await resolveInstalledPackage("versionless", path.join(root, "src", "index.ts"));
+
+    assert.deepEqual(result, {
+      ok: true,
+      packageName: "versionless",
+      packageJsonPath: path.join(packageDir, "package.json"),
+      packageRoot: packageDir,
+      version: "unknown",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

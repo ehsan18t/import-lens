@@ -9,7 +9,7 @@ use crate::{
         graph::{ModuleGraph, ModuleId, build_module_graph_cached_with_runtime},
         minify::{minify_source, minify_source_with_markers},
         reachability::reachable_exports,
-        resolver::{ResolvedPackage, SideEffectsMode, resolve_package_entry},
+        resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
     },
 };
 use std::{
@@ -53,7 +53,13 @@ fn analyze_import_inner(
     context: &AnalysisContext,
     request: &ImportRequest,
 ) -> Result<ImportResult, AnalysisError> {
-    let resolved = resolve_import_package(context, request)?;
+    let resolved = match resolve_import_package(context, request) {
+        Ok(resolved) => resolved,
+        Err(error) if error.stage == "package_manifest" => {
+            return approximate_manifest_fallback(context, request, error);
+        }
+        Err(error) => return Err(error),
+    };
     analyze_import_inner_resolved(context, request, resolved)
 }
 
@@ -66,12 +72,20 @@ fn resolve_import_package(
             "package_validation"
         } else if message.contains("package manifest not found") {
             "package_resolution"
+        } else if is_manifest_fallback_error(&message) {
+            "package_manifest"
         } else {
             "entry_resolution"
         };
         let details = resolver_details(&message);
         error_with_context(stage, message, context, request, details)
     })
+}
+
+fn is_manifest_fallback_error(message: &str) -> bool {
+    message.contains("failed to read package manifest")
+        || message.contains("failed to parse package manifest")
+        || message.contains("missing a string version")
 }
 
 fn analyze_import_inner_resolved(
@@ -386,6 +400,150 @@ fn analyze_static_entry(
         shared_bytes: None,
         internal_contributions: Vec::new(),
     })
+}
+
+fn approximate_manifest_fallback(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    error: AnalysisError,
+) -> Result<ImportResult, AnalysisError> {
+    let package_root = find_package_root(&context.active_document_path, &request.package_name)
+        .map_err(|message| {
+            error_with_context("package_resolution", message, context, request, Vec::new())
+        })?;
+    let (raw_bytes, mut diagnostics) = approximate_directory_size(&package_root);
+    diagnostics.insert(
+        0,
+        ImportDiagnostic {
+            stage: "manifest_fallback".to_owned(),
+            message: format!(
+                "package manifest could not be used; computed approximate raw directory size (approx): {}",
+                error.message
+            ),
+            details: vec![
+                format!("package_root: {}", package_root.display()),
+                format!("failed_stage: {}", error.stage),
+            ],
+        },
+    );
+
+    Ok(ImportResult {
+        specifier: request.specifier.clone(),
+        raw_bytes,
+        minified_bytes: raw_bytes,
+        gzip_bytes: raw_bytes,
+        brotli_bytes: raw_bytes,
+        zstd_bytes: raw_bytes,
+        cache_hit: false,
+        side_effects: true,
+        truly_treeshakeable: false,
+        is_cjs: false,
+        error: None,
+        diagnostics,
+        module_breakdown: Some(vec![ModuleContribution {
+            path: package_root.to_string_lossy().to_string(),
+            bytes: raw_bytes,
+        }]),
+        shared_bytes: None,
+        internal_contributions: vec![ModuleContribution {
+            path: package_root.to_string_lossy().to_string(),
+            bytes: raw_bytes,
+        }],
+    })
+}
+
+const APPROXIMATE_MAX_FILES: usize = 10_000;
+const APPROXIMATE_MAX_BYTES: u64 = 250 * 1024 * 1024;
+
+fn approximate_directory_size(package_root: &Path) -> (u64, Vec<ImportDiagnostic>) {
+    let mut diagnostics = Vec::new();
+    let mut stack = vec![package_root.to_path_buf()];
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    let mut capped = false;
+
+    while let Some(directory) = stack.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                diagnostics.push(ImportDiagnostic {
+                    stage: "manifest_fallback".to_owned(),
+                    message: format!(
+                        "failed to read package directory during approximate sizing: {error}"
+                    ),
+                    details: vec![format!("directory: {}", directory.display())],
+                });
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            if file_type.is_dir() {
+                if !should_skip_approximate_directory(&path) {
+                    stack.push(path);
+                }
+                continue;
+            }
+
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            files += 1;
+            bytes = bytes.saturating_add(metadata.len());
+            if files >= APPROXIMATE_MAX_FILES || bytes >= APPROXIMATE_MAX_BYTES {
+                capped = true;
+                break;
+            }
+        }
+
+        if capped {
+            break;
+        }
+    }
+
+    if capped {
+        diagnostics.push(ImportDiagnostic {
+            stage: "manifest_fallback".to_owned(),
+            message: "approximate package directory traversal hit safety cap".to_owned(),
+            details: vec![
+                format!("max_files: {APPROXIMATE_MAX_FILES}"),
+                format!("max_bytes: {APPROXIMATE_MAX_BYTES}"),
+            ],
+        });
+    }
+
+    (bytes, diagnostics)
+}
+
+fn should_skip_approximate_directory(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        name,
+        "node_modules"
+            | ".git"
+            | ".hg"
+            | ".svn"
+            | ".cache"
+            | ".turbo"
+            | ".parcel-cache"
+            | ".next"
+            | ".nuxt"
+            | ".vite"
+            | "coverage"
+            | "target"
+    )
 }
 
 fn top_module_contributions(contributions: &[ModuleContribution]) -> Vec<ModuleContribution> {

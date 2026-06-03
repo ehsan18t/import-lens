@@ -150,7 +150,7 @@ The extension targets the following environments:
 ### 2.6 Assumptions and Dependencies
 
 - The user's project has a `node_modules` directory populated by a package manager (npm, yarn, or pnpm with hoisting).
-- Each importable package has a `package.json` in its `node_modules/<package>/` directory containing at least a `version` field.
+- Each importable package has a `package.json` in its `node_modules/<package>/` directory. A parseable string `version` field enables exact cache identity; malformed or versionless manifests are still requestable and fall back to approximate package-directory sizing.
 - Packages that expose ESM entry points (via the `exports` or `module` field in `package.json`) will produce accurate tree-shaken sizes. CommonJS-only packages are analyzed statically where possible and produce approximate sizes with a visible warning when the daemon must fall back.
 
 ---
@@ -228,7 +228,7 @@ On each daemon respawn, the extension host reads `<globalStoragePath>/importlens
 4. `oxc-parser` (NAPI binding) parses each script region and extracts ESM import information directly from the `result.module.staticImports`, `result.module.staticExports`, and `result.module.dynamicImports` arrays (no AST walk required).
 5. The extension maps region-relative import ranges back to absolute document positions for stable inlay hint, decoration, and CodeLens placement.
 6. The extension filters imports to node_modules only, skipping local paths, `node:` builtins, and `import type` declarations.
-7. For each remaining import, the extension reads the installed package version from `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory.
+7. For each remaining import, the extension reads the installed package version from `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory. If the package directory exists but the manifest is malformed or lacks a string `version`, the extension sends the request with an unknown-version sentinel so the daemon can return an approximate fallback instead of marking the import missing.
 8. A single batched `BatchRequest` is serialised to MessagePack and sent over the socket. Protocol v2 clients may set `streaming: true` to receive indexed partial responses as individual imports finish.
 9. The daemon receives the batch, verifies that the connection has completed the `HelloMessage` handshake, and checks its `papaya` map for each import's cache key.
 10. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
@@ -327,11 +327,11 @@ This section documents the key architectural decisions made before implementatio
 
 ### 5.2 Package Version Resolution
 
-**FR-007** (Critical) - Before sending a request to the daemon, the extension must resolve the installed version of each package by reading `node_modules/<package>/package.json` and extracting the `version` field. For scoped packages (e.g. `@babel/core`), the path is `node_modules/@<scope>/<name>/package.json`. The `<package>` identifier in all cache keys and IPC messages includes the full scope prefix when present.
+**FR-007** (Critical) - Before sending a request to the daemon, the extension must resolve each package by reading `node_modules/<package>/package.json` and extracting the `version` field when it is present as a string. For scoped packages (e.g. `@babel/core`), the path is `node_modules/@<scope>/<name>/package.json`. The `<package>` identifier in all cache keys and IPC messages includes the full scope prefix when present. If the package directory exists but the manifest is malformed or lacks a string `version`, the extension must still send the package to the daemon using an unknown-version sentinel so the daemon can compute the approximate fallback described in Section 7.1.
 
 **FR-008** (High) - The daemon resolver must start package discovery and module resolution from the `active_document_path` supplied in `BatchRequest`, not from the workspace root. Starting from the file being edited ensures that upward traversal through the directory tree matches Node's own resolution algorithm exactly. This is critical in multi-root VS Code windows, NPM Workspaces, Yarn Workspaces, and nested PNPM layouts where a package inside `packages/app-a/` may have its own `node_modules/` with a different version of a dependency than the root-level hoisted copy. The daemon must validate package identifiers before building filesystem paths and must reject identifiers containing traversal or platform path separators.
 
-**FR-009** (High) - If a package cannot be found in `node_modules`, the extension must display a subtle "Package not found" decoration on that import line and must not send it to the daemon.
+**FR-009** (High) - If a package cannot be found in `node_modules`, the extension must display a subtle "Package not found" decoration on that import line and must not send it to the daemon. This missing-package path applies only when the package directory cannot be located; installed packages with malformed or versionless manifests follow FR-007's daemon fallback path.
 
 ### 5.3 Daemon Communication
 
@@ -389,7 +389,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-024** (Critical) - The Rust daemon must operate exclusively via static AST analysis. It is prohibited from evaluating, executing, or interpreting any code found within third-party packages. No `eval`, subprocess execution, or dynamic code loading of any kind is permitted.
 
-**FR-024a** (High) - CommonJS support must be implemented through static analysis only. For CJS entry points, the daemon may scan literal relative `require()` calls and common export shapes such as `exports.foo`, `module.exports.foo`, `module.exports = { foo }`, and default-like `module.exports = function/class`. Dynamic `require()`, unsupported export shapes, and unresolved CJS dependencies must fall back to conservative entry sizing with `cjs_fallback` or `cjs_resolution` diagnostics. The daemon must never use `oxc_transformer` as a CJS-to-ESM converter because the pinned OXC transformer does not provide that conversion path.
+**FR-024a** (High) - CommonJS support must be implemented through static analysis only. For CJS entry points, the daemon may scan literal relative `require()` calls and common export shapes such as `exports.foo`, `module.exports.foo`, `module.exports = { foo }`, and default-like `module.exports = function/class`. Dynamic `require()`, unsupported export shapes, and unresolved CJS dependencies must fall back to conservative entry sizing with `cjs_fallback` or `cjs_resolution` diagnostics. File-level size requests that contain only CommonJS imports must return conservative non-deduped CJS totals with diagnostics instead of reporting zero bytes. The daemon must never use `oxc_transformer` as a CJS-to-ESM converter because the pinned OXC transformer does not provide that conversion path.
 
 **Implementation status note (Windows alpha):** The current Windows alpha runs the OXC graph pipeline for ESM entries and uses the CommonJS static analyzer described in FR-024a for CJS entries. When static graph analysis cannot safely proceed, the daemon returns conservative static-entry estimates with structured diagnostics instead of throwing away partial successful results.
 
@@ -484,7 +484,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 | Scenario                                                   | Required Behaviour                                                                                                                                                                                                                     |
 | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Package not installed in node_modules                      | Display a subtle "Package not found" decoration on that import line. Do not send the import to the daemon. Do not display an error dialog.                                                                                             |
-| Corrupted or malformed `package.json` in node_modules      | Fall back to computing the raw directory size of the package folder. Display an `(approx)` suffix on the size decoration to indicate the fallback method was used.                                                                     |
+| Corrupted, malformed, or versionless `package.json` in node_modules | Fall back to computing a defensively bounded raw directory size of the package folder, excluding nested `node_modules`, VCS directories, and build-cache directories. Display an `(approx)` suffix on the size decoration to indicate the fallback method was used. |
 | Malformed or incomplete import syntax (user is mid-typing) | Use OXC parser error recovery mode to extract as much structural information as possible. Render partial results if a package name can be identified. Suppress decorations silently if no package name can be resolved.                |
 | Daemon crash                                               | Detect the process exit, wait 1 second, and restart the daemon. Apply exponential backoff on repeated failures (1s, 2s, 4s, 8s, max 30s). After three crashes within 60 seconds, enter degraded mode and display a status bar warning. |
 | Socket disconnect without crash                            | Discard any stale MessagePack payloads currently in the receive buffer. Wait for the next document change event to trigger a fresh request cycle. Do not attempt immediate reconnection to avoid cascading retries on rapid edits.     |

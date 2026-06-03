@@ -219,6 +219,26 @@ fn write_effectful_package(workspace: &Path) {
     .expect("entry should be written");
 }
 
+fn write_cjs_file_size_package(workspace: &Path) {
+    let package_root = workspace.join("node_modules").join("cjs-file-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(
+        package_root.join("index.cjs"),
+        "const helper = require('./helper.cjs');\nexports.value = helper.value;",
+    )
+    .expect("entry should be written");
+    fs::write(
+        package_root.join("helper.cjs"),
+        "exports.value = 'cjs payload';",
+    )
+    .expect("helper should be written");
+}
+
 fn batch(workspace: &Path, request_id: u64) -> BatchRequest {
     BatchRequest {
         version: 1,
@@ -420,6 +440,28 @@ fn file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
         workspace_root: batch.workspace_root,
         active_document_path: batch.active_document_path,
         imports: batch.imports,
+    }
+}
+
+fn cjs_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
+    FileSizeRequest {
+        message_type: "file_size".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![ImportRequest {
+            specifier: "cjs-file-lib".to_owned(),
+            package_name: "cjs-file-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec!["value".to_owned()],
+            import_kind: ImportKind::Named,
+            runtime: ImportRuntime::Component,
+        }],
     }
 }
 
@@ -703,6 +745,28 @@ fn service_computes_file_size_with_shared_module_deduplication() {
             .imports
             .iter()
             .all(|result| result.shared_bytes.is_some_and(|bytes| bytes > 0)),
+        "{file_size:?}",
+    );
+}
+
+#[test]
+fn service_computes_file_size_for_commonjs_only_imports_conservatively() {
+    let workspace = temp_workspace();
+    write_cjs_file_size_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let file_size = service.handle_file_size(cjs_file_size_request(&workspace, 25));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(file_size.request_id, 25);
+    assert_eq!(file_size.error, None);
+    assert!(file_size.raw_bytes > 0, "{file_size:?}");
+    assert!(file_size.minified_bytes > 0, "{file_size:?}");
+    assert_eq!(file_size.imports.len(), 1);
+    assert!(
+        file_size.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "file_size" && diagnostic.message.contains("CommonJS")
+        }),
         "{file_size:?}",
     );
 }
