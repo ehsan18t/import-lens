@@ -54,7 +54,6 @@ pub fn resolve_package_entry(
         Ok(resolved) => {
             let entry_path = resolved.entry_path;
             validate_declared_entry_resolution(&manifest, request.runtime)?;
-            reject_unsupported_entry_source(&entry_path)?;
             let is_cjs = resolved_entry_is_commonjs(&manifest, &entry_path, resolved.is_cjs);
             (entry_path, is_cjs)
         }
@@ -305,6 +304,9 @@ fn resolved_entry_is_commonjs(
     if extension == "mjs" {
         return false;
     }
+    if matches!(extension, "ts" | "tsx" | "jsx" | "json") {
+        return false;
+    }
     if entry_matches_manifest_esm_field(manifest, entry_path) {
         return false;
     }
@@ -425,8 +427,6 @@ fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
             )
         })?;
 
-    reject_unsupported_entry_source(&found_path)?;
-
     Ok(found_path)
 }
 
@@ -469,7 +469,7 @@ fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
 }
 
 fn module_extensions() -> Vec<String> {
-    [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"]
+    [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".json"]
         .into_iter()
         .map(str::to_owned)
         .collect()
@@ -504,18 +504,6 @@ pub(crate) fn resolve_module_path(
         path: normalize_existing_path(&full_path)?,
         is_cjs,
     })
-}
-
-fn reject_unsupported_entry_source(entry_path: &Path) -> Result<(), String> {
-    let path_str = entry_path.to_string_lossy();
-    if path_str.ends_with(".ts") || path_str.ends_with(".tsx") {
-        return Err(format!(
-            "resolved entry is a TypeScript source file ({}) which cannot be analyzed",
-            entry_path.display()
-        ));
-    }
-
-    Ok(())
 }
 
 pub(crate) fn append_extension(candidate: &Path, extension: &str) -> PathBuf {

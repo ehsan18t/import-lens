@@ -1259,19 +1259,37 @@ fn analyze_import_resolves_top_level_condition_map_exports() {
 }
 
 #[test]
-fn analyze_import_rejects_typescript_entry_files() {
+fn analyze_import_transforms_typescript_jsx_and_type_only_modules() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
         "ts-pkg",
-        r#"{"version":"1.0.0","main":"src/index.ts"}"#,
+        r#"{"version":"1.0.0","module":"src/index.ts","sideEffects":false}"#,
         "// js entry",
     );
     write_package_file(
         &workspace,
         "ts-pkg",
         "src/index.ts",
-        "export const x: number = 42;",
+        "import type { Label } from './types';\nimport { componentValue } from './component';\nimport { legacyValue } from './legacy.jsx';\nexport type { Label } from './types';\nexport const x: number = componentValue + legacyValue;",
+    );
+    write_package_file(
+        &workspace,
+        "ts-pkg",
+        "src/types.ts",
+        "export type Label = { text: string };",
+    );
+    write_package_file(
+        &workspace,
+        "ts-pkg",
+        "src/component.tsx",
+        "export const componentValue: number = <span data-value=\"1\" /> ? 1 : 0;",
+    );
+    write_package_file(
+        &workspace,
+        "ts-pkg",
+        "src/legacy.jsx",
+        "export const legacyValue = <div /> ? 2 : 0;",
     );
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
@@ -1281,21 +1299,131 @@ fn analyze_import_rejects_typescript_entry_files() {
         specifier: "ts-pkg".to_owned(),
         package_name: "ts-pkg".to_owned(),
         version: "1.0.0".to_owned(),
-        named: vec![],
-        import_kind: ImportKind::Default,
+        named: vec!["x".to_owned()],
+        import_kind: ImportKind::Named,
         runtime: ImportRuntime::Component,
     };
 
     let result = analyze_import(&context, &request);
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert!(result.error.is_some());
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(!result.is_cjs);
+    assert!(
+        result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("component.tsx"))
+                && modules
+                    .iter()
+                    .any(|module| module.path.ends_with("legacy.jsx"))
+                && !modules
+                    .iter()
+                    .any(|module| module.path.ends_with("types.ts"))
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_import_includes_json_import_as_synthetic_js() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "json-pkg",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "import data, { answer } from './data.json';\nexport const value = data.answer + answer;",
+    );
+    write_package_file(
+        &workspace,
+        "json-pkg",
+        "data.json",
+        r#"{"answer":21,"label":"ok"}"#,
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "json-pkg".to_owned(),
+        package_name: "json-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(
+        result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("data.json") && module.bytes > 0)
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_import_keeps_assets_external_with_diagnostics() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "asset-pkg",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "import './style.css';\nimport logo from './logo.svg';\nexport const value = logo;",
+    );
+    write_package_file(
+        &workspace,
+        "asset-pkg",
+        "style.css",
+        ".root { color: red; }",
+    );
+    write_package_file(
+        &workspace,
+        "asset-pkg",
+        "logo.svg",
+        r#"<svg viewBox="0 0 1 1"></svg>"#,
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "asset-pkg".to_owned(),
+        package_name: "asset-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
     assert!(
         result
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("TypeScript source file")
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.stage == "asset")
+            .count()
+            >= 2,
+        "{result:?}",
+    );
+    assert!(
+        !result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules.iter().any(|module| {
+                module.path.ends_with("style.css") || module.path.ends_with("logo.svg")
+            })
+        }),
+        "{result:?}",
     );
 }
 

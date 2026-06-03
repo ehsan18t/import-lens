@@ -392,7 +392,7 @@ fn module_breakdown(
         .filter(|module| included.contains_key(&module.id))
         .map(|module| ModuleContribution {
             path: module.path.to_string_lossy().to_string(),
-            bytes: module.source.len() as u64,
+            bytes: module.original_source_bytes as u64,
         })
         .collect::<Vec<_>>();
 

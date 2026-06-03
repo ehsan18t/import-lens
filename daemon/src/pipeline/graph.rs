@@ -4,6 +4,7 @@ use crate::{
 };
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{BindingPattern, Declaration, ExportDefaultDeclarationKind, Program, Statement};
+use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
 use oxc_resolver::Resolver;
 use oxc_semantic::SemanticBuilder;
@@ -12,6 +13,8 @@ use oxc_syntax::module_record::{
     ExportEntry, ExportExportName, ExportImportName, ExportLocalName, ImportEntry,
     ImportImportName, ModuleRecord as OxcModuleRecord,
 };
+use oxc_transformer::{TransformOptions, Transformer};
+use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -51,6 +54,7 @@ pub struct ModuleRecord {
     pub id: ModuleId,
     pub path: PathBuf,
     pub source: String,
+    pub original_source_bytes: usize,
     pub imports: Vec<ImportEdge>,
     pub external_imports: Vec<ExternalImportEdge>,
     pub import_statement_spans: Vec<(usize, usize)>,
@@ -343,7 +347,8 @@ impl ModuleGraphBuilder {
             diagnostics: &mut self.graph.diagnostics,
             dependency_paths: &mut self.dependency_paths,
         };
-        let parsed = parse_module(&path, &source, &mut resolver_context)?;
+        let prepared_source = prepare_module_source(&path, &source)?;
+        let parsed = parse_module(&path, &prepared_source, &mut resolver_context)?;
         let id = ModuleId(self.graph.modules.len());
         let next_paths = parsed
             .imports
@@ -369,7 +374,8 @@ impl ModuleGraphBuilder {
         self.graph.modules.push(ModuleRecord {
             id,
             path: path.clone(),
-            source,
+            source: prepared_source,
+            original_source_bytes: source_bytes,
             imports: parsed.imports,
             external_imports: parsed.external_imports,
             import_statement_spans: parsed.import_statement_spans,
@@ -410,6 +416,170 @@ struct ModuleResolverContext<'a> {
 enum ModuleResolution {
     Internal(PathBuf),
     External,
+    IgnoredExternal,
+}
+
+fn prepare_module_source(path: &Path, source: &str) -> Result<String, String> {
+    if path_has_extension(path, "json") {
+        return synthetic_json_module(path, source);
+    }
+
+    if module_needs_transform(path) {
+        return transform_module_source(path, source);
+    }
+
+    Ok(source.to_owned())
+}
+
+fn synthetic_json_module(path: &Path, source: &str) -> Result<String, String> {
+    let json = serde_json::from_str::<Value>(source)
+        .map_err(|error| format!("failed to parse JSON module {}: {error}", path.display()))?;
+    let literal = serde_json::to_string(&json)
+        .map_err(|error| format!("failed to encode JSON module {}: {error}", path.display()))?;
+    let mut generated =
+        format!("const __importLensJson = {literal};\nexport default __importLensJson;\n");
+
+    if let Some(object) = json.as_object() {
+        let mut keys = object.keys().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            if is_safe_js_identifier(key) {
+                let quoted_key = serde_json::to_string(key).map_err(|error| {
+                    format!("failed to encode JSON key in {}: {error}", path.display())
+                })?;
+                generated.push_str(&format!(
+                    "export const {key} = __importLensJson[{quoted_key}];\n"
+                ));
+            }
+        }
+    }
+
+    Ok(generated)
+}
+
+fn transform_module_source(path: &Path, source: &str) -> Result<String, String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if parsed.panicked || !parsed.errors.is_empty() {
+        return Err(format!(
+            "failed to parse module before transform {}; errors: {}",
+            path.display(),
+            parsed
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    let mut program = parsed.program;
+    let semantic = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&program);
+    if !semantic.errors.is_empty() {
+        return Err(format!(
+            "semantic validation failed before transform {}; errors: {}",
+            path.display(),
+            semantic
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    let transform = Transformer::new(&allocator, path, &TransformOptions::default())
+        .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
+    if !transform.errors.is_empty() {
+        return Err(format!(
+            "failed to transform module {}; errors: {}",
+            path.display(),
+            transform
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    Ok(Codegen::new()
+        .with_options(CodegenOptions::default())
+        .build(&program)
+        .code)
+}
+
+fn module_needs_transform(path: &Path) -> bool {
+    ["ts", "tsx", "jsx"]
+        .iter()
+        .any(|extension| path_has_extension(path, extension))
+}
+
+fn path_has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+fn is_safe_js_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first == '$' || first.is_ascii_alphabetic())
+        && chars.all(|char| char == '_' || char == '$' || char.is_ascii_alphanumeric())
+        && !matches!(
+            value,
+            "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "debugger"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "false"
+                | "finally"
+                | "for"
+                | "function"
+                | "if"
+                | "implements"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "interface"
+                | "let"
+                | "null"
+                | "new"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "return"
+                | "static"
+                | "super"
+                | "switch"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "typeof"
+                | "var"
+                | "void"
+                | "while"
+                | "with"
+                | "yield"
+                | "await"
+        )
 }
 
 fn parse_module(
@@ -519,6 +689,7 @@ fn import_edges(
                     local_name,
                 });
             }
+            ModuleResolution::IgnoredExternal => {}
         }
     }
 
@@ -550,6 +721,7 @@ fn import_edges(
                     local_name: String::new(),
                 });
             }
+            ModuleResolution::IgnoredExternal => {}
         }
     }
 
@@ -649,7 +821,7 @@ fn reexport_record(
     let resolved_path = match resolve_module(path, module_request.name.as_str(), resolver_context)?
     {
         ModuleResolution::Internal(resolved_path) => resolved_path,
-        ModuleResolution::External => return Ok(None),
+        ModuleResolution::External | ModuleResolution::IgnoredExternal => return Ok(None),
     };
     let Some(exported_name) = export_export_name(&entry.export_name) else {
         return Ok(None);
@@ -682,7 +854,9 @@ fn star_export_records(
             let resolved_path =
                 match resolve_module(path, module_request.name.as_str(), resolver_context) {
                     Ok(ModuleResolution::Internal(resolved_path)) => resolved_path,
-                    Ok(ModuleResolution::External) => return None,
+                    Ok(ModuleResolution::External | ModuleResolution::IgnoredExternal) => {
+                        return None;
+                    }
                     Err(error) => return Some(Err(error)),
                 };
             Some(Ok(StarExportRecord {
@@ -851,6 +1025,21 @@ fn resolve_module(
     specifier: &str,
     resolver_context: &mut ModuleResolverContext<'_>,
 ) -> Result<ModuleResolution, String> {
+    if specifier_has_query_or_fragment(specifier) {
+        push_resolution_diagnostic(
+            resolver_context,
+            from_path,
+            specifier,
+            format!("import '{specifier}' contains an unsupported query or fragment"),
+        );
+        return Ok(ModuleResolution::IgnoredExternal);
+    }
+
+    if let Some(kind) = asset_import_kind(specifier) {
+        push_asset_diagnostic(resolver_context, from_path, specifier, kind);
+        return Ok(ModuleResolution::IgnoredExternal);
+    }
+
     if is_node_builtin_specifier(specifier) {
         push_resolution_diagnostic(
             resolver_context,
@@ -892,6 +1081,54 @@ fn resolve_module(
         .dependency_paths
         .insert(resolved.path.clone());
     Ok(ModuleResolution::Internal(resolved.path))
+}
+
+fn specifier_has_query_or_fragment(specifier: &str) -> bool {
+    specifier.contains('?') || specifier.contains('#')
+}
+
+fn asset_import_kind(specifier: &str) -> Option<&'static str> {
+    let extension = Path::new(specifier)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())?
+        .to_ascii_lowercase();
+
+    if is_javascript_module_extension(&extension) {
+        return None;
+    }
+
+    match extension.as_str() {
+        "css" | "scss" | "sass" | "less" | "styl" => Some("style"),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "svg" | "ico" | "bmp" => Some("image"),
+        "ttf" | "otf" | "woff" | "woff2" | "eot" => Some("font"),
+        _ if specifier.starts_with('.') || specifier.starts_with('/') => Some("asset"),
+        _ => None,
+    }
+}
+
+fn is_javascript_module_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "json"
+    )
+}
+
+fn push_asset_diagnostic(
+    resolver_context: &mut ModuleResolverContext<'_>,
+    from_path: &Path,
+    specifier: &str,
+    kind: &str,
+) {
+    resolver_context.diagnostics.push(GraphDiagnostic {
+        stage: "asset".to_owned(),
+        message: format!("non-JavaScript {kind} import kept external: {specifier}"),
+        details: vec![
+            format!("from_path: {}", from_path.display()),
+            format!("specifier: {specifier}"),
+            format!("asset_kind: {kind}"),
+        ],
+    });
 }
 
 fn push_resolution_diagnostic(
