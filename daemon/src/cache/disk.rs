@@ -406,7 +406,11 @@ fn cache_envelope(key: &str, cached: CachedImport) -> CacheEnvelope {
 
     CacheEnvelope {
         analyzer_version: ANALYZER_VERSION.to_owned(),
-        full_contributions: cached.result.module_breakdown.clone().unwrap_or_default(),
+        full_contributions: if cached.result.internal_contributions.is_empty() {
+            cached.result.module_breakdown.clone().unwrap_or_default()
+        } else {
+            cached.result.internal_contributions.clone()
+        },
         result: cached.result,
         package_identity,
         dependency_fingerprints,
@@ -416,8 +420,10 @@ fn cache_envelope(key: &str, cached: CachedImport) -> CacheEnvelope {
 fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
     if let Ok(envelope) = rmp_serde::from_slice::<CacheEnvelope>(bytes) {
         if envelope.analyzer_version == ANALYZER_VERSION {
+            let mut result = envelope.result;
+            result.internal_contributions = envelope.full_contributions;
             return Some(CachedImport {
-                result: envelope.result,
+                result,
                 dependency_fingerprints: envelope.dependency_fingerprints,
             });
         }

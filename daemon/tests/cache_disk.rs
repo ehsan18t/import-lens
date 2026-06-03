@@ -50,6 +50,7 @@ fn result(specifier: &str) -> ImportResult {
         }],
         module_breakdown: None,
         shared_bytes: None,
+        internal_contributions: Vec::new(),
     }
 }
 

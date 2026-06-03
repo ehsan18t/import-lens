@@ -17,6 +17,7 @@ fn result(specifier: &str, cache_hit: bool) -> ImportResult {
         diagnostics: Vec::new(),
         module_breakdown: None,
         shared_bytes: None,
+        internal_contributions: Vec::new(),
     }
 }
 

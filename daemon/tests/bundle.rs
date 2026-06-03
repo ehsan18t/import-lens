@@ -89,12 +89,54 @@ fn bundle_renames_module_scoped_bindings_to_avoid_collisions() {
 }
 
 #[test]
+fn bundle_does_not_emit_import_lens_usage_markers() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export const value = 1;");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["value".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+    let minified = minify_source(&bundled, false).expect("reachable bundle should minify");
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(!bundled.contains("__importLensUse"), "{bundled}");
+    assert!(!minified.contains("__importLensUse"), "{minified}");
+}
+
+#[test]
 fn minify_source_removes_whitespace_and_preserves_parseability() {
     let minified = minify_source("const value = 1 + 1;\nconsole.log(value);\n", false)
         .expect("source should minify");
 
     assert!(minified.len() < "const value = 1 + 1;\nconsole.log(value);\n".len());
     assert_parseable(&minified);
+}
+
+#[test]
+fn bundle_keeps_only_reachable_bindings_from_imported_modules() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { used } from './dep.js';\nexport const value = used;",
+    );
+    write_source(
+        &root,
+        "dep.js",
+        "export const used = 1;\nexport const unused = 'large unused payload';",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["value".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(bundled.contains("__il_m1_used"), "{bundled}");
+    assert!(!bundled.contains("__il_m1_unused"), "{bundled}");
+    assert!(!bundled.contains("large unused payload"), "{bundled}");
+    assert_parseable(&bundled);
 }
 
 #[test]

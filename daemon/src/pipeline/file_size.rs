@@ -1,11 +1,13 @@
 use crate::{
-    ipc::protocol::{ImportDiagnostic, ImportKind, ImportRequest, ImportResult},
+    ipc::protocol::{
+        ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ModuleContribution,
+    },
     pipeline::{
         analyze::AnalysisContext,
-        bundle::bundle_reachable_modules,
+        bundle::bundle_reachable_modules_with_metadata,
         compress::compress_all,
         graph::{ModuleGraph, ModuleId, ModuleRecord, build_module_graph_cached_with_runtime},
-        minify::minify_source,
+        minify::minify_source_with_markers,
         reachability::{ReachableExports, reachable_exports},
         resolver::resolve_package_entry,
     },
@@ -31,27 +33,28 @@ pub fn annotate_shared_bytes(results: &mut [ImportResult]) {
 
     for module in results
         .iter()
-        .filter_map(|result| result.module_breakdown.as_ref())
-        .flatten()
+        .flat_map(|result| result_contributions(result).iter())
     {
         *counts.entry(module.path.clone()).or_default() += 1;
     }
 
     for result in results {
-        let shared = result
-            .module_breakdown
-            .as_ref()
-            .map(|modules| {
-                modules
-                    .iter()
-                    .filter(|module| counts.get(&module.path).copied().unwrap_or_default() > 1)
-                    .map(|module| module.bytes)
-                    .sum()
-            })
-            .unwrap_or_default();
+        let shared = result_contributions(result)
+            .iter()
+            .filter(|module| counts.get(&module.path).copied().unwrap_or_default() > 1)
+            .map(|module| module.bytes)
+            .sum();
 
         result.shared_bytes = Some(shared);
     }
+}
+
+fn result_contributions(result: &ImportResult) -> &[ModuleContribution] {
+    if result.internal_contributions.is_empty() {
+        return result.module_breakdown.as_deref().unwrap_or_default();
+    }
+
+    &result.internal_contributions
 }
 
 pub fn compute_file_size(
@@ -126,11 +129,12 @@ pub fn compute_file_size(
         Vec::new(),
         seen_paths.into_iter().collect(),
     );
-    let bundled = match bundle_reachable_modules(&combined_graph, &combined_reachable) {
+    let bundled = match bundle_reachable_modules_with_metadata(&combined_graph, &combined_reachable)
+    {
         Ok(bundled) => bundled,
         Err(error) => return error_computation("bundle", error, diagnostics),
     };
-    let minified = match minify_source(&bundled, false) {
+    let minified = match minify_source_with_markers(&bundled.minifier_source, false) {
         Ok(minified) => minified,
         Err(error) => return error_computation("minify", error, diagnostics),
     };
@@ -140,7 +144,7 @@ pub fn compute_file_size(
     };
 
     FileSizeComputation {
-        raw_bytes: bundled.len() as u64,
+        raw_bytes: bundled.source.len() as u64,
         minified_bytes: minified.len() as u64,
         gzip_bytes: compressed.gzip_bytes,
         brotli_bytes: compressed.brotli_bytes,

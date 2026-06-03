@@ -30,6 +30,20 @@ impl ReachableExports {
         self.modules.extend(other.modules.iter().cloned());
         self.full_modules.extend(other.full_modules.iter().cloned());
     }
+
+    pub fn mark_module(&mut self, path: PathBuf) {
+        self.modules.insert(path);
+    }
+
+    pub fn mark_full_module(&mut self, path: PathBuf) {
+        self.modules.insert(path.clone());
+        self.full_modules.insert(path);
+    }
+
+    pub fn mark_module_symbol(&mut self, path: PathBuf, exported_name: String) {
+        self.modules.insert(path.clone());
+        self.symbols.insert((path, exported_name));
+    }
 }
 
 pub fn reachable_exports(

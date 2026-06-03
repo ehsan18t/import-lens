@@ -16,6 +16,7 @@ use std::{
 pub struct CjsGraphAnalysis {
     pub source: String,
     pub module_breakdown: Vec<ModuleContribution>,
+    pub full_module_breakdown: Vec<ModuleContribution>,
     pub exports: Vec<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
     pub unsupported: bool,
@@ -117,11 +118,13 @@ pub fn analyze_cjs_graph_with_runtime(
             .cmp(&left.bytes)
             .then_with(|| left.path.cmp(&right.path))
     });
+    let full_module_breakdown = module_breakdown.clone();
     module_breakdown.truncate(10);
 
     Ok(CjsGraphAnalysis {
         source: sources.join("\n"),
         module_breakdown,
+        full_module_breakdown,
         exports,
         diagnostics,
         unsupported,

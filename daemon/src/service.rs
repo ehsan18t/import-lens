@@ -514,5 +514,6 @@ fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
         }],
         module_breakdown: None,
         shared_bytes: None,
+        internal_contributions: Vec::new(),
     }
 }

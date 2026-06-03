@@ -3,11 +3,11 @@ use crate::{
         ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ModuleContribution,
     },
     pipeline::{
-        bundle::{bundle_reachable_modules, included_module_ids},
+        bundle::{bundle_reachable_modules, bundle_reachable_modules_with_metadata},
         cjs::{CjsGraphAnalysis, analyze_cjs_graph_with_runtime},
         compress::compress_all,
         graph::{ModuleGraph, ModuleId, build_module_graph_cached_with_runtime},
-        minify::minify_source,
+        minify::{minify_source, minify_source_with_markers},
         reachability::reachable_exports,
         resolver::{ResolvedPackage, SideEffectsMode, resolve_package_entry},
     },
@@ -173,6 +173,8 @@ fn cjs_graph_result(request: &ImportRequest, graph: CjsGraphAnalysis) -> ImportR
     let compressed = compress_all(&minified);
     let mut diagnostics = graph.diagnostics;
     diagnostics.extend(missing_cjs_export_diagnostics(request, &graph.exports));
+    let module_breakdown = top_module_contributions(&graph.module_breakdown);
+    let internal_contributions = graph.full_module_breakdown;
 
     match compressed {
         Ok(compressed) => ImportResult {
@@ -188,8 +190,9 @@ fn cjs_graph_result(request: &ImportRequest, graph: CjsGraphAnalysis) -> ImportR
             is_cjs: true,
             error: None,
             diagnostics,
-            module_breakdown: Some(graph.module_breakdown),
+            module_breakdown: Some(module_breakdown),
             shared_bytes: None,
+            internal_contributions,
         },
         Err(error) => error_result(
             request,
@@ -222,18 +225,19 @@ fn analyze_with_oxc_pipeline(
     let include_full_entry = side_effects || matches!(request.import_kind, ImportKind::Namespace);
     let requested_exports = requested_exports(request);
     let mut reachable = reachable_exports(&graph, &requested_exports, include_full_entry);
-    let mut bundled = bundle_reachable_modules(&graph, &reachable).map_err(|error| {
-        error_with_context(
-            "bundle",
-            format!("failed to bundle reachable modules: {error}"),
-            context,
-            request,
-            vec![format!("entry_path: {}", entry_path.display())],
-        )
-    })?;
-    if bundled.trim().is_empty() && !include_full_entry {
+    let mut bundled =
+        bundle_reachable_modules_with_metadata(&graph, &reachable).map_err(|error| {
+            error_with_context(
+                "bundle",
+                format!("failed to bundle reachable modules: {error}"),
+                context,
+                request,
+                vec![format!("entry_path: {}", entry_path.display())],
+            )
+        })?;
+    if bundled.source.trim().is_empty() && !include_full_entry {
         reachable = reachable_exports(&graph, &[], true);
-        bundled = bundle_reachable_modules(&graph, &reachable).map_err(|error| {
+        bundled = bundle_reachable_modules_with_metadata(&graph, &reachable).map_err(|error| {
             error_with_context(
                 "bundle",
                 format!("failed to bundle fallback full module: {error}"),
@@ -243,15 +247,16 @@ fn analyze_with_oxc_pipeline(
             )
         })?;
     }
-    let minified = minify_source(&bundled, false).map_err(|error| {
-        error_with_context(
-            "minify",
-            format!("failed to minify bundled modules: {error}"),
-            context,
-            request,
-            vec![format!("entry_path: {}", entry_path.display())],
-        )
-    })?;
+    let minified =
+        minify_source_with_markers(&bundled.minifier_source, false).map_err(|error| {
+            error_with_context(
+                "minify",
+                format!("failed to minify bundled modules: {error}"),
+                context,
+                request,
+                vec![format!("entry_path: {}", entry_path.display())],
+            )
+        })?;
     let compressed = compress_all(&minified).map_err(|error| {
         error_with_context(
             "compression",
@@ -272,7 +277,7 @@ fn analyze_with_oxc_pipeline(
 
     Ok(ImportResult {
         specifier: request.specifier.clone(),
-        raw_bytes: bundled.len() as u64,
+        raw_bytes: bundled.source.len() as u64,
         minified_bytes: minified.len() as u64,
         gzip_bytes: compressed.gzip_bytes,
         brotli_bytes: compressed.brotli_bytes,
@@ -283,13 +288,14 @@ fn analyze_with_oxc_pipeline(
             request,
             side_effects,
             &graph,
-            bundled.len() as u64,
+            bundled.source.len() as u64,
         ),
         is_cjs: false,
         error: None,
         diagnostics,
-        module_breakdown: Some(module_breakdown(&graph, &reachable)),
+        module_breakdown: Some(top_module_contributions(&bundled.contributions)),
         shared_bytes: None,
+        internal_contributions: bundled.contributions,
     })
 }
 
@@ -378,24 +384,12 @@ fn analyze_static_entry(
         diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path),
         module_breakdown: None,
         shared_bytes: None,
+        internal_contributions: Vec::new(),
     })
 }
 
-fn module_breakdown(
-    graph: &ModuleGraph,
-    reachable: &crate::pipeline::reachability::ReachableExports,
-) -> Vec<ModuleContribution> {
-    let included = included_module_ids(graph, reachable);
-    let mut contributions = graph
-        .modules
-        .iter()
-        .filter(|module| included.contains_key(&module.id))
-        .map(|module| ModuleContribution {
-            path: module.path.to_string_lossy().to_string(),
-            bytes: module.original_source_bytes as u64,
-        })
-        .collect::<Vec<_>>();
-
+fn top_module_contributions(contributions: &[ModuleContribution]) -> Vec<ModuleContribution> {
+    let mut contributions = contributions.to_vec();
     contributions.sort_by(|left, right| {
         right
             .bytes
@@ -595,6 +589,7 @@ fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
         }],
         module_breakdown: None,
         shared_bytes: None,
+        internal_contributions: Vec::new(),
     }
 }
 

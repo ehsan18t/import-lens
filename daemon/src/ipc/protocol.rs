@@ -76,6 +76,8 @@ pub struct ImportResult {
     pub module_breakdown: Option<Vec<ModuleContribution>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_bytes: Option<u64>,
+    #[serde(default, skip)]
+    pub internal_contributions: Vec<ModuleContribution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

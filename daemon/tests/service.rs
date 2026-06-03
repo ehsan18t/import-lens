@@ -166,6 +166,44 @@ fn write_shared_packages(workspace: &Path) {
     }
 }
 
+fn write_shared_packages_with_many_unique_modules(workspace: &Path) {
+    let util_root = workspace.join("node_modules").join("shared-small-util");
+    fs::create_dir_all(&util_root).expect("shared util root should be created");
+    fs::write(
+        util_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("shared util manifest should be written");
+    fs::write(util_root.join("index.js"), "export const util = 'u';")
+        .expect("shared util entry should be written");
+
+    for package_name in ["left-wide-lib", "right-wide-lib"] {
+        let package_root = workspace.join("node_modules").join(package_name);
+        fs::create_dir_all(&package_root).expect("package root should be created");
+        fs::write(
+            package_root.join("package.json"),
+            r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        )
+        .expect("package manifest should be written");
+
+        let export_name = package_name.replace("-wide-lib", "").replace('-', "_");
+        let mut entry = "import { util } from 'shared-small-util';\n".to_owned();
+        for index in 0..11 {
+            entry.push_str(&format!("import './local-{index}.js';\n"));
+            fs::write(
+                package_root.join(format!("local-{index}.js")),
+                format!(
+                    "globalThis.__importLensLocal{index} = '{}';",
+                    "x".repeat(120)
+                ),
+            )
+            .expect("local side-effect module should be written");
+        }
+        entry.push_str(&format!("export const {export_name} = util;"));
+        fs::write(package_root.join("index.js"), entry).expect("package entry should be written");
+    }
+}
+
 fn write_effectful_package(workspace: &Path) {
     let package_root = workspace.join("node_modules").join("effectful-lib");
     fs::create_dir_all(&package_root).expect("package root should be created");
@@ -330,6 +368,38 @@ fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
             ImportRequest {
                 specifier: "right-lib".to_owned(),
                 package_name: "right-lib".to_owned(),
+                version: "1.0.0".to_owned(),
+                named: vec!["right".to_owned()],
+                import_kind: ImportKind::Named,
+                runtime: ImportRuntime::Component,
+            },
+        ],
+        streaming: false,
+    }
+}
+
+fn wide_shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
+    BatchRequest {
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![
+            ImportRequest {
+                specifier: "left-wide-lib".to_owned(),
+                package_name: "left-wide-lib".to_owned(),
+                version: "1.0.0".to_owned(),
+                named: vec!["left".to_owned()],
+                import_kind: ImportKind::Named,
+                runtime: ImportRuntime::Component,
+            },
+            ImportRequest {
+                specifier: "right-wide-lib".to_owned(),
+                package_name: "right-wide-lib".to_owned(),
                 version: "1.0.0".to_owned(),
                 named: vec!["right".to_owned()],
                 import_kind: ImportKind::Named,
@@ -572,6 +642,37 @@ fn service_marks_shared_transitive_modules_in_batch_results() {
             .all(|result| result.shared_bytes.is_some_and(|bytes| bytes > 0)),
         "{response:?}",
     );
+}
+
+#[test]
+fn service_marks_shared_bytes_outside_public_top_ten_breakdown() {
+    let workspace = temp_workspace();
+    write_shared_packages_with_many_unique_modules(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_batch(wide_shared_batch(&workspace, 24));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.imports.len(), 2);
+    for result in &response.imports {
+        assert_eq!(
+            result.module_breakdown.as_ref().map(Vec::len),
+            Some(10),
+            "{result:?}",
+        );
+        assert!(
+            !result.module_breakdown.as_ref().is_some_and(|modules| {
+                modules
+                    .iter()
+                    .any(|module| module.path.contains("shared-small-util"))
+            }),
+            "{result:?}",
+        );
+        assert!(
+            result.shared_bytes.is_some_and(|bytes| bytes > 0),
+            "{result:?}",
+        );
+    }
 }
 
 #[test]

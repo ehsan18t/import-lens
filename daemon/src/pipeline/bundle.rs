@@ -1,6 +1,9 @@
-use crate::pipeline::{
-    graph::{ModuleGraph, ModuleId, ModuleRecord},
-    reachability::ReachableExports,
+use crate::{
+    ipc::protocol::ModuleContribution,
+    pipeline::{
+        graph::{ModuleGraph, ModuleId, ModuleRecord},
+        reachability::ReachableExports,
+    },
 };
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
@@ -8,12 +11,29 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{SourceType, Span};
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, Clone)]
+pub struct BundledModules {
+    pub source: String,
+    pub minifier_source: String,
+    pub contributions: Vec<ModuleContribution>,
+}
+
 pub fn bundle_reachable_modules(
     graph: &ModuleGraph,
     reachable: &ReachableExports,
 ) -> Result<String, String> {
-    let included = included_module_ids(graph, reachable);
+    bundle_reachable_modules_with_metadata(graph, reachable).map(|bundled| bundled.source)
+}
+
+pub fn bundle_reachable_modules_with_metadata(
+    graph: &ModuleGraph,
+    reachable: &ReachableExports,
+) -> Result<BundledModules, String> {
+    let mut expanded_reachable = reachable.clone();
+    let included = included_module_ids_with_reachable(graph, &mut expanded_reachable);
     let mut source = String::new();
+    let mut minifier_source = String::new();
+    let mut contributions = Vec::new();
     let mut deduplicated_external_imports = HashMap::new();
 
     for module in graph
@@ -29,10 +49,22 @@ pub fn bundle_reachable_modules(
         }
 
         let keep_all_exports = included.get(&module.id).copied().unwrap_or(false);
-        let rewritten = rewrite_module(graph, module, reachable, keep_all_exports)?;
+        let rewritten = rewrite_module(graph, module, &expanded_reachable, keep_all_exports)?;
         if !rewritten.trim().is_empty() {
+            contributions.push(ModuleContribution {
+                path: module.path.to_string_lossy().to_string(),
+                bytes: rewritten.len() as u64,
+            });
             source.push_str(&rewritten);
             source.push('\n');
+
+            minifier_source.push_str(&rewritten);
+            let markers = usage_markers(module, &expanded_reachable, keep_all_exports);
+            if !markers.is_empty() {
+                minifier_source.push('\n');
+                minifier_source.push_str(&markers);
+            }
+            minifier_source.push('\n');
         }
     }
 
@@ -86,20 +118,42 @@ pub fn bundle_reachable_modules(
         }
     }
 
-    synthetic_imports.push_str(&source);
-    Ok(synthetic_imports)
+    let mut bundled_source = synthetic_imports.clone();
+    bundled_source.push_str(&source);
+    let mut bundled_minifier_source = synthetic_imports;
+    bundled_minifier_source.push_str(&minifier_source);
+
+    Ok(BundledModules {
+        source: bundled_source,
+        minifier_source: bundled_minifier_source,
+        contributions,
+    })
 }
 
 pub fn included_module_ids(
     graph: &ModuleGraph,
     reachable: &ReachableExports,
 ) -> HashMap<ModuleId, bool> {
+    let mut reachable = reachable.clone();
+    included_module_ids_with_reachable(graph, &mut reachable)
+}
+
+fn included_module_ids_with_reachable(
+    graph: &ModuleGraph,
+    reachable: &mut ReachableExports,
+) -> HashMap<ModuleId, bool> {
     let mut included = HashMap::new();
 
     for module in &graph.modules {
         if reachable.contains_module(&module.path) {
             let keep_all_exports = reachable.is_full_module(&module.path);
-            include_module_with_imports(graph, module.id, keep_all_exports, &mut included);
+            include_module_with_imports(
+                graph,
+                module.id,
+                keep_all_exports,
+                reachable,
+                &mut included,
+            );
         }
     }
 
@@ -110,35 +164,53 @@ fn include_module_with_imports(
     graph: &ModuleGraph,
     module_id: ModuleId,
     keep_all_exports: bool,
+    reachable: &mut ReachableExports,
     included: &mut HashMap<ModuleId, bool>,
 ) {
-    let was_included_as_full = included.insert(
-        module_id,
-        included.get(&module_id).copied().unwrap_or(false) || keep_all_exports,
-    );
-    if was_included_as_full == Some(true) && keep_all_exports {
+    let previous_keep_all = included.get(&module_id).copied();
+    let next_keep_all = previous_keep_all.unwrap_or(false) || keep_all_exports;
+    if previous_keep_all == Some(next_keep_all) {
         return;
     }
+    included.insert(module_id, next_keep_all);
 
     let Some(module) = graph.module_by_id(module_id) else {
         return;
     };
+    if next_keep_all {
+        reachable.mark_full_module(module.path.clone());
+    } else {
+        reachable.mark_module(module.path.clone());
+    }
 
     for import in &module.imports {
         if let Some(target_id) = graph.module_id_by_path(&import.resolved_path) {
-            include_module_with_imports(graph, target_id, true, included);
+            let target_keep_all =
+                keep_all_exports || import.imported_names.iter().any(|name| name == "*");
+            if let Some(target) = graph.module_by_id(target_id) {
+                if target_keep_all {
+                    reachable.mark_full_module(target.path.clone());
+                } else if import.imported_names.is_empty() {
+                    reachable.mark_module(target.path.clone());
+                } else {
+                    for imported_name in &import.imported_names {
+                        reachable.mark_module_symbol(target.path.clone(), imported_name.clone());
+                    }
+                }
+            }
+            include_module_with_imports(graph, target_id, target_keep_all, reachable, included);
         }
     }
 
-    if keep_all_exports {
+    if next_keep_all {
         for reexport in &module.reexports {
             if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path) {
-                include_module_with_imports(graph, target_id, true, included);
+                include_module_with_imports(graph, target_id, true, reachable, included);
             }
         }
         for star_export in &module.star_exports {
             if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path) {
-                include_module_with_imports(graph, target_id, true, included);
+                include_module_with_imports(graph, target_id, true, reachable, included);
             }
         }
     }
@@ -208,13 +280,7 @@ fn rewrite_module(
     let rename_replacements = semantic_rename_replacements(module, &renames, &replacements)?;
     replacements.extend(rename_replacements);
 
-    let mut rewritten = apply_replacements(&module.source, replacements)?;
-    let anchors = usage_anchors(module, reachable, keep_all_exports);
-    if !anchors.is_empty() {
-        rewritten.push_str("\n;");
-        rewritten.push_str(&anchors);
-    }
-
+    let rewritten = apply_replacements(&module.source, replacements)?;
     Ok(rewritten)
 }
 
@@ -518,21 +584,23 @@ fn apply_replacements(source: &str, mut replacements: Vec<Replacement>) -> Resul
     Ok(output)
 }
 
-fn usage_anchors(
+fn usage_markers(
     module: &ModuleRecord,
     reachable: &ReachableExports,
     keep_all_exports: bool,
 ) -> String {
-    let mut anchors = String::new();
+    let mut markers = String::new();
     for export in &module.exports {
         if keep_all_exports || reachable.contains_module_symbol(&module.path, &export.exported_name)
         {
-            anchors.push_str("__importLensUse(");
-            anchors.push_str(&module_binding_name(module.id, &export.local_name));
-            anchors.push_str(");\n");
+            markers.push_str("export { ");
+            markers.push_str(&module_binding_name(module.id, &export.local_name));
+            markers.push_str(" as __importLensUse_");
+            markers.push_str(&module_binding_name(module.id, &export.exported_name));
+            markers.push_str(" };\n");
         }
     }
-    anchors
+    markers
 }
 
 fn is_object_shorthand_occurrence(source: &str, start: usize, end: usize) -> bool {

@@ -699,6 +699,55 @@ fn analyze_commonjs_literal_require_graph_includes_required_modules() {
 }
 
 #[test]
+fn analyze_commonjs_graph_keeps_complete_internal_contribution_data() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "cjs-wide-graph-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+
+    let mut entry = String::new();
+    for index in 0..12 {
+        entry.push_str(&format!("require('./dep-{index}.cjs');\n"));
+        write_package_file(
+            &workspace,
+            "cjs-wide-graph-lib",
+            &format!("dep-{index}.cjs"),
+            &format!("exports.dep{index} = '{}';", "x".repeat(40)),
+        );
+    }
+    entry.push_str("exports.used = 1;");
+    write_package_file(&workspace, "cjs-wide-graph-lib", "index.cjs", &entry);
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "cjs-wide-graph-lib".to_owned(),
+        package_name: "cjs-wide-graph-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["used".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.is_cjs);
+    assert_eq!(
+        result.module_breakdown.as_ref().map(Vec::len),
+        Some(10),
+        "{result:?}",
+    );
+    assert_eq!(result.internal_contributions.len(), 13, "{result:?}");
+}
+
+#[test]
 fn analyze_commonjs_literal_require_resolves_directory_package_manifest() {
     let workspace = temp_workspace();
     write_package(
