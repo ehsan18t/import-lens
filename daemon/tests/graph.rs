@@ -197,6 +197,44 @@ fn graph_resolves_bare_transitive_dependency_modules() {
 }
 
 #[test]
+fn graph_resolves_relative_directory_package_manifest() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import createClient from './createClient';\nexport const value = createClient();",
+    );
+    write_source(
+        &root,
+        "createClient/package.json",
+        r#"{"name":"create-client-fixture","browser":"./browser.js","main":"./node.js"}"#,
+    );
+    write_source(
+        &root,
+        "createClient/browser.js",
+        "export default function createClient() { return 'browser'; }",
+    );
+    write_source(
+        &root,
+        "createClient/node.js",
+        "export default function createClient() { return 'node'; }",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js"))
+        .expect("relative directory package manifest should resolve");
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+    assert!(
+        graph
+            .modules
+            .iter()
+            .any(|module| module.path.ends_with("createClient/browser.js")),
+        "{graph:?}",
+    );
+    assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+}
+
+#[test]
 fn graph_keeps_builtins_and_unresolved_peers_external_with_diagnostics() {
     let root = temp_workspace();
     write_source(

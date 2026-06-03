@@ -4,7 +4,7 @@ use crate::{
         analyze::AnalysisContext,
         bundle::bundle_reachable_modules,
         compress::compress_all,
-        graph::{ModuleGraph, ModuleId, ModuleRecord, build_module_graph_cached},
+        graph::{ModuleGraph, ModuleId, ModuleRecord, build_module_graph_cached_with_runtime},
         minify::minify_source,
         reachability::{ReachableExports, reachable_exports},
         resolver::resolve_package_entry,
@@ -85,17 +85,18 @@ pub fn compute_file_size(
             continue;
         }
 
-        let graph = match build_module_graph_cached(&resolved.entry_path) {
-            Ok(graph) => graph,
-            Err(error) => {
-                diagnostics.push(diagnostic(
-                    "module_graph",
-                    error,
-                    vec![format!("entry_path: {}", resolved.entry_path.display())],
-                ));
-                continue;
-            }
-        };
+        let graph =
+            match build_module_graph_cached_with_runtime(&resolved.entry_path, request.runtime) {
+                Ok(graph) => graph,
+                Err(error) => {
+                    diagnostics.push(diagnostic(
+                        "module_graph",
+                        error,
+                        vec![format!("entry_path: {}", resolved.entry_path.display())],
+                    ));
+                    continue;
+                }
+            };
         diagnostics.extend(graph.diagnostics.iter().map(|item| ImportDiagnostic {
             stage: item.stage.clone(),
             message: item.message.clone(),

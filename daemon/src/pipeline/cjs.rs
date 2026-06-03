@@ -1,10 +1,11 @@
 use crate::{
-    ipc::protocol::{ImportDiagnostic, ModuleContribution},
+    ipc::protocol::{ImportDiagnostic, ImportRuntime, ModuleContribution},
     pipeline::{
         graph::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES},
-        resolver::append_extension,
+        resolver::{create_resolver, normalize_existing_path, resolve_module_path},
     },
 };
+use oxc_resolver::Resolver;
 use std::{
     collections::{HashSet, VecDeque},
     fs,
@@ -21,6 +22,13 @@ pub struct CjsGraphAnalysis {
 }
 
 pub fn analyze_cjs_graph(entry_path: &Path) -> Result<CjsGraphAnalysis, String> {
+    analyze_cjs_graph_with_runtime(entry_path, ImportRuntime::Component)
+}
+
+pub fn analyze_cjs_graph_with_runtime(
+    entry_path: &Path,
+    runtime: ImportRuntime,
+) -> Result<CjsGraphAnalysis, String> {
     let entry_path = normalize_existing_path(entry_path)?;
     let mut queue = VecDeque::from([entry_path]);
     let mut seen = HashSet::new();
@@ -30,6 +38,7 @@ pub fn analyze_cjs_graph(entry_path: &Path) -> Result<CjsGraphAnalysis, String> 
     let mut diagnostics = Vec::new();
     let mut total_source_bytes = 0_usize;
     let mut unsupported = false;
+    let resolver = create_resolver(runtime);
 
     while let Some(path) = queue.pop_front() {
         let path = normalize_existing_path(&path)?;
@@ -71,7 +80,7 @@ pub fn analyze_cjs_graph(entry_path: &Path) -> Result<CjsGraphAnalysis, String> 
         let masked = mask_non_code(&source);
         let requires = literal_requires(&source, &masked, &mut unsupported);
         for specifier in requires {
-            match resolve_require(&path, &specifier) {
+            match resolve_require(&resolver, &path, &specifier) {
                 Ok(Some(resolved_path)) => queue.push_back(resolved_path),
                 Ok(None) => diagnostics.push(diagnostic(
                     "cjs_resolution",
@@ -259,7 +268,11 @@ fn is_module_exports(bytes: &[u8], exports_start: usize) -> bool {
         && is_identifier_boundary(bytes, module_start, exports_start + "exports".len())
 }
 
-fn resolve_require(from_path: &Path, specifier: &str) -> Result<Option<PathBuf>, String> {
+fn resolve_require(
+    resolver: &Resolver,
+    from_path: &Path,
+    specifier: &str,
+) -> Result<Option<PathBuf>, String> {
     if !specifier.starts_with('.') {
         return Ok(None);
     }
@@ -270,26 +283,13 @@ fn resolve_require(from_path: &Path, specifier: &str) -> Result<Option<PathBuf>,
             from_path.display()
         )
     })?;
-    let candidate = from_dir.join(specifier);
-    let candidates = [
-        candidate.clone(),
-        append_extension(&candidate, "js"),
-        append_extension(&candidate, "cjs"),
-        append_extension(&candidate, "mjs"),
-        candidate.join("index.js"),
-        candidate.join("index.cjs"),
-        candidate.join("index.mjs"),
-    ];
-
-    candidates
-        .iter()
-        .find(|path| path.is_file())
-        .map(|path| normalize_existing_path(path).map(Some))
-        .unwrap_or_else(|| {
-            Err(format!(
-                "failed to resolve CommonJS require '{specifier}' from {}",
+    resolve_module_path(resolver, from_dir, specifier)
+        .map(|resolved| Some(resolved.path))
+        .map_err(|error| {
+            format!(
+                "failed to resolve CommonJS require '{specifier}' from {}: {error}",
                 from_path.display()
-            ))
+            )
         })
 }
 
@@ -429,11 +429,6 @@ fn is_identifier_start(byte: u8) -> bool {
 
 fn is_identifier_part(byte: u8) -> bool {
     is_identifier_start(byte) || byte.is_ascii_digit()
-}
-
-fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
-    fs::canonicalize(path)
-        .map_err(|error| format!("failed to resolve path {}: {error}", path.display()))
 }
 
 fn diagnostic(stage: &str, message: String, details: Vec<String>) -> ImportDiagnostic {

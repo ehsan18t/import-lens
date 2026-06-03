@@ -4,9 +4,9 @@ use crate::{
     },
     pipeline::{
         bundle::{bundle_reachable_modules, included_module_ids},
-        cjs::{CjsGraphAnalysis, analyze_cjs_graph},
+        cjs::{CjsGraphAnalysis, analyze_cjs_graph_with_runtime},
         compress::compress_all,
-        graph::{ModuleGraph, ModuleId, build_module_graph_cached},
+        graph::{ModuleGraph, ModuleId, build_module_graph_cached_with_runtime},
         minify::minify_source,
         reachability::reachable_exports,
         resolver::{ResolvedPackage, SideEffectsMode, resolve_package_entry},
@@ -139,7 +139,7 @@ fn analyze_with_cjs_graph(
     request: &ImportRequest,
     entry_path: &Path,
 ) -> Result<ImportResult, Vec<ImportDiagnostic>> {
-    let graph = analyze_cjs_graph(entry_path).map_err(|error| {
+    let graph = analyze_cjs_graph_with_runtime(entry_path, request.runtime).map_err(|error| {
         vec![ImportDiagnostic {
             stage: "cjs_fallback".to_owned(),
             message: format!("CommonJS static analysis failed; using static entry sizing: {error}"),
@@ -209,15 +209,16 @@ fn analyze_with_oxc_pipeline(
     side_effects_mode: SideEffectsMode,
 ) -> Result<ImportResult, AnalysisError> {
     let side_effects = side_effects_mode.has_side_effects();
-    let graph = build_module_graph_cached(&entry_path).map_err(|error| {
-        error_with_context(
-            "module_graph",
-            format!("failed to build module graph: {error}"),
-            context,
-            request,
-            vec![format!("entry_path: {}", entry_path.display())],
-        )
-    })?;
+    let graph =
+        build_module_graph_cached_with_runtime(&entry_path, request.runtime).map_err(|error| {
+            error_with_context(
+                "module_graph",
+                format!("failed to build module graph: {error}"),
+                context,
+                request,
+                vec![format!("entry_path: {}", entry_path.display())],
+            )
+        })?;
     let include_full_entry = side_effects || matches!(request.import_kind, ImportKind::Namespace);
     let requested_exports = requested_exports(request);
     let mut reachable = reachable_exports(&graph, &requested_exports, include_full_entry);

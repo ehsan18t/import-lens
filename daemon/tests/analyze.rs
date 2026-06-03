@@ -616,6 +616,68 @@ fn analyze_commonjs_literal_require_graph_includes_required_modules() {
 }
 
 #[test]
+fn analyze_commonjs_literal_require_resolves_directory_package_manifest() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "cjs-dir-require-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+    write_package_file(
+        &workspace,
+        "cjs-dir-require-lib",
+        "index.cjs",
+        "const client = require('./createClient');\nexports.used = client.used;",
+    );
+    write_package_file(
+        &workspace,
+        "cjs-dir-require-lib",
+        "createClient/package.json",
+        r#"{"name":"create-client-fixture","main":"./node.cjs"}"#,
+    );
+    write_package_file(
+        &workspace,
+        "cjs-dir-require-lib",
+        "createClient/node.cjs",
+        "exports.used = 'directory manifest payload';",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "cjs-dir-require-lib".to_owned(),
+        package_name: "cjs-dir-require-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["used".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.is_cjs);
+    assert!(
+        result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules.iter().any(|module| {
+                module.path.contains("createClient") && module.path.ends_with("node.cjs")
+            })
+        }),
+        "{result:?}",
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "cjs_resolution"),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_commonjs_dynamic_require_uses_static_fallback_diagnostic() {
     let workspace = temp_workspace();
     write_package(

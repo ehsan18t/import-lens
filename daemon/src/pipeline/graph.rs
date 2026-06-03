@@ -1,8 +1,11 @@
-use crate::pipeline::resolver::append_extension;
+use crate::{
+    ipc::protocol::ImportRuntime,
+    pipeline::resolver::{create_resolver, normalize_existing_path, resolve_module_path},
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{BindingPattern, Declaration, ExportDefaultDeclarationKind, Program, Statement};
 use oxc_parser::Parser;
-use oxc_resolver::{ResolveOptions, Resolver};
+use oxc_resolver::Resolver;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{SourceType, Span};
 use oxc_syntax::module_record::{
@@ -16,7 +19,8 @@ use std::{
     sync::OnceLock,
 };
 
-static GRAPH_CACHE: OnceLock<papaya::HashMap<PathBuf, ModuleGraph>> = OnceLock::new();
+static GRAPH_CACHE: OnceLock<papaya::HashMap<(PathBuf, ImportRuntime), ModuleGraph>> =
+    OnceLock::new();
 
 pub const MAX_GRAPH_MODULES: usize = 2_000;
 pub const MAX_MODULE_SOURCE_BYTES: usize = 5 * 1024 * 1024;
@@ -162,43 +166,35 @@ impl ModuleGraph {
     }
 }
 
-fn module_resolver() -> Resolver {
-    Resolver::new(ResolveOptions {
-        alias_fields: vec![vec!["browser".to_owned()]],
-        condition_names: vec![
-            "module".to_owned(),
-            "import".to_owned(),
-            "default".to_owned(),
-        ],
-        extensions: vec![
-            ".js".to_owned(),
-            ".mjs".to_owned(),
-            ".cjs".to_owned(),
-            ".jsx".to_owned(),
-            ".ts".to_owned(),
-            ".tsx".to_owned(),
-        ],
-        main_fields: vec!["browser".to_owned(), "module".to_owned(), "main".to_owned()],
-        module_type: true,
-        node_path: false,
-        ..ResolveOptions::default()
-    })
+pub fn build_module_graph(entry_path: &Path) -> Result<ModuleGraph, String> {
+    build_module_graph_with_runtime(entry_path, ImportRuntime::Component)
 }
 
-pub fn build_module_graph(entry_path: &Path) -> Result<ModuleGraph, String> {
-    build_module_graph_with_limits(entry_path, GraphLimits::default())
+pub fn build_module_graph_with_runtime(
+    entry_path: &Path,
+    runtime: ImportRuntime,
+) -> Result<ModuleGraph, String> {
+    build_module_graph_with_limits_and_runtime(entry_path, GraphLimits::default(), runtime)
 }
 
 pub fn build_module_graph_cached(entry_path: &Path) -> Result<ModuleGraph, String> {
+    build_module_graph_cached_with_runtime(entry_path, ImportRuntime::Component)
+}
+
+pub fn build_module_graph_cached_with_runtime(
+    entry_path: &Path,
+    runtime: ImportRuntime,
+) -> Result<ModuleGraph, String> {
     let entry_path = normalize_existing_path(entry_path)?;
     let cache = GRAPH_CACHE.get_or_init(papaya::HashMap::new);
     let pinned = cache.pin();
-    if let Some(graph) = pinned.get(&entry_path) {
+    let cache_key = (entry_path.clone(), runtime);
+    if let Some(graph) = pinned.get(&cache_key) {
         return Ok(graph.clone());
     }
 
-    let graph = build_module_graph(&entry_path)?;
-    pinned.insert(entry_path, graph.clone());
+    let graph = build_module_graph_with_runtime(&entry_path, runtime)?;
+    pinned.insert(cache_key, graph.clone());
     Ok(graph)
 }
 
@@ -211,12 +207,12 @@ pub fn invalidate_module_graph_cache_for_package(package_name: &str) {
     let pinned = cache.pin();
     let keys = pinned
         .iter()
-        .filter(|(path, _)| {
+        .filter(|((path, _runtime), _)| {
             path.to_string_lossy()
                 .replace('\\', "/")
                 .contains(&package_segment)
         })
-        .map(|(path, _)| path.clone())
+        .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
 
     for key in keys {
@@ -234,8 +230,16 @@ pub fn build_module_graph_with_limits(
     entry_path: &Path,
     limits: GraphLimits,
 ) -> Result<ModuleGraph, String> {
+    build_module_graph_with_limits_and_runtime(entry_path, limits, ImportRuntime::Component)
+}
+
+pub fn build_module_graph_with_limits_and_runtime(
+    entry_path: &Path,
+    limits: GraphLimits,
+    runtime: ImportRuntime,
+) -> Result<ModuleGraph, String> {
     let entry_path = normalize_existing_path(entry_path)?;
-    let mut builder = ModuleGraphBuilder::new(limits);
+    let mut builder = ModuleGraphBuilder::new(limits, runtime);
     let entry_id = builder.load_module(&entry_path)?;
     builder.graph.entry_id = entry_id;
     builder.graph.dependency_paths = builder.dependency_paths.into_iter().collect();
@@ -255,12 +259,12 @@ struct ModuleGraphBuilder {
 }
 
 impl ModuleGraphBuilder {
-    fn new(limits: GraphLimits) -> Self {
+    fn new(limits: GraphLimits, runtime: ImportRuntime) -> Self {
         Self {
             graph: ModuleGraph::default(),
             limits,
             graph_source_bytes: 0,
-            resolver: module_resolver(),
+            resolver: create_resolver(runtime),
             dependency_paths: HashSet::new(),
             circular_edges: HashSet::new(),
             loading_paths: HashSet::new(),
@@ -847,10 +851,6 @@ fn resolve_module(
     specifier: &str,
     resolver_context: &mut ModuleResolverContext<'_>,
 ) -> Result<ModuleResolution, String> {
-    if specifier.starts_with('.') {
-        return resolve_relative_module(from_path, specifier).map(ModuleResolution::Internal);
-    }
-
     if is_node_builtin_specifier(specifier) {
         push_resolution_diagnostic(
             resolver_context,
@@ -868,9 +868,16 @@ fn resolve_module(
         )
     })?;
 
-    let resolution = match resolver_context.resolver.resolve(from_dir, specifier) {
-        Ok(resolution) => resolution,
+    let resolved = match resolve_module_path(resolver_context.resolver, from_dir, specifier) {
+        Ok(resolved) => resolved,
         Err(error) => {
+            if specifier.starts_with('.') {
+                return Err(format!(
+                    "failed to resolve relative module '{specifier}' from {}; {error}",
+                    from_path.display()
+                ));
+            }
+
             push_resolution_diagnostic(
                 resolver_context,
                 from_path,
@@ -881,76 +888,10 @@ fn resolve_module(
         }
     };
 
-    if resolution.query().is_some() || resolution.fragment().is_some() {
-        push_resolution_diagnostic(
-            resolver_context,
-            from_path,
-            specifier,
-            format!("resolved module '{specifier}' contains unsupported query or fragment"),
-        );
-        return Ok(ModuleResolution::External);
-    }
-
-    let resolved_path = resolution.into_path_buf();
-    if !resolved_path.is_file() {
-        push_resolution_diagnostic(
-            resolver_context,
-            from_path,
-            specifier,
-            format!(
-                "resolved module '{specifier}' is not a file: {}",
-                resolved_path.display()
-            ),
-        );
-        return Ok(ModuleResolution::External);
-    }
-
-    let resolved_path = normalize_existing_path(&resolved_path)?;
     resolver_context
         .dependency_paths
-        .insert(resolved_path.clone());
-    Ok(ModuleResolution::Internal(resolved_path))
-}
-
-fn resolve_relative_module(from_path: &Path, specifier: &str) -> Result<PathBuf, String> {
-    let from_dir = from_path.parent().ok_or_else(|| {
-        format!(
-            "module path has no parent directory: {}",
-            from_path.display()
-        )
-    })?;
-    let candidate = from_dir.join(specifier);
-    let candidates = [
-        candidate.clone(),
-        append_extension(&candidate, "js"),
-        append_extension(&candidate, "mjs"),
-        append_extension(&candidate, "cjs"),
-        append_extension(&candidate, "jsx"),
-        append_extension(&candidate, "ts"),
-        append_extension(&candidate, "tsx"),
-        candidate.join("index.js"),
-        candidate.join("index.mjs"),
-        candidate.join("index.cjs"),
-        candidate.join("index.jsx"),
-        candidate.join("index.ts"),
-        candidate.join("index.tsx"),
-    ];
-
-    candidates
-        .iter()
-        .find(|path| path.is_file())
-        .map(|path| normalize_existing_path(path))
-        .unwrap_or_else(|| {
-            let checked = candidates
-                .iter()
-                .map(|path| format!("candidate: {}", path.display()))
-                .collect::<Vec<_>>()
-                .join("; ");
-            Err(format!(
-                "failed to resolve relative module '{specifier}' from {}; {checked}",
-                from_path.display()
-            ))
-        })
+        .insert(resolved.path.clone());
+    Ok(ModuleResolution::Internal(resolved.path))
 }
 
 fn push_resolution_diagnostic(
@@ -1013,11 +954,6 @@ pub fn is_node_builtin_specifier(specifier: &str) -> bool {
             | "worker_threads"
             | "zlib"
     )
-}
-
-fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
-    fs::canonicalize(path)
-        .map_err(|error| format!("failed to resolve path {}: {error}", path.display()))
 }
 
 fn span_start(span: Span) -> usize {

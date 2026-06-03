@@ -1,4 +1,4 @@
-use crate::ipc::protocol::ImportRequest;
+use crate::ipc::protocol::{ImportRequest, ImportRuntime};
 use oxc_resolver::{ModuleType, ResolveOptions, Resolver};
 use serde_json::Value;
 use std::{
@@ -36,6 +36,12 @@ struct PackageManifest {
     json: Value,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedModulePath {
+    pub path: PathBuf,
+    pub is_cjs: bool,
+}
+
 pub fn resolve_package_entry(
     active_document_path: &Path,
     request: &ImportRequest,
@@ -43,16 +49,13 @@ pub fn resolve_package_entry(
     validate_package_name(&request.package_name)?;
 
     let manifest = find_package_manifest(active_document_path, request)?;
-    let resolution = if manifest.json.get("exports").is_some() {
-        resolve_with_oxc(active_document_path, request)
-    } else {
-        Err("package has no exports map; using legacy entry fallback".to_owned())
-    };
+    let resolution = resolve_with_oxc(active_document_path, request);
     let (entry_path, is_cjs) = match resolution {
         Ok(resolved) => {
             let entry_path = resolved.entry_path;
-            let is_cjs = (resolved.is_cjs || entry_looks_commonjs(&entry_path))
-                && !entry_matches_manifest_esm_field(&manifest, &entry_path);
+            validate_declared_entry_resolution(&manifest, request.runtime)?;
+            reject_unsupported_entry_source(&entry_path)?;
+            let is_cjs = resolved_entry_is_commonjs(&manifest, &entry_path, resolved.is_cjs);
             (entry_path, is_cjs)
         }
         Err(error) => resolve_legacy_fallback(&manifest, request, &error)?,
@@ -81,37 +84,12 @@ fn resolve_with_oxc(
         .parent()
         .ok_or_else(|| "active document path has no parent directory".to_owned())?;
 
-    let resolver = Resolver::new(ResolveOptions {
-        alias_fields: vec![vec!["browser".to_owned()]],
-        condition_names: vec![
-            "module".to_owned(),
-            "import".to_owned(),
-            "default".to_owned(),
-        ],
-        extensions: vec![".js".to_owned(), ".mjs".to_owned(), ".cjs".to_owned()],
-        main_fields: vec!["browser".to_owned(), "module".to_owned()],
-        module_type: true,
-        node_path: false,
-        ..ResolveOptions::default()
-    });
-
-    let resolution = resolver
-        .resolve(directory, &request.specifier)
-        .map_err(|error| error.to_string())?;
-
-    if resolution.query().is_some() || resolution.fragment().is_some() {
-        return Err(format!(
-            "resolved entry contains unsupported query or fragment: {}",
-            resolution.full_path().display()
-        ));
-    }
-
-    let is_cjs = resolution.module_type() == Some(ModuleType::CommonJs)
-        || path_looks_cjs(&resolution.full_path().to_string_lossy());
+    let resolver = create_resolver(request.runtime);
+    let resolved = resolve_module_path(&resolver, directory, &request.specifier)?;
 
     Ok(ResolvedEntry {
-        entry_path: resolution.into_path_buf(),
-        is_cjs,
+        entry_path: resolved.path,
+        is_cjs: resolved.is_cjs,
     })
 }
 
@@ -156,6 +134,62 @@ fn resolve_legacy_fallback(
     }
 
     resolve_file_candidate(&manifest.root.join("index.js")).map(|path| (path, true))
+}
+
+fn validate_declared_entry_resolution(
+    manifest: &PackageManifest,
+    runtime: ImportRuntime,
+) -> Result<(), String> {
+    if manifest.json.get("exports").is_some() {
+        return Ok(());
+    }
+
+    let declared_entries = profile_entry_fields(runtime)
+        .iter()
+        .filter_map(|field| {
+            manifest
+                .json
+                .get(*field)
+                .and_then(Value::as_str)
+                .map(|target| (*field, target))
+        })
+        .collect::<Vec<_>>();
+    if declared_entries.is_empty() {
+        return Ok(());
+    }
+
+    let resolver = create_resolver(runtime);
+    for (_, target) in &declared_entries {
+        if resolve_manifest_target(&resolver, &manifest.root, target).is_ok() {
+            return Ok(());
+        }
+    }
+
+    let (_, first_target) = declared_entries[0];
+    resolve_file_candidate(&manifest.root.join(first_target)).map(|_| ())
+}
+
+fn profile_entry_fields(runtime: ImportRuntime) -> &'static [&'static str] {
+    match runtime {
+        ImportRuntime::Component | ImportRuntime::Client => &["browser", "module", "main"],
+        ImportRuntime::Server => &["module", "main"],
+    }
+}
+
+fn resolve_manifest_target(
+    resolver: &Resolver,
+    package_root: &Path,
+    target: &str,
+) -> Result<ResolvedModulePath, String> {
+    let specifier =
+        if target.starts_with("./") || target.starts_with("../") || Path::new(target).is_absolute()
+        {
+            target.to_owned()
+        } else {
+            format!("./{target}")
+        };
+
+    resolve_module_path(resolver, package_root, &specifier)
 }
 
 fn find_package_manifest(
@@ -237,8 +271,49 @@ fn entry_matches_manifest_esm_field(manifest: &PackageManifest, entry_path: &Pat
     ["module", "browser"]
         .iter()
         .filter_map(|field| manifest.json.get(field).and_then(Value::as_str))
-        .filter_map(|relative| resolve_file_candidate(&manifest.root.join(relative)).ok())
+        .filter_map(|relative| resolve_manifest_file_candidate(manifest, relative).ok())
         .any(|candidate| candidate == entry_path)
+}
+
+fn resolved_entry_is_commonjs(
+    manifest: &PackageManifest,
+    entry_path: &Path,
+    resolver_is_cjs: bool,
+) -> bool {
+    if entry_matches_manifest_esm_field(manifest, entry_path) {
+        return false;
+    }
+
+    let path_str = entry_path.to_string_lossy();
+    if resolver_is_cjs || path_looks_cjs(&path_str) {
+        return true;
+    }
+    if path_str.ends_with(".mjs") || package_type(&manifest.json) == Some("module") {
+        return false;
+    }
+
+    entry_matches_manifest_main_field(manifest, entry_path) || entry_looks_commonjs(entry_path)
+}
+
+fn entry_matches_manifest_main_field(manifest: &PackageManifest, entry_path: &Path) -> bool {
+    manifest
+        .json
+        .get("main")
+        .and_then(Value::as_str)
+        .and_then(|relative| resolve_manifest_file_candidate(manifest, relative).ok())
+        .is_some_and(|candidate| candidate == entry_path)
+}
+
+fn package_type(package_json: &Value) -> Option<&str> {
+    package_json.get("type").and_then(Value::as_str)
+}
+
+fn resolve_manifest_file_candidate(
+    manifest: &PackageManifest,
+    relative: &str,
+) -> Result<PathBuf, String> {
+    let candidate = resolve_file_candidate(&manifest.root.join(relative))?;
+    normalize_existing_path(&candidate)
 }
 
 fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
@@ -268,15 +343,97 @@ fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
             )
         })?;
 
-    let path_str = found_path.to_string_lossy();
-    if path_str.ends_with(".ts") || path_str.ends_with(".tsx") {
+    reject_unsupported_entry_source(&found_path)?;
+
+    Ok(found_path)
+}
+
+pub(crate) fn create_resolver(runtime: ImportRuntime) -> Resolver {
+    Resolver::new(resolve_options(runtime))
+}
+
+fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
+    match runtime {
+        ImportRuntime::Component | ImportRuntime::Client => ResolveOptions {
+            alias_fields: vec![vec!["browser".to_owned()]],
+            condition_names: vec![
+                "browser".to_owned(),
+                "module".to_owned(),
+                "import".to_owned(),
+                "default".to_owned(),
+            ],
+            extensions: module_extensions(),
+            main_fields: vec!["browser".to_owned(), "module".to_owned(), "main".to_owned()],
+            module_type: true,
+            node_path: false,
+            ..ResolveOptions::default()
+        },
+        ImportRuntime::Server => ResolveOptions {
+            alias_fields: Vec::new(),
+            condition_names: vec![
+                "node".to_owned(),
+                "server".to_owned(),
+                "module".to_owned(),
+                "import".to_owned(),
+                "default".to_owned(),
+            ],
+            extensions: module_extensions(),
+            main_fields: vec!["module".to_owned(), "main".to_owned()],
+            module_type: true,
+            node_path: false,
+            ..ResolveOptions::default()
+        },
+    }
+}
+
+fn module_extensions() -> Vec<String> {
+    [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn resolve_module_path(
+    resolver: &Resolver,
+    from_path: &Path,
+    specifier: &str,
+) -> Result<ResolvedModulePath, String> {
+    let resolution = resolver
+        .resolve(from_path, specifier)
+        .map_err(|error| error.to_string())?;
+
+    if resolution.query().is_some() || resolution.fragment().is_some() {
         return Err(format!(
-            "resolved entry is a TypeScript source file ({}) which cannot be analyzed",
-            found_path.display()
+            "resolved module '{specifier}' contains unsupported query or fragment"
         ));
     }
 
-    Ok(found_path)
+    let full_path = resolution.full_path().to_path_buf();
+    if !full_path.is_file() {
+        return Err(format!(
+            "resolved module '{specifier}' is not a file: {}",
+            full_path.display()
+        ));
+    }
+
+    let is_cjs = resolution.module_type() == Some(ModuleType::CommonJs)
+        || path_looks_cjs(&full_path.to_string_lossy());
+    Ok(ResolvedModulePath {
+        path: normalize_existing_path(&full_path)?,
+        is_cjs,
+    })
+}
+
+fn reject_unsupported_entry_source(entry_path: &Path) -> Result<(), String> {
+    let path_str = entry_path.to_string_lossy();
+    if path_str.ends_with(".ts") || path_str.ends_with(".tsx") {
+        return Err(format!(
+            "resolved entry is a TypeScript source file ({}) which cannot be analyzed",
+            entry_path.display()
+        ));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
@@ -284,6 +441,11 @@ pub(crate) fn append_extension(candidate: &Path, extension: &str) -> PathBuf {
     path.push(".");
     path.push(extension);
     PathBuf::from(path)
+}
+
+pub(crate) fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
+    fs::canonicalize(path)
+        .map_err(|error| format!("failed to resolve path {}: {error}", path.display()))
 }
 
 fn side_effects_mode(package_json: &Value) -> SideEffectsMode {
