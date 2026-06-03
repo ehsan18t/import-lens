@@ -1,7 +1,10 @@
 use crate::{
     ipc::{
         codec::{FrameDecoder, decode_payload, encode_frame},
-        protocol::ClientMessage,
+        protocol::{
+            BatchRequest, BatchResponse, ClientMessage, EnumerateExportsRequest,
+            EnumerateExportsResponse, FileSizeRequest, FileSizeResponse, PROTOCOL_VERSION,
+        },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
     prefetch::Prefetcher,
@@ -17,6 +20,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 const LIFECYCLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -53,12 +57,22 @@ pub async fn run_server(
     }
 
     let listener = UnixListener::bind(pipe_name)?;
-    let (stream, _) = listener.accept().await?;
+    restrict_unix_socket_permissions(pipe_name)?;
 
     let service = std::sync::Arc::new(ImportLensService::new(None, false));
     let prefetcher = Prefetcher::new();
 
-    handle_connection(stream, storage_path, service, prefetcher).await
+    let result = async {
+        let (stream, _) = listener.accept().await?;
+        handle_connection(stream, storage_path, service, prefetcher).await
+    }
+    .await;
+
+    if let Err(error) = std::fs::remove_file(pipe_name) {
+        eprintln!("[import-lens-daemon] failed to remove IPC socket {pipe_name}: {error}");
+    }
+
+    result
 }
 
 async fn handle_connection<S>(
@@ -96,6 +110,14 @@ where
 
             match message {
                 ClientMessage::Hello(hello) => {
+                    if !is_supported_hello_version(hello.version) {
+                        eprintln!(
+                            "[import-lens-daemon] unsupported hello protocol version {}",
+                            hello.version
+                        );
+                        return Ok(());
+                    }
+
                     let hello_storage_path = PathBuf::from(&hello.storage_path);
                     let hello_workspace_root = PathBuf::from(&hello.workspace_root);
                     service = std::sync::Arc::new(ImportLensService::new(
@@ -118,6 +140,7 @@ where
                     lifecycle.record_batch();
                     let svc = std::sync::Arc::clone(&service);
                     if request.version >= 2 && request.streaming {
+                        let request_for_error = request.clone();
                         let (partial_tx, mut partial_rx) = mpsc::unbounded_channel();
                         let response_handle = tokio::task::spawn_blocking(move || {
                             svc.handle_batch_streaming(request, move |partial| {
@@ -127,13 +150,15 @@ where
                         while let Some(response) = partial_rx.recv().await {
                             stream.write_all(&encode_frame(&response)?).await?;
                         }
-                        let response = response_handle.await.expect("spawn_blocking failed");
+                        let response =
+                            batch_response_from_join(response_handle, &request_for_error).await;
                         stream.write_all(&encode_frame(&response)?).await?;
                     } else {
+                        let request_for_error = request.clone();
+                        let response_handle =
+                            tokio::task::spawn_blocking(move || svc.handle_batch(request));
                         let response =
-                            tokio::task::spawn_blocking(move || svc.handle_batch(request))
-                                .await
-                                .expect("spawn_blocking failed");
+                            batch_response_from_join(response_handle, &request_for_error).await;
                         stream.write_all(&encode_frame(&response)?).await?;
                     }
 
@@ -163,10 +188,11 @@ where
                 }
                 ClientMessage::EnumerateExports(request) if hello_received => {
                     let svc = std::sync::Arc::clone(&service);
+                    let request_for_error = request.clone();
+                    let response_handle =
+                        tokio::task::spawn_blocking(move || svc.enumerate_exports(request));
                     let response =
-                        tokio::task::spawn_blocking(move || svc.enumerate_exports(request))
-                            .await
-                            .expect("spawn_blocking failed");
+                        exports_response_from_join(response_handle, &request_for_error).await;
                     stream.write_all(&encode_frame(&response)?).await?;
                 }
                 ClientMessage::EnumerateExports(request) => {
@@ -178,10 +204,11 @@ where
                 }
                 ClientMessage::FileSize(request) if hello_received => {
                     let svc = std::sync::Arc::clone(&service);
+                    let request_for_error = request.clone();
+                    let response_handle =
+                        tokio::task::spawn_blocking(move || svc.handle_file_size(request));
                     let response =
-                        tokio::task::spawn_blocking(move || svc.handle_file_size(request))
-                            .await
-                            .expect("spawn_blocking failed");
+                        file_size_response_from_join(response_handle, &request_for_error).await;
                     stream.write_all(&encode_frame(&response)?).await?;
                 }
                 ClientMessage::FileSize(request) => {
@@ -204,6 +231,44 @@ where
     Ok(())
 }
 
+async fn batch_response_from_join(
+    response_handle: JoinHandle<BatchResponse>,
+    request: &BatchRequest,
+) -> BatchResponse {
+    match response_handle.await {
+        Ok(response) => response,
+        Err(error) => protocol_error_batch_response(request, join_error_message(error)),
+    }
+}
+
+async fn exports_response_from_join(
+    response_handle: JoinHandle<EnumerateExportsResponse>,
+    request: &EnumerateExportsRequest,
+) -> EnumerateExportsResponse {
+    match response_handle.await {
+        Ok(response) => response,
+        Err(error) => protocol_error_exports_response(request, join_error_message(error)),
+    }
+}
+
+async fn file_size_response_from_join(
+    response_handle: JoinHandle<FileSizeResponse>,
+    request: &FileSizeRequest,
+) -> FileSizeResponse {
+    match response_handle.await {
+        Ok(response) => response,
+        Err(error) => protocol_error_file_size_response(request, join_error_message(error)),
+    }
+}
+
+fn join_error_message(error: tokio::task::JoinError) -> String {
+    format!("analysis worker failed: {error}")
+}
+
+fn is_supported_hello_version(version: u32) -> bool {
+    (1..=PROTOCOL_VERSION).contains(&version)
+}
+
 fn recycle_if_needed(
     lifecycle: &LifecycleState,
     cache_len: usize,
@@ -221,6 +286,17 @@ fn recycle_if_needed(
 
     eprintln!("[import-lens-daemon] lifecycle recycle requested: {reason:?}");
     true
+}
+
+#[cfg(not(windows))]
+fn restrict_unix_socket_permissions(pipe_name: &str) -> Result<(), Box<dyn Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(pipe_name, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -475,5 +551,68 @@ mod tests {
             .expect("server task should join")
             .expect("server should exit cleanly");
         fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn unsupported_hello_version_closes_connection_without_accepting_requests() {
+        let workspace = temp_workspace();
+        let (mut client_stream, server_stream) = duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            handle_connection(
+                server_stream,
+                None,
+                Arc::new(ImportLensService::new(None, false)),
+                Prefetcher::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        });
+        let mut unsupported_hello = hello(&workspace);
+        unsupported_hello.version = PROTOCOL_VERSION + 1;
+        let mut frames = encode_frame(&unsupported_hello).expect("hello should encode");
+        frames
+            .extend(encode_frame(&cache_warmup_batch(&workspace, 3)).expect("batch should encode"));
+
+        client_stream
+            .write_all(&frames)
+            .await
+            .expect("client frames should be written");
+        let mut buffer = [0_u8; 256];
+        let read = tokio::time::timeout(Duration::from_secs(1), client_stream.read(&mut buffer))
+            .await
+            .expect("connection should close")
+            .expect("client read should complete");
+
+        assert_eq!(read, 0);
+        server
+            .await
+            .expect("server task should join")
+            .expect("server should exit cleanly");
+        fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn spawn_blocking_join_error_returns_protocol_batch_error() {
+        let workspace = temp_workspace();
+        let request = cache_warmup_batch(&workspace, 4);
+        let response = batch_response_from_join(
+            tokio::task::spawn_blocking(|| -> BatchResponse {
+                panic!("analysis worker panic");
+            }),
+            &request,
+        )
+        .await;
+
+        fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+        assert_eq!(response.request_id, 4);
+        assert_eq!(response.indexes, None);
+        assert_eq!(response.imports.len(), 1);
+        assert!(
+            response.imports[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("analysis worker failed")),
+            "{response:?}",
+        );
     }
 }

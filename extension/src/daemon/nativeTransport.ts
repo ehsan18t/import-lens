@@ -18,6 +18,7 @@ import { protocolVersion } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { currentPlatformTarget, daemonBinaryName } from "./platform.js";
 import { knownDaemonHashes } from "./knownHashes.generated.js";
+import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs } from "./processLifecycle.js";
 import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 import type { AnalysisTransport, DaemonState } from "./transport.js";
@@ -98,6 +99,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       "--storage",
       this.#context.globalStorageUri.fsPath,
     ]);
+    pipeDaemonProcessLogs(this.#process, this.#logger);
 
     this.#process.once("exit", (code, signal) => {
       this.#handleProcessExit(code, signal);
@@ -107,6 +109,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#client = await IpcClient.connect(pipeName);
     } catch (error) {
       this.#logger.warn(`Failed to connect to daemon: ${error instanceof Error ? error.message : String(error)}`);
+      cleanupFailedDaemonStartup(null, this.#process);
+      this.#client = null;
+      this.#process = null;
       this.#handleCrash();
       return this.#state;
     }
@@ -115,7 +120,18 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#logger.warn(`IPC disconnected: ${error instanceof Error ? error.message : String(error)}`);
       this.#handleUnexpectedDisconnect();
     });
-    this.#client.send(this.#hello(workspaceRoot));
+
+    try {
+      this.#client.send(this.#hello(workspaceRoot));
+    } catch (error) {
+      this.#logger.warn(`Failed to send daemon hello: ${error instanceof Error ? error.message : String(error)}`);
+      cleanupFailedDaemonStartup(this.#client, this.#process);
+      this.#client = null;
+      this.#process = null;
+      this.#handleCrash();
+      return this.#state;
+    }
+
     this.#state = "ready";
     this.#armStabilityReset();
     this.#armCleanRecycleReset();

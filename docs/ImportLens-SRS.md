@@ -212,8 +212,8 @@ A WebAssembly daemon fallback may be added in v1.1 or later using the existing a
 1. Extension activates on the `onLanguage:javascript`, `onLanguage:typescript`, `onLanguage:typescriptreact`, `onLanguage:javascriptreact`, `onLanguage:svelte`, and `onLanguage:astro` events.
 2. The extension host checks for a native binary matching the current platform in the extension's `bin/` directory.
 3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
-4. If the hash matches, it spawns the daemon process and opens a socket connection. The socket path includes a window-unique identifier (NFR-014b).
-5. If no native binary is found, or if the binary cannot be verified or spawned, the extension enters degraded mode.
+4. If the hash matches, it spawns the daemon process, pipes daemon stdout/stderr into the ImportLens output channel according to the configured log level, opens a socket connection, and sends a versioned `HelloMessage`. The socket path includes a window-unique identifier (NFR-014b).
+5. If no native binary is found, or if the binary cannot be verified, spawned, connected, or sent a hello message, the extension disposes any partial IPC client state, terminates the spawned daemon process when it is still alive, and enters the restart/degraded-mode path defined in FR-015.
 6. The daemon loads its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and preloads valid size entries into the in-memory `papaya` cache.
 7. The extension is ready to accept requests.
 
@@ -350,6 +350,8 @@ This section documents the key architectural decisions made before implementatio
 **FR-014** (High) - On socket disconnect, the extension must discard any stale MessagePack payloads currently in the receive buffer and wait for the next document change event to trigger a fresh request cycle.
 
 **FR-015** (High) - If the daemon process crashes, the extension must detect the disconnection, wait 1 second, and attempt to restart the daemon. On subsequent failures, it must apply exponential backoff (1s, 2s, 4s, 8s, capped at 30s). After three consecutive failures within 60 seconds, it must enter degraded mode and display a status bar notification.
+
+**FR-015a** (High) - The extension host must pipe daemon stdout to the ImportLens output channel at debug level and daemon stderr at warning level. The logger's configured level controls visibility. Failed startup after process spawn, including IPC connect failure or hello-send failure, must dispose any created IPC client and terminate the child daemon process before scheduling restart or entering degraded mode.
 
 ### 5.4 Size Computation
 
@@ -490,6 +492,8 @@ The system must handle all failure conditions gracefully. No error scenario may 
 | Socket disconnect without crash                            | Discard any stale MessagePack payloads currently in the receive buffer. Wait for the next document change event to trigger a fresh request cycle. Do not attempt immediate reconnection to avoid cascading retries on rapid edits.     |
 | IPC frame larger than 32 MiB                               | Reject the frame before allocation, close or reset the affected request path, and log a diagnostic. The extension must not attempt to decode the oversized payload.                                                                    |
 | Batch-like request sent before `HelloMessage`              | Do not process the request. `BatchRequest` receives per-import protocol errors; `EnumerateExportsRequest` and `FileSizeRequest` receive protocol error responses. Invalidation and prewarm messages are ignored until hello.          |
+| Unsupported `HelloMessage.version`                         | Log the unsupported version on the daemon side, close the connection without accepting subsequent requests from that socket, and rely on the extension host startup/connection recovery path.                                             |
+| Blocking analysis worker panic or join failure             | Do not panic the Tokio IPC server. Return a protocol diagnostic response for the affected request when the request shape allows it, and keep the daemon process alive for future requests.                                                |
 | node_modules folder deleted while extension is running     | The file watcher must detect the deletion. The extension host must send a `CacheInvalidateAll` message (see Section 10.1). The daemon must evict all entries from both `papaya` and `redb`. The extension host must update all affected decorations to "Package not found".    |
 | redb database corrupted on startup                         | Log the corruption, delete the corrupted database file, and create a fresh empty database. Continue operation using only the in-memory cache for the current session.                                                                  |
 | Requested named export missing from a package              | Return a normal `ImportResult` when partial sizing can continue, include a `missing_export` diagnostic naming the export, and keep the raw diagnostic details in hover-copy output rather than inline UI.                              |
@@ -543,7 +547,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 **NFR-013** (Critical) - The daemon must operate with read-only access limited to `node_modules` packages discovered by walking upward from the active document path. It must not use the first VS Code workspace folder as a hard read boundary, because multi-root windows and nested package workspaces can place the active document in a different dependency tree. The daemon must not write any files other than its own cache database in the VS Code global storage directory.
 
-**NFR-014** (High) - The IPC socket or named pipe must be created with permissions that restrict access to the current user only (mode `0600` on Unix systems).
+**NFR-014** (High) - The IPC socket or named pipe must be created with permissions that restrict access to the current user only (mode `0600` on Unix systems). On Unix targets, the daemon must remove the socket file on normal shutdown or lifecycle recycle.
 
 **NFR-014a** (High) - Before spawning the daemon, the extension host must verify the binary's integrity by computing a SHA-256 hash of the daemon executable and comparing it against a known-good hash embedded in the extension package. If the hash does not match, the extension must refuse to spawn the daemon, log a security warning to the `ImportLens` output channel, and enter degraded mode. This prevents execution of tampered binaries.
 
@@ -759,12 +763,12 @@ interface ModuleContribution {
 
 #### HelloMessage
 
-Sent by the extension host immediately after opening the socket connection. The daemon must not process any `BatchRequest` until a valid `HelloMessage` has been received.
+Sent by the extension host immediately after opening the socket connection. The daemon must validate the hello protocol version before accepting the handshake and must not process any request until a valid `HelloMessage` has been received.
 
 ```typescript
 interface HelloMessage {
   type: "hello";
-  version: number;              // Protocol version, currently 2
+  version: number;              // Protocol version, currently 3
   workspace_root: string;       // Absolute path to the workspace root
   storage_path: string;         // Absolute VS Code globalStoragePath for cache and lifecycle files
   enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
@@ -772,7 +776,7 @@ interface HelloMessage {
 }
 ```
 
-After accepting a valid `HelloMessage`, the daemon starts best-effort recent-cache prewarm work for the active workspace. Protocol-bearing requests sent before hello receive protocol errors or are ignored as specified in Section 6.
+After accepting a valid `HelloMessage`, the daemon starts best-effort recent-cache prewarm work for the active workspace. Protocol-bearing requests sent before hello receive protocol errors or are ignored as specified in Section 6. Unsupported hello versions are logged by the daemon and cause the connection to close without processing later frames from that socket.
 
 #### CacheInvalidateMessage
 
@@ -948,7 +952,7 @@ Extension activates
     |
     ├─ Locate native binary in extension/bin/<platform>/import-lens-daemon
     │       |
-    │       ├─ Found → spawn process, open socket, send HelloMessage handshake
+    │       ├─ Found → spawn process, pipe stdout/stderr, open socket, send HelloMessage handshake
     │       │
     │       └─ Not found → enter degraded mode, show status bar warning
     |
