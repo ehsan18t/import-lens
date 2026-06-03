@@ -1,7 +1,11 @@
 use import_lens_daemon::pipeline::{
-    graph::{GraphLimits, ModuleGraph, build_module_graph, build_module_graph_with_limits},
+    graph::{
+        GraphLimits, ModuleGraph, build_module_graph, build_module_graph_cached,
+        build_module_graph_with_limits, clear_module_graph_cache,
+    },
     reachability::reachable_exports,
 };
+use std::sync::Arc;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -301,4 +305,18 @@ fn graph_does_not_report_shared_dependency_as_cycle() {
         "{:?}",
         graph.diagnostics
     );
+}
+
+#[test]
+fn graph_cache_returns_shared_graph_handle_without_deep_clone() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export const value = 1;");
+    clear_module_graph_cache();
+
+    let first = build_module_graph_cached(&root.join("entry.js")).expect("graph should build");
+    let second = build_module_graph_cached(&root.join("entry.js")).expect("graph should be cached");
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+    clear_module_graph_cache();
+    assert!(Arc::ptr_eq(&first, &second));
 }

@@ -1,8 +1,9 @@
 use crate::{
     cache::key::{
         ANALYZER_VERSION, CacheIdentityV3, FileFingerprint, cache_key_matches_package,
-        decode_cache_identity,
+        decode_cache_identity, fingerprints_are_current,
     },
+    cache::memory::CachedImport,
     ipc::protocol::{ImportResult, ModuleContribution},
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -50,20 +51,25 @@ impl DiskCache {
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<ImportResult> {
+    pub fn get(&self, key: &str) -> Option<CachedImport> {
         let db = self.db.as_ref()?;
         let read_txn = db.begin_read().ok()?;
         let table = read_txn.open_table(CACHE_TABLE).ok()?;
         let value = table.get(key).ok()??;
 
         let bytes = value.value();
-        let mut result = decode_cached_result(bytes)?;
-        result.cache_hit = true;
+        let cached = decode_cached_result(bytes)?;
+        if !fingerprints_are_current(&cached.dependency_fingerprints) {
+            drop(table);
+            drop(read_txn);
+            self.remove(key);
+            return None;
+        }
         self.touch(key);
-        Some(result)
+        Some(cached)
     }
 
-    pub fn load_all(&self) -> Vec<(String, ImportResult)> {
+    pub fn load_all(&self) -> Vec<(String, CachedImport)> {
         let db = match self.db.as_ref() {
             Some(db) => db,
             None => return Vec::new(),
@@ -95,21 +101,23 @@ impl DiskCache {
 
         iter.filter_map(|entry| {
             let (key, value) = entry.ok()?;
-            let mut result = decode_cached_result(value.value())?;
-            result.cache_hit = false;
-            Some((key.value().to_owned(), result))
+            let cached = decode_cached_result(value.value())?;
+            if !fingerprints_are_current(&cached.dependency_fingerprints) {
+                return None;
+            }
+            Some((key.value().to_owned(), cached))
         })
         .collect()
     }
 
-    pub fn insert(&self, key: &str, result: &ImportResult) {
+    pub fn insert(&self, key: &str, cached: &CachedImport) {
         let db = match self.db.as_ref() {
             Some(db) => db,
             None => return,
         };
 
-        let mut persisted = result.clone();
-        persisted.cache_hit = false;
+        let mut persisted = cached.clone();
+        persisted.result.cache_hit = false;
 
         let envelope = cache_envelope(key, persisted);
         let bytes = match rmp_serde::to_vec(&envelope) {
@@ -137,6 +145,23 @@ impl DiskCache {
         if let Ok(write_txn) = db.begin_write() {
             if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
                 let _ = recents.insert(key, unix_millis_now());
+            }
+            let _ = write_txn.commit();
+        }
+    }
+
+    pub fn remove(&self, key: &str) {
+        let db = match self.db.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
+
+        if let Ok(write_txn) = db.begin_write() {
+            if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
+                let _ = table.remove(key);
+            }
+            if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
+                let _ = recents.remove(key);
             }
             let _ = write_txn.commit();
         }
@@ -367,9 +392,9 @@ fn unix_millis_now() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-fn cache_envelope(key: &str, result: ImportResult) -> CacheEnvelope {
+fn cache_envelope(key: &str, cached: CachedImport) -> CacheEnvelope {
     let package_identity = decode_cache_identity(key);
-    let mut dependency_fingerprints = Vec::new();
+    let mut dependency_fingerprints = cached.dependency_fingerprints.clone();
     if let Some(identity) = &package_identity {
         if let Some(fingerprint) = &identity.manifest_fingerprint {
             dependency_fingerprints.push(fingerprint.clone());
@@ -381,22 +406,30 @@ fn cache_envelope(key: &str, result: ImportResult) -> CacheEnvelope {
 
     CacheEnvelope {
         analyzer_version: ANALYZER_VERSION.to_owned(),
-        full_contributions: result.module_breakdown.clone().unwrap_or_default(),
-        result,
+        full_contributions: cached.result.module_breakdown.clone().unwrap_or_default(),
+        result: cached.result,
         package_identity,
         dependency_fingerprints,
     }
 }
 
-fn decode_cached_result(bytes: &[u8]) -> Option<ImportResult> {
+fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
     if let Ok(envelope) = rmp_serde::from_slice::<CacheEnvelope>(bytes) {
         if envelope.analyzer_version == ANALYZER_VERSION {
-            return Some(envelope.result);
+            return Some(CachedImport {
+                result: envelope.result,
+                dependency_fingerprints: envelope.dependency_fingerprints,
+            });
         }
         return None;
     }
 
-    rmp_serde::from_slice::<ImportResult>(bytes).ok()
+    rmp_serde::from_slice::<ImportResult>(bytes)
+        .ok()
+        .map(|result| CachedImport {
+            result,
+            dependency_fingerprints: Vec::new(),
+        })
 }
 
 fn cache_warn(message: String) {

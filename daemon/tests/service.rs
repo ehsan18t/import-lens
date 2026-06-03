@@ -73,6 +73,46 @@ fn write_missing_export_effectful_package(workspace: &Path) {
         .expect("entry should be written");
 }
 
+fn write_dependent_package(workspace: &Path, helper_source: &str) {
+    let package_root = workspace.join("node_modules").join("dependent-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "import { helper } from './helper.js';\nexport const value = helper;",
+    )
+    .expect("entry should be written");
+    fs::write(package_root.join("helper.js"), helper_source).expect("helper should be written");
+}
+
+fn write_parent_and_transitive_package(workspace: &Path, dependency_source: &str) {
+    let parent_root = workspace.join("node_modules").join("parent-lib");
+    fs::create_dir_all(&parent_root).expect("parent root should be created");
+    fs::write(
+        parent_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("parent manifest should be written");
+    fs::write(
+        parent_root.join("index.js"),
+        "import { dep } from 'dep-lib';\nexport const value = dep;",
+    )
+    .expect("parent entry should be written");
+
+    let dep_root = workspace.join("node_modules").join("dep-lib");
+    fs::create_dir_all(&dep_root).expect("dep root should be created");
+    fs::write(
+        dep_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("dep manifest should be written");
+    fs::write(dep_root.join("index.js"), dependency_source).expect("dep entry should be written");
+}
+
 fn write_export_package(workspace: &Path) {
     let package_root = workspace.join("node_modules").join("exports-lib");
     fs::create_dir_all(&package_root).expect("package root should be created");
@@ -241,6 +281,33 @@ fn missing_effectful_batch(
     }
 }
 
+fn package_batch(
+    workspace: &Path,
+    request_id: u64,
+    package_name: &str,
+    named: &str,
+) -> BatchRequest {
+    BatchRequest {
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![ImportRequest {
+            specifier: package_name.to_owned(),
+            package_name: package_name.to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec![named.to_owned()],
+            import_kind: ImportKind::Named,
+            runtime: ImportRuntime::Component,
+        }],
+        streaming: false,
+    }
+}
+
 fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
     BatchRequest {
         version: PROTOCOL_VERSION,
@@ -367,6 +434,52 @@ fn service_cache_invalidation_removes_matching_package_entries() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!after_invalidate.imports[0].cache_hit);
+}
+
+#[test]
+fn service_revalidates_cache_when_relative_dependency_changes() {
+    let workspace = temp_workspace();
+    write_dependent_package(&workspace, "export const helper = 1;");
+    let service = ImportLensService::new(None, false);
+
+    let first = service.handle_batch(package_batch(&workspace, 1, "dependent-lib", "value"));
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("dependent-lib")
+            .join("helper.js"),
+        "export const helper = 'changed dependency payload';",
+    )
+    .expect("helper should be updated");
+    let second = service.handle_batch(package_batch(&workspace, 2, "dependent-lib", "value"));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(!first.imports[0].cache_hit);
+    assert!(!second.imports[0].cache_hit);
+    assert_ne!(first.imports[0].raw_bytes, second.imports[0].raw_bytes);
+}
+
+#[test]
+fn service_revalidates_cache_when_transitive_package_dependency_changes() {
+    let workspace = temp_workspace();
+    write_parent_and_transitive_package(&workspace, "export const dep = 1;");
+    let service = ImportLensService::new(None, false);
+
+    let first = service.handle_batch(package_batch(&workspace, 1, "parent-lib", "value"));
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("dep-lib")
+            .join("index.js"),
+        "export const dep = 'changed transitive dependency payload';",
+    )
+    .expect("dependency should be updated");
+    let second = service.handle_batch(package_batch(&workspace, 2, "parent-lib", "value"));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(!first.imports[0].cache_hit);
+    assert!(!second.imports[0].cache_hit);
+    assert_ne!(first.imports[0].raw_bytes, second.imports[0].raw_bytes);
 }
 
 #[test]

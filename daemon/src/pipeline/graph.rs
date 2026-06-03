@@ -19,10 +19,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
-static GRAPH_CACHE: OnceLock<papaya::HashMap<(PathBuf, ImportRuntime), ModuleGraph>> =
+static GRAPH_CACHE: OnceLock<papaya::HashMap<(PathBuf, ImportRuntime), Arc<ModuleGraph>>> =
     OnceLock::new();
 
 pub const MAX_GRAPH_MODULES: usize = 2_000;
@@ -181,24 +181,24 @@ pub fn build_module_graph_with_runtime(
     build_module_graph_with_limits_and_runtime(entry_path, GraphLimits::default(), runtime)
 }
 
-pub fn build_module_graph_cached(entry_path: &Path) -> Result<ModuleGraph, String> {
+pub fn build_module_graph_cached(entry_path: &Path) -> Result<Arc<ModuleGraph>, String> {
     build_module_graph_cached_with_runtime(entry_path, ImportRuntime::Component)
 }
 
 pub fn build_module_graph_cached_with_runtime(
     entry_path: &Path,
     runtime: ImportRuntime,
-) -> Result<ModuleGraph, String> {
+) -> Result<Arc<ModuleGraph>, String> {
     let entry_path = normalize_existing_path(entry_path)?;
     let cache = GRAPH_CACHE.get_or_init(papaya::HashMap::new);
     let pinned = cache.pin();
     let cache_key = (entry_path.clone(), runtime);
     if let Some(graph) = pinned.get(&cache_key) {
-        return Ok(graph.clone());
+        return Ok(Arc::clone(graph));
     }
 
-    let graph = build_module_graph_with_runtime(&entry_path, runtime)?;
-    pinned.insert(cache_key, graph.clone());
+    let graph = Arc::new(build_module_graph_with_runtime(&entry_path, runtime)?);
+    pinned.insert(cache_key, Arc::clone(&graph));
     Ok(graph)
 }
 

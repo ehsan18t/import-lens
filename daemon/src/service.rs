@@ -1,5 +1,8 @@
 use crate::{
-    cache::{key::cache_key_for_resolved_import, memory::ImportCache},
+    cache::{
+        key::{cache_key_for_resolved_import, fingerprints_for_paths},
+        memory::ImportCache,
+    },
     ipc::protocol::{
         BatchRequest, BatchResponse, EnumerateExportsRequest, EnumerateExportsResponse,
         FileSizeRequest, FileSizeResponse, ImportDiagnostic, ImportKind, ImportRequest,
@@ -8,8 +11,8 @@ use crate::{
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
     pipeline::graph::{
-        ModuleGraph, ModuleId, build_module_graph_cached, clear_module_graph_cache,
-        invalidate_module_graph_cache_for_package,
+        ModuleGraph, ModuleId, build_module_graph_cached, build_module_graph_cached_with_runtime,
+        clear_module_graph_cache, invalidate_module_graph_cache_for_package,
     },
     pipeline::resolver::{ResolvedPackage, resolve_package_entry},
 };
@@ -251,8 +254,10 @@ impl ImportLensService {
         let result = analyze_resolved_import(context, request, resolved.clone());
 
         if should_cache_result(&result) && should_continue() {
-            self.cache_full_variant_alias(request, &result, &resolved);
-            self.cache.insert(key, result);
+            let fingerprints = dependency_fingerprints(request, &resolved, &result);
+            self.cache_full_variant_alias(request, &result, &resolved, &fingerprints);
+            self.cache
+                .insert_with_fingerprints(key, result, fingerprints);
         }
     }
 
@@ -274,8 +279,10 @@ impl ImportLensService {
         let result = analyze_resolved_import(context, request, resolved.clone());
 
         if should_cache_result(&result) && should_continue() {
-            self.cache_full_variant_alias(request, &result, &resolved);
-            self.cache.insert(key, result);
+            let fingerprints = dependency_fingerprints(request, &resolved, &result);
+            self.cache_full_variant_alias(request, &result, &resolved, &fingerprints);
+            self.cache
+                .insert_with_fingerprints(key, result, fingerprints);
         }
     }
 
@@ -294,11 +301,14 @@ impl ImportLensService {
             return result;
         }
 
+        invalidate_module_graph_cache_for_package(&request.package_name);
         let result = analyze_resolved_import(context, request, resolved.clone());
 
         if should_cache_result(&result) {
-            self.cache_full_variant_alias(request, &result, &resolved);
-            self.cache.insert(key, result.clone());
+            let fingerprints = dependency_fingerprints(request, &resolved, &result);
+            self.cache_full_variant_alias(request, &result, &resolved, &fingerprints);
+            self.cache
+                .insert_with_fingerprints(key, result.clone(), fingerprints);
         }
 
         result
@@ -309,6 +319,7 @@ impl ImportLensService {
         request: &ImportRequest,
         result: &ImportResult,
         resolved: &ResolvedPackage,
+        dependency_fingerprints: &[crate::cache::key::FileFingerprint],
     ) {
         if !result.side_effects
             || result.is_cjs
@@ -333,7 +344,11 @@ impl ImportLensService {
         let mut namespace_result = result.clone();
         namespace_result.cache_hit = false;
         namespace_result.truly_treeshakeable = false;
-        self.cache.insert(namespace_key, namespace_result);
+        self.cache.insert_with_fingerprints(
+            namespace_key,
+            namespace_result,
+            dependency_fingerprints.to_vec(),
+        );
     }
 }
 
@@ -346,6 +361,27 @@ fn has_request_specific_diagnostics(result: &ImportResult) -> bool {
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.stage == "exports")
+}
+
+fn dependency_fingerprints(
+    request: &ImportRequest,
+    resolved: &ResolvedPackage,
+    result: &ImportResult,
+) -> Vec<crate::cache::key::FileFingerprint> {
+    let mut paths = vec![
+        resolved.package_root.join("package.json"),
+        resolved.entry_path.clone(),
+    ];
+
+    if !result.is_cjs
+        && let Ok(graph) =
+            build_module_graph_cached_with_runtime(&resolved.entry_path, request.runtime)
+    {
+        paths.extend(graph.modules.iter().map(|module| module.path.clone()));
+        paths.extend(graph.dependency_paths.iter().cloned());
+    }
+
+    fingerprints_for_paths(paths)
 }
 
 pub fn protocol_error_batch_response(request: &BatchRequest, message: String) -> BatchResponse {

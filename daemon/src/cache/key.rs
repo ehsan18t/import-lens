@@ -89,6 +89,24 @@ pub fn cache_key_matches_package(key: &str, package_name: &str) -> bool {
     key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix)
 }
 
+pub fn fingerprints_for_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<FileFingerprint> {
+    let mut fingerprints = paths
+        .into_iter()
+        .filter_map(file_fingerprint)
+        .collect::<Vec<_>>();
+    fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
+    fingerprints.dedup_by(|left, right| left.path == right.path);
+    fingerprints
+}
+
+pub fn fingerprints_are_current(fingerprints: &[FileFingerprint]) -> bool {
+    fingerprints.iter().all(|stored| {
+        file_fingerprint(&stored.path).is_some_and(|current| {
+            current.len == stored.len && current.modified_millis == stored.modified_millis
+        })
+    })
+}
+
 fn encode_cache_identity(identity: &CacheIdentityV3) -> String {
     let bytes = rmp_serde::to_vec(identity).unwrap_or_default();
     format!("{CACHE_KEY_PREFIX_V3}{}", hex_encode(&bytes))

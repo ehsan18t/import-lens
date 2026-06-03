@@ -1,13 +1,22 @@
 use crate::{
-    cache::{disk::DiskCache, key::cache_key_matches_package},
+    cache::{
+        disk::DiskCache,
+        key::{FileFingerprint, cache_key_matches_package, fingerprints_are_current},
+    },
     ipc::protocol::ImportResult,
 };
 use papaya::HashMap;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone)]
+pub struct CachedImport {
+    pub result: ImportResult,
+    pub dependency_fingerprints: Vec<FileFingerprint>,
+}
+
 #[derive(Debug)]
 pub struct ImportCache {
-    memory: HashMap<String, ImportResult>,
+    memory: HashMap<String, CachedImport>,
     disk: DiskCache,
 }
 
@@ -27,8 +36,8 @@ impl ImportCache {
 
         {
             let pinned = memory.pin();
-            for (key, result) in disk.load_all() {
-                pinned.insert(key, result);
+            for (key, cached) in disk.load_all() {
+                pinned.insert(key, cached);
             }
         }
 
@@ -37,15 +46,21 @@ impl ImportCache {
 
     pub fn get(&self, key: &str) -> Option<ImportResult> {
         let memory = self.memory.pin();
-        if let Some(result) = memory.get(key) {
-            let mut result = result.clone();
+        if let Some(cached) = memory.get(key) {
+            if !fingerprints_are_current(&cached.dependency_fingerprints) {
+                memory.remove(key);
+                self.disk.remove(key);
+                return None;
+            }
+            let mut result = cached.result.clone();
             result.cache_hit = true;
             self.disk.touch(key);
             return Some(result);
         }
 
-        if let Some(mut result) = self.disk.get(key) {
-            memory.insert(key.to_owned(), result.clone());
+        if let Some(cached) = self.disk.get(key) {
+            let mut result = cached.result.clone();
+            memory.insert(key.to_owned(), cached);
             result.cache_hit = true;
             return Some(result);
         }
@@ -54,8 +69,21 @@ impl ImportCache {
     }
 
     pub fn insert(&self, key: String, result: ImportResult) {
-        self.disk.insert(&key, &result);
-        self.memory.pin().insert(key, result);
+        self.insert_with_fingerprints(key, result, Vec::new());
+    }
+
+    pub fn insert_with_fingerprints(
+        &self,
+        key: String,
+        result: ImportResult,
+        dependency_fingerprints: Vec<FileFingerprint>,
+    ) {
+        let cached = CachedImport {
+            result,
+            dependency_fingerprints,
+        };
+        self.disk.insert(&key, &cached);
+        self.memory.pin().insert(key, cached);
     }
 
     pub fn invalidate_package(&self, package_name: &str) {
