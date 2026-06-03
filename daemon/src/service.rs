@@ -1,5 +1,5 @@
 use crate::{
-    cache::{key::cache_key_for_import, memory::ImportCache},
+    cache::{key::cache_key_for_resolved_import, memory::ImportCache},
     ipc::protocol::{
         BatchRequest, BatchResponse, EnumerateExportsRequest, EnumerateExportsResponse,
         FileSizeRequest, FileSizeResponse, ImportDiagnostic, ImportKind, ImportRequest,
@@ -238,16 +238,20 @@ impl ImportLensService {
     ) where
         F: Fn() -> bool,
     {
-        let key = cache_key_for_import(request);
+        let resolved = match resolve_package_entry(&context.active_document_path, request) {
+            Ok(resolved) => resolved,
+            Err(_) => return,
+        };
+        let key = cache_key_for_resolved_import(request, &resolved);
 
         if self.cache.get(&key).is_some() || !should_continue() {
             return;
         }
 
-        let result = analyze_import(context, request);
+        let result = analyze_resolved_import(context, request, resolved.clone());
 
-        if result.error.is_none() && should_continue() {
-            self.cache_full_variant_alias(request, &result);
+        if should_cache_result(&result) && should_continue() {
+            self.cache_full_variant_alias(request, &result, &resolved);
             self.cache.insert(key, result);
         }
     }
@@ -261,16 +265,16 @@ impl ImportLensService {
     ) where
         F: Fn() -> bool,
     {
-        let key = cache_key_for_import(request);
+        let key = cache_key_for_resolved_import(request, &resolved);
 
         if self.cache.get(&key).is_some() || !should_continue() {
             return;
         }
 
-        let result = analyze_resolved_import(context, request, resolved);
+        let result = analyze_resolved_import(context, request, resolved.clone());
 
-        if result.error.is_none() && should_continue() {
-            self.cache_full_variant_alias(request, &result);
+        if should_cache_result(&result) && should_continue() {
+            self.cache_full_variant_alias(request, &result, &resolved);
             self.cache.insert(key, result);
         }
     }
@@ -280,25 +284,35 @@ impl ImportLensService {
         context: &AnalysisContext,
         request: &ImportRequest,
     ) -> ImportResult {
-        let key = cache_key_for_import(request);
+        let resolved = match resolve_package_entry(&context.active_document_path, request) {
+            Ok(resolved) => resolved,
+            Err(_) => return analyze_import(context, request),
+        };
+        let key = cache_key_for_resolved_import(request, &resolved);
 
         if let Some(result) = self.cache.get(&key) {
             return result;
         }
 
-        let result = analyze_import(context, request);
+        let result = analyze_resolved_import(context, request, resolved.clone());
 
-        if result.error.is_none() {
-            self.cache_full_variant_alias(request, &result);
+        if should_cache_result(&result) {
+            self.cache_full_variant_alias(request, &result, &resolved);
             self.cache.insert(key, result.clone());
         }
 
         result
     }
 
-    fn cache_full_variant_alias(&self, request: &ImportRequest, result: &ImportResult) {
+    fn cache_full_variant_alias(
+        &self,
+        request: &ImportRequest,
+        result: &ImportResult,
+        resolved: &ResolvedPackage,
+    ) {
         if !result.side_effects
             || result.is_cjs
+            || has_request_specific_diagnostics(result)
             || matches!(
                 request.import_kind,
                 ImportKind::Namespace | ImportKind::Dynamic
@@ -310,7 +324,7 @@ impl ImportLensService {
         let mut namespace_request = request.clone();
         namespace_request.import_kind = ImportKind::Namespace;
         namespace_request.named.clear();
-        let namespace_key = cache_key_for_import(&namespace_request);
+        let namespace_key = cache_key_for_resolved_import(&namespace_request, resolved);
 
         if self.cache.get(&namespace_key).is_some() {
             return;
@@ -321,6 +335,17 @@ impl ImportLensService {
         namespace_result.truly_treeshakeable = false;
         self.cache.insert(namespace_key, namespace_result);
     }
+}
+
+fn should_cache_result(result: &ImportResult) -> bool {
+    result.error.is_none() && !has_request_specific_diagnostics(result)
+}
+
+fn has_request_specific_diagnostics(result: &ImportResult) -> bool {
+    result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.stage == "exports")
 }
 
 pub fn protocol_error_batch_response(request: &BatchRequest, message: String) -> BatchResponse {

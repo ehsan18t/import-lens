@@ -14,7 +14,7 @@ use std::{
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CURRENT_SCHEMA_VERSION: u64 = 2;
+const CURRENT_SCHEMA_VERSION: u64 = 3;
 
 fn temp_storage() -> PathBuf {
     let suffix = SystemTime::now()

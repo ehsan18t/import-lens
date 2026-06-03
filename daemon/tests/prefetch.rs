@@ -1,5 +1,7 @@
 use import_lens_daemon::{
-    ipc::protocol::ImportKind,
+    cache::key::cache_key_for_resolved_import,
+    ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
+    pipeline::resolver::resolve_package_entry,
     prefetch::{
         CancellationToken, cached_import_request_from_key, package_json_dependency_names,
         package_json_prewarm_requests,
@@ -107,21 +109,32 @@ fn cancellation_token_invalidates_existing_jobs() {
 
 #[test]
 fn cached_import_request_from_key_parses_recent_cache_keys() {
-    let default = cached_import_request_from_key("react@19.2.3::default")
-        .expect("default cache key should parse");
-    let namespace = cached_import_request_from_key("@scope/pkg@1.0.0::*")
-        .expect("namespace cache key should parse");
-    let named = cached_import_request_from_key("lodash-es@4.17.21::debounce,throttle")
-        .expect("named cache key should parse");
+    let workspace = temp_workspace();
+    write_installed_package(&workspace, "lodash-es", "4.17.21");
+    let active_document_path = workspace.join("src").join("index.ts");
+    let request = ImportRequest {
+        specifier: "lodash-es".to_owned(),
+        package_name: "lodash-es".to_owned(),
+        version: "4.17.21".to_owned(),
+        named: vec!["throttle".to_owned(), "debounce".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+    let resolved =
+        resolve_package_entry(&active_document_path, &request).expect("package should resolve");
+    let key = cache_key_for_resolved_import(&request, &resolved);
 
-    assert_eq!(default.specifier, "react");
-    assert_eq!(default.version, "19.2.3");
-    assert_eq!(default.import_kind, ImportKind::Default);
-    assert_eq!(namespace.package_name, "@scope/pkg");
-    assert_eq!(namespace.import_kind, ImportKind::Namespace);
+    let named = cached_import_request_from_key(&key).expect("v3 cache key should parse");
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(named.specifier, "lodash-es");
+    assert_eq!(named.version, "4.17.21");
+    assert_eq!(named.import_kind, ImportKind::Named);
+    assert_eq!(named.runtime, ImportRuntime::Component);
     assert_eq!(
         named.named,
         vec!["debounce".to_owned(), "throttle".to_owned()]
     );
+    assert!(cached_import_request_from_key("react@19.2.3::default").is_none());
     assert!(cached_import_request_from_key("bad-key").is_none());
 }

@@ -1,4 +1,5 @@
 use crate::{
+    cache::key::decode_cache_identity,
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
@@ -282,56 +283,16 @@ fn installed_package(active_document_path: &Path, package_name: &str) -> Option<
 }
 
 pub fn cached_import_request_from_key(key: &str) -> Option<ImportRequest> {
-    let (specifier_and_version, exports) = key.split_once("::")?;
-    let version_separator = specifier_and_version.rfind('@')?;
-    if version_separator == 0 {
-        return None;
-    }
-
-    let specifier = &specifier_and_version[..version_separator];
-    let version = &specifier_and_version[version_separator + 1..];
-    if specifier.is_empty() || version.is_empty() || exports.is_empty() {
-        return None;
-    }
-
-    let (import_kind, named) = match exports {
-        "default" => (ImportKind::Default, Vec::new()),
-        "*" => (ImportKind::Namespace, Vec::new()),
-        "dynamic" => (ImportKind::Dynamic, Vec::new()),
-        named => (
-            ImportKind::Named,
-            named
-                .split(',')
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .collect(),
-        ),
-    };
+    let identity = decode_cache_identity(key)?;
 
     Some(ImportRequest {
-        specifier: specifier.to_owned(),
-        package_name: package_name_from_specifier(specifier),
-        version: version.to_owned(),
-        named,
-        import_kind,
-        runtime: ImportRuntime::Component,
+        specifier: identity.specifier,
+        package_name: identity.package_name,
+        version: identity.package_version,
+        named: identity.named_exports,
+        import_kind: identity.import_kind,
+        runtime: identity.runtime,
     })
-}
-
-fn package_name_from_specifier(specifier: &str) -> String {
-    if specifier.starts_with('@') {
-        let mut parts = specifier.split('/');
-        return match (parts.next(), parts.next()) {
-            (Some(scope), Some(name)) => format!("{scope}/{name}"),
-            _ => specifier.to_owned(),
-        };
-    }
-
-    specifier
-        .split('/')
-        .next()
-        .map(str::to_owned)
-        .unwrap_or_else(|| specifier.to_owned())
 }
 
 fn prewarm_request(package_name: &str, version: &str, import_kind: ImportKind) -> ImportRequest {

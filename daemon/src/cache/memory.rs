@@ -1,4 +1,7 @@
-use crate::{cache::disk::DiskCache, ipc::protocol::ImportResult};
+use crate::{
+    cache::{disk::DiskCache, key::cache_key_matches_package},
+    ipc::protocol::ImportResult,
+};
 use papaya::HashMap;
 use std::path::PathBuf;
 
@@ -59,11 +62,9 @@ impl ImportCache {
         self.disk.invalidate_package(package_name);
 
         let memory = self.memory.pin();
-        let root_prefix = format!("{package_name}@");
-        let subpath_prefix = format!("{package_name}/");
         let keys = memory
             .iter()
-            .filter(|(key, _)| key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix))
+            .filter(|(key, _)| cache_key_matches_package(key, package_name))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
 

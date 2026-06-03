@@ -1,5 +1,12 @@
-use crate::ipc::protocol::ImportResult;
+use crate::{
+    cache::key::{
+        ANALYZER_VERSION, CacheIdentityV3, FileFingerprint, cache_key_matches_package,
+        decode_cache_identity,
+    },
+    ipc::protocol::{ImportResult, ModuleContribution},
+};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -11,7 +18,16 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cac
 const RECENTS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_recents");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CURRENT_SCHEMA_VERSION: u64 = 2;
+const CURRENT_SCHEMA_VERSION: u64 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheEnvelope {
+    analyzer_version: String,
+    result: ImportResult,
+    package_identity: Option<CacheIdentityV3>,
+    dependency_fingerprints: Vec<FileFingerprint>,
+    full_contributions: Vec<ModuleContribution>,
+}
 
 #[derive(Debug, Default)]
 pub struct DiskCache {
@@ -41,7 +57,7 @@ impl DiskCache {
         let value = table.get(key).ok()??;
 
         let bytes = value.value();
-        let mut result: ImportResult = rmp_serde::from_slice(bytes).ok()?;
+        let mut result = decode_cached_result(bytes)?;
         result.cache_hit = true;
         self.touch(key);
         Some(result)
@@ -79,7 +95,7 @@ impl DiskCache {
 
         iter.filter_map(|entry| {
             let (key, value) = entry.ok()?;
-            let mut result = rmp_serde::from_slice::<ImportResult>(value.value()).ok()?;
+            let mut result = decode_cached_result(value.value())?;
             result.cache_hit = false;
             Some((key.value().to_owned(), result))
         })
@@ -95,7 +111,8 @@ impl DiskCache {
         let mut persisted = result.clone();
         persisted.cache_hit = false;
 
-        let bytes = match rmp_serde::to_vec(&persisted) {
+        let envelope = cache_envelope(key, persisted);
+        let bytes = match rmp_serde::to_vec(&envelope) {
             Ok(b) => b,
             Err(_) => return,
         };
@@ -169,26 +186,15 @@ impl DiskCache {
             None => return,
         };
 
-        let root_prefix = format!("{package_name}@");
-        let root_end = format!("{package_name}@\u{10FFFF}");
-        let subpath_prefix = format!("{package_name}/");
-        let subpath_end = format!("{package_name}/\u{10FFFF}");
-
         if let Ok(write_txn) = db.begin_write() {
             if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
                 let mut keys_to_remove = Vec::new();
 
-                if let Ok(iter) = table.range(root_prefix.as_str()..root_end.as_str()) {
+                if let Ok(iter) = table.iter() {
                     for result in iter {
-                        if let Ok((key, _)) = result {
-                            keys_to_remove.push(key.value().to_owned());
-                        }
-                    }
-                }
-
-                if let Ok(iter) = table.range(subpath_prefix.as_str()..subpath_end.as_str()) {
-                    for result in iter {
-                        if let Ok((key, _)) = result {
+                        if let Ok((key, _)) = result
+                            && cache_key_matches_package(key.value(), package_name)
+                        {
                             keys_to_remove.push(key.value().to_owned());
                         }
                     }
@@ -359,6 +365,38 @@ fn unix_millis_now() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn cache_envelope(key: &str, result: ImportResult) -> CacheEnvelope {
+    let package_identity = decode_cache_identity(key);
+    let mut dependency_fingerprints = Vec::new();
+    if let Some(identity) = &package_identity {
+        if let Some(fingerprint) = &identity.manifest_fingerprint {
+            dependency_fingerprints.push(fingerprint.clone());
+        }
+        if let Some(fingerprint) = &identity.entry_fingerprint {
+            dependency_fingerprints.push(fingerprint.clone());
+        }
+    }
+
+    CacheEnvelope {
+        analyzer_version: ANALYZER_VERSION.to_owned(),
+        full_contributions: result.module_breakdown.clone().unwrap_or_default(),
+        result,
+        package_identity,
+        dependency_fingerprints,
+    }
+}
+
+fn decode_cached_result(bytes: &[u8]) -> Option<ImportResult> {
+    if let Ok(envelope) = rmp_serde::from_slice::<CacheEnvelope>(bytes) {
+        if envelope.analyzer_version == ANALYZER_VERSION {
+            return Some(envelope.result);
+        }
+        return None;
+    }
+
+    rmp_serde::from_slice::<ImportResult>(bytes).ok()
 }
 
 fn cache_warn(message: String) {

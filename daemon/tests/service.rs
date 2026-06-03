@@ -33,6 +33,46 @@ fn write_package(workspace: &Path) {
         .expect("entry should be written");
 }
 
+fn write_tiny_package_with_source(workspace: &Path, source: &str) {
+    let package_root = workspace.join("node_modules").join("tiny-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(package_root.join("index.js"), source).expect("entry should be written");
+}
+
+fn write_runtime_package(workspace: &Path) {
+    let package_root = workspace.join("node_modules").join("runtime-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","exports":{"browser":"./browser.js","node":"./node.js","default":"./browser.js"},"sideEffects":false}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(package_root.join("browser.js"), "export const value = 'b';")
+        .expect("browser entry should be written");
+    fs::write(
+        package_root.join("node.js"),
+        "export const value = 'node branch with different bytes';",
+    )
+    .expect("node entry should be written");
+}
+
+fn write_missing_export_effectful_package(workspace: &Path) {
+    let package_root = workspace.join("node_modules").join("missing-effectful-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":true}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(package_root.join("index.js"), "export const present = 1;")
+        .expect("entry should be written");
+}
+
 fn write_export_package(workspace: &Path) {
     let package_root = workspace.join("node_modules").join("exports-lib");
     fs::create_dir_all(&package_root).expect("package root should be created");
@@ -149,6 +189,58 @@ fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -
     }
 }
 
+fn runtime_batch(workspace: &Path, request_id: u64, runtime: ImportRuntime) -> BatchRequest {
+    BatchRequest {
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![ImportRequest {
+            specifier: "runtime-lib".to_owned(),
+            package_name: "runtime-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec!["value".to_owned()],
+            import_kind: ImportKind::Named,
+            runtime,
+        }],
+        streaming: false,
+    }
+}
+
+fn missing_effectful_batch(
+    workspace: &Path,
+    request_id: u64,
+    import_kind: ImportKind,
+) -> BatchRequest {
+    BatchRequest {
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![ImportRequest {
+            specifier: "missing-effectful-lib".to_owned(),
+            package_name: "missing-effectful-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: if matches!(import_kind, ImportKind::Named) {
+                vec!["missing".to_owned()]
+            } else {
+                Vec::new()
+            },
+            import_kind,
+            runtime: ImportRuntime::Component,
+        }],
+        streaming: false,
+    }
+}
+
 fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
     BatchRequest {
         version: PROTOCOL_VERSION,
@@ -228,6 +320,42 @@ fn service_processes_batch_and_serves_second_request_from_cache() {
 }
 
 #[test]
+fn service_does_not_reuse_same_package_version_across_workspaces() {
+    let left_workspace = temp_workspace();
+    let right_workspace = temp_workspace();
+    write_tiny_package_with_source(&left_workspace, "export const value = 1;");
+    write_tiny_package_with_source(
+        &right_workspace,
+        "export const value = 'right workspace has different package bytes';",
+    );
+    let service = ImportLensService::new(None, false);
+
+    let left = service.handle_batch(batch(&left_workspace, 1));
+    let right = service.handle_batch(batch(&right_workspace, 2));
+
+    fs::remove_dir_all(left_workspace).expect("left workspace should be removed");
+    fs::remove_dir_all(right_workspace).expect("right workspace should be removed");
+    assert!(!left.imports[0].cache_hit);
+    assert!(!right.imports[0].cache_hit);
+    assert_ne!(left.imports[0].raw_bytes, right.imports[0].raw_bytes);
+}
+
+#[test]
+fn service_does_not_reuse_cache_across_runtime_profiles() {
+    let workspace = temp_workspace();
+    write_runtime_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let component = service.handle_batch(runtime_batch(&workspace, 1, ImportRuntime::Component));
+    let server = service.handle_batch(runtime_batch(&workspace, 2, ImportRuntime::Server));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(!component.imports[0].cache_hit);
+    assert!(!server.imports[0].cache_hit);
+    assert_ne!(component.imports[0].raw_bytes, server.imports[0].raw_bytes);
+}
+
+#[test]
 fn service_cache_invalidation_removes_matching_package_entries() {
     let workspace = temp_workspace();
     write_package(&workspace);
@@ -254,6 +382,31 @@ fn service_caches_full_package_variant_for_conservative_named_imports() {
     assert!(!named.imports[0].cache_hit);
     assert!(namespace.imports[0].cache_hit);
     assert_eq!(named.imports[0].raw_bytes, namespace.imports[0].raw_bytes);
+}
+
+#[test]
+fn service_does_not_alias_missing_export_result_to_namespace_cache() {
+    let workspace = temp_workspace();
+    write_missing_export_effectful_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let named = service.handle_batch(missing_effectful_batch(&workspace, 1, ImportKind::Named));
+    let namespace = service.handle_batch(missing_effectful_batch(
+        &workspace,
+        2,
+        ImportKind::Namespace,
+    ));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(!named.imports[0].cache_hit);
+    assert!(
+        named.imports[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "exports"),
+        "{named:?}",
+    );
+    assert!(!namespace.imports[0].cache_hit);
 }
 
 #[test]
