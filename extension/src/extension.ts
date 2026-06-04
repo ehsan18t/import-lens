@@ -17,6 +17,7 @@ import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSi
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
+import { TreeShakeCodeActionProvider } from "./ui/treeShakeActions.js";
 import type { ImportResult } from "./ipc/protocol.js";
 import type { ImportRuntime } from "./imports/types.js";
 
@@ -35,6 +36,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const decorations = new DecorationController(store);
   const inlayHints = new ImportLensInlayHintsProvider(store);
   const codeLens = new ImportLensCodeLensProvider(store);
+  const treeShakeActions = new TreeShakeCodeActionProvider(store);
 
   daemon = new DaemonManager(context, logger);
   const completions = new ImportMemberCompletionProvider(daemon);
@@ -42,6 +44,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(languageSelector, inlayHints));
   context.subscriptions.push(vscode.languages.registerCodeLensProvider(languageSelector, codeLens));
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider(languageSelector, completions, "{", ","));
+  context.subscriptions.push(vscode.languages.registerCodeActionsProvider(languageSelector, treeShakeActions));
 
   const analysis = new DocumentAnalysisController(context, store, daemon, logger, statusBar);
   context.subscriptions.push(analysis);

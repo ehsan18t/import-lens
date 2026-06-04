@@ -1,0 +1,67 @@
+import * as vscode from "vscode";
+import { getImportLensConfig } from "../config.js";
+import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
+import { copyImportDiagnosticsCommand } from "./diagnostics.js";
+import { treeShakeActionReason } from "./treeShakeActionReason.js";
+
+export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
+  readonly #store: AnalysisStore;
+
+  constructor(store: AnalysisStore) {
+    this.#store = store;
+  }
+
+  provideCodeActions(
+    document: vscode.TextDocument,
+    range: vscode.Range,
+  ): vscode.CodeAction[] {
+    if (!getImportLensConfig().enabled) {
+      return [];
+    }
+
+    return this.#store
+      .get(document.uri)
+      .filter((state) => stateOverlapsRange(state, range))
+      .flatMap((state) => this.actionsForState(state));
+  }
+
+  private actionsForState(state: ImportAnalysisState): vscode.CodeAction[] {
+    if (state.status !== "ready" || !state.result) {
+      return [];
+    }
+
+    const reason = treeShakeActionReason(state.result);
+    if (!reason) {
+      return [];
+    }
+
+    const inspect = new vscode.CodeAction(
+      `Inspect ImportLens tree-shaking: ${reason}`,
+      vscode.CodeActionKind.Refactor,
+    );
+    inspect.command = {
+      command: "importLens.showImportDetails",
+      title: "Inspect ImportLens tree-shaking diagnostics",
+      arguments: [state.result, state.detected.runtime],
+    };
+
+    const copy = new vscode.CodeAction(
+      "Copy ImportLens tree-shaking diagnostics",
+      vscode.CodeActionKind.Refactor,
+    );
+    copy.command = {
+      command: copyImportDiagnosticsCommand,
+      title: "Copy ImportLens tree-shaking diagnostics",
+      arguments: [state.result],
+    };
+
+    return [inspect, copy];
+  }
+}
+
+const stateOverlapsRange = (state: ImportAnalysisState, range: vscode.Range): boolean => {
+  const startLine = state.detected.statementRange.start.line;
+  const endLine = state.detected.statementRange.end.line;
+
+  return range.end.line >= startLine && range.start.line <= endLine;
+};
