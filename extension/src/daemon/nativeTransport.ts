@@ -21,6 +21,7 @@ import { knownDaemonHashes } from "./knownHashes.generated.js";
 import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs } from "./processLifecycle.js";
 import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
+import { resolveDaemonStartRoot } from "./startRoot.js";
 import type { AnalysisTransport, DaemonState } from "./transport.js";
 
 const STABLE_SESSION_RESET_MS = 60_000;
@@ -40,6 +41,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
   #stabilityTimer: NodeJS.Timeout | null = null;
   #cleanRecycleTimer: NodeJS.Timeout | null = null;
   #disconnectTimer: NodeJS.Timeout | null = null;
+  #lastAnalysisRoot: string | undefined;
 
   constructor(context: vscode.ExtensionContext, logger: ImportLensLogger) {
     this.#context = context;
@@ -55,7 +57,11 @@ export class NativeDaemonTransport implements AnalysisTransport {
     if (this.#isDisposed) return "unavailable";
     if (this.#state === "ready" && this.#process && this.#client) return "ready";
 
-    const workspaceRoot = analysisRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const workspaceRoot = resolveDaemonStartRoot(
+      analysisRoot,
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      this.#lastAnalysisRoot,
+    );
 
     if (!workspaceRoot) {
       this.#logger.warn("No workspace or analysis root is available; daemon unavailable.");
@@ -133,6 +139,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
 
     this.#state = "ready";
+    this.#lastAnalysisRoot = workspaceRoot;
     this.#armStabilityReset();
     this.#armCleanRecycleReset();
 
@@ -198,7 +205,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#logger[level](message);
     this.#restartTimer = setTimeout(() => {
       this.#restartTimer = null;
-      if (!this.#isDisposed) void this.start();
+      if (!this.#isDisposed) void this.start(this.#lastAnalysisRoot);
     }, delay);
   }
 
