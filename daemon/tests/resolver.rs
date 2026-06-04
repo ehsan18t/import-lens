@@ -5,17 +5,12 @@ use import_lens_daemon::{
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
+mod common;
+
 fn temp_workspace() -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("import-lens-resolver-{suffix}"));
-    fs::create_dir_all(&path).expect("temp resolver workspace should be created");
-    path
+    common::temp_workspace("import-lens-resolver")
 }
 
 fn write_source(root: &Path, relative_path: &str, source: &str) {

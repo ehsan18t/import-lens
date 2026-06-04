@@ -11,16 +11,12 @@ use std::{
     path::{Path, PathBuf},
     thread,
     time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
+mod common;
+
 fn temp_workspace() -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("import-lens-graph-{suffix}"));
-    fs::create_dir_all(&path).expect("temp graph workspace should be created");
+    let path = common::temp_workspace("import-lens-graph");
     fs::canonicalize(&path).expect("temp graph workspace should be canonicalized")
 }
 

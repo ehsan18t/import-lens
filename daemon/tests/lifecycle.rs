@@ -4,17 +4,13 @@ use import_lens_daemon::lifecycle::{
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
+mod common;
+
 fn temp_storage() -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("import-lens-lifecycle-{suffix}"));
-    fs::create_dir_all(&path).expect("temp storage should be created");
-    path
+    common::temp_workspace("import-lens-lifecycle")
 }
 
 fn recycle_file(storage_path: &Path) -> PathBuf {

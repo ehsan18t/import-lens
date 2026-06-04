@@ -10,17 +10,12 @@ use import_lens_daemon::{
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
+mod common;
+
 fn temp_workspace() -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("import-lens-prefetch-{suffix}"));
-    fs::create_dir_all(&path).expect("temp workspace should be created");
-    path
+    common::temp_workspace("import-lens-prefetch")
 }
 
 fn write_installed_package(workspace: &Path, package_name: &str, version: &str) {

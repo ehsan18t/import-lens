@@ -4,17 +4,12 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Once,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
+mod common;
+
 fn temp_workspace() -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("import-lens-analyze-{suffix}"));
-    fs::create_dir_all(&path).expect("temp workspace should be created");
-    path
+    common::temp_workspace("import-lens-analyze")
 }
 
 fn write_package(workspace: &Path, name: &str, package_json: &str, source: &str) {

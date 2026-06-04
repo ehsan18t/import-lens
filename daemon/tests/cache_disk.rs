@@ -8,7 +8,6 @@ use std::{
     path::{Path, PathBuf},
     thread,
     time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
@@ -17,14 +16,10 @@ const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadat
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CURRENT_SCHEMA_VERSION: u64 = 3;
 
+mod common;
+
 fn temp_storage() -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("import-lens-cache-{suffix}"));
-    fs::create_dir_all(&path).expect("temp storage should be created");
-    path
+    common::temp_workspace("import-lens-cache")
 }
 
 fn db_path(storage_path: &Path) -> PathBuf {
