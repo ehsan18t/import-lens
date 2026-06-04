@@ -100,6 +100,7 @@ pub struct BatchResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloMessage {
     #[serde(rename = "type")]
+    #[serde(default = "hello_message_type")]
     pub message_type: String,
     pub version: u32,
     pub workspace_root: String,
@@ -111,6 +112,7 @@ pub struct HelloMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheInvalidateMessage {
     #[serde(rename = "type")]
+    #[serde(default = "cache_invalidate_message_type")]
     pub message_type: String,
     #[serde(rename = "package")]
     pub package_name: String,
@@ -119,12 +121,14 @@ pub struct CacheInvalidateMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheInvalidateAllMessage {
     #[serde(rename = "type")]
+    #[serde(default = "cache_invalidate_all_message_type")]
     pub message_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrewarmPackageJsonMessage {
     #[serde(rename = "type")]
+    #[serde(default = "prewarm_package_json_message_type")]
     pub message_type: String,
     pub package_json_path: String,
     pub active_document_path: String,
@@ -133,6 +137,7 @@ pub struct PrewarmPackageJsonMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnumerateExportsRequest {
     #[serde(rename = "type")]
+    #[serde(default = "enumerate_exports_message_type")]
     pub message_type: String,
     pub version: u32,
     pub request_id: u64,
@@ -157,6 +162,7 @@ pub struct EnumerateExportsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSizeRequest {
     #[serde(rename = "type")]
+    #[serde(default = "file_size_message_type")]
     pub message_type: String,
     pub version: u32,
     pub request_id: u64,
@@ -182,6 +188,7 @@ pub struct FileSizeResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownMessage {
     #[serde(rename = "type")]
+    #[serde(default = "shutdown_message_type")]
     pub message_type: String,
 }
 
@@ -197,41 +204,106 @@ pub enum ClientMessage {
     Shutdown(ShutdownMessage),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum ClientMessageWire {
+    Typed(TypedClientMessage),
+    Batch(BatchRequestWire),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TypedClientMessage {
+    Hello(HelloMessage),
+    CacheInvalidate(CacheInvalidateMessage),
+    CacheInvalidateAll(CacheInvalidateAllMessage),
+    PrewarmPackageJson(PrewarmPackageJsonMessage),
+    EnumerateExports(EnumerateExportsRequest),
+    FileSize(FileSizeRequest),
+    Shutdown(ShutdownMessage),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchRequestWire {
+    version: u32,
+    request_id: u64,
+    workspace_root: String,
+    active_document_path: String,
+    imports: Vec<ImportRequest>,
+    #[serde(default)]
+    streaming: bool,
+}
+
 impl<'de> Deserialize<'de> for ClientMessage {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let value = serde_json::Value::deserialize(deserializer)?;
+        ClientMessageWire::deserialize(deserializer).map(Into::into)
+    }
+}
 
-        match value.get("type").and_then(serde_json::Value::as_str) {
-            Some("hello") => serde_json::from_value(value)
-                .map(Self::Hello)
-                .map_err(serde::de::Error::custom),
-            Some("cache_invalidate") => serde_json::from_value(value)
-                .map(Self::CacheInvalidate)
-                .map_err(serde::de::Error::custom),
-            Some("cache_invalidate_all") => serde_json::from_value(value)
-                .map(Self::CacheInvalidateAll)
-                .map_err(serde::de::Error::custom),
-            Some("prewarm_package_json") => serde_json::from_value(value)
-                .map(Self::PrewarmPackageJson)
-                .map_err(serde::de::Error::custom),
-            Some("enumerate_exports") => serde_json::from_value(value)
-                .map(Self::EnumerateExports)
-                .map_err(serde::de::Error::custom),
-            Some("file_size") => serde_json::from_value(value)
-                .map(Self::FileSize)
-                .map_err(serde::de::Error::custom),
-            Some("shutdown") => serde_json::from_value(value)
-                .map(Self::Shutdown)
-                .map_err(serde::de::Error::custom),
-            Some(message_type) => Err(serde::de::Error::custom(format!(
-                "unknown client message type: {message_type}"
-            ))),
-            None => serde_json::from_value(value)
-                .map(Self::Batch)
-                .map_err(serde::de::Error::custom),
+impl From<ClientMessageWire> for ClientMessage {
+    fn from(message: ClientMessageWire) -> Self {
+        match message {
+            ClientMessageWire::Typed(message) => message.into(),
+            ClientMessageWire::Batch(request) => Self::Batch(request.into()),
         }
     }
+}
+
+impl From<TypedClientMessage> for ClientMessage {
+    fn from(message: TypedClientMessage) -> Self {
+        match message {
+            TypedClientMessage::Hello(message) => Self::Hello(message),
+            TypedClientMessage::CacheInvalidate(message) => Self::CacheInvalidate(message),
+            TypedClientMessage::CacheInvalidateAll(message) => Self::CacheInvalidateAll(message),
+            TypedClientMessage::PrewarmPackageJson(message) => Self::PrewarmPackageJson(message),
+            TypedClientMessage::EnumerateExports(message) => Self::EnumerateExports(message),
+            TypedClientMessage::FileSize(message) => Self::FileSize(message),
+            TypedClientMessage::Shutdown(message) => Self::Shutdown(message),
+        }
+    }
+}
+
+impl From<BatchRequestWire> for BatchRequest {
+    fn from(request: BatchRequestWire) -> Self {
+        Self {
+            version: request.version,
+            request_id: request.request_id,
+            workspace_root: request.workspace_root,
+            active_document_path: request.active_document_path,
+            imports: request.imports,
+            streaming: request.streaming,
+        }
+    }
+}
+
+fn hello_message_type() -> String {
+    "hello".to_owned()
+}
+
+fn cache_invalidate_message_type() -> String {
+    "cache_invalidate".to_owned()
+}
+
+fn cache_invalidate_all_message_type() -> String {
+    "cache_invalidate_all".to_owned()
+}
+
+fn prewarm_package_json_message_type() -> String {
+    "prewarm_package_json".to_owned()
+}
+
+fn enumerate_exports_message_type() -> String {
+    "enumerate_exports".to_owned()
+}
+
+fn file_size_message_type() -> String {
+    "file_size".to_owned()
+}
+
+fn shutdown_message_type() -> String {
+    "shutdown".to_owned()
 }
