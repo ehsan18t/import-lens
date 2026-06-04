@@ -5,6 +5,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createStagedManifest } from "./package-vsix-manifest.mjs";
 import { targetInfo, vsixNameForTarget } from "./targets.mjs";
 
 const require = createRequire(import.meta.url);
@@ -50,33 +51,6 @@ const run = (command, args, cwd) => {
   }
 };
 
-const createStagedManifest = (manifest, bindingPackage) => {
-  const files = [
-    "extension/dist/extension.cjs",
-    "bin/",
-    "node_modules/oxc-parser/",
-    `node_modules/@oxc-parser/${path.basename(bindingPackage)}/`,
-    "node_modules/@oxc-project/types/",
-    "README.md",
-    "package.json",
-  ];
-
-  if (manifest.icon) {
-    files.push(manifest.icon);
-  }
-
-  return {
-    ...manifest,
-    dependencies: {
-      [bindingPackage]: manifest.dependencies[bindingPackage] ?? manifest.dependencies["oxc-parser"],
-      "oxc-parser": manifest.dependencies["oxc-parser"],
-    },
-    devDependencies: undefined,
-    files,
-    scripts: undefined,
-  };
-};
-
 if (!target) {
   fail("Usage: node scripts/package-vsix.mjs <target>");
 }
@@ -101,13 +75,14 @@ mkdirSync(path.dirname(outputPath), { recursive: true });
 
 writeFileSync(
   path.join(stagingRoot, "package.json"),
-  `${JSON.stringify(createStagedManifest(manifest, bindingPackage), null, 2)}\n`,
+  `${JSON.stringify(createStagedManifest({ manifest, bindingPackage }), null, 2)}\n`,
 );
 
 console.log(`Downloading ${bindingPackage} inside staging directory...`);
 run("pnpm", ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoisted", "--ignore-workspace"], stagingRoot);
 
 copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));
+copyPath(path.join(repoRoot, "LICENSE"), path.join(stagingRoot, "LICENSE"));
 copyPath(
   path.join(repoRoot, "extension", "dist", "extension.cjs"),
   path.join(stagingRoot, "extension", "dist", "extension.cjs"),

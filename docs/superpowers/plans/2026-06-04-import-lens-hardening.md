@@ -221,6 +221,53 @@ git add extension/src/daemon/knownHashes.generated.ts
 git commit -m "chore: refresh Windows daemon hash"
 ```
 
+## Task 4: Include License In VSIX Staging
+
+**Files:**
+- Create: `scripts/package-vsix-manifest.mjs`
+- Create: `scripts/package-vsix-manifest.test.mjs`
+- Modify: `scripts/package-vsix.mjs`
+
+- [x] **Step 1: Write failing script test**
+
+Add a test that imports `createStagedManifest()` and asserts the staged manifest includes `LICENSE` in `files` when the root manifest has the standard metadata:
+
+```javascript
+const staged = createStagedManifest({
+  manifest: { dependencies: { "oxc-parser": "^0" }, icon: "media/icon.png" },
+  bindingPackage: "@oxc-parser/binding-win32-x64-msvc",
+});
+assert.ok(staged.files.includes("LICENSE"));
+```
+
+Expected before implementation: fails because `scripts/package-vsix-manifest.mjs` does not exist.
+
+- [x] **Step 2: Extract manifest helper**
+
+Move the staged manifest construction out of `package-vsix.mjs` into `package-vsix-manifest.mjs`, preserving the existing dependency pruning and target binding behavior.
+
+- [x] **Step 3: Copy license during staging**
+
+In `package-vsix.mjs`, copy `LICENSE` into the staging root when it exists so `vsce package` no longer warns about a missing license file.
+
+- [x] **Step 4: Verify**
+
+Run:
+
+```powershell
+pnpm test:scripts
+pnpm package:win32-x64
+```
+
+Expected: script tests pass, VSIX packaging succeeds, and the license warning disappears.
+
+- [x] **Step 5: Commit**
+
+```powershell
+git add scripts/package-vsix.mjs scripts/package-vsix-manifest.mjs scripts/package-vsix-manifest.test.mjs docs/superpowers/plans/2026-06-04-import-lens-hardening.md
+git commit -m "fix: include license in packaged VSIX"
+```
+
 ## Deferred Validated Backlog
 
 - Add a protocol field such as `shared_modules?: ModuleContribution[]` so hover/report insights can name shared modules even when they are outside the top-10 public `module_breakdown`.
