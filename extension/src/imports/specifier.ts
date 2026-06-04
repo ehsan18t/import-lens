@@ -18,8 +18,13 @@ export const isRelativeSpecifier = (specifier: string): boolean =>
   specifier.startsWith("./") ||
   specifier.startsWith("../") ||
   specifier.startsWith("/") ||
+  specifier.startsWith("\\\\") ||
   specifier.startsWith(".\\") ||
-  specifier.startsWith("..\\");
+  specifier.startsWith("..\\") ||
+  /^[A-Za-z]:[\\/]/u.test(specifier);
+
+const isUrlLikeSpecifier = (specifier: string): boolean =>
+  /^[A-Za-z][A-Za-z\d+.-]*:/u.test(specifier);
 
 export const isNodeBuiltinSpecifier = (specifier: string): boolean => {
   const normalized = specifier.startsWith("node:") ? specifier.slice("node:".length) : specifier;
@@ -46,5 +51,6 @@ const isHostProvidedModule = (specifier: string): boolean =>
 export const isRuntimePackageSpecifier = (specifier: string): boolean =>
   !isRelativeSpecifier(specifier) &&
   !isNodeBuiltinSpecifier(specifier) &&
+  !isUrlLikeSpecifier(specifier) &&
   !isFrameworkVirtualSpecifier(specifier) &&
   !isHostProvidedModule(specifier);

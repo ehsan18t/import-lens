@@ -16,6 +16,15 @@ test("isRuntimePackageSpecifier rejects relative paths and Node builtins", () =>
   assert.equal(isRuntimePackageSpecifier("lodash-es"), true);
 });
 
+test("isRuntimePackageSpecifier rejects URL and absolute path imports", () => {
+  assert.equal(isRuntimePackageSpecifier("https://esm.sh/react"), false);
+  assert.equal(isRuntimePackageSpecifier("data:text/javascript,export default 1"), false);
+  assert.equal(isRuntimePackageSpecifier("file:///tmp/module.js"), false);
+  assert.equal(isRuntimePackageSpecifier("C:/project/src/module.js"), false);
+  assert.equal(isRuntimePackageSpecifier("C:\\project\\src\\module.js"), false);
+  assert.equal(isRuntimePackageSpecifier("\\\\server\\share\\module.js"), false);
+});
+
 test("isRuntimePackageSpecifier rejects framework virtual and app alias imports", () => {
   assert.equal(isRuntimePackageSpecifier("astro:content"), false);
   assert.equal(isRuntimePackageSpecifier("virtual:astro/icons"), false);
