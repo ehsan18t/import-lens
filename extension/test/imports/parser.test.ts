@@ -84,6 +84,31 @@ test("extractRuntimeImports keeps runtime default imports and skips mixed type s
   );
 });
 
+test("extractRuntimeImports parses .mts and .cts files as TypeScript modules", () => {
+  const source = [
+    "import type { Config } from 'ignored-types';",
+    "import { z } from 'zod';",
+    "export type Output = Config;",
+  ].join("\n");
+
+  assert.deepEqual(
+    extractRuntimeImports("schema.mts", source).map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      named: item.named,
+    })),
+    [{ specifier: "zod", kind: "named", named: ["z"] }],
+  );
+  assert.deepEqual(
+    extractRuntimeImports("schema.cts", source).map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      named: item.named,
+    })),
+    [{ specifier: "zod", kind: "named", named: ["z"] }],
+  );
+});
+
 test("extractRuntimeImports detects imports inside Svelte TypeScript script blocks", () => {
   const source = [
     "<script lang=\"ts\">",

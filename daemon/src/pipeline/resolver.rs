@@ -316,10 +316,10 @@ fn resolved_entry_is_commonjs(
         return resolver_is_cjs;
     };
 
-    if extension == "cjs" {
+    if matches!(extension, "cjs" | "cts") {
         return true;
     }
-    if extension == "mjs" {
+    if matches!(extension, "mjs" | "mts") {
         return false;
     }
     if matches!(extension, "ts" | "tsx" | "jsx" | "json") {
@@ -487,10 +487,12 @@ fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
 }
 
 fn module_extensions() -> Vec<String> {
-    [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".json"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+    [
+        ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".json",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 pub(crate) fn resolve_module_path(
@@ -554,5 +556,5 @@ fn subpath_for_request(request: &ImportRequest) -> Option<&str> {
 }
 
 fn path_looks_cjs(path: &str) -> bool {
-    path.ends_with(".cjs")
+    path.ends_with(".cjs") || path.ends_with(".cts")
 }

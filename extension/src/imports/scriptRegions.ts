@@ -24,7 +24,11 @@ const languageFromFilename = (filename: string): ScriptLanguage => {
     return "tsx";
   }
 
-  if (lowerFilename.endsWith(".ts")) {
+  if (
+    lowerFilename.endsWith(".ts") ||
+    lowerFilename.endsWith(".mts") ||
+    lowerFilename.endsWith(".cts")
+  ) {
     return "ts";
   }
 

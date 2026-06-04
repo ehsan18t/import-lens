@@ -513,7 +513,7 @@ fn transform_module_source(path: &Path, source: &str) -> Result<String, String> 
 }
 
 fn module_needs_transform(path: &Path) -> bool {
-    ["ts", "tsx", "jsx"]
+    ["ts", "tsx", "mts", "cts", "jsx"]
         .iter()
         .any(|extension| path_has_extension(path, extension))
 }
@@ -1110,7 +1110,7 @@ fn asset_import_kind(specifier: &str) -> Option<&'static str> {
 fn is_javascript_module_extension(extension: &str) -> bool {
     matches!(
         extension,
-        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "json"
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "mts" | "cts" | "json"
     )
 }
 
@@ -1199,4 +1199,53 @@ fn span_start(span: Span) -> usize {
 
 fn span_end(span: Span) -> usize {
     span.end as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_graph_workspace() -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("import-lens-graph-{suffix}"));
+        fs::create_dir_all(&path).expect("temp graph workspace should be created");
+        path
+    }
+
+    #[test]
+    fn graph_resolves_and_transforms_mts_and_cts_modules() {
+        let workspace = temp_graph_workspace();
+
+        for extension in ["mts", "cts"] {
+            let entry = workspace.join(format!("entry.{extension}"));
+            let dep = workspace.join(format!("dep.{extension}"));
+            fs::write(
+                &entry,
+                "import { value } from './dep';\nexport const answer: number = value;\n",
+            )
+            .expect("entry module should be written");
+            fs::write(&dep, "export const value: number = 42;\n")
+                .expect("dep module should be written");
+
+            let graph = build_module_graph(&entry).expect("graph should build");
+
+            assert_eq!(graph.modules.len(), 2);
+            assert!(
+                graph
+                    .modules
+                    .iter()
+                    .all(|module| !module.source.contains(": number")),
+                "{graph:?}",
+            );
+        }
+
+        fs::remove_dir_all(workspace).expect("temp graph workspace should be removed");
+    }
 }
