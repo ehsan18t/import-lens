@@ -12,6 +12,9 @@ interface RecycleFile {
 
 export class RecycleGuard {
   readonly #storagePath: string;
+  #cachedRecycleTimes: number[] | null = null;
+  #loadPromise: Promise<number[]> | null = null;
+  #pendingMutation: Promise<void> = Promise.resolve();
 
   constructor(storagePath: string) {
     this.#storagePath = storagePath;
@@ -23,20 +26,49 @@ export class RecycleGuard {
   }
 
   async recordRecycle(now: number = Date.now()): Promise<void> {
-    const recent = this.#recentRecycleTimes(await this.readRecycleTimes(), now);
-    await this.recordRecycleTimes([...recent, now]);
+    await this.#mutateRecycleTimes((recycleTimes) => [
+      ...this.#recentRecycleTimes(recycleTimes, now),
+      now,
+    ]);
   }
 
   async resetAfterCleanSession(now: number = Date.now()): Promise<void> {
-    const recycleTimes = await this.readRecycleTimes();
-    const hasRecentRecycle = recycleTimes.some((timestamp) => now - timestamp <= CLEAN_SESSION_MS);
+    await this.#mutateRecycleTimes((recycleTimes) => {
+      const hasRecentRecycle = recycleTimes.some((timestamp) => now - timestamp <= CLEAN_SESSION_MS);
 
-    if (!hasRecentRecycle) {
-      await this.recordRecycleTimes([]);
-    }
+      return hasRecentRecycle ? recycleTimes : [];
+    });
   }
 
   async readRecycleTimes(): Promise<number[]> {
+    await this.#pendingMutation;
+    return [...(await this.#loadRecycleTimes())];
+  }
+
+  async recordRecycleTimes(recycleTimes: readonly number[]): Promise<void> {
+    await this.#replaceRecycleTimes(recycleTimes);
+  }
+
+  async #loadRecycleTimes(): Promise<number[]> {
+    if (this.#cachedRecycleTimes) {
+      return this.#cachedRecycleTimes;
+    }
+
+    if (this.#loadPromise) {
+      return this.#loadPromise;
+    }
+
+    this.#loadPromise = this.#readRecycleTimesFromDisk();
+
+    try {
+      this.#cachedRecycleTimes = await this.#loadPromise;
+      return this.#cachedRecycleTimes;
+    } finally {
+      this.#loadPromise = null;
+    }
+  }
+
+  async #readRecycleTimesFromDisk(): Promise<number[]> {
     try {
       const parsed = JSON.parse(await readFile(this.#filePath(), "utf8")) as RecycleFile;
 
@@ -52,17 +84,47 @@ export class RecycleGuard {
     }
   }
 
-  async recordRecycleTimes(recycleTimes: readonly number[]): Promise<void> {
+  async #replaceRecycleTimes(recycleTimes: readonly number[]): Promise<void> {
+    const mutation = this.#pendingMutation.then(async () => {
+      await this.#writeRecycleTimes(this.#sortedRecycleTimes(recycleTimes));
+    });
+
+    this.#pendingMutation = mutation.catch(() => undefined);
+    await mutation;
+  }
+
+  async #mutateRecycleTimes(updater: (recycleTimes: readonly number[]) => readonly number[]): Promise<void> {
+    const mutation = this.#pendingMutation.then(async () => {
+      const current = await this.#loadRecycleTimes();
+      const next = this.#sortedRecycleTimes(updater(current));
+      await this.#writeRecycleTimes(next);
+    });
+
+    this.#pendingMutation = mutation.catch(() => undefined);
+    await mutation;
+  }
+
+  async #writeRecycleTimes(recycleTimes: readonly number[]): Promise<void> {
     await mkdir(this.#storagePath, { recursive: true });
+    const sorted = this.#sortedRecycleTimes(recycleTimes);
+
     await writeFile(
       this.#filePath(),
-      JSON.stringify({ recycles: [...recycleTimes].sort((left, right) => left - right) }),
+      JSON.stringify({ recycles: sorted }),
       "utf8",
     );
+
+    this.#cachedRecycleTimes = sorted;
   }
 
   #recentRecycleTimes(recycleTimes: readonly number[], now: number): number[] {
     return recycleTimes.filter((timestamp) => now - timestamp <= RECYCLE_WINDOW_MS);
+  }
+
+  #sortedRecycleTimes(recycleTimes: readonly number[]): number[] {
+    return recycleTimes
+      .filter((value): value is number => Number.isFinite(value))
+      .sort((left, right) => left - right);
   }
 
   #filePath(): string {

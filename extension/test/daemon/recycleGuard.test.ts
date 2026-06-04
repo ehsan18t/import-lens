@@ -57,6 +57,28 @@ test("recycle guard records clean daemon recycle events", async () => {
   }
 });
 
+test("recycle guard preserves concurrent recycle records", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "import-lens-recycles-"));
+
+  try {
+    const guard = new RecycleGuard(root);
+    const now = 1_800_000;
+
+    await Promise.all([
+      guard.recordRecycle(now - 100),
+      guard.recordRecycle(now - 90),
+      guard.recordRecycle(now - 80),
+      guard.recordRecycle(now - 70),
+      guard.recordRecycle(now - 60),
+      guard.recordRecycle(now - 50),
+    ]);
+
+    assert.deepEqual(await guard.readRecycleTimes(), [now - 100, now - 90, now - 80, now - 70, now - 60, now - 50]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("recycle guard resets after a clean thirty minute session", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "import-lens-recycles-"));
 
