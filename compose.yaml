@@ -8,7 +8,7 @@ services:
     environment:
       CI: "true"
       PNPM_CONFIG_CONFIRM_MODULES_PURGE: "false"
-      IMPORT_LENS_PERF_MULTIPLIER: ${IMPORT_LENS_PERF_MULTIPLIER:-}
+      IMPORT_LENS_PERF_MULTIPLIER: ${IMPORT_LENS_PERF_MULTIPLIER:-20}
     volumes:
       - .:/workspace
       - /workspace/node_modules

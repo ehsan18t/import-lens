@@ -49,6 +49,7 @@ fn uuid_batch(workspace: &Path, request_id: u64) -> BatchRequest {
 }
 
 #[test]
+#[ignore = "release-only performance smoke run by pnpm test:performance"]
 fn fixture_miss_and_cache_hit_stay_under_release_thresholds() {
     let workspace = fixture_workspace("uuid@13.0.0");
     let service = ImportLensService::new(None, false);

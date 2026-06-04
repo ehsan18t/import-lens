@@ -5,7 +5,7 @@ use import_lens_daemon::pipeline::{
     },
     reachability::reachable_exports,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -14,6 +14,8 @@ use std::{
 };
 
 mod common;
+
+static GRAPH_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn temp_workspace() -> PathBuf {
     let path = common::temp_workspace("import-lens-graph");
@@ -307,6 +309,7 @@ fn graph_does_not_report_shared_dependency_as_cycle() {
 
 #[test]
 fn graph_cache_returns_shared_graph_handle_without_deep_clone() {
+    let _guard = GRAPH_CACHE_TEST_LOCK.lock().expect("graph cache test lock");
     let root = temp_workspace();
     write_source(&root, "entry.js", "export const value = 1;");
     clear_module_graph_cache();
@@ -321,6 +324,7 @@ fn graph_cache_returns_shared_graph_handle_without_deep_clone() {
 
 #[test]
 fn graph_cache_rebuilds_when_dependency_file_changes() {
+    let _guard = GRAPH_CACHE_TEST_LOCK.lock().expect("graph cache test lock");
     let root = temp_workspace();
     write_source(
         &root,

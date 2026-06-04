@@ -140,7 +140,7 @@
     "test:ts": "tsc -p tsconfig.test.json && node --test \"extension/test-dist/**/*.test.js\"",
     "test:scripts": "node --test \"scripts/**/*.test.mjs\"",
     "test:rust": "cargo test --workspace",
-    "test:performance": "cargo test -p import-lens-daemon --test performance -- --nocapture",
+    "test:performance": "cargo test -p import-lens-daemon --release --test performance -- --ignored --nocapture",
     "coverage:rust": "node scripts/check-coverage.mjs",
     "build:daemon": "node scripts/build-daemon.mjs",
     "build:daemon:win32-x64": "node scripts/build-daemon.mjs win32-x64",
