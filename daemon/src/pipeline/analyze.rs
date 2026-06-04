@@ -10,6 +10,7 @@ use crate::{
         minify::{minify_source, minify_source_with_markers},
         reachability::{reachable_exports, requested_exports},
         resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
+        types_only::declaration_only_package_result,
     },
 };
 use std::{
@@ -57,6 +58,15 @@ fn analyze_import_inner(
         Ok(resolved) => resolved,
         Err(error) if error.stage == "package_manifest" => {
             return approximate_manifest_fallback(context, request, error);
+        }
+        Err(error) if error.stage == "entry_resolution" => {
+            if let Some(result) =
+                declaration_only_package_result(&context.active_document_path, request)
+            {
+                return Ok(result);
+            }
+
+            return Err(error);
         }
         Err(error) => return Err(error),
     };

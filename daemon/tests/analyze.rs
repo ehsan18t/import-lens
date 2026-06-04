@@ -642,6 +642,97 @@ fn analyze_import_returns_partial_error_result_on_missing_entry() {
 }
 
 #[test]
+fn analyze_declaration_only_package_returns_zero_runtime_cost() {
+    let workspace = temp_workspace();
+    write_package_file(
+        &workspace,
+        "@types/demo",
+        "package.json",
+        r#"{"version":"1.0.0","types":"index.d.ts"}"#,
+    );
+    write_package_file(
+        &workspace,
+        "@types/demo",
+        "index.d.ts",
+        "export interface Demo { value: string }",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "@types/demo".to_owned(),
+        package_name: "@types/demo".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["Demo".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "{result:?}");
+    assert_eq!(result.raw_bytes, 0);
+    assert_eq!(result.minified_bytes, 0);
+    assert_eq!(result.gzip_bytes, 0);
+    assert_eq!(result.brotli_bytes, 0);
+    assert_eq!(result.zstd_bytes, 0);
+    assert!(!result.side_effects);
+    assert!(!result.is_cjs);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "types_only"
+                && diagnostic.message.contains("zero runtime")),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_declaration_only_detection_requires_declaration_files() {
+    let workspace = temp_workspace();
+    write_package_file(
+        &workspace,
+        "empty-runtime-lib",
+        "package.json",
+        r#"{"version":"1.0.0","main":"missing.js"}"#,
+    );
+    write_package_file(
+        &workspace,
+        "empty-runtime-lib",
+        "README.md",
+        "This package has no runtime entry and no declarations.",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "empty-runtime-lib".to_owned(),
+        package_name: "empty-runtime-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: Vec::new(),
+        import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(
+        result
+            .error
+            .as_ref()
+            .expect("missing runtime entry without declarations should still fail")
+            .contains("entry"),
+        "{result:?}",
+    );
+    assert_eq!(result.diagnostics[0].stage, "entry_resolution");
+}
+
+#[test]
 fn analyze_import_resolves_dotted_nestjs_style_subpath() {
     let workspace = temp_workspace();
     write_package(

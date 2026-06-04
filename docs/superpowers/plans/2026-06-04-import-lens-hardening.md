@@ -106,14 +106,16 @@ git commit -m "fix: preserve daemon hashes across target builds"
 ## Task 2: Report Declaration-Only Packages as Zero Runtime Cost
 
 **Files:**
+- Create: `daemon/src/pipeline/types_only.rs`
 - Modify: `daemon/src/pipeline/analyze.rs`
+- Modify: `daemon/src/pipeline/mod.rs`
 - Modify: `daemon/tests/analyze.rs`
 - Modify: `extension/src/ui/format.ts`
 - Modify: `extension/src/ui/tooltip.ts`
 - Modify: `extension/test/ui/format.test.ts`
 - Modify: `docs/ImportLens-SRS.md`
 
-- [ ] **Step 1: Write failing daemon regression tests**
+- [x] **Step 1: Write failing daemon regression tests**
 
 Add a test that creates `node_modules/@types/demo/package.json` and `index.d.ts` with no runtime files, calls `analyze_import()`, and expects:
 
@@ -135,9 +137,9 @@ cargo test -p import-lens-daemon --test analyze declaration_only -- --nocapture
 
 Expected before implementation: declaration-only test fails with an entry error.
 
-- [ ] **Step 2: Implement declaration-only detection**
+- [x] **Step 2: Implement declaration-only detection**
 
-In `analyze.rs`, when `resolve_import_package()` returns an `entry_resolution` error, locate the package root with `find_package_root()`. Walk the package directory with existing-style safety caps, skipping nested `node_modules` and common generated directories. Return type-only only when at least one declaration file exists and no runtime file exists.
+When `resolve_import_package()` returns an `entry_resolution` error, call a focused `types_only` pipeline helper. That helper locates the package root with `find_package_root()`, walks the package directory with existing-style safety caps, skips nested `node_modules` and common generated directories, and returns type-only only when at least one declaration file exists and no runtime file exists.
 
 Declaration files:
 
@@ -153,19 +155,19 @@ js, mjs, cjs, jsx, ts, tsx, mts, cts
 
 Do not count declaration files as runtime files.
 
-- [ ] **Step 3: Return an explicit zero-byte result**
+- [x] **Step 3: Return an explicit zero-byte result**
 
 Construct an `ImportResult` with all byte fields set to zero, `side_effects: false`, `truly_treeshakeable: true`, `is_cjs: false`, `error: None`, and a `types_only` diagnostic with package root details.
 
-- [ ] **Step 4: Add UI labeling**
+- [x] **Step 4: Add UI labeling**
 
 In `format.ts`, add a helper that checks `result.diagnostics.some((diagnostic) => diagnostic.stage === "types_only")` and append ` · types only` before approximate/CJS logic. In `tooltip.ts`, add `Type-only package: yes` when the diagnostic is present.
 
-- [ ] **Step 5: Update SRS**
+- [x] **Step 5: Update SRS**
 
 Add an edge-case requirement that declaration-only packages are reported as zero runtime bytes with a type-only diagnostic instead of `unavailable`.
 
-- [ ] **Step 6: Verify**
+- [x] **Step 6: Verify**
 
 Run:
 
@@ -176,7 +178,7 @@ pnpm test:ts -- extension/test/ui/format.test.ts
 
 Expected: targeted daemon and TS tests pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add daemon/src/pipeline/analyze.rs daemon/tests/analyze.rs extension/src/ui/format.ts extension/src/ui/tooltip.ts extension/test/ui/format.test.ts docs/ImportLens-SRS.md

@@ -43,3 +43,27 @@ test("formatImportSize labels server-side import runtime", () => {
     "1.8 kB gz · 5.3 kB min · server · approximate",
   );
 });
+
+test("formatImportSize labels declaration-only packages as types only", () => {
+  assert.equal(
+    formatImportSize(
+      {
+        ...result,
+        raw_bytes: 0,
+        minified_bytes: 0,
+        gzip_bytes: 0,
+        brotli_bytes: 0,
+        zstd_bytes: 0,
+        diagnostics: [
+          {
+            stage: "types_only",
+            message: "package contains declarations only; zero runtime cost",
+            details: [],
+          },
+        ],
+      },
+      { display: "minimal", compression: "brotli", showWarnings: true },
+    ),
+    "0 B br · types only",
+  );
+});

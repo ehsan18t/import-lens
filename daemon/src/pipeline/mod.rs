@@ -7,3 +7,4 @@ pub mod graph;
 pub mod minify;
 pub mod reachability;
 pub mod resolver;
+pub mod types_only;

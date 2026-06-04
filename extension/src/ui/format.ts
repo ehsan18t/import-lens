@@ -1,5 +1,6 @@
 import type { ImportResult } from "../ipc/protocol.js";
 import type { ImportRuntime } from "../imports/types.js";
+import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
 export type DisplayMode = "minimal" | "standard" | "verbose" | "inlayHint";
 
@@ -42,6 +43,10 @@ export const formatBytes = (bytes: number): string => {
 
 const formatWarningSuffix = (result: ImportResult, showWarnings: boolean, runtime: ImportRuntime): string => {
   const runtimeSuffix = runtime === "server" ? " · server" : "";
+
+  if (isTypesOnlyResult(result)) {
+    return `${runtimeSuffix} · types only`;
+  }
 
   if (result.is_cjs) {
     return `${runtimeSuffix} · CJS`;
