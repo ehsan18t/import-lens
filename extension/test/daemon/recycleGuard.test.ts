@@ -35,6 +35,28 @@ test("recycle guard ignores older recycles outside the rolling window", async ()
   }
 });
 
+test("recycle guard records clean daemon recycle events", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "import-lens-recycles-"));
+
+  try {
+    const guard = new RecycleGuard(root);
+    const now = 1_800_000;
+
+    await guard.recordRecycle(now - 700_000);
+    await guard.recordRecycle(now - 90);
+    await guard.recordRecycle(now - 80);
+    await guard.recordRecycle(now - 70);
+    await guard.recordRecycle(now - 60);
+    await guard.recordRecycle(now - 50);
+    await guard.recordRecycle(now - 40);
+
+    assert.equal(await guard.shouldEnterDegradedMode(now), true);
+    assert.deepEqual(await guard.readRecycleTimes(), [now - 90, now - 80, now - 70, now - 60, now - 50, now - 40]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("recycle guard resets after a clean thirty minute session", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "import-lens-recycles-"));
 

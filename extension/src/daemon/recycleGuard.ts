@@ -22,6 +22,11 @@ export class RecycleGuard {
     return recent.length > MAX_RECYCLES_IN_WINDOW;
   }
 
+  async recordRecycle(now: number = Date.now()): Promise<void> {
+    const recent = this.#recentRecycleTimes(await this.readRecycleTimes(), now);
+    await this.recordRecycleTimes([...recent, now]);
+  }
+
   async resetAfterCleanSession(now: number = Date.now()): Promise<void> {
     const recycleTimes = await this.readRecycleTimes();
     const hasRecentRecycle = recycleTimes.some((timestamp) => now - timestamp <= CLEAN_SESSION_MS);

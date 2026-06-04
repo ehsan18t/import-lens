@@ -102,7 +102,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     pipeDaemonProcessLogs(this.#process, this.#logger);
 
     this.#process.once("exit", (code, signal) => {
-      this.#handleProcessExit(code, signal);
+      void this.#handleProcessExit(code, signal);
     });
 
     try {
@@ -139,7 +139,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#state;
   }
 
-  #handleProcessExit(code: number | null, signal: NodeJS.Signals | null): void {
+  async #handleProcessExit(code: number | null, signal: NodeJS.Signals | null): Promise<void> {
     if (this.#isDisposed || this.#restartTimer) return;
     this.#clearDisconnectTimer();
 
@@ -149,11 +149,20 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#cleanup(false);
 
     if (gracefulExit) {
+      await this.#recordCleanRecycle();
       this.#scheduleRestart(1000, "Daemon recycled; restarting in 1000ms.", "info");
       return;
     }
 
     this.#handleCrash();
+  }
+
+  async #recordCleanRecycle(): Promise<void> {
+    try {
+      await this.#recycleGuard.recordRecycle();
+    } catch (error) {
+      this.#logger.warn(`Failed to record daemon recycle: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   #handleUnexpectedDisconnect(): void {
