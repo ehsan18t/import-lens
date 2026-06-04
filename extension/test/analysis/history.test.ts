@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   bundleImpactHistoryLabel,
+  bundleImpactHistoryDeltaLabel,
   recordBundleImpactHistory,
   type BundleImpactHistoryItem,
 } from "../../src/analysis/history.js";
@@ -46,5 +47,16 @@ test("bundleImpactHistoryLabel formats bundle history entries", () => {
   assert.equal(
     bundleImpactHistoryLabel(item("/workspace/src/app.ts", 1500)),
     "1.5 kB br · 5.0 kB min · 2 imports · app.ts",
+  );
+});
+
+test("bundleImpactHistoryDeltaLabel formats import cost deltas", () => {
+  assert.equal(
+    bundleImpactHistoryDeltaLabel(item("/workspace/src/app.ts", 1800), item("/workspace/src/app.ts", 1500)),
+    "+300 B br vs previous",
+  );
+  assert.equal(
+    bundleImpactHistoryDeltaLabel(item("/workspace/src/app.ts", 1200), item("/workspace/src/app.ts", 1500)),
+    "-300 B br vs previous",
   );
 });

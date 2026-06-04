@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import {
   bundleImpactHistoryKey,
+  bundleImpactHistoryDeltaLabel,
   bundleImpactHistoryLabel,
+  previousBundleImpactForFile,
   recordBundleImpactHistory,
   type BundleImpactHistoryItem,
 } from "../analysis/history.js";
@@ -93,7 +95,7 @@ export const showCurrentFileSize = async (
       return;
     }
 
-    await recordBundleImpactHistory(context.globalState, {
+    const currentHistoryItem: BundleImpactHistoryItem = {
       timestamp: Date.now(),
       fileName: document.fileName,
       rawBytes: response.raw_bytes,
@@ -102,11 +104,17 @@ export const showCurrentFileSize = async (
       brotliBytes: response.brotli_bytes,
       zstdBytes: response.zstd_bytes,
       importCount: response.imports.length,
-    });
+    };
+    const previous = previousBundleImpactForFile(
+      context.globalState.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []),
+      document.fileName,
+    );
+    await recordBundleImpactHistory(context.globalState, currentHistoryItem);
 
     const skipped = detectedImports.length - imports.length;
     const skippedSuffix = skipped > 0 ? ` · ${skipped} skipped` : "";
-    await vscode.window.showInformationMessage(`${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}`);
+    const diffSuffix = previous ? ` · ${bundleImpactHistoryDeltaLabel(currentHistoryItem, previous)}` : "";
+    await vscode.window.showInformationMessage(`${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}${diffSuffix}`);
   } catch (error) {
     logger.warn(`Current-file size request failed: ${error instanceof Error ? error.message : String(error)}`);
     await vscode.window.showWarningMessage("ImportLens current-file size request failed.");

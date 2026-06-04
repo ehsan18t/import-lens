@@ -35,3 +35,18 @@ export const bundleImpactHistoryLabel = (item: BundleImpactHistoryItem): string 
     `${item.importCount} ${item.importCount === 1 ? "import" : "imports"}`,
     path.basename(item.fileName),
   ].join(" · ");
+
+export const bundleImpactHistoryDeltaLabel = (
+  current: BundleImpactHistoryItem,
+  previous: BundleImpactHistoryItem,
+): string => {
+  const delta = current.brotliBytes - previous.brotliBytes;
+  const sign = delta >= 0 ? "+" : "-";
+  return `${sign}${formatBytes(Math.abs(delta))} br vs previous`;
+};
+
+export const previousBundleImpactForFile = (
+  history: readonly BundleImpactHistoryItem[],
+  fileName: string,
+): BundleImpactHistoryItem | undefined =>
+  history.find((item) => item.fileName === fileName);
