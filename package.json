@@ -43,6 +43,11 @@
         "category": "ImportLens"
       },
       {
+        "command": "importLens.showBundleImpactHistory",
+        "title": "ImportLens: Show Bundle Impact History",
+        "category": "ImportLens"
+      },
+      {
         "command": "importLens.showReport",
         "title": "ImportLens: Show Report",
         "category": "ImportLens"

@@ -1,4 +1,10 @@
 import * as vscode from "vscode";
+import {
+  bundleImpactHistoryKey,
+  bundleImpactHistoryLabel,
+  recordBundleImpactHistory,
+  type BundleImpactHistoryItem,
+} from "../analysis/history.js";
 import { createImportRequest } from "../analysis/request.js";
 import { formatCurrentFileSizeSummary } from "../analysis/fileSize.js";
 import { getImportLensConfig } from "../config.js";
@@ -13,6 +19,7 @@ import { analysisRootForFile } from "../workspaceContext.js";
 let fileSizeRequestId = 0;
 
 export const showCurrentFileSize = async (
+  context: vscode.ExtensionContext,
   daemon: DaemonManager,
   logger: ImportLensLogger,
 ): Promise<void> => {
@@ -86,6 +93,17 @@ export const showCurrentFileSize = async (
       return;
     }
 
+    await recordBundleImpactHistory(context.globalState, {
+      timestamp: Date.now(),
+      fileName: document.fileName,
+      rawBytes: response.raw_bytes,
+      minifiedBytes: response.minified_bytes,
+      gzipBytes: response.gzip_bytes,
+      brotliBytes: response.brotli_bytes,
+      zstdBytes: response.zstd_bytes,
+      importCount: response.imports.length,
+    });
+
     const skipped = detectedImports.length - imports.length;
     const skippedSuffix = skipped > 0 ? ` · ${skipped} skipped` : "";
     await vscode.window.showInformationMessage(`${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}`);
@@ -93,4 +111,27 @@ export const showCurrentFileSize = async (
     logger.warn(`Current-file size request failed: ${error instanceof Error ? error.message : String(error)}`);
     await vscode.window.showWarningMessage("ImportLens current-file size request failed.");
   }
+};
+
+export const showBundleImpactHistory = async (
+  context: vscode.ExtensionContext,
+): Promise<void> => {
+  const history = context.globalState.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []);
+
+  if (history.length === 0) {
+    await vscode.window.showInformationMessage("ImportLens bundle impact history is empty.");
+    return;
+  }
+
+  await vscode.window.showQuickPick(
+    history.map((item) => ({
+      label: bundleImpactHistoryLabel(item),
+      description: new Date(item.timestamp).toLocaleString(),
+      detail: item.fileName,
+    })),
+    {
+      title: "ImportLens Bundle Impact History",
+      placeHolder: "Recent current-file size measurements",
+    },
+  );
 };

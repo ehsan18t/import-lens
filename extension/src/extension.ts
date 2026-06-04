@@ -13,7 +13,7 @@ import { ImportMemberCompletionProvider } from "./ui/completions.js";
 import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
-import { showCurrentFileSize } from "./ui/currentFileSize.js";
+import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
@@ -62,7 +62,8 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(
     vscode.commands.registerCommand("importLens.showLogs", () => logger.show()),
-    vscode.commands.registerCommand("importLens.showCurrentFileSize", () => void showCurrentFileSize(daemon!, logger)),
+    vscode.commands.registerCommand("importLens.showCurrentFileSize", () => void showCurrentFileSize(context, daemon!, logger)),
+    vscode.commands.registerCommand("importLens.showBundleImpactHistory", () => void showBundleImpactHistory(context)),
     vscode.commands.registerCommand("importLens.clearCache", () => {
       daemon?.invalidateAll();
       const editor = vscode.window.activeTextEditor;
