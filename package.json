@@ -169,7 +169,7 @@
     "package:darwin-arm64:zig": "node scripts/package-target.mjs darwin-arm64 --zigbuild",
     "package:all:native": "pnpm package:win32-x64 && pnpm package:win32-arm64 && pnpm package:linux-x64 && pnpm package:linux-arm64 && pnpm package:darwin-x64 && pnpm package:darwin-arm64",
     "package:all:zig": "pnpm package:linux-x64:zig && pnpm package:linux-arm64:zig && pnpm package:darwin-x64:zig && pnpm package:darwin-arm64:zig",
-    "docker:build": "node scripts/docker-build.mjs"
+    "docker:build": "docker compose run --rm --build builder"
   },
   "dependencies": {
     "@msgpack/msgpack": "3.1.3",

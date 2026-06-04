@@ -1,4 +1,5 @@
 node_modules/
+.pnpm-store/
 extension/dist/
 extension/test-dist/
 coverage/

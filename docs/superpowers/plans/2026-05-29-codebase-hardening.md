@@ -12,7 +12,7 @@
 
 ## Verified Findings
 
-1. Docker build fails in the builder container because `Dockerfile.cross` uses Rust 1.85.0 while the locked `redb 4.1.0` requires Rust 1.89 or newer. `docker compose up --build` still exits 0 because the package script does not propagate the builder service exit code.
+1. Docker build fails in the builder container when the Compose builder image uses a Rust toolchain older than the locked `redb 4.1.0` MSRV of Rust 1.89. `docker compose up --build` still exits 0 because the package script does not propagate the builder service exit code.
 2. Platform package scripts all run the host `cargo build --release`; cross-target packages can fail or copy the wrong binary. `scripts/copy-daemon.mjs` explicitly falls back to `target/release`, which makes this unsafe.
 3. `scripts/package-vsix.mjs` shells out to `npm install`, violating the repository rule to use pnpm and producing npm warnings.
 4. `extractRuntimeImports()` treats `import(name)` as a package named `name` because it trims quotes from every dynamic import argument without checking whether the argument is a literal.
@@ -125,7 +125,7 @@ Commit message: `fix: surface unavailable daemon analysis state`
 - Modify: `scripts/package-vsix.mjs`
 - Modify: `package.json`
 - Modify: `Cargo.toml`
-- Modify: `Dockerfile.cross`
+- Modify: `Dockerfile.build`
 - Modify: `scripts/docker-build-entrypoint.sh`
 - Modify: `compose.yaml`
 - Add: `.dockerignore`

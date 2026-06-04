@@ -2,11 +2,14 @@ services:
   builder:
     build:
       context: .
-      dockerfile: Dockerfile.cross
+      dockerfile: Dockerfile.build
     image: import-lens-builder
     init: true
     environment:
       CI: "true"
+      PNPM_CONFIG_CONFIRM_MODULES_PURGE: "false"
+      IMPORT_LENS_PERF_MULTIPLIER: ${IMPORT_LENS_PERF_MULTIPLIER:-}
     volumes:
       - .:/workspace
       - /workspace/node_modules
+      - /workspace/.pnpm-store
