@@ -90,3 +90,17 @@ test("buildReportRows carries shared file bytes", () => {
 
   assert.equal(rows[0].sharedBytes, 25);
 });
+
+test("buildReportRows explains shared dependency bytes", () => {
+  const rows = buildReportRows([
+    {
+      ...item("tiny-lib", 100),
+      result: {
+        ...result("tiny-lib", 100),
+        shared_bytes: 25,
+      },
+    },
+  ]);
+
+  assert.match(rows[0].warning, /Shares 25 B with other imports/u);
+});

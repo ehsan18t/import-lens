@@ -72,17 +72,23 @@ const moduleBreakdownSummary = (result: ImportResult | undefined): string => {
 };
 
 const warningForItem = (item: WorkspaceReportItem): string => {
+  const warnings: string[] = [];
+
   if (item.warning) {
-    return item.warning;
+    warnings.push(item.warning);
   }
 
   if (item.result?.error) {
-    return item.result.error;
+    warnings.push(item.result.error);
+  }
+
+  if (item.result?.shared_bytes && item.result.shared_bytes > 0) {
+    warnings.push(`Shares ${item.result.shared_bytes} B with other imports in this file`);
   }
 
   if (item.result?.is_cjs || item.result?.side_effects || item.result?.truly_treeshakeable === false) {
-    return "Conservative estimate";
+    warnings.push("Conservative estimate");
   }
 
-  return "";
+  return warnings.join(" · ");
 };
