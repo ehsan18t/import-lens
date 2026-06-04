@@ -1,0 +1,79 @@
+import * as vscode from "vscode";
+import { getImportLensConfig } from "../config.js";
+import type { DaemonManager } from "../daemon/manager.js";
+import { resolveInstalledPackage } from "../imports/resolver.js";
+import type { DetectedImport } from "../imports/types.js";
+import { protocolVersion } from "../ipc/protocol.js";
+import type { ImportLensLogger } from "../logger.js";
+import { analysisRootForFile } from "../workspaceContext.js";
+
+export const showNamedExportCandidatesCommand = "importLens.showNamedExportCandidates";
+let namedExportRequestId = 0;
+
+export const showNamedExportCandidates = async (
+  daemon: DaemonManager,
+  logger: ImportLensLogger,
+  uri: vscode.Uri,
+  detected: DetectedImport,
+): Promise<void> => {
+  if (!getImportLensConfig().enabled) {
+    return;
+  }
+
+  const resolution = await resolveInstalledPackage(detected.specifier, uri.fsPath);
+  if (!resolution.ok) {
+    await vscode.window.showWarningMessage(`ImportLens could not resolve ${detected.specifier}.`);
+    return;
+  }
+
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+  const workspaceRoot = await analysisRootForFile(uri.fsPath, workspaceFolder?.uri.fsPath);
+
+  if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
+    await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
+    return;
+  }
+
+  const response = await daemon.enumerateExports({
+    type: "enumerate_exports",
+    version: protocolVersion,
+    request_id: ++namedExportRequestId,
+    workspace_root: workspaceRoot,
+    active_document_path: uri.fsPath,
+    specifier: detected.specifier,
+    package: resolution.packageName,
+    package_version: resolution.version,
+  });
+
+  if (!response || response.error) {
+    logger.warn(`Named export candidates unavailable for ${detected.specifier}: ${response?.error ?? "no daemon response"}`);
+    await vscode.window.showWarningMessage(`ImportLens could not enumerate exports for ${detected.specifier}.`);
+    return;
+  }
+
+  const exports = response.exports
+    .filter((exportedName) => exportedName !== "default")
+    .sort((left, right) => left.localeCompare(right));
+
+  if (exports.length === 0) {
+    await vscode.window.showInformationMessage(`ImportLens found no named exports for ${detected.specifier}.`);
+    return;
+  }
+
+  const selected = await vscode.window.showQuickPick(
+    exports.map((exportedName) => ({ label: exportedName })),
+    {
+      canPickMany: true,
+      title: `Named exports from ${detected.specifier}`,
+      placeHolder: "Select exports to copy as a named import",
+    },
+  );
+
+  if (!selected || selected.length === 0) {
+    return;
+  }
+
+  const names = selected.map((item) => item.label).sort((left, right) => left.localeCompare(right));
+  await vscode.env.clipboard.writeText(`import { ${names.join(", ")} } from '${detected.specifier}';`);
+  await vscode.window.showInformationMessage(`Copied named import for ${detected.specifier}.`);
+};

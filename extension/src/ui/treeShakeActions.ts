@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
 import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
+import { shouldOfferNamedExportCandidates } from "./namedExportCandidatePolicy.js";
+import { showNamedExportCandidatesCommand } from "./namedExportCandidates.js";
 import { treeShakeActionReason } from "./treeShakeActionReason.js";
 
 export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
@@ -22,10 +24,10 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
     return this.#store
       .get(document.uri)
       .filter((state) => stateOverlapsRange(state, range))
-      .flatMap((state) => this.actionsForState(state));
+      .flatMap((state) => this.actionsForState(document, state));
   }
 
-  private actionsForState(state: ImportAnalysisState): vscode.CodeAction[] {
+  private actionsForState(document: vscode.TextDocument, state: ImportAnalysisState): vscode.CodeAction[] {
     if (state.status !== "ready" || !state.result) {
       return [];
     }
@@ -55,7 +57,22 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
       arguments: [state.result],
     };
 
-    return [inspect, copy];
+    const actions = [inspect, copy];
+
+    if (shouldOfferNamedExportCandidates(state)) {
+      const namedExports = new vscode.CodeAction(
+        "Show ImportLens named export candidates",
+        vscode.CodeActionKind.QuickFix,
+      );
+      namedExports.command = {
+        command: showNamedExportCandidatesCommand,
+        title: "Show ImportLens named export candidates",
+        arguments: [document.uri, state.detected],
+      };
+      actions.push(namedExports);
+    }
+
+    return actions;
   }
 }
 

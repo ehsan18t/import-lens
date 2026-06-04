@@ -14,12 +14,13 @@ import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
+import { showNamedExportCandidates, showNamedExportCandidatesCommand } from "./ui/namedExportCandidates.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
 import { TreeShakeCodeActionProvider } from "./ui/treeShakeActions.js";
 import type { ImportResult } from "./ipc/protocol.js";
-import type { ImportRuntime } from "./imports/types.js";
+import type { DetectedImport, ImportRuntime } from "./imports/types.js";
 
 let daemon: DaemonManager | undefined;
 
@@ -101,6 +102,9 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       }
 
       await copyImportDiagnostics(result);
+    }),
+    vscode.commands.registerCommand(showNamedExportCandidatesCommand, async (uri: vscode.Uri, detected: DetectedImport) => {
+      await showNamedExportCandidates(daemon!, logger, uri, detected);
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration("importLens")) {
