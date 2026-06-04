@@ -43,7 +43,7 @@
 - Modify: `scripts/generate-daemon-hashes.mjs`
 - Modify: `extension/src/daemon/knownHashes.generated.ts`
 
-- [ ] **Step 1: Write failing script tests**
+- [x] **Step 1: Write failing script tests**
 
 Add tests that import the new helper and assert:
 
@@ -68,7 +68,7 @@ pnpm test:scripts -- scripts/daemon-hashes.test.mjs
 
 Expected before implementation: fails because `scripts/daemon-hashes.mjs` does not exist.
 
-- [ ] **Step 2: Implement the helper**
+- [x] **Step 2: Implement the helper**
 
 Implement arrow-function exports:
 
@@ -81,11 +81,11 @@ export const knownHashesSource = (hashes) => `export const knownDaemonHashes...`
 
 Use `targetInfo()` for binary names and SHA-256 over existing `bin/<target>/<binary>` files. Preserve unrelated existing entries when a selected-target run updates only one platform.
 
-- [ ] **Step 3: Keep the CLI thin**
+- [x] **Step 3: Keep the CLI thin**
 
 Change `generate-daemon-hashes.mjs` to read the existing generated file when present, call `updateKnownDaemonHashes()`, and write the returned source.
 
-- [ ] **Step 4: Verify and regenerate**
+- [x] **Step 4: Verify and regenerate**
 
 Run:
 
@@ -96,7 +96,7 @@ pnpm hash:daemon
 
 Expected: tests pass and `knownHashes.generated.ts` contains hashes for all locally present daemon binaries while keeping deterministic sorted keys.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add scripts/daemon-hashes.mjs scripts/daemon-hashes.test.mjs scripts/generate-daemon-hashes.mjs extension/src/daemon/knownHashes.generated.ts
