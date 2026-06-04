@@ -27,3 +27,9 @@ test("namedImportCompletionContext ignores positions outside named import braces
 
   assert.equal(namedImportCompletionContext(source, source.indexOf("console")), null);
 });
+
+test("namedImportCompletionContext ignores import-like text in comments", () => {
+  const source = `// import { alpha } from "tiny-lib";\nconst value = 1;`;
+
+  assert.equal(namedImportCompletionContext(source, source.indexOf("alpha")), null);
+});

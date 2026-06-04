@@ -1,39 +1,70 @@
+import {
+  ImportNameKind,
+  parseSync,
+  type ParserOptions,
+  type StaticImport,
+  type StaticImportEntry,
+} from "oxc-parser";
+
 export interface NamedImportCompletionContext {
   specifier: string;
   importedNames: string[];
 }
 
-const namedImportPattern =
-  /\bimport\s*\{(?<members>[\s\S]*?)\}\s*from\s*(?<quote>["'])(?<specifier>[^"']+)\k<quote>/gu;
+const parserOptions: ParserOptions & { recovery?: boolean } = {
+  sourceType: "module",
+  astType: "ts",
+  lang: "tsx",
+  range: false,
+  recovery: true,
+};
 
 export const namedImportCompletionContext = (
   source: string,
   offset: number,
 ): NamedImportCompletionContext | null => {
-  for (const match of source.matchAll(namedImportPattern)) {
-    const matchStart = match.index ?? 0;
-    const members = match.groups?.members ?? "";
-    const membersStart = matchStart + match[0].indexOf("{") + 1;
-    const membersEnd = membersStart + members.length;
+  const parsed = parseSync("import-lens-completion.tsx", source, parserOptions);
 
-    if (offset < membersStart || offset > membersEnd) {
+  for (const item of parsed.module.staticImports) {
+    const range = namedImportMemberRange(source, item);
+
+    if (!range || offset < range.start || offset > range.end) {
       continue;
     }
 
     return {
-      specifier: match.groups?.specifier ?? "",
-      importedNames: importedNamesFromMembers(members),
+      specifier: item.moduleRequest.value,
+      importedNames: importedNamesFromEntries(item.entries),
     };
   }
 
   return null;
 };
 
-const importedNamesFromMembers = (members: string): string[] =>
-  members
-    .split(",")
-    .map((member) => member.trim())
-    .filter(Boolean)
-    .map((member) => member.replace(/^type\s+/u, ""))
-    .map((member) => member.split(/\s+as\s+/iu)[0]?.trim() ?? "")
-    .filter(Boolean);
+const namedImportMemberRange = (
+  source: string,
+  item: StaticImport,
+): { start: number; end: number } | null => {
+  const statement = source.slice(item.start, item.end);
+  const openBrace = statement.indexOf("{");
+
+  if (openBrace === -1) {
+    return null;
+  }
+
+  const closeBrace = statement.indexOf("}", openBrace + 1);
+
+  if (closeBrace === -1) {
+    return null;
+  }
+
+  return {
+    start: item.start + openBrace + 1,
+    end: item.start + closeBrace,
+  };
+};
+
+const importedNamesFromEntries = (entries: StaticImportEntry[]): string[] =>
+  entries
+    .filter((entry) => entry.importName.kind === ImportNameKind.Name && entry.importName.name)
+    .map((entry) => entry.importName.name as string);
