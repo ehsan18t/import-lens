@@ -12,7 +12,7 @@ import {
 } from "../../src/report/workspaceScanner.js";
 
 test("workspace scanner uses supported source include and generated-folder exclude patterns", () => {
-  assert.equal(workspaceIncludePattern, "**/*.{js,jsx,ts,tsx,svelte,astro}");
+  assert.equal(workspaceIncludePattern, "**/*.{js,jsx,ts,tsx,mts,cts,svelte,astro}");
   assert.equal(workspaceExcludePattern, "**/{node_modules,dist,build,out,coverage}/**");
 });
 

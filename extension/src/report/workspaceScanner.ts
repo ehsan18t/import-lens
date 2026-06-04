@@ -7,7 +7,7 @@ import type { BatchRequest, BatchResponse, ImportRequest } from "../ipc/protocol
 import { protocolVersion } from "../ipc/protocol.js";
 import type { WorkspaceReportItem } from "./reportModel.js";
 
-export const workspaceIncludePattern = "**/*.{js,jsx,ts,tsx,svelte,astro}";
+export const workspaceIncludePattern = "**/*.{js,jsx,ts,tsx,mts,cts,svelte,astro}";
 export const workspaceExcludePattern = "**/{node_modules,dist,build,out,coverage}/**";
 const DEFAULT_BATCH_SIZE = 50;
 
