@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
+import { shouldShowCodeLens } from "./displayGuards.js";
 import { formatImportSize } from "./format.js";
 
 export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
@@ -18,7 +19,7 @@ export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vsco
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
     const config = getImportLensConfig();
 
-    if (config.display === "inlayHint" || !config.useCodeLens) {
+    if (!shouldShowCodeLens(config)) {
       return [];
     }
 

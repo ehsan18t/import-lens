@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
+import { shouldShowDecorations } from "./displayGuards.js";
 import { formatImportSize } from "./format.js";
 import { tooltipForMessage, tooltipForResult } from "./tooltip.js";
 
@@ -29,6 +30,12 @@ export class DecorationController implements vscode.Disposable {
     }
   }
 
+  refreshVisibleEditors(): void {
+    for (const editor of vscode.window.visibleTextEditors) {
+      this.refreshEditor(editor);
+    }
+  }
+
   refreshUri(uri: vscode.Uri): void {
     for (const editor of vscode.window.visibleTextEditors) {
       if (editor.document.uri.toString() === uri.toString()) {
@@ -40,7 +47,7 @@ export class DecorationController implements vscode.Disposable {
   refreshEditor(editor: vscode.TextEditor): void {
     const config = getImportLensConfig();
 
-    if (config.display === "inlayHint" || config.useCodeLens) {
+    if (!shouldShowDecorations(config)) {
       editor.setDecorations(this.#decoration, []);
       return;
     }

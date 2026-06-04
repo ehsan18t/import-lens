@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { AnalysisStore } from "./analysis/state.js";
+import { refreshVisibleImportLensDocuments } from "./configRefresh.js";
 import { getImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
 import { DocumentAnalysisController } from "./listener.js";
@@ -88,9 +89,17 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 
       const nextConfig = getImportLensConfig();
       logger.setLevel(nextConfig.logLevel);
-      decorations.refreshActiveEditor();
-      inlayHints.refresh();
-      codeLens.refresh();
+      refreshVisibleImportLensDocuments(
+        vscode.window.visibleTextEditors.map((editor) => editor.document),
+        nextConfig,
+        {
+          schedule: (document) => analysis.schedule(document),
+          clear: (uri) => store.clear(uri),
+          refreshDecorations: () => decorations.refreshVisibleEditors(),
+          refreshInlayHints: () => inlayHints.refresh(),
+          refreshCodeLens: () => codeLens.refresh(),
+        },
+      );
     }),
   );
 

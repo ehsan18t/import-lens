@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
+import { shouldShowInlayHints } from "./displayGuards.js";
 import { formatImportSize } from "./format.js";
 import { tooltipForResult } from "./tooltip.js";
 
@@ -19,7 +20,7 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
   provideInlayHints(document: vscode.TextDocument): vscode.InlayHint[] {
     const config = getImportLensConfig();
 
-    if (config.display !== "inlayHint") {
+    if (!shouldShowInlayHints(config)) {
       return [];
     }
 

@@ -1,9 +1,11 @@
 import * as vscode from "vscode";
+import { getImportLensConfig } from "../config.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import { namedImportCompletionContext } from "../imports/completionContext.js";
 import { resolveInstalledPackage } from "../imports/resolver.js";
 import type { DaemonManager } from "../daemon/manager.js";
 import { analysisRootForFile } from "../workspaceContext.js";
+import { shouldOfferImportCompletions } from "./displayGuards.js";
 
 export class ImportMemberCompletionProvider implements vscode.CompletionItemProvider {
   readonly #daemon: DaemonManager;
@@ -19,6 +21,10 @@ export class ImportMemberCompletionProvider implements vscode.CompletionItemProv
     token: vscode.CancellationToken,
   ): Promise<vscode.CompletionItem[] | undefined> {
     if (token.isCancellationRequested) {
+      return undefined;
+    }
+
+    if (!shouldOfferImportCompletions(getImportLensConfig())) {
       return undefined;
     }
 
