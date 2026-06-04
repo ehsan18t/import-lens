@@ -38,6 +38,11 @@
         "category": "ImportLens"
       },
       {
+        "command": "importLens.showCurrentFileSize",
+        "title": "ImportLens: Show Current File Size",
+        "category": "ImportLens"
+      },
+      {
         "command": "importLens.showReport",
         "title": "ImportLens: Show Report",
         "category": "ImportLens"
