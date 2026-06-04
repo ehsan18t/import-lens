@@ -48,7 +48,7 @@ Hover over the import statement and click **Copy diagnostics** to extract the de
 ## Requirements
 
 - VS Code version 1.100.0 or higher.
-- A local workspace with a populated `node_modules` directory.
+- A local workspace or loose file whose parent tree contains a populated `node_modules` directory.
 
 ---
 *Built with [OXC](https://oxc.rs/) for maximum performance.*

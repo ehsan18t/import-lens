@@ -23,8 +23,8 @@ class FakeTransport implements AnalysisTransport {
     return this.#state;
   }
 
-  async start(): Promise<DaemonState> {
-    this.calls.push("start");
+  async start(analysisRoot?: string): Promise<DaemonState> {
+    this.calls.push(analysisRoot ? `start:${analysisRoot}` : "start");
     this.#state = this.#startState;
     return this.#state;
   }
@@ -116,6 +116,14 @@ test("TransportCoordinator returns null when no transport is ready", async () =>
 
   assert.equal(await coordinator.start(), "unavailable");
   assert.equal(await coordinator.sendBatch(batch(1)), null);
+});
+
+test("TransportCoordinator passes analysis root to transport startup", async () => {
+  const ready = new FakeTransport("ready");
+  const coordinator = new TransportCoordinator([ready]);
+
+  assert.equal(await coordinator.start("/workspace/loose-app"), "ready");
+  assert.deepEqual(ready.calls, ["start:/workspace/loose-app"]);
 });
 
 test("TransportCoordinator shuts down all transports", async () => {

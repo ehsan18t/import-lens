@@ -10,6 +10,7 @@ import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import type { StatusBarController } from "./ui/statusbar.js";
 import { protocolVersion, type BatchResponse } from "./ipc/protocol.js";
+import { analysisRootForFile } from "./workspaceContext.js";
 
 export class DocumentAnalysisController implements vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -103,7 +104,10 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
 
-    if (this.#daemon.state !== "ready") {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+    const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
+
+    if (this.#daemon.state !== "ready" && await this.#daemon.start(workspaceRoot) !== "ready") {
       this.#store.set(document.uri, markLoadingStatesUnavailable(states, "Daemon unavailable"));
       return;
     }
@@ -114,9 +118,6 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#statusBar.setStatus("computing");
 
     try {
-      const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
-      const workspaceRoot = workspaceFolder?.uri.fsPath ?? document.uri.fsPath;
-
       const applyPartial = (partial: BatchResponse): void => {
         if (partial.request_id !== this.#latestRequestIds.get(documentKey) || !partial.indexes) {
           return;

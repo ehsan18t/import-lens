@@ -107,7 +107,7 @@ ImportLens is a standalone VS Code extension. It does not replace or wrap any ex
 
 Unlike existing calculators that spin up Node.js bundlers, ImportLens offloads all heavy computation to a decoupled Rust background process. This guarantees editor stability and minimal memory overhead inside the extension host. The daemon protocol is kept behind a transport boundary so a future WebAssembly worker can reuse it, but v1.0 ships native daemon binaries only.
 
-The extension introduces a background native process (the Rust daemon) which runs separately from the VS Code extension host. This separation is a deliberate design choice: the extension host is a shared Node.js process that also runs every other installed extension. Placing CPU-intensive work (parsing, tree-shaking, compression) inside the extension host would degrade the entire editor. The daemon runs in its own process with its own memory space, and a crash in the daemon does not affect VS Code.
+The extension introduces a background native process (the Rust daemon) which runs separately from the VS Code extension host. This separation is a deliberate design choice: the extension host is a shared Node.js process that also runs every other installed extension. Placing CPU-intensive work (parsing, tree-shaking, compression) inside the extension host would degrade the entire editor. The daemon runs in its own process with its own memory space, and a crash in the daemon does not affect VS Code. When a supported file is opened outside a VS Code workspace folder, the extension derives an analysis root by walking upward from the file to the nearest `package.json` or `node_modules` directory and still resolves packages from the active document path.
 
 ### 2.2 Product Functions
 
@@ -699,7 +699,7 @@ interface BatchRequest {
                                 // The daemon echoes this value in BatchResponse.
                                 // The extension host discards responses whose
                                 // request_id does not match the most recently sent value.
-  workspace_root: string;       // Absolute path to the active workspace root.
+  workspace_root: string;       // Absolute path to the active analysis root.
   active_document_path: string; // Absolute path to the file currently being edited.
                                 // oxc_resolver starts upward traversal from this path,
                                 // not from the workspace root, to correctly resolve
@@ -770,7 +770,7 @@ Sent by the extension host immediately after opening the socket connection. The 
 interface HelloMessage {
   type: "hello";
   version: number;              // Protocol version, currently 3
-  workspace_root: string;       // Absolute path to the workspace root
+  workspace_root: string;       // Absolute path to the active analysis root.
   storage_path: string;         // Absolute VS Code globalStoragePath for cache and lifecycle files
   enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
   log_level: "error" | "warn" | "info" | "debug";

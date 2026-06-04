@@ -51,14 +51,14 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#state;
   }
 
-  async start(): Promise<DaemonState> {
+  async start(analysisRoot?: string): Promise<DaemonState> {
     if (this.#isDisposed) return "unavailable";
     if (this.#state === "ready" && this.#process && this.#client) return "ready";
 
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const workspaceRoot = analysisRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
     if (!workspaceRoot) {
-      this.#logger.warn("No workspace folder is open; daemon unavailable.");
+      this.#logger.warn("No workspace or analysis root is available; daemon unavailable.");
       this.#state = "unavailable";
       return this.#state;
     }

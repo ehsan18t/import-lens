@@ -3,6 +3,7 @@ import { protocolVersion } from "../ipc/protocol.js";
 import { namedImportCompletionContext } from "../imports/completionContext.js";
 import { resolveInstalledPackage } from "../imports/resolver.js";
 import type { DaemonManager } from "../daemon/manager.js";
+import { analysisRootForFile } from "../workspaceContext.js";
 
 export class ImportMemberCompletionProvider implements vscode.CompletionItemProvider {
   readonly #daemon: DaemonManager;
@@ -17,7 +18,7 @@ export class ImportMemberCompletionProvider implements vscode.CompletionItemProv
     position: vscode.Position,
     token: vscode.CancellationToken,
   ): Promise<vscode.CompletionItem[] | undefined> {
-    if (this.#daemon.state !== "ready" || token.isCancellationRequested) {
+    if (token.isCancellationRequested) {
       return undefined;
     }
 
@@ -33,7 +34,13 @@ export class ImportMemberCompletionProvider implements vscode.CompletionItemProv
       return undefined;
     }
 
-    const workspaceRoot = vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath ?? document.uri.fsPath;
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+    const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
+
+    if (this.#daemon.state !== "ready" && await this.#daemon.start(workspaceRoot) !== "ready") {
+      return undefined;
+    }
+
     const response = await this.#daemon.enumerateExports({
       type: "enumerate_exports",
       version: protocolVersion,

@@ -11,7 +11,7 @@ export type DaemonState = "ready" | "unavailable";
 
 export interface AnalysisTransport {
   readonly state: DaemonState;
-  start(): Promise<DaemonState>;
+  start(analysisRoot?: string): Promise<DaemonState>;
   sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null>;
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null>;
   requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null>;
@@ -35,9 +35,9 @@ export class TransportCoordinator implements AnalysisTransport {
     return this.#state;
   }
 
-  async start(): Promise<DaemonState> {
+  async start(analysisRoot?: string): Promise<DaemonState> {
     for (const transport of this.#transports) {
-      const state = await transport.start();
+      const state = await transport.start(analysisRoot);
 
       if (state === "ready") {
         this.#activeTransport = transport;

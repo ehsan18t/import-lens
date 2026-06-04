@@ -24,8 +24,8 @@ export class DaemonManager implements vscode.Disposable {
     return this.#transport.state;
   }
 
-  start(): Promise<DaemonState> {
-    return this.#transport.start();
+  start(analysisRoot?: string): Promise<DaemonState> {
+    return this.#transport.start(analysisRoot);
   }
 
   sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null> {
