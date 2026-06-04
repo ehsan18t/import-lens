@@ -313,10 +313,15 @@ mod tests {
         collections::VecDeque,
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+
+    static NEXT_TEMP_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
     struct ResponseReader {
         decoder: FrameDecoder,
@@ -365,7 +370,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("import-lens-server-{suffix}"));
+        let id = NEXT_TEMP_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
+        let process_id = std::process::id();
+        let path =
+            std::env::temp_dir().join(format!("import-lens-server-{process_id}-{suffix}-{id}"));
         fs::create_dir_all(path.join("src")).expect("temp workspace should be created");
         path
     }
