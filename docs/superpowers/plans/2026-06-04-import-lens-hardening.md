@@ -190,7 +190,7 @@ git commit -m "feat: mark declaration-only packages as type-only"
 **Files:**
 - No planned production edits.
 
-- [ ] **Step 1: Run project checks**
+- [x] **Step 1: Run project checks**
 
 Run:
 
@@ -202,7 +202,7 @@ cargo test -p import-lens-daemon --test analyze declaration_only -- --nocapture
 pnpm test:ts
 ```
 
-- [ ] **Step 2: Package Windows x64 if daemon code changed**
+- [x] **Step 2: Package Windows x64 if daemon code changed**
 
 Run:
 
@@ -212,7 +212,7 @@ pnpm package:win32-x64
 
 Expected: Windows daemon rebuilds, hash refreshes, extension bundles, and VSIX size check passes.
 
-- [ ] **Step 3: Commit generated Windows packaging updates if any**
+- [x] **Step 3: Commit generated Windows packaging updates if any**
 
 If `knownHashes.generated.ts` changes after packaging, commit it with:
 
