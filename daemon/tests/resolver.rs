@@ -173,6 +173,34 @@ fn resolver_marks_commonjs_type_js_subpath_as_cjs() {
 }
 
 #[test]
+fn resolver_does_not_validate_root_entry_fields_for_resolved_subpath_imports() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "node_modules/subpath-pkg/package.json",
+        r#"{"version":"1.0.0","module":"missing-root-entry.js"}"#,
+    );
+    write_source(
+        &root,
+        "node_modules/subpath-pkg/subpath.js",
+        "export const target = 'subpath';",
+    );
+
+    let resolved = resolve_package_entry(
+        &root.join("src").join("app.ts"),
+        &request_for_specifier(
+            "subpath-pkg/subpath",
+            "subpath-pkg",
+            ImportRuntime::Component,
+        ),
+    )
+    .expect("valid subpath should not be rejected by broken root entry fields");
+
+    fs::remove_dir_all(root).expect("temp resolver workspace should be removed");
+    assert!(resolved.entry_path.ends_with("subpath.js"), "{resolved:?}");
+}
+
+#[test]
 fn resolver_keeps_mjs_and_module_type_entries_as_esm() {
     let root = temp_workspace();
     write_source(

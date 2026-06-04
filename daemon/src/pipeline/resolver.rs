@@ -53,7 +53,9 @@ pub fn resolve_package_entry(
     let (entry_path, is_cjs) = match resolution {
         Ok(resolved) => {
             let entry_path = resolved.entry_path;
-            validate_declared_entry_resolution(&manifest, request.runtime)?;
+            if subpath_for_request(request).is_none() {
+                validate_declared_entry_resolution(&manifest, request.runtime)?;
+            }
             let is_cjs = resolved_entry_is_commonjs(&manifest, &entry_path, resolved.is_cjs);
             (entry_path, is_cjs)
         }
