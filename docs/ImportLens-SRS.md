@@ -4,8 +4,8 @@
 
 | Field    | Value            |
 | -------- | ---------------- |
-| Version  | 1.6              |
-| Date     | 29 May 2026      |
+| Version  | 1.7              |
+| Date     | 4 June 2026      |
 | Status   | Draft            |
 | Audience | Engineering Team |
 
@@ -42,7 +42,7 @@ The primary audience is the engineering team responsible for building and mainta
 
 ### 1.2 Scope
 
-ImportLens analyses import statements in JavaScript and TypeScript files and shows, inline next to each import, the actual post-tree-shake, minified, and compressed byte size that the import would add to a production bundle. The extension does this without running the user's build system, without modifying any project files, and without blocking the editor.
+ImportLens analyses import statements in JavaScript and TypeScript files and shows, inline next to each import, the actual post-tree-shake, minified, and compressed byte size that the import would add to a production bundle. The extension also surfaces bundle-impact insights such as working-tree import deltas, shared dependency explanations, package history trends, and tree-shaking opportunity actions. The extension does this without running the user's build system, without modifying any project files, and without blocking the editor.
 
 The system performs real tree-shaking and minification inside a background Rust daemon process. Results are cached persistently so that repeat lookups are instant. The extension works for any project that uses npm packages, regardless of which bundler the project itself uses.
 
@@ -118,8 +118,11 @@ At a high level, ImportLens:
 3. Resolves the installed version of each package from the project's node_modules
 4. Sends a batched request to the background Rust daemon over a local socket
 5. Receives computed size data (raw, minified, and compressed) for each import
-6. Renders the size inline in the editor as end-of-line decorations or code lens annotations
-7. Caches all results so subsequent lookups are instantaneous
+6. Renders the size inline in the editor as inlay hints, end-of-line decorations, or code lens annotations
+7. Adds contextual insights such as Git working-tree deltas, per-import history trends, shared-byte explanations, and barrel re-export warnings
+8. Provides commands for current-file totals, bundle impact history, workspace reports, diagnostic copying, and cache clearing
+9. Provides CodeActions for non-tree-shakeable imports, including named-export candidate enumeration for namespace imports
+10. Caches all results so subsequent lookups are instantaneous
 
 ### 2.3 User Classes
 
@@ -236,6 +239,8 @@ On each daemon respawn, the extension host reads `<globalStoragePath>/importlens
 12. Results are written to `papaya` (memory) and `redb` (disk).
 13. The daemon serialises one full `BatchResponse` for protocol v1/full-batch requests, or writes indexed partial `BatchResponse` frames to the socket as individual imports finish followed by a final full response for protocol v2+ streaming requests.
 14. The extension host deserialises responses, discards stale `request_id` values, and updates decorations progressively without regressing newer results.
+15. When the final response for a document is current, the extension enriches ready states with extension-side insights: Git working-tree import deltas, per-import history trends, shared-module explanations, and barrel re-export warnings.
+16. The extension records bounded per-import and current-file history entries in VS Code global storage. History persistence failures are logged but must not mark an otherwise successful size result unavailable.
 
 ---
 
@@ -307,7 +312,10 @@ This section documents the key architectural decisions made before implementatio
 | Dynamic imports                     | `import('date-fns')`                          | Evaluate the full module entry size                                                                                                                                                                   |
 | Dynamic imports with named bindings | `const { format } = await import('date-fns')` | **v1.0 limitation:** Treated as full module entry size (same as bare `import('date-fns')`). Named bindings on dynamic imports require runtime analysis that is not feasible with static AST analysis. |
 | Re-exports                          | `export { format } from 'date-fns'`           | Treat equivalently to a named import of the same specifier                                                                                                                                            |
+| Star re-exports                     | `export * from 'lodash-es'`                   | Treat equivalently to a namespace import and mark the syntax as a barrel boundary for UI insight warnings                                                                                              |
 | Type-only imports                   | `import type { Foo } from 'bar'`              | Identify and immediately discard; zero runtime cost, must not be sent to daemon                                                                                                                       |
+
+The extension must retain the detected import syntax category (`static`, `reexport`, `star_reexport`, or `dynamic`) in its in-memory analysis state so UI features can distinguish normal namespace imports from barrel re-export boundaries without relying on daemon heuristics.
 
 **FR-002** (Critical) - The extension must skip relative imports (those beginning with `./` or `../`).
 
@@ -325,9 +333,13 @@ This section documents the key architectural decisions made before implementatio
 
 **FR-006b** (High) - The extension must support Astro documents by extracting imports from frontmatter and processed client `<script>` blocks. Frontmatter imports must be marked as `server` runtime; processed client script imports must be marked as `client` runtime. Inline Astro scripts with non-processed attributes such as `is:inline` must not be treated as bundled imports.
 
+**FR-006c** (High) - The extension must support local JS/TS files opened outside a VS Code workspace folder. For such loose files, the extension must derive an analysis root by walking upward from the file to the nearest `package.json` or `node_modules` directory and must start the daemon with that derived root. If neither exists, the file's containing directory is used as the fallback root. Loose-file support must use the active document path for package resolution and must not display daemon unavailable solely because no workspace folder exists.
+
 ### 5.2 Package Version Resolution
 
 **FR-007** (Critical) - Before sending a request to the daemon, the extension must resolve each package by reading `node_modules/<package>/package.json` and extracting the `version` field when it is present as a string. For scoped packages (e.g. `@babel/core`), the path is `node_modules/@<scope>/<name>/package.json`. The `<package>` identifier in all cache keys and IPC messages includes the full scope prefix when present. If the package directory exists but the manifest is malformed or lacks a string `version`, the extension must still send the package to the daemon using an unknown-version sentinel so the daemon can compute the approximate fallback described in Section 7.1.
+
+**FR-007a** (High) - The extension host package resolver must search upward from the active document path, not from the first workspace folder. This mirrors Node resolution in nested workspaces and loose-file windows before the daemon receives the request.
 
 **FR-008** (High) - The daemon resolver must start package discovery and module resolution from the `active_document_path` supplied in `BatchRequest`, not from the workspace root. Starting from the file being edited ensures that upward traversal through the directory tree matches Node's own resolution algorithm exactly. This is critical in multi-root VS Code windows, NPM Workspaces, Yarn Workspaces, and nested PNPM layouts where a package inside `packages/app-a/` may have its own `node_modules/` with a different version of a dependency than the root-level hoisted copy. The daemon must validate package identifiers before building filesystem paths and must reject identifiers containing traversal or platform path separators.
 
@@ -419,9 +431,17 @@ The virtual entry must never use `console.log` or any pattern that can be static
 - `verbose`: `1.5 kB br · 1.8 kB gz · 1.6 kB zstd · 5.3 kB min` (all three formats)
 - `inlayHint`: Uses the VS Code Inlay Hints API instead of end-of-line decorations. Displays the primary compression size as an inline hint after the import specifier. This mode integrates natively with VS Code's built-in inlay hint toggling and provides better performance than decoration-based rendering.
 
-**FR-031** (High) - When `side_effects: true` or `truly_treeshakeable: false`, the extension must display a warning indicator next to the size decoration indicating that the shown size may not reflect the actual shipped size.
+**FR-031** (High) - When `side_effects: true`, `is_cjs: true`, or `truly_treeshakeable: false`, the extension must display a warning indicator next to the size label indicating that the shown size may be conservative or approximate. The label must be applied consistently across inlay hints, end-of-line decorations, and CodeLens mode.
 
 **FR-031a** (Medium) - When an import is detected from Astro frontmatter, the extension must label the displayed size with `server` and include the runtime in the hover tooltip so users do not confuse server-only dependency cost with client bundle cost.
+
+**FR-031b** (Medium) - When the active file is tracked by Git and an import statement overlaps an added or modified line in the working-tree diff against `HEAD`, the extension must append a positive import-cost delta label based on the current import's Brotli bytes, for example `+2.1 kB br`. Deleted imports have no current editor range and are out of scope for inline labels.
+
+**FR-031c** (Medium) - The extension must persist a bounded per-import size history in VS Code global storage. When a current import result differs from the most recent stored entry for the same import identity, the hover tooltip must include a trend note showing the previous Brotli size, current Brotli size, and signed delta.
+
+**FR-031d** (Medium) - When multiple imports in the same file share module paths reported by `module_breakdown` and `shared_bytes`, the extension must add hover insight text naming up to three shared module basenames and the other specifiers that include them. If the daemon reports `shared_bytes` but the shared modules are outside the public top-module breakdown, the hover must still explain that shared bytes exist.
+
+**FR-031e** (Medium) - When the parser detects a star re-export (`export * from "package"`), the extension must surface a barrel-boundary insight. The inline label may append `barrel`, and the hover must explain that the broad re-export can prevent precise named-export tree-shaking.
 
 **FR-032** (High) - The extension must display a loading indicator next to imports that are currently being computed (cache miss in progress).
 
@@ -436,6 +456,14 @@ The virtual entry must never use `console.log` or any pattern that can be static
 **FR-036a** (Medium) - Report rows and hover tooltips must surface file-level sharing information when the daemon returns it. `ImportResult.module_breakdown` contains the top 10 module contributors for an import. `ImportResult.shared_bytes` contains the number of raw module bytes shared with at least one other import in the same file. The report must expose both the top contributors and shared-byte value without changing the inline decoration format.
 
 **FR-036b** (Medium) - The extension must provide named-import member completions for existing ESM import clauses. When the cursor is inside `import { ... } from "specifier"`, the completion provider must request `EnumerateExportsRequest` from the daemon and offer cached named exports from the resolved graph. Completion requests must be best-effort and must fail silently in degraded mode.
+
+**FR-036c** (Medium) - The extension must provide a command `ImportLens: Show Current File Size` that sends a `FileSizeRequest` for the active file's runtime package imports, receives a deduplicated file-level total, displays the selected compression summary, and records the measurement in bundle impact history. The command must work for supported loose files using the same analysis-root derivation as FR-006c.
+
+**FR-036d** (Medium) - The extension must provide a command `ImportLens: Show Bundle Impact History` that reads recent current-file measurements from VS Code global storage and displays them in a QuickPick with timestamp and file path details.
+
+**FR-036e** (Medium) - The extension must provide CodeActions for imports whose current result is CommonJS, side-effectful, or not truly tree-shakeable. These actions must allow users to inspect existing ImportLens details or copy diagnostics. They must not automatically rewrite user source.
+
+**FR-036f** (Medium) - For namespace imports whose result is not truly tree-shakeable, the extension must offer a CodeAction that enumerates named exports through `EnumerateExportsRequest`, lets the user select one or more export names, and copies a candidate named import statement to the clipboard. The action must not rewrite source automatically because namespace member usage requires semantic transformation outside the current static import-cost scope.
 
 ### 5.7 Configuration
 
@@ -467,7 +495,7 @@ If the daemon closes the IPC socket cleanly before the 5-second timeout elapses,
 
 **FR-039a** (Medium) - When `importLens.useCodeLens` is set to `true`, the extension must register a `CodeLensProvider` for the relevant language selectors and render one `CodeLens` per import line, positioned on the line above the import statement. The lens must display the primary compression size and, when clicked, open the full size breakdown in a hover-style `MarkdownString` notification. The `useCodeLens` setting is independent of `importLens.display`; if both `inlayHint` display mode and `useCodeLens` are active simultaneously, the `inlayHint` mode takes precedence and the `CodeLensProvider` must not be registered. The `CodeLens` approach is noted as less space-efficient than end-of-line decorations (see D-011) but is retained as an option for users who prefer it.
 
-**FR-039** (High) - When `importLens.display` is set to `inlayHint`, the extension must register an `InlayHintsProvider` with VS Code for the relevant language selectors. The provider must return one `InlayHint` per import line, positioned after the closing quote of the import specifier, with `kind` set to `undefined` (no `InlayHintKind`) and `paddingLeft` enabled so the hint does not visually run into the string literal. Import sizes are not parameters or types; using `InlayHintKind.Parameter` or `InlayHintKind.Type` would apply the wrong theme colours (`editorInlayHint.parameterForeground` or `editorInlayHint.typeForeground` respectively). An `undefined` kind falls through to the generic `editorInlayHint.foreground`/`editorInlayHint.background`, which theme authors expect for custom inlay hints. Each `InlayHint` must also set `tooltip` to a `MarkdownString` containing the full size breakdown (raw bytes, minified bytes, all three compressed sizes, `side_effects` status, and `is_cjs` indicator). When a size is unavailable, the tooltip must show a compact unavailable message and a trusted `Copy diagnostics` command link instead of rendering raw daemon logs inline.
+**FR-039** (High) - When `importLens.display` is set to `inlayHint`, the extension must register an `InlayHintsProvider` with VS Code for the relevant language selectors. The provider must return one `InlayHint` per import line, positioned after the closing quote of the import specifier, with `kind` set to `undefined` (no `InlayHintKind`) and `paddingLeft` enabled so the hint does not visually run into the string literal. Import sizes are not parameters or types; using `InlayHintKind.Parameter` or `InlayHintKind.Type` would apply the wrong theme colours (`editorInlayHint.parameterForeground` or `editorInlayHint.typeForeground` respectively). An `undefined` kind falls through to the generic `editorInlayHint.foreground`/`editorInlayHint.background`, which theme authors expect for custom inlay hints. Each `InlayHint` must also set `tooltip` to a `MarkdownString` containing the full size breakdown (raw bytes, minified bytes, all three compressed sizes, `side_effects` status, `is_cjs` indicator, runtime, and any analysis insights from FR-031b through FR-031e). When a size is unavailable, the tooltip must show a compact unavailable message and a trusted `Copy diagnostics` command link instead of rendering raw daemon logs inline.
 
 **FR-039b** (Medium) - The extension must include a note in its README and marketplace description that the default `importLens.display: "inlayHint"` mode is preferred for screen-reader accessibility. End-of-line decorations are not exposed to VS Code's accessibility APIs and are therefore invisible to screen readers. The `inlayHint` mode uses the VS Code Inlay Hints API, which is part of the document model and is screen-reader-accessible. The status bar item (FR-033) must always reflect the current operating tier regardless of display mode, as it is accessible to screen readers.
 
@@ -502,6 +530,9 @@ The system must handle all failure conditions gracefully. No error scenario may 
 | Daemon binary hash mismatch (NFR-014a)                    | Refuse to spawn the daemon. Log a security warning to the ImportLens output channel at `error` level. Enter degraded mode and display `ImportLens: Unavailable`. Do not show a user-facing error dialog. |
 | Daemon recycle loop detected (NFR-004b)                   | If more than 5 recycles occurred within any rolling 10-minute window (read from `importlens-recycles.json`), enter degraded mode, log a warning, and display `ImportLens: Unavailable`. Reset counter after a clean 30-minute session with no recycles. |
 | IPC socket path collision (multiple VS Code windows)      | Each window uses a unique socket path via `VSCODE_PID` or UUID at activation (NFR-014b). If the generated path already exists, generate a fresh UUID and retry once before entering degraded mode. |
+| Active file is not in a Git repository or Git diff fails  | Skip working-tree delta insights for that analysis cycle. Do not block import sizing, do not show a user-facing error, and do not require Git to be installed for normal size computation. |
+| VS Code globalState write fails for history               | Keep the current import size result visible, log a warning to the ImportLens output channel, and skip only the history/trend update. |
+| Named export candidate enumeration fails                  | Keep existing tree-shaking CodeActions available, log the daemon or resolution error, and show a compact warning only for the explicit user-triggered action. Do not rewrite source. |
 
 ---
 
@@ -580,6 +611,12 @@ The following criteria constitute the definition of done for the v1.0 release. A
 **AC-004 - Settings reactivity:** Changing the `importLens.compression` setting immediately updates all currently visible inline decorations to reflect the new format selection. No file change, save, or editor reload is required.
 
 **AC-005 - Memory stability:** A memory profile of the Node.js extension host process taken before and after 5 minutes of continuous rapid typing in a JS/TS file confirms that the extension host heap does not grow continuously. The heap must return to within 10% of its pre-typing baseline between typing bursts.
+
+**AC-006 - Loose-file support:** Opening a supported JS/TS file outside a VS Code workspace folder but inside a parent tree containing `package.json` or `node_modules` computes import sizes without showing daemon unavailable solely due to the missing workspace folder.
+
+**AC-007 - Insight surfacing:** In a Git-tracked file with a newly added package import, the inline label or hover shows the current import-cost delta. For an `export * from "package"` statement, the hover shows a barrel re-export warning. For two imports sharing at least one reported module path, the hover or report identifies shared dependency bytes.
+
+**AC-008 - Named export action safety:** For a namespace import whose result is not truly tree-shakeable, the lightbulb action can enumerate named exports and copy a candidate named import statement. The action must not rewrite the user's document automatically.
 
 ---
 
@@ -1105,7 +1142,18 @@ The `redb` database schema version is `3` and contains these tables:
 
 `size_cache` values persist an internal cache envelope containing the public `ImportResult`, analyzer version, package identity, dependency fingerprints, and full contribution list needed for accurate shared-byte accounting. The daemon normalizes `cache_hit` to `false` before writing and sets it to `true` when serving a memory or disk hit. `cache_recents` is updated on insert and through batched/debounced hit touches, and is used to select up to 20 recent entries for bounded startup preload and best-effort prewarm after hello.
 
-### 11.2 Configuration Storage
+### 11.2 Extension Global Storage
+
+The extension stores lightweight UI history in VS Code `globalState`. These records are separate from the daemon's `redb` cache and are not used for daemon cache identity or correctness.
+
+| Key                              | Value shape                         | Purpose                                                                                     |
+| -------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------- |
+| `importLens.bundleImpactHistory` | `BundleImpactHistoryItem[]`         | Recent current-file total measurements shown by `ImportLens: Show Bundle Impact History`    |
+| `importLens.importCostHistory`   | `ImportCostHistoryItem[]`           | Recent per-import measurements used to show trend notes in import hovers                    |
+
+`BundleImpactHistoryItem` stores timestamp, file path, raw/minified/gzip/brotli/zstd byte totals, and import count. `ImportCostHistoryItem` stores timestamp, specifier, import kind, sorted named exports, raw/minified/gzip/brotli/zstd byte values, and a stable identity composed from specifier, import kind, runtime, and named export list. Both histories are bounded and newest-first. Repeated per-import entries with unchanged byte values should not create duplicate consecutive history records.
+
+### 11.3 Configuration Storage
 
 User configuration is stored by VS Code in the user's `settings.json` and accessed via `workspace.getConfiguration('importLens')`. The daemon does not read VS Code settings directly; the extension host passes relevant configuration values and the VS Code `globalStoragePath` in the `HelloMessage` handshake at startup.
 
@@ -1208,8 +1256,17 @@ import-lens/
 │   │   ├── extension.ts               # activate() / deactivate(); sends Shutdown on deactivate
 │   │   ├── listener.ts                # onDidChangeTextDocument, debounce
 │   │   ├── languages.ts               # VS Code language selector and supported language ids
+│   │   ├── workspaceContext.ts        # workspace/loose-file analysis root derivation
+│   │   ├── configRefresh.ts           # visible-editor refresh on settings changes
+│   │   ├── watcherActions.ts          # node_modules invalidation batching and refresh hooks
 │   │   ├── analysis/
+│   │   │   ├── fileSize.ts            # current-file size summary formatting
+│   │   │   ├── freshness.ts           # request freshness tracking
+│   │   │   ├── gitDiff.ts             # working-tree changed-line extraction
+│   │   │   ├── history.ts             # bundle and per-import history globalState helpers
+│   │   │   ├── insights.ts            # extension-side analysis insight builder
 │   │   │   ├── request.ts             # DetectedImport to BatchRequest item mapping
+│   │   │   ├── status.ts              # loading/unavailable state helpers
 │   │   │   └── state.ts               # Per-document import analysis state
 │   │   ├── imports/
 │   │   │   ├── parser.ts              # oxc-parser (NAPI) import extraction via parseSync()
@@ -1224,7 +1281,12 @@ import-lens/
 │   │   │   └── codec.ts               # MessagePack encode/decode
 │   │   ├── daemon/
 │   │   │   ├── manager.ts             # daemon lifecycle and analysis transport coordination
+│   │   │   ├── nativeTransport.ts     # native daemon process transport
 │   │   │   ├── platform.ts            # platform target mapping
+│   │   │   ├── processLifecycle.ts    # startup/shutdown process cleanup helpers
+│   │   │   ├── recycleGuard.ts        # graceful recycle loop guard
+│   │   │   ├── restartPolicy.ts       # crash backoff policy
+│   │   │   ├── startRoot.ts           # daemon analysis root selection
 │   │   │   └── knownHashes.generated.ts # generated daemon binary hashes
 │   │   ├── prewarm/
 │   │   │   ├── packageJson.ts         # package.json open/save prewarm registration
@@ -1234,12 +1296,19 @@ import-lens/
 │   │   │   └── workspaceScanner.ts    # Workspace import scanner for report command
 │   │   ├── watcher.ts                 # vscode.workspace.createFileSystemWatcher; sends CacheInvalidate IPC messages
 │   │   ├── ui/
+│   │   │   ├── currentFileSize.ts     # current-file total and bundle impact history commands
 │   │   │   ├── decorations.ts         # End-of-line text decorations
 │   │   │   ├── inlayHints.ts          # InlayHintsProvider for inlayHint display mode
 │   │   │   ├── codelens.ts            # Code lens provider
 │   │   │   ├── completions.ts         # Named import member completion provider
+│   │   │   ├── displayGuards.ts       # display-mode enablement helpers
+│   │   │   ├── format.ts              # size and display label formatting
+│   │   │   ├── namedExportCandidatePolicy.ts # pure policy for named export CodeAction eligibility
+│   │   │   ├── namedExportCandidates.ts # named export candidate QuickPick command
 │   │   │   ├── statusbar.ts           # Status bar item
 │   │   │   ├── tooltip.ts             # Shared MarkdownString hover content
+│   │   │   ├── treeShakeActionReason.ts # pure tree-shaking action reason helper
+│   │   │   ├── treeShakeActions.ts    # CodeActions for tree-shaking diagnostics and candidates
 │   │   │   ├── diagnostics.ts         # Clipboard formatting for ImportResult diagnostics
 │   │   │   └── report.ts              # Show Report webview
 │   │   ├── logger.ts                  # OutputChannel-based diagnostic logger (FR-040)
@@ -1320,6 +1389,8 @@ import-lens/
 | D-012 | TypeScript 6.x over TypeScript 5.x                                                        | TS 6.0 is the current stable release (March 2026). It modernizes tsconfig defaults, requires explicit ambient type inclusion (`types: ["node", "vscode"]` for this extension), deprecates legacy patterns, and serves as the migration bridge to the native Go-based TS 7.0. Starting on TS 6 now avoids a painful double-migration later. | TypeScript 5.x (rejected: legacy defaults, will require migration to 6.x before 7.x anyway)                                                                         |
 | D-013 | `request_id` field in BatchRequest/BatchResponse for cancellation | Timing-based heuristics for discarding stale responses are fragile when two requests are fired within milliseconds of each other. An explicit monotonic ID makes the discard decision unambiguous at zero protocol cost. | Timing-only approach (rejected: race condition on fast edits); sequence number on daemon side only (rejected: daemon has no state to track which request is current) |
 | D-014 | `CacheInvalidateAll` as a distinct message type | Sending one `CacheInvalidate` per package when `node_modules` is deleted would produce hundreds of IPC messages in a large project. A single bulk message is more efficient and avoids buffer pressure on the socket. The 20-package threshold is a pragmatic cutoff; below it, per-package messages give the daemon more granular invalidation information. | Always use bulk (rejected: loses granularity for small changes); always use per-package (rejected: floods socket on full reinstall) |
+| D-015 | Extension-side insight enrichment over daemon protocol expansion | Git diff state, VS Code globalState history, and UI-only barrel warnings are editor-context features. Keeping them in the extension avoids changing the native protocol for data the daemon cannot independently know and keeps daemon cache identity stable. | Add fields to `ImportResult` for every insight (rejected: daemon lacks editor/Git context); compute all insights in the daemon (rejected: would require Git and VS Code storage access in Rust) |
+| D-016 | Clipboard named-import candidates over automatic namespace rewrites | Rewriting `import * as ns` safely requires semantic usage rewriting across the file, including property accesses and potential shadowing. The v1 feature enumerates exports and copies a candidate import while leaving code changes under user control. | Automatic rewrite CodeAction (rejected: unsafe without full semantic transform); no action (rejected: misses a high-value tree-shaking improvement path) |
 
 ---
 

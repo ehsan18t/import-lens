@@ -7,17 +7,19 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 ## Features
 
 - ⚡ **Instant Feedback:** See post-tree-shake, minified, and compressed (Gzip, Brotli, Zstd) sizes inline.
-- 🌳 **Real Tree-shaking:** Accurately calculates sizes for named, default, namespace, and dynamic imports.
-- 🦀 **Rust Daemon Engine:** Built on `oxc_parser`, `oxc_semantic`, and `oxc_minifier` for unparalleled speed.
-- 💾 **Persistent Caching:** Results are cached in-memory and to disk using a fast embedded database (`redb`), making repeat lookups instantaneous.
-- 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, Svelte (`<script>` blocks), and Astro (frontmatter and client scripts).
+- 🌳 **Real Tree-shaking:** Calculates sizes for named, default, namespace, dynamic imports, and package re-exports.
+- 🦀 **Rust Daemon Engine:** Built on `oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`, and parallel Rust compression.
+- 💾 **Persistent Caching:** Results are cached in-memory and to disk using `papaya` and `redb`, with startup prewarm for recent entries.
+- 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, `.mts`, `.cts`, Svelte (`<script>` blocks), and Astro (frontmatter and client scripts).
 - 🎨 **Flexible UI Options:** Displays sizes as accessible **Inlay Hints** (default), end-of-line decorations, or CodeLens annotations.
+- 📈 **Impact Insights:** Shows working-tree import cost deltas, per-import history trends, shared dependency explanations, and barrel re-export warnings.
+- 🛠️ **Import Actions:** Offers tree-shaking CodeActions, diagnostic copy actions, named export candidates for namespace imports, current-file totals, bundle history, and workspace reports.
 
 ## How It Works
 
 ImportLens analyzes your import statements and resolves the exact package version installed in your local `node_modules`. It then constructs a virtual module graph, tree-shakes dead code using custom reachability analysis, minifies the output, and compresses it in parallel (Gzip, Brotli, Zstd).
 
-All of this happens invisibly in a secure, self-contained background daemon, meaning your editor stays buttery smooth.
+All of this happens invisibly in a secure, self-contained background daemon, meaning your editor stays responsive. Results are keyed by the active document path, so nested workspaces, pnpm layouts, and loose files opened outside a VS Code workspace can still resolve from the nearest usable package tree.
 
 ## Supported Languages
 - JavaScript (`.js`, `.mjs`, `.cjs`)
@@ -27,6 +29,28 @@ All of this happens invisibly in a secure, self-contained background daemon, mea
 - Astro (`.astro`)
 
 > **Note:** Framework virtual modules and common app aliases (`astro:*`, `virtual:*`, `$app/*`, `$env/*`, `@/*`) are automatically ignored as they are not npm package dependencies.
+
+## Editor Insights
+
+ImportLens adds context next to size labels when the extra signal is useful:
+
+- **Working-tree deltas:** Imports added or modified in the current Git diff show their current added Brotli cost, for example `+2.1 kB br`.
+- **History trends:** Repeated measurements can show when an import became larger or smaller after dependency updates.
+- **Shared bytes:** When multiple imports in the same file include the same module path, hovers and reports explain the shared cost.
+- **Barrel re-exports:** `export * from "package"` is flagged because it keeps the package boundary broad and can prevent precise named-export tree-shaking.
+- **Tree-shaking actions:** For CommonJS, side-effectful, namespace, or otherwise non-tree-shakeable imports, lightbulb actions can inspect or copy diagnostics. Namespace imports can also enumerate named exports and copy a named import candidate.
+
+ImportLens does not rewrite source files automatically. Actions that suggest named imports copy a candidate import statement to the clipboard so you stay in control of usage changes.
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `ImportLens: Show Current File Size` | Calculates a deduplicated total for runtime package imports in the active file and records it in bundle impact history. |
+| `ImportLens: Show Bundle Impact History` | Shows recent current-file measurements from VS Code global storage. |
+| `ImportLens: Show Report` | Scans the workspace and opens a report of imports sorted by Brotli size. |
+| `ImportLens: Clear Cache` | Clears daemon memory and disk cache, then reanalyzes the active document. |
+| `ImportLens: Show Logs` | Opens the ImportLens output channel. |
 
 ## Configuration
 
@@ -38,12 +62,14 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 | `importLens.compression` | The primary compression size to display: `brotli` (default), `gzip`, `zstd`, or `all`. |
 | `importLens.enableDiskCache` | Enable persistent caching to disk (`true` by default). |
 | `importLens.useCodeLens` | Show sizes as a CodeLens above the import instead of inline (`false` by default). |
-| `importLens.showWarnings` | Show an indicator `(!)` when a package cannot be efficiently tree-shaken. |
+| `importLens.showWarnings` | Show warning suffixes such as `approximate` when a package cannot be efficiently tree-shaken. |
 
 ## Diagnostics & Troubleshooting
 
 If ImportLens cannot determine the size of a package, it will show an `unavailable` hint. 
 Hover over the import statement and click **Copy diagnostics** to extract the detailed, structured error context directly from the Rust daemon for easy debugging.
+
+CommonJS-only packages, packages with conservative `sideEffects` metadata, and imports that are not truly tree-shakeable are labeled so approximate results are visible without opening the output channel.
 
 ## Requirements
 
