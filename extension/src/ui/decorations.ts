@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { insightLabelSuffix } from "../analysis/insights.js";
 import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
 import { shouldShowDecorations } from "./displayGuards.js";
@@ -101,7 +102,7 @@ export class DecorationController implements vscode.Disposable {
 
     if (state.status === "ready" && state.result) {
       const config = getImportLensConfig();
-      return formatImportSize(state.result, config, state.detected.runtime);
+      return `${formatImportSize(state.result, config, state.detected.runtime)}${insightLabelSuffix(state.insights)}`;
     }
 
     return null;
@@ -117,7 +118,7 @@ export class DecorationController implements vscode.Disposable {
     }
 
     if (state.status === "ready" && state.result) {
-      return tooltipForResult(state.result, state.detected.runtime);
+      return tooltipForResult(state.result, state.detected.runtime, state.insights);
     }
 
     return undefined;

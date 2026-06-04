@@ -1,6 +1,7 @@
 import type { ImportKind } from "../ipc/protocol.js";
 
 export type ImportRuntime = "component" | "server" | "client";
+export type ImportSyntax = "static" | "reexport" | "star_reexport" | "dynamic";
 
 export interface SourcePosition {
   line: number;
@@ -17,6 +18,7 @@ export interface DetectedImport {
   packageName: string;
   named: string[];
   importKind: ImportKind;
+  syntax: ImportSyntax;
   runtime: ImportRuntime;
   line: number;
   quoteEnd: SourcePosition;

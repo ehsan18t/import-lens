@@ -39,6 +39,7 @@ const createDetectedImport = (
   region: ScriptRegion,
   specifier: string,
   importKind: DetectedImport["importKind"],
+  syntax: DetectedImport["syntax"],
   named: string[],
   start: number,
   end: number,
@@ -53,6 +54,7 @@ const createDetectedImport = (
     packageName: getPackageName(specifier),
     named: [...named].sort(),
     importKind,
+    syntax,
     runtime: region.runtime,
     line: positionAt(source, absoluteStart).line,
     quoteEnd: positionAt(source, absoluteQuoteEndOffset),
@@ -74,7 +76,7 @@ const importsFromStaticImport = (source: string, region: ScriptRegion, item: Sta
 
   if (entries.length === 0 && item.entries.length === 0) {
     return [
-      createDetectedImport(source, region, specifier, "namespace", [], item.start, item.end, item.moduleRequest.end),
+      createDetectedImport(source, region, specifier, "namespace", "static", [], item.start, item.end, item.moduleRequest.end),
     ];
   }
 
@@ -88,15 +90,15 @@ const importsFromStaticImport = (source: string, region: ScriptRegion, item: Sta
     .map((entry) => entry.importName.name as string);
 
   if (entries.some((entry) => entry.importName.kind === ImportNameKind.Default)) {
-    imports.push(createDetectedImport(source, region, specifier, "default", [], item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "default", "static", [], item.start, item.end, item.moduleRequest.end));
   }
 
   if (entries.some((entry) => entry.importName.kind === ImportNameKind.NamespaceObject)) {
-    imports.push(createDetectedImport(source, region, specifier, "namespace", [], item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "namespace", "static", [], item.start, item.end, item.moduleRequest.end));
   }
 
   if (named.length > 0) {
-    imports.push(createDetectedImport(source, region, specifier, "named", named, item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "named", "static", named, item.start, item.end, item.moduleRequest.end));
   }
 
   return imports;
@@ -118,11 +120,11 @@ const importsFromStaticExport = (source: string, region: ScriptRegion, item: Sta
     .map((entry) => entry.importName.name as string);
 
   if (item.entries.some((entry) => entry.importName.kind === ExportImportNameKind.All || entry.importName.kind === ExportImportNameKind.AllButDefault)) {
-    imports.push(createDetectedImport(source, region, specifier, "namespace", [], item.start, item.end, item.entries[0].moduleRequest!.end));
+    imports.push(createDetectedImport(source, region, specifier, "namespace", "star_reexport", [], item.start, item.end, item.entries[0].moduleRequest!.end));
   }
 
   if (named.length > 0) {
-    imports.push(createDetectedImport(source, region, specifier, "named", named, item.start, item.end, item.entries[0].moduleRequest!.end));
+    imports.push(createDetectedImport(source, region, specifier, "named", "reexport", named, item.start, item.end, item.entries[0].moduleRequest!.end));
   }
 
   return imports;
@@ -149,7 +151,7 @@ const importsFromRegion = (source: string, region: ScriptRegion): DetectedImport
     );
 
     if (specifier && isRuntimePackageSpecifier(specifier)) {
-      imports.push(createDetectedImport(source, region, specifier, "dynamic", [], item.start, item.end, item.moduleRequest.end));
+      imports.push(createDetectedImport(source, region, specifier, "dynamic", "dynamic", [], item.start, item.end, item.moduleRequest.end));
     }
   }
 

@@ -8,6 +8,7 @@ const detected: DetectedImport = {
   packageName: "date-fns",
   named: ["format"],
   importKind: "named",
+  syntax: "static",
   runtime: "component",
   line: 0,
   quoteEnd: { line: 0, character: 31 },

@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { ImportAnalysisInsight } from "../analysis/state.js";
 import type { ImportResult } from "../ipc/protocol.js";
 import type { ImportRuntime } from "../imports/types.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
@@ -13,6 +14,7 @@ const appendCopyDiagnosticsLink = (tooltip: vscode.MarkdownString, result: Impor
 export const tooltipForResult = (
   result: ImportResult,
   runtime: ImportRuntime = "component",
+  insights: readonly ImportAnalysisInsight[] = [],
 ): vscode.MarkdownString => {
   const tooltip = new vscode.MarkdownString(undefined, true);
   tooltip.appendMarkdown(`**${result.specifier}**\n\n`);
@@ -34,6 +36,12 @@ export const tooltipForResult = (
   tooltip.appendMarkdown(`Runtime: ${runtime}\n\n`);
   tooltip.appendMarkdown(`Side effects: ${result.side_effects ? "yes" : "no"}\n\n`);
   tooltip.appendMarkdown(`CJS: ${result.is_cjs ? "yes" : "no"}`);
+  if (insights.length > 0) {
+    tooltip.appendMarkdown("\n\n**Insights**\n\n");
+    for (const insight of insights) {
+      tooltip.appendMarkdown(`- ${insight.tooltip}\n`);
+    }
+  }
   return tooltip;
 };
 

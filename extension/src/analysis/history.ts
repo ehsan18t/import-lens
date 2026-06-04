@@ -1,7 +1,10 @@
 import path from "node:path";
+import type { DetectedImport } from "../imports/types.js";
+import type { ImportResult } from "../ipc/protocol.js";
 import { formatBytes } from "../ui/format.js";
 
 export const bundleImpactHistoryKey = "importLens.bundleImpactHistory";
+export const importCostHistoryKey = "importLens.importCostHistory";
 
 export interface BundleImpactHistoryItem {
   timestamp: number;
@@ -17,6 +20,19 @@ export interface BundleImpactHistoryItem {
 export interface BundleImpactHistoryStore {
   get<T>(key: string, defaultValue: T): T;
   update(key: string, value: unknown): Thenable<void> | Promise<void>;
+}
+
+export interface ImportCostHistoryItem {
+  identity: string;
+  timestamp: number;
+  specifier: string;
+  importKind: string;
+  named: string[];
+  rawBytes: number;
+  minifiedBytes: number;
+  gzipBytes: number;
+  brotliBytes: number;
+  zstdBytes: number;
 }
 
 export const recordBundleImpactHistory = async (
@@ -50,3 +66,68 @@ export const previousBundleImpactForFile = (
   fileName: string,
 ): BundleImpactHistoryItem | undefined =>
   history.find((item) => item.fileName === fileName);
+
+export const importCostHistoryIdentity = (detected: DetectedImport): string =>
+  [
+    detected.specifier,
+    detected.importKind,
+    detected.runtime,
+    detected.named.join(","),
+  ].join("\0");
+
+export const importCostHistoryItem = (
+  detected: DetectedImport,
+  result: ImportResult,
+  timestamp: number = Date.now(),
+): ImportCostHistoryItem => ({
+  identity: importCostHistoryIdentity(detected),
+  timestamp,
+  specifier: detected.specifier,
+  importKind: detected.importKind,
+  named: [...detected.named],
+  rawBytes: result.raw_bytes,
+  minifiedBytes: result.minified_bytes,
+  gzipBytes: result.gzip_bytes,
+  brotliBytes: result.brotli_bytes,
+  zstdBytes: result.zstd_bytes,
+});
+
+export const previousImportCostFor = (
+  history: readonly ImportCostHistoryItem[],
+  detected: DetectedImport,
+): ImportCostHistoryItem | undefined =>
+  history.find((item) => item.identity === importCostHistoryIdentity(detected));
+
+export const importCostHistoryDeltaLabel = (
+  current: ImportCostHistoryItem,
+  previous: ImportCostHistoryItem,
+): string => {
+  const delta = current.brotliBytes - previous.brotliBytes;
+  const sign = delta >= 0 ? "+" : "-";
+  return `${sign}${formatBytes(Math.abs(delta))}`;
+};
+
+export const recordImportCostHistory = async (
+  store: BundleImpactHistoryStore,
+  items: readonly ImportCostHistoryItem[],
+  limit = 200,
+): Promise<void> => {
+  const existing = store.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
+  const changedItems = items.filter((item) => {
+    const previous = existing.find((entry) => entry.identity === item.identity);
+    return !previous || !sameImportCost(item, previous);
+  });
+
+  if (changedItems.length === 0) {
+    return;
+  }
+
+  await store.update(importCostHistoryKey, [...changedItems, ...existing].slice(0, Math.max(1, limit)));
+};
+
+const sameImportCost = (left: ImportCostHistoryItem, right: ImportCostHistoryItem): boolean =>
+  left.rawBytes === right.rawBytes &&
+  left.minifiedBytes === right.minifiedBytes &&
+  left.gzipBytes === right.gzipBytes &&
+  left.brotliBytes === right.brotliBytes &&
+  left.zstdBytes === right.zstdBytes;

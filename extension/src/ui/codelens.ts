@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { insightLabelSuffix } from "../analysis/insights.js";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
 import { shouldShowCodeLens } from "./displayGuards.js";
@@ -32,7 +33,7 @@ export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vsco
         const result = state.result!;
 
         return new vscode.CodeLens(range, {
-          title: formatImportSize(result, config, state.detected.runtime),
+          title: `${formatImportSize(result, config, state.detected.runtime)}${insightLabelSuffix(state.insights)}`,
           command: "importLens.showImportDetails",
           arguments: [result, state.detected.runtime],
         });

@@ -9,6 +9,7 @@ const detected = (specifier: string): DetectedImport => ({
   packageName: specifier,
   named: [],
   importKind: "namespace",
+  syntax: "static",
   runtime: "component",
   line: 2,
   quoteEnd: { line: 2, character: 20 },

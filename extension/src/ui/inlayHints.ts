@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { insightLabelSuffix } from "../analysis/insights.js";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
 import { shouldShowInlayHints } from "./displayGuards.js";
@@ -38,8 +39,8 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
       } else if (state.status === "unavailable") {
         label = state.message ?? "Daemon unavailable";
       } else if (state.status === "ready" && state.result) {
-        label = formatImportSize(state.result, config, state.detected.runtime);
-        tooltip = tooltipForResult(state.result, state.detected.runtime);
+        label = `${formatImportSize(state.result, config, state.detected.runtime)}${insightLabelSuffix(state.insights)}`;
+        tooltip = tooltipForResult(state.result, state.detected.runtime, state.insights);
       }
 
       if (!label) {

@@ -10,6 +10,7 @@ const detected: DetectedImport = {
   packageName: "react",
   named: [],
   importKind: "default",
+  syntax: "static",
   runtime: "component",
   line: 0,
   quoteEnd: { line: 0, character: 26 },

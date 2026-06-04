@@ -1,5 +1,16 @@
 import * as vscode from "vscode";
 import { AnalysisFreshnessTracker } from "./analysis/freshness.js";
+import { changedLinesForFile } from "./analysis/gitDiff.js";
+import {
+  applyImportAnalysisInsights,
+  importCostHistoryItemsForStates,
+} from "./analysis/insights.js";
+import {
+  importCostHistoryKey,
+  recordImportCostHistory,
+  type BundleImpactHistoryStore,
+  type ImportCostHistoryItem,
+} from "./analysis/history.js";
 import { createImportRequest } from "./analysis/request.js";
 import { markLoadingStatesUnavailable } from "./analysis/status.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
@@ -16,6 +27,7 @@ import { analysisRootForFile } from "./workspaceContext.js";
 export class DocumentAnalysisController implements vscode.Disposable {
   readonly #store: AnalysisStore;
   readonly #daemon: DaemonManager;
+  readonly #historyStore: BundleImpactHistoryStore;
   readonly #logger: ImportLensLogger;
   readonly #statusBar: StatusBarController;
   readonly #timers = new Map<string, NodeJS.Timeout>();
@@ -30,6 +42,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
   ) {
     this.#store = store;
     this.#daemon = daemon;
+    this.#historyStore = context.globalState;
     this.#logger = logger;
     this.#statusBar = statusBar;
 
@@ -81,6 +94,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
     const states: ImportAnalysisState[] = [];
     const requestImports = [];
     const requestStateIndexes: number[] = [];
+    const changedLinesPromise = changedLinesForFile(document.fileName);
 
     for (const detected of imports) {
       const resolution = await resolveInstalledPackage(detected.specifier, document.fileName);
@@ -166,7 +180,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
       let responseIndex = 0;
 
-      const nextStates = states.map((state) => {
+      const responseStates = states.map((state) => {
         if (state.status === "missing") {
           return state;
         }
@@ -188,7 +202,18 @@ export class DocumentAnalysisController implements vscode.Disposable {
         };
       });
 
+      const history = this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
+      const nextStates = applyImportAnalysisInsights(responseStates, {
+        changedLines: await changedLinesPromise,
+        importCostHistory: history,
+      });
+
       this.#store.set(document.uri, nextStates);
+      try {
+        await recordImportCostHistory(this.#historyStore, importCostHistoryItemsForStates(responseStates));
+      } catch (error) {
+        this.#logger.warn(`Import history update failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
       this.#statusBar.setStatus("ready");
     } catch (error) {
       this.#logger.warn(`Analysis request failed: ${error instanceof Error ? error.message : String(error)}`);

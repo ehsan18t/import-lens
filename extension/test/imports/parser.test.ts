@@ -19,16 +19,30 @@ test("extractRuntimeImports handles static imports, re-exports, dynamic imports,
       specifier: item.specifier,
       kind: item.importKind,
       named: item.named,
+      syntax: item.syntax,
       line: item.line,
     })),
     [
-      { specifier: "react", kind: "default", named: [], line: 0 },
-      { specifier: "react", kind: "named", named: ["useMemo"], line: 0 },
-      { specifier: "date-fns", kind: "namespace", named: [], line: 2 },
-      { specifier: "zod", kind: "named", named: ["z"], line: 3 },
-      { specifier: "uuid", kind: "dynamic", named: [], line: 4 },
-      { specifier: "pkg", kind: "named", named: ["a", "b"], line: 5 },
+      { specifier: "react", kind: "default", named: [], syntax: "static", line: 0 },
+      { specifier: "react", kind: "named", named: ["useMemo"], syntax: "static", line: 0 },
+      { specifier: "date-fns", kind: "namespace", named: [], syntax: "static", line: 2 },
+      { specifier: "zod", kind: "named", named: ["z"], syntax: "reexport", line: 3 },
+      { specifier: "uuid", kind: "dynamic", named: [], syntax: "dynamic", line: 4 },
+      { specifier: "pkg", kind: "named", named: ["a", "b"], syntax: "reexport", line: 5 },
     ],
+  );
+});
+
+test("extractRuntimeImports marks star re-exports as barrel syntax", () => {
+  const imports = extractRuntimeImports("barrel.ts", "export * from 'lodash-es';");
+
+  assert.deepEqual(
+    imports.map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      syntax: item.syntax,
+    })),
+    [{ specifier: "lodash-es", kind: "namespace", syntax: "star_reexport" }],
   );
 });
 

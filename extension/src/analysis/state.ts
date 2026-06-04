@@ -4,11 +4,17 @@ import type { ImportResult } from "../ipc/protocol.js";
 
 export type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
 
+export interface ImportAnalysisInsight {
+  label?: string;
+  tooltip: string;
+}
+
 export interface ImportAnalysisState {
   detected: DetectedImport;
   status: ImportAnalysisStatus;
   result?: ImportResult;
   message?: string;
+  insights?: ImportAnalysisInsight[];
 }
 
 export class AnalysisStore implements vscode.Disposable {
