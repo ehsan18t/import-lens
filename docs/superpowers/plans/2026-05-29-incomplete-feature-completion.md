@@ -209,16 +209,17 @@ git commit -m "test: add real package size fixtures"
 Update `daemon/Cargo.toml`:
 
 ```toml
-oxc_allocator = "~0.133"
-oxc_ast = "~0.133"
-oxc_codegen = "~0.133"
-oxc_mangler = "~0.133"
-oxc_minifier = "~0.133"
-oxc_parser = "~0.133"
-oxc_resolver = "~11.19"
-oxc_semantic = "~0.133"
-oxc_span = "~0.133"
-oxc_transformer = "~0.133"
+oxc_allocator = "^0"
+oxc_ast = "^0"
+oxc_codegen = "^0"
+oxc_mangler = "^0"
+oxc_minifier = "^0"
+oxc_parser = "^0"
+oxc_resolver = "^11"
+oxc_semantic = "^0"
+oxc_span = "^0"
+oxc_syntax = "^0"
+oxc_transformer = "^0"
 ```
 
 - [ ] **Step 2: Export module boundaries**

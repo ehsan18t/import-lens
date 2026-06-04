@@ -12,7 +12,7 @@
 
 ## Verified Findings
 
-1. Docker build fails in the builder container when the Compose builder image uses a Rust toolchain older than the locked `redb 4.1.0` MSRV of Rust 1.89. `docker compose up --build` still exits 0 because the package script does not propagate the builder service exit code.
+1. Docker build can fail in the builder container when the Compose image uses a Rust toolchain older than the locked dependency MSRVs. The package script must propagate the builder service exit code, and the Docker builder must follow stable Rust instead of a fixed historical MSRV.
 2. Platform package scripts all run the host `cargo build --release`; cross-target packages can fail or copy the wrong binary. `scripts/copy-daemon.mjs` explicitly falls back to `target/release`, which makes this unsafe.
 3. `scripts/package-vsix.mjs` shells out to `npm install`, violating the repository rule to use pnpm and producing npm warnings.
 4. `extractRuntimeImports()` treats `import(name)` as a package named `name` because it trims quotes from every dynamic import argument without checking whether the argument is a literal.
@@ -148,9 +148,9 @@ Add `targets.mjs`, update `copy-daemon.mjs` to require `target/<rust-target>/rel
 
 Update `package-vsix.mjs` to use `pnpm install --prod --no-lockfile --config.node-linker=hoisted` inside staging and invoke `vsce` without `shell: true`.
 
-- [ ] **Step 5: Fix Docker and Rust MSRV**
+- [ ] **Step 5: Fix Docker toolchain policy**
 
-Set Rust MSRV to 1.89, use a matching Docker Rust image, run Docker packaging through target-aware scripts, and make Compose return the builder exit code.
+Use stable Rust in the Docker builder, resolve latest stable Zig and latest `cargo-zigbuild` for cross-target packaging, run Docker packaging through target-aware scripts, and make Compose return the builder exit code.
 
 - [ ] **Step 6: Verify script tests**
 

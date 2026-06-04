@@ -169,11 +169,12 @@
     "package:darwin-arm64:zig": "node scripts/package-target.mjs darwin-arm64 --zigbuild",
     "package:all:native": "pnpm package:win32-x64 && pnpm package:win32-arm64 && pnpm package:linux-x64 && pnpm package:linux-arm64 && pnpm package:darwin-x64 && pnpm package:darwin-arm64",
     "package:all:zig": "pnpm package:linux-x64:zig && pnpm package:linux-arm64:zig && pnpm package:darwin-x64:zig && pnpm package:darwin-arm64:zig",
-    "docker:build": "docker compose run --rm --build builder"
+    "docker:build": "docker compose run --rm --build builder",
+    "deps:update": "pnpm update --latest && cargo update"
   },
   "dependencies": {
     "@msgpack/msgpack": "3.1.3",
-    "oxc-parser": "^0.134.0"
+    "oxc-parser": "^0"
   },
   "devDependencies": {
     "@types/node": "22.15.3",

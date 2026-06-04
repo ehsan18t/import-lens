@@ -1,9 +1,9 @@
 FROM node:22-bookworm
 
-ARG RUST_VERSION=1.89.0
+ARG RUST_VERSION=stable
 ARG PNPM_VERSION=11.5.0
-ARG ZIG_VERSION=0.14.1
-ARG CARGO_ZIGBUILD_VERSION=0.22.3
+ARG ZIG_VERSION=latest
+ARG CARGO_ZIGBUILD_VERSION=latest
 
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
@@ -34,14 +34,22 @@ RUN rustup target add \
 RUN corepack enable \
   && corepack prepare pnpm@${PNPM_VERSION} --activate
 
-RUN curl --proto '=https' --tlsv1.2 -fsSL \
-    https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz \
-    -o /tmp/zig.tar.xz \
+RUN set -eux; \
+  zig_download_url="$(curl --proto '=https' --tlsv1.2 -fsSL https://ziglang.org/download/index.json \
+    | python3 -c 'import json, re, sys; data = json.load(sys.stdin); requested = sys.argv[1]; version = sorted([key for key in data if re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+", key)], key=lambda item: tuple(map(int, item.split("."))), reverse=True)[0] if requested == "latest" else requested; print(data[version]["x86_64-linux"]["tarball"])' "${ZIG_VERSION}")"; \
+  curl --proto '=https' --tlsv1.2 -fsSL "${zig_download_url}" -o /tmp/zig.tar.xz \
   && mkdir -p /opt/zig \
   && tar -xJf /tmp/zig.tar.xz --strip-components=1 -C /opt/zig \
-  && rm /tmp/zig.tar.xz
+  && ln -sf /opt/zig/zig /usr/local/bin/zig \
+  && rm /tmp/zig.tar.xz \
+  && zig version
 
-RUN cargo install cargo-zigbuild --version ${CARGO_ZIGBUILD_VERSION} --locked
+RUN set -eux; \
+  if [ "${CARGO_ZIGBUILD_VERSION}" = "latest" ]; then \
+    cargo install cargo-zigbuild --locked; \
+  else \
+    cargo install cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}" --locked; \
+  fi
 
 WORKDIR /workspace
 
