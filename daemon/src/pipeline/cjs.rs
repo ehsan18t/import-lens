@@ -136,8 +136,7 @@ fn literal_requires(source: &str, masked: &str, unsupported: &mut bool) -> Vec<S
     let mut specifiers = Vec::new();
     let mut index = 0;
 
-    while let Some(relative) = masked[index..].find("require") {
-        let start = index + relative;
+    while let Some(start) = find_ascii_token(bytes, b"require", index) {
         let end = start + "require".len();
         if !is_boundary(bytes, start, end) {
             index = end;
@@ -166,8 +165,7 @@ fn commonjs_exports(source: &str, masked: &str) -> Vec<String> {
     let mut exports = Vec::new();
     let mut index = 0;
 
-    while let Some(relative) = masked[index..].find("exports") {
-        let start = index + relative;
+    while let Some(start) = find_ascii_token(bytes, b"exports", index) {
         let end = start + "exports".len();
         if !is_identifier_boundary(bytes, start, end) {
             index = end;
@@ -399,6 +397,22 @@ fn skip_spaces(bytes: &[u8], mut index: usize) -> usize {
         index += 1;
     }
     index
+}
+
+fn find_ascii_token(bytes: &[u8], token: &[u8], mut index: usize) -> Option<usize> {
+    if token.is_empty() || token.len() > bytes.len() {
+        return None;
+    }
+
+    while index <= bytes.len() - token.len() {
+        if bytes[index] == token[0] && &bytes[index..index + token.len()] == token {
+            return Some(index);
+        }
+
+        index += 1;
+    }
+
+    None
 }
 
 fn read_identifier(bytes: &[u8], start: usize) -> Option<(String, usize)> {
