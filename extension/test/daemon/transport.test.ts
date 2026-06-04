@@ -88,6 +88,64 @@ class FakeTransport implements AnalysisTransport {
   }
 }
 
+class SlowReadyTransport implements AnalysisTransport {
+  readonly calls: string[] = [];
+  #state: DaemonState = "unavailable";
+  #releaseStart: (() => void) | undefined;
+  #startGate: Promise<void> | undefined;
+
+  get state(): DaemonState {
+    return this.#state;
+  }
+
+  async start(analysisRoot?: string): Promise<DaemonState> {
+    this.calls.push(analysisRoot ? `start:${analysisRoot}` : "start");
+    this.#startGate ??= new Promise((resolve) => {
+      this.#releaseStart = resolve;
+    });
+
+    await this.#startGate;
+    this.#state = "ready";
+    return this.#state;
+  }
+
+  releaseStart(): void {
+    this.#releaseStart?.();
+  }
+
+  async sendBatch(): Promise<BatchResponse | null> {
+    return null;
+  }
+
+  async enumerateExports(): Promise<EnumerateExportsResponse | null> {
+    return null;
+  }
+
+  async requestFileSize(): Promise<FileSizeResponse | null> {
+    return null;
+  }
+
+  invalidatePackage(): void {
+    return undefined;
+  }
+
+  invalidateAll(): void {
+    return undefined;
+  }
+
+  prewarmPackageJson(): void {
+    return undefined;
+  }
+
+  async shutdown(): Promise<void> {
+    this.#state = "unavailable";
+  }
+
+  dispose(): void {
+    return undefined;
+  }
+}
+
 test("TransportCoordinator selects the first ready transport and delegates requests", async () => {
   const unavailable = new FakeTransport("unavailable");
   const ready = new FakeTransport("ready");
@@ -124,6 +182,18 @@ test("TransportCoordinator passes analysis root to transport startup", async () 
 
   assert.equal(await coordinator.start("/workspace/loose-app"), "ready");
   assert.deepEqual(ready.calls, ["start:/workspace/loose-app"]);
+});
+
+test("TransportCoordinator coalesces concurrent startup attempts", async () => {
+  const ready = new SlowReadyTransport();
+  const coordinator = new TransportCoordinator([ready]);
+
+  const first = coordinator.start("/workspace/app");
+  const second = coordinator.start("/workspace/app");
+  ready.releaseStart();
+
+  assert.deepEqual(await Promise.all([first, second]), ["ready", "ready"]);
+  assert.deepEqual(ready.calls, ["start:/workspace/app"]);
 });
 
 test("TransportCoordinator shuts down all transports", async () => {

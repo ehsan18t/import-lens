@@ -25,6 +25,7 @@ export interface AnalysisTransport {
 export class TransportCoordinator implements AnalysisTransport {
   readonly #transports: readonly AnalysisTransport[];
   #activeTransport: AnalysisTransport | null = null;
+  #startPromise: Promise<DaemonState> | null = null;
   #state: DaemonState = "unavailable";
 
   constructor(transports: readonly AnalysisTransport[]) {
@@ -36,6 +37,22 @@ export class TransportCoordinator implements AnalysisTransport {
   }
 
   async start(analysisRoot?: string): Promise<DaemonState> {
+    if (this.#state === "ready" && this.#activeTransport?.state === "ready") {
+      return "ready";
+    }
+
+    if (this.#startPromise) {
+      return this.#startPromise;
+    }
+
+    this.#startPromise = this.#startTransports(analysisRoot).finally(() => {
+      this.#startPromise = null;
+    });
+
+    return this.#startPromise;
+  }
+
+  async #startTransports(analysisRoot?: string): Promise<DaemonState> {
     for (const transport of this.#transports) {
       const state = await transport.start(analysisRoot);
 
@@ -78,6 +95,7 @@ export class TransportCoordinator implements AnalysisTransport {
   async shutdown(): Promise<void> {
     await Promise.all(this.#transports.map((transport) => transport.shutdown()));
     this.#activeTransport = null;
+    this.#startPromise = null;
     this.#state = "unavailable";
   }
 
