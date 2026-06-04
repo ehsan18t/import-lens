@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { AnalysisStore } from "./analysis/state.js";
 import { refreshVisibleImportLensDocuments } from "./configRefresh.js";
-import { getImportLensConfig } from "./config.js";
+import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
 import { DocumentAnalysisController } from "./listener.js";
 import { languageSelector } from "./languages.js";
@@ -44,6 +44,20 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 
   const analysis = new DocumentAnalysisController(context, store, daemon, logger, statusBar);
   context.subscriptions.push(analysis);
+
+  const refreshVisibleDocuments = (nextConfig: ImportLensConfig): void => {
+    refreshVisibleImportLensDocuments(
+      vscode.window.visibleTextEditors.map((editor) => editor.document),
+      nextConfig,
+      {
+        schedule: (document) => analysis.schedule(document),
+        clear: (uri) => store.clear(uri),
+        refreshDecorations: () => decorations.refreshVisibleEditors(),
+        refreshInlayHints: () => inlayHints.refresh(),
+        refreshCodeLens: () => codeLens.refresh(),
+      },
+    );
+  };
 
   context.subscriptions.push(
     vscode.commands.registerCommand("importLens.showLogs", () => logger.show()),
@@ -89,21 +103,11 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 
       const nextConfig = getImportLensConfig();
       logger.setLevel(nextConfig.logLevel);
-      refreshVisibleImportLensDocuments(
-        vscode.window.visibleTextEditors.map((editor) => editor.document),
-        nextConfig,
-        {
-          schedule: (document) => analysis.schedule(document),
-          clear: (uri) => store.clear(uri),
-          refreshDecorations: () => decorations.refreshVisibleEditors(),
-          refreshInlayHints: () => inlayHints.refresh(),
-          refreshCodeLens: () => codeLens.refresh(),
-        },
-      );
+      refreshVisibleDocuments(nextConfig);
     }),
   );
 
-  registerNodeModulesWatchers(context, daemon);
+  registerNodeModulesWatchers(context, daemon, () => refreshVisibleDocuments(getImportLensConfig()));
   const state = await daemon.start();
   statusBar.setStatus(state === "ready" ? "ready" : "unavailable");
   registerPackageJsonPrewarm(context, daemon);

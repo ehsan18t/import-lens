@@ -2,23 +2,20 @@ import path from "node:path";
 import * as vscode from "vscode";
 import type { DaemonManager } from "./daemon/manager.js";
 import { getPackageName } from "./imports/specifier.js";
+import { flushNodeModulesInvalidations } from "./watcherActions.js";
 
-export const registerNodeModulesWatchers = (context: vscode.ExtensionContext, daemon: DaemonManager): void => {
+export const registerNodeModulesWatchers = (
+  context: vscode.ExtensionContext,
+  daemon: DaemonManager,
+  onInvalidated?: () => void,
+): void => {
   const pending = new Set<string>();
   let timer: NodeJS.Timeout | undefined;
 
   const flush = (): void => {
     const packages = [...pending];
     pending.clear();
-
-    if (packages.length > 20) {
-      daemon.invalidateAll();
-      return;
-    }
-
-    for (const packageName of packages) {
-      daemon.invalidatePackage(packageName);
-    }
+    flushNodeModulesInvalidations(packages, daemon, onInvalidated);
   };
 
   const queue = (uri: vscode.Uri): void => {
@@ -26,6 +23,7 @@ export const registerNodeModulesWatchers = (context: vscode.ExtensionContext, da
 
     if (!packageName) {
       daemon.invalidateAll();
+      onInvalidated?.();
       return;
     }
 
@@ -59,4 +57,3 @@ const packageNameFromPackageJsonPath = (packageJsonPath: string): string | null 
   const afterNodeModules = normalized.slice(index + marker.length).replace(/\/package\.json$/u, "");
   return getPackageName(afterNodeModules);
 };
-
