@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::{
     fs,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -319,4 +321,37 @@ fn graph_cache_returns_shared_graph_handle_without_deep_clone() {
     fs::remove_dir_all(root).expect("temp graph workspace should be removed");
     clear_module_graph_cache();
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn graph_cache_rebuilds_when_dependency_file_changes() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { value } from './dep.js';\nexport const answer = value;",
+    );
+    write_source(&root, "dep.js", "export const value = 'before';");
+    clear_module_graph_cache();
+
+    let first = build_module_graph_cached(&root.join("entry.js")).expect("graph should build");
+    thread::sleep(Duration::from_millis(2));
+    write_source(
+        &root,
+        "dep.js",
+        "export const value = 'after dependency change';",
+    );
+    let second = build_module_graph_cached(&root.join("entry.js"))
+        .expect("graph should rebuild after dependency changes");
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+    clear_module_graph_cache();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(
+        second
+            .modules
+            .iter()
+            .any(|module| module.source.contains("after dependency change")),
+        "{second:?}",
+    );
 }

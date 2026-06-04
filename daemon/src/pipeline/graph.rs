@@ -1,4 +1,5 @@
 use crate::{
+    cache::key::{FileFingerprint, fingerprints_are_current, fingerprints_for_paths},
     ipc::protocol::ImportRuntime,
     pipeline::resolver::{create_resolver, normalize_existing_path, resolve_module_path},
 };
@@ -22,12 +23,18 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-static GRAPH_CACHE: OnceLock<papaya::HashMap<(PathBuf, ImportRuntime), Arc<ModuleGraph>>> =
+static GRAPH_CACHE: OnceLock<papaya::HashMap<(PathBuf, ImportRuntime), CachedModuleGraph>> =
     OnceLock::new();
 
 pub const MAX_GRAPH_MODULES: usize = 2_000;
 pub const MAX_MODULE_SOURCE_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_GRAPH_SOURCE_BYTES: usize = 50 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct CachedModuleGraph {
+    graph: Arc<ModuleGraph>,
+    fingerprints: Vec<FileFingerprint>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphLimits {
@@ -194,12 +201,29 @@ pub fn build_module_graph_cached_with_runtime(
     let pinned = cache.pin();
     let cache_key = (entry_path.clone(), runtime);
     if let Some(graph) = pinned.get(&cache_key) {
-        return Ok(Arc::clone(graph));
+        if fingerprints_are_current(&graph.fingerprints) {
+            return Ok(Arc::clone(&graph.graph));
+        }
+
+        pinned.remove(&cache_key);
     }
 
     let graph = Arc::new(build_module_graph_with_runtime(&entry_path, runtime)?);
-    pinned.insert(cache_key, Arc::clone(&graph));
+    pinned.insert(
+        cache_key,
+        CachedModuleGraph {
+            fingerprints: module_graph_fingerprints(&entry_path, &graph),
+            graph: Arc::clone(&graph),
+        },
+    );
     Ok(graph)
+}
+
+fn module_graph_fingerprints(entry_path: &Path, graph: &ModuleGraph) -> Vec<FileFingerprint> {
+    let mut paths = Vec::with_capacity(graph.dependency_paths.len() + 1);
+    paths.push(entry_path.to_path_buf());
+    paths.extend(graph.dependency_paths.iter().cloned());
+    fingerprints_for_paths(paths)
 }
 
 pub fn invalidate_module_graph_cache_for_package(package_name: &str) {
