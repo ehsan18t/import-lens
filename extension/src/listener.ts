@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { AnalysisFreshnessTracker } from "./analysis/freshness.js";
 import { createImportRequest } from "./analysis/request.js";
 import { markLoadingStatesUnavailable } from "./analysis/status.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
@@ -18,8 +19,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
   readonly #logger: ImportLensLogger;
   readonly #statusBar: StatusBarController;
   readonly #timers = new Map<string, NodeJS.Timeout>();
-  readonly #latestRequestIds = new Map<string, number>();
-  #requestId = 0;
+  readonly #freshness = new AnalysisFreshnessTracker();
 
   constructor(
     context: vscode.ExtensionContext,
@@ -63,6 +63,8 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
   async analyze(document: vscode.TextDocument): Promise<void> {
     const config = getImportLensConfig();
+    const documentKey = document.uri.toString();
+    const requestId = this.#freshness.begin(documentKey);
 
     if (!config.enabled || !supportedLanguageIds.has(document.languageId)) {
       this.#store.clear(document.uri);
@@ -112,14 +114,11 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
 
-    const requestId = ++this.#requestId;
-    const documentKey = document.uri.toString();
-    this.#latestRequestIds.set(documentKey, requestId);
     this.#statusBar.setStatus("computing");
 
     try {
       const applyPartial = (partial: BatchResponse): void => {
-        if (partial.request_id !== this.#latestRequestIds.get(documentKey) || !partial.indexes) {
+        if (!this.#freshness.isCurrent(documentKey, partial.request_id) || !partial.indexes) {
           return;
         }
 
@@ -161,7 +160,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
         applyPartial,
       );
 
-      if (!response || response.request_id !== this.#latestRequestIds.get(documentKey)) {
+      if (!response || !this.#freshness.isCurrent(documentKey, response.request_id)) {
         return;
       }
 
@@ -207,7 +206,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       this.#timers.delete(key);
     }
 
-    this.#latestRequestIds.delete(key);
+    this.#freshness.forget(key);
     this.#store.clear(document.uri);
   }
 
@@ -217,6 +216,6 @@ export class DocumentAnalysisController implements vscode.Disposable {
     }
 
     this.#timers.clear();
-    this.#latestRequestIds.clear();
+    this.#freshness.clear();
   }
 }
