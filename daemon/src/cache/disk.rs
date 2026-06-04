@@ -328,6 +328,7 @@ impl DiskCache {
         }
 
         let db_path = storage_path.join(CACHE_DB_FILE_NAME);
+        let db_existed = db_path.exists();
         let db = match Database::create(&db_path) {
             Ok(db) => db,
             Err(error) => {
@@ -339,7 +340,7 @@ impl DiskCache {
             }
         };
 
-        match Self::ensure_schema(&db) {
+        match Self::ensure_schema(&db, !db_existed) {
             Ok(()) => Some(db),
             Err(error) => {
                 cache_warn(format!(
@@ -374,7 +375,7 @@ impl DiskCache {
             }
         };
 
-        if let Err(error) = Self::ensure_schema(&db) {
+        if let Err(error) = Self::ensure_schema(&db, true) {
             cache_warn(format!(
                 "failed to initialize cache database {}: {error}",
                 db_path.display()
@@ -385,7 +386,7 @@ impl DiskCache {
         Some(db)
     }
 
-    fn ensure_schema(db: &Database) -> Result<(), String> {
+    fn ensure_schema(db: &Database, initialize_missing_schema: bool) -> Result<(), String> {
         let write_txn = db
             .begin_write()
             .map_err(|error| format!("failed to begin schema transaction: {error}"))?;
@@ -401,12 +402,13 @@ impl DiskCache {
 
             match current {
                 Some(value) => value,
-                None => {
+                None if initialize_missing_schema => {
                     metadata
                         .insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION)
                         .map_err(|error| format!("failed to write schema version: {error}"))?;
                     CURRENT_SCHEMA_VERSION
                 }
+                None => return Err("schema version is missing".to_owned()),
             }
         };
 

@@ -109,6 +109,38 @@ fn write_database_with_schema(storage_path: &Path, schema_version: u64) {
     write_txn.commit().expect("database should commit");
 }
 
+fn write_database_without_schema_version(storage_path: &Path) {
+    let db = Database::create(db_path(storage_path)).expect("cache database should be created");
+    let write_txn = db.begin_write().expect("write transaction should begin");
+
+    {
+        write_txn
+            .open_table(METADATA_TABLE)
+            .expect("metadata table should open");
+    }
+
+    {
+        let bytes = rmp_serde::to_vec(&result("react")).expect("result should serialize");
+        let mut cache = write_txn
+            .open_table(CACHE_TABLE)
+            .expect("cache table should open");
+        cache
+            .insert("react@18.3.1::default", bytes.as_slice())
+            .expect("cache entry should be written");
+    }
+
+    {
+        let mut recents = write_txn
+            .open_table(RECENTS_TABLE)
+            .expect("recents table should open");
+        recents
+            .insert("react@18.3.1::default", 1)
+            .expect("recent entry should be written");
+    }
+
+    write_txn.commit().expect("database should commit");
+}
+
 fn write_corrupt_cache_entry(storage_path: &Path, key: &str) {
     let db = Database::create(db_path(storage_path)).expect("cache database should be created");
     let write_txn = db.begin_write().expect("write transaction should begin");
@@ -273,6 +305,22 @@ fn disk_cache_skips_corrupt_entries_without_poisoning_memory() {
 fn disk_cache_recreates_database_when_schema_mismatches() {
     let storage_path = temp_storage();
     write_database_with_schema(&storage_path, 999);
+
+    let cache = ImportCache::new(Some(storage_path.clone()), true);
+
+    assert_eq!(cache.memory_len(), 0);
+    assert!(cache.get("react@18.3.1::default").is_none());
+    drop(cache);
+
+    assert_eq!(read_schema_version(&storage_path), CURRENT_SCHEMA_VERSION);
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
+fn disk_cache_recreates_existing_database_when_schema_version_is_missing() {
+    let storage_path = temp_storage();
+    write_database_without_schema_version(&storage_path);
 
     let cache = ImportCache::new(Some(storage_path.clone()), true);
 
