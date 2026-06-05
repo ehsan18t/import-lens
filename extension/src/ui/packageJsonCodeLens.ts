@@ -1,7 +1,7 @@
 import path from "node:path";
 import * as vscode from "vscode";
 import { packageJsonDependencyEntries, type PackageJsonDependencyEntry } from "../guidance/packageJsonDependencies.js";
-import { registryHintForPackage } from "../guidance/registryHints.js";
+import { getCachedRegistryHint, fetchRegistryHint } from "../guidance/registryHints.js";
 import type { DaemonManager } from "../daemon/manager.js";
 import { resolveInstalledPackage } from "../imports/resolver.js";
 import { protocolVersion, type ImportRequest, type ImportResult } from "../ipc/protocol.js";
@@ -60,9 +60,17 @@ export class PackageJsonDependencyCodeLensProvider implements vscode.CodeLensPro
 
     return Promise.all(entries.map(async (entry) => {
       const result = resultByEntry.get(entry);
-      const registryHint = config.enableRegistryHints
-        ? await registryHintForPackage(this.#context, entry.name)
-        : null;
+      let registryHint = null;
+      if (config.enableRegistryHints) {
+        registryHint = getCachedRegistryHint(this.#context, entry.name);
+        if (!registryHint) {
+          fetchRegistryHint(this.#context, entry.name).then((hint) => {
+            if (hint) {
+              this.refresh();
+            }
+          });
+        }
+      }
 
       let suffix = "";
       if (registryHint) {
