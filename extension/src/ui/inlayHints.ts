@@ -28,29 +28,36 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
     const hints: vscode.InlayHint[] = [];
 
     for (const state of this.#store.get(document.uri)) {
-      const position = new vscode.Position(state.detected.quoteEnd.line, state.detected.quoteEnd.character);
-      let label: string | undefined;
-      let tooltip: vscode.MarkdownString | undefined;
+      const position = new vscode.Position(state.detected.statementRange.end.line, state.detected.statementRange.end.character);
+      let labelString: string | undefined;
 
       if (state.status === "loading") {
-        label = "…";
+        labelString = "…";
       } else if (state.status === "missing") {
-        label = state.message ?? "Package not found";
+        labelString = state.message ?? "Package not found";
       } else if (state.status === "unavailable") {
-        label = state.message ?? "Daemon unavailable";
+        labelString = state.message ?? "Daemon unavailable";
       } else if (state.status === "ready" && state.result) {
-        label = `${formatImportSize(state.result, config, state.detected.runtime)}${insightLabelSuffix(state.insights)}`;
+        labelString = `${formatImportSize(state.result, config, state.detected.runtime)}${insightLabelSuffix(state.insights)}`;
       }
 
-      tooltip = tooltipForAnalysisState(state);
-
-      if (!label) {
+      if (!labelString) {
         continue;
       }
 
-      const hint = new vscode.InlayHint(position, label, undefined);
+      const labelPart = new vscode.InlayHintLabelPart(labelString);
+      labelPart.tooltip = tooltipForAnalysisState(state);
+
+      if (state.status === "ready" && state.result) {
+        labelPart.command = {
+          title: "Show Import Details",
+          command: "importLens.showImportDetails",
+          arguments: [state.result, state.detected.runtime],
+        };
+      }
+
+      const hint = new vscode.InlayHint(position, [labelPart], undefined);
       hint.paddingLeft = true;
-      hint.tooltip = tooltip;
       hints.push(hint);
     }
 

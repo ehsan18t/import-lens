@@ -20,4 +20,4 @@ export const stateForHoverPosition = (
   states: readonly ImportAnalysisState[],
   position: SourcePosition,
 ): ImportAnalysisState | undefined =>
-  states.find((state) => sourceRangeContainsPosition(state.detected.statementRange, position));
+  states.find((state) => sourceRangeContainsPosition(state.detected.specifierRange, position));

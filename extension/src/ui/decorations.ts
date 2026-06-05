@@ -100,9 +100,9 @@ export class DecorationController implements vscode.Disposable {
     config: ImportLensConfig,
   ): vscode.Position {
     if (config.display === "inlayHint") {
-      const lineNumber = Math.min(state.detected.quoteEnd.line, document.lineCount - 1);
+      const lineNumber = Math.min(state.detected.statementRange.end.line, document.lineCount - 1);
       const line = document.lineAt(lineNumber);
-      return new vscode.Position(lineNumber, Math.min(state.detected.quoteEnd.character, line.text.length));
+      return new vscode.Position(lineNumber, Math.min(state.detected.statementRange.end.character, line.text.length));
     }
 
     const line = document.lineAt(Math.min(state.detected.line, document.lineCount - 1));

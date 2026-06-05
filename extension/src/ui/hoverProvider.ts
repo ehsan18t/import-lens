@@ -43,6 +43,6 @@ export class ImportLensHoverProvider implements vscode.HoverProvider {
       return undefined;
     }
 
-    return new vscode.Hover(tooltip, vscodeRangeFromSourceRange(state.detected.statementRange));
+    return new vscode.Hover(tooltip, vscodeRangeFromSourceRange(state.detected.specifierRange));
   }
 }
