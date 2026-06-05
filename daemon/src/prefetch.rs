@@ -103,6 +103,12 @@ impl Prefetcher {
     }
 }
 
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 pub fn package_json_dependency_names(contents: &str) -> Result<Vec<String>, String> {
     let json = serde_json::from_str::<Value>(contents)
         .map_err(|error| format!("failed to parse package.json: {error}"))?;
@@ -310,4 +316,24 @@ fn prewarm_thread_count() -> usize {
     std::thread::available_parallelism()
         .map(|value| (value.get() / 2).max(1))
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefetcher_drop_cancels_current_generation() {
+        let cancellation = Arc::new(CancellationToken::default());
+        let generation = cancellation.next_generation();
+        let prefetcher = Prefetcher {
+            cancellation: Arc::clone(&cancellation),
+        };
+
+        assert!(cancellation.is_current(generation));
+
+        drop(prefetcher);
+
+        assert!(!cancellation.is_current(generation));
+    }
 }

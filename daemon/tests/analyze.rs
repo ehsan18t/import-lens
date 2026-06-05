@@ -5,7 +5,6 @@ use import_lens_daemon::pipeline::analyze::{AnalysisContext, analyze_import};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Once,
 };
 
 mod common;
@@ -32,31 +31,8 @@ fn write_package_file(workspace: &Path, package_name: &str, relative_path: &str,
     fs::write(path, source).expect("fixture file should be written");
 }
 
-static FIXTURES_EXTRACTED: Once = Once::new();
-
-fn extract_fixture_archives() {
-    let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures");
-
-    let archive = fixtures_dir.join("packages.zip");
-    let target = fixtures_dir.join("packages");
-
-    if archive.exists() && !target.exists() {
-        let file = fs::File::open(&archive).expect("fixture archive should be readable");
-        let mut zip = zip::ZipArchive::new(file).expect("fixture archive should be a valid zip");
-        zip.extract(&target)
-            .expect("fixture archive should extract successfully");
-    }
-}
-
 fn fixture_workspace(name: &str) -> PathBuf {
-    FIXTURES_EXTRACTED.call_once(extract_fixture_archives);
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("packages")
-        .join(name)
+    common::fixture_workspace(name)
 }
 
 fn import_request(

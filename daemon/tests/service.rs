@@ -3,12 +3,13 @@ use import_lens_daemon::{
         BatchRequest, EnumerateExportsRequest, FileSizeRequest, ImportKind, ImportRequest,
         ImportRuntime, PROTOCOL_VERSION,
     },
+    pipeline::graph::{build_module_graph_cached, clear_module_graph_cache},
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
 };
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 mod common;
@@ -542,6 +543,38 @@ fn service_cache_invalidation_removes_matching_package_entries() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!after_invalidate.imports[0].cache_hit);
+}
+
+#[test]
+fn service_cache_miss_preserves_existing_module_graph_cache() {
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("graph-cache-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(package_root.join("index.js"), "export const value = 1;")
+        .expect("entry should be written");
+    let entry_path = workspace
+        .join("node_modules")
+        .join("graph-cache-lib")
+        .join("index.js");
+    clear_module_graph_cache();
+    let cached_before = build_module_graph_cached(&entry_path).expect("graph should build");
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_batch(package_batch(&workspace, 3, "graph-cache-lib", "value"));
+    let cached_after = build_module_graph_cached(&entry_path).expect("graph should stay cached");
+
+    clear_module_graph_cache();
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.imports[0].error, None);
+    assert!(
+        Arc::ptr_eq(&cached_before, &cached_after),
+        "service cache misses should reuse valid module graph cache entries",
+    );
 }
 
 #[test]

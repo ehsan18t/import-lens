@@ -8,12 +8,10 @@ use std::{
     time::Instant,
 };
 
+mod common;
+
 fn fixture_workspace(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("packages")
-        .join(name)
+    common::fixture_workspace(name)
 }
 
 fn threshold_ms(base_ms: u128) -> u128 {

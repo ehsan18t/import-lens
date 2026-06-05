@@ -305,7 +305,6 @@ impl ImportLensService {
             return result;
         }
 
-        invalidate_module_graph_cache_for_package(&request.package_name);
         let result = analyze_resolved_import(context, request, resolved.clone());
 
         if should_cache_result(&result) {
