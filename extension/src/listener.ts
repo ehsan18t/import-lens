@@ -12,6 +12,7 @@ import {
   type ImportCostHistoryItem,
 } from "./analysis/history.js";
 import { createImportRequest } from "./analysis/request.js";
+import { ImportResultLogTracker } from "./analysis/resultLogging.js";
 import { markLoadingStatesUnavailable } from "./analysis/status.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
@@ -131,6 +132,8 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#statusBar.setStatus("computing");
 
     try {
+      const resultLogger = new ImportResultLogTracker(this.#logger);
+
       const applyPartial = (partial: BatchResponse): void => {
         if (!this.#freshness.isCurrent(documentKey, partial.request_id) || !partial.indexes) {
           return;
@@ -147,9 +150,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
             return;
           }
 
-          if (result.error) {
-            this.#logger.warn(`${result.specifier}: ${result.error}`);
-          }
+          resultLogger.logResult(result);
 
           nextStates[stateIndex] = {
             detected: state.detected,
@@ -187,13 +188,23 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
         const result = response.imports[responseIndex++];
 
-        if (!result || result.specifier !== state.detected.specifier) {
+        if (!result) {
+          resultLogger.logMissingResult(
+            state.detected.specifier,
+            "daemon response did not include a matching result",
+          );
           return state;
         }
 
-        if (result.error) {
-          this.#logger.warn(`${result.specifier}: ${result.error}`);
+        if (result.specifier !== state.detected.specifier) {
+          resultLogger.logMissingResult(
+            state.detected.specifier,
+            `daemon response returned ${result.specifier} instead`,
+          );
+          return state;
         }
+
+        resultLogger.logResult(result);
 
         return {
           detected: state.detected,
