@@ -7,13 +7,15 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 ## Features
 
 - ⚡ **Instant Feedback:** See post-tree-shake, minified, and compressed (Gzip, Brotli, Zstd) sizes inline.
-- 🌳 **Real Tree-shaking:** Calculates sizes for named, default, namespace, dynamic imports, and package re-exports.
+- 🌳 **Real Tree-shaking:** Calculates sizes for named, default, namespace, dynamic imports, re-exports, and named export candidates.
 - 🦀 **Rust Daemon Engine:** Built on `oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`, and parallel Rust compression.
 - 💾 **Persistent Caching:** Results are cached in-memory and to disk using `papaya` and `redb`, with startup prewarm for recent entries.
 - 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, `.mts`, `.cts`, Svelte (`<script>` blocks), and Astro (frontmatter and client scripts).
 - 🎨 **Flexible UI Options:** Displays sizes as accessible **Inlay Hints** (default), end-of-line decorations, or CodeLens annotations.
-- 📈 **Impact Insights:** Shows working-tree import cost deltas, per-import history trends, shared dependency explanations, and barrel re-export warnings.
-- 🛠️ **Import Actions:** Offers tree-shaking CodeActions, diagnostic copy actions, named export candidates for namespace imports, current-file totals, bundle history, and workspace reports.
+- 📈 **Impact Insights:** Shows confidence levels, working-tree import cost deltas, per-import history trends, current-file totals, shared dependency explanations, and barrel re-export warnings.
+- 🛠️ **Import Actions:** Offers tree-shaking CodeActions, diagnostic copy actions, named export candidates and completions, bundle history, and workspace reports.
+- 🧾 **Operational Visibility:** The ImportLens output channel records daemon startup, IPC, fallback, cache, and troubleshooting events according to `importLens.logLevel`.
+- 🪶 **Runtime-Aware Results:** Declaration-only packages report zero runtime bytes, framework virtual modules are skipped, and conservative CJS or fallback paths surface structured diagnostics instead of silently failing.
 
 ## How It Works
 
@@ -62,14 +64,15 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 | `importLens.compression` | The primary compression size to display: `brotli` (default), `gzip`, `zstd`, or `all`. |
 | `importLens.enableDiskCache` | Enable persistent caching to disk (`true` by default). |
 | `importLens.useCodeLens` | Show sizes as a CodeLens above the import instead of inline (`false` by default). |
-| `importLens.showWarnings` | Show warning suffixes such as `approximate` when a package cannot be efficiently tree-shaken. |
+| `importLens.showWarnings` | Show warning indicators when a package cannot be efficiently tree-shaken. |
+| `importLens.logLevel` | Controls output-channel verbosity: `error`, `warn`, `info`, or `debug` (`info` by default). |
 
 ## Diagnostics & Troubleshooting
 
 If ImportLens cannot determine the size of a package, it will show an `unavailable` hint. 
 Hover over the import statement and click **Copy diagnostics** to extract the detailed, structured error context directly from the Rust daemon for easy debugging.
 
-CommonJS-only packages, packages with conservative `sideEffects` metadata, and imports that are not truly tree-shakeable are labeled so approximate results are visible without opening the output channel.
+CommonJS-only packages, packages with conservative `sideEffects` metadata, and imports that are not truly tree-shakeable include confidence and diagnostic details in hovers, reports, copied diagnostics, and logs.
 
 ## Requirements
 
