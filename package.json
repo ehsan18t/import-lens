@@ -182,6 +182,7 @@
     "test:ts": "tsc -p tsconfig.test.json && node --test \"extension/test-dist/**/*.test.js\"",
     "test:scripts": "node --test \"scripts/**/*.test.mjs\"",
     "test:rust": "cargo test --workspace",
+    "test:accuracy": "node scripts/accuracy-compare.mjs",
     "test:performance": "cargo test -p import-lens-daemon --release --test performance -- --ignored --nocapture",
     "coverage:rust": "node scripts/check-coverage.mjs",
     "build:daemon": "node scripts/build-daemon.mjs",
@@ -224,6 +225,7 @@
     "@types/node": "22.15.3",
     "@types/vscode": "1.100.0",
     "@vscode/vsce": "3.9.1",
+    "esbuild": "^0.28.0",
     "tsdown": "0.22.1",
     "typescript": "6.0.3"
   }

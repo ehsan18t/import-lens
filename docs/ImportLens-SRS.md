@@ -687,7 +687,7 @@ OXC Rust crates and the `oxc-parser` npm package use 0.x versions, but that does
 
 ### 9.4 Dependency Manifest (Current Resolved Versions)
 
-> **This table tracks the current resolved dependency versions and the intended upgrade policy.** OXC monorepo crates and the npm `oxc-parser` binding are pinned as a coordinated stack; `Cargo.lock` and `pnpm-lock.yaml` provide reproducible builds between deliberate upgrade runs. Run `pnpm deps:update:oxc` when intentionally refreshing the OXC stack; use `pnpm deps:update:all` only for broad dependency refreshes. Re-run the dependency policy and accuracy suites after either path. OXC versioning policy last audited: **5 June 2026.**
+> **This table tracks the current resolved dependency versions and the intended upgrade policy.** OXC monorepo crates and the npm `oxc-parser` binding are pinned as a coordinated stack; `Cargo.lock` and `pnpm-lock.yaml` provide reproducible builds between deliberate upgrade runs. Run `pnpm deps:update:oxc` when intentionally refreshing the OXC stack; use `pnpm deps:update:all` only for broad dependency refreshes. Re-run the dependency policy and `pnpm test:accuracy` suites after either path. OXC versioning policy last audited: **5 June 2026.**
 
 #### 9.4.1 Rust Crates (`Cargo.toml`)
 
