@@ -21,7 +21,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cac
 const RECENTS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_recents");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CURRENT_SCHEMA_VERSION: u64 = 3;
+const CURRENT_SCHEMA_VERSION: u64 = 4;
 const RECENCY_TOUCH_FLUSH_BATCH: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

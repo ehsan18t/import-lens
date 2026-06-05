@@ -4,9 +4,9 @@ use crate::{
         memory::ImportCache,
     },
     ipc::protocol::{
-        BatchRequest, BatchResponse, EnumerateExportsRequest, EnumerateExportsResponse,
-        FileSizeRequest, FileSizeResponse, ImportDiagnostic, ImportKind, ImportRequest,
-        ImportResult, ImportRuntime, PROTOCOL_VERSION,
+        BatchRequest, BatchResponse, ConfidenceLevel, EnumerateExportsRequest,
+        EnumerateExportsResponse, FileSizeRequest, FileSizeResponse, ImportDiagnostic, ImportKind,
+        ImportRequest, ImportResult, ImportRuntime, PROTOCOL_VERSION,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
@@ -510,6 +510,10 @@ fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
         side_effects: true,
         truly_treeshakeable: false,
         is_cjs: false,
+        confidence: ConfidenceLevel::Low,
+        confidence_reasons: vec![
+            "Protocol validation failed before a bundle size could be measured.".to_owned(),
+        ],
         error: Some(message.clone()),
         diagnostics: vec![ImportDiagnostic {
             stage: "protocol".to_owned(),

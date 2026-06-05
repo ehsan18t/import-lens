@@ -1,4 +1,6 @@
-use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
+use import_lens_daemon::ipc::protocol::{
+    ConfidenceLevel, ImportKind, ImportRequest, ImportRuntime,
+};
 use import_lens_daemon::pipeline::analyze::{AnalysisContext, analyze_import};
 use std::{
     fs,
@@ -207,6 +209,7 @@ fn analyze_import_computes_static_sizes_for_local_package_entry() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
+    assert_eq!(result.confidence, ConfidenceLevel::High);
     assert!(result.raw_bytes > 0);
     assert!(result.minified_bytes > 0);
     assert!(result.gzip_bytes > 0);
@@ -583,6 +586,14 @@ fn analyze_invalid_package_json_returns_approximate_directory_size() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
+    assert_eq!(result.confidence, ConfidenceLevel::Low);
+    assert!(
+        result
+            .confidence_reasons
+            .iter()
+            .any(|reason| reason.contains("approximate")),
+        "{result:?}",
+    );
     assert!(result.raw_bytes > 0, "{result:?}");
     assert!(result.raw_bytes < 2048, "{result:?}");
     assert_eq!(result.minified_bytes, result.raw_bytes);

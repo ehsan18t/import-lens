@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ImportResult } from "../../src/ipc/protocol.js";
 import { formatImportSize } from "../../src/ui/format.js";
 
-const result = {
+const result: ImportResult = {
   specifier: "lodash-es",
   raw_bytes: 18000,
   minified_bytes: 5300,
@@ -13,6 +14,8 @@ const result = {
   side_effects: false,
   truly_treeshakeable: true,
   is_cjs: false,
+  confidence: "high",
+  confidence_reasons: ["test fixture confidence"],
   error: null,
   diagnostics: [],
 };

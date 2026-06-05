@@ -31,6 +31,8 @@ const result: ImportResult = {
   side_effects: false,
   truly_treeshakeable: true,
   is_cjs: false,
+  confidence: "high",
+  confidence_reasons: ["test fixture confidence"],
   error: null,
   diagnostics: [],
 };

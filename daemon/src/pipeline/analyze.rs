@@ -1,6 +1,7 @@
 use crate::{
     ipc::protocol::{
-        ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ModuleContribution,
+        ConfidenceLevel, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
+        ModuleContribution,
     },
     pipeline::{
         bundle::{bundle_reachable_modules, bundle_reachable_modules_with_metadata},
@@ -217,6 +218,11 @@ fn cjs_graph_result(request: &ImportRequest, graph: CjsGraphAnalysis) -> ImportR
             side_effects: true,
             truly_treeshakeable: false,
             is_cjs: true,
+            confidence: ConfidenceLevel::Low,
+            confidence_reasons: vec![
+                "CommonJS static analysis is conservative and may miss dynamic require or runtime export behavior."
+                    .to_owned(),
+            ],
             error: None,
             diagnostics,
             module_breakdown: Some(module_breakdown),
@@ -307,6 +313,7 @@ fn analyze_with_oxc_pipeline(
         details: diagnostic.details.clone(),
     }));
     diagnostics.extend(missing_export_diagnostics(request, &graph));
+    let (confidence, confidence_reasons) = oxc_confidence(side_effects, &diagnostics);
 
     Ok(ImportResult {
         specifier: request.specifier.clone(),
@@ -324,6 +331,8 @@ fn analyze_with_oxc_pipeline(
             bundled.source.len() as u64,
         ),
         is_cjs: false,
+        confidence,
+        confidence_reasons,
         error: None,
         diagnostics,
         module_breakdown: Some(top_module_contributions(&bundled.contributions)),
@@ -405,6 +414,11 @@ fn analyze_static_entry(
             && !is_cjs
             && matches!(request.import_kind, ImportKind::Named),
         is_cjs,
+        confidence: ConfidenceLevel::Low,
+        confidence_reasons: vec![
+            "Static entry sizing is a fallback; it does not build a complete module graph."
+                .to_owned(),
+        ],
         error: None,
         diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path),
         module_breakdown: None,
@@ -449,6 +463,11 @@ fn approximate_manifest_fallback(
         side_effects: true,
         truly_treeshakeable: false,
         is_cjs: false,
+        confidence: ConfidenceLevel::Low,
+        confidence_reasons: vec![
+            "Package manifest fallback uses approximate directory sizing because manifest resolution failed."
+                .to_owned(),
+        ],
         error: None,
         diagnostics,
         module_breakdown: Some(vec![ModuleContribution {
@@ -585,6 +604,48 @@ fn side_effect_diagnostics(
             format!("entry_path: {}", entry_path.display()),
         ],
     }]
+}
+
+fn oxc_confidence(
+    side_effects: bool,
+    diagnostics: &[ImportDiagnostic],
+) -> (ConfidenceLevel, Vec<String>) {
+    if !side_effects && diagnostics.is_empty() {
+        return (
+            ConfidenceLevel::High,
+            vec![
+                "OXC module graph, transform, minify, and compression completed without precision warnings."
+                    .to_owned(),
+            ],
+        );
+    }
+
+    let mut reasons = Vec::new();
+    if side_effects {
+        reasons.push(
+            "Package side effects require full-graph sizing instead of named-export tree shaking."
+                .to_owned(),
+        );
+    }
+
+    if !diagnostics.is_empty() {
+        let mut stages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.stage.as_str())
+            .collect::<Vec<_>>();
+        stages.sort_unstable();
+        stages.dedup();
+        reasons.push(format!(
+            "Analysis emitted diagnostics that can reduce precision: {}.",
+            stages.join(", ")
+        ));
+    }
+
+    if reasons.is_empty() {
+        reasons.push("OXC pipeline completed with conservative assumptions.".to_owned());
+    }
+
+    (ConfidenceLevel::Medium, reasons)
 }
 
 fn oxc_fallback_diagnostic(error: AnalysisError) -> ImportDiagnostic {
@@ -750,6 +811,10 @@ fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
         side_effects: true,
         truly_treeshakeable: false,
         is_cjs: false,
+        confidence: ConfidenceLevel::Low,
+        confidence_reasons: vec![
+            "Analysis failed before a bundle size could be measured.".to_owned(),
+        ],
         error: Some(error.message.clone()),
         diagnostics: vec![ImportDiagnostic {
             stage: error.stage.to_owned(),

@@ -1,5 +1,5 @@
 use import_lens_daemon::cache::memory::ImportCache;
-use import_lens_daemon::ipc::protocol::ImportResult;
+use import_lens_daemon::ipc::protocol::{ConfidenceLevel, ImportResult};
 
 fn result(specifier: &str, cache_hit: bool) -> ImportResult {
     ImportResult {
@@ -13,6 +13,8 @@ fn result(specifier: &str, cache_hit: bool) -> ImportResult {
         side_effects: false,
         truly_treeshakeable: true,
         is_cjs: false,
+        confidence: ConfidenceLevel::High,
+        confidence_reasons: vec!["test fixture confidence".to_owned()],
         error: None,
         diagnostics: Vec::new(),
         module_breakdown: None,

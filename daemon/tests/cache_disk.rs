@@ -1,6 +1,6 @@
 use import_lens_daemon::{
     cache::memory::ImportCache,
-    ipc::protocol::{ImportDiagnostic, ImportResult},
+    ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportResult},
 };
 use redb::{Database, ReadableDatabase, TableDefinition};
 use std::{
@@ -14,7 +14,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cac
 const RECENTS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_recents");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CURRENT_SCHEMA_VERSION: u64 = 3;
+const CURRENT_SCHEMA_VERSION: u64 = 4;
 
 mod common;
 
@@ -38,6 +38,8 @@ fn result(specifier: &str) -> ImportResult {
         side_effects: false,
         truly_treeshakeable: true,
         is_cjs: false,
+        confidence: ConfidenceLevel::High,
+        confidence_reasons: vec!["test fixture confidence".to_owned()],
         error: None,
         diagnostics: vec![ImportDiagnostic {
             stage: "test".to_owned(),

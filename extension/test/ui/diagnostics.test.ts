@@ -14,6 +14,10 @@ const failedResult: ImportResult = {
   side_effects: true,
   truly_treeshakeable: false,
   is_cjs: false,
+  confidence: "low",
+  confidence_reasons: [
+    "Entry resolution failed, so the reported size is an error result rather than a measured bundle.",
+  ],
   error: "package entry not found near C:\\project\\node_modules\\@nestjs\\common\\missing",
   diagnostics: [
     {
@@ -32,6 +36,8 @@ test("formatImportDiagnostics includes daemon error context without UI copy", ()
   const formatted = formatImportDiagnostics(failedResult);
 
   assert.match(formatted, /ImportLens diagnostics for @nestjs\/common/u);
+  assert.match(formatted, /Confidence: low/u);
+  assert.match(formatted, /Entry resolution failed/u);
   assert.match(formatted, /\[entry_resolution\]/u);
   assert.match(formatted, /candidate: C:\\project\\node_modules\\@nestjs\\common\\missing\.js/u);
 });

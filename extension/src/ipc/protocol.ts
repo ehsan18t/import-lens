@@ -1,10 +1,12 @@
-export const protocolVersion = 3;
+export const protocolVersion = 4;
 
 export type ImportKind = "named" | "default" | "namespace" | "dynamic";
 
 export type ImportRuntime = "component" | "client" | "server";
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
+
+export type ConfidenceLevel = "high" | "medium" | "low";
 
 export interface ImportRequest {
   specifier: string;
@@ -35,6 +37,8 @@ export interface ImportResult {
   side_effects: boolean;
   truly_treeshakeable: boolean;
   is_cjs: boolean;
+  confidence: ConfidenceLevel;
+  confidence_reasons: string[];
   error: string | null;
   diagnostics: ImportDiagnostic[];
   module_breakdown?: ModuleContribution[];

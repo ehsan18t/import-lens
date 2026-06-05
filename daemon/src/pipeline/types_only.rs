@@ -1,5 +1,5 @@
 use crate::{
-    ipc::protocol::{ImportDiagnostic, ImportRequest, ImportResult},
+    ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportRequest, ImportResult},
     pipeline::resolver::find_package_root,
 };
 use std::{
@@ -44,6 +44,10 @@ pub fn declaration_only_package_result(
         side_effects: false,
         truly_treeshakeable: true,
         is_cjs: false,
+        confidence: ConfidenceLevel::High,
+        confidence_reasons: vec![
+            "Package contains declaration files only and no runtime source files.".to_owned(),
+        ],
         error: None,
         diagnostics: vec![ImportDiagnostic {
             stage: "types_only".to_owned(),

@@ -4,6 +4,15 @@ export const copyImportDiagnosticsCommand = "importLens.copyImportDiagnostics";
 
 export const formatImportDiagnostics = (result: ImportResult): string => {
   const lines = [`ImportLens diagnostics for ${result.specifier}`, ""];
+  lines.push(`Confidence: ${result.confidence}`, "");
+
+  if (result.confidence_reasons.length > 0) {
+    lines.push("Confidence reasons:");
+    for (const reason of result.confidence_reasons) {
+      lines.push(`- ${reason}`);
+    }
+    lines.push("");
+  }
 
   if (result.error) {
     lines.push(`Error: ${result.error}`, "");
@@ -26,4 +35,3 @@ export const formatImportDiagnostics = (result: ImportResult): string => {
 
   return lines.join("\n").trimEnd();
 };
-

@@ -4,7 +4,7 @@ import { formatCurrentFileSizeSummary } from "../../src/analysis/fileSize.js";
 import type { FileSizeResponse } from "../../src/ipc/protocol.js";
 
 const response = (imports = 2): FileSizeResponse => ({
-  version: 3,
+  version: 4,
   request_id: 1,
   raw_bytes: 12000,
   minified_bytes: 5300,
@@ -22,6 +22,8 @@ const response = (imports = 2): FileSizeResponse => ({
     side_effects: false,
     truly_treeshakeable: true,
     is_cjs: false,
+    confidence: "high",
+    confidence_reasons: ["test fixture confidence"],
     error: null,
     diagnostics: [],
   })),

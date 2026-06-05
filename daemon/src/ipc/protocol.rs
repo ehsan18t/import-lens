@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +18,15 @@ pub enum ImportRuntime {
     Component,
     Client,
     Server,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceLevel {
+    High,
+    Medium,
+    #[default]
+    Low,
 }
 
 impl ImportRuntime {
@@ -65,6 +74,10 @@ pub struct ImportResult {
     pub side_effects: bool,
     pub truly_treeshakeable: bool,
     pub is_cjs: bool,
+    #[serde(default)]
+    pub confidence: ConfidenceLevel,
+    #[serde(default)]
+    pub confidence_reasons: Vec<String>,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

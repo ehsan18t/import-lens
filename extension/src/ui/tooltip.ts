@@ -22,6 +22,13 @@ export const tooltipForResult = (
 
   if (result.error) {
     tooltip.appendMarkdown("ImportLens could not compute this import size.\n\n");
+    tooltip.appendMarkdown(`Confidence: ${result.confidence}\n\n`);
+    for (const reason of result.confidence_reasons) {
+      tooltip.appendMarkdown(`- ${reason}\n`);
+    }
+    if (result.confidence_reasons.length > 0) {
+      tooltip.appendMarkdown("\n");
+    }
     appendCopyDiagnosticsLink(tooltip, result);
     return tooltip;
   }
@@ -37,6 +44,13 @@ export const tooltipForResult = (
   tooltip.appendMarkdown(`Runtime: ${runtime}\n\n`);
   if (isTypesOnlyResult(result)) {
     tooltip.appendMarkdown("Type-only package: yes\n\n");
+  }
+  tooltip.appendMarkdown(`Confidence: ${result.confidence}\n\n`);
+  for (const reason of result.confidence_reasons) {
+    tooltip.appendMarkdown(`- ${reason}\n`);
+  }
+  if (result.confidence_reasons.length > 0) {
+    tooltip.appendMarkdown("\n");
   }
   tooltip.appendMarkdown(`Side effects: ${result.side_effects ? "yes" : "no"}\n\n`);
   tooltip.appendMarkdown(`CJS: ${result.is_cjs ? "yes" : "no"}`);
