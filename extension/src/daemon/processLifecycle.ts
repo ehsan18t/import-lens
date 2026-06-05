@@ -17,7 +17,7 @@ export interface DaemonLogStreams {
   readonly stderr: Readable;
 }
 
-type DaemonLogLogger = Pick<ImportLensLogger, "debug" | "warn">;
+type DaemonLogLogger = Pick<ImportLensLogger, "info" | "warn">;
 
 export const cleanupFailedDaemonStartup = (
   client: DisposableIpcClient | null,
@@ -36,7 +36,7 @@ export const pipeDaemonProcessLogs = (
   childProcess: Pick<ChildProcessWithoutNullStreams, "stdout" | "stderr"> | DaemonLogStreams,
   logger: DaemonLogLogger,
 ): void => {
-  pipeStreamLines(childProcess.stdout, "stdout", (line) => logger.debug(`[daemon:stdout] ${line}`));
+  pipeStreamLines(childProcess.stdout, "stdout", (line) => logger.info(`[daemon:stdout] ${line}`));
   pipeStreamLines(childProcess.stderr, "stderr", (line) => logger.warn(`[daemon:stderr] ${line}`));
 };
 

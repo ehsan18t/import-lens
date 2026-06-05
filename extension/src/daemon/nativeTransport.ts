@@ -68,6 +68,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#state = "unavailable";
       return this.#state;
     }
+    this.#logger.info(`Starting ImportLens daemon for workspace ${workspaceRoot}.`);
 
     if (await this.#recycleGuard.shouldEnterDegradedMode()) {
       this.#logger.warn("Daemon recycle loop detected. ImportLens is entering unavailable mode.");
@@ -90,6 +91,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#state = "unavailable";
       return this.#state;
     }
+    this.#logger.info(`Daemon binary verified: ${relativeBinaryPath}.`);
 
     await mkdir(this.#context.globalStorageUri.fsPath, { recursive: true });
 
@@ -105,6 +107,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       "--storage",
       this.#context.globalStorageUri.fsPath,
     ]);
+    this.#logger.info(`Spawned ImportLens daemon process ${this.#process.pid ?? "unknown"}.`);
     pipeDaemonProcessLogs(this.#process, this.#logger);
 
     this.#process.once("exit", (code, signal) => {
@@ -113,6 +116,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     try {
       this.#client = await IpcClient.connect(pipeName);
+      this.#logger.info("Connected to ImportLens daemon IPC.");
     } catch (error) {
       this.#logger.warn(`Failed to connect to daemon: ${error instanceof Error ? error.message : String(error)}`);
       cleanupFailedDaemonStartup(null, this.#process);
@@ -129,6 +133,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     try {
       this.#client.send(this.#hello(workspaceRoot));
+      this.#logger.info(`Sent daemon hello using protocol v${protocolVersion}.`);
     } catch (error) {
       this.#logger.warn(`Failed to send daemon hello: ${error instanceof Error ? error.message : String(error)}`);
       cleanupFailedDaemonStartup(this.#client, this.#process);
@@ -142,6 +147,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#lastAnalysisRoot = workspaceRoot;
     this.#armStabilityReset();
     this.#armCleanRecycleReset();
+    this.#logger.info("ImportLens daemon is ready.");
 
     return this.#state;
   }
@@ -249,41 +255,51 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null> {
     if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Batch request ${request.request_id} skipped because daemon is ${this.#state}.`);
       return null;
     }
 
+    this.#logger.debug(`Sending batch request ${request.request_id} with ${request.imports.length} import(s).`);
     return this.#client.requestBatch(request, 10000, onPartial);
   }
 
   async enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
     if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Export enumeration ${request.request_id} skipped because daemon is ${this.#state}.`);
       return null;
     }
 
+    this.#logger.debug(`Requesting export enumeration ${request.request_id} for ${request.specifier}.`);
     return this.#client.requestExports(request);
   }
 
   async requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null> {
     if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Current-file size request ${request.request_id} skipped because daemon is ${this.#state}.`);
       return null;
     }
 
+    this.#logger.debug(`Requesting current-file size ${request.request_id} for ${request.imports.length} import(s).`);
     return this.#client.requestFileSize(request);
   }
 
   invalidatePackage(packageName: string): void {
+    this.#logger.info(`Invalidating ImportLens cache for ${packageName}.`);
     this.#client?.send({ type: "cache_invalidate", package: packageName });
   }
 
   invalidateAll(): void {
+    this.#logger.info("Invalidating entire ImportLens cache.");
     this.#client?.send({ type: "cache_invalidate_all" });
   }
 
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {
     if (!this.#client || this.#state !== "ready") {
+      this.#logger.debug(`Skipping package.json prewarm because daemon is ${this.#state}: ${packageJsonPath}.`);
       return;
     }
 
+    this.#logger.debug(`Sending package.json prewarm for ${packageJsonPath}.`);
     this.#client.send({
       type: "prewarm_package_json",
       package_json_path: packageJsonPath,

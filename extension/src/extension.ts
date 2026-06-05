@@ -32,6 +32,7 @@ const copyImportDiagnostics = async (result: ImportResult): Promise<void> => {
 export const activate = async (context: vscode.ExtensionContext): Promise<void> => {
   const config = getImportLensConfig();
   const logger = new ImportLensLogger(config.logLevel);
+  logger.info("ImportLens activation started.");
   const store = new AnalysisStore();
   const statusBar = new StatusBarController();
   const decorations = new DecorationController(store);
@@ -69,6 +70,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("importLens.showCurrentFileSize", () => void showCurrentFileSize(context, daemon!, logger)),
     vscode.commands.registerCommand("importLens.showBundleImpactHistory", () => void showBundleImpactHistory(context)),
     vscode.commands.registerCommand("importLens.clearCache", () => {
+      logger.info("Clearing ImportLens daemon cache.");
       daemon?.invalidateAll();
       const editor = vscode.window.activeTextEditor;
 
@@ -113,12 +115,14 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 
       const nextConfig = getImportLensConfig();
       logger.setLevel(nextConfig.logLevel);
+      logger.info("ImportLens configuration changed; refreshing visible documents.");
       refreshVisibleDocuments(nextConfig);
     }),
   );
 
   registerNodeModulesWatchers(context, daemon, () => refreshVisibleDocuments(getImportLensConfig()));
   const state = await daemon.start();
+  logger.info(`ImportLens daemon startup completed with state: ${state}.`);
   statusBar.setStatus(state === "ready" ? "ready" : "unavailable");
   registerPackageJsonPrewarm(context, daemon);
 

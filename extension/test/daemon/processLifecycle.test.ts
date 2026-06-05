@@ -54,7 +54,7 @@ test("pipeDaemonProcessLogs forwards daemon stderr through the extension logger"
   pipeDaemonProcessLogs(
     { stdout, stderr },
     {
-      debug: (message: string) => messages.push(`debug:${message}`),
+      info: (message: string) => messages.push(`info:${message}`),
       warn: (message: string) => messages.push(`warn:${message}`),
     },
   );
@@ -64,7 +64,7 @@ test("pipeDaemonProcessLogs forwards daemon stderr through the extension logger"
   await delay(0);
 
   assert.deepEqual(messages, [
-    "debug:[daemon:stdout] startup ready",
+    "info:[daemon:stdout] startup ready",
     "warn:[daemon:stderr] resolver failed",
   ]);
 });

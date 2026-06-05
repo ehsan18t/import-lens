@@ -1,24 +1,20 @@
 import * as vscode from "vscode";
 import type { LogLevel } from "./ipc/protocol.js";
-
-const logRank: Record<LogLevel, number> = {
-  error: 0,
-  warn: 1,
-  info: 2,
-  debug: 3,
-};
+import { defaultLogLevel, formatLogLine, shouldWriteLog } from "./loggerCore.js";
 
 export class ImportLensLogger implements vscode.Disposable {
   readonly #channel: vscode.OutputChannel;
   #level: LogLevel;
 
-  constructor(level: LogLevel) {
+  constructor(level: LogLevel = defaultLogLevel) {
     this.#channel = vscode.window.createOutputChannel("ImportLens");
     this.#level = level;
+    this.#writeAlways("info", `Output channel initialized. Current log level: ${level}.`);
   }
 
   setLevel(level: LogLevel): void {
     this.#level = level;
+    this.#writeAlways("info", `Log level changed to ${level}.`);
   }
 
   error(message: string): void {
@@ -38,7 +34,8 @@ export class ImportLensLogger implements vscode.Disposable {
   }
 
   show(): void {
-    this.#channel.show();
+    this.#writeAlways("info", `Output channel opened. Current log level: ${this.#level}.`);
+    this.#channel.show(true);
   }
 
   dispose(): void {
@@ -46,11 +43,14 @@ export class ImportLensLogger implements vscode.Disposable {
   }
 
   #write(level: LogLevel, message: string): void {
-    if (logRank[level] > logRank[this.#level]) {
+    if (!shouldWriteLog(this.#level, level)) {
       return;
     }
 
-    this.#channel.appendLine(`${new Date().toISOString()} [${level.toUpperCase()}] ${message}`);
+    this.#writeAlways(level, message);
+  }
+
+  #writeAlways(level: LogLevel, message: string): void {
+    this.#channel.appendLine(formatLogLine(level, message));
   }
 }
-

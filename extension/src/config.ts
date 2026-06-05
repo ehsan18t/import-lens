@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { CompressionFormat, DisplayMode } from "./ui/format.js";
 import type { LogLevel } from "./ipc/protocol.js";
+import { defaultLogLevel } from "./loggerCore.js";
 
 export interface ImportLensConfig {
   enabled: boolean;
@@ -24,6 +25,6 @@ export const getImportLensConfig = (): ImportLensConfig => {
     showWarnings: config.get("showWarnings", true),
     useCodeLens: config.get("useCodeLens", false),
     enableDiskCache: config.get("enableDiskCache", true),
-    logLevel: config.get<LogLevel>("logLevel", "error"),
+    logLevel: config.get<LogLevel>("logLevel", defaultLogLevel),
   };
 };

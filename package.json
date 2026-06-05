@@ -118,7 +118,7 @@
             "info",
             "debug"
           ],
-          "default": "error",
+          "default": "info",
           "description": "Logging verbosity for the ImportLens output channel."
         }
       }
