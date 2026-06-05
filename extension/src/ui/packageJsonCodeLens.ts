@@ -63,7 +63,19 @@ export class PackageJsonDependencyCodeLensProvider implements vscode.CodeLensPro
       const registryHint = config.enableRegistryHints
         ? await registryHintForPackage(this.#context, entry.name)
         : null;
-      const suffix = registryHint ? ` · ${registryHint}` : "";
+
+      let suffix = "";
+      if (registryHint) {
+        if (registryHint.deprecated) {
+          suffix = " · deprecated";
+        } else if (registryHint.latestVersion) {
+          const cleanVersion = entry.version.replace(/^[^\d]+/, "");
+          if (cleanVersion !== registryHint.latestVersion) {
+            suffix = ` · latest ${registryHint.latestVersion}`;
+          }
+        }
+      }
+
       const title = result && !result.error
         ? `ImportLens: ${formatBytes(result.brotli_bytes)} br${suffix}`
         : `ImportLens: size unavailable${suffix}`;

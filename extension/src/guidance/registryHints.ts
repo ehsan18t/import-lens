@@ -2,12 +2,15 @@ import type * as vscode from "vscode";
 
 const registryCacheKey = "importLens.registryHints";
 const registryCacheTtlMs = 24 * 60 * 60 * 1000;
-const registryTimeoutMs = 800;
+const registryTimeoutMs = 1500;
 
-interface RegistryHintCacheEntry {
-  timestamp: number;
+export interface RegistryHint {
   latestVersion?: string;
   deprecated?: boolean;
+}
+
+interface RegistryHintCacheEntry extends RegistryHint {
+  timestamp: number;
 }
 
 type RegistryHintCache = Record<string, RegistryHintCacheEntry>;
@@ -15,21 +18,22 @@ type RegistryHintCache = Record<string, RegistryHintCacheEntry>;
 export const registryHintForPackage = async (
   context: vscode.ExtensionContext,
   packageName: string,
-): Promise<string | null> => {
+): Promise<RegistryHint | null> => {
   const cache = context.globalState.get<RegistryHintCache>(registryCacheKey, {});
   const cached = cache[packageName];
   const now = Date.now();
 
   if (cached && now - cached.timestamp < registryCacheTtlMs) {
-    return formatRegistryHint(cached);
+    return { latestVersion: cached.latestVersion, deprecated: cached.deprecated };
   }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), registryTimeoutMs);
 
   try {
-    const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(packageName)}`, {
+    const response = await fetch(`https://registry.npmjs.org/${packageName}`, {
       signal: controller.signal,
+      headers: { accept: "application/vnd.npm.install-v1+json" },
     });
 
     if (!response.ok) {
@@ -44,18 +48,10 @@ export const registryHintForPackage = async (
     const deprecated = latestVersion ? Boolean(metadata.versions?.[latestVersion]?.deprecated) : false;
     const entry = { timestamp: now, latestVersion, deprecated };
     await context.globalState.update(registryCacheKey, { ...cache, [packageName]: entry });
-    return formatRegistryHint(entry);
+    return { latestVersion, deprecated };
   } catch {
     return null;
   } finally {
     clearTimeout(timer);
   }
-};
-
-const formatRegistryHint = (entry: RegistryHintCacheEntry): string | null => {
-  if (entry.deprecated) {
-    return "deprecated";
-  }
-
-  return entry.latestVersion ? `latest ${entry.latestVersion}` : null;
 };
