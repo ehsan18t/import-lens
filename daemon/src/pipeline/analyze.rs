@@ -142,12 +142,17 @@ fn analyze_import_inner_resolved(
     if !is_cjs
         && matches!(
             request.import_kind,
-            ImportKind::Named | ImportKind::Default | ImportKind::Namespace
+            ImportKind::Named | ImportKind::Default | ImportKind::Namespace | ImportKind::Dynamic
         )
     {
         match analyze_with_oxc_pipeline(context, request, entry_path.clone(), side_effects_mode) {
             Ok(result) => return Ok(result),
-            Err(error) if matches!(request.import_kind, ImportKind::Namespace) => {
+            Err(error)
+                if matches!(
+                    request.import_kind,
+                    ImportKind::Namespace | ImportKind::Dynamic
+                ) =>
+            {
                 fallback_diagnostics.push(oxc_fallback_diagnostic(error));
             }
             Err(error) => return Err(error),
@@ -246,7 +251,11 @@ fn analyze_with_oxc_pipeline(
                 vec![format!("entry_path: {}", entry_path.display())],
             )
         })?;
-    let include_full_entry = side_effects || matches!(request.import_kind, ImportKind::Namespace);
+    let include_full_entry = side_effects
+        || matches!(
+            request.import_kind,
+            ImportKind::Namespace | ImportKind::Dynamic
+        );
     let requested_exports = requested_exports(request);
     let mut reachable = reachable_exports(&graph, &requested_exports, include_full_entry);
     let mut bundled =

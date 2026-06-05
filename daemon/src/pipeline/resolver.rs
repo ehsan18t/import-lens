@@ -64,7 +64,7 @@ pub fn resolve_package_entry(
 
     Ok(ResolvedPackage {
         package_root: manifest.root,
-        side_effects: side_effects_mode(&manifest.json),
+        side_effects: side_effects_mode(&manifest.json, &entry_path),
         package_json: manifest.json,
         entry_path,
         is_cjs,
@@ -465,6 +465,7 @@ fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
                 "default".to_owned(),
             ],
             extensions: module_extensions(),
+            extension_alias: extension_aliases(),
             main_fields: vec!["browser".to_owned(), "module".to_owned(), "main".to_owned()],
             module_type: true,
             node_path: false,
@@ -480,6 +481,7 @@ fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
                 "default".to_owned(),
             ],
             extensions: module_extensions(),
+            extension_alias: extension_aliases(),
             main_fields: vec!["module".to_owned(), "main".to_owned()],
             module_type: true,
             node_path: false,
@@ -494,6 +496,23 @@ fn module_extensions() -> Vec<String> {
     ]
     .into_iter()
     .map(str::to_owned)
+    .collect()
+}
+
+fn extension_aliases() -> Vec<(String, Vec<String>)> {
+    [
+        (".js", [".ts", ".tsx", ".js"].as_slice()),
+        (".mjs", [".mts", ".mjs"].as_slice()),
+        (".cjs", [".cts", ".cjs"].as_slice()),
+        (".jsx", [".tsx", ".jsx"].as_slice()),
+    ]
+    .into_iter()
+    .map(|(extension, aliases)| {
+        (
+            extension.to_owned(),
+            aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+        )
+    })
     .collect()
 }
 
@@ -540,14 +559,149 @@ pub(crate) fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("failed to resolve path {}: {error}", path.display()))
 }
 
-fn side_effects_mode(package_json: &Value) -> SideEffectsMode {
+fn side_effects_mode(package_json: &Value, entry_path: &Path) -> SideEffectsMode {
     match package_json.get("sideEffects") {
         Some(Value::Bool(false)) => SideEffectsMode::False,
         Some(Value::Bool(true)) => SideEffectsMode::True,
-        Some(Value::Array(_)) => SideEffectsMode::Array,
+        Some(Value::Array(patterns)) => side_effects_array_mode(patterns, entry_path),
         Some(_) => SideEffectsMode::Unknown,
         None => SideEffectsMode::Missing,
     }
+}
+
+fn side_effects_array_mode(patterns: &[Value], entry_path: &Path) -> SideEffectsMode {
+    let Some(entry) = normalized_side_effect_path(entry_path) else {
+        return SideEffectsMode::Unknown;
+    };
+
+    let mut saw_string = false;
+
+    for pattern in patterns {
+        let Some(pattern) = pattern.as_str() else {
+            return SideEffectsMode::Unknown;
+        };
+        saw_string = true;
+
+        if side_effects_pattern_matches(pattern, &entry) {
+            return SideEffectsMode::True;
+        }
+    }
+
+    if saw_string {
+        SideEffectsMode::False
+    } else {
+        SideEffectsMode::Unknown
+    }
+}
+
+fn normalized_side_effect_path(path: &Path) -> Option<String> {
+    path.file_name()?;
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    let node_modules_index = components
+        .iter()
+        .rposition(|component| *component == "node_modules")?;
+    let package_start = node_modules_index + 1;
+    let relative_start = if components
+        .get(package_start)
+        .is_some_and(|name| name.starts_with('@'))
+    {
+        package_start + 2
+    } else {
+        package_start + 1
+    };
+
+    Some(components.get(relative_start..)?.join("/"))
+}
+
+fn side_effects_pattern_matches(pattern: &str, path: &str) -> bool {
+    let pattern = normalize_side_effect_pattern(pattern);
+    let expanded_patterns = expand_brace_patterns(&pattern);
+
+    expanded_patterns.into_iter().any(|pattern| {
+        if pattern.contains('/') {
+            path_components_match(
+                &pattern.split('/').collect::<Vec<_>>(),
+                &path.split('/').collect::<Vec<_>>(),
+            )
+        } else {
+            path.split('/')
+                .any(|segment| segment_pattern_matches(&pattern, segment))
+        }
+    })
+}
+
+fn normalize_side_effect_pattern(pattern: &str) -> String {
+    pattern.trim().trim_start_matches("./").replace('\\', "/")
+}
+
+fn expand_brace_patterns(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_owned()];
+    };
+    let Some(close_offset) = pattern[open + 1..].find('}') else {
+        return vec![pattern.to_owned()];
+    };
+    let close = open + 1 + close_offset;
+    let before = &pattern[..open];
+    let after = &pattern[close + 1..];
+
+    pattern[open + 1..close]
+        .split(',')
+        .flat_map(|choice| expand_brace_patterns(&format!("{before}{choice}{after}")))
+        .collect()
+}
+
+fn path_components_match(pattern: &[&str], path: &[&str]) -> bool {
+    if pattern.is_empty() {
+        return path.is_empty();
+    }
+
+    if pattern[0] == "**" {
+        return path_components_match(&pattern[1..], path)
+            || (!path.is_empty() && path_components_match(pattern, &path[1..]));
+    }
+
+    !path.is_empty()
+        && segment_pattern_matches(pattern[0], path[0])
+        && path_components_match(&pattern[1..], &path[1..])
+}
+
+fn segment_pattern_matches(pattern: &str, segment: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let segment = segment.as_bytes();
+    let mut pattern_index = 0;
+    let mut segment_index = 0;
+    let mut star_index = None;
+    let mut star_segment_index = 0;
+
+    while segment_index < segment.len() {
+        if pattern
+            .get(pattern_index)
+            .is_some_and(|byte| *byte == b'?' || *byte == segment[segment_index])
+        {
+            pattern_index += 1;
+            segment_index += 1;
+        } else if pattern.get(pattern_index) == Some(&b'*') {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_segment_index = segment_index;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_segment_index += 1;
+            segment_index = star_segment_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern.get(pattern_index) == Some(&b'*') {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern.len()
 }
 
 fn subpath_for_request(request: &ImportRequest) -> Option<&str> {

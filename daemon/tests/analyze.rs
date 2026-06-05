@@ -308,7 +308,7 @@ fn analyze_import_uses_full_graph_when_side_effects_missing() {
 }
 
 #[test]
-fn analyze_import_reports_side_effect_array_conservatively() {
+fn analyze_import_treats_unmatched_side_effect_array_as_treeshakeable() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -345,17 +345,89 @@ fn analyze_import_reports_side_effect_array_conservatively() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(named.error, None);
     assert_eq!(namespace.error, None);
-    assert_eq!(named.raw_bytes, namespace.raw_bytes);
-    assert!(named.side_effects);
-    assert!(!named.truly_treeshakeable);
+    assert!(named.raw_bytes < namespace.raw_bytes);
+    assert!(!named.side_effects);
+    assert!(named.truly_treeshakeable);
     assert!(
         named
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "side_effects"
-                && diagnostic.message.contains("array")),
+            .all(|diagnostic| diagnostic.stage != "side_effects"),
         "{named:?}",
     );
+}
+
+#[test]
+fn analyze_dynamic_import_measures_full_module_graph() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "dynamic-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "export const used = 1;\nexport { heavy as unused } from './payload.js';\n",
+    );
+    write_package_file(
+        &workspace,
+        "dynamic-lib",
+        "payload.js",
+        &format!("export const heavy = '{}';", "x".repeat(2048)),
+    );
+    write_package_file(
+        &workspace,
+        "dynamic-lib",
+        "index.js",
+        "import { heavy } from './payload.js';\nexport const used = 1;\nexport const unused = heavy;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let named = analyze_import(
+        &context,
+        &import_request(
+            "dynamic-lib",
+            "dynamic-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+    let dynamic = analyze_import(
+        &context,
+        &import_request(
+            "dynamic-lib",
+            "dynamic-lib",
+            "1.0.0",
+            ImportKind::Dynamic,
+            &[],
+        ),
+    );
+    let namespace = analyze_import(
+        &context,
+        &import_request(
+            "dynamic-lib",
+            "dynamic-lib",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(named.error, None);
+    assert_eq!(dynamic.error, None);
+    assert_eq!(namespace.error, None);
+    assert_eq!(dynamic.raw_bytes, namespace.raw_bytes);
+    assert!(
+        dynamic.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("payload.js"))
+        }),
+        "{dynamic:?}",
+    );
+    assert!(!dynamic.truly_treeshakeable);
 }
 
 #[test]
@@ -1536,6 +1608,54 @@ fn analyze_import_transforms_typescript_jsx_and_type_only_modules() {
                 && !modules
                     .iter()
                     .any(|module| module.path.ends_with("types.ts"))
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_import_resolves_typescript_source_via_js_extension_alias() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "alias-ts-pkg",
+        r#"{"version":"1.0.0","module":"src/index.ts","sideEffects":false}"#,
+        "// js entry",
+    );
+    write_package_file(
+        &workspace,
+        "alias-ts-pkg",
+        "src/index.ts",
+        "import { helper } from './helper.js';\nexport const value = helper;",
+    );
+    write_package_file(
+        &workspace,
+        "alias-ts-pkg",
+        "src/helper.ts",
+        "export const helper: number = 1;",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "alias-ts-pkg".to_owned(),
+        package_name: "alias-ts-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(
+        result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("helper.ts"))
         }),
         "{result:?}",
     );
