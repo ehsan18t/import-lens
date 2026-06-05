@@ -11,7 +11,7 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 - 🦀 **Rust Daemon Engine:** Built on `oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`, and parallel Rust compression.
 - 💾 **Persistent Caching:** Results are cached in-memory and to disk using `papaya` and `redb`, with startup prewarm for recent entries.
 - 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, `.mts`, `.cts`, Svelte (`<script>` blocks), and Astro (frontmatter and client scripts).
-- 🎨 **Flexible UI Options:** Displays colored inline hints by default, with native accessible Inlay Hints, end-of-line decorations, and CodeLens annotations available.
+- 🎨 **Flexible UI Options:** Displays native accessible Inlay Hints by default, with opt-in colored confidence hints, end-of-line decorations, and CodeLens annotations available.
 - 📈 **Impact Insights:** Shows confidence levels, working-tree import cost deltas, per-import history trends, current-file totals, shared dependency explanations, and barrel re-export warnings.
 - 🛠️ **Import Actions:** Offers tree-shaking CodeActions, local substitution suggestions, diagnostic copy actions, named export candidates and completions, bundle history, and workspace reports.
 - 🧭 **Guidance Workflows:** Adds package.json dependency CodeLens, import comparison, `.importlensignore`, and opt-in npm registry hints that fail silently when unavailable.
@@ -37,7 +37,7 @@ All of this happens invisibly in a secure, self-contained background daemon, mea
 
 ImportLens adds context next to size labels when the extra signal is useful:
 
-- **Confidence colors:** High-confidence sizes use a muted success color, medium confidence uses amber, and low confidence uses red. Low-confidence inline labels also start with `~`, for example `~1.6 kB br`.
+- **Confidence colors:** In the opt-in colored inline renderer, high-confidence sizes use a muted success color, medium confidence uses amber, and low confidence uses red. Low-confidence inline labels also start with `~`, for example `~1.6 kB br`.
 - **Budgets:** Optional per-import and per-file Brotli thresholds surface as editor diagnostics, inline `over budget` labels, hovers, reports, and CLI failures.
 - **Working-tree deltas:** Imports added or modified in the current Git diff show their current added Brotli cost, for example `+2.1 kB br`.
 - **History trends:** Repeated measurements can show when an import became larger or smaller after dependency updates.
@@ -67,7 +67,7 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 | Setting | Description |
 | --- | --- |
 | `importLens.display` | Set the display mode: `inlayHint` (default), `minimal`, `standard`, or `verbose`. |
-| `importLens.inlineRenderer` | Choose the renderer for `display: inlayHint`: `colored` (default) for confidence-colored decoration-backed hints, or `native` for VS Code's screen-reader-accessible Inlay Hints API. |
+| `importLens.inlineRenderer` | Choose the renderer for `display: inlayHint`: `native` (default) for VS Code's screen-reader-accessible Inlay Hints API, or `colored` for confidence-colored decoration-backed hints. |
 | `importLens.compression` | The primary compression size to display: `brotli` (default), `gzip`, `zstd`, or `all`. |
 | `importLens.budgets` | Optional budget object with `perImportBrotliBytes` and `perFileBrotliBytes` thresholds. |
 | `importLens.enableRegistryHints` | Opt in to short-timeout npm metadata hints in package.json CodeLens (`false` by default). |
@@ -79,7 +79,7 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 ## Diagnostics & Troubleshooting
 
 If ImportLens cannot determine the size of a package, it will show an `unavailable` hint. 
-Hover over the import statement and click **Copy diagnostics** to extract the detailed, structured error context directly from the Rust daemon for easy debugging.
+Hover over the native inlay hint, or the import statement when using the colored renderer, and click **Copy diagnostics** to extract the detailed, structured error context directly from the Rust daemon for easy debugging.
 
 CommonJS-only packages, packages with conservative `sideEffects` metadata, and imports that are not truly tree-shakeable include confidence and diagnostic details in hovers, reports, copied diagnostics, and debug logs. The normal output channel warning level is reserved for daemon, IPC, startup, protocol, or no-result failures.
 

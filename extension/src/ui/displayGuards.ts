@@ -6,10 +6,13 @@ export const shouldShowInlayHints = (config: ImportLensConfig): boolean =>
 export const shouldShowNativeInlayHints = (config: ImportLensConfig): boolean =>
   shouldShowInlayHints(config) && config.inlineRenderer === "native";
 
+export const shouldShowColoredSourceHovers = (config: ImportLensConfig): boolean =>
+  shouldShowInlayHints(config) && config.inlineRenderer === "colored";
+
 export const shouldShowDecorations = (config: ImportLensConfig): boolean =>
   config.enabled
   && (
-    (config.display === "inlayHint" && config.inlineRenderer === "colored")
+    shouldShowColoredSourceHovers(config)
     || (config.display !== "inlayHint" && !config.useCodeLens)
   );
 

@@ -5,7 +5,7 @@ import { getImportLensConfig, type ImportLensConfig } from "../config.js";
 import { confidenceVisualFor } from "./confidenceVisuals.js";
 import { shouldShowDecorations } from "./displayGuards.js";
 import { formatImportSize } from "./format.js";
-import { tooltipForMessage, tooltipForResult } from "./tooltip.js";
+import { tooltipForAnalysisState } from "./tooltip.js";
 
 export class DecorationController implements vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -81,7 +81,7 @@ export class DecorationController implements vscode.Disposable {
 
     return {
       range: new vscode.Range(position, position),
-      hoverMessage: this.hoverForState(state),
+      hoverMessage: tooltipForAnalysisState(state),
       renderOptions: {
         after: {
           contentText: ` ${message}`,
@@ -127,22 +127,6 @@ export class DecorationController implements vscode.Disposable {
     }
 
     return null;
-  }
-
-  private hoverForState(state: ImportAnalysisState): vscode.MarkdownString | undefined {
-    if (state.status === "missing") {
-      return tooltipForMessage("ImportLens", state.message ?? "Package not found");
-    }
-
-    if (state.status === "unavailable") {
-      return tooltipForMessage("ImportLens", state.message ?? "Daemon unavailable");
-    }
-
-    if (state.status === "ready" && state.result) {
-      return tooltipForResult(state.result, state.detected.runtime, state.insights);
-    }
-
-    return undefined;
   }
 
   private colorForState(state: ImportAnalysisState): vscode.ThemeColor {

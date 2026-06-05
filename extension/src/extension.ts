@@ -14,6 +14,7 @@ import { compareImports, compareImportsCommand } from "./ui/compareImports.js";
 import { ImportMemberCompletionProvider } from "./ui/completions.js";
 import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
+import { ImportLensHoverProvider } from "./ui/hoverProvider.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import { showNamedExportCandidates, showNamedExportCandidatesCommand } from "./ui/namedExportCandidates.js";
@@ -50,6 +51,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const decorations = new DecorationController(store);
   const budgetDiagnostics = new BudgetDiagnosticsController(store);
   const inlayHints = new ImportLensInlayHintsProvider(store);
+  const hoverProvider = new ImportLensHoverProvider(store);
   const codeLens = new ImportLensCodeLensProvider(store);
   const treeShakeActions = new TreeShakeCodeActionProvider(store);
 
@@ -58,6 +60,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const completions = new ImportMemberCompletionProvider(daemon);
   context.subscriptions.push(logger, store, statusBar, decorations, budgetDiagnostics, inlayHints, codeLens, packageJsonCodeLens, daemon);
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(languageSelector, inlayHints));
+  context.subscriptions.push(vscode.languages.registerHoverProvider(languageSelector, hoverProvider));
   context.subscriptions.push(vscode.languages.registerCodeLensProvider(languageSelector, codeLens));
   context.subscriptions.push(vscode.languages.registerCodeLensProvider({ language: "json", scheme: "file", pattern: "**/package.json" }, packageJsonCodeLens));
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider(languageSelector, completions, "{", ","));

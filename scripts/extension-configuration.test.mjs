@@ -8,11 +8,11 @@ test("ImportLens log level defaults to info for visible output-channel diagnosti
   assert.equal(manifest.contributes.configuration.properties["importLens.logLevel"].default, "info");
 });
 
-test("ImportLens colored inline renderer is the default with native available", () => {
+test("ImportLens native inline renderer is the default with colored available", () => {
   const setting = manifest.contributes.configuration.properties["importLens.inlineRenderer"];
 
-  assert.equal(setting.default, "colored");
-  assert.deepEqual(setting.enum, ["colored", "native"]);
+  assert.equal(setting.default, "native");
+  assert.deepEqual(setting.enum, ["native", "colored"]);
 });
 
 test("ImportLens budgets expose per-import and per-file Brotli thresholds", () => {

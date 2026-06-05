@@ -4,7 +4,7 @@ import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
 import { shouldShowNativeInlayHints } from "./displayGuards.js";
 import { formatImportSize } from "./format.js";
-import { tooltipForResult } from "./tooltip.js";
+import { tooltipForAnalysisState } from "./tooltip.js";
 
 export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -40,8 +40,9 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
         label = state.message ?? "Daemon unavailable";
       } else if (state.status === "ready" && state.result) {
         label = `${formatImportSize(state.result, config, state.detected.runtime)}${insightLabelSuffix(state.insights)}`;
-        tooltip = tooltipForResult(state.result, state.detected.runtime, state.insights);
       }
+
+      tooltip = tooltipForAnalysisState(state);
 
       if (!label) {
         continue;

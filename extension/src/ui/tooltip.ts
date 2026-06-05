@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { ImportAnalysisInsight } from "../analysis/state.js";
+import type { ImportAnalysisInsight, ImportAnalysisState } from "../analysis/state.js";
 import type { ImportResult } from "../ipc/protocol.js";
 import type { ImportRuntime } from "../imports/types.js";
 import { getImportLensConfig } from "../config.js";
@@ -94,4 +94,20 @@ export const tooltipForMessage = (title: string, message: string): vscode.Markdo
   tooltip.appendMarkdown(`**${title}**\n\n`);
   tooltip.appendText(message);
   return tooltip;
+};
+
+export const tooltipForAnalysisState = (state: ImportAnalysisState): vscode.MarkdownString | undefined => {
+  if (state.status === "missing") {
+    return tooltipForMessage("ImportLens", state.message ?? "Package not found");
+  }
+
+  if (state.status === "unavailable") {
+    return tooltipForMessage("ImportLens", state.message ?? "Daemon unavailable");
+  }
+
+  if (state.status === "ready" && state.result) {
+    return tooltipForResult(state.result, state.detected.runtime, state.insights);
+  }
+
+  return undefined;
 };
