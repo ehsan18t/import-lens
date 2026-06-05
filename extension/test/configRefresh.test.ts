@@ -13,6 +13,7 @@ const config = (enabled: boolean): ImportLensConfig => ({
   useCodeLens: false,
   enableDiskCache: true,
   logLevel: "error",
+  budgets: {},
 });
 
 const document = (languageId: string, scheme = "file") => ({
@@ -27,6 +28,7 @@ test("refreshVisibleImportLensDocuments reanalyzes supported visible file docume
   const scheduled: string[] = [];
   const cleared: string[] = [];
   let decorationRefreshes = 0;
+  let budgetDiagnosticRefreshes = 0;
   let hintRefreshes = 0;
   let codeLensRefreshes = 0;
 
@@ -35,16 +37,18 @@ test("refreshVisibleImportLensDocuments reanalyzes supported visible file docume
     config(true),
     {
       schedule: (doc) => scheduled.push(doc.uri.toString()),
-      clear: (uri) => cleared.push(uri.toString()),
-      refreshDecorations: () => decorationRefreshes++,
-      refreshInlayHints: () => hintRefreshes++,
-      refreshCodeLens: () => codeLensRefreshes++,
+        clear: (uri) => cleared.push(uri.toString()),
+        refreshDecorations: () => decorationRefreshes++,
+        refreshBudgetDiagnostics: () => budgetDiagnosticRefreshes++,
+        refreshInlayHints: () => hintRefreshes++,
+        refreshCodeLens: () => codeLensRefreshes++,
     },
   );
 
   assert.deepEqual(scheduled, ["file:///app/src/file.typescript"]);
   assert.deepEqual(cleared, []);
   assert.equal(decorationRefreshes, 1);
+  assert.equal(budgetDiagnosticRefreshes, 1);
   assert.equal(hintRefreshes, 1);
   assert.equal(codeLensRefreshes, 1);
 });
@@ -60,6 +64,7 @@ test("refreshVisibleImportLensDocuments clears supported visible file documents 
       schedule: (doc) => scheduled.push(doc.uri.toString()),
       clear: (uri) => cleared.push(uri.toString()),
       refreshDecorations: () => undefined,
+      refreshBudgetDiagnostics: () => undefined,
       refreshInlayHints: () => undefined,
       refreshCodeLens: () => undefined,
     },

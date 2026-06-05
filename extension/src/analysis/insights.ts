@@ -5,12 +5,14 @@ import {
   previousImportCostFor,
   type ImportCostHistoryItem,
 } from "./history.js";
+import { budgetInsightForState, type ImportLensBudgets } from "./budgets.js";
 import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
 import { formatBytes } from "../ui/format.js";
 
 export interface ImportAnalysisInsightOptions {
   changedLines?: ReadonlySet<number>;
   importCostHistory: readonly ImportCostHistoryItem[];
+  budgets?: ImportLensBudgets;
   now?: number;
 }
 
@@ -27,6 +29,7 @@ export const applyImportAnalysisInsights = (
 
     const insights = [
       gitDeltaInsight(state, options.changedLines),
+      budgetInsightForState(state, options.budgets ?? {}),
       sharedDependencyInsight(state, sharedModules),
       barrelReexportInsight(state),
       historyTrendInsight(state, options.importCostHistory, options.now),

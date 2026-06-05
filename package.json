@@ -8,6 +8,9 @@
   "icon": "media/icon.png",
   "private": true,
   "type": "module",
+  "bin": {
+    "importlens": "./cli/importlens.mjs"
+  },
   "packageManager": "pnpm@11.5.0+sha512.dbfcc4f81cf48597afd4bc391ffdf12c11f1a9fb83a395bfa6b0a2d9cc2fd8ffebafdb1ccbd529632153f793904c2615b7f09fe1a345473fd1c35845172a8eb1",
   "main": "./extension/dist/extension.cjs",
   "engines": {
@@ -109,6 +112,24 @@
           "default": true,
           "description": "Show warning indicators for imports that may not tree-shake accurately."
         },
+        "importLens.budgets": {
+          "type": "object",
+          "default": {},
+          "description": "Bundle budget thresholds in bytes. ImportLens currently supports perImportBrotliBytes and perFileBrotliBytes.",
+          "properties": {
+            "perImportBrotliBytes": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Warn when a single import's Brotli size exceeds this many bytes."
+            },
+            "perFileBrotliBytes": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Warn when analyzed imports in a file exceed this total Brotli budget."
+            }
+          },
+          "additionalProperties": false
+        },
         "importLens.useCodeLens": {
           "type": "boolean",
           "default": false,
@@ -136,6 +157,7 @@
   "files": [
     "extension/dist/extension.cjs",
     "bin/",
+    "cli/",
     "media/icon.png",
     "node_modules/oxc-parser/",
     "node_modules/@oxc-project/types/",

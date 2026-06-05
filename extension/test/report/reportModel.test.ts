@@ -3,6 +3,8 @@ import test from "node:test";
 import type { DetectedImport } from "../../src/imports/types.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
 import {
+  buildDuplicateImportGroups,
+  buildDuplicateModuleGroups,
   buildReportRows,
   buildReportSummary,
   type WorkspaceReportItem,
@@ -84,6 +86,57 @@ test("buildReportRows summarizes the largest module contributors", () => {
   assert.equal(rows[0].topModules, "large.js (1200 B), small.js (80 B)");
 });
 
+test("buildDuplicateImportGroups aggregates repeated specifiers across files", () => {
+  const rows = buildReportRows([
+    item("react", 100),
+    {
+      ...item("react", 80),
+      sourceFile: "/workspace/src/other.ts",
+    },
+    item("zod", 50),
+  ]);
+
+  assert.deepEqual(buildDuplicateImportGroups(rows), [
+    {
+      specifier: "react",
+      count: 2,
+      totalBrotliBytes: 180,
+      sourceFiles: ["src/other.ts", "src/react.ts"],
+    },
+  ]);
+});
+
+test("buildDuplicateModuleGroups finds shared module paths across report rows", () => {
+  const sharedPath = "/workspace/node_modules/shared/dist/index.js";
+  const rows = buildReportRows([
+    {
+      ...item("left", 100),
+      result: {
+        ...result("left", 100),
+        module_breakdown: [{ path: sharedPath, bytes: 60 }],
+      },
+    },
+    {
+      ...item("right", 90),
+      result: {
+        ...result("right", 90),
+        module_breakdown: [{ path: sharedPath, bytes: 60 }],
+      },
+    },
+  ]);
+
+  assert.deepEqual(buildDuplicateModuleGroups(rows), [
+    {
+      modulePath: sharedPath,
+      basename: "index.js",
+      count: 2,
+      totalBytes: 120,
+      specifiers: ["left", "right"],
+      vendored: false,
+    },
+  ]);
+});
+
 test("buildReportRows carries shared file bytes", () => {
   const rows = buildReportRows([
     {
@@ -129,6 +182,14 @@ test("buildReportRows carries confidence and confidence reasons", () => {
   assert.match(rows[0].warning, /Low confidence/u);
 });
 
+test("buildReportRows reports configured per-import budget violations", () => {
+  const rows = buildReportRows([item("large", 2500)], { perImportBrotliBytes: 2000 });
+  const summary = buildReportSummary(rows);
+
+  assert.match(rows[0].warning, /Budget exceeded/u);
+  assert.equal(summary.budgetViolationCount, 1);
+});
+
 test("buildReportSummary totals imports and builds largest-contributor treemap data", () => {
   const rows = buildReportRows([
     item("small", 10),
@@ -144,6 +205,9 @@ test("buildReportSummary totals imports and builds largest-contributor treemap d
 
   assert.equal(summary.importCount, 2);
   assert.equal(summary.totalBrotliBytes, 100);
+  assert.equal(summary.budgetViolationCount, 0);
+  assert.deepEqual(summary.duplicateImports, []);
+  assert.deepEqual(summary.sharedModules, []);
   assert.deepEqual(
     summary.treemap.map((item) => [item.specifier, item.brotliBytes, item.percentage, item.confidence]),
     [

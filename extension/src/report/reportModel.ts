@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { ImportLensBudgets } from "../analysis/budgets.js";
 import type { DetectedImport } from "../imports/types.js";
 import type { ConfidenceLevel, ImportResult } from "../ipc/protocol.js";
 
@@ -24,6 +25,7 @@ export interface WorkspaceReportRow {
   confidence: ConfidenceLevel | "unknown";
   confidenceReasons: string;
   topModules: string;
+  moduleContributions: { path: string; bytes: number }[];
   warning: string;
 }
 
@@ -42,10 +44,32 @@ export interface WorkspaceReportSummary {
   lowConfidenceCount: number;
   mediumConfidenceCount: number;
   conservativeCount: number;
+  budgetViolationCount: number;
+  duplicateImports: DuplicateImportGroup[];
+  sharedModules: DuplicateModuleGroup[];
   treemap: WorkspaceReportTreemapItem[];
 }
 
-export const buildReportRows = (items: readonly WorkspaceReportItem[]): WorkspaceReportRow[] =>
+export interface DuplicateImportGroup {
+  specifier: string;
+  count: number;
+  totalBrotliBytes: number;
+  sourceFiles: string[];
+}
+
+export interface DuplicateModuleGroup {
+  modulePath: string;
+  basename: string;
+  count: number;
+  totalBytes: number;
+  specifiers: string[];
+  vendored: boolean;
+}
+
+export const buildReportRows = (
+  items: readonly WorkspaceReportItem[],
+  budgets: ImportLensBudgets = {},
+): WorkspaceReportRow[] =>
   items
     .map((item) => {
       const result = item.result;
@@ -64,7 +88,8 @@ export const buildReportRows = (items: readonly WorkspaceReportItem[]): Workspac
         confidence: confidenceForResult(result),
         confidenceReasons: confidenceReasonsForResult(result),
         topModules: moduleBreakdownSummary(result),
-        warning: warningForItem(item),
+        moduleContributions: moduleContributions(result),
+        warning: warningForItem(item, budgets),
       };
     })
     .sort((left, right) => {
@@ -99,8 +124,71 @@ export const buildReportSummary = (rows: readonly WorkspaceReportRow[]): Workspa
     lowConfidenceCount: rows.filter((row) => row.confidence === "low").length,
     mediumConfidenceCount: rows.filter((row) => row.confidence === "medium").length,
     conservativeCount: rows.filter((row) => row.warning.includes("Conservative estimate")).length,
+    budgetViolationCount: rows.filter((row) => row.warning.includes("Budget exceeded")).length,
+    duplicateImports: buildDuplicateImportGroups(rows),
+    sharedModules: buildDuplicateModuleGroups(rows),
     treemap,
   };
+};
+
+export const buildDuplicateImportGroups = (rows: readonly WorkspaceReportRow[]): DuplicateImportGroup[] => {
+  const groups = new Map<string, DuplicateImportGroup>();
+
+  for (const row of rows) {
+    const group = groups.get(row.specifier) ?? {
+      specifier: row.specifier,
+      count: 0,
+      totalBrotliBytes: 0,
+      sourceFiles: [],
+    };
+    group.count += 1;
+    group.totalBrotliBytes += row.brotliBytes;
+    group.sourceFiles.push(row.sourceFile);
+    groups.set(row.specifier, group);
+  }
+
+  return [...groups.values()]
+    .filter((group) => group.count > 1)
+    .map((group) => ({
+      ...group,
+      sourceFiles: [...new Set(group.sourceFiles)].sort(),
+    }))
+    .sort((left, right) =>
+      right.count - left.count
+      || right.totalBrotliBytes - left.totalBrotliBytes
+      || left.specifier.localeCompare(right.specifier));
+};
+
+export const buildDuplicateModuleGroups = (rows: readonly WorkspaceReportRow[]): DuplicateModuleGroup[] => {
+  const groups = new Map<string, DuplicateModuleGroup>();
+
+  for (const row of rows) {
+    for (const module of row.moduleContributions) {
+      const group = groups.get(module.path) ?? {
+        modulePath: module.path,
+        basename: path.basename(module.path),
+        count: 0,
+        totalBytes: 0,
+        specifiers: [],
+        vendored: isVendoredModulePath(module.path),
+      };
+      group.count += 1;
+      group.totalBytes += module.bytes;
+      group.specifiers.push(row.specifier);
+      groups.set(module.path, group);
+    }
+  }
+
+  return [...groups.values()]
+    .filter((group) => group.count > 1)
+    .map((group) => ({
+      ...group,
+      specifiers: [...new Set(group.specifiers)].sort(),
+    }))
+    .sort((left, right) =>
+      right.count - left.count
+      || right.totalBytes - left.totalBytes
+      || left.modulePath.localeCompare(right.modulePath));
 };
 
 const relativeSourceFile = (workspaceRoot: string, sourceFile: string): string => {
@@ -109,13 +197,14 @@ const relativeSourceFile = (workspaceRoot: string, sourceFile: string): string =
 };
 
 const moduleBreakdownSummary = (result: ImportResult | undefined): string => {
-  const modules = result?.module_breakdown ?? [];
-
-  return modules
+  return moduleContributions(result)
     .slice(0, 3)
     .map((module) => `${path.basename(module.path)} (${module.bytes} B)`)
     .join(", ");
 };
+
+const moduleContributions = (result: ImportResult | undefined): { path: string; bytes: number }[] =>
+  result?.module_breakdown?.map((module) => ({ path: module.path, bytes: module.bytes })) ?? [];
 
 const confidenceForResult = (result: ImportResult | undefined): ConfidenceLevel | "unknown" =>
   result?.confidence ?? "unknown";
@@ -123,7 +212,7 @@ const confidenceForResult = (result: ImportResult | undefined): ConfidenceLevel 
 const confidenceReasonsForResult = (result: ImportResult | undefined): string =>
   result?.confidence_reasons.join(" · ") ?? "";
 
-const warningForItem = (item: WorkspaceReportItem): string => {
+const warningForItem = (item: WorkspaceReportItem, budgets: ImportLensBudgets): string => {
   const warnings: string[] = [];
 
   if (item.warning) {
@@ -136,6 +225,15 @@ const warningForItem = (item: WorkspaceReportItem): string => {
 
   if (item.result?.shared_bytes && item.result.shared_bytes > 0) {
     warnings.push(`Shares ${item.result.shared_bytes} B with other imports in this file`);
+  }
+
+  if (
+    item.result
+    && !item.result.error
+    && budgets.perImportBrotliBytes !== undefined
+    && item.result.brotli_bytes > budgets.perImportBrotliBytes
+  ) {
+    warnings.push(`Budget exceeded: ${item.result.brotli_bytes} B br > ${budgets.perImportBrotliBytes} B br`);
   }
 
   if (item.result?.is_cjs || item.result?.side_effects || item.result?.truly_treeshakeable === false) {
@@ -157,4 +255,9 @@ const confidenceReasonSuffix = (result: ImportResult): string => {
   }
 
   return `: ${result.confidence_reasons.join(" · ")}`;
+};
+
+const isVendoredModulePath = (modulePath: string): boolean => {
+  const normalized = modulePath.split(path.sep).join("/");
+  return /\/vendor(?:ed|s)?\//iu.test(normalized) || /\/node_modules\/.*\/node_modules\//iu.test(normalized);
 };

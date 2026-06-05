@@ -217,6 +217,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       const nextStates = applyImportAnalysisInsights(responseStates, {
         changedLines: await changedLinesPromise,
         importCostHistory: history,
+        budgets: config.budgets,
       });
 
       this.#store.set(document.uri, nextStates);

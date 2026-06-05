@@ -4,6 +4,7 @@ export const createStagedManifest = ({ manifest, bindingPackage }) => {
   const files = [
     "extension/dist/extension.cjs",
     "bin/",
+    "cli/",
     "node_modules/oxc-parser/",
     `node_modules/@oxc-parser/${path.basename(bindingPackage)}/`,
     "node_modules/@oxc-project/types/",

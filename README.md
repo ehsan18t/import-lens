@@ -37,6 +37,7 @@ All of this happens invisibly in a secure, self-contained background daemon, mea
 ImportLens adds context next to size labels when the extra signal is useful:
 
 - **Confidence colors:** High-confidence sizes use a muted success color, medium confidence uses amber, and low confidence uses red. Low-confidence inline labels also start with `~`, for example `~1.6 kB br`.
+- **Budgets:** Optional per-import and per-file Brotli thresholds surface as editor diagnostics, inline `over budget` labels, hovers, reports, and CLI failures.
 - **Working-tree deltas:** Imports added or modified in the current Git diff show their current added Brotli cost, for example `+2.1 kB br`.
 - **History trends:** Repeated measurements can show when an import became larger or smaller after dependency updates.
 - **Shared bytes:** When multiple imports in the same file include the same module path, hovers and reports explain the shared cost.
@@ -51,7 +52,7 @@ ImportLens does not rewrite source files automatically. Actions that suggest nam
 | --- | --- |
 | `ImportLens: Show Current File Size` | Calculates a deduplicated total for runtime package imports in the active file and records it in bundle impact history. |
 | `ImportLens: Show Bundle Impact History` | Shows recent current-file measurements from VS Code global storage. |
-| `ImportLens: Show Report` | Scans the workspace and opens a report of imports sorted by Brotli size. |
+| `ImportLens: Show Report` | Scans the workspace and opens a report of imports sorted by Brotli size, with duplicate imports, shared modules, budget counts, and an SVG treemap. |
 | `ImportLens: Clear Cache` | Clears daemon memory and disk cache, then reanalyzes the active document. |
 | `ImportLens: Show Logs` | Opens the ImportLens output channel. |
 
@@ -64,6 +65,7 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 | `importLens.display` | Set the display mode: `inlayHint` (default), `minimal`, `standard`, or `verbose`. |
 | `importLens.inlineRenderer` | Choose the renderer for `display: inlayHint`: `colored` (default) for confidence-colored decoration-backed hints, or `native` for VS Code's screen-reader-accessible Inlay Hints API. |
 | `importLens.compression` | The primary compression size to display: `brotli` (default), `gzip`, `zstd`, or `all`. |
+| `importLens.budgets` | Optional budget object with `perImportBrotliBytes` and `perFileBrotliBytes` thresholds. |
 | `importLens.enableDiskCache` | Enable persistent caching to disk (`true` by default). |
 | `importLens.useCodeLens` | Show sizes as a CodeLens above the import instead of inline (`false` by default). |
 | `importLens.showWarnings` | Show warning indicators when a package cannot be efficiently tree-shaken. |
@@ -75,6 +77,10 @@ If ImportLens cannot determine the size of a package, it will show an `unavailab
 Hover over the import statement and click **Copy diagnostics** to extract the detailed, structured error context directly from the Rust daemon for easy debugging.
 
 CommonJS-only packages, packages with conservative `sideEffects` metadata, and imports that are not truly tree-shakeable include confidence and diagnostic details in hovers, reports, copied diagnostics, and debug logs. The normal output channel warning level is reserved for daemon, IPC, startup, protocol, or no-result failures.
+
+## CLI Budget Check
+
+Run `importlens check` from a workspace to check changed JS/TS files from `git diff HEAD` against configured budgets. Budgets can live in `.importlensrc.json` as `{ "budgets": { ... } }` or in `package.json` as `{ "importLens": { "budgets": { ... } } }`. The CLI uses the native daemon for real Brotli sizes and exits non-zero when a threshold is exceeded.
 
 ## Requirements
 

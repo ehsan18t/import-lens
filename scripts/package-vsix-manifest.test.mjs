@@ -25,6 +25,7 @@ test("createStagedManifest includes the repository license in packaged files", (
   });
 
   assert.ok(staged.files.includes("LICENSE"));
+  assert.ok(staged.files.includes("cli/"));
 });
 
 test("createStagedManifest keeps target parser binding and strips development-only fields", () => {

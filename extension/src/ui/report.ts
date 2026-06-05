@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
 import { buildReportRows, buildReportSummary } from "../report/reportModel.js";
 import { buildWorkspaceReportItems, type WorkspaceScannerApi } from "../report/workspaceScanner.js";
@@ -16,22 +17,24 @@ export const showReport = async (
     },
     () => buildWorkspaceReportItems(workspaceScannerApi(), daemon),
   );
-  const reportRows = buildReportRows(items);
+  const config = getImportLensConfig();
+  const reportRows = buildReportRows(items, config.budgets);
   const summary = buildReportSummary(reportRows);
   const panel = vscode.window.createWebviewPanel("importLensReport", "ImportLens Report", vscode.ViewColumn.Beside, {
     enableScripts: false,
   });
-  const treemap = summary.treemap
-    .map((item) => `<div class="bar">
-<div class="bar-fill ${confidenceVisualFor(item.confidence).cssClass}" style="width:${item.percentage}%"></div>
-<div class="bar-label">${escapeHtml(item.specifier)} · ${formatBytes(item.brotliBytes)} br · ${item.percentage}%</div>
-</div>`)
-    .join("");
+  const treemap = svgTreemap(summary.treemap);
   const confidenceLegend = (["high", "medium", "low"] as const)
     .map((confidence) => {
       const visual = confidenceVisualFor(confidence);
       return `<span class="legend-item ${visual.cssClass}"><span class="legend-swatch"></span>${visual.label}</span>`;
     })
+    .join("");
+  const duplicateImports = summary.duplicateImports
+    .map((item) => `<tr><td>${escapeHtml(item.specifier)}</td><td>${item.count}</td><td>${formatBytes(item.totalBrotliBytes)}</td><td>${escapeHtml(item.sourceFiles.join(", "))}</td></tr>`)
+    .join("");
+  const sharedModules = summary.sharedModules
+    .map((item) => `<tr><td>${escapeHtml(item.basename)}</td><td>${item.count}</td><td>${formatBytes(item.totalBytes)}</td><td>${escapeHtml(item.specifiers.join(", "))}</td><td>${item.vendored ? "yes" : "no"}</td><td>${escapeHtml(item.modulePath)}</td></tr>`)
     .join("");
   const rows = reportRows
     .map((row) => `<tr>
@@ -62,10 +65,8 @@ body{font-family:var(--vscode-font-family);padding:16px;color:var(--vscode-foreg
 .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin:0 0 16px}
 .metric{border:1px solid var(--vscode-panel-border);padding:8px}
 .metric strong{display:block;font-size:18px;margin-top:2px}
-.bars{margin:0 0 16px}
-.bar{position:relative;height:24px;margin:4px 0;background:var(--vscode-editorWidget-background);overflow:hidden}
-.bar-fill{position:absolute;inset:0 auto 0 0;background:var(--vscode-progressBar-background)}
-.bar-label{position:relative;padding:4px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.treemap{margin:0 0 16px;max-width:100%;height:auto;background:var(--vscode-editorWidget-background)}
+.treemap text{fill:var(--vscode-editor-foreground);font-size:12px}
 .legend{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 12px}
 .legend-item{display:inline-flex;align-items:center;gap:6px;font-weight:600}
 .legend-swatch{width:10px;height:10px;background:currentColor;border-radius:2px}
@@ -74,9 +75,10 @@ body{font-family:var(--vscode-font-family);padding:16px;color:var(--vscode-foreg
 .confidence-medium{color:${confidenceCssColor("medium")}}
 .confidence-low{color:${confidenceCssColor("low")}}
 .confidence-unknown{color:${confidenceCssColor("unknown")}}
-.bar-fill.confidence-high{background:${confidenceCssColor("high")}}
-.bar-fill.confidence-medium{background:${confidenceCssColor("medium")}}
-.bar-fill.confidence-low{background:${confidenceCssColor("low")}}
+.confidence-fill-high{fill:${confidenceCssColor("high")}}
+.confidence-fill-medium{fill:${confidenceCssColor("medium")}}
+.confidence-fill-low{fill:${confidenceCssColor("low")}}
+.confidence-fill-unknown{fill:${confidenceCssColor("unknown")}}
 table{border-collapse:collapse;width:100%}
 td,th{border-bottom:1px solid var(--vscode-panel-border);padding:6px 8px;text-align:left;vertical-align:top}
 th{font-weight:600}
@@ -91,9 +93,21 @@ th{font-weight:600}
 <div class="metric">Low confidence<strong>${summary.lowConfidenceCount}</strong></div>
 <div class="metric">Medium confidence<strong>${summary.mediumConfidenceCount}</strong></div>
 <div class="metric">Conservative<strong>${summary.conservativeCount}</strong></div>
+<div class="metric">Budget violations<strong>${summary.budgetViolationCount}</strong></div>
 </section>
 <section class="legend">${confidenceLegend}</section>
-<section class="bars">${treemap || `<p class="empty">No measured imports to summarize.</p>`}</section>
+<section>${treemap || `<p class="empty">No measured imports to summarize.</p>`}</section>
+<h2>Duplicate Imports</h2>
+<table>
+<thead><tr><th>Import</th><th>Count</th><th>Total Brotli</th><th>Sources</th></tr></thead>
+<tbody>${duplicateImports || `<tr><td class="empty" colspan="4">No duplicate import specifiers found.</td></tr>`}</tbody>
+</table>
+<h2>Shared Modules</h2>
+<table>
+<thead><tr><th>Module</th><th>Count</th><th>Total Bytes</th><th>Imports</th><th>Vendored</th><th>Path</th></tr></thead>
+<tbody>${sharedModules || `<tr><td class="empty" colspan="6">No shared top modules found.</td></tr>`}</tbody>
+</table>
+<h2>Imports</h2>
 <table>
 <thead><tr><th>Package</th><th>Import</th><th>Source</th><th>Line</th><th>Runtime</th><th>Minified</th><th>Gzip</th><th>Brotli</th><th>Zstd</th><th>Shared</th><th>Confidence</th><th>Confidence Reasons</th><th>Top Modules</th><th>Warning</th></tr></thead>
 <tbody>${rows || `<tr><td class="empty" colspan="14">No package imports found.</td></tr>`}</tbody>
@@ -115,3 +129,26 @@ const escapeHtml = (value: string): string =>
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+
+const svgTreemap = (
+  items: ReturnType<typeof buildReportSummary>["treemap"],
+): string => {
+  if (items.length === 0) {
+    return "";
+  }
+
+  const width = 1000;
+  const rowHeight = 28;
+  const height = items.length * rowHeight;
+  const rows = items.map((item, index) => {
+    const y = index * rowHeight;
+    const fillClass = confidenceVisualFor(item.confidence).cssClass.replace("confidence-", "confidence-fill-");
+    const barWidth = Math.max(1, Math.round((item.percentage / 100) * width));
+    return `<g>
+<rect class="${fillClass}" x="0" y="${y}" width="${barWidth}" height="24"></rect>
+<text x="8" y="${y + 17}">${escapeHtml(item.specifier)} · ${formatBytes(item.brotliBytes)} br · ${item.percentage}%</text>
+</g>`;
+  }).join("");
+
+  return `<svg class="treemap" viewBox="0 0 ${width} ${height}" role="img" aria-label="Brotli size treemap">${rows}</svg>`;
+};

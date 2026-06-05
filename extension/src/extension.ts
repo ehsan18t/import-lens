@@ -8,6 +8,7 @@ import { languageSelector } from "./languages.js";
 import { ImportLensLogger } from "./logger.js";
 import { registerNodeModulesWatchers } from "./watcher.js";
 import { registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
+import { BudgetDiagnosticsController } from "./ui/budgetDiagnostics.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
 import { ImportMemberCompletionProvider } from "./ui/completions.js";
 import { DecorationController } from "./ui/decorations.js";
@@ -36,13 +37,14 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const store = new AnalysisStore();
   const statusBar = new StatusBarController();
   const decorations = new DecorationController(store);
+  const budgetDiagnostics = new BudgetDiagnosticsController(store);
   const inlayHints = new ImportLensInlayHintsProvider(store);
   const codeLens = new ImportLensCodeLensProvider(store);
   const treeShakeActions = new TreeShakeCodeActionProvider(store);
 
   daemon = new DaemonManager(context, logger);
   const completions = new ImportMemberCompletionProvider(daemon);
-  context.subscriptions.push(logger, store, statusBar, decorations, inlayHints, codeLens, daemon);
+  context.subscriptions.push(logger, store, statusBar, decorations, budgetDiagnostics, inlayHints, codeLens, daemon);
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(languageSelector, inlayHints));
   context.subscriptions.push(vscode.languages.registerCodeLensProvider(languageSelector, codeLens));
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider(languageSelector, completions, "{", ","));
@@ -59,6 +61,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         schedule: (document) => analysis.schedule(document),
         clear: (uri) => store.clear(uri),
         refreshDecorations: () => decorations.refreshVisibleEditors(),
+        refreshBudgetDiagnostics: () => budgetDiagnostics.refreshVisibleEditors(),
         refreshInlayHints: () => inlayHints.refresh(),
         refreshCodeLens: () => codeLens.refresh(),
       },

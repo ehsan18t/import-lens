@@ -13,6 +13,7 @@ export interface ImportLensRefreshActions<TDocument extends RefreshableDocument>
   schedule(document: TDocument): void;
   clear(uri: TDocument["uri"]): void;
   refreshDecorations(): void;
+  refreshBudgetDiagnostics(): void;
   refreshInlayHints(): void;
   refreshCodeLens(): void;
 }
@@ -35,6 +36,7 @@ export const refreshVisibleImportLensDocuments = <TDocument extends RefreshableD
   }
 
   actions.refreshDecorations();
+  actions.refreshBudgetDiagnostics();
   actions.refreshInlayHints();
   actions.refreshCodeLens();
 };

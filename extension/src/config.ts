@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { sanitizeBudgets, type ImportLensBudgets } from "./analysis/budgets.js";
 import type { CompressionFormat, DisplayMode } from "./ui/format.js";
 import type { LogLevel } from "./ipc/protocol.js";
 import { defaultLogLevel } from "./loggerCore.js";
@@ -15,6 +16,7 @@ export interface ImportLensConfig {
   useCodeLens: boolean;
   enableDiskCache: boolean;
   logLevel: LogLevel;
+  budgets: ImportLensBudgets;
 }
 
 export const getImportLensConfig = (): ImportLensConfig => {
@@ -30,5 +32,6 @@ export const getImportLensConfig = (): ImportLensConfig => {
     useCodeLens: config.get("useCodeLens", false),
     enableDiskCache: config.get("enableDiskCache", true),
     logLevel: config.get<LogLevel>("logLevel", defaultLogLevel),
+    budgets: sanitizeBudgets(config.get("budgets", {})),
   };
 };
