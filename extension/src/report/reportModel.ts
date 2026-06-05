@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { DetectedImport } from "../imports/types.js";
-import type { ImportResult } from "../ipc/protocol.js";
+import type { ConfidenceLevel, ImportResult } from "../ipc/protocol.js";
 
 export interface WorkspaceReportItem {
   detected: DetectedImport;
@@ -21,8 +21,27 @@ export interface WorkspaceReportRow {
   brotliBytes: number;
   zstdBytes: number;
   sharedBytes: number;
+  confidence: ConfidenceLevel | "unknown";
+  confidenceReasons: string;
   topModules: string;
   warning: string;
+}
+
+export interface WorkspaceReportTreemapItem {
+  packageName: string;
+  specifier: string;
+  sourceFile: string;
+  brotliBytes: number;
+  percentage: number;
+}
+
+export interface WorkspaceReportSummary {
+  importCount: number;
+  totalBrotliBytes: number;
+  lowConfidenceCount: number;
+  mediumConfidenceCount: number;
+  conservativeCount: number;
+  treemap: WorkspaceReportTreemapItem[];
 }
 
 export const buildReportRows = (items: readonly WorkspaceReportItem[]): WorkspaceReportRow[] =>
@@ -41,6 +60,8 @@ export const buildReportRows = (items: readonly WorkspaceReportItem[]): Workspac
         brotliBytes: result?.brotli_bytes ?? 0,
         zstdBytes: result?.zstd_bytes ?? 0,
         sharedBytes: result?.shared_bytes ?? 0,
+        confidence: confidenceForResult(result),
+        confidenceReasons: confidenceReasonsForResult(result),
         topModules: moduleBreakdownSummary(result),
         warning: warningForItem(item),
       };
@@ -57,6 +78,29 @@ export const buildReportRows = (items: readonly WorkspaceReportItem[]): Workspac
       );
     });
 
+export const buildReportSummary = (rows: readonly WorkspaceReportRow[]): WorkspaceReportSummary => {
+  const totalBrotliBytes = rows.reduce((total, row) => total + row.brotliBytes, 0);
+  const treemap = rows
+    .filter((row) => row.brotliBytes > 0)
+    .slice(0, 10)
+    .map((row) => ({
+      packageName: row.packageName,
+      specifier: row.specifier,
+      sourceFile: row.sourceFile,
+      brotliBytes: row.brotliBytes,
+      percentage: totalBrotliBytes > 0 ? Math.round((row.brotliBytes / totalBrotliBytes) * 100) : 0,
+    }));
+
+  return {
+    importCount: rows.length,
+    totalBrotliBytes,
+    lowConfidenceCount: rows.filter((row) => row.confidence === "low").length,
+    mediumConfidenceCount: rows.filter((row) => row.confidence === "medium").length,
+    conservativeCount: rows.filter((row) => row.warning.includes("Conservative estimate")).length,
+    treemap,
+  };
+};
+
 const relativeSourceFile = (workspaceRoot: string, sourceFile: string): string => {
   const relative = path.relative(workspaceRoot, sourceFile);
   return (relative || sourceFile).split(path.sep).join("/");
@@ -70,6 +114,12 @@ const moduleBreakdownSummary = (result: ImportResult | undefined): string => {
     .map((module) => `${path.basename(module.path)} (${module.bytes} B)`)
     .join(", ");
 };
+
+const confidenceForResult = (result: ImportResult | undefined): ConfidenceLevel | "unknown" =>
+  result?.confidence ?? "unknown";
+
+const confidenceReasonsForResult = (result: ImportResult | undefined): string =>
+  result?.confidence_reasons.join(" · ") ?? "";
 
 const warningForItem = (item: WorkspaceReportItem): string => {
   const warnings: string[] = [];
@@ -90,5 +140,19 @@ const warningForItem = (item: WorkspaceReportItem): string => {
     warnings.push("Conservative estimate");
   }
 
+  if (item.result?.confidence === "low") {
+    warnings.push(`Low confidence${confidenceReasonSuffix(item.result)}`);
+  } else if (item.result?.confidence === "medium") {
+    warnings.push(`Medium confidence${confidenceReasonSuffix(item.result)}`);
+  }
+
   return warnings.join(" · ");
+};
+
+const confidenceReasonSuffix = (result: ImportResult): string => {
+  if (result.confidence_reasons.length === 0) {
+    return "";
+  }
+
+  return `: ${result.confidence_reasons.join(" · ")}`;
 };

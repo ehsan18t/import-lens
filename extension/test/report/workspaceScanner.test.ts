@@ -59,6 +59,34 @@ test("analyzeScannedImports sends daemon batches per source file", async () => {
   assert.deepEqual(items.map((item) => item.result?.specifier), ["react", "lodash-es"]);
 });
 
+test("analyzeScannedImports default request IDs stay unique across report scans", async () => {
+  const originalNow = Date.now;
+  const requestIds: number[] = [];
+  Date.now = () => 1_700_000;
+  const daemon = {
+    state: "ready" as const,
+    sendBatch: async (request: BatchRequest): Promise<BatchResponse> => {
+      requestIds.push(request.request_id);
+      return {
+        version: request.version,
+        request_id: request.request_id,
+        imports: request.imports.map((item) => result(item.specifier)),
+      };
+    },
+  };
+
+  try {
+    await Promise.all([
+      analyzeScannedImports([scanned("react", "/workspace/src/a.ts")], daemon),
+      analyzeScannedImports([scanned("lodash-es", "/workspace/src/b.ts")], daemon),
+    ]);
+  } finally {
+    Date.now = originalNow;
+  }
+
+  assert.equal(new Set(requestIds).size, requestIds.length);
+});
+
 const requestIdGenerator = (): (() => number) => {
   let requestId = 0;
   return () => {

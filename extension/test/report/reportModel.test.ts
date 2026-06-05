@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { DetectedImport } from "../../src/imports/types.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
-import { buildReportRows, type WorkspaceReportItem } from "../../src/report/reportModel.js";
+import {
+  buildReportRows,
+  buildReportSummary,
+  type WorkspaceReportItem,
+} from "../../src/report/reportModel.js";
 
 const detected = (specifier: string): DetectedImport => ({
   specifier,
@@ -106,4 +110,36 @@ test("buildReportRows explains shared dependency bytes", () => {
   ]);
 
   assert.match(rows[0].warning, /Shares 25 B with other imports/u);
+});
+
+test("buildReportRows carries confidence and confidence reasons", () => {
+  const rows = buildReportRows([
+    {
+      ...item("fallback-lib", 100),
+      result: {
+        ...result("fallback-lib", 100),
+        confidence: "low",
+        confidence_reasons: ["Static entry sizing is a fallback."],
+      },
+    },
+  ]);
+
+  assert.equal(rows[0].confidence, "low");
+  assert.equal(rows[0].confidenceReasons, "Static entry sizing is a fallback.");
+  assert.match(rows[0].warning, /Low confidence/u);
+});
+
+test("buildReportSummary totals imports and builds largest-contributor treemap data", () => {
+  const rows = buildReportRows([item("small", 10), item("large", 90)]);
+  const summary = buildReportSummary(rows);
+
+  assert.equal(summary.importCount, 2);
+  assert.equal(summary.totalBrotliBytes, 100);
+  assert.deepEqual(
+    summary.treemap.map((item) => [item.specifier, item.brotliBytes, item.percentage]),
+    [
+      ["large", 90, 90],
+      ["small", 10, 10],
+    ],
+  );
 });
