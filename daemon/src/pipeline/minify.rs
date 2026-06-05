@@ -16,6 +16,45 @@ pub fn minify_source_with_markers(source: &str, is_cjs: bool) -> Result<String, 
     minify_source_inner(source, is_cjs, true)
 }
 
+pub fn validate_source(source: &str, is_cjs: bool) -> Result<(), String> {
+    let allocator = Allocator::default();
+    let source_type = if is_cjs {
+        SourceType::cjs()
+    } else {
+        SourceType::mjs()
+    };
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+
+    if parsed.panicked || !parsed.errors.is_empty() {
+        return Err(format!(
+            "failed to parse generated source: {}",
+            parsed
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    let semantic = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
+    if !semantic.errors.is_empty() {
+        return Err(format!(
+            "semantic validation failed for generated source: {}",
+            semantic
+                .errors
+                .iter()
+                .map(|error| format!("{error:?}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    Ok(())
+}
+
 fn minify_source_inner(
     source: &str,
     is_cjs: bool,

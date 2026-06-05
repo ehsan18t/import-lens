@@ -657,6 +657,45 @@ fn analyze_namespace_import_reports_oxc_fallback_diagnostic() {
 }
 
 #[test]
+fn analyze_named_import_falls_back_to_static_entry_after_oxc_failure() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "named-fallback-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "export const value = ;\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "named-fallback-lib",
+            "named-fallback-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["value"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert_eq!(result.confidence, ConfidenceLevel::Low);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "oxc_fallback"
+                && diagnostic.message.contains("static entry")),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_import_returns_partial_error_result_on_missing_entry() {
     let workspace = temp_workspace();
     write_package(

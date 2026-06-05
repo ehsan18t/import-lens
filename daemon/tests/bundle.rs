@@ -1,5 +1,7 @@
 use import_lens_daemon::pipeline::{
-    bundle::bundle_reachable_modules, graph::build_module_graph, minify::minify_source,
+    bundle::{bundle_reachable_modules, bundle_reachable_modules_with_metadata},
+    graph::build_module_graph,
+    minify::minify_source,
     reachability::reachable_exports,
 };
 use oxc_allocator::Allocator;
@@ -261,5 +263,61 @@ fn bundle_preserves_object_shorthand_and_string_literals_when_renaming() {
     assert!(bundled.contains("\"value\""), "{bundled}");
     assert!(!bundled.contains("\"__il_m1_value\""), "{bundled}");
     assert_semantic_valid(&bundled);
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+}
+
+#[test]
+fn bundle_namespace_reexport_does_not_emit_marker_for_missing_entry_binding() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export * as mod from './dep.js';");
+    write_source(
+        &root,
+        "dep.js",
+        "export const value = 1;\nexport const other = 2;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["mod".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+
+    assert!(
+        !bundled.contains("__il_m0_mod as __importLensUse"),
+        "{bundled}"
+    );
+    assert_semantic_valid(&bundled);
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+}
+
+#[test]
+fn bundle_imported_then_exported_binding_marker_references_target_binding() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { value } from './dep.js';\nexport { value };",
+    );
+    write_source(&root, "dep.js", "export const value = 1;");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["value".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+
+    assert!(
+        !bundled
+            .minifier_source
+            .contains("__il_m0_value as __importLensUse"),
+        "{}",
+        bundled.minifier_source
+    );
+    assert!(
+        bundled
+            .minifier_source
+            .contains("__il_m1_value as __importLensUse"),
+        "{}",
+        bundled.minifier_source
+    );
+    assert_semantic_valid(&bundled.minifier_source);
     fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
 }

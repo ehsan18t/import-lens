@@ -6,6 +6,11 @@ use crate::{
     },
 };
 use oxc_allocator::Allocator;
+use oxc_ast::ast::{
+    AssignmentTargetPropertyIdentifier, BindingPattern, BindingProperty, Expression,
+    ObjectProperty, Program,
+};
+use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{SourceType, Span};
@@ -453,6 +458,7 @@ fn semantic_rename_replacements(
         ));
     }
 
+    let shorthand_spans = shorthand_identifier_spans(&parsed.program);
     let semantic = semantic.semantic;
     let scoping = semantic.scoping();
     let mut replacements = Vec::new();
@@ -468,6 +474,7 @@ fn semantic_rename_replacements(
             &module.source,
             scoping.symbol_span(symbol_id),
             new_name,
+            &shorthand_spans,
             protected_replacements,
             &mut seen_spans,
             &mut replacements,
@@ -478,6 +485,7 @@ fn semantic_rename_replacements(
                 &module.source,
                 semantic.reference_span(reference),
                 new_name,
+                &shorthand_spans,
                 protected_replacements,
                 &mut seen_spans,
                 &mut replacements,
@@ -492,6 +500,7 @@ fn push_semantic_rename(
     source: &str,
     span: Span,
     new_name: &str,
+    shorthand_spans: &HashSet<(usize, usize)>,
     protected_replacements: &[Replacement],
     seen_spans: &mut HashSet<(usize, usize)>,
     replacements: &mut Vec<Replacement>,
@@ -507,7 +516,7 @@ fn push_semantic_rename(
         return Ok(());
     }
 
-    let value = if is_object_shorthand_occurrence(source, start, end) {
+    let value = if shorthand_spans.contains(&(start, end)) {
         format!("{original_name}: {new_name}")
     } else {
         new_name.to_owned()
@@ -603,123 +612,77 @@ fn usage_markers(
     markers
 }
 
-fn is_object_shorthand_occurrence(source: &str, start: usize, end: usize) -> bool {
-    enclosing_delimiter(source, start) == Some(b'{')
-        && matches!(previous_significant_byte(source, start), Some(b'{' | b','))
-        && matches!(next_significant_byte(source, end), Some(b'}' | b',' | b'='))
+fn shorthand_identifier_spans(program: &Program<'_>) -> HashSet<(usize, usize)> {
+    let mut collector = ShorthandIdentifierCollector::default();
+    collector.visit_program(program);
+    collector.spans
 }
 
-fn previous_significant_byte(source: &str, start: usize) -> Option<u8> {
-    source.as_bytes()[..start]
-        .iter()
-        .rev()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
+#[derive(Default)]
+struct ShorthandIdentifierCollector {
+    spans: HashSet<(usize, usize)>,
 }
 
-fn next_significant_byte(source: &str, end: usize) -> Option<u8> {
-    source.as_bytes()[end..]
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
+impl<'a> Visit<'a> for ShorthandIdentifierCollector {
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        if property.shorthand
+            && let Expression::Identifier(identifier) = &property.value
+        {
+            self.spans.insert(span_bounds(identifier.span));
+        }
+
+        walk::walk_object_property(self, property);
+    }
+
+    fn visit_binding_property(&mut self, property: &BindingProperty<'a>) {
+        if property.shorthand {
+            collect_binding_pattern_spans(&property.value, &mut self.spans);
+        }
+
+        walk::walk_binding_property(self, property);
+    }
+
+    fn visit_assignment_target_property_identifier(
+        &mut self,
+        property: &AssignmentTargetPropertyIdentifier<'a>,
+    ) {
+        self.spans.insert(span_bounds(property.binding.span));
+        walk::walk_assignment_target_property_identifier(self, property);
+    }
 }
 
-fn enclosing_delimiter(source: &str, position: usize) -> Option<u8> {
-    let bytes = source.as_bytes();
-    let mut stack = Vec::new();
-    let mut index = 0;
-
-    while index < position && index < bytes.len() {
-        let byte = bytes[index];
-        match byte {
-            b'\'' | b'"' | b'`' => {
-                index = skip_quoted(source, index, byte);
+fn collect_binding_pattern_spans(
+    pattern: &BindingPattern<'_>,
+    spans: &mut HashSet<(usize, usize)>,
+) {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => {
+            spans.insert(span_bounds(identifier.span));
+        }
+        BindingPattern::AssignmentPattern(pattern) => {
+            collect_binding_pattern_spans(&pattern.left, spans);
+        }
+        BindingPattern::ObjectPattern(pattern) => {
+            for property in &pattern.properties {
+                collect_binding_pattern_spans(&property.value, spans);
             }
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                index = skip_line_comment(source, index);
+            if let Some(rest) = &pattern.rest {
+                collect_binding_pattern_spans(&rest.argument, spans);
             }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index = skip_block_comment(source, index);
+        }
+        BindingPattern::ArrayPattern(pattern) => {
+            for element in pattern.elements.iter().flatten() {
+                collect_binding_pattern_spans(element, spans);
             }
-            b'{' | b'[' | b'(' => {
-                stack.push(byte);
-                index += 1;
-            }
-            b'}' => {
-                pop_matching_delimiter(&mut stack, b'{');
-                index += 1;
-            }
-            b']' => {
-                pop_matching_delimiter(&mut stack, b'[');
-                index += 1;
-            }
-            b')' => {
-                pop_matching_delimiter(&mut stack, b'(');
-                index += 1;
-            }
-            _ => {
-                index = next_char_end(source, index);
+            if let Some(rest) = &pattern.rest {
+                collect_binding_pattern_spans(&rest.argument, spans);
             }
         }
     }
-
-    stack.last().copied()
 }
 
-fn pop_matching_delimiter(stack: &mut Vec<u8>, expected: u8) {
-    if stack.last() == Some(&expected) {
-        stack.pop();
-    }
-}
-
-fn skip_quoted(source: &str, start: usize, quote: u8) -> usize {
-    let bytes = source.as_bytes();
-    let mut index = start + 1;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        index = next_char_end(source, index);
-        if byte == b'\\' && index < bytes.len() {
-            index = next_char_end(source, index);
-        } else if byte == quote {
-            break;
-        }
-    }
-    index
-}
-
-fn skip_line_comment(source: &str, start: usize) -> usize {
-    let bytes = source.as_bytes();
-    let mut index = start;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        index += 1;
-        if byte == b'\n' {
-            break;
-        }
-    }
-    index
-}
-
-fn skip_block_comment(source: &str, start: usize) -> usize {
-    let bytes = source.as_bytes();
-    let mut index = start;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        index += 1;
-        if byte == b'*' && bytes.get(index) == Some(&b'/') {
-            index += 1;
-            break;
-        }
-    }
-    index
-}
-
-fn next_char_end(source: &str, start: usize) -> usize {
-    source[start..]
-        .chars()
-        .next()
-        .map(|character| start + character.len_utf8())
-        .unwrap_or(start + 1)
+fn span_bounds(span: Span) -> (usize, usize) {
+    (span.start as usize, span.end as usize)
 }
 
 fn module_binding_name(module_id: ModuleId, name: &str) -> String {

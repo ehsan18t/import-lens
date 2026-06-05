@@ -8,7 +8,7 @@ use crate::{
         cjs::{CjsGraphAnalysis, analyze_cjs_graph_with_runtime},
         compress::compress_all,
         graph::{ModuleGraph, ModuleId, build_module_graph_cached_with_runtime},
-        minify::{minify_source, minify_source_with_markers},
+        minify::{minify_source, minify_source_with_markers, validate_source},
         reachability::{reachable_exports, requested_exports},
         resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
         types_only::declaration_only_package_result,
@@ -148,15 +148,7 @@ fn analyze_import_inner_resolved(
     {
         match analyze_with_oxc_pipeline(context, request, entry_path.clone(), side_effects_mode) {
             Ok(result) => return Ok(result),
-            Err(error)
-                if matches!(
-                    request.import_kind,
-                    ImportKind::Namespace | ImportKind::Dynamic
-                ) =>
-            {
-                fallback_diagnostics.push(oxc_fallback_diagnostic(error));
-            }
-            Err(error) => return Err(error),
+            Err(error) => fallback_diagnostics.push(oxc_fallback_diagnostic(error)),
         }
     }
 
@@ -286,6 +278,18 @@ fn analyze_with_oxc_pipeline(
             )
         })?;
     }
+    validate_source(&bundled.minifier_source, false).map_err(|error| {
+        error_with_context(
+            "bundle_validation",
+            format!("generated bundle failed validation before minification: {error}"),
+            context,
+            request,
+            vec![
+                format!("entry_path: {}", entry_path.display()),
+                source_excerpt_detail(&bundled.minifier_source),
+            ],
+        )
+    })?;
     let minified =
         minify_source_with_markers(&bundled.minifier_source, false).map_err(|error| {
             error_with_context(
@@ -293,7 +297,10 @@ fn analyze_with_oxc_pipeline(
                 format!("failed to minify bundled modules: {error}"),
                 context,
                 request,
-                vec![format!("entry_path: {}", entry_path.display())],
+                vec![
+                    format!("entry_path: {}", entry_path.display()),
+                    source_excerpt_detail(&bundled.minifier_source),
+                ],
             )
         })?;
     let compressed = compress_all(&minified).map_err(|error| {
@@ -888,6 +895,22 @@ fn estimate_minified_source(source: &str) -> String {
     }
 
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn source_excerpt_detail(source: &str) -> String {
+    const MAX_EXCERPT_CHARS: usize = 240;
+    let excerpt = source
+        .chars()
+        .take(MAX_EXCERPT_CHARS)
+        .collect::<String>()
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+
+    if source.chars().count() > MAX_EXCERPT_CHARS {
+        format!("source_excerpt: {excerpt}...")
+    } else {
+        format!("source_excerpt: {excerpt}")
+    }
 }
 
 fn error_with_context(
