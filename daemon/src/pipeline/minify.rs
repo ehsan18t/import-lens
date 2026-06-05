@@ -1,7 +1,6 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Expression, ModuleExportName, Program, Statement};
 use oxc_codegen::{Codegen, CodegenOptions};
-use oxc_mangler::Mangler;
 use oxc_minifier::{Minifier, MinifierOptions};
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -76,15 +75,14 @@ fn minify_source_inner(
         ));
     }
 
-    let _minified = Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
+    let minified = Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
     if remove_import_lens_markers {
         remove_import_lens_marker_statements(&mut program);
     }
-    let mangled = Mangler::new().build(&program);
     let generated = Codegen::new()
         .with_options(CodegenOptions::minify())
-        .with_scoping(Some(mangled.scoping))
-        .with_private_member_mappings(Some(mangled.class_private_mappings))
+        .with_scoping(minified.scoping)
+        .with_private_member_mappings(minified.class_private_mappings)
         .build(&program);
 
     Ok(generated.code)

@@ -12,11 +12,10 @@ import { scriptRegionsForDocument, type ScriptRegion } from "./scriptRegions.js"
 import type { DetectedImport } from "./types.js";
 import { positionAt, rangeFromOffsets } from "./positions.js";
 
-const parserOptions: ParserOptions & { recovery?: boolean } = {
+const parserOptions: ParserOptions = {
   sourceType: "module",
   astType: "ts",
   range: false,
-  recovery: true,
 };
 
 const literalDynamicImportSpecifier = (value: string): string | null => {

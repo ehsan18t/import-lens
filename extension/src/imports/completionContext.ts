@@ -11,12 +11,11 @@ export interface NamedImportCompletionContext {
   importedNames: string[];
 }
 
-const parserOptions: ParserOptions & { recovery?: boolean } = {
+const parserOptions: ParserOptions = {
   sourceType: "module",
   astType: "ts",
   lang: "tsx",
   range: false,
-  recovery: true,
 };
 
 export const namedImportCompletionContext = (
