@@ -12,6 +12,11 @@ export interface KillableDaemonProcess {
   kill(signal?: NodeJS.Signals | number): boolean;
 }
 
+export interface WaitableDaemonProcess extends KillableDaemonProcess {
+  once(event: "exit", listener: () => void): this;
+  off(event: "exit", listener: () => void): this;
+}
+
 export interface DaemonLogStreams {
   readonly stdout: Readable;
   readonly stderr: Readable;
@@ -38,6 +43,49 @@ export const pipeDaemonProcessLogs = (
 ): void => {
   pipeStreamLines(childProcess.stdout, "stdout", (line) => logger.info(`[daemon:stdout] ${line}`));
   pipeStreamLines(childProcess.stderr, "stderr", (line) => logger.warn(`[daemon:stderr] ${line}`));
+};
+
+export const terminateProcess = async (
+  childProcess: ChildProcessWithoutNullStreams | WaitableDaemonProcess,
+): Promise<void> => {
+  if (await waitForExit(childProcess, 5000)) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    childProcess.kill();
+    await waitForExit(childProcess, 2000);
+    return;
+  }
+
+  childProcess.kill("SIGTERM");
+
+  if (!(await waitForExit(childProcess, 2000))) {
+    childProcess.kill("SIGKILL");
+    await waitForExit(childProcess, 1000);
+  }
+};
+
+const waitForExit = (
+  childProcess: ChildProcessWithoutNullStreams | WaitableDaemonProcess,
+  timeoutMs: number,
+): Promise<boolean> => {
+  if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      childProcess.off("exit", onExit);
+      resolve(false);
+    }, timeoutMs);
+
+    childProcess.once("exit", onExit);
+  });
 };
 
 const pipeStreamLines = (

@@ -34,10 +34,6 @@ pub struct CacheIdentityV3 {
     pub entry_fingerprint: Option<FileFingerprint>,
 }
 
-pub fn cache_key_for_import(request: &ImportRequest) -> String {
-    encode_cache_identity(&cache_identity_for_import(request, None))
-}
-
 pub fn cache_key_for_resolved_import(
     request: &ImportRequest,
     resolved: &ResolvedPackage,
@@ -45,7 +41,7 @@ pub fn cache_key_for_resolved_import(
     encode_cache_identity(&cache_identity_for_import(request, Some(resolved)))
 }
 
-pub fn cache_identity_for_import(
+fn cache_identity_for_import(
     request: &ImportRequest,
     resolved: Option<&ResolvedPackage>,
 ) -> CacheIdentityV3 {

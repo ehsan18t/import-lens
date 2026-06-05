@@ -1,10 +1,13 @@
 pub mod analyze;
 pub mod bundle;
 pub mod cjs;
+mod cjs_scan;
 pub mod compress;
+mod fallback;
 pub mod file_size;
 pub mod graph;
 pub mod minify;
 pub mod reachability;
+mod replacements;
 pub mod resolver;
 pub mod types_only;

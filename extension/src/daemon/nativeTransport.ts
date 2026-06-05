@@ -18,7 +18,7 @@ import { protocolVersion } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { currentPlatformTarget, daemonBinaryName } from "./platform.js";
 import { knownDaemonHashes } from "./knownHashes.generated.js";
-import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs } from "./processLifecycle.js";
+import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs, terminateProcess } from "./processLifecycle.js";
 import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 import { resolveDaemonStartRoot } from "./startRoot.js";
@@ -410,44 +410,3 @@ export class NativeDaemonTransport implements AnalysisTransport {
     };
   }
 }
-
-const waitForExit = (
-  childProcess: ChildProcessWithoutNullStreams,
-  timeoutMs: number,
-): Promise<boolean> => {
-  if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
-    return Promise.resolve(true);
-  }
-
-  return new Promise((resolve) => {
-    const onExit = (): void => {
-      clearTimeout(timer);
-      resolve(true);
-    };
-    const timer = setTimeout(() => {
-      childProcess.off("exit", onExit);
-      resolve(false);
-    }, timeoutMs);
-
-    childProcess.once("exit", onExit);
-  });
-};
-
-const terminateProcess = async (childProcess: ChildProcessWithoutNullStreams): Promise<void> => {
-  if (await waitForExit(childProcess, 5000)) {
-    return;
-  }
-
-  if (process.platform === "win32") {
-    childProcess.kill();
-    await waitForExit(childProcess, 2000);
-    return;
-  }
-
-  childProcess.kill("SIGTERM");
-
-  if (!(await waitForExit(childProcess, 2000))) {
-    childProcess.kill("SIGKILL");
-    await waitForExit(childProcess, 1000);
-  }
-};

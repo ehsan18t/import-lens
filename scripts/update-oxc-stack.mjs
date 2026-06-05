@@ -6,6 +6,18 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { oxcStackConfig } from "./oxc-stack.config.mjs";
+import {
+  formatOxcUpdateResult,
+  latestCrateVersion,
+  latestNpmVersion,
+  replaceKnownVersions,
+  updateCargoToml,
+  updateConfig,
+  updateManifest,
+  validateAvailableVersions,
+  validateCurrentStack,
+  validateVersion,
+} from "./oxc-stack-helpers.mjs";
 
 const execFilePromise = promisify(execFileCallback);
 
@@ -17,8 +29,6 @@ const defaultPaths = {
   srs: "docs/ImportLens-SRS.md",
   config: "scripts/oxc-stack.config.mjs",
 };
-
-const semverPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
 
 export const parseUpdateArgs = (argv) => {
   const parsed = {
@@ -111,7 +121,7 @@ export const updateOxcStack = async ({
     dryRun,
   };
 
-  stdout?.write(formatResult(result));
+  stdout?.write(formatOxcUpdateResult(result));
   return result;
 };
 
@@ -141,144 +151,12 @@ const valueAfter = (argv, index, option) => {
   return value;
 };
 
-const validateCurrentStack = (cargoToml, manifest) => {
-  if (/^oxc_mangler\s*=/mu.test(cargoToml)) {
-    throw new Error("oxc_mangler must not be present in daemon/Cargo.toml");
-  }
-
-  const crateVersions = oxcStackConfig.oxcCrates.map((crate) => {
-    const match = cargoToml.match(new RegExp(`^${crate}\\s*=\\s*"([^"]+)"$`, "mu"));
-    if (!match) {
-      throw new Error(`Missing OXC crate pin: ${crate}`);
-    }
-    return match[1];
-  });
-  const uniqueCrateVersions = new Set(crateVersions);
-  if (uniqueCrateVersions.size !== 1) {
-    throw new Error(`Current OXC crate versions are not coordinated: ${[...uniqueCrateVersions].join(", ")}`);
-  }
-
-  const npmVersion = manifest.dependencies?.["oxc-parser"];
-  if (npmVersion && npmVersion !== crateVersions[0]) {
-    throw new Error(`Current npm oxc-parser version ${npmVersion} does not match OXC crates ${crateVersions[0]}`);
-  }
-};
-
-const validateVersion = (label, version) => {
-  if (!semverPattern.test(version)) {
-    throw new Error(`Invalid ${label} version: ${version}`);
-  }
-};
-
-const validateAvailableVersions = async (fetchJson, oxcVersion, resolverVersion) => {
-  await npmPackageVersion(fetchJson, "oxc-parser", oxcVersion).catch((error) => {
-    throw new Error(`Unavailable OXC version ${oxcVersion}: ${error.message}`);
-  });
-
-  await Promise.all(
-    oxcStackConfig.oxcCrates.map((crate) =>
-      crateVersion(fetchJson, crate, oxcVersion).catch((error) => {
-        throw new Error(`Unavailable OXC crate ${crate}@${oxcVersion}: ${error.message}`);
-      }),
-    ),
-  );
-
-  await crateVersion(fetchJson, "oxc_resolver", resolverVersion).catch((error) => {
-    throw new Error(`Unavailable oxc_resolver version ${resolverVersion}: ${error.message}`);
-  });
-};
-
-const latestNpmVersion = async (fetchJson, packageName) => {
-  const payload = await fetchJson(`https://registry.npmjs.org/${packageName}/latest`);
-  if (!payload?.version) {
-    throw new Error(`Could not resolve latest npm version for ${packageName}`);
-  }
-  return payload.version;
-};
-
-const latestCrateVersion = async (fetchJson, crate) => {
-  const payload = await fetchJson(`https://crates.io/api/v1/crates/${crate}`);
-  const version = payload?.crate?.max_stable_version ?? payload?.crate?.newest_version;
-  if (!version) {
-    throw new Error(`Could not resolve latest crate version for ${crate}`);
-  }
-  return version;
-};
-
-const npmPackageVersion = async (fetchJson, packageName, version) => {
-  const payload = await fetchJson(`https://registry.npmjs.org/${packageName}/${version}`);
-  if (payload?.version !== version) {
-    throw new Error(`registry returned ${payload?.version ?? "no version"}`);
-  }
-};
-
-const crateVersion = async (fetchJson, crate, version) => {
-  const payload = await fetchJson(`https://crates.io/api/v1/crates/${crate}/${version}`);
-  const returnedVersion = payload?.version?.num;
-  if (returnedVersion !== version) {
-    throw new Error(`crates.io returned ${returnedVersion ?? "no version"}`);
-  }
-};
-
-const updateCargoToml = (cargoToml, oxcVersion, resolverVersion) => {
-  let next = cargoToml;
-  for (const crate of oxcStackConfig.oxcCrates) {
-    next = next.replace(new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"), `${crate} = "${oxcVersion}"`);
-  }
-  return next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "${resolverVersion}"`);
-};
-
-const updateManifest = (manifest, oxcVersion) => {
-  const next = structuredClone(manifest);
-  next.dependencies = next.dependencies ?? {};
-  next.dependencies["oxc-parser"] = oxcVersion;
-
-  for (const section of ["dependencies", "devDependencies", "optionalDependencies"]) {
-    for (const name of Object.keys(next[section] ?? {})) {
-      if (name.startsWith("@oxc-parser/binding-")) {
-        next[section][name] = oxcVersion;
-      }
-    }
-  }
-
-  next.scripts = {
-    ...(next.scripts ?? {}),
-    "deps:update": "pnpm deps:update:oxc",
-    "deps:update:oxc": "node scripts/update-oxc-stack.mjs",
-    "deps:update:all": "pnpm update --latest && cargo update",
-  };
-
-  return `${JSON.stringify(next, null, 2)}\n`;
-};
-
-const replaceKnownVersions = (content, oxcVersion, resolverVersion) =>
-  content
-    .replaceAll(oxcStackConfig.currentOxcVersion, oxcVersion)
-    .replaceAll(oxcStackConfig.currentResolverVersion, resolverVersion);
-
-const updateConfig = (content, oxcVersion, resolverVersion) =>
-  content
-    .replace(
-      /currentOxcVersion:\s*"[^"]+"/u,
-      `currentOxcVersion: "${oxcVersion}"`,
-    )
-    .replace(
-      /currentResolverVersion:\s*"[^"]+"/u,
-      `currentResolverVersion: "${resolverVersion}"`,
-    );
-
 const updateLockfiles = async (execFile, oxcVersion, resolverVersion) => {
   await execFile("pnpm", ["install", "--lockfile-only"]);
   await execFile("cargo", ["update", "-p", "oxc_resolver", "--precise", resolverVersion]);
   for (const crate of oxcStackConfig.oxcCrates) {
     await execFile("cargo", ["update", "-p", crate, "--precise", oxcVersion]);
   }
-};
-
-const formatResult = ({ dryRun, oxcVersion, resolverVersion, changedFiles }) => {
-  const mode = dryRun ? "Dry run" : "Updated";
-  const files = changedFiles.length === 0 ? "No file edits needed." : `Files: ${changedFiles.join(", ")}`;
-  return `${mode}: OXC ${oxcVersion}, oxc_resolver ${resolverVersion}\n${files}\n`;
 };
 
 const defaultFetchJson = async (url) => {

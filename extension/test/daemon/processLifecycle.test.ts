@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   cleanupFailedDaemonStartup,
   pipeDaemonProcessLogs,
+  terminateProcess,
 } from "../../src/daemon/processLifecycle.js";
 
 test("cleanupFailedDaemonStartup disposes client and kills live daemon process", () => {
@@ -40,6 +41,27 @@ test("cleanupFailedDaemonStartup does not kill an already exited process", () =>
     kill: () => {
       killed++;
       return true;
+    },
+  });
+
+  assert.equal(killed, 0);
+});
+
+test("terminateProcess does not kill an already exited process", async () => {
+  let killed = 0;
+
+  await terminateProcess({
+    exitCode: 0,
+    signalCode: null,
+    kill: () => {
+      killed++;
+      return true;
+    },
+    once: () => {
+      throw new Error("already exited process should not wait for exit");
+    },
+    off: () => {
+      throw new Error("already exited process should not clear exit listener");
     },
   });
 
