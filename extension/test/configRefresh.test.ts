@@ -6,6 +6,7 @@ import type { ImportLensConfig } from "../src/config.js";
 const config = (enabled: boolean): ImportLensConfig => ({
   enabled,
   display: "inlayHint",
+  inlineRenderer: "colored",
   compression: "brotli",
   debounceMs: 300,
   showWarnings: true,

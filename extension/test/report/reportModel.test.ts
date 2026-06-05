@@ -130,16 +130,25 @@ test("buildReportRows carries confidence and confidence reasons", () => {
 });
 
 test("buildReportSummary totals imports and builds largest-contributor treemap data", () => {
-  const rows = buildReportRows([item("small", 10), item("large", 90)]);
+  const rows = buildReportRows([
+    item("small", 10),
+    {
+      ...item("large", 90),
+      result: {
+        ...result("large", 90),
+        confidence: "medium",
+      },
+    },
+  ]);
   const summary = buildReportSummary(rows);
 
   assert.equal(summary.importCount, 2);
   assert.equal(summary.totalBrotliBytes, 100);
   assert.deepEqual(
-    summary.treemap.map((item) => [item.specifier, item.brotliBytes, item.percentage]),
+    summary.treemap.map((item) => [item.specifier, item.brotliBytes, item.percentage, item.confidence]),
     [
-      ["large", 90, 90],
-      ["small", 10, 10],
+      ["large", 90, 90, "medium"],
+      ["small", 10, 10, "high"],
     ],
   );
 });

@@ -33,6 +33,7 @@ export interface WorkspaceReportTreemapItem {
   sourceFile: string;
   brotliBytes: number;
   percentage: number;
+  confidence: ConfidenceLevel | "unknown";
 }
 
 export interface WorkspaceReportSummary {
@@ -89,6 +90,7 @@ export const buildReportSummary = (rows: readonly WorkspaceReportRow[]): Workspa
       sourceFile: row.sourceFile,
       brotliBytes: row.brotliBytes,
       percentage: totalBrotliBytes > 0 ? Math.round((row.brotliBytes / totalBrotliBytes) * 100) : 0,
+      confidence: row.confidence,
     }));
 
   return {

@@ -77,6 +77,15 @@
           "default": "inlayHint",
           "description": "Display format for import size annotations."
         },
+        "importLens.inlineRenderer": {
+          "type": "string",
+          "enum": [
+            "colored",
+            "native"
+          ],
+          "default": "colored",
+          "description": "Renderer used when importLens.display is inlayHint. Colored uses decoration-backed inline text with confidence colors; native uses VS Code's accessible Inlay Hints API."
+        },
         "importLens.compression": {
           "type": "string",
           "enum": [

@@ -11,7 +11,7 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 - 🦀 **Rust Daemon Engine:** Built on `oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`, and parallel Rust compression.
 - 💾 **Persistent Caching:** Results are cached in-memory and to disk using `papaya` and `redb`, with startup prewarm for recent entries.
 - 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, `.mts`, `.cts`, Svelte (`<script>` blocks), and Astro (frontmatter and client scripts).
-- 🎨 **Flexible UI Options:** Displays sizes as accessible **Inlay Hints** (default), end-of-line decorations, or CodeLens annotations.
+- 🎨 **Flexible UI Options:** Displays colored inline hints by default, with native accessible Inlay Hints, end-of-line decorations, and CodeLens annotations available.
 - 📈 **Impact Insights:** Shows confidence levels, working-tree import cost deltas, per-import history trends, current-file totals, shared dependency explanations, and barrel re-export warnings.
 - 🛠️ **Import Actions:** Offers tree-shaking CodeActions, diagnostic copy actions, named export candidates and completions, bundle history, and workspace reports.
 - 🧾 **Operational Visibility:** The ImportLens output channel records daemon startup, IPC, fallback, cache, and troubleshooting events according to `importLens.logLevel`.
@@ -36,6 +36,7 @@ All of this happens invisibly in a secure, self-contained background daemon, mea
 
 ImportLens adds context next to size labels when the extra signal is useful:
 
+- **Confidence colors:** High-confidence sizes use a muted success color, medium confidence uses amber, and low confidence uses red. Low-confidence inline labels also start with `~`, for example `~1.6 kB br`.
 - **Working-tree deltas:** Imports added or modified in the current Git diff show their current added Brotli cost, for example `+2.1 kB br`.
 - **History trends:** Repeated measurements can show when an import became larger or smaller after dependency updates.
 - **Shared bytes:** When multiple imports in the same file include the same module path, hovers and reports explain the shared cost.
@@ -61,6 +62,7 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 | Setting | Description |
 | --- | --- |
 | `importLens.display` | Set the display mode: `inlayHint` (default), `minimal`, `standard`, or `verbose`. |
+| `importLens.inlineRenderer` | Choose the renderer for `display: inlayHint`: `colored` (default) for confidence-colored decoration-backed hints, or `native` for VS Code's screen-reader-accessible Inlay Hints API. |
 | `importLens.compression` | The primary compression size to display: `brotli` (default), `gzip`, `zstd`, or `all`. |
 | `importLens.enableDiskCache` | Enable persistent caching to disk (`true` by default). |
 | `importLens.useCodeLens` | Show sizes as a CodeLens above the import instead of inline (`false` by default). |
@@ -72,7 +74,7 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 If ImportLens cannot determine the size of a package, it will show an `unavailable` hint. 
 Hover over the import statement and click **Copy diagnostics** to extract the detailed, structured error context directly from the Rust daemon for easy debugging.
 
-CommonJS-only packages, packages with conservative `sideEffects` metadata, and imports that are not truly tree-shakeable include confidence and diagnostic details in hovers, reports, copied diagnostics, and logs.
+CommonJS-only packages, packages with conservative `sideEffects` metadata, and imports that are not truly tree-shakeable include confidence and diagnostic details in hovers, reports, copied diagnostics, and debug logs. The normal output channel warning level is reserved for daemon, IPC, startup, protocol, or no-result failures.
 
 ## Requirements
 

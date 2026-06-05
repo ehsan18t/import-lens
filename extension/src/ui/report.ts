@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { DaemonManager } from "../daemon/manager.js";
 import { buildReportRows, buildReportSummary } from "../report/reportModel.js";
 import { buildWorkspaceReportItems, type WorkspaceScannerApi } from "../report/workspaceScanner.js";
+import { confidenceCssColor, confidenceVisualFor } from "./confidenceVisuals.js";
 import { formatBytes } from "./format.js";
 
 export const showReport = async (
@@ -22,9 +23,15 @@ export const showReport = async (
   });
   const treemap = summary.treemap
     .map((item) => `<div class="bar">
-<div class="bar-fill" style="width:${item.percentage}%"></div>
+<div class="bar-fill ${confidenceVisualFor(item.confidence).cssClass}" style="width:${item.percentage}%"></div>
 <div class="bar-label">${escapeHtml(item.specifier)} · ${formatBytes(item.brotliBytes)} br · ${item.percentage}%</div>
 </div>`)
+    .join("");
+  const confidenceLegend = (["high", "medium", "low"] as const)
+    .map((confidence) => {
+      const visual = confidenceVisualFor(confidence);
+      return `<span class="legend-item ${visual.cssClass}"><span class="legend-swatch"></span>${visual.label}</span>`;
+    })
     .join("");
   const rows = reportRows
     .map((row) => `<tr>
@@ -38,7 +45,7 @@ export const showReport = async (
 <td>${formatBytes(row.brotliBytes)}</td>
 <td>${formatBytes(row.zstdBytes)}</td>
 <td>${formatBytes(row.sharedBytes)}</td>
-<td>${escapeHtml(row.confidence)}</td>
+<td class="confidence ${confidenceVisualFor(row.confidence).cssClass}">${escapeHtml(row.confidence)}</td>
 <td>${escapeHtml(row.confidenceReasons)}</td>
 <td>${escapeHtml(row.topModules)}</td>
 <td>${escapeHtml(row.warning)}</td>
@@ -59,6 +66,17 @@ body{font-family:var(--vscode-font-family);padding:16px;color:var(--vscode-foreg
 .bar{position:relative;height:24px;margin:4px 0;background:var(--vscode-editorWidget-background);overflow:hidden}
 .bar-fill{position:absolute;inset:0 auto 0 0;background:var(--vscode-progressBar-background)}
 .bar-label{position:relative;padding:4px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 12px}
+.legend-item{display:inline-flex;align-items:center;gap:6px;font-weight:600}
+.legend-swatch{width:10px;height:10px;background:currentColor;border-radius:2px}
+.confidence{font-weight:600}
+.confidence-high{color:${confidenceCssColor("high")}}
+.confidence-medium{color:${confidenceCssColor("medium")}}
+.confidence-low{color:${confidenceCssColor("low")}}
+.confidence-unknown{color:${confidenceCssColor("unknown")}}
+.bar-fill.confidence-high{background:${confidenceCssColor("high")}}
+.bar-fill.confidence-medium{background:${confidenceCssColor("medium")}}
+.bar-fill.confidence-low{background:${confidenceCssColor("low")}}
 table{border-collapse:collapse;width:100%}
 td,th{border-bottom:1px solid var(--vscode-panel-border);padding:6px 8px;text-align:left;vertical-align:top}
 th{font-weight:600}
@@ -74,6 +92,7 @@ th{font-weight:600}
 <div class="metric">Medium confidence<strong>${summary.mediumConfidenceCount}</strong></div>
 <div class="metric">Conservative<strong>${summary.conservativeCount}</strong></div>
 </section>
+<section class="legend">${confidenceLegend}</section>
 <section class="bars">${treemap || `<p class="empty">No measured imports to summarize.</p>`}</section>
 <table>
 <thead><tr><th>Package</th><th>Import</th><th>Source</th><th>Line</th><th>Runtime</th><th>Minified</th><th>Gzip</th><th>Brotli</th><th>Zstd</th><th>Shared</th><th>Confidence</th><th>Confidence Reasons</th><th>Top Modules</th><th>Warning</th></tr></thead>

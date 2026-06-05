@@ -48,16 +48,15 @@ const formatWarningSuffix = (result: ImportResult, showWarnings: boolean, runtim
     return `${runtimeSuffix} · types only`;
   }
 
-  if (result.is_cjs) {
+  if (showWarnings && result.is_cjs) {
     return `${runtimeSuffix} · CJS`;
-  }
-
-  if (showWarnings && (result.side_effects || !result.truly_treeshakeable)) {
-    return `${runtimeSuffix} · approximate`;
   }
 
   return runtimeSuffix;
 };
+
+const confidencePrefix = (result: ImportResult): string =>
+  result.confidence === "low" ? "~" : "";
 
 export const formatImportSize = (
   result: ImportResult,
@@ -69,7 +68,7 @@ export const formatImportSize = (
   }
 
   if (options.display === "verbose" || options.compression === "all") {
-    return `${formatBytes(result.brotli_bytes)} br · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd · ${formatBytes(result.minified_bytes)} min${formatWarningSuffix(result, options.showWarnings, runtime)}`;
+    return `${confidencePrefix(result)}${formatBytes(result.brotli_bytes)} br · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd · ${formatBytes(result.minified_bytes)} min${formatWarningSuffix(result, options.showWarnings, runtime)}`;
   }
 
   const compressedBytes = bytesForCompression(result, options.compression);
@@ -78,8 +77,8 @@ export const formatImportSize = (
   const suffix = formatWarningSuffix(result, options.showWarnings, runtime);
 
   if (options.display === "minimal" || options.display === "inlayHint") {
-    return `${compressed} ${label}${suffix}`;
+    return `${confidencePrefix(result)}${compressed} ${label}${suffix}`;
   }
 
-  return `${compressed} ${label} · ${formatBytes(result.minified_bytes)} min${suffix}`;
+  return `${confidencePrefix(result)}${compressed} ${label} · ${formatBytes(result.minified_bytes)} min${suffix}`;
 };
