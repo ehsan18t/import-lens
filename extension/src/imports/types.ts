@@ -22,6 +22,7 @@ export interface DetectedImport {
   runtime: ImportRuntime;
   line: number;
   quoteEnd: SourcePosition;
+  specifierRange: SourceRange;
   statementRange: SourceRange;
 }
 

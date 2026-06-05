@@ -42,10 +42,12 @@ const createDetectedImport = (
   named: string[],
   start: number,
   end: number,
+  specifierStartOffset: number,
   quoteEndOffset: number,
 ): DetectedImport => {
   const absoluteStart = region.offset + start;
   const absoluteEnd = region.offset + end;
+  const absoluteSpecifierStartOffset = region.offset + specifierStartOffset;
   const absoluteQuoteEndOffset = region.offset + quoteEndOffset;
 
   return {
@@ -57,6 +59,7 @@ const createDetectedImport = (
     runtime: region.runtime,
     line: positionAt(source, absoluteStart).line,
     quoteEnd: positionAt(source, absoluteQuoteEndOffset),
+    specifierRange: rangeFromOffsets(source, absoluteSpecifierStartOffset, absoluteQuoteEndOffset),
     statementRange: rangeFromOffsets(source, absoluteStart, absoluteEnd),
   };
 };
@@ -77,7 +80,7 @@ const importsFromStaticImport = (source: string, region: ScriptRegion, item: Sta
 
   if (entries.length === 0 && item.entries.length === 0) {
     return [
-      createDetectedImport(source, region, specifier, "namespace", "static", [], item.start, item.end, item.moduleRequest.end),
+      createDetectedImport(source, region, specifier, "namespace", "static", [], item.start, item.end, item.moduleRequest.start, item.moduleRequest.end),
     ];
   }
 
@@ -91,15 +94,15 @@ const importsFromStaticImport = (source: string, region: ScriptRegion, item: Sta
     .map((entry) => entry.importName.name as string);
 
   if (entries.some((entry) => entry.importName.kind === ImportNameKind.Default)) {
-    imports.push(createDetectedImport(source, region, specifier, "default", "static", [], item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "default", "static", [], item.start, item.end, item.moduleRequest.start, item.moduleRequest.end));
   }
 
   if (entries.some((entry) => entry.importName.kind === ImportNameKind.NamespaceObject)) {
-    imports.push(createDetectedImport(source, region, specifier, "namespace", "static", [], item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "namespace", "static", [], item.start, item.end, item.moduleRequest.start, item.moduleRequest.end));
   }
 
   if (named.length > 0) {
-    imports.push(createDetectedImport(source, region, specifier, "named", "static", named, item.start, item.end, item.moduleRequest.end));
+    imports.push(createDetectedImport(source, region, specifier, "named", "static", named, item.start, item.end, item.moduleRequest.start, item.moduleRequest.end));
   }
 
   return imports;
@@ -107,7 +110,7 @@ const importsFromStaticImport = (source: string, region: ScriptRegion, item: Sta
 
 const importsFromStaticExport = (source: string, region: ScriptRegion, item: StaticExport): DetectedImport[] => {
   const imports: DetectedImport[] = [];
-  const groups = new Map<string, { quoteEndOffset: number; entries: StaticExportEntry[] }>();
+  const groups = new Map<string, { specifierStartOffset: number; quoteEndOffset: number; entries: StaticExportEntry[] }>();
 
   for (const entry of item.entries) {
     const moduleRequest = entry.moduleRequest;
@@ -117,6 +120,7 @@ const importsFromStaticExport = (source: string, region: ScriptRegion, item: Sta
     }
 
     const group = groups.get(moduleRequest.value) ?? {
+      specifierStartOffset: moduleRequest.start,
       quoteEndOffset: moduleRequest.end,
       entries: [],
     };
@@ -130,11 +134,11 @@ const importsFromStaticExport = (source: string, region: ScriptRegion, item: Sta
       .map((entry) => entry.importName.name as string);
 
     if (group.entries.some((entry) => entry.importName.kind === ExportImportNameKind.All || entry.importName.kind === ExportImportNameKind.AllButDefault)) {
-      imports.push(createDetectedImport(source, region, specifier, "namespace", "star_reexport", [], item.start, item.end, group.quoteEndOffset));
+      imports.push(createDetectedImport(source, region, specifier, "namespace", "star_reexport", [], item.start, item.end, group.specifierStartOffset, group.quoteEndOffset));
     }
 
     if (named.length > 0) {
-      imports.push(createDetectedImport(source, region, specifier, "named", "reexport", named, item.start, item.end, group.quoteEndOffset));
+      imports.push(createDetectedImport(source, region, specifier, "named", "reexport", named, item.start, item.end, group.specifierStartOffset, group.quoteEndOffset));
     }
   }
 
@@ -162,7 +166,7 @@ const importsFromRegion = (source: string, region: ScriptRegion): DetectedImport
     );
 
     if (specifier && isRuntimePackageSpecifier(specifier)) {
-      imports.push(createDetectedImport(source, region, specifier, "dynamic", "dynamic", [], item.start, item.end, item.moduleRequest.end));
+      imports.push(createDetectedImport(source, region, specifier, "dynamic", "dynamic", [], item.start, item.end, item.moduleRequest.start, item.moduleRequest.end));
     }
   }
 

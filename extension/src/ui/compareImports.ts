@@ -93,6 +93,10 @@ const detectedImport = (specifier: string): DetectedImport => ({
   runtime: "component",
   line: 0,
   quoteEnd: { line: 0, character: 0 },
+  specifierRange: {
+    start: { line: 0, character: 0 },
+    end: { line: 0, character: 0 },
+  },
   statementRange: {
     start: { line: 0, character: 0 },
     end: { line: 0, character: 0 },
