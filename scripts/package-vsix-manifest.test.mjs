@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { oxcStackConfig } from "./oxc-stack.config.mjs";
 import { createStagedManifest } from "./package-vsix-manifest.mjs";
+
+const packageVsixScript = readFileSync(new URL("./package-vsix.mjs", import.meta.url), "utf8");
 
 const manifest = {
   name: "import-lens",
@@ -38,4 +41,8 @@ test("createStagedManifest keeps target parser binding and strips development-on
   assert.equal(staged.dependencies["@oxc-parser/binding-win32-x64-msvc"], oxcStackConfig.currentOxcVersion);
   assert.equal(staged.devDependencies, undefined);
   assert.equal(staged.scripts, undefined);
+});
+
+test("package-vsix copies every non-generated manifest directory", () => {
+  assert.match(packageVsixScript, /copyPath\(path\.join\(repoRoot, "cli"\), path\.join\(stagingRoot, "cli"\)\)/);
 });

@@ -83,6 +83,7 @@ run("pnpm", ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoi
 
 copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));
 copyPath(path.join(repoRoot, "LICENSE"), path.join(stagingRoot, "LICENSE"));
+copyPath(path.join(repoRoot, "cli"), path.join(stagingRoot, "cli"));
 copyPath(
   path.join(repoRoot, "extension", "dist", "extension.cjs"),
   path.join(stagingRoot, "extension", "dist", "extension.cjs"),
