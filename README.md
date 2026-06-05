@@ -13,7 +13,8 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 - 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, `.mts`, `.cts`, Svelte (`<script>` blocks), and Astro (frontmatter and client scripts).
 - 🎨 **Flexible UI Options:** Displays colored inline hints by default, with native accessible Inlay Hints, end-of-line decorations, and CodeLens annotations available.
 - 📈 **Impact Insights:** Shows confidence levels, working-tree import cost deltas, per-import history trends, current-file totals, shared dependency explanations, and barrel re-export warnings.
-- 🛠️ **Import Actions:** Offers tree-shaking CodeActions, diagnostic copy actions, named export candidates and completions, bundle history, and workspace reports.
+- 🛠️ **Import Actions:** Offers tree-shaking CodeActions, local substitution suggestions, diagnostic copy actions, named export candidates and completions, bundle history, and workspace reports.
+- 🧭 **Guidance Workflows:** Adds package.json dependency CodeLens, import comparison, `.importlensignore`, and opt-in npm registry hints that fail silently when unavailable.
 - 🧾 **Operational Visibility:** The ImportLens output channel records daemon startup, IPC, fallback, cache, and troubleshooting events according to `importLens.logLevel`.
 - 🪶 **Runtime-Aware Results:** Declaration-only packages report zero runtime bytes, framework virtual modules are skipped, and conservative CJS or fallback paths surface structured diagnostics instead of silently failing.
 
@@ -43,16 +44,19 @@ ImportLens adds context next to size labels when the extra signal is useful:
 - **Shared bytes:** When multiple imports in the same file include the same module path, hovers and reports explain the shared cost.
 - **Barrel re-exports:** `export * from "package"` is flagged because it keeps the package boundary broad and can prevent precise named-export tree-shaking.
 - **Tree-shaking actions:** For CommonJS, side-effectful, namespace, or otherwise non-tree-shakeable imports, lightbulb actions can inspect or copy diagnostics. Namespace imports can also enumerate named exports and copy a named import candidate.
+- **Substitution suggestions:** Curated local alternatives for known heavy packages appear as copy-only CodeActions. ImportLens never rewrites source automatically.
+- **Package dependency lenses:** `package.json` dependency entries can show their ImportLens Brotli size and open the compare workflow.
 
-ImportLens does not rewrite source files automatically. Actions that suggest named imports copy a candidate import statement to the clipboard so you stay in control of usage changes.
+ImportLens does not rewrite source files automatically. Actions that suggest named imports or package substitutions copy a candidate to the clipboard so you stay in control of usage changes.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
 | `ImportLens: Show Current File Size` | Calculates a deduplicated total for runtime package imports in the active file and records it in bundle impact history. |
-| `ImportLens: Show Bundle Impact History` | Shows recent current-file measurements from VS Code global storage. |
+| `ImportLens: Show Bundle Impact History` | Opens a script-free SVG history panel from recent current-file measurements in VS Code global storage. |
 | `ImportLens: Show Report` | Scans the workspace and opens a report of imports sorted by Brotli size, with duplicate imports, shared modules, budget counts, and an SVG treemap. |
+| `ImportLens: Compare Imports` | Compares comma-separated package imports from the active workspace and lists them by Brotli size. |
 | `ImportLens: Clear Cache` | Clears daemon memory and disk cache, then reanalyzes the active document. |
 | `ImportLens: Show Logs` | Opens the ImportLens output channel. |
 
@@ -66,6 +70,7 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 | `importLens.inlineRenderer` | Choose the renderer for `display: inlayHint`: `colored` (default) for confidence-colored decoration-backed hints, or `native` for VS Code's screen-reader-accessible Inlay Hints API. |
 | `importLens.compression` | The primary compression size to display: `brotli` (default), `gzip`, `zstd`, or `all`. |
 | `importLens.budgets` | Optional budget object with `perImportBrotliBytes` and `perFileBrotliBytes` thresholds. |
+| `importLens.enableRegistryHints` | Opt in to short-timeout npm metadata hints in package.json CodeLens (`false` by default). |
 | `importLens.enableDiskCache` | Enable persistent caching to disk (`true` by default). |
 | `importLens.useCodeLens` | Show sizes as a CodeLens above the import instead of inline (`false` by default). |
 | `importLens.showWarnings` | Show warning indicators when a package cannot be efficiently tree-shaken. |
@@ -81,6 +86,16 @@ CommonJS-only packages, packages with conservative `sideEffects` metadata, and i
 ## CLI Budget Check
 
 Run `importlens check` from a workspace to check changed JS/TS files from `git diff HEAD` against configured budgets. Budgets can live in `.importlensrc.json` as `{ "budgets": { ... } }` or in `package.json` as `{ "importLens": { "budgets": { ... } } }`. The CLI uses the native daemon for real Brotli sizes and exits non-zero when a threshold is exceeded.
+
+## Ignoring Imports
+
+Create a `.importlensignore` file to skip known generated files or imports:
+
+```text
+package:large-package
+import:@internal/*
+path:src/generated/**
+```
 
 ## Requirements
 

@@ -1,5 +1,6 @@
 import path from "node:path";
 import { createImportRequest } from "../analysis/request.js";
+import { loadImportLensIgnore, shouldIgnoreImport } from "../imports/ignore.js";
 import { extractRuntimeImports } from "../imports/parser.js";
 import { resolveInstalledPackage } from "../imports/resolver.js";
 import type { DetectedImport } from "../imports/types.js";
@@ -71,7 +72,9 @@ export const scanWorkspaceImports = async (
     let detectedImports: DetectedImport[];
 
     try {
-      detectedImports = extractRuntimeImports(document.fileName, document.getText());
+      const ignoreRules = await loadImportLensIgnore(document.fileName);
+      detectedImports = extractRuntimeImports(document.fileName, document.getText())
+        .filter((detected) => !shouldIgnoreImport(detected, document.fileName, ignoreRules));
     } catch {
       continue;
     }

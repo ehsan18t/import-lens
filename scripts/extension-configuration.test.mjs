@@ -23,3 +23,12 @@ test("ImportLens budgets expose per-import and per-file Brotli thresholds", () =
   assert.equal(setting.properties.perFileBrotliBytes.minimum, 1);
   assert.equal(setting.additionalProperties, false);
 });
+
+test("ImportLens registry hints are opt-in", () => {
+  assert.equal(manifest.contributes.configuration.properties["importLens.enableRegistryHints"].default, false);
+});
+
+test("ImportLens compare workflow is contributed and package.json can activate the extension", () => {
+  assert.ok(manifest.activationEvents.includes("onLanguage:json"));
+  assert.ok(manifest.contributes.commands.some((command) => command.command === "importLens.compareImports"));
+});

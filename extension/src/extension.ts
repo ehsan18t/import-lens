@@ -10,12 +10,14 @@ import { registerNodeModulesWatchers } from "./watcher.js";
 import { registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
 import { BudgetDiagnosticsController } from "./ui/budgetDiagnostics.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
+import { compareImports, compareImportsCommand } from "./ui/compareImports.js";
 import { ImportMemberCompletionProvider } from "./ui/completions.js";
 import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import { showNamedExportCandidates, showNamedExportCandidatesCommand } from "./ui/namedExportCandidates.js";
+import { PackageJsonDependencyCodeLensProvider } from "./ui/packageJsonCodeLens.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
@@ -28,6 +30,15 @@ let daemon: DaemonManager | undefined;
 const copyImportDiagnostics = async (result: ImportResult): Promise<void> => {
   await vscode.env.clipboard.writeText(formatImportDiagnostics(result));
   void vscode.window.showInformationMessage("ImportLens diagnostics copied.");
+};
+
+const copySubstitutionSuggestion = async (
+  currentSpecifier: string,
+  replacementPackage: string,
+  reason: string,
+): Promise<void> => {
+  await vscode.env.clipboard.writeText(`${currentSpecifier} -> ${replacementPackage}\n${reason}`);
+  void vscode.window.showInformationMessage(`ImportLens alternative copied: ${replacementPackage}.`);
 };
 
 export const activate = async (context: vscode.ExtensionContext): Promise<void> => {
@@ -43,10 +54,12 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const treeShakeActions = new TreeShakeCodeActionProvider(store);
 
   daemon = new DaemonManager(context, logger);
+  const packageJsonCodeLens = new PackageJsonDependencyCodeLensProvider(context, daemon);
   const completions = new ImportMemberCompletionProvider(daemon);
-  context.subscriptions.push(logger, store, statusBar, decorations, budgetDiagnostics, inlayHints, codeLens, daemon);
+  context.subscriptions.push(logger, store, statusBar, decorations, budgetDiagnostics, inlayHints, codeLens, packageJsonCodeLens, daemon);
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(languageSelector, inlayHints));
   context.subscriptions.push(vscode.languages.registerCodeLensProvider(languageSelector, codeLens));
+  context.subscriptions.push(vscode.languages.registerCodeLensProvider({ language: "json", scheme: "file", pattern: "**/package.json" }, packageJsonCodeLens));
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider(languageSelector, completions, "{", ","));
   context.subscriptions.push(vscode.languages.registerCodeActionsProvider(languageSelector, treeShakeActions));
 
@@ -64,6 +77,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         refreshBudgetDiagnostics: () => budgetDiagnostics.refreshVisibleEditors(),
         refreshInlayHints: () => inlayHints.refresh(),
         refreshCodeLens: () => codeLens.refresh(),
+        refreshPackageJsonCodeLens: () => packageJsonCodeLens.refresh(),
       },
     );
   };
@@ -82,6 +96,8 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       }
     }),
     vscode.commands.registerCommand("importLens.showReport", () => void showReport(context, daemon!)),
+    vscode.commands.registerCommand(compareImportsCommand, (initialSpecifier?: string) => void compareImports(daemon!, initialSpecifier)),
+    vscode.commands.registerCommand("importLens.copySubstitutionSuggestion", copySubstitutionSuggestion),
     vscode.commands.registerCommand("importLens.showImportDetails", async (result: ImportResult, runtime: ImportRuntime = "component") => {
       if (result.error) {
         const action = await vscode.window.showWarningMessage(

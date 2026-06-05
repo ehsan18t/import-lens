@@ -465,7 +465,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-036e** (Medium) - The extension must provide a command `ImportLens: Show Current File Size` that sends a `FileSizeRequest` for the active file's runtime package imports, receives a deduplicated file-level total, displays the selected compression summary, and records the measurement in bundle impact history. The command must work for supported loose files using the same analysis-root derivation as FR-006c.
 
-**FR-036f** (Medium) - The extension must provide a command `ImportLens: Show Bundle Impact History` that reads recent current-file measurements from VS Code global storage and displays them in a QuickPick with timestamp and file path details.
+**FR-036f** (Medium) - The extension must provide a command `ImportLens: Show Bundle Impact History` that reads recent current-file measurements from VS Code global storage and opens a script-free static SVG history panel with timestamp, file path, import count, and byte details.
 
 **FR-036g** (Medium) - The extension must provide CodeActions for imports whose current result is CommonJS, side-effectful, or not truly tree-shakeable. These actions must allow users to inspect existing ImportLens details or copy diagnostics. They must not automatically rewrite user source.
 
@@ -483,7 +483,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-036n** (Medium) - The extension must provide `ImportLens: Compare Imports`, allowing users to compare two package specifiers side by side using the same local daemon sizing path as normal import analysis.
 
-**FR-036o** (Medium) - The extension must provide a static SVG history panel generated from existing import cost history data. The webview must keep scripts disabled.
+**FR-036o** (Medium) - The extension must provide a static SVG history panel generated from existing bundle impact history data. The webview must keep scripts disabled.
 
 **FR-036p** (Medium) - The extension must support `.importlensignore` using gitignore-style package, path, and import-pattern rules to suppress analysis and decorations for matching imports.
 

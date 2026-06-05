@@ -16,6 +16,7 @@ export interface ImportLensRefreshActions<TDocument extends RefreshableDocument>
   refreshBudgetDiagnostics(): void;
   refreshInlayHints(): void;
   refreshCodeLens(): void;
+  refreshPackageJsonCodeLens(): void;
 }
 
 export const refreshVisibleImportLensDocuments = <TDocument extends RefreshableDocument>(
@@ -39,4 +40,5 @@ export const refreshVisibleImportLensDocuments = <TDocument extends RefreshableD
   actions.refreshBudgetDiagnostics();
   actions.refreshInlayHints();
   actions.refreshCodeLens();
+  actions.refreshPackageJsonCodeLens();
 };

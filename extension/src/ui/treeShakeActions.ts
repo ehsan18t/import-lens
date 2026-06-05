@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
 import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
+import { substitutionSuggestionsFor } from "../guidance/substitutions.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import { shouldOfferNamedExportCandidates } from "./namedExportCandidatePolicy.js";
 import { showNamedExportCandidatesCommand } from "./namedExportCandidates.js";
@@ -32,32 +33,32 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
       return [];
     }
 
+    const actions: vscode.CodeAction[] = [];
     const reason = treeShakeActionReason(state.result);
-    if (!reason) {
-      return [];
+
+    if (reason) {
+      const inspect = new vscode.CodeAction(
+        `Inspect ImportLens tree-shaking: ${reason}`,
+        vscode.CodeActionKind.Refactor,
+      );
+      inspect.command = {
+        command: "importLens.showImportDetails",
+        title: "Inspect ImportLens tree-shaking diagnostics",
+        arguments: [state.result, state.detected.runtime],
+      };
+
+      const copy = new vscode.CodeAction(
+        "Copy ImportLens tree-shaking diagnostics",
+        vscode.CodeActionKind.Refactor,
+      );
+      copy.command = {
+        command: copyImportDiagnosticsCommand,
+        title: "Copy ImportLens tree-shaking diagnostics",
+        arguments: [state.result],
+      };
+
+      actions.push(inspect, copy);
     }
-
-    const inspect = new vscode.CodeAction(
-      `Inspect ImportLens tree-shaking: ${reason}`,
-      vscode.CodeActionKind.Refactor,
-    );
-    inspect.command = {
-      command: "importLens.showImportDetails",
-      title: "Inspect ImportLens tree-shaking diagnostics",
-      arguments: [state.result, state.detected.runtime],
-    };
-
-    const copy = new vscode.CodeAction(
-      "Copy ImportLens tree-shaking diagnostics",
-      vscode.CodeActionKind.Refactor,
-    );
-    copy.command = {
-      command: copyImportDiagnosticsCommand,
-      title: "Copy ImportLens tree-shaking diagnostics",
-      arguments: [state.result],
-    };
-
-    const actions = [inspect, copy];
 
     if (shouldOfferNamedExportCandidates(state)) {
       const namedExports = new vscode.CodeAction(
@@ -70,6 +71,19 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
         arguments: [document.uri, state.detected],
       };
       actions.push(namedExports);
+    }
+
+    for (const suggestion of substitutionSuggestionsFor(state.detected.specifier, state.detected.packageName)) {
+      const action = new vscode.CodeAction(
+        `Copy ImportLens alternative: ${suggestion.packageName}`,
+        vscode.CodeActionKind.Refactor,
+      );
+      action.command = {
+        command: "importLens.copySubstitutionSuggestion",
+        title: "Copy ImportLens import alternative",
+        arguments: [state.detected.specifier, suggestion.packageName, suggestion.reason],
+      };
+      actions.push(action);
     }
 
     return actions;

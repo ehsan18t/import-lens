@@ -1,0 +1,6 @@
+# ImportLens ignore rules.
+# Lines are inactive until you remove the leading "#".
+#
+# package:large-package
+# import:@internal/*
+# path:src/generated/**

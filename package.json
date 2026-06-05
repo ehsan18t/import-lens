@@ -25,6 +25,7 @@
     "onLanguage:typescript",
     "onLanguage:typescriptreact",
     "onLanguage:javascriptreact",
+    "onLanguage:json",
     "onLanguage:svelte",
     "onLanguage:astro"
   ],
@@ -53,6 +54,11 @@
       {
         "command": "importLens.showReport",
         "title": "ImportLens: Show Report",
+        "category": "ImportLens"
+      },
+      {
+        "command": "importLens.compareImports",
+        "title": "ImportLens: Compare Imports",
         "category": "ImportLens"
       },
       {
@@ -139,6 +145,11 @@
           "type": "boolean",
           "default": true,
           "description": "Persist computed sizes to disk across editor restarts."
+        },
+        "importLens.enableRegistryHints": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt in to short-timeout npm registry metadata hints for package.json dependency CodeLens."
         },
         "importLens.logLevel": {
           "type": "string",

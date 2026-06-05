@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import {
   bundleImpactHistoryKey,
   bundleImpactHistoryDeltaLabel,
-  bundleImpactHistoryLabel,
   previousBundleImpactForFile,
   recordBundleImpactHistory,
   type BundleImpactHistoryItem,
@@ -17,6 +16,7 @@ import { protocolVersion, type ImportRequest } from "../ipc/protocol.js";
 import { supportedLanguageIds } from "../languages.js";
 import type { ImportLensLogger } from "../logger.js";
 import { analysisRootForFile } from "../workspaceContext.js";
+import { bundleImpactHistoryHtml } from "./bundleImpactHistoryView.js";
 
 let fileSizeRequestId = 0;
 
@@ -131,15 +131,14 @@ export const showBundleImpactHistory = async (
     return;
   }
 
-  await vscode.window.showQuickPick(
-    history.map((item) => ({
-      label: bundleImpactHistoryLabel(item),
-      description: new Date(item.timestamp).toLocaleString(),
-      detail: item.fileName,
-    })),
+  const panel = vscode.window.createWebviewPanel(
+    "importLensBundleImpactHistory",
+    "ImportLens Bundle Impact History",
+    vscode.ViewColumn.Beside,
     {
-      title: "ImportLens Bundle Impact History",
-      placeHolder: "Recent current-file size measurements",
+      enableScripts: false,
+      retainContextWhenHidden: false,
     },
   );
+  panel.webview.html = bundleImpactHistoryHtml(history);
 };

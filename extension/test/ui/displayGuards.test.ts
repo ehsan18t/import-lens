@@ -18,6 +18,7 @@ const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => 
   showWarnings: true,
   useCodeLens: false,
   enableDiskCache: true,
+  enableRegistryHints: false,
   logLevel: "error",
   budgets: {},
   ...overrides,

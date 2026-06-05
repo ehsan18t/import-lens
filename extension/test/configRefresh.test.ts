@@ -12,6 +12,7 @@ const config = (enabled: boolean): ImportLensConfig => ({
   showWarnings: true,
   useCodeLens: false,
   enableDiskCache: true,
+  enableRegistryHints: false,
   logLevel: "error",
   budgets: {},
 });
@@ -31,17 +32,19 @@ test("refreshVisibleImportLensDocuments reanalyzes supported visible file docume
   let budgetDiagnosticRefreshes = 0;
   let hintRefreshes = 0;
   let codeLensRefreshes = 0;
+  let packageJsonCodeLensRefreshes = 0;
 
   refreshVisibleImportLensDocuments(
     [document("typescript"), document("markdown"), document("javascript", "untitled")],
     config(true),
     {
       schedule: (doc) => scheduled.push(doc.uri.toString()),
-        clear: (uri) => cleared.push(uri.toString()),
-        refreshDecorations: () => decorationRefreshes++,
-        refreshBudgetDiagnostics: () => budgetDiagnosticRefreshes++,
-        refreshInlayHints: () => hintRefreshes++,
-        refreshCodeLens: () => codeLensRefreshes++,
+      clear: (uri) => cleared.push(uri.toString()),
+      refreshDecorations: () => decorationRefreshes++,
+      refreshBudgetDiagnostics: () => budgetDiagnosticRefreshes++,
+      refreshInlayHints: () => hintRefreshes++,
+      refreshCodeLens: () => codeLensRefreshes++,
+      refreshPackageJsonCodeLens: () => packageJsonCodeLensRefreshes++,
     },
   );
 
@@ -51,6 +54,7 @@ test("refreshVisibleImportLensDocuments reanalyzes supported visible file docume
   assert.equal(budgetDiagnosticRefreshes, 1);
   assert.equal(hintRefreshes, 1);
   assert.equal(codeLensRefreshes, 1);
+  assert.equal(packageJsonCodeLensRefreshes, 1);
 });
 
 test("refreshVisibleImportLensDocuments clears supported visible file documents when disabled", () => {
@@ -67,6 +71,7 @@ test("refreshVisibleImportLensDocuments clears supported visible file documents 
       refreshBudgetDiagnostics: () => undefined,
       refreshInlayHints: () => undefined,
       refreshCodeLens: () => undefined,
+      refreshPackageJsonCodeLens: () => undefined,
     },
   );
 

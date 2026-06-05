@@ -18,6 +18,7 @@ import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
 import { extractRuntimeImports } from "./imports/parser.js";
+import { loadImportLensIgnore, shouldIgnoreImport } from "./imports/ignore.js";
 import { resolveInstalledPackage } from "./imports/resolver.js";
 import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
@@ -85,7 +86,9 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
 
-    const imports = extractRuntimeImports(document.fileName, document.getText());
+    const ignoreRules = await loadImportLensIgnore(document.fileName);
+    const imports = extractRuntimeImports(document.fileName, document.getText())
+      .filter((detected) => !shouldIgnoreImport(detected, document.fileName, ignoreRules));
 
     if (imports.length === 0) {
       this.#store.clear(document.uri);

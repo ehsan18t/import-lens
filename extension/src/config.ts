@@ -15,6 +15,7 @@ export interface ImportLensConfig {
   showWarnings: boolean;
   useCodeLens: boolean;
   enableDiskCache: boolean;
+  enableRegistryHints: boolean;
   logLevel: LogLevel;
   budgets: ImportLensBudgets;
 }
@@ -31,6 +32,7 @@ export const getImportLensConfig = (): ImportLensConfig => {
     showWarnings: config.get("showWarnings", true),
     useCodeLens: config.get("useCodeLens", false),
     enableDiskCache: config.get("enableDiskCache", true),
+    enableRegistryHints: config.get("enableRegistryHints", false),
     logLevel: config.get<LogLevel>("logLevel", defaultLogLevel),
     budgets: sanitizeBudgets(config.get("budgets", {})),
   };
