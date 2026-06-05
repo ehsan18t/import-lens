@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { oxcStackConfig } from "./oxc-stack.config.mjs";
 
 const repoFile = (relativePath) => readFileSync(new URL(`../${relativePath}`, import.meta.url), "utf8");
 
@@ -10,24 +11,12 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   const dockerfile = repoFile("Dockerfile.build");
   const manifest = JSON.parse(repoFile("package.json"));
   const rustToolchain = repoFile("rust-toolchain.toml");
-  const oxcCrates = [
-    "oxc_allocator",
-    "oxc_ast",
-    "oxc_codegen",
-    "oxc_minifier",
-    "oxc_parser",
-    "oxc_semantic",
-    "oxc_span",
-    "oxc_syntax",
-    "oxc_transformer",
-  ];
-
-  for (const crate of oxcCrates) {
-    assert.match(cargoToml, new RegExp(`^${crate} = "0\\.134\\.0"$`, "mu"));
+  for (const crate of oxcStackConfig.oxcCrates) {
+    assert.match(cargoToml, new RegExp(`^${crate} = "${escapedVersion(oxcStackConfig.currentOxcVersion)}"$`, "mu"));
   }
 
   assert.doesNotMatch(cargoToml, /^oxc_mangler = /mu);
-  assert.match(cargoToml, /^oxc_resolver = "11\.21\.0"$/mu);
+  assert.match(cargoToml, new RegExp(`^oxc_resolver = "${escapedVersion(oxcStackConfig.currentResolverVersion)}"$`, "mu"));
   assert.doesNotMatch(workspaceCargoToml, /^rust-version = /mu);
   assert.doesNotMatch(cargoToml, /^rust-version\.workspace = /mu);
   assert.match(dockerfile, /^ARG RUST_VERSION=stable$/mu);
@@ -40,6 +29,10 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   assert.doesNotMatch(dockerfile, /ZIG_VERSION=0\./);
   assert.doesNotMatch(dockerfile, /CARGO_ZIGBUILD_VERSION=0\./);
   assert.match(rustToolchain, /^channel = "stable"$/mu);
-  assert.equal(manifest.dependencies["oxc-parser"], "0.134.0");
-  assert.equal(manifest.scripts["deps:update"], "pnpm update --latest && cargo update");
+  assert.equal(manifest.dependencies["oxc-parser"], oxcStackConfig.currentOxcVersion);
+  assert.equal(manifest.scripts["deps:update"], "pnpm deps:update:oxc");
+  assert.equal(manifest.scripts["deps:update:oxc"], "node scripts/update-oxc-stack.mjs");
+  assert.equal(manifest.scripts["deps:update:all"], "pnpm update --latest && cargo update");
 });
+
+const escapedVersion = (version) => version.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
