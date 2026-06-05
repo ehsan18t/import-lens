@@ -221,14 +221,9 @@ fn run_prewarm_job(
         });
     };
 
-    let pool = PREWARM_POOL.get_or_init(|| {
-        ThreadPoolBuilder::new()
-            .num_threads(prewarm_thread_count())
-            .build()
-            .expect("failed to build prewarm thread pool")
-    });
-
-    pool.install(run);
+    if let Ok(pool) = prewarm_pool() {
+        pool.install(run);
+    }
 }
 
 fn run_recent_prewarm_job(
@@ -273,14 +268,9 @@ fn run_recent_prewarm_job(
         });
     };
 
-    let pool = PREWARM_POOL.get_or_init(|| {
-        ThreadPoolBuilder::new()
-            .num_threads(prewarm_thread_count())
-            .build()
-            .expect("failed to build prewarm thread pool")
-    });
-
-    pool.install(run);
+    if let Ok(pool) = prewarm_pool() {
+        pool.install(run);
+    }
 }
 
 fn installed_package(active_document_path: &Path, package_name: &str) -> Option<ResolvedPackage> {
@@ -318,6 +308,20 @@ fn prewarm_thread_count() -> usize {
         .unwrap_or(1)
 }
 
+fn prewarm_pool() -> Result<&'static rayon::ThreadPool, String> {
+    if PREWARM_POOL.get().is_none() {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(prewarm_thread_count())
+            .build()
+            .map_err(|error| format!("failed to build prewarm thread pool: {error}"))?;
+        let _ = PREWARM_POOL.set(pool);
+    }
+
+    PREWARM_POOL
+        .get()
+        .ok_or_else(|| "failed to initialize prewarm thread pool".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +339,14 @@ mod tests {
         drop(prefetcher);
 
         assert!(!cancellation.is_current(generation));
+    }
+
+    #[test]
+    fn prewarm_pool_reuses_one_fallible_thread_pool() {
+        let first = prewarm_pool().expect("prewarm pool should build") as *const rayon::ThreadPool;
+        let second =
+            prewarm_pool().expect("prewarm pool should be reused") as *const rayon::ThreadPool;
+
+        assert_eq!(first, second);
     }
 }

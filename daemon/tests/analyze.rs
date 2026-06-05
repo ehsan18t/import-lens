@@ -1179,6 +1179,69 @@ fn analyze_commonjs_ignores_require_inside_regex_literal() {
 }
 
 #[test]
+fn analyze_commonjs_scans_require_inside_template_expressions_only() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "template-cjs-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+    write_package_file(
+        &workspace,
+        "template-cjs-lib",
+        "index.cjs",
+        "const text = `ignore require('./heavy.cjs') but include ${require('./helper.cjs').used}`;\nexports.used = text;",
+    );
+    write_package_file(
+        &workspace,
+        "template-cjs-lib",
+        "helper.cjs",
+        "exports.used = 'template helper payload';",
+    );
+    write_package_file(
+        &workspace,
+        "template-cjs-lib",
+        "heavy.cjs",
+        &format!("exports.heavy = '{}';", "x".repeat(4096)),
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "template-cjs-lib",
+            "template-cjs-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(
+        result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("helper.cjs"))
+        }),
+        "{result:?}",
+    );
+    assert!(
+        !result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("heavy.cjs"))
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_commonjs_dynamic_require_uses_static_fallback_diagnostic() {
     let workspace = temp_workspace();
     write_package(

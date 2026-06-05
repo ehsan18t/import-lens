@@ -316,23 +316,8 @@ fn mask_non_code(source: &str) -> String {
 
     while index < bytes.len() {
         match bytes[index] {
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[index];
-                index += 1;
-                while index < bytes.len() {
-                    let current = bytes[index];
-                    masked[index] = if current == b'\n' { b'\n' } else { b' ' };
-                    index += 1;
-                    if current == b'\\' {
-                        if index < bytes.len() {
-                            masked[index] = b' ';
-                            index += 1;
-                        }
-                    } else if current == quote {
-                        break;
-                    }
-                }
-            }
+            b'\'' | b'"' => index = mask_string_literal(bytes, &mut masked, index),
+            b'`' => index = mask_template_literal(bytes, &mut masked, index),
             b'/' if bytes.get(index + 1) == Some(&b'/') => {
                 masked[index] = b' ';
                 masked[index + 1] = b' ';
@@ -366,6 +351,109 @@ fn mask_non_code(source: &str) -> String {
     }
 
     String::from_utf8(masked).expect("masked source should remain valid UTF-8")
+}
+
+fn mask_string_literal(bytes: &[u8], masked: &mut [u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut index = start + 1;
+
+    while index < bytes.len() {
+        let current = bytes[index];
+        masked[index] = if current == b'\n' { b'\n' } else { b' ' };
+        index += 1;
+        if current == b'\\' {
+            if index < bytes.len() {
+                masked[index] = b' ';
+                index += 1;
+            }
+        } else if current == quote {
+            break;
+        }
+    }
+
+    index
+}
+
+fn mask_template_literal(bytes: &[u8], masked: &mut [u8], start: usize) -> usize {
+    let mut index = start + 1;
+
+    while index < bytes.len() {
+        let current = bytes[index];
+        masked[index] = if current == b'\n' { b'\n' } else { b' ' };
+
+        if current == b'\\' {
+            index += 1;
+            if index < bytes.len() {
+                masked[index] = if bytes[index] == b'\n' { b'\n' } else { b' ' };
+            }
+        } else if current == b'`' {
+            index += 1;
+            break;
+        } else if current == b'$' && bytes.get(index + 1) == Some(&b'{') {
+            masked[index + 1] = b' ';
+            index = mask_template_expression(bytes, masked, index + 2);
+            continue;
+        }
+
+        index += 1;
+    }
+
+    index
+}
+
+fn mask_template_expression(bytes: &[u8], masked: &mut [u8], start: usize) -> usize {
+    let mut index = start;
+    let mut depth = 1_usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' => index = mask_string_literal(bytes, masked, index),
+            b'`' => index = mask_template_literal(bytes, masked, index),
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                masked[index] = b' ';
+                masked[index + 1] = b' ';
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    masked[index] = b' ';
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                masked[index] = b' ';
+                masked[index + 1] = b' ';
+                index += 2;
+                while index < bytes.len() {
+                    let current = bytes[index];
+                    let next = bytes.get(index + 1).copied();
+                    masked[index] = if current == b'\n' { b'\n' } else { b' ' };
+                    index += 1;
+                    if current == b'*' && next == Some(b'/') {
+                        masked[index] = b' ';
+                        index += 1;
+                        break;
+                    }
+                }
+            }
+            b'/' if is_regex_literal_start(bytes, index) => {
+                index = mask_regex_literal(bytes, masked, index);
+            }
+            b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    masked[index] = b' ';
+                    return index + 1;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    index
 }
 
 fn is_regex_literal_start(bytes: &[u8], start: usize) -> bool {

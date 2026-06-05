@@ -46,6 +46,26 @@ test("extractRuntimeImports marks star re-exports as barrel syntax", () => {
   );
 });
 
+test("extractRuntimeImports ignores local export specifiers while keeping package re-exports", () => {
+  const source = [
+    "const local = 1;",
+    "export { local };",
+    "export { z } from 'zod';",
+  ].join("\n");
+
+  const imports = extractRuntimeImports("barrel.ts", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      named: item.named,
+      syntax: item.syntax,
+    })),
+    [{ specifier: "zod", kind: "named", named: ["z"], syntax: "reexport" }],
+  );
+});
+
 test("extractRuntimeImports ignores non-literal dynamic imports", () => {
   const source = [
     "const packageName = 'react';",

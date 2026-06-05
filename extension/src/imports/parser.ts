@@ -64,6 +64,8 @@ const createDetectedImport = (
 const runtimeEntries = (entries: StaticImportEntry[]): StaticImportEntry[] =>
   entries.filter((entry) => !entry.isType);
 
+type StaticExportEntry = StaticExport["entries"][number];
+
 const importsFromStaticImport = (source: string, region: ScriptRegion, item: StaticImport): DetectedImport[] => {
   const specifier = item.moduleRequest.value;
 
@@ -104,26 +106,36 @@ const importsFromStaticImport = (source: string, region: ScriptRegion, item: Sta
 };
 
 const importsFromStaticExport = (source: string, region: ScriptRegion, item: StaticExport): DetectedImport[] => {
-  if (item.entries.length === 0) {
-    return [];
-  }
-
-  const specifier = item.entries[0]?.moduleRequest?.value;
-  if (!specifier || !isRuntimePackageSpecifier(specifier)) {
-    return [];
-  }
-
   const imports: DetectedImport[] = [];
-  const named = item.entries
-    .filter((entry) => entry.importName.kind === ExportImportNameKind.Name && entry.importName.name)
-    .map((entry) => entry.importName.name as string);
+  const groups = new Map<string, { quoteEndOffset: number; entries: StaticExportEntry[] }>();
 
-  if (item.entries.some((entry) => entry.importName.kind === ExportImportNameKind.All || entry.importName.kind === ExportImportNameKind.AllButDefault)) {
-    imports.push(createDetectedImport(source, region, specifier, "namespace", "star_reexport", [], item.start, item.end, item.entries[0].moduleRequest!.end));
+  for (const entry of item.entries) {
+    const moduleRequest = entry.moduleRequest;
+
+    if (!moduleRequest || !isRuntimePackageSpecifier(moduleRequest.value)) {
+      continue;
+    }
+
+    const group = groups.get(moduleRequest.value) ?? {
+      quoteEndOffset: moduleRequest.end,
+      entries: [],
+    };
+    group.entries.push(entry);
+    groups.set(moduleRequest.value, group);
   }
 
-  if (named.length > 0) {
-    imports.push(createDetectedImport(source, region, specifier, "named", "reexport", named, item.start, item.end, item.entries[0].moduleRequest!.end));
+  for (const [specifier, group] of groups) {
+    const named = group.entries
+      .filter((entry) => entry.importName.kind === ExportImportNameKind.Name && entry.importName.name)
+      .map((entry) => entry.importName.name as string);
+
+    if (group.entries.some((entry) => entry.importName.kind === ExportImportNameKind.All || entry.importName.kind === ExportImportNameKind.AllButDefault)) {
+      imports.push(createDetectedImport(source, region, specifier, "namespace", "star_reexport", [], item.start, item.end, group.quoteEndOffset));
+    }
+
+    if (named.length > 0) {
+      imports.push(createDetectedImport(source, region, specifier, "named", "reexport", named, item.start, item.end, group.quoteEndOffset));
+    }
   }
 
   return imports;

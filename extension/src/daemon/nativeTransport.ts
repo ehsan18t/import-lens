@@ -56,6 +56,12 @@ export class NativeDaemonTransport implements AnalysisTransport {
   async start(analysisRoot?: string): Promise<DaemonState> {
     if (this.#isDisposed) return "unavailable";
     if (this.#state === "ready" && this.#process && this.#client) return "ready";
+    this.#clearRestartTimer();
+    this.#clearDisconnectTimer();
+
+    if (this.#process || this.#client) {
+      this.#cleanup();
+    }
 
     const workspaceRoot = resolveDaemonStartRoot(
       analysisRoot,
@@ -99,7 +105,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       ? `\\\\.\\pipe\\import-lens-${process.pid}-${randomUUID()}`
       : path.join(this.#context.globalStorageUri.fsPath, `import-lens-${process.pid}-${randomUUID()}.sock`);
 
-    this.#process = spawn(binaryPath, [
+    const childProcess = spawn(binaryPath, [
       "--pipe",
       pipeName,
       "--workspace",
@@ -107,26 +113,47 @@ export class NativeDaemonTransport implements AnalysisTransport {
       "--storage",
       this.#context.globalStorageUri.fsPath,
     ]);
-    this.#logger.info(`Spawned ImportLens daemon process ${this.#process.pid ?? "unknown"}.`);
-    pipeDaemonProcessLogs(this.#process, this.#logger);
+    this.#process = childProcess;
+    this.#logger.info(`Spawned ImportLens daemon process ${childProcess.pid ?? "unknown"}.`);
+    pipeDaemonProcessLogs(childProcess, this.#logger);
 
-    this.#process.once("exit", (code, signal) => {
+    childProcess.once("exit", (code, signal) => {
+      if (childProcess !== this.#process) {
+        this.#logger.debug("Ignoring stale daemon process exit event.");
+        return;
+      }
+
       void this.#handleProcessExit(code, signal);
     });
 
+    let client: IpcClient;
+
     try {
-      this.#client = await IpcClient.connect(pipeName);
+      client = await IpcClient.connect(pipeName);
+      if (childProcess !== this.#process) {
+        client.dispose();
+        return this.#state;
+      }
+
+      this.#client = client;
       this.#logger.info("Connected to ImportLens daemon IPC.");
     } catch (error) {
       this.#logger.warn(`Failed to connect to daemon: ${error instanceof Error ? error.message : String(error)}`);
-      cleanupFailedDaemonStartup(null, this.#process);
-      this.#client = null;
-      this.#process = null;
-      this.#handleCrash();
+      cleanupFailedDaemonStartup(null, childProcess);
+      if (childProcess === this.#process) {
+        this.#client = null;
+        this.#process = null;
+        this.#handleCrash();
+      }
       return this.#state;
     }
 
-    this.#client.on("disconnect", (error) => {
+    client.on("disconnect", (error) => {
+      if (client !== this.#client) {
+        this.#logger.debug("Ignoring stale daemon IPC disconnect event.");
+        return;
+      }
+
       this.#logger.warn(`IPC disconnected: ${error instanceof Error ? error.message : String(error)}`);
       this.#handleUnexpectedDisconnect();
     });
@@ -136,10 +163,12 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#logger.info(`Sent daemon hello using protocol v${protocolVersion}.`);
     } catch (error) {
       this.#logger.warn(`Failed to send daemon hello: ${error instanceof Error ? error.message : String(error)}`);
-      cleanupFailedDaemonStartup(this.#client, this.#process);
-      this.#client = null;
-      this.#process = null;
-      this.#handleCrash();
+      cleanupFailedDaemonStartup(client, childProcess);
+      if (childProcess === this.#process && client === this.#client) {
+        this.#client = null;
+        this.#process = null;
+        this.#handleCrash();
+      }
       return this.#state;
     }
 
@@ -238,6 +267,13 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#disconnectTimer = null;
   }
 
+  #clearRestartTimer(): void {
+    if (!this.#restartTimer) return;
+
+    clearTimeout(this.#restartTimer);
+    this.#restartTimer = null;
+  }
+
   #armStabilityReset(): void {
     if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
     this.#stabilityTimer = setTimeout(() => {
@@ -309,7 +345,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async shutdown(): Promise<void> {
     this.#isDisposed = true;
-    if (this.#restartTimer) clearTimeout(this.#restartTimer);
+    this.#clearRestartTimer();
     if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
     if (this.#cleanRecycleTimer) clearTimeout(this.#cleanRecycleTimer);
     this.#clearDisconnectTimer();
