@@ -172,14 +172,16 @@ fn commonjs_exports(source: &str, masked: &str) -> Vec<String> {
             continue;
         }
 
-        if let Some((name, next_index)) = export_name_after_exports(bytes, end) {
+        if let Some((name, next_index)) = export_name_after_exports(source.as_bytes(), bytes, end) {
             exports.push(name);
             index = next_index;
             continue;
         }
 
         if is_module_exports(bytes, start) {
-            if let Some((name, next_index)) = export_name_after_exports(bytes, end) {
+            if let Some((name, next_index)) =
+                export_name_after_exports(source.as_bytes(), bytes, end)
+            {
                 exports.push(name);
                 index = next_index;
                 continue;
@@ -200,13 +202,26 @@ fn commonjs_exports(source: &str, masked: &str) -> Vec<String> {
     exports
 }
 
-fn export_name_after_exports(bytes: &[u8], exports_end: usize) -> Option<(String, usize)> {
-    let dot = skip_spaces(bytes, exports_end);
-    if bytes.get(dot) != Some(&b'.') {
+fn export_name_after_exports(
+    source_bytes: &[u8],
+    bytes: &[u8],
+    exports_end: usize,
+) -> Option<(String, usize)> {
+    let property_start = skip_spaces(bytes, exports_end);
+    let (name, name_end) = if bytes.get(property_start) == Some(&b'.') {
+        let name_start = skip_spaces(bytes, property_start + 1);
+        read_identifier(bytes, name_start)?
+    } else if bytes.get(property_start) == Some(&b'[') {
+        let string_start = skip_spaces(bytes, property_start + 1);
+        let (name, string_end) = parse_string_literal(source_bytes, string_start)?;
+        let bracket_end = skip_spaces(bytes, string_end);
+        if bytes.get(bracket_end) != Some(&b']') {
+            return None;
+        }
+        (name, bracket_end + 1)
+    } else {
         return None;
-    }
-    let name_start = skip_spaces(bytes, dot + 1);
-    let (name, name_end) = read_identifier(bytes, name_start)?;
+    };
     let assignment = skip_spaces(bytes, name_end);
     if bytes.get(assignment) != Some(&b'=') {
         return None;
@@ -343,11 +358,71 @@ fn mask_non_code(source: &str) -> String {
                     }
                 }
             }
+            b'/' if is_regex_literal_start(bytes, index) => {
+                index = mask_regex_literal(bytes, &mut masked, index);
+            }
             _ => index += 1,
         }
     }
 
     String::from_utf8(masked).expect("masked source should remain valid UTF-8")
+}
+
+fn is_regex_literal_start(bytes: &[u8], start: usize) -> bool {
+    let Some(previous) = previous_significant_byte(bytes, start) else {
+        return true;
+    };
+
+    matches!(
+        previous,
+        b'(' | b'=' | b':' | b'[' | b'{' | b',' | b'!' | b'?' | b';'
+    )
+}
+
+fn previous_significant_byte(bytes: &[u8], start: usize) -> Option<u8> {
+    bytes[..start]
+        .iter()
+        .rev()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+}
+
+fn mask_regex_literal(bytes: &[u8], masked: &mut [u8], start: usize) -> usize {
+    masked[start] = b' ';
+    let mut index = start + 1;
+    let mut in_character_class = false;
+
+    while index < bytes.len() {
+        let current = bytes[index];
+        masked[index] = if current == b'\n' { b'\n' } else { b' ' };
+        index += 1;
+
+        if current == b'\\' {
+            if index < bytes.len() {
+                masked[index] = if bytes[index] == b'\n' { b'\n' } else { b' ' };
+                index += 1;
+            }
+            continue;
+        }
+
+        match current {
+            b'[' => in_character_class = true,
+            b']' => in_character_class = false,
+            b'/' if !in_character_class => {
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| byte.is_ascii_alphabetic())
+                {
+                    masked[index] = b' ';
+                    index += 1;
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    index
 }
 
 fn parse_string_literal(bytes: &[u8], start: usize) -> Option<(String, usize)> {

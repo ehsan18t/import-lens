@@ -1035,6 +1035,111 @@ fn analyze_commonjs_literal_require_resolves_directory_package_manifest() {
 }
 
 #[test]
+fn analyze_commonjs_bracket_exports_include_required_modules() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "bracket-cjs-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+    write_package_file(
+        &workspace,
+        "bracket-cjs-lib",
+        "index.cjs",
+        "const helper = require('./helper.cjs');\nexports[\"used\"] = helper.used;",
+    );
+    write_package_file(
+        &workspace,
+        "bracket-cjs-lib",
+        "helper.cjs",
+        "exports.used = 'required helper payload';",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "bracket-cjs-lib",
+            "bracket-cjs-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(
+        result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("helper.cjs"))
+        }),
+        "{result:?}",
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.stage != "cjs_fallback"),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_commonjs_ignores_require_inside_regex_literal() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "regex-cjs-lib",
+        r#"{"version":"1.0.0","main":"index.cjs"}"#,
+        "// unused js entry",
+    );
+    write_package_file(
+        &workspace,
+        "regex-cjs-lib",
+        "index.cjs",
+        "const pattern = /require('.\\/heavy.cjs')/;\nexports.used = pattern.test('');",
+    );
+    write_package_file(
+        &workspace,
+        "regex-cjs-lib",
+        "heavy.cjs",
+        &format!("exports.heavy = '{}';", "x".repeat(4096)),
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "regex-cjs-lib",
+            "regex-cjs-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(
+        !result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.ends_with("heavy.cjs"))
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_commonjs_dynamic_require_uses_static_fallback_diagnostic() {
     let workspace = temp_workspace();
     write_package(
