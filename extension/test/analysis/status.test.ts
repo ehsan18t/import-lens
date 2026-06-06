@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { markLoadingStatesUnavailable } from "../../src/analysis/status.js";
+import {
+  applyFinalBatchResults,
+  markLoadingStatesUnavailable,
+} from "../../src/analysis/status.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import type { DetectedImport } from "../../src/imports/types.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
@@ -54,4 +57,47 @@ test("markLoadingStatesUnavailable preserves completed states and marks pending 
     missing,
     ready,
   ]);
+});
+
+test("applyFinalBatchResults marks missing daemon results unavailable", () => {
+  const warnings: string[] = [];
+
+  const states = applyFinalBatchResults(
+    [
+      { detected, status: "loading" },
+      {
+        detected: detectedImport({
+          specifier: "lodash-es",
+          packageName: "lodash-es",
+          importKind: "namespace",
+          quoteEnd: { line: 1, character: 28 },
+          specifierRange: sourceRange(1, 8, 27),
+          statementRange: sourceRange(1, 0, 30),
+        }),
+        status: "loading",
+      },
+    ],
+    [result],
+    (specifier, reason) => warnings.push(`${specifier}: ${reason}`),
+  );
+
+  assert.equal(states[0]?.status, "ready");
+  assert.deepEqual(states[1], {
+    detected: states[1]?.detected,
+    status: "unavailable",
+    message: "No daemon response",
+  });
+  assert.deepEqual(warnings, [
+    "lodash-es: daemon response did not include a matching result",
+  ]);
+});
+
+test("applyFinalBatchResults keeps partial ready states when final response is incomplete", () => {
+  const states = applyFinalBatchResults(
+    [{ detected, status: "ready", result }],
+    [],
+    () => undefined,
+  );
+
+  assert.deepEqual(states, [{ detected, status: "ready", result }]);
 });

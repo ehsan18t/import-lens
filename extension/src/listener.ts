@@ -13,7 +13,7 @@ import {
 } from "./analysis/history.js";
 import { createImportRequest } from "./analysis/request.js";
 import { ImportResultLogTracker } from "./analysis/resultLogging.js";
-import { markLoadingStatesUnavailable } from "./analysis/status.js";
+import { applyFinalBatchResults, markLoadingStatesUnavailable } from "./analysis/status.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
@@ -179,43 +179,27 @@ export class DocumentAnalysisController implements vscode.Disposable {
         applyPartial,
       );
 
-      if (!response || !this.#freshness.isCurrent(documentKey, response.request_id)) {
+      if (!response) {
+        this.#store.set(document.uri, markLoadingStatesUnavailable(currentStates, "No daemon response"));
+        this.#statusBar.setStatus("unavailable");
         return;
       }
 
-      let responseIndex = 0;
+      if (!this.#freshness.isCurrent(documentKey, response.request_id)) {
+        return;
+      }
 
-      const responseStates = states.map((state) => {
-        if (state.status === "missing") {
-          return state;
+      const responseStates = applyFinalBatchResults(
+        currentStates,
+        response.imports,
+        (specifier, reason) => resultLogger.logMissingResult(specifier, reason),
+      );
+
+      for (const state of responseStates) {
+        if (state.status === "ready" && state.result) {
+          resultLogger.logResult(state.result);
         }
-
-        const result = response.imports[responseIndex++];
-
-        if (!result) {
-          resultLogger.logMissingResult(
-            state.detected.specifier,
-            "daemon response did not include a matching result",
-          );
-          return state;
-        }
-
-        if (result.specifier !== state.detected.specifier) {
-          resultLogger.logMissingResult(
-            state.detected.specifier,
-            `daemon response returned ${result.specifier} instead`,
-          );
-          return state;
-        }
-
-        resultLogger.logResult(result);
-
-        return {
-          detected: state.detected,
-          status: "ready" as const,
-          result,
-        };
-      });
+      }
 
       const history = this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
       const nextStates = applyImportAnalysisInsights(responseStates, {

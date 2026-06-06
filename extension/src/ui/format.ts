@@ -48,8 +48,22 @@ const formatWarningSuffix = (result: ImportResult, showWarnings: boolean, runtim
     return `${runtimeSuffix} · types only`;
   }
 
-  if (showWarnings && result.is_cjs) {
-    return `${runtimeSuffix} · CJS`;
+  if (!showWarnings) {
+    return runtimeSuffix;
+  }
+
+  const warningTags = [];
+
+  if (result.is_cjs) {
+    warningTags.push("CJS");
+  }
+
+  if (result.side_effects || !result.truly_treeshakeable) {
+    warningTags.push("conservative");
+  }
+
+  if (warningTags.length > 0) {
+    return `${runtimeSuffix} · ${warningTags.join(" · ")}`;
   }
 
   return runtimeSuffix;
