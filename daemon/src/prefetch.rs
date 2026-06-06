@@ -114,7 +114,12 @@ pub fn package_json_dependency_names(contents: &str) -> Result<Vec<String>, Stri
         .map_err(|error| format!("failed to parse package.json: {error}"))?;
     let mut names = Vec::new();
 
-    for field in ["dependencies", "devDependencies"] {
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
         let Some(dependencies) = json.get(field).and_then(Value::as_object) else {
             continue;
         };

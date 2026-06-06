@@ -34,7 +34,7 @@ fn write_installed_package(workspace: &Path, package_name: &str, version: &str) 
 }
 
 #[test]
-fn package_json_dependency_names_include_dependencies_and_dev_dependencies() {
+fn package_json_dependency_names_include_all_installable_dependency_sections() {
     let names = package_json_dependency_names(
         r#"{
             "dependencies": {
@@ -42,12 +42,26 @@ fn package_json_dependency_names_include_dependencies_and_dev_dependencies() {
             },
             "devDependencies": {
                 "lodash-es": "^4"
+            },
+            "peerDependencies": {
+                "@types/react": "^19"
+            },
+            "optionalDependencies": {
+                "fsevents": "^2"
             }
         }"#,
     )
     .expect("package json should parse");
 
-    assert_eq!(names, vec!["lodash-es".to_owned(), "react".to_owned()]);
+    assert_eq!(
+        names,
+        vec![
+            "@types/react".to_owned(),
+            "fsevents".to_owned(),
+            "lodash-es".to_owned(),
+            "react".to_owned()
+        ]
+    );
 }
 
 #[test]

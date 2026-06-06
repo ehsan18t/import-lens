@@ -13,6 +13,7 @@ import { TransportCoordinator, type AnalysisTransport, type DaemonState } from "
 class FakeTransport implements AnalysisTransport {
   readonly #startState: DaemonState;
   readonly calls: string[] = [];
+  readonly #stateListeners = new Set<(state: DaemonState) => void>();
   #state: DaemonState = "unavailable";
 
   constructor(startState: DaemonState) {
@@ -23,9 +24,27 @@ class FakeTransport implements AnalysisTransport {
     return this.#state;
   }
 
+  readonly onDidChangeState = (listener: (state: DaemonState) => void): { dispose(): void } => {
+    this.#stateListeners.add(listener);
+
+    return {
+      dispose: () => {
+        this.#stateListeners.delete(listener);
+      },
+    };
+  };
+
+  setState(state: DaemonState): void {
+    this.#state = state;
+
+    for (const listener of this.#stateListeners) {
+      listener(state);
+    }
+  }
+
   async start(analysisRoot?: string): Promise<DaemonState> {
     this.calls.push(analysisRoot ? `start:${analysisRoot}` : "start");
-    this.#state = this.#startState;
+    this.setState(this.#startState);
     return this.#state;
   }
 
@@ -80,7 +99,7 @@ class FakeTransport implements AnalysisTransport {
 
   async shutdown(): Promise<void> {
     this.calls.push("shutdown");
-    this.#state = "unavailable";
+    this.setState("unavailable");
   }
 
   dispose(): void {
@@ -207,6 +226,22 @@ test("TransportCoordinator shuts down all transports", async () => {
   assert.equal(coordinator.state, "unavailable");
   assert.equal(first.calls.includes("shutdown"), true);
   assert.equal(second.calls.includes("shutdown"), true);
+});
+
+test("TransportCoordinator emits active transport state changes", async () => {
+  const ready = new FakeTransport("ready");
+  const coordinator = new TransportCoordinator([ready]);
+  const states: DaemonState[] = [];
+  const subscription = coordinator.onDidChangeState((state) => states.push(state));
+
+  await coordinator.start();
+  ready.setState("unavailable");
+  ready.setState("ready");
+  await coordinator.shutdown();
+  subscription.dispose();
+
+  assert.deepEqual(states, ["ready", "unavailable", "ready", "unavailable"]);
+  assert.equal(coordinator.state, "unavailable");
 });
 
 const batch = (requestId: number): BatchRequest => ({

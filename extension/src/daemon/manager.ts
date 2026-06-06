@@ -9,7 +9,7 @@ import type {
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { NativeDaemonTransport } from "./nativeTransport.js";
-import { TransportCoordinator, type DaemonState } from "./transport.js";
+import { TransportCoordinator, type DaemonState, type DaemonStateEvent } from "./transport.js";
 
 export class DaemonManager implements vscode.Disposable {
   readonly #transport: TransportCoordinator;
@@ -22,6 +22,10 @@ export class DaemonManager implements vscode.Disposable {
 
   get state(): DaemonState {
     return this.#transport.state;
+  }
+
+  get onDidChangeState(): DaemonStateEvent {
+    return this.#transport.onDidChangeState;
   }
 
   start(analysisRoot?: string): Promise<DaemonState> {

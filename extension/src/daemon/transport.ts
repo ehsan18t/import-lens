@@ -8,9 +8,11 @@ import type {
 } from "../ipc/protocol.js";
 
 export type DaemonState = "ready" | "unavailable";
+export type DaemonStateEvent = (listener: (state: DaemonState) => void) => { dispose(): void };
 
 export interface AnalysisTransport {
   readonly state: DaemonState;
+  readonly onDidChangeState?: DaemonStateEvent;
   start(analysisRoot?: string): Promise<DaemonState>;
   sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null>;
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null>;
@@ -24,17 +26,32 @@ export interface AnalysisTransport {
 
 export class TransportCoordinator implements AnalysisTransport {
   readonly #transports: readonly AnalysisTransport[];
+  readonly #stateListeners = new Set<(state: DaemonState) => void>();
   #activeTransport: AnalysisTransport | null = null;
   #startPromise: Promise<DaemonState> | null = null;
   #state: DaemonState = "unavailable";
 
   constructor(transports: readonly AnalysisTransport[]) {
     this.#transports = transports;
+
+    for (const transport of transports) {
+      transport.onDidChangeState?.((state) => this.#handleTransportState(transport, state));
+    }
   }
 
   get state(): DaemonState {
     return this.#state;
   }
+
+  readonly onDidChangeState: DaemonStateEvent = (listener) => {
+    this.#stateListeners.add(listener);
+
+    return {
+      dispose: () => {
+        this.#stateListeners.delete(listener);
+      },
+    };
+  };
 
   async start(analysisRoot?: string): Promise<DaemonState> {
     if (this.#state === "ready" && this.#activeTransport?.state === "ready") {
@@ -58,13 +75,13 @@ export class TransportCoordinator implements AnalysisTransport {
 
       if (state === "ready") {
         this.#activeTransport = transport;
-        this.#state = "ready";
+        this.#setState("ready");
         return this.#state;
       }
     }
 
     this.#activeTransport = null;
-    this.#state = "unavailable";
+    this.#setState("unavailable");
     return this.#state;
   }
 
@@ -96,10 +113,34 @@ export class TransportCoordinator implements AnalysisTransport {
     await Promise.all(this.#transports.map((transport) => transport.shutdown()));
     this.#activeTransport = null;
     this.#startPromise = null;
-    this.#state = "unavailable";
+    this.#setState("unavailable");
   }
 
   dispose(): void {
     void this.shutdown();
+  }
+
+  #handleTransportState(transport: AnalysisTransport, state: DaemonState): void {
+    if (transport !== this.#activeTransport && !(state === "ready" && this.#activeTransport === null)) {
+      return;
+    }
+
+    if (state === "ready") {
+      this.#activeTransport = transport;
+    }
+
+    this.#setState(state);
+  }
+
+  #setState(state: DaemonState): void {
+    if (this.#state === state) {
+      return;
+    }
+
+    this.#state = state;
+
+    for (const listener of this.#stateListeners) {
+      listener(state);
+    }
   }
 }

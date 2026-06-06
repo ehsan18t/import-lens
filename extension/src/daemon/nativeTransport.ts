@@ -22,7 +22,7 @@ import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs, terminateProcess } f
 import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 import { resolveDaemonStartRoot } from "./startRoot.js";
-import type { AnalysisTransport, DaemonState } from "./transport.js";
+import type { AnalysisTransport, DaemonState, DaemonStateEvent } from "./transport.js";
 
 const STABLE_SESSION_RESET_MS = 60_000;
 const CLEAN_RECYCLE_SESSION_MS = 30 * 60 * 1000;
@@ -31,6 +31,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
   readonly #context: vscode.ExtensionContext;
   readonly #logger: ImportLensLogger;
   readonly #recycleGuard: RecycleGuard;
+  readonly #stateListeners = new Set<(state: DaemonState) => void>();
   #process: ChildProcessWithoutNullStreams | null = null;
   #client: IpcClient | null = null;
   #state: DaemonState = "unavailable";
@@ -53,6 +54,16 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#state;
   }
 
+  readonly onDidChangeState: DaemonStateEvent = (listener) => {
+    this.#stateListeners.add(listener);
+
+    return {
+      dispose: () => {
+        this.#stateListeners.delete(listener);
+      },
+    };
+  };
+
   async start(analysisRoot?: string): Promise<DaemonState> {
     if (this.#isDisposed) return "unavailable";
     if (this.#state === "ready" && this.#process && this.#client) return "ready";
@@ -71,14 +82,14 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     if (!workspaceRoot) {
       this.#logger.warn("No workspace or analysis root is available; daemon unavailable.");
-      this.#state = "unavailable";
+      this.#setState("unavailable");
       return this.#state;
     }
     this.#logger.info(`Starting ImportLens daemon for workspace ${workspaceRoot}.`);
 
     if (await this.#recycleGuard.shouldEnterDegradedMode()) {
       this.#logger.warn("Daemon recycle loop detected. ImportLens is entering unavailable mode.");
-      this.#state = "unavailable";
+      this.#setState("unavailable");
       return this.#state;
     }
 
@@ -86,7 +97,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     if (!target) {
       this.#logger.warn(`Unsupported platform ${process.platform}-${process.arch}; daemon unavailable.`);
-      this.#state = "unavailable";
+      this.#setState("unavailable");
       return this.#state;
     }
 
@@ -94,7 +105,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     const binaryPath = path.join(this.#context.extensionPath, relativeBinaryPath);
 
     if (!(await this.#verifyBinary(relativeBinaryPath, binaryPath))) {
-      this.#state = "unavailable";
+      this.#setState("unavailable");
       return this.#state;
     }
     this.#logger.info(`Daemon binary verified: ${relativeBinaryPath}.`);
@@ -172,8 +183,8 @@ export class NativeDaemonTransport implements AnalysisTransport {
       return this.#state;
     }
 
-    this.#state = "ready";
     this.#lastAnalysisRoot = workspaceRoot;
+    this.#setState("ready");
     this.#armStabilityReset();
     this.#armCleanRecycleReset();
     this.#logger.info("ImportLens daemon is ready.");
@@ -226,7 +237,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     if (shouldEnterCrashDegradedMode(this.#crashTimes, now)) {
       this.#logger.error("Daemon crashed three times within 60 seconds. ImportLens is entering unavailable mode.");
-      this.#state = "unavailable";
+      this.#setState("unavailable");
       return;
     }
 
@@ -236,7 +247,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
   }
 
   #scheduleRestart(delay: number, message: string, level: "info" | "warn" = "warn"): void {
-    this.#state = "unavailable";
+    this.#setState("unavailable");
     this.#logger[level](message);
     this.#restartTimer = setTimeout(() => {
       this.#restartTimer = null;
@@ -257,7 +268,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       childProcess?.kill();
     }
 
-    this.#state = "unavailable";
+    this.#setState("unavailable");
   }
 
   #clearDisconnectTimer(): void {
@@ -355,7 +366,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     this.#client = null;
     this.#process = null;
-    this.#state = "unavailable";
+    this.#setState("unavailable");
 
     try {
       client?.send({ type: "shutdown" });
@@ -372,6 +383,18 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   dispose(): void {
     void this.shutdown();
+  }
+
+  #setState(state: DaemonState): void {
+    if (this.#state === state) {
+      return;
+    }
+
+    this.#state = state;
+
+    for (const listener of this.#stateListeners) {
+      listener(state);
+    }
   }
 
   async #verifyBinary(relativePath: string, binaryPath: string): Promise<boolean> {

@@ -9,6 +9,7 @@ import { languageSelector } from "./languages.js";
 import { ImportLensLogger } from "./logger.js";
 import { registerNodeModulesWatchers } from "./watcher.js";
 import { registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
+import { prewarmPackageJsonDocuments } from "./prewarm/packageJsonHelpers.js";
 import { BudgetDiagnosticsController } from "./ui/budgetDiagnostics.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
 import { compareImports, compareImportsCommand } from "./ui/compareImports.js";
@@ -148,10 +149,25 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   );
 
   registerNodeModulesWatchers(context, daemon, () => refreshVisibleDocuments(getImportLensConfig()));
+  registerPackageJsonPrewarm(context, daemon);
+  context.subscriptions.push(daemon.onDidChangeState((nextState) => {
+    statusBar.setStatus(nextState === "ready" ? "ready" : "unavailable");
+
+    if (nextState !== "ready") {
+      return;
+    }
+
+    const prewarmCount = prewarmPackageJsonDocuments(vscode.workspace.textDocuments, daemon!);
+    if (prewarmCount > 0) {
+      logger.debug(`Replayed package.json prewarm for ${prewarmCount} open document(s).`);
+    }
+
+    packageJsonAnalysis.refreshVisibleDocuments();
+    packageJsonInlayHints.refresh();
+  }));
   const state = await daemon.start();
   logger.info(`ImportLens daemon startup completed with state: ${state}.`);
   statusBar.setStatus(state === "ready" ? "ready" : "unavailable");
-  registerPackageJsonPrewarm(context, daemon);
 
   if (vscode.window.activeTextEditor) {
     analysis.schedule(vscode.window.activeTextEditor.document);
