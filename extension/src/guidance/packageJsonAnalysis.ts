@@ -109,7 +109,6 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     const requestStateIndexes: number[] = [];
 
     for (const entry of entries) {
-      const registryHint = this.registryHintForEntry(document.uri, requestId, entry);
       const resolution = await resolveInstalledPackage(entry.name, document.fileName);
 
       if (!resolution.ok) {
@@ -119,11 +118,12 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
           section: entry.section,
           status: "missing",
           message: resolution.reason === "package_not_found" ? "Package not found" : "Invalid package.json",
-          registryHint,
+          registryHint: null,
         });
         continue;
       }
 
+      const registryHint = this.registryHintForEntry(document.uri, requestId, entry, resolution.version);
       requestStateIndexes.push(states.length);
       requestImports.push({
         specifier: entry.name,
@@ -266,18 +266,22 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     uri: vscode.Uri,
     requestId: number,
     entry: PackageJsonDependencyEntry,
+    installedVersion: string,
   ): PackageJsonDependencyAnalysisState["registryHint"] {
     if (!getImportLensConfig().enableRegistryHints) {
       return null;
     }
 
-    const cached = getCachedRegistryHint(this.#context, entry.name);
+    const cached = getCachedRegistryHint(this.#context, entry.name, installedVersion);
 
     if (cached) {
       return cached;
     }
 
-    void fetchRegistryHint(this.#context, entry.name).then((hint) => {
+    void fetchRegistryHint(this.#context, entry.name, {
+      installedVersion,
+      logger: this.#logger,
+    }).then((hint) => {
       if (hint) {
         this.applyRegistryHint(uri, requestId, entry.name, hint);
       }
