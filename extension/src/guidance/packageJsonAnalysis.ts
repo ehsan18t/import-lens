@@ -112,13 +112,14 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       const resolution = await resolveInstalledPackage(entry.name, document.fileName);
 
       if (!resolution.ok) {
+        const registryHint = this.registryHintForEntry(document.uri, requestId, entry);
         states.push({
           entry,
           name: entry.name,
           section: entry.section,
           status: "missing",
           message: resolution.reason === "package_not_found" ? "Package not found" : "Invalid package.json",
-          registryHint: null,
+          registryHint,
         });
         continue;
       }
@@ -138,6 +139,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
         name: entry.name,
         section: entry.section,
         status: "loading",
+        installedVersion: resolution.version,
         registryHint,
       });
     }
@@ -266,7 +268,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     uri: vscode.Uri,
     requestId: number,
     entry: PackageJsonDependencyEntry,
-    installedVersion: string,
+    installedVersion?: string,
   ): PackageJsonDependencyAnalysisState["registryHint"] {
     if (!getImportLensConfig().enableRegistryHints) {
       return null;

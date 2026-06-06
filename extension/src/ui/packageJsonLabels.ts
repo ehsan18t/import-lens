@@ -7,14 +7,55 @@ import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
 export type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 
-const latestVersionPart = (registryHint: PackageJsonDependencyHintState["registryHint"]): string | null =>
-  registryHint?.latestVersion ? `latest ${registryHint.latestVersion}` : null;
+const freshReleaseWindowMs = 24 * 60 * 60 * 1000;
+
+export const isFreshLatestRelease = (
+  registryHint: PackageJsonDependencyHintState["registryHint"],
+  now: number = Date.now(),
+): boolean => {
+  if (!registryHint?.latestPublishedAt) {
+    return false;
+  }
+
+  const publishedAt = Date.parse(registryHint.latestPublishedAt);
+
+  return Number.isFinite(publishedAt)
+    && publishedAt <= now
+    && now - publishedAt < freshReleaseWindowMs;
+};
+
+export const packageJsonDependencyVersionStatusLabel = (
+  state: PackageJsonDependencyHintState,
+  now: number = Date.now(),
+): string | null => {
+  const { registryHint } = state;
+
+  if (!registryHint?.latestVersion) {
+    return null;
+  }
+
+  let status: string | null = null;
+
+  if (state.status === "missing") {
+    status = `install ${registryHint.latestVersion}`;
+  } else if (registryHint.isLatest === true) {
+    status = "latest";
+  } else if (registryHint.isLatest === false) {
+    status = `update ${registryHint.latestVersion}`;
+  }
+
+  if (!status) {
+    return null;
+  }
+
+  return isFreshLatestRelease(registryHint, now) ? `✦ ${status}` : status;
+};
 
 const packageJsonDependencyLabel = (
   primary: string,
-  registryHint: PackageJsonDependencyHintState["registryHint"],
+  state: PackageJsonDependencyHintState,
 ): string =>
-  [primary, latestVersionPart(registryHint)]
+  [primary, packageJsonDependencyVersionStatusLabel(state)]
     .filter((part): part is string => Boolean(part))
     .join(" · ");
 
@@ -50,25 +91,25 @@ export const packageJsonDependencyHintLabel = (
   config: ImportLensConfig,
 ): string => {
   if (state.status === "loading") {
-    return packageJsonDependencyLabel("checking...", state.registryHint);
+    return packageJsonDependencyLabel("checking...", state);
   }
 
   if (state.status === "missing") {
-    return packageJsonDependencyLabel("not installed", state.registryHint);
+    return packageJsonDependencyLabel("not installed", state);
   }
 
   if (state.status === "unavailable" || !state.result || state.result.error) {
-    return packageJsonDependencyLabel("unavailable", state.registryHint);
+    return packageJsonDependencyLabel("unavailable", state);
   }
 
   if (isTypesOnlyResult(state.result)) {
-    return packageJsonDependencyLabel("types only", state.registryHint);
+    return packageJsonDependencyLabel("types only", state);
   }
 
   const confidencePrefix = state.result.confidence === "low" ? "~" : "";
   const primary = `${confidencePrefix}${formatBytes(selectedCompressionBytes(state.result, config.compression))} ${selectedCompressionLabel(config.compression)}`;
 
-  return packageJsonDependencyLabel(primary, state.registryHint);
+  return packageJsonDependencyLabel(primary, state);
 };
 
 export const packageJsonSectionSummaryLabel = (

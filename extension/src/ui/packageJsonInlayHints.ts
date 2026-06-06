@@ -7,7 +7,9 @@ import {
   packageJsonDependencyHintLabel,
   packageJsonSectionSummaryLabel,
 } from "./packageJsonLabels.js";
-import { tooltipForMessage, tooltipForResult } from "./tooltip.js";
+import { packageJsonDependencyTooltipMarkdown } from "./packageJsonTooltip.js";
+import { tooltipForMessage } from "./tooltip.js";
+import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 
 export const packageJsonDocumentSelector: vscode.DocumentSelector = [
   { language: "json", scheme: "file", pattern: "**/package.json" },
@@ -104,13 +106,18 @@ export class PackageJsonDependencyInlayHintsProvider implements vscode.InlayHint
 const tooltipForPackageJsonState = (
   state: PackageJsonDependencyAnalysisState,
 ): vscode.MarkdownString | undefined => {
-  if (state.status === "ready" && state.result) {
-    return tooltipForResult(state.result);
+  if (state.status === "loading") {
+    return undefined;
   }
 
-  if (state.status === "missing" || state.status === "unavailable") {
-    return tooltipForMessage("ImportLens", state.message ?? packageJsonDependencyHintLabel(state, getImportLensConfig()));
+  const tooltip = new vscode.MarkdownString(
+    packageJsonDependencyTooltipMarkdown(state, getImportLensConfig()),
+    true,
+  );
+
+  if (state.result?.diagnostics.length) {
+    tooltip.isTrusted = { enabledCommands: [copyImportDiagnosticsCommand] };
   }
 
-  return undefined;
+  return tooltip;
 };

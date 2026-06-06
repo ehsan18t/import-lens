@@ -112,6 +112,7 @@ test("fetchRegistryHint checks deprecation for the installed version", async () 
   const store = context();
   const fetchImpl = (async () => response(200, {
     "dist-tags": { latest: "2.0.0" },
+    time: { "2.0.0": "2026-06-05T10:00:00.000Z" },
     versions: {
       "1.0.0": { deprecated: "Use 2.x" },
       "2.0.0": {},
@@ -123,7 +124,96 @@ test("fetchRegistryHint checks deprecation for the installed version", async () 
       fetchImpl,
       installedVersion: "1.0.0",
     }),
-    { latestVersion: "2.0.0", deprecated: true },
+    {
+      latestVersion: "2.0.0",
+      latestPublishedAt: "2026-06-05T10:00:00.000Z",
+      isLatest: false,
+      deprecated: true,
+    },
+  );
+});
+
+test("fetchRegistryHint marks installed versions that match latest", async () => {
+  const store = context();
+  const fetchImpl = (async () => response(200, {
+    "dist-tags": { latest: "2.0.0" },
+    time: { "2.0.0": "2026-06-05T10:00:00.000Z" },
+    versions: { "2.0.0": {} },
+  })) as typeof fetch;
+
+  assert.deepEqual(
+    await fetchRegistryHint(store.context as never, "latest-installed", {
+      fetchImpl,
+      installedVersion: "2.0.0",
+    }),
+    {
+      latestVersion: "2.0.0",
+      latestPublishedAt: "2026-06-05T10:00:00.000Z",
+      isLatest: true,
+      deprecated: false,
+    },
+  );
+});
+
+test("registryHintForPackage refreshes successful cache entries after six hours", async () => {
+  const cacheKey = "importLens.registryHints";
+  const packageKey = "stale-pkg\n1.0.0";
+  const store = context({
+    [cacheKey]: {
+      [packageKey]: {
+        status: "ok",
+        timestamp: 1_000,
+        latestVersion: "1.0.0",
+        isLatest: true,
+        deprecated: false,
+      },
+    },
+  });
+  let calls = 0;
+  const fetchImpl = (async () => {
+    calls++;
+    return response(200, {
+      "dist-tags": { latest: "1.0.1" },
+      versions: { "1.0.1": {} },
+    });
+  }) as typeof fetch;
+
+  assert.deepEqual(
+    await registryHintForPackage(store.context as never, "stale-pkg", {
+      fetchImpl,
+      installedVersion: "1.0.0",
+      now: () => 1_000 + (6 * 60 * 60 * 1000) - 1,
+    }),
+    { latestVersion: "1.0.0", isLatest: true, deprecated: false },
+  );
+  assert.equal(calls, 0);
+
+  assert.deepEqual(
+    await registryHintForPackage(store.context as never, "stale-pkg", {
+      fetchImpl,
+      installedVersion: "1.0.0",
+      now: () => 1_000 + (6 * 60 * 60 * 1000),
+    }),
+    { latestVersion: "1.0.1", isLatest: false, deprecated: false },
+  );
+  assert.equal(calls, 1);
+});
+
+test("registryHintForPackage fetches install metadata without an installed version", async () => {
+  const store = context();
+  const fetchImpl = (async () => response(200, {
+    "dist-tags": { latest: "4.5.6" },
+    time: { "4.5.6": "2026-06-05T10:00:00.000Z" },
+    versions: { "4.5.6": {} },
+  })) as typeof fetch;
+
+  assert.deepEqual(
+    await registryHintForPackage(store.context as never, "installable-pkg", { fetchImpl }),
+    {
+      latestVersion: "4.5.6",
+      latestPublishedAt: "2026-06-05T10:00:00.000Z",
+      deprecated: false,
+    },
   );
 });
 
@@ -143,11 +233,11 @@ test("getCachedRegistryHint hydrates global state once into memory", async () =>
 
   assert.deepEqual(
     getCachedRegistryHint(store.context as never, "cached-pkg", "1.0.0"),
-    { latestVersion: "1.0.0", deprecated: false },
+    { latestVersion: "1.0.0", isLatest: true, deprecated: false },
   );
   assert.deepEqual(
     getCachedRegistryHint(store.context as never, "cached-pkg", "1.0.0"),
-    { latestVersion: "1.0.0", deprecated: false },
+    { latestVersion: "1.0.0", isLatest: true, deprecated: false },
   );
   assert.equal(store.getCount(), 1);
 });

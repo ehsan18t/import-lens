@@ -41,7 +41,7 @@ const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
   ...overrides,
 });
 
-test("packageJsonDependencyHintLabel shows size and latest version for measured dependencies", () => {
+test("packageJsonDependencyHintLabel shows latest status for current dependencies", () => {
   assert.equal(
     packageJsonDependencyHintLabel(
       {
@@ -49,11 +49,27 @@ test("packageJsonDependencyHintLabel shows size and latest version for measured 
         section: "dependencies",
         status: "ready",
         result: result(),
-        registryHint: { latestVersion: "18.2.0" },
+        registryHint: { latestVersion: "18.2.0", isLatest: true },
       },
       config(),
     ),
-    "1.5 kB br · latest 18.2.0",
+    "1.5 kB br · latest",
+  );
+});
+
+test("packageJsonDependencyHintLabel shows update status for outdated dependencies", () => {
+  assert.equal(
+    packageJsonDependencyHintLabel(
+      {
+        name: "react",
+        section: "dependencies",
+        status: "ready",
+        result: result(),
+        registryHint: { latestVersion: "19.0.0", isLatest: false },
+      },
+      config(),
+    ),
+    "1.5 kB br · update 19.0.0",
   );
   assert.equal(
     packageJsonDependencyHintLabel(
@@ -67,11 +83,11 @@ test("packageJsonDependencyHintLabel shows size and latest version for measured 
           is_cjs: true,
           confidence: "low",
         }),
-        registryHint: { deprecated: true, latestVersion: "99.0.0" },
+        registryHint: { deprecated: true, latestVersion: "99.0.0", isLatest: false },
       },
       config({ display: "standard", compression: "gzip" }),
     ),
-    "~2.1 kB gz · latest 99.0.0",
+    "~2.1 kB gz · update 99.0.0",
   );
 });
 
@@ -90,11 +106,31 @@ test("packageJsonDependencyHintLabel shows types only instead of zero-byte sizes
           zstd_bytes: 0,
           diagnostics: [{ stage: "types_only", message: "Declaration-only package.", details: [] }],
         }),
-        registryHint: { latestVersion: "22.15.3" },
+        registryHint: { latestVersion: "22.15.3", isLatest: true },
       },
       config(),
     ),
-    "types only · latest 22.15.3",
+    "types only · latest",
+  );
+});
+
+test("packageJsonDependencyHintLabel marks latest releases published under twenty four hours ago", () => {
+  assert.equal(
+    packageJsonDependencyHintLabel(
+      {
+        name: "react",
+        section: "dependencies",
+        status: "ready",
+        result: result(),
+        registryHint: {
+          latestVersion: "19.0.0",
+          isLatest: false,
+          latestPublishedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+        },
+      },
+      config(),
+    ),
+    "1.5 kB br · ✦ update 19.0.0",
   );
 });
 
@@ -113,7 +149,7 @@ test("packageJsonDependencyHintLabel formats unresolved states without daemon wo
       },
       config(),
     ),
-    "not installed · latest 1.2.3",
+    "not installed · install 1.2.3",
   );
   assert.equal(
     packageJsonDependencyHintLabel(
@@ -121,11 +157,15 @@ test("packageJsonDependencyHintLabel formats unresolved states without daemon wo
         name: "react",
         section: "dependencies",
         status: "unavailable",
-        registryHint: { latestVersion: "18.2.0" },
+        registryHint: { latestVersion: "18.2.0", isLatest: true },
       },
       config(),
     ),
-    "unavailable · latest 18.2.0",
+    "unavailable · latest",
+  );
+  assert.equal(
+    packageJsonDependencyHintLabel({ name: "react", section: "dependencies", status: "unavailable" }, config()),
+    "unavailable",
   );
 });
 

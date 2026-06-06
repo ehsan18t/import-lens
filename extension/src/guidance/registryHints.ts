@@ -1,7 +1,7 @@
 import type * as vscode from "vscode";
 
 const registryCacheKey = "importLens.registryHints";
-const okCacheTtlMs = 24 * 60 * 60 * 1000;
+const okCacheTtlMs = 6 * 60 * 60 * 1000;
 const notFoundCacheTtlMs = 6 * 60 * 60 * 1000;
 const errorCacheTtlMs = 5 * 60 * 1000;
 const registryTimeoutMs = 3000;
@@ -10,6 +10,8 @@ const maxAttempts = 3;
 
 export interface RegistryHint {
   latestVersion?: string;
+  latestPublishedAt?: string;
+  isLatest?: boolean;
   deprecated?: boolean;
 }
 
@@ -87,14 +89,37 @@ const memoryCacheFor = (context: vscode.ExtensionContext): Map<string, RegistryH
 
   const persisted = context.globalState.get<Record<string, LegacyRegistryHintCacheEntry>>(registryCacheKey, {});
   const hydrated = new Map(
-    Object.entries(persisted).map(([key, entry]) => [
-      key,
-      { ...entry, status: entry.status ?? "ok" },
-    ]),
+    Object.entries(persisted).map(([key, entry]) => [key, hydrateCacheEntry(key, entry)]),
   );
   memoryCaches.set(key, hydrated);
   return hydrated;
 };
+
+const installedVersionFromCacheKey = (key: string): string | undefined => {
+  const separatorIndex = key.indexOf("\n");
+
+  if (separatorIndex === -1) {
+    return undefined;
+  }
+
+  const installedVersion = key.slice(separatorIndex + 1);
+  return installedVersion.length > 0 ? installedVersion : undefined;
+};
+
+const inferIsLatest = (
+  installedVersion: string | undefined,
+  latestVersion: string | undefined,
+): boolean | undefined =>
+  installedVersion && latestVersion ? installedVersion === latestVersion : undefined;
+
+const hydrateCacheEntry = (
+  key: string,
+  entry: LegacyRegistryHintCacheEntry,
+): RegistryHintCacheEntry => ({
+  ...entry,
+  status: entry.status ?? "ok",
+  isLatest: entry.isLatest ?? inferIsLatest(installedVersionFromCacheKey(key), entry.latestVersion),
+});
 
 const cachedEntry = (
   context: vscode.ExtensionContext,
@@ -119,10 +144,31 @@ const cachedEntry = (
   return null;
 };
 
-const hintFromEntry = (entry: RegistryHintCacheEntry | null): RegistryHint | null =>
-  entry?.status === "ok"
-    ? { latestVersion: entry.latestVersion, deprecated: entry.deprecated }
-    : null;
+const hintFromEntry = (entry: RegistryHintCacheEntry | null): RegistryHint | null => {
+  if (entry?.status !== "ok") {
+    return null;
+  }
+
+  const hint: RegistryHint = {};
+
+  if (entry.latestVersion) {
+    hint.latestVersion = entry.latestVersion;
+  }
+
+  if (entry.latestPublishedAt) {
+    hint.latestPublishedAt = entry.latestPublishedAt;
+  }
+
+  if (typeof entry.isLatest === "boolean") {
+    hint.isLatest = entry.isLatest;
+  }
+
+  if (typeof entry.deprecated === "boolean") {
+    hint.deprecated = entry.deprecated;
+  }
+
+  return hint;
+};
 
 const storeEntry = async (
   context: vscode.ExtensionContext,
@@ -170,7 +216,7 @@ const fetchWithTimeout = async (
   try {
     return await fetchImpl(url, {
       signal: controller.signal,
-      headers: { accept: "application/vnd.npm.install-v1+json" },
+      headers: { accept: "application/json" },
     });
   } finally {
     clearTimeout(timer);
@@ -180,17 +226,33 @@ const fetchWithTimeout = async (
 const registryHintFromMetadata = (
   metadata: {
     "dist-tags"?: { latest?: string };
+    time?: Record<string, string>;
     versions?: Record<string, { deprecated?: unknown }>;
   },
   installedVersion?: string,
 ): RegistryHint => {
   const latestVersion = metadata["dist-tags"]?.latest;
+  const latestPublishedAt = latestVersion ? metadata.time?.[latestVersion] : undefined;
   const versionForDeprecation = installedVersion ?? latestVersion;
   const deprecated = versionForDeprecation
     ? Boolean(metadata.versions?.[versionForDeprecation]?.deprecated)
     : false;
+  const isLatest = inferIsLatest(installedVersion, latestVersion);
+  const hint: RegistryHint = { deprecated };
 
-  return { latestVersion, deprecated };
+  if (latestVersion) {
+    hint.latestVersion = latestVersion;
+  }
+
+  if (latestPublishedAt) {
+    hint.latestPublishedAt = latestPublishedAt;
+  }
+
+  if (typeof isLatest === "boolean") {
+    hint.isLatest = isLatest;
+  }
+
+  return hint;
 };
 
 const fetchRegistryHintUncached = async (
@@ -219,6 +281,8 @@ const fetchRegistryHintUncached = async (
             status: "ok",
             timestamp: now(),
             latestVersion: hint.latestVersion,
+            latestPublishedAt: hint.latestPublishedAt,
+            isLatest: hint.isLatest,
             deprecated: hint.deprecated,
           });
           return hint;
