@@ -6,22 +6,16 @@ import {
   sanitizeBudgets,
 } from "../../src/analysis/budgets.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
-import type { DetectedImport } from "../../src/imports/types.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
+import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
-const detected = (specifier: string, line: number): DetectedImport => ({
+const detected = (specifier: string, line: number) => detectedImport({
   specifier,
   packageName: specifier,
-  named: [],
-  importKind: "namespace",
-  syntax: "static",
-  runtime: "component",
   line,
   quoteEnd: { line, character: 20 },
-  statementRange: {
-    start: { line, character: 0 },
-    end: { line, character: 24 },
-  },
+  specifierRange: sourceRange(line, 8, 18),
+  statementRange: sourceRange(line, 0, 24),
 });
 
 const result = (specifier: string, brotliBytes: number): ImportResult => ({

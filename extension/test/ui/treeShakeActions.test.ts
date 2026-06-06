@@ -5,6 +5,7 @@ import { treeShakeActionReason } from "../../src/ui/treeShakeActionReason.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import type { DetectedImport } from "../../src/imports/types.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
+import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
 const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
   specifier: "tiny-lib",
@@ -35,19 +36,12 @@ test("treeShakeActionReason ignores already tree-shakeable and errored imports",
   assert.equal(treeShakeActionReason(result({ error: "failed" })), null);
 });
 
-const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport => ({
+const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport => detectedImport({
   specifier: "date-fns",
   packageName: "date-fns",
-  named: [],
-  importKind: "namespace",
-  syntax: "static",
-  runtime: "component",
-  line: 0,
   quoteEnd: { line: 0, character: 31 },
-  statementRange: {
-    start: { line: 0, character: 0 },
-    end: { line: 0, character: 33 },
-  },
+  specifierRange: sourceRange(0, 8, 30),
+  statementRange: sourceRange(0, 0, 33),
   ...overrides,
 });
 

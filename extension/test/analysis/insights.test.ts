@@ -13,6 +13,7 @@ import {
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import type { DetectedImport } from "../../src/imports/types.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
+import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
 class MemoryStore {
   readonly values = new Map<string, unknown>();
@@ -26,19 +27,15 @@ class MemoryStore {
   }
 }
 
-const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport => ({
+const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport => detectedImport({
   specifier: "lodash-es",
   packageName: "lodash-es",
   named: ["debounce"],
   importKind: "named",
-  syntax: "static",
-  runtime: "component",
   line: 4,
   quoteEnd: { line: 4, character: 32 },
-  statementRange: {
-    start: { line: 4, character: 0 },
-    end: { line: 4, character: 36 },
-  },
+  specifierRange: sourceRange(4, 8, 31),
+  statementRange: sourceRange(4, 0, 36),
   ...overrides,
 });
 

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { DetectedImport } from "../../src/imports/types.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
 import {
   buildDuplicateImportGroups,
@@ -9,20 +8,15 @@ import {
   buildReportSummary,
   type WorkspaceReportItem,
 } from "../../src/report/reportModel.js";
+import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
-const detected = (specifier: string): DetectedImport => ({
+const detected = (specifier: string) => detectedImport({
   specifier,
   packageName: specifier,
-  named: [],
-  importKind: "namespace",
-  syntax: "static",
-  runtime: "component",
   line: 2,
   quoteEnd: { line: 2, character: 20 },
-  statementRange: {
-    start: { line: 2, character: 0 },
-    end: { line: 2, character: 21 },
-  },
+  specifierRange: sourceRange(2, 8, 18),
+  statementRange: sourceRange(2, 0, 21),
 });
 
 const result = (specifier: string, brotliBytes: number): ImportResult => ({

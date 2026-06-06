@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { DetectedImport } from "../../src/imports/types.js";
 import type { BatchRequest, BatchResponse, ImportRequest, ImportResult } from "../../src/ipc/protocol.js";
 import {
   analyzeScannedImports,
@@ -10,6 +9,7 @@ import {
   workspaceIncludePattern,
   type ScannedImport,
 } from "../../src/report/workspaceScanner.js";
+import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
 test("workspace scanner uses supported source include and generated-folder exclude patterns", () => {
   assert.equal(workspaceIncludePattern, "**/*.{js,jsx,ts,tsx,mts,cts,svelte,astro}");
@@ -95,19 +95,12 @@ const requestIdGenerator = (): (() => number) => {
   };
 };
 
-const detected = (specifier: string): DetectedImport => ({
+const detected = (specifier: string) => detectedImport({
   specifier,
   packageName: specifier,
-  named: [],
-  importKind: "namespace",
-  syntax: "static",
-  runtime: "component",
-  line: 0,
   quoteEnd: { line: 0, character: 20 },
-  statementRange: {
-    start: { line: 0, character: 0 },
-    end: { line: 0, character: 21 },
-  },
+  specifierRange: sourceRange(0, 8, 18),
+  statementRange: sourceRange(0, 0, 21),
 });
 
 const request = (specifier: string): ImportRequest => ({

@@ -179,7 +179,7 @@
     "build": "tsdown",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "pnpm test:ts && pnpm test:scripts && pnpm test:rust",
-    "test:ts": "tsc -p tsconfig.test.json && node --test \"extension/test-dist/**/*.test.js\"",
+    "test:ts": "node -e \"require('node:fs').rmSync('extension/test-dist', { recursive: true, force: true })\" && tsc -p tsconfig.test.json && node --test \"extension/test-dist/**/*.test.js\"",
     "test:scripts": "node --test \"scripts/**/*.test.mjs\"",
     "test:rust": "cargo test --workspace",
     "test:accuracy": "node scripts/accuracy-compare.mjs",

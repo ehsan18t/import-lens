@@ -4,21 +4,16 @@ import { markLoadingStatesUnavailable } from "../../src/analysis/status.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import type { DetectedImport } from "../../src/imports/types.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
+import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
-const detected: DetectedImport = {
+const detected: DetectedImport = detectedImport({
   specifier: "react",
   packageName: "react",
-  named: [],
   importKind: "default",
-  syntax: "static",
-  runtime: "component",
-  line: 0,
   quoteEnd: { line: 0, character: 26 },
-  statementRange: {
-    start: { line: 0, character: 0 },
-    end: { line: 0, character: 28 },
-  },
-};
+  specifierRange: sourceRange(0, 8, 25),
+  statementRange: sourceRange(0, 0, 28),
+});
 
 const result: ImportResult = {
   specifier: "react",
