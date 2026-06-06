@@ -13,12 +13,11 @@ import type { DaemonManager } from "../daemon/manager.js";
 import { extractRuntimeImports } from "../imports/parser.js";
 import { resolveInstalledPackage } from "../imports/resolver.js";
 import { protocolVersion, type ImportRequest } from "../ipc/protocol.js";
+import { nextIpcRequestId } from "../ipc/requestIds.js";
 import { supportedLanguageIds } from "../languages.js";
 import type { ImportLensLogger } from "../logger.js";
 import { analysisRootForFile } from "../workspaceContext.js";
 import { bundleImpactHistoryHtml } from "./bundleImpactHistoryView.js";
-
-let fileSizeRequestId = 0;
 
 export const showCurrentFileSize = async (
   context: vscode.ExtensionContext,
@@ -78,7 +77,7 @@ export const showCurrentFileSize = async (
       () => daemon.requestFileSize({
         type: "file_size",
         version: protocolVersion,
-        request_id: ++fileSizeRequestId,
+        request_id: nextIpcRequestId(),
         workspace_root: workspaceRoot,
         active_document_path: document.fileName,
         imports,

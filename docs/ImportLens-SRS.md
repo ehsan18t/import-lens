@@ -212,7 +212,7 @@ A WebAssembly daemon fallback may be added in v1.1 or later using the existing a
 
 ### 3.3 Startup Sequence
 
-1. Extension activates on the `onLanguage:javascript`, `onLanguage:typescript`, `onLanguage:typescriptreact`, `onLanguage:javascriptreact`, `onLanguage:svelte`, and `onLanguage:astro` events.
+1. Extension activates on the `onLanguage:javascript`, `onLanguage:typescript`, `onLanguage:typescriptreact`, `onLanguage:javascriptreact`, `onLanguage:json`, `onLanguage:jsonc`, `onLanguage:svelte`, and `onLanguage:astro` events.
 2. The extension host checks for a native binary matching the current platform in the extension's `bin/` directory.
 3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
 4. If the hash matches, it spawns the daemon process, pipes daemon stdout/stderr into the ImportLens output channel according to the configured log level, opens a socket connection, and sends a versioned `HelloMessage`. The socket path includes a window-unique identifier (NFR-014b).
@@ -479,7 +479,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-036l** (Medium) - When `importLens.enableRegistryHints` is enabled, the extension may fetch npm metadata for registry-based hints. The setting must default to `true`; network work must use short timeouts, cache positive and negative results in VS Code globalState and session memory, and fail silently without affecting size computation.
 
-**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide dependency-cost CodeLens information for dependency blocks using local package resolution and prewarm-friendly requests.
+**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost inlay hints for dependency blocks using local package resolution and prewarm-friendly daemon requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from the `InlayHintsProvider`. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. Each dependency block should also expose a compact measured/total summary when analysis state is available.
 
 **FR-036n** (Medium) - The extension must provide `ImportLens: Compare Imports`, allowing users to compare two package specifiers side by side using the same local daemon sizing path as normal import analysis.
 
@@ -1308,9 +1308,15 @@ import-lens/
 │   │   │   ├── specifier.ts           # package/builtin/relative specifier helpers
 │   │   │   ├── positions.ts           # offset-to-position mapping helpers
 │   │   │   └── types.ts               # import detection data models
+│   │   ├── guidance/
+│   │   │   ├── packageJsonAnalysis.ts # cached package.json dependency analysis controller
+│   │   │   ├── packageJsonDependencies.ts # JSON-aware dependency block/range extraction
+│   │   │   ├── packageJsonState.ts    # package.json dependency analysis state types
+│   │   │   └── registryHints.ts       # short-timeout npm metadata hints
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
 │   │   │   ├── protocol.ts            # Protocol v4 IPC types
+│   │   │   ├── requestIds.ts          # shared monotonic IPC request ID generator
 │   │   │   └── codec.ts               # MessagePack encode/decode
 │   │   ├── daemon/
 │   │   │   ├── manager.ts             # daemon lifecycle and analysis transport coordination
@@ -1323,7 +1329,7 @@ import-lens/
 │   │   │   └── knownHashes.generated.ts # generated daemon binary hashes
 │   │   ├── prewarm/
 │   │   │   ├── packageJson.ts         # package.json open/save prewarm registration
-│   │   │   └── packageJsonHelpers.ts  # dependency extraction helpers
+│   │   │   └── packageJsonHelpers.ts  # package.json path and prewarm payload helpers
 │   │   ├── report/
 │   │   │   ├── reportModel.ts         # Workspace report rows, confidence summaries, module breakdown
 │   │   │   └── workspaceScanner.ts    # Workspace import scanner for report command
@@ -1336,6 +1342,8 @@ import-lens/
 │   │   │   ├── completions.ts         # Named import member completion provider
 │   │   │   ├── displayGuards.ts       # display-mode enablement helpers
 │   │   │   ├── format.ts              # size and display label formatting
+│   │   │   ├── packageJsonInlayHints.ts # package.json dependency inlay hint provider
+│   │   │   ├── packageJsonLabels.ts   # package.json dependency label formatting
 │   │   │   ├── namedExportCandidatePolicy.ts # pure policy for named export CodeAction eligibility
 │   │   │   ├── namedExportCandidates.ts # named export candidate QuickPick command
 │   │   │   ├── statusbar.ts           # Status bar item

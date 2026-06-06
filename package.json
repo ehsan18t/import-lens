@@ -26,6 +26,7 @@
     "onLanguage:typescriptreact",
     "onLanguage:javascriptreact",
     "onLanguage:json",
+    "onLanguage:jsonc",
     "onLanguage:svelte",
     "onLanguage:astro"
   ],

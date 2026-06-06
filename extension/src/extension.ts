@@ -3,6 +3,7 @@ import { AnalysisStore } from "./analysis/state.js";
 import { refreshVisibleImportLensDocuments } from "./configRefresh.js";
 import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
+import { PackageJsonAnalysisController } from "./guidance/packageJsonAnalysis.js";
 import { DocumentAnalysisController } from "./listener.js";
 import { languageSelector } from "./languages.js";
 import { ImportLensLogger } from "./logger.js";
@@ -18,7 +19,7 @@ import { ImportLensHoverProvider } from "./ui/hoverProvider.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import { showNamedExportCandidates, showNamedExportCandidatesCommand } from "./ui/namedExportCandidates.js";
-import { PackageJsonDependencyCodeLensProvider } from "./ui/packageJsonCodeLens.js";
+import { PackageJsonDependencyInlayHintsProvider, packageJsonDocumentSelector } from "./ui/packageJsonInlayHints.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
@@ -56,13 +57,14 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const treeShakeActions = new TreeShakeCodeActionProvider(store);
 
   daemon = new DaemonManager(context, logger);
-  const packageJsonCodeLens = new PackageJsonDependencyCodeLensProvider(context, daemon);
+  const packageJsonAnalysis = new PackageJsonAnalysisController(context, daemon, logger);
+  const packageJsonInlayHints = new PackageJsonDependencyInlayHintsProvider(packageJsonAnalysis);
   const completions = new ImportMemberCompletionProvider(daemon);
-  context.subscriptions.push(logger, store, statusBar, decorations, budgetDiagnostics, inlayHints, codeLens, packageJsonCodeLens, daemon);
+  context.subscriptions.push(logger, store, statusBar, decorations, budgetDiagnostics, inlayHints, codeLens, packageJsonAnalysis, packageJsonInlayHints, daemon);
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(languageSelector, inlayHints));
+  context.subscriptions.push(vscode.languages.registerInlayHintsProvider(packageJsonDocumentSelector, packageJsonInlayHints));
   context.subscriptions.push(vscode.languages.registerHoverProvider(languageSelector, hoverProvider));
   context.subscriptions.push(vscode.languages.registerCodeLensProvider(languageSelector, codeLens));
-  context.subscriptions.push(vscode.languages.registerCodeLensProvider({ language: "json", scheme: "file", pattern: "**/package.json" }, packageJsonCodeLens));
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider(languageSelector, completions, "{", ","));
   context.subscriptions.push(vscode.languages.registerCodeActionsProvider(languageSelector, treeShakeActions));
 
@@ -80,7 +82,10 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         refreshBudgetDiagnostics: () => budgetDiagnostics.refreshVisibleEditors(),
         refreshInlayHints: () => inlayHints.refresh(),
         refreshCodeLens: () => codeLens.refresh(),
-        refreshPackageJsonCodeLens: () => packageJsonCodeLens.refresh(),
+        refreshPackageJsonHints: () => {
+          packageJsonAnalysis.refreshVisibleDocuments();
+          packageJsonInlayHints.refresh();
+        },
       },
     );
   };

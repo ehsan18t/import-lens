@@ -24,6 +24,7 @@ import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import type { StatusBarController } from "./ui/statusbar.js";
 import { protocolVersion, type BatchResponse } from "./ipc/protocol.js";
+import { nextIpcRequestId } from "./ipc/requestIds.js";
 import { analysisRootForFile } from "./workspaceContext.js";
 
 export class DocumentAnalysisController implements vscode.Disposable {
@@ -79,7 +80,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
   async analyze(document: vscode.TextDocument): Promise<void> {
     const config = getImportLensConfig();
     const documentKey = document.uri.toString();
-    const requestId = this.#freshness.begin(documentKey);
+    const requestId = this.#freshness.begin(documentKey, nextIpcRequestId());
 
     if (!config.enabled || !supportedLanguageIds.has(document.languageId)) {
       this.#store.clear(document.uri);

@@ -2,8 +2,8 @@ export class AnalysisFreshnessTracker {
   #nextRequestId = 0;
   readonly #latestRequestIds = new Map<string, number>();
 
-  begin(documentKey: string): number {
-    const requestId = ++this.#nextRequestId;
+  begin(documentKey: string, requestId: number = this.#nextRequestId + 1): number {
+    this.#nextRequestId = Math.max(this.#nextRequestId, requestId);
     this.#latestRequestIds.set(documentKey, requestId);
     return requestId;
   }

@@ -32,7 +32,7 @@ test("refreshVisibleImportLensDocuments reanalyzes supported visible file docume
   let budgetDiagnosticRefreshes = 0;
   let hintRefreshes = 0;
   let codeLensRefreshes = 0;
-  let packageJsonCodeLensRefreshes = 0;
+  let packageJsonHintRefreshes = 0;
 
   refreshVisibleImportLensDocuments(
     [document("typescript"), document("markdown"), document("javascript", "untitled")],
@@ -44,7 +44,7 @@ test("refreshVisibleImportLensDocuments reanalyzes supported visible file docume
       refreshBudgetDiagnostics: () => budgetDiagnosticRefreshes++,
       refreshInlayHints: () => hintRefreshes++,
       refreshCodeLens: () => codeLensRefreshes++,
-      refreshPackageJsonCodeLens: () => packageJsonCodeLensRefreshes++,
+      refreshPackageJsonHints: () => packageJsonHintRefreshes++,
     },
   );
 
@@ -54,7 +54,7 @@ test("refreshVisibleImportLensDocuments reanalyzes supported visible file docume
   assert.equal(budgetDiagnosticRefreshes, 1);
   assert.equal(hintRefreshes, 1);
   assert.equal(codeLensRefreshes, 1);
-  assert.equal(packageJsonCodeLensRefreshes, 1);
+  assert.equal(packageJsonHintRefreshes, 1);
 });
 
 test("refreshVisibleImportLensDocuments clears supported visible file documents when disabled", () => {
@@ -71,7 +71,7 @@ test("refreshVisibleImportLensDocuments clears supported visible file documents 
       refreshBudgetDiagnostics: () => undefined,
       refreshInlayHints: () => undefined,
       refreshCodeLens: () => undefined,
-      refreshPackageJsonCodeLens: () => undefined,
+      refreshPackageJsonHints: () => undefined,
     },
   );
 

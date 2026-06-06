@@ -6,12 +6,12 @@ import { resolveInstalledPackage } from "../imports/resolver.js";
 import type { DetectedImport } from "../imports/types.js";
 import type { BatchRequest, BatchResponse, ImportRequest } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
+import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { WorkspaceReportItem } from "./reportModel.js";
 
 export const workspaceIncludePattern = "**/*.{js,jsx,ts,tsx,mts,cts,svelte,astro}";
 export const workspaceExcludePattern = "**/{node_modules,dist,build,out,coverage}/**";
 const DEFAULT_BATCH_SIZE = 50;
-let fallbackReportRequestId = Date.now();
 
 export interface WorkspaceUri {
   fsPath: string;
@@ -110,7 +110,7 @@ export const analyzeScannedImports = async (
   options: WorkspaceScannerOptions = {},
 ): Promise<WorkspaceReportItem[]> => {
   const chunkSize = options.chunkSize ?? DEFAULT_BATCH_SIZE;
-  const nextRequestId = options.nextRequestId ?? nextWorkspaceReportRequestId;
+  const nextRequestId = options.nextRequestId ?? nextIpcRequestId;
   const reportItems: WorkspaceReportItem[] = scannedImports
     .filter((item) => !item.request)
     .map((item) => ({
@@ -177,11 +177,6 @@ export const chunkArray = <T>(items: readonly T[], chunkSize: number): T[][] => 
 
 const hasRequest = (item: ScannedImport): item is ScannedImport & { request: ImportRequest } =>
   item.request !== undefined;
-
-const nextWorkspaceReportRequestId = (): number => {
-  fallbackReportRequestId = Math.max(fallbackReportRequestId + 1, Date.now());
-  return fallbackReportRequestId;
-};
 
 const groupBySourceFile = (
   items: readonly (ScannedImport & { request: ImportRequest })[],

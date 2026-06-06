@@ -4,11 +4,11 @@ import type { DaemonManager } from "../daemon/manager.js";
 import { resolveInstalledPackage } from "../imports/resolver.js";
 import type { DetectedImport } from "../imports/types.js";
 import { protocolVersion } from "../ipc/protocol.js";
+import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { ImportLensLogger } from "../logger.js";
 import { analysisRootForFile } from "../workspaceContext.js";
 
 export const showNamedExportCandidatesCommand = "importLens.showNamedExportCandidates";
-let namedExportRequestId = 0;
 
 export const showNamedExportCandidates = async (
   daemon: DaemonManager,
@@ -37,7 +37,7 @@ export const showNamedExportCandidates = async (
   const response = await daemon.enumerateExports({
     type: "enumerate_exports",
     version: protocolVersion,
-    request_id: ++namedExportRequestId,
+    request_id: nextIpcRequestId(),
     workspace_root: workspaceRoot,
     active_document_path: uri.fsPath,
     specifier: detected.specifier,

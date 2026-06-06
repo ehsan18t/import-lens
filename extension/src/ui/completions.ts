@@ -5,11 +5,11 @@ import { namedImportCompletionContext } from "../imports/completionContext.js";
 import { resolveInstalledPackage } from "../imports/resolver.js";
 import type { DaemonManager } from "../daemon/manager.js";
 import { analysisRootForFile } from "../workspaceContext.js";
+import { nextIpcRequestId } from "../ipc/requestIds.js";
 import { shouldOfferImportCompletions } from "./displayGuards.js";
 
 export class ImportMemberCompletionProvider implements vscode.CompletionItemProvider {
   readonly #daemon: DaemonManager;
-  #requestId = 0;
 
   constructor(daemon: DaemonManager) {
     this.#daemon = daemon;
@@ -50,7 +50,7 @@ export class ImportMemberCompletionProvider implements vscode.CompletionItemProv
     const response = await this.#daemon.enumerateExports({
       type: "enumerate_exports",
       version: protocolVersion,
-      request_id: ++this.#requestId,
+      request_id: nextIpcRequestId(),
       workspace_root: workspaceRoot,
       active_document_path: document.fileName,
       specifier: context.specifier,

@@ -5,10 +5,9 @@ import { getPackageName } from "../imports/specifier.js";
 import { resolveInstalledPackage } from "../imports/resolver.js";
 import type { DetectedImport } from "../imports/types.js";
 import { protocolVersion, type ImportRequest } from "../ipc/protocol.js";
+import { nextIpcRequestId } from "../ipc/requestIds.js";
 import { analysisRootForFile } from "../workspaceContext.js";
 import { formatBytes } from "./format.js";
-
-let compareRequestId = Date.now();
 
 export const compareImportsCommand = "importLens.compareImports";
 
@@ -64,7 +63,7 @@ export const compareImports = async (
 
   const response = await daemon.sendBatch({
     version: protocolVersion,
-    request_id: ++compareRequestId,
+    request_id: nextIpcRequestId(),
     workspace_root: workspaceRoot,
     active_document_path: editor.document.fileName,
     imports,
