@@ -10,10 +10,10 @@ export const supportedLanguageIds: ReadonlySet<string> = new Set([
 ]);
 
 export const languageSelector: vscode.DocumentSelector = [
-  { language: "javascript" },
-  { language: "typescript" },
-  { language: "typescriptreact" },
-  { language: "javascriptreact" },
-  { language: "svelte" },
-  { language: "astro" },
+  { language: "javascript", scheme: "file" },
+  { language: "typescript", scheme: "file" },
+  { language: "typescriptreact", scheme: "file" },
+  { language: "javascriptreact", scheme: "file" },
+  { language: "svelte", scheme: "file" },
+  { language: "astro", scheme: "file" },
 ];

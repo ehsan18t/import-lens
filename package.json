@@ -14,7 +14,7 @@
   "packageManager": "pnpm@11.5.0+sha512.dbfcc4f81cf48597afd4bc391ffdf12c11f1a9fb83a395bfa6b0a2d9cc2fd8ffebafdb1ccbd529632153f793904c2615b7f09fe1a345473fd1c35845172a8eb1",
   "main": "./extension/dist/extension.cjs",
   "engines": {
-    "vscode": "^1.100.0"
+    "vscode": "^1.90.0"
   },
   "categories": [
     "Programming Languages",
@@ -92,8 +92,8 @@
             "native",
             "colored"
           ],
-          "default": "native",
-          "description": "Renderer used when importLens.display is inlayHint. Native uses VS Code's accessible Inlay Hints API; colored uses decoration-backed inline text with confidence colors."
+          "default": "colored",
+          "description": "Renderer used when importLens.display is inlayHint. Colored uses decoration-backed inline text with confidence colors; native uses VS Code's accessible Inlay Hints API."
         },
         "importLens.compression": {
           "type": "string",
@@ -148,8 +148,8 @@
         },
         "importLens.enableRegistryHints": {
           "type": "boolean",
-          "default": false,
-          "description": "Opt in to short-timeout npm registry metadata hints for package.json dependency CodeLens."
+          "default": true,
+          "description": "Enable short-timeout npm registry metadata hints for package.json dependency surfaces."
         },
         "importLens.logLevel": {
           "type": "string",

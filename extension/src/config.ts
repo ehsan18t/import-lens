@@ -26,13 +26,13 @@ export const getImportLensConfig = (): ImportLensConfig => {
   return {
     enabled: config.get("enabled", true),
     display: config.get<DisplayMode>("display", "inlayHint"),
-    inlineRenderer: config.get<InlineRenderer>("inlineRenderer", "native"),
+    inlineRenderer: config.get<InlineRenderer>("inlineRenderer", "colored"),
     compression: config.get<CompressionFormat>("compression", "brotli"),
     debounceMs: config.get("debounceMs", 300),
     showWarnings: config.get("showWarnings", true),
     useCodeLens: config.get("useCodeLens", false),
     enableDiskCache: config.get("enableDiskCache", true),
-    enableRegistryHints: config.get("enableRegistryHints", false),
+    enableRegistryHints: config.get("enableRegistryHints", true),
     logLevel: config.get<LogLevel>("logLevel", defaultLogLevel),
     budgets: sanitizeBudgets(config.get("budgets", {})),
   };
