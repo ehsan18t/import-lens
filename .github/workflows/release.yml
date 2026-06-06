@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.version }}
   cancel-in-progress: false
 
 env:
@@ -23,17 +23,18 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -78,7 +79,7 @@ jobs:
         run: pnpm coverage:rust
 
   package-windows:
-    name: Package Windows ${{ matrix.target }}
+    name: Package ${{ matrix.target }}
     needs: validate
     runs-on: windows-latest
     strategy:
@@ -87,20 +88,22 @@ jobs:
         include:
           - target: win32-x64
             rust-target: x86_64-pc-windows-msvc
+            package-script: package:win32-x64
           - target: win32-arm64
             rust-target: aarch64-pc-windows-msvc
+            package-script: package:win32-arm64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -115,10 +118,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Package VSIX
-        run: pnpm run package:${{ matrix.target }}
+        run: pnpm run ${{ matrix.package-script }}
 
       - name: Upload VSIX artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: import-lens-${{ matrix.target }}-${{ inputs.version }}
           path: builds/import-lens-${{ matrix.target }}-${{ inputs.version }}.vsix
@@ -128,17 +131,20 @@ jobs:
     name: Package Linux and macOS
     needs: validate
     runs-on: ubuntu-24.04
+    env:
+      PACKAGE_SCRIPTS: package:linux-x64:zig package:linux-arm64:zig package:darwin-x64:zig package:darwin-arm64:zig
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6.0.8
         with:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -149,7 +155,7 @@ jobs:
         run: pnpm docker:build
 
       - name: Upload Linux and macOS VSIX artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: import-lens-unix-${{ inputs.version }}
           path: |
@@ -158,3 +164,88 @@ jobs:
             builds/import-lens-darwin-x64-${{ inputs.version }}.vsix
             builds/import-lens-darwin-arm64-${{ inputs.version }}.vsix
           if-no-files-found: error
+
+  release:
+    name: Draft release and publish
+    needs:
+      - package-windows
+      - package-unix-cross
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: v${{ inputs.version }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6.0.8
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download VSIX artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: import-lens-*-${{ inputs.version }}
+          path: builds
+          merge-multiple: true
+
+      - name: Verify expected VSIX artifacts
+        run: |
+          node --input-type=module <<'NODE'
+          import { existsSync } from "node:fs";
+
+          const targets = [
+            "win32-x64",
+            "win32-arm64",
+            "linux-x64",
+            "linux-arm64",
+            "darwin-x64",
+            "darwin-arm64",
+          ];
+          const missing = targets
+            .map((target) => `builds/import-lens-${target}-${process.env.RELEASE_VERSION}.vsix`)
+            .filter((file) => !existsSync(file));
+
+          if (missing.length > 0) {
+            console.error(`Missing VSIX artifacts:\n${missing.join("\n")}`);
+            process.exit(1);
+          }
+          NODE
+
+      - name: Check VSIX size budget
+        run: pnpm assert:vsix-size builds/*.vsix
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" builds/*.vsix \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "ImportLens $RELEASE_VERSION" \
+            --notes "Draft release for ImportLens $RELEASE_VERSION."
+
+      - name: Publish VSIXs to Visual Studio Marketplace
+        if: ${{ env.VSCE_PAT != '' }}
+        run: |
+          for file in builds/*.vsix; do
+            pnpm exec vsce publish --packagePath "$file" --pat "$VSCE_PAT"
+          done
+
+      - name: Skip Visual Studio Marketplace publish
+        if: ${{ env.VSCE_PAT == '' }}
+        run: echo "VSCE_PAT is not set; skipping Visual Studio Marketplace publish."
