@@ -2,12 +2,21 @@ import type { ImportLensConfig } from "../config.js";
 import type { PackageJsonDependencySectionName } from "../guidance/packageJsonDependencies.js";
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 import type { ImportResult } from "../ipc/protocol.js";
-import { formatBytes, formatImportSize, type CompressionFormat } from "./format.js";
+import { formatBytes, type CompressionFormat } from "./format.js";
+import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
 export type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 
-const registryHintSuffix = (registryHint: PackageJsonDependencyHintState["registryHint"]): string =>
-  registryHint?.deprecated ? " · deprecated" : "";
+const latestVersionPart = (registryHint: PackageJsonDependencyHintState["registryHint"]): string | null =>
+  registryHint?.latestVersion ? `latest ${registryHint.latestVersion}` : null;
+
+const packageJsonDependencyLabel = (
+  primary: string,
+  registryHint: PackageJsonDependencyHintState["registryHint"],
+): string =>
+  [primary, latestVersionPart(registryHint)]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
 
 const selectedCompressionBytes = (
   result: ImportResult,
@@ -41,18 +50,25 @@ export const packageJsonDependencyHintLabel = (
   config: ImportLensConfig,
 ): string => {
   if (state.status === "loading") {
-    return "checking...";
+    return packageJsonDependencyLabel("checking...", state.registryHint);
   }
 
   if (state.status === "missing") {
-    return `not installed${registryHintSuffix(state.registryHint)}`;
+    return packageJsonDependencyLabel("not installed", state.registryHint);
   }
 
   if (state.status === "unavailable" || !state.result || state.result.error) {
-    return `unavailable${registryHintSuffix(state.registryHint)}`;
+    return packageJsonDependencyLabel("unavailable", state.registryHint);
   }
 
-  return `${formatImportSize(state.result, config)}${registryHintSuffix(state.registryHint)}`;
+  if (isTypesOnlyResult(state.result)) {
+    return packageJsonDependencyLabel("types only", state.registryHint);
+  }
+
+  const confidencePrefix = state.result.confidence === "low" ? "~" : "";
+  const primary = `${confidencePrefix}${formatBytes(selectedCompressionBytes(state.result, config.compression))} ${selectedCompressionLabel(config.compression)}`;
+
+  return packageJsonDependencyLabel(primary, state.registryHint);
 };
 
 export const packageJsonSectionSummaryLabel = (
