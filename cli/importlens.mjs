@@ -18,6 +18,7 @@ import {
 const execFile = promisify(execFileCallback);
 const protocolVersion = 4;
 const supportedExtensions = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts"]);
+const defaultIpcTimeoutMs = 10000;
 
 export const parseCliArgs = (argv) => {
   const [command, ...rest] = argv;
@@ -211,7 +212,7 @@ const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
 
 const startDaemon = async (workspaceRoot) => {
   const target = platformTarget();
-  const binary = path.resolve("bin", target, process.platform === "win32" ? "import-lens-daemon.exe" : "import-lens-daemon");
+  const binary = daemonBinaryPath({ platformTarget: target });
 
   if (!existsSync(binary)) {
     throw new Error(`ImportLens daemon binary is unavailable at ${binary}`);
@@ -230,16 +231,27 @@ const startDaemon = async (workspaceRoot) => {
     "--storage",
     storagePath,
   ], { stdio: ["ignore", "ignore", "inherit"] });
-  const socket = await connectWithRetry(pipeName, 5000);
-  const client = daemonClient(socket);
-  client.send({
-    type: "hello",
-    version: protocolVersion,
-    workspace_root: workspaceRoot,
-    storage_path: storagePath,
-    enable_disk_cache: true,
-    log_level: "warn",
-  });
+  let socket;
+  let client;
+
+  try {
+    socket = await connectWithRetry(pipeName, 5000);
+    client = createDaemonClient(socket);
+    client.send({
+      type: "hello",
+      version: protocolVersion,
+      workspace_root: workspaceRoot,
+      storage_path: storagePath,
+      enable_disk_cache: true,
+      log_level: "warn",
+    });
+  } catch (error) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill();
+    }
+    socket?.destroy();
+    throw error;
+  }
 
   return {
     request: client.request,
@@ -257,6 +269,22 @@ const startDaemon = async (workspaceRoot) => {
   };
 };
 
+const cliPackageRoot = () => path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+export const daemonBinaryPath = ({
+  packageRoot = cliPackageRoot(),
+  platformTarget: requestedTarget = platformTarget(),
+} = {}) => {
+  if (!requestedTarget) {
+    throw new Error(`Unsupported platform for ImportLens daemon: ${process.platform}-${os.arch()}`);
+  }
+
+  return path.join(packageRoot, "bin", requestedTarget, daemonBinaryName(requestedTarget));
+};
+
+const daemonBinaryName = (target) =>
+  target.startsWith("win32-") ? "import-lens-daemon.exe" : "import-lens-daemon";
+
 const connectWithRetry = async (pipeName, timeoutMs) => {
   const started = Date.now();
   let lastError;
@@ -266,7 +294,10 @@ const connectWithRetry = async (pipeName, timeoutMs) => {
       return await new Promise((resolve, reject) => {
         const socket = net.createConnection(pipeName);
         socket.once("connect", () => resolve(socket));
-        socket.once("error", reject);
+        socket.once("error", (error) => {
+          socket.destroy();
+          reject(error);
+        });
       });
     } catch (error) {
       lastError = error;
@@ -277,8 +308,8 @@ const connectWithRetry = async (pipeName, timeoutMs) => {
   throw lastError ?? new Error("failed to connect to ImportLens daemon");
 };
 
-const daemonClient = (socket) => {
-  let pending = [];
+export const createDaemonClient = (socket) => {
+  const pending = new Map();
   let buffer = Buffer.alloc(0);
 
   socket.on("data", (chunk) => {
@@ -292,15 +323,35 @@ const daemonClient = (socket) => {
 
       const payload = buffer.subarray(4, 4 + length);
       buffer = buffer.subarray(4 + length);
-      pending.shift()?.resolve(decode(payload));
+      let message;
+
+      try {
+        message = decode(payload);
+      } catch (error) {
+        rejectPending(error instanceof Error ? error : new Error(String(error)));
+        socket.destroy?.();
+        return;
+      }
+
+      const requestId = requestIdForMessage(message);
+
+      if (requestId === null) {
+        continue;
+      }
+
+      const item = pending.get(requestId);
+
+      if (!item) {
+        continue;
+      }
+
+      pending.delete(requestId);
+      clearTimeout(item.timer);
+      item.resolve(message);
     }
   });
-  socket.on("error", (error) => {
-    for (const item of pending) {
-      item.reject(error);
-    }
-    pending = [];
-  });
+  socket.on("error", (error) => rejectPending(error));
+  socket.on("close", () => rejectPending(new Error("IPC socket closed")));
 
   const send = (message) => {
     const payload = Buffer.from(encode(message));
@@ -311,11 +362,53 @@ const daemonClient = (socket) => {
 
   return {
     send,
-    request: (message) => new Promise((resolve, reject) => {
-      pending.push({ resolve, reject });
-      send(message);
-    }),
+    request: (message, timeoutMs = defaultIpcTimeoutMs) => {
+      const requestId = requestIdForMessage(message);
+
+      if (requestId === null) {
+        return Promise.reject(new Error("IPC request requires a numeric request_id"));
+      }
+
+      if (pending.has(requestId)) {
+        return Promise.reject(new Error(`duplicate IPC request id ${requestId}`));
+      }
+
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (pending.delete(requestId)) {
+            reject(new Error(`IPC request ${requestId} timed out after ${timeoutMs}ms`));
+          }
+        }, timeoutMs);
+
+        pending.set(requestId, { resolve, reject, timer });
+
+        try {
+          send(message);
+        } catch (error) {
+          clearTimeout(timer);
+          pending.delete(requestId);
+          reject(error);
+        }
+      });
+    },
   };
+
+  function rejectPending(error) {
+    for (const item of pending.values()) {
+      clearTimeout(item.timer);
+      item.reject(error);
+    }
+
+    pending.clear();
+  }
+};
+
+const requestIdForMessage = (message) => {
+  if (!message || typeof message !== "object" || !Number.isSafeInteger(message.request_id)) {
+    return null;
+  }
+
+  return message.request_id;
 };
 
 const extractRuntimeImports = (filePath, source) => {

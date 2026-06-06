@@ -1,10 +1,31 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import path from "node:path";
+import { encode } from "@msgpack/msgpack";
 import test from "node:test";
 import {
+  createDaemonClient,
+  daemonBinaryPath,
   loadBudgetConfig,
   parseCliArgs,
   runImportLensCheck,
 } from "../cli/importlens.mjs";
+
+class FakeSocket extends EventEmitter {
+  writes = [];
+
+  write(frame) {
+    this.writes.push(frame);
+    return true;
+  }
+}
+
+const frame = (message) => {
+  const payload = Buffer.from(encode(message));
+  const header = Buffer.allocUnsafe(4);
+  header.writeUInt32BE(payload.length, 0);
+  return Buffer.concat([header, payload]);
+};
 
 test("parseCliArgs supports importlens check and optional config", () => {
   assert.deepEqual(parseCliArgs(["check"]), { command: "check", configPath: undefined });
@@ -66,4 +87,56 @@ test("runImportLensCheck passes when changed files are within budgets", async ()
 
   assert.equal(exitCode, 0);
   assert.deepEqual(output, ["ImportLens budgets passed for 1 changed file."]);
+});
+
+test("daemonBinaryPath resolves from the installed package root", () => {
+  assert.equal(
+    daemonBinaryPath({ packageRoot: path.join("C:", "ImportLens"), platformTarget: "win32-x64" }),
+    path.join("C:", "ImportLens", "bin", "win32-x64", "import-lens-daemon.exe"),
+  );
+});
+
+test("createDaemonClient resolves concurrent responses by request id", async () => {
+  const socket = new FakeSocket();
+  const client = createDaemonClient(socket);
+  const first = client.request({ type: "file_size", request_id: 1 }, 100);
+  const second = client.request({ type: "file_size", request_id: 2 }, 100);
+
+  socket.emit("data", frame({ request_id: 2, ok: "second" }));
+  socket.emit("data", frame({ request_id: 1, ok: "first" }));
+
+  assert.deepEqual(await Promise.all([first, second]), [
+    { request_id: 1, ok: "first" },
+    { request_id: 2, ok: "second" },
+  ]);
+});
+
+test("createDaemonClient rejects pending requests on timeout and close", async () => {
+  const timeoutSocket = new FakeSocket();
+  const timeoutClient = createDaemonClient(timeoutSocket);
+
+  await assert.rejects(
+    () => timeoutClient.request({ type: "file_size", request_id: 3 }, 1),
+    /timed out/u,
+  );
+
+  const closeSocket = new FakeSocket();
+  const closeClient = createDaemonClient(closeSocket);
+  const pending = closeClient.request({ type: "file_size", request_id: 4 }, 100);
+  closeSocket.emit("close");
+
+  await assert.rejects(pending, /IPC socket closed/u);
+});
+
+test("createDaemonClient rejects pending requests on malformed frames", async () => {
+  const socket = new FakeSocket();
+  const client = createDaemonClient(socket);
+  const pending = client.request({ type: "file_size", request_id: 5 }, 100);
+  const invalidPayload = Buffer.from([0xc1]);
+  const header = Buffer.allocUnsafe(4);
+  header.writeUInt32BE(invalidPayload.length, 0);
+
+  socket.emit("data", Buffer.concat([header, invalidPayload]));
+
+  await assert.rejects(pending);
 });
