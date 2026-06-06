@@ -7,7 +7,7 @@ import type { DetectedImport } from "../imports/types.js";
 import { protocolVersion, type ImportRequest } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import { analysisRootForFile } from "../workspaceContext.js";
-import { formatBytes } from "./format.js";
+import { compareImportItemsForResponse } from "./compareImportItems.js";
 
 export const compareImportsCommand = "importLens.compareImports";
 
@@ -61,21 +61,27 @@ export const compareImports = async (
     return;
   }
 
-  const response = await daemon.sendBatch({
-    version: protocolVersion,
-    request_id: nextIpcRequestId(),
-    workspace_root: workspaceRoot,
-    active_document_path: editor.document.fileName,
-    imports,
-  });
+  let response: Awaited<ReturnType<DaemonManager["sendBatch"]>>;
 
-  const items = (response?.imports ?? [])
-    .filter((result) => !result.error)
-    .sort((left, right) => left.brotli_bytes - right.brotli_bytes)
-    .map((result) => ({
-      label: `${result.specifier}: ${formatBytes(result.brotli_bytes)} br`,
-      detail: `${formatBytes(result.minified_bytes)} min · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd`,
-    }));
+  try {
+    response = await daemon.sendBatch({
+      version: protocolVersion,
+      request_id: nextIpcRequestId(),
+      workspace_root: workspaceRoot,
+      active_document_path: editor.document.fileName,
+      imports,
+    });
+  } catch {
+    await vscode.window.showWarningMessage("ImportLens import comparison failed.");
+    return;
+  }
+
+  const { items, warning } = compareImportItemsForResponse(response);
+
+  if (warning) {
+    await vscode.window.showWarningMessage(warning);
+    return;
+  }
 
   await vscode.window.showQuickPick(items, {
     title: "ImportLens Import Comparison",

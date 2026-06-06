@@ -1,0 +1,40 @@
+import type { BatchResponse } from "../ipc/protocol.js";
+import { formatBytes } from "./format.js";
+
+export interface CompareImportQuickPickItem {
+  label: string;
+  detail: string;
+}
+
+export interface CompareImportItemsResult {
+  items: CompareImportQuickPickItem[];
+  warning?: string;
+}
+
+export const compareImportItemsForResponse = (
+  response: BatchResponse | null,
+): CompareImportItemsResult => {
+  if (!response) {
+    return {
+      items: [],
+      warning: "ImportLens daemon did not return comparison results.",
+    };
+  }
+
+  const items = response.imports
+    .filter((result) => !result.error)
+    .sort((left, right) => left.brotli_bytes - right.brotli_bytes)
+    .map((result) => ({
+      label: `${result.specifier}: ${formatBytes(result.brotli_bytes)} br`,
+      detail: `${formatBytes(result.minified_bytes)} min · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd`,
+    }));
+
+  if (items.length === 0) {
+    return {
+      items,
+      warning: "ImportLens could not compute any comparison results.",
+    };
+  }
+
+  return { items };
+};

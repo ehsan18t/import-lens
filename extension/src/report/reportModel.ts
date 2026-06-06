@@ -69,8 +69,8 @@ export interface DuplicateModuleGroup {
 export const buildReportRows = (
   items: readonly WorkspaceReportItem[],
   budgets: ImportLensBudgets = {},
-): WorkspaceReportRow[] =>
-  items
+): WorkspaceReportRow[] => {
+  const rows = items
     .map((item) => {
       const result = item.result;
 
@@ -91,7 +91,8 @@ export const buildReportRows = (
         moduleContributions: moduleContributions(result),
         warning: warningForItem(item, budgets),
       };
-    })
+    });
+  return applyFileBudgetWarnings(rows, budgets)
     .sort((left, right) => {
       const sizeDelta = right.brotliBytes - left.brotliBytes;
 
@@ -103,6 +104,7 @@ export const buildReportRows = (
         `${right.sourceFile}:${right.line}:${right.specifier}`,
       );
     });
+};
 
 export const buildReportSummary = (rows: readonly WorkspaceReportRow[]): WorkspaceReportSummary => {
   const totalBrotliBytes = rows.reduce((total, row) => total + row.brotliBytes, 0);
@@ -124,11 +126,51 @@ export const buildReportSummary = (rows: readonly WorkspaceReportRow[]): Workspa
     lowConfidenceCount: rows.filter((row) => row.confidence === "low").length,
     mediumConfidenceCount: rows.filter((row) => row.confidence === "medium").length,
     conservativeCount: rows.filter((row) => row.warning.includes("Conservative estimate")).length,
-    budgetViolationCount: rows.filter((row) => row.warning.includes("Budget exceeded")).length,
+    budgetViolationCount: rows.filter((row) => /budget exceeded/iu.test(row.warning)).length,
     duplicateImports: buildDuplicateImportGroups(rows),
     sharedModules: buildDuplicateModuleGroups(rows),
     treemap,
   };
+};
+
+const applyFileBudgetWarnings = (
+  rows: readonly WorkspaceReportRow[],
+  budgets: ImportLensBudgets,
+): WorkspaceReportRow[] => {
+  const limit = budgets.perFileBrotliBytes;
+
+  if (limit === undefined) {
+    return [...rows];
+  }
+
+  const totals = new Map<string, number>();
+
+  for (const row of rows) {
+    if (row.brotliBytes <= 0) {
+      continue;
+    }
+
+    totals.set(row.sourceFile, (totals.get(row.sourceFile) ?? 0) + row.brotliBytes);
+  }
+
+  const warnedFiles = new Set<string>();
+
+  return rows.map((row) => {
+    const total = totals.get(row.sourceFile) ?? 0;
+
+    if (total <= limit || warnedFiles.has(row.sourceFile)) {
+      return row;
+    }
+
+    warnedFiles.add(row.sourceFile);
+    return {
+      ...row,
+      warning: appendWarning(
+        row.warning,
+        `File budget exceeded: ${total} B br > ${limit} B br`,
+      ),
+    };
+  });
 };
 
 export const buildDuplicateImportGroups = (rows: readonly WorkspaceReportRow[]): DuplicateImportGroup[] => {
@@ -248,6 +290,9 @@ const warningForItem = (item: WorkspaceReportItem, budgets: ImportLensBudgets): 
 
   return warnings.join(" · ");
 };
+
+const appendWarning = (existing: string, next: string): string =>
+  existing ? `${existing} · ${next}` : next;
 
 const confidenceReasonSuffix = (result: ImportResult): string => {
   if (result.confidence_reasons.length === 0) {

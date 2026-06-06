@@ -184,6 +184,23 @@ test("buildReportRows reports configured per-import budget violations", () => {
   assert.equal(summary.budgetViolationCount, 1);
 });
 
+test("buildReportRows counts one per-file budget violation per source file", () => {
+  const rows = buildReportRows(
+    [
+      { ...item("left", 800), sourceFile: "/workspace/src/app.ts" },
+      { ...item("right", 500), sourceFile: "/workspace/src/app.ts" },
+      { ...item("small", 100), sourceFile: "/workspace/src/other.ts" },
+    ],
+    { perFileBrotliBytes: 1000 },
+  );
+  const summary = buildReportSummary(rows);
+  const fileBudgetRows = rows.filter((row) => row.warning.includes("File budget exceeded"));
+
+  assert.equal(fileBudgetRows.length, 1);
+  assert.equal(fileBudgetRows[0]?.sourceFile, "src/app.ts");
+  assert.equal(summary.budgetViolationCount, 1);
+});
+
 test("buildReportSummary totals imports and builds largest-contributor treemap data", () => {
   const rows = buildReportRows([
     item("small", 10),
