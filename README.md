@@ -10,7 +10,7 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 - 🌳 **Real Tree-shaking:** Calculates sizes for named, default, namespace, dynamic imports, re-exports, and named export candidates.
 - 🦀 **Rust Daemon Engine:** Built on `oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`, and parallel Rust compression.
 - 💾 **Persistent Caching:** Results are cached in-memory and to disk using `papaya` and `redb`, with startup prewarm for recent entries.
-- 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, `.mts`, `.cts`, Svelte (`<script>` blocks), and Astro (frontmatter and client scripts).
+- 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, `.mts`, `.cts`, Svelte (`<script>` blocks), Astro (frontmatter and client scripts), and Vue (`<script>` / `<script setup>` blocks).
 - 🎨 **Flexible UI Options:** Displays colored confidence hints by default, with native accessible Inlay Hints, end-of-line decorations, and CodeLens annotations available.
 - 📈 **Impact Insights:** Shows confidence levels, working-tree import cost deltas, per-import history trends, current-file totals, shared dependency explanations, and barrel re-export warnings.
 - 🛠️ **Import Actions:** Offers tree-shaking CodeActions, local substitution suggestions, diagnostic copy actions, named export candidates and completions, bundle history, and workspace reports.
@@ -30,6 +30,7 @@ All of this happens invisibly in a secure, self-contained background daemon, mea
 - React & Solid (`.jsx`, `.tsx`)
 - Svelte (`.svelte`)
 - Astro (`.astro`)
+- Vue (`.vue`)
 
 > **Note:** Framework virtual modules and common app aliases (`astro:*`, `virtual:*`, `$app/*`, `$env/*`, `@/*`) are automatically ignored as they are not npm package dependencies.
 

@@ -36,6 +36,26 @@ test("scriptRegionsForDocument extracts module and instance Svelte scripts", () 
   assert.equal(regions.length, 2);
 });
 
+test("scriptRegionsForDocument extracts Vue setup and classic scripts", () => {
+  const source = [
+    "<template><h1>{{ title }}</h1></template>",
+    "<script setup lang=\"ts\">",
+    "  import { ref } from 'vue';",
+    "</script>",
+    "<script>",
+    "  import dayjs from 'dayjs';",
+    "</script>",
+  ].join("\n");
+
+  const regions = scriptRegionsForDocument("Component.vue", source);
+
+  assert.equal(regions.length, 2);
+  assert.deepEqual(regions.map((region) => region.language), ["ts", "js"]);
+  assert.deepEqual(regions.map((region) => region.runtime), ["component", "component"]);
+  assert.equal(regions[0]?.source.includes("import { ref } from 'vue';"), true);
+  assert.equal(regions[1]?.source.includes("import dayjs from 'dayjs';"), true);
+});
+
 test("scriptRegionsForDocument extracts Astro frontmatter as server runtime", () => {
   const source = [
     "---",

@@ -42,3 +42,7 @@ test("ImportLens compare workflow is contributed and package.json can activate t
   assert.ok(manifest.activationEvents.includes("onLanguage:jsonc"));
   assert.ok(manifest.contributes.commands.some((command) => command.command === "importLens.compareImports"));
 });
+
+test("ImportLens activates for Vue component files", () => {
+  assert.ok(manifest.activationEvents.includes("onLanguage:vue"));
+});

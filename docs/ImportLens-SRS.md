@@ -212,7 +212,7 @@ A WebAssembly daemon fallback may be added in v1.1 or later using the existing a
 
 ### 3.3 Startup Sequence
 
-1. Extension activates on the `onLanguage:javascript`, `onLanguage:typescript`, `onLanguage:typescriptreact`, `onLanguage:javascriptreact`, `onLanguage:json`, `onLanguage:jsonc`, `onLanguage:svelte`, and `onLanguage:astro` events.
+1. Extension activates on the `onLanguage:javascript`, `onLanguage:typescript`, `onLanguage:typescriptreact`, `onLanguage:javascriptreact`, `onLanguage:json`, `onLanguage:jsonc`, `onLanguage:svelte`, `onLanguage:astro`, and `onLanguage:vue` events.
 2. The extension host checks for a native binary matching the current platform in the extension's `bin/` directory.
 3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
 4. If the hash matches, it spawns the daemon process, pipes daemon stdout/stderr into the ImportLens output channel according to the configured log level, opens a socket connection, and sends a versioned `HelloMessage`. The socket path includes a window-unique identifier (NFR-014b).
@@ -225,9 +225,9 @@ A WebAssembly daemon fallback may be added in v1.1 or later using the existing a
 On each daemon respawn, the extension host reads `<globalStoragePath>/importlens-recycles.json` before deciding whether to spawn, applying the recycle rate limit defined in NFR-004b.
 
 
-1. The user opens or edits a supported JS/TS, JSX/TSX, Svelte, or Astro file.
+1. The user opens or edits a supported JS/TS, JSX/TSX, Svelte, Astro, or Vue file.
 2. The document listener fires after a 300ms debounce.
-3. The extension extracts parseable script regions for component files. Plain JS/TS and JSX/TSX files are parsed as one region; Svelte `<script>` blocks are parsed as component regions; Astro frontmatter is parsed as server runtime and processed Astro `<script>` blocks are parsed as client runtime.
+3. The extension extracts parseable script regions for component files. Plain JS/TS and JSX/TSX files are parsed as one region; Svelte `<script>` blocks and Vue `<script>` / `<script setup>` blocks are parsed as component regions; Astro frontmatter is parsed as server runtime and processed Astro `<script>` blocks are parsed as client runtime.
 4. `oxc-parser` (NAPI binding) parses each script region and extracts ESM import information directly from the `result.module.staticImports`, `result.module.staticExports`, and `result.module.dynamicImports` arrays (no AST walk required).
 5. The extension maps region-relative import ranges back to absolute document positions for stable inlay hint, decoration, and CodeLens placement.
 6. The extension filters imports to node_modules only, skipping local paths, `node:` builtins, and `import type` declarations.
@@ -334,6 +334,8 @@ The extension must retain the detected import syntax category (`static`, `reexpo
 **FR-006b** (High) - The extension must support Astro documents by extracting imports from frontmatter and processed client `<script>` blocks. Frontmatter imports must be marked as `server` runtime; processed client script imports must be marked as `client` runtime. Inline Astro scripts with non-processed attributes such as `is:inline` must not be treated as bundled imports.
 
 **FR-006c** (High) - The extension must support local JS/TS files opened outside a VS Code workspace folder. For such loose files, the extension must derive an analysis root by walking upward from the file to the nearest `package.json` or `node_modules` directory and must start the daemon with that derived root. If neither exists, the file's containing directory is used as the fallback root. Loose-file support must use the active document path for package resolution and must not display daemon unavailable solely because no workspace folder exists.
+
+**FR-006d** (High) - The extension must support Vue Single File Components by extracting imports from every `<script>` block, including `<script setup>` and classic scripts. `<script lang="ts">`, `<script lang="tsx">`, and `<script lang="jsx">` blocks must be parsed with the matching language mode, and all detected import positions must map back to the original `.vue` document.
 
 ### 5.2 Package Version Resolution
 
@@ -1303,7 +1305,7 @@ import-lens/
 │   │   │   └── state.ts               # Per-document import analysis state
 │   │   ├── imports/
 │   │   │   ├── parser.ts              # oxc-parser (NAPI) import extraction via parseSync()
-│   │   │   ├── scriptRegions.ts       # Svelte/Astro script region extraction and runtime labeling
+│   │   │   ├── scriptRegions.ts       # Svelte/Astro/Vue script region extraction and runtime labeling
 │   │   │   ├── resolver.ts            # package.json version resolution (handles scoped packages)
 │   │   │   ├── specifier.ts           # package/builtin/relative specifier helpers
 │   │   │   ├── positions.ts           # offset-to-position mapping helpers

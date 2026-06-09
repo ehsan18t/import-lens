@@ -13,7 +13,7 @@ export interface ScriptRegion {
   runtime: ScriptRuntime;
 }
 
-const svelteScriptPattern = /<script\b([^>]*)>([\s\S]*?)<\/script>/giu;
+const componentScriptPattern = /<script\b([^>]*)>([\s\S]*?)<\/script>/giu;
 const astroClientScriptPattern = /<script\b([^>]*)>([\s\S]*?)<\/script>/giu;
 const astroFrontmatterPattern = /^---(?:\r\n|\n|\r)([\s\S]*?)(?:\r\n|\n|\r)---(?:\r\n|\n|\r|$)/u;
 
@@ -39,9 +39,20 @@ const languageFromFilename = (filename: string): ScriptLanguage => {
   return "js";
 };
 
-const svelteLanguageFromAttributes = (attributes: string): ScriptLanguage => {
-  if (/\blang\s*=\s*(?:"ts"|'ts'|ts)(?:\s|$)/iu.test(attributes)) {
+const scriptLanguageFromAttributes = (attributes: string): ScriptLanguage => {
+  const langMatch = /\blang\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/iu.exec(attributes);
+  const language = (langMatch?.[1] ?? langMatch?.[2] ?? langMatch?.[3] ?? "").toLowerCase();
+
+  if (language === "ts" || language === "typescript") {
     return "ts";
+  }
+
+  if (language === "tsx") {
+    return "tsx";
+  }
+
+  if (language === "jsx") {
+    return "jsx";
   }
 
   return "js";
@@ -60,16 +71,16 @@ const isProcessedAstroScript = (attributes: string): boolean => {
   return /^src\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)\s*$/iu.test(normalized);
 };
 
-const svelteRegions = (filename: string, source: string): ScriptRegion[] => {
+const componentScriptRegions = (filename: string, source: string): ScriptRegion[] => {
   const regions: ScriptRegion[] = [];
 
-  for (const match of source.matchAll(svelteScriptPattern)) {
+  for (const match of source.matchAll(componentScriptPattern)) {
     const fullMatch = match[0];
     const attributes = match[1] ?? "";
     const scriptSource = match[2] ?? "";
     const matchIndex = match.index ?? 0;
     const contentOffset = matchIndex + fullMatch.indexOf(">") + 1;
-    const language = svelteLanguageFromAttributes(attributes);
+    const language = scriptLanguageFromAttributes(attributes);
 
     regions.push({
       filename: blockFilename(filename, language, regions.length),
@@ -129,7 +140,11 @@ export const scriptRegionsForDocument = (filename: string, source: string): Scri
   const lowerFilename = filename.toLowerCase();
 
   if (lowerFilename.endsWith(".svelte")) {
-    return svelteRegions(filename, source);
+    return componentScriptRegions(filename, source);
+  }
+
+  if (lowerFilename.endsWith(".vue")) {
+    return componentScriptRegions(filename, source);
   }
 
   if (lowerFilename.endsWith(".astro")) {

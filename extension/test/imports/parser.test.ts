@@ -190,6 +190,35 @@ test("extractRuntimeImports detects imports from both Svelte module and instance
   );
 });
 
+test("extractRuntimeImports detects imports inside Vue SFC scripts", () => {
+  const source = [
+    "<template><h1>{{ count }}</h1></template>",
+    "<script setup lang=\"ts\">",
+    "  import { ref, type Ref } from 'vue';",
+    "  import debounce from 'lodash-es/debounce';",
+    "</script>",
+    "<script>",
+    "  import dayjs from 'dayjs';",
+    "</script>",
+  ].join("\n");
+
+  const imports = extractRuntimeImports("Counter.vue", source);
+
+  assert.deepEqual(
+    imports.map((item) => ({
+      specifier: item.specifier,
+      kind: item.importKind,
+      named: item.named,
+      line: item.line,
+    })),
+    [
+      { specifier: "vue", kind: "named", named: ["ref"], line: 2 },
+      { specifier: "lodash-es/debounce", kind: "default", named: [], line: 3 },
+      { specifier: "dayjs", kind: "default", named: [], line: 6 },
+    ],
+  );
+});
+
 test("extractRuntimeImports detects imports inside Astro frontmatter", () => {
   const source = [
     "---",

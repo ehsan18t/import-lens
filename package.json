@@ -28,7 +28,8 @@
     "onLanguage:json",
     "onLanguage:jsonc",
     "onLanguage:svelte",
-    "onLanguage:astro"
+    "onLanguage:astro",
+    "onLanguage:vue"
   ],
   "contributes": {
     "commands": [

@@ -7,6 +7,7 @@ export const supportedLanguageIds: ReadonlySet<string> = new Set([
   "javascriptreact",
   "svelte",
   "astro",
+  "vue",
 ]);
 
 export const languageSelector: vscode.DocumentSelector = [
@@ -16,4 +17,5 @@ export const languageSelector: vscode.DocumentSelector = [
   { language: "javascriptreact", scheme: "file" },
   { language: "svelte", scheme: "file" },
   { language: "astro", scheme: "file" },
+  { language: "vue", scheme: "file" },
 ];
