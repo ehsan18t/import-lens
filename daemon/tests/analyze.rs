@@ -337,6 +337,65 @@ fn analyze_import_treats_unmatched_side_effect_array_as_treeshakeable() {
 }
 
 #[test]
+fn analyze_import_includes_graph_modules_matching_side_effect_array_patterns() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "array-graph-effects-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["**/{polyfill,compat}/**/*.js"]}"#,
+        "export const used = 1;\nexport { setup } from './dist/polyfill/browser/setup.js';\n",
+    );
+    write_package_file(
+        &workspace,
+        "array-graph-effects-lib",
+        "dist/polyfill/browser/setup.js",
+        "globalThis.__importLensSideEffect = 'kept';\nexport const setup = 'polyfill';\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "array-graph-effects-lib",
+            "array-graph-effects-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.side_effects, "{result:?}");
+    assert!(!result.truly_treeshakeable, "{result:?}");
+    assert!(
+        result.module_breakdown.as_ref().is_some_and(|modules| {
+            modules.iter().any(|module| {
+                module
+                    .path
+                    .replace('\\', "/")
+                    .ends_with("dist/polyfill/browser/setup.js")
+            })
+        }),
+        "{result:?}",
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "side_effects"
+                && diagnostic.details.iter().any(|detail| {
+                    detail
+                        .replace('\\', "/")
+                        .contains("dist/polyfill/browser/setup.js")
+                })
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_dynamic_import_measures_full_module_graph() {
     let workspace = temp_workspace();
     write_package(

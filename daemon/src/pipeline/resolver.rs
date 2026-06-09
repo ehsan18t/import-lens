@@ -15,18 +15,57 @@ pub struct ResolvedPackage {
     pub side_effects: SideEffectsMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SideEffectsMode {
     False,
     True,
-    Array,
+    Array(SideEffectsPatterns),
     Missing,
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideEffectsPatterns {
+    patterns: Vec<String>,
+    entry_matches: bool,
+}
+
 impl SideEffectsMode {
-    pub fn has_side_effects(self) -> bool {
-        !matches!(self, Self::False)
+    pub fn has_side_effects(&self) -> bool {
+        match self {
+            Self::False => false,
+            Self::True | Self::Missing | Self::Unknown => true,
+            Self::Array(patterns) => patterns.entry_matches,
+        }
+    }
+
+    pub fn matching_paths<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> Vec<PathBuf> {
+        let Self::Array(patterns) = self else {
+            return Vec::new();
+        };
+
+        let mut matched_paths = Vec::new();
+        for path in paths {
+            let Some(normalized) = normalized_side_effect_path(path) else {
+                continue;
+            };
+            if patterns
+                .patterns
+                .iter()
+                .any(|pattern| side_effects_pattern_matches(pattern, &normalized))
+            {
+                let path = path.to_path_buf();
+                if !matched_paths.contains(&path) {
+                    matched_paths.push(path);
+                }
+            }
+        }
+
+        matched_paths
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self, Self::Array(_))
     }
 }
 
@@ -574,24 +613,25 @@ fn side_effects_array_mode(patterns: &[Value], entry_path: &Path) -> SideEffects
         return SideEffectsMode::Unknown;
     };
 
-    let mut saw_string = false;
+    let mut side_effect_patterns = Vec::new();
 
     for pattern in patterns {
         let Some(pattern) = pattern.as_str() else {
             return SideEffectsMode::Unknown;
         };
-        saw_string = true;
-
-        if side_effects_pattern_matches(pattern, &entry) {
-            return SideEffectsMode::True;
-        }
+        side_effect_patterns.push(pattern.to_owned());
     }
 
-    if saw_string {
-        SideEffectsMode::False
-    } else {
-        SideEffectsMode::Unknown
+    if side_effect_patterns.is_empty() {
+        return SideEffectsMode::Unknown;
     }
+
+    SideEffectsMode::Array(SideEffectsPatterns {
+        entry_matches: side_effect_patterns
+            .iter()
+            .any(|pattern| side_effects_pattern_matches(pattern, &entry)),
+        patterns: side_effect_patterns,
+    })
 }
 
 fn normalized_side_effect_path(path: &Path) -> Option<String> {

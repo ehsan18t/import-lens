@@ -3,7 +3,7 @@ use crate::{
         ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ModuleContribution,
     },
     pipeline::{
-        analyze::AnalysisContext,
+        analyze::{AnalysisContext, side_effect_diagnostics},
         bundle::bundle_reachable_modules_with_metadata,
         cjs::analyze_cjs_graph_with_runtime,
         compress::compress_all,
@@ -143,12 +143,25 @@ pub fn compute_file_size(
             details: item.details.clone(),
         }));
 
+        let side_effect_matches = resolved
+            .side_effects
+            .matching_paths(graph.modules.iter().map(|module| module.path.as_path()));
+        diagnostics.extend(side_effect_diagnostics(
+            &resolved.side_effects,
+            &resolved.entry_path,
+            &side_effect_matches,
+        ));
+
         let include_full_entry = resolved.side_effects.has_side_effects()
             || matches!(
                 request.import_kind,
                 ImportKind::Namespace | ImportKind::Dynamic
             );
-        let reachable = reachable_exports(&graph, &requested_exports(request), include_full_entry);
+        let mut reachable =
+            reachable_exports(&graph, &requested_exports(request), include_full_entry);
+        for path in side_effect_matches {
+            reachable.mark_full_module(path);
+        }
         combined_reachable.merge_from(&reachable);
         merge_graph_modules(&mut combined_modules, &mut seen_paths, &graph);
     }

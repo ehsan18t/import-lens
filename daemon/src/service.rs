@@ -324,7 +324,7 @@ impl ImportLensService {
         resolved: &ResolvedPackage,
         dependency_fingerprints: &[crate::cache::key::FileFingerprint],
     ) {
-        if !result.side_effects
+        if !resolved.side_effects.has_side_effects()
             || result.is_cjs
             || has_request_specific_diagnostics(result)
             || matches!(

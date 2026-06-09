@@ -216,6 +216,33 @@ fn write_effectful_package(workspace: &Path) {
     .expect("entry should be written");
 }
 
+fn write_array_graph_effects_package(workspace: &Path) {
+    let package_root = workspace
+        .join("node_modules")
+        .join("array-graph-effects-lib");
+    fs::create_dir_all(package_root.join("dist").join("polyfill").join("browser"))
+        .expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["**/polyfill/**/*.js"]}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "export const value = 1;\nexport { setup } from './dist/polyfill/browser/setup.js';",
+    )
+    .expect("entry should be written");
+    fs::write(
+        package_root
+            .join("dist")
+            .join("polyfill")
+            .join("browser")
+            .join("setup.js"),
+        "globalThis.__importLensSideEffect = 'kept';\nexport const setup = 'polyfill';",
+    )
+    .expect("side-effect module should be written");
+}
+
 fn write_cjs_file_size_package(workspace: &Path) {
     let package_root = workspace.join("node_modules").join("cjs-file-lib");
     fs::create_dir_all(&package_root).expect("package root should be created");
@@ -271,6 +298,32 @@ fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -
         imports: vec![ImportRequest {
             specifier: "effectful-lib".to_owned(),
             package_name: "effectful-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: if matches!(import_kind, ImportKind::Named) {
+                vec!["value".to_owned()]
+            } else {
+                Vec::new()
+            },
+            import_kind,
+            runtime: ImportRuntime::Component,
+        }],
+        streaming: false,
+    }
+}
+
+fn graph_effects_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -> BatchRequest {
+    BatchRequest {
+        version: 1,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![ImportRequest {
+            specifier: "array-graph-effects-lib".to_owned(),
+            package_name: "array-graph-effects-lib".to_owned(),
             version: "1.0.0".to_owned(),
             named: if matches!(import_kind, ImportKind::Named) {
                 vec!["value".to_owned()]
@@ -462,6 +515,28 @@ fn cjs_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
     }
 }
 
+fn graph_effects_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
+    FileSizeRequest {
+        message_type: "file_size".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![ImportRequest {
+            specifier: "array-graph-effects-lib".to_owned(),
+            package_name: "array-graph-effects-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec!["value".to_owned()],
+            import_kind: ImportKind::Named,
+            runtime: ImportRuntime::Component,
+        }],
+    }
+}
+
 fn enumerate_exports_request(workspace: &Path, request_id: u64) -> EnumerateExportsRequest {
     EnumerateExportsRequest {
         message_type: "enumerate_exports".to_owned(),
@@ -639,6 +714,21 @@ fn service_caches_full_package_variant_for_conservative_named_imports() {
 }
 
 #[test]
+fn service_does_not_alias_graph_only_side_effect_result_to_namespace_cache() {
+    let workspace = temp_workspace();
+    write_array_graph_effects_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let named = service.handle_batch(graph_effects_batch(&workspace, 1, ImportKind::Named));
+    let namespace = service.handle_batch(graph_effects_batch(&workspace, 2, ImportKind::Namespace));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(!named.imports[0].cache_hit);
+    assert!(named.imports[0].side_effects, "{named:?}");
+    assert!(!namespace.imports[0].cache_hit);
+}
+
+#[test]
 fn service_does_not_alias_missing_export_result_to_namespace_cache() {
     let workspace = temp_workspace();
     write_missing_export_effectful_package(&workspace);
@@ -807,6 +897,28 @@ fn service_computes_file_size_for_commonjs_only_imports_conservatively() {
         }),
         "{file_size:?}",
     );
+}
+
+#[test]
+fn service_file_size_includes_graph_only_side_effect_modules() {
+    let workspace = temp_workspace();
+    write_array_graph_effects_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_file_size(graph_effects_file_size_request(&workspace, 26));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.error, None);
+    assert_eq!(response.imports.len(), 1);
+    assert_eq!(response.raw_bytes, response.imports[0].raw_bytes);
+    assert!(response.diagnostics.iter().any(|diagnostic| {
+        diagnostic.stage == "side_effects"
+            && diagnostic.details.iter().any(|detail| {
+                detail
+                    .replace('\\', "/")
+                    .contains("dist/polyfill/browser/setup.js")
+            })
+    }));
 }
 
 #[test]

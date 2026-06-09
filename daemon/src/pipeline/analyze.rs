@@ -147,13 +147,14 @@ fn analyze_import_inner_resolved(
             ImportKind::Named | ImportKind::Default | ImportKind::Namespace | ImportKind::Dynamic
         )
     {
-        match analyze_with_oxc_pipeline(context, request, entry_path.clone(), side_effects_mode) {
+        match analyze_with_oxc_pipeline(context, request, entry_path.clone(), &side_effects_mode) {
             Ok(result) => return Ok(result),
             Err(error) => fallback_diagnostics.push(oxc_fallback_diagnostic(error)),
         }
     }
 
-    let mut result = analyze_static_entry(context, request, entry_path, side_effects_mode, is_cjs)?;
+    let mut result =
+        analyze_static_entry(context, request, entry_path, &side_effects_mode, is_cjs)?;
     result.diagnostics.extend(fallback_diagnostics);
     Ok(result)
 }
@@ -237,9 +238,8 @@ fn analyze_with_oxc_pipeline(
     context: &AnalysisContext,
     request: &ImportRequest,
     entry_path: PathBuf,
-    side_effects_mode: SideEffectsMode,
+    side_effects_mode: &SideEffectsMode,
 ) -> Result<ImportResult, AnalysisError> {
-    let side_effects = side_effects_mode.has_side_effects();
     let graph =
         build_module_graph_cached_with_runtime(&entry_path, request.runtime).map_err(|error| {
             error_with_context(
@@ -250,13 +250,19 @@ fn analyze_with_oxc_pipeline(
                 vec![format!("entry_path: {}", entry_path.display())],
             )
         })?;
-    let include_full_entry = side_effects
+    let side_effect_matches =
+        side_effects_mode.matching_paths(graph.modules.iter().map(|module| module.path.as_path()));
+    let side_effects = side_effects_mode.has_side_effects() || !side_effect_matches.is_empty();
+    let include_full_entry = side_effects_mode.has_side_effects()
         || matches!(
             request.import_kind,
             ImportKind::Namespace | ImportKind::Dynamic
         );
     let requested_exports = requested_exports(request);
     let mut reachable = reachable_exports(&graph, &requested_exports, include_full_entry);
+    for path in &side_effect_matches {
+        reachable.mark_full_module(path.clone());
+    }
     let mut bundled =
         bundle_reachable_modules_with_metadata(&graph, &reachable).map_err(|error| {
             error_with_context(
@@ -314,7 +320,8 @@ fn analyze_with_oxc_pipeline(
         )
     })?;
 
-    let mut diagnostics = side_effect_diagnostics(side_effects_mode, &entry_path);
+    let mut diagnostics =
+        side_effect_diagnostics(side_effects_mode, &entry_path, &side_effect_matches);
     diagnostics.extend(graph.diagnostics.iter().map(|diagnostic| ImportDiagnostic {
         stage: diagnostic.stage.clone(),
         message: diagnostic.message.clone(),
@@ -379,10 +386,12 @@ fn analyze_static_entry(
     context: &AnalysisContext,
     request: &ImportRequest,
     entry_path: PathBuf,
-    side_effects_mode: SideEffectsMode,
+    side_effects_mode: &SideEffectsMode,
     is_cjs: bool,
 ) -> Result<ImportResult, AnalysisError> {
     let side_effects = side_effects_mode.has_side_effects();
+    let side_effect_matches =
+        side_effects_mode.matching_paths(std::iter::once(entry_path.as_path()));
     let source = fs::read_to_string(&entry_path).map_err(|error| {
         error_with_context(
             "entry_read",
@@ -428,7 +437,7 @@ fn analyze_static_entry(
                 .to_owned(),
         ],
         error: None,
-        diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path),
+        diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path, &side_effect_matches),
         module_breakdown: None,
         shared_bytes: None,
         internal_contributions: Vec::new(),
@@ -502,21 +511,29 @@ fn top_module_contributions(contributions: &[ModuleContribution]) -> Vec<ModuleC
     contributions
 }
 
-fn side_effect_diagnostics(
-    side_effects_mode: SideEffectsMode,
+pub(crate) fn side_effect_diagnostics(
+    side_effects_mode: &SideEffectsMode,
     entry_path: &Path,
+    matched_paths: &[PathBuf],
 ) -> Vec<ImportDiagnostic> {
-    if side_effects_mode != SideEffectsMode::Array {
+    if !side_effects_mode.is_array() || matched_paths.is_empty() {
         return Vec::new();
     }
 
+    let mut details = vec![
+        "sideEffects: array".to_owned(),
+        format!("entry_path: {}", entry_path.display()),
+    ];
+    details.extend(
+        matched_paths
+            .iter()
+            .map(|path| format!("matched_path: {}", path.display())),
+    );
+
     vec![ImportDiagnostic {
         stage: "side_effects".to_owned(),
-        message: "package sideEffects array requires conservative full-graph analysis".to_owned(),
-        details: vec![
-            "sideEffects: array".to_owned(),
-            format!("entry_path: {}", entry_path.display()),
-        ],
+        message: "package sideEffects array matched analyzed module path(s); conservative inclusion applied".to_owned(),
+        details,
     }]
 }
 
