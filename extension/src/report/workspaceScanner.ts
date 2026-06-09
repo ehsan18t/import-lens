@@ -7,11 +7,13 @@ import type { DetectedImport } from "../imports/types.js";
 import type { BatchRequest, BatchResponse, ImportRequest } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
+import { mapWithConcurrency } from "./concurrency.js";
 import type { WorkspaceReportItem } from "./reportModel.js";
 
 export const workspaceIncludePattern = "**/*.{js,jsx,ts,tsx,mts,cts,svelte,astro,vue}";
 export const workspaceExcludePattern = "**/{node_modules,dist,build,out,coverage}/**";
 const DEFAULT_BATCH_SIZE = 50;
+const DEFAULT_SCAN_CONCURRENCY = 8;
 
 export interface WorkspaceUri {
   fsPath: string;
@@ -49,6 +51,7 @@ export interface ScannedImport {
 interface WorkspaceScannerOptions {
   chunkSize?: number;
   nextRequestId?: () => number;
+  scanConcurrency?: number;
 }
 
 export const buildWorkspaceReportItems = async (
@@ -56,30 +59,45 @@ export const buildWorkspaceReportItems = async (
   daemon: WorkspaceReportDaemon,
   options: WorkspaceScannerOptions = {},
 ): Promise<WorkspaceReportItem[]> => {
-  const scannedImports = await scanWorkspaceImports(workspace);
+  const scannedImports = await scanWorkspaceImports(workspace, options);
   return analyzeScannedImports(scannedImports, daemon, options);
 };
 
 export const scanWorkspaceImports = async (
   workspace: WorkspaceScannerApi,
+  options: WorkspaceScannerOptions = {},
 ): Promise<ScannedImport[]> => {
   const uris = sortWorkspaceUris(await workspace.findFiles(workspaceIncludePattern, workspaceExcludePattern));
+  const scannedImportGroups = await mapWithConcurrency(
+    uris,
+    options.scanConcurrency ?? DEFAULT_SCAN_CONCURRENCY,
+    async (uri) => scanWorkspaceUri(workspace, uri),
+  );
+
+  return scannedImportGroups.flat();
+};
+
+const scanWorkspaceUri = async (
+  workspace: WorkspaceScannerApi,
+  uri: WorkspaceUri,
+): Promise<ScannedImport[]> => {
   const scannedImports: ScannedImport[] = [];
+  let document: WorkspaceTextDocument;
+  let workspaceRoot: string;
+  let detectedImports: DetectedImport[];
 
-  for (const uri of uris) {
-    const document = await workspace.openTextDocument(uri);
-    const workspaceRoot = workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath ?? path.dirname(document.fileName);
-    let detectedImports: DetectedImport[];
+  try {
+    document = await workspace.openTextDocument(uri);
+    workspaceRoot = workspace.getWorkspaceFolder?.(document.uri)?.uri.fsPath ?? path.dirname(document.fileName);
+    const ignoreRules = await loadImportLensIgnore(document.fileName);
+    detectedImports = extractRuntimeImports(document.fileName, document.getText())
+      .filter((detected) => !shouldIgnoreImport(detected, document.fileName, ignoreRules));
+  } catch {
+    return [];
+  }
 
+  for (const detected of detectedImports) {
     try {
-      const ignoreRules = await loadImportLensIgnore(document.fileName);
-      detectedImports = extractRuntimeImports(document.fileName, document.getText())
-        .filter((detected) => !shouldIgnoreImport(detected, document.fileName, ignoreRules));
-    } catch {
-      continue;
-    }
-
-    for (const detected of detectedImports) {
       const resolution = await resolveInstalledPackage(detected.specifier, document.fileName);
 
       if (!resolution.ok) {
@@ -98,6 +116,8 @@ export const scanWorkspaceImports = async (
         workspaceRoot,
         request: createImportRequest(detected, resolution.version),
       });
+    } catch {
+      continue;
     }
   }
 
