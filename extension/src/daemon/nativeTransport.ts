@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
@@ -114,7 +115,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     const pipeName = process.platform === "win32"
       ? `\\\\.\\pipe\\import-lens-${process.pid}-${randomUUID()}`
-      : path.join(this.#context.globalStorageUri.fsPath, `import-lens-${process.pid}-${randomUUID()}.sock`);
+      : path.join(tmpdir(), `import-lens-${process.pid}-${randomUUID()}.sock`);
 
     const childProcess = spawn(binaryPath, [
       "--pipe",
