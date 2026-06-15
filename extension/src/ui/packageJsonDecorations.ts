@@ -62,7 +62,7 @@ export class PackageJsonDecorationController implements vscode.Disposable {
         .map((section) => this.decorationForSection(editor.document, section, states, config))
         .filter((value): value is vscode.DecorationOptions => Boolean(value)),
       ...states
-        .map((state) => this.decorationForState(state, config))
+        .map((state) => this.decorationForState(editor.document, state, config))
         .filter((value): value is vscode.DecorationOptions => Boolean(value)),
     ];
 
@@ -75,13 +75,12 @@ export class PackageJsonDecorationController implements vscode.Disposable {
   }
 
   private decorationForState(
+    document: vscode.TextDocument,
     state: PackageJsonDependencyAnalysisState,
     config: ReturnType<typeof getImportLensConfig>,
   ): vscode.DecorationOptions | null {
-    const position = new vscode.Position(
-      state.entry.valueRange.end.line,
-      state.entry.valueRange.end.character,
-    );
+    const line = document.lineAt(state.entry.valueRange.end.line);
+    const position = line.range.end;
     const label = packageJsonDependencyHintLabel(state, config);
     const tooltip = tooltipForPackageJsonState(state);
 
