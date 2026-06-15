@@ -58,10 +58,6 @@ const formatWarningSuffix = (result: ImportResult, showWarnings: boolean, runtim
     warningTags.push("CJS");
   }
 
-  if (result.side_effects || !result.truly_treeshakeable) {
-    warningTags.push("conservative");
-  }
-
   if (warningTags.length > 0) {
     return `${runtimeSuffix} · ${warningTags.join(" · ")}`;
   }
@@ -78,7 +74,7 @@ export const formatImportSize = (
   runtime: ImportRuntime = "component",
 ): string => {
   if (result.error) {
-    return "unavailable";
+    return "Size unavailable";
   }
 
   if (options.display === "verbose" || options.compression === "all") {
