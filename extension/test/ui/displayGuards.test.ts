@@ -7,6 +7,7 @@ import {
   shouldShowInlayHints,
   shouldShowNativeInlayHints,
   shouldShowCodeLens,
+  shouldShowPackageJsonDecorations,
 } from "../../src/ui/displayGuards.js";
 import type { ImportLensConfig } from "../../src/config.js";
 
@@ -33,6 +34,7 @@ test("display guards hide all ImportLens UI surfaces when disabled", () => {
   assert.equal(shouldShowCodeLens(disabled), false);
   assert.equal(shouldShowDecorations(disabled), false);
   assert.equal(shouldOfferImportCompletions(disabled), false);
+  assert.equal(shouldShowPackageJsonDecorations(disabled), false);
 });
 
 test("display guards keep surfaces mutually consistent when enabled", () => {
@@ -48,5 +50,7 @@ test("display guards keep surfaces mutually consistent when enabled", () => {
   assert.equal(shouldShowDecorations(config({ display: "inlayHint", inlineRenderer: "native" })), false);
   assert.equal(shouldShowDecorations(config({ display: "standard", useCodeLens: false })), true);
   assert.equal(shouldShowCodeLens(config({ display: "standard", useCodeLens: true })), true);
+  assert.equal(shouldShowCodeLens(config({ display: "inlayHint", useCodeLens: true })), false);
+  assert.equal(shouldShowPackageJsonDecorations(config()), true);
   assert.equal(shouldOfferImportCompletions(config()), true);
 });
