@@ -8,7 +8,9 @@ use crate::{
         cjs::{CjsGraphAnalysis, analyze_cjs_graph_with_runtime},
         compress::compress_all,
         fallback::{approximate_directory_size, estimate_minified_source, source_excerpt_detail},
-        graph::{ModuleGraph, ModuleId, build_module_graph_cached_with_runtime},
+        graph::{
+            MAX_MODULE_SOURCE_BYTES, ModuleGraph, ModuleId, build_module_graph_cached_with_runtime,
+        },
         minify::{minify_source, minify_source_with_markers, validate_source},
         reachability::{reachable_exports, requested_exports},
         resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
@@ -122,15 +124,26 @@ fn analyze_import_inner_resolved(
         )
     })?;
 
-    let max_size = 5 * 1024 * 1024;
-    if metadata.len() > max_size {
-        return Err(error_with_context(
-            "file_size_limit",
-            format!("file size {} exceeds 5MB limit", metadata.len()),
-            context,
-            request,
-            vec![format!("entry_path: {}", entry_path.display())],
-        ));
+    let entry_size = metadata.len() as usize;
+    if entry_size > MAX_MODULE_SOURCE_BYTES {
+        let entry_path_display = entry_path.display().to_string();
+        let mut result =
+            analyze_static_entry(context, request, entry_path, &side_effects_mode, is_cjs)?;
+        result.diagnostics.insert(
+            0,
+            ImportDiagnostic {
+                stage: "oversized_entry".to_owned(),
+                message: format!(
+                    "entry file exceeds {MAX_MODULE_SOURCE_BYTES} byte module source limit; skipped graph analysis and used static entry sizing"
+                ),
+                details: vec![format!("entry_path: {entry_path_display}")],
+            },
+        );
+        result.confidence_reasons.insert(
+            0,
+            "Entry exceeds module graph source limit; size is static entry fallback.".to_owned(),
+        );
+        return Ok(result);
     }
 
     let mut fallback_diagnostics = Vec::new();

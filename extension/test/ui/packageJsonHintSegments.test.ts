@@ -41,7 +41,7 @@ const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
   ...overrides,
 });
 
-test("packageJsonHintSegments uses red primary and green suffix for unavailable latest packages", () => {
+test("packageJsonHintSegments uses error primary and added-resource suffix for unavailable latest packages", () => {
   const parts = packageJsonDependencyHintParts(
     {
       name: "typescript",
@@ -55,19 +55,19 @@ test("packageJsonHintSegments uses red primary and green suffix for unavailable 
   assert.deepEqual(packageJsonHintSegments(parts, config()), [
     {
       contentText: " unavailable",
-      themeColorId: "charts.red",
+      themeColorId: "list.errorForeground",
       fontStyle: "normal",
       margin: "0 0 0 0.75rem",
     },
     {
       contentText: " · latest",
-      themeColorId: "charts.green",
-      fontStyle: "normal",
+      themeColorId: "gitDecoration.addedResourceForeground",
+      fontStyle: "italic",
     },
   ]);
 });
 
-test("packageJsonHintSegments uses muted size and amber update suffix", () => {
+test("packageJsonHintSegments uses muted size and modified-resource update suffix", () => {
   const parts = packageJsonDependencyHintParts(
     {
       name: "react",
@@ -88,8 +88,8 @@ test("packageJsonHintSegments uses muted size and amber update suffix", () => {
     },
     {
       contentText: " · update 19.0.0",
-      themeColorId: "charts.yellow",
-      fontStyle: "normal",
+      themeColorId: "gitDecoration.modifiedResourceForeground",
+      fontStyle: "italic",
     },
   ]);
 });

@@ -2058,7 +2058,7 @@ fn analyze_import_strips_comments_for_minified_estimate() {
 }
 
 #[test]
-fn analyze_import_rejects_files_over_size_limit() {
+fn analyze_import_falls_back_for_oversized_entries() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -2067,12 +2067,11 @@ fn analyze_import_rejects_files_over_size_limit() {
         "// this will be replaced",
     );
 
-    // Create a 6MB file
     let path = workspace
         .join("node_modules")
         .join("huge-pkg")
         .join("index.js");
-    let data = vec![b'a'; 6 * 1024 * 1024];
+    let data = vec![b'a'; 25 * 1024 * 1024];
     fs::write(&path, &data).expect("huge file should be written");
 
     let context = AnalysisContext {
@@ -2091,6 +2090,58 @@ fn analyze_import_rejects_files_over_size_limit() {
     let result = analyze_import(&context, &request);
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert!(result.error.is_some());
-    assert!(result.error.as_ref().unwrap().contains("exceeds 5MB limit"));
+    assert!(result.error.is_none(), "{result:?}");
+    assert_eq!(result.confidence, ConfidenceLevel::Low);
+    assert!(result.brotli_bytes > 0, "{result:?}");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "oversized_entry"),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_import_analyzes_typescript_scale_entries() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "large-pkg",
+        r#"{"version":"1.0.0","main":"index.js"}"#,
+        "// this will be replaced",
+    );
+
+    let path = workspace
+        .join("node_modules")
+        .join("large-pkg")
+        .join("index.js");
+    let data = vec![b'a'; 9 * 1024 * 1024];
+    fs::write(&path, &data).expect("large file should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("main.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "large-pkg".to_owned(),
+        package_name: "large-pkg".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec![],
+        import_kind: ImportKind::Namespace,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(result.error.is_none(), "{result:?}");
+    assert!(result.brotli_bytes > 0, "{result:?}");
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "oversized_entry"),
+        "{result:?}",
+    );
 }

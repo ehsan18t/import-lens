@@ -27,8 +27,8 @@ static GRAPH_CACHE: OnceLock<papaya::HashMap<(PathBuf, ImportRuntime), CachedMod
     OnceLock::new();
 
 pub const MAX_GRAPH_MODULES: usize = 2_000;
-pub const MAX_MODULE_SOURCE_BYTES: usize = 5 * 1024 * 1024;
-pub const MAX_GRAPH_SOURCE_BYTES: usize = 50 * 1024 * 1024;
+pub const MAX_MODULE_SOURCE_BYTES: usize = 20 * 1024 * 1024;
+pub const MAX_GRAPH_SOURCE_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct CachedModuleGraph {

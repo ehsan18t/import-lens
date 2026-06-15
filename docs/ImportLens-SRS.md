@@ -384,7 +384,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 **FR-018** (Critical) - The daemon must perform tree-shaking using a custom module graph walker built on OXC primitives. The pipeline is:
 1. Construct a virtual ESM entry module (as defined in FR-016).
 2. Resolve the package entry point via `oxc_resolver`.
-3. Recursively parse all reachable modules using `oxc_parser`, building the module graph. Graph construction must enforce hard limits of 2,000 modules, 5 MiB per module source file, and 50 MiB total graph source bytes.
+3. Recursively parse all reachable modules using `oxc_parser`, building the module graph. Graph construction must enforce hard limits of 2,000 modules, 20 MiB per module source file, and 100 MiB total graph source bytes.
 4. Run `oxc_semantic` on each parsed module to produce scope trees, symbol tables, and binding information.
 5. Walk the module graph from the virtual entry's requested exports, marking all transitively reachable code.
 6. Concatenate only the reachable code into a single in-memory source.
@@ -481,7 +481,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-036l** (Medium) - When `importLens.enableRegistryHints` is enabled, the extension may fetch npm metadata for registry-based hints. The setting must default to `true`; network work must use short timeouts, cache positive and negative results in VS Code globalState and session memory, and fail silently without affecting size computation.
 
-**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost end-of-line decorations for dependency blocks using local package resolution and prewarm-friendly daemon requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from a decoration refresh handler. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. Each dependency block should also expose a compact measured/total summary when analysis state is available. Inline decorations must use independent primary and suffix colors: primary text (size, `types only`, `checking...`, or `unavailable`) uses muted foreground except `unavailable`, which uses the same red confidence token; registry suffixes (`latest`, `update`, `install`) use green and amber confidence tokens respectively and may appear even when sizing is unavailable. Section summaries use muted foreground only.
+**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost end-of-line decorations for dependency blocks using local package resolution and prewarm-friendly daemon requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from a decoration refresh handler. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. Each dependency block should also expose a compact measured/total summary when analysis state is available. Inline decorations must use independent primary and suffix colors: primary text (size, `types only`, `checking...`, or `unavailable`) uses `descriptionForeground` except `unavailable`, which uses `list.errorForeground`; registry suffixes (`latest`, `update`, `install`) use `gitDecoration.addedResourceForeground` and `gitDecoration.modifiedResourceForeground` respectively, rendered in italic, and may appear even when sizing is unavailable. Section summaries use muted foreground only.
 
 **FR-036n** (Medium) - The extension must provide `ImportLens: Compare Imports`, allowing users to compare two package specifiers side by side using the same local daemon sizing path as normal import analysis.
 
@@ -557,6 +557,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 | redb database corrupted on startup                                  | Log the corruption, delete the corrupted database file, and create a fresh empty database. Continue operation using only the in-memory cache for the current session.                                                                                                       |
 | Requested named export missing from a package                       | Return a normal `ImportResult` when partial sizing can continue, include a `missing_export` diagnostic naming the export, and keep the raw diagnostic details in hover-copy output rather than inline UI.                                                                   |
 | Namespace import needs conservative fallback                        | Return the best available static size, include an OXC fallback diagnostic, and keep successful imports from the same batch intact.                                                                                                                                          |
+| Package entry file exceeds module graph source limit (20 MiB)       | Skip module graph analysis, use static entry sizing, mark the result as low confidence with a leading `~` on the inline size label, and expose an `oversized_entry` diagnostic in hover/report/copy output.                                                                  |
 | Unsupported native platform or missing daemon binary                | Log the missing runtime and enter degraded mode. Display `ImportLens: Unavailable` in the status bar.                                                                                                                                                                       |
 | Daemon binary hash mismatch (NFR-014a)                              | Refuse to spawn the daemon. Log a security warning to the ImportLens output channel at `error` level. Enter degraded mode and display `ImportLens: Unavailable`. Do not show a user-facing error dialog.                                                                    |
 | Daemon recycle loop detected (NFR-004b)                             | If more than 5 recycles occurred within any rolling 10-minute window (read from `importlens-recycles.json`), enter degraded mode, log a warning, and display `ImportLens: Unavailable`. Reset counter after a clean 30-minute session with no recycles.                     |
@@ -1094,9 +1095,9 @@ fn build_graph(entry_path, resolver) -> ModuleGraph:
     active_stack.insert(path)
 
     source = fs::read(path)
-    if source.byte_length > 5 MiB: fail("module source size limit exceeded")
+    if source.byte_length > 20 MiB: fail("module source size limit exceeded")
     total_source_bytes += source.byte_length
-    if total_source_bytes > 50 MiB: fail("graph source size limit exceeded")
+    if total_source_bytes > 100 MiB: fail("graph source size limit exceeded")
     ast = oxc_parser::parse(source)
     semantic = oxc_semantic::build(ast)
     imports = collect_static_imports(ast)

@@ -32,7 +32,7 @@ export const packageJsonHintSegments = (
   segments.push({
     contentText: ` · ${parts.suffix}`,
     themeColorId: suffixToneThemeColor(parts.suffixTone),
-    fontStyle: "normal",
+    fontStyle: "italic",
   });
 
   return segments;

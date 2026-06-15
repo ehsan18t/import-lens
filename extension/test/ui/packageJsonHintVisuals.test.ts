@@ -5,13 +5,13 @@ import {
   suffixToneThemeColor,
 } from "../../src/ui/packageJsonHintVisuals.js";
 
-test("primaryToneThemeColor maps unavailable to red and neutral to muted foreground", () => {
-  assert.equal(primaryToneThemeColor("unavailable"), "charts.red");
+test("primaryToneThemeColor maps unavailable to list error and neutral to muted foreground", () => {
+  assert.equal(primaryToneThemeColor("unavailable"), "list.errorForeground");
   assert.equal(primaryToneThemeColor("neutral"), "descriptionForeground");
 });
 
-test("suffixToneThemeColor maps registry statuses to green and amber", () => {
-  assert.equal(suffixToneThemeColor("latest"), "charts.green");
-  assert.equal(suffixToneThemeColor("update"), "charts.yellow");
-  assert.equal(suffixToneThemeColor("install"), "charts.yellow");
+test("suffixToneThemeColor maps registry statuses to git decoration tokens", () => {
+  assert.equal(suffixToneThemeColor("latest"), "gitDecoration.addedResourceForeground");
+  assert.equal(suffixToneThemeColor("update"), "gitDecoration.modifiedResourceForeground");
+  assert.equal(suffixToneThemeColor("install"), "gitDecoration.modifiedResourceForeground");
 });

@@ -4,7 +4,7 @@ export type PackageJsonSuffixTone = "latest" | "update" | "install";
 
 export const primaryToneThemeColor = (tone: PackageJsonPrimaryTone): string => {
   if (tone === "unavailable") {
-    return "charts.red";
+    return "list.errorForeground";
   }
 
   return "descriptionForeground";
@@ -12,8 +12,8 @@ export const primaryToneThemeColor = (tone: PackageJsonPrimaryTone): string => {
 
 export const suffixToneThemeColor = (tone: PackageJsonSuffixTone): string => {
   if (tone === "latest") {
-    return "charts.green";
+    return "gitDecoration.addedResourceForeground";
   }
 
-  return "charts.yellow";
+  return "gitDecoration.modifiedResourceForeground";
 };
