@@ -59,4 +59,8 @@ export class DaemonManager implements vscode.Disposable {
   dispose(): Promise<void> {
     return this.#transport.shutdown();
   }
+
+  restart(analysisRoot?: string): Promise<DaemonState> {
+    return this.dispose().then(() => this.start(analysisRoot));
+  }
 }
