@@ -46,6 +46,10 @@ export const changedLinesFromGitDiff = (diff: string): Set<number> => {
 };
 
 export const changedLinesForFile = async (fileName: string): Promise<Set<number>> => {
+  if (!await isGitRepository(fileName)) {
+    return new Set();
+  }
+
   try {
     const { stdout } = await execFileAsync(
       "git",
@@ -60,5 +64,22 @@ export const changedLinesForFile = async (fileName: string): Promise<Set<number>
     return changedLinesFromGitDiff(stdout);
   } catch {
     return new Set();
+  }
+};
+
+const isGitRepository = async (fileName: string): Promise<boolean> => {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", path.dirname(fileName), "rev-parse", "--is-inside-work-tree"],
+      {
+        encoding: "utf8",
+        timeout: 500,
+      },
+    );
+
+    return stdout.trim() === "true";
+  } catch {
+    return false;
   }
 };
