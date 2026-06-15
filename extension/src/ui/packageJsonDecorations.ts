@@ -5,25 +5,30 @@ import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
 import { getImportLensConfig } from "../config.js";
 import { shouldShowPackageJsonDecorations } from "./displayGuards.js";
 import {
-  packageJsonDependencyHintLabel,
+  packageJsonDependencyHintParts,
   packageJsonSectionSummaryLabel,
 } from "./packageJsonLabels.js";
 import { packageJsonDependencyTooltipMarkdown } from "./packageJsonTooltip.js";
 import { tooltipForMessage } from "./tooltip.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
+import { packageJsonDependencyHintAnchorCharacter } from "./packageJsonDecorationAnchor.js";
+import {
+  packageJsonHintDecorationGroups,
+  packageJsonSectionSummaryDecorationOptions,
+} from "./packageJsonDecorationSegments.js";
 
 export class PackageJsonDecorationController implements vscode.Disposable {
   readonly #analysis: PackageJsonAnalysisController;
-  readonly #decoration: vscode.TextEditorDecorationType;
+  readonly #primaryDecoration: vscode.TextEditorDecorationType;
+  readonly #suffixDecoration: vscode.TextEditorDecorationType;
   readonly #subscription: vscode.Disposable;
 
   constructor(analysis: PackageJsonAnalysisController) {
     this.#analysis = analysis;
-    this.#decoration = vscode.window.createTextEditorDecorationType({
-      after: {
-        margin: "0 0 0 0.75rem",
-        fontStyle: "italic",
-      },
+    this.#primaryDecoration = vscode.window.createTextEditorDecorationType({
+      rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+    });
+    this.#suffixDecoration = vscode.window.createTextEditorDecorationType({
       rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
     });
     this.#subscription = this.#analysis.onDidChange((uri) => this.refreshUri(uri));
@@ -51,49 +56,54 @@ export class PackageJsonDecorationController implements vscode.Disposable {
       || editor.document.uri.scheme !== "file"
       || !isPackageJsonPath(editor.document.fileName)
     ) {
-      editor.setDecorations(this.#decoration, []);
+      editor.setDecorations(this.#primaryDecoration, []);
+      editor.setDecorations(this.#suffixDecoration, []);
       return;
     }
 
     const states = this.#analysis.get(editor.document.uri);
     const sections = this.#analysis.sections(editor.document.uri);
-    const decorations = [
-      ...sections
-        .map((section) => this.decorationForSection(editor.document, section, states, config))
-        .filter((value): value is vscode.DecorationOptions => Boolean(value)),
-      ...states
-        .map((state) => this.decorationForState(editor.document, state, config))
-        .filter((value): value is vscode.DecorationOptions => Boolean(value)),
-    ];
+    const primaryDecorations: vscode.DecorationOptions[] = [];
+    const suffixDecorations: vscode.DecorationOptions[] = [];
 
-    editor.setDecorations(this.#decoration, decorations);
+    for (const section of sections) {
+      const option = this.decorationForSection(editor.document, section, states, config);
+
+      if (option) {
+        primaryDecorations.push(option);
+      }
+    }
+
+    for (const state of states) {
+      const groups = this.decorationGroupsForState(editor.document, state, config);
+      primaryDecorations.push(...groups.primary);
+      suffixDecorations.push(...groups.suffix);
+    }
+
+    editor.setDecorations(this.#primaryDecoration, primaryDecorations);
+    editor.setDecorations(this.#suffixDecoration, suffixDecorations);
   }
 
   dispose(): void {
     this.#subscription.dispose();
-    this.#decoration.dispose();
+    this.#primaryDecoration.dispose();
+    this.#suffixDecoration.dispose();
   }
 
-  private decorationForState(
+  private decorationGroupsForState(
     document: vscode.TextDocument,
     state: PackageJsonDependencyAnalysisState,
     config: ReturnType<typeof getImportLensConfig>,
-  ): vscode.DecorationOptions | null {
+  ): ReturnType<typeof packageJsonHintDecorationGroups> {
     const line = document.lineAt(state.entry.valueRange.end.line);
-    const position = line.range.end;
-    const label = packageJsonDependencyHintLabel(state, config);
+    const position = new vscode.Position(
+      line.lineNumber,
+      packageJsonDependencyHintAnchorCharacter(line.text),
+    );
+    const parts = packageJsonDependencyHintParts(state, config);
     const tooltip = tooltipForPackageJsonState(state);
 
-    return {
-      range: new vscode.Range(position, position),
-      hoverMessage: tooltip,
-      renderOptions: {
-        after: {
-          contentText: ` ${label}`,
-          fontStyle: "italic",
-        },
-      },
-    };
+    return packageJsonHintDecorationGroups(parts, position, config, tooltip);
   }
 
   private decorationForSection(
@@ -111,16 +121,11 @@ export class PackageJsonDecorationController implements vscode.Disposable {
     const line = document.lineAt(section.objectRange.start.line);
     const position = line.range.end;
 
-    return {
-      range: new vscode.Range(position, position),
-      hoverMessage: tooltipForMessage("ImportLens dependency summary", label),
-      renderOptions: {
-        after: {
-          contentText: ` ${label}`,
-          fontStyle: "italic",
-        },
-      },
-    };
+    return packageJsonSectionSummaryDecorationOptions(
+      label,
+      position,
+      tooltipForMessage("ImportLens dependency summary", label),
+    );
   }
 }
 

@@ -4,6 +4,8 @@ import type { ImportLensConfig } from "../../src/config.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
 import {
   packageJsonDependencyHintLabel,
+  packageJsonDependencyHintParts,
+  packageJsonDependencyVersionStatusLabel,
   packageJsonSectionSummaryLabel,
   type PackageJsonDependencyHintState,
 } from "../../src/ui/packageJsonLabels.js";
@@ -114,7 +116,7 @@ test("packageJsonDependencyHintLabel shows types only instead of zero-byte sizes
   );
 });
 
-test("packageJsonDependencyHintLabel marks latest releases published under twenty four hours ago", () => {
+test("packageJsonDependencyHintLabel omits sparkle from inline decorations", () => {
   assert.equal(
     packageJsonDependencyHintLabel(
       {
@@ -130,7 +132,41 @@ test("packageJsonDependencyHintLabel marks latest releases published under twent
       },
       config(),
     ),
-    "1.5 kB br · ✦ update 19.0.0",
+    "1.5 kB br · update 19.0.0",
+  );
+  assert.equal(
+    packageJsonDependencyVersionStatusLabel({
+      name: "react",
+      section: "dependencies",
+      status: "ready",
+      result: result(),
+      registryHint: {
+        latestVersion: "19.0.0",
+        isLatest: false,
+        latestPublishedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      },
+    }),
+    "✦ update 19.0.0",
+  );
+});
+
+test("packageJsonDependencyHintParts assigns independent primary and suffix tones", () => {
+  assert.deepEqual(
+    packageJsonDependencyHintParts(
+      {
+        name: "typescript",
+        section: "devDependencies",
+        status: "unavailable",
+        registryHint: { latestVersion: "5.9.3", isLatest: true },
+      },
+      config(),
+    ),
+    {
+      primary: "unavailable",
+      primaryTone: "unavailable",
+      suffix: "latest",
+      suffixTone: "latest",
+    },
   );
 });
 

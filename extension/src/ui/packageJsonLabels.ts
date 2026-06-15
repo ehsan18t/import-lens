@@ -3,11 +3,19 @@ import type { PackageJsonDependencySectionName } from "../guidance/packageJsonDe
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 import type { ImportResult } from "../ipc/protocol.js";
 import { formatBytes, type CompressionFormat } from "./format.js";
+import type { PackageJsonPrimaryTone, PackageJsonSuffixTone } from "./packageJsonHintVisuals.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
 export type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 
 const freshReleaseWindowMs = 24 * 60 * 60 * 1000;
+
+export interface PackageJsonHintParts {
+  readonly primary: string;
+  readonly primaryTone: PackageJsonPrimaryTone;
+  readonly suffix: string | null;
+  readonly suffixTone: PackageJsonSuffixTone | null;
+}
 
 export const isFreshLatestRelease = (
   registryHint: PackageJsonDependencyHintState["registryHint"],
@@ -24,40 +32,52 @@ export const isFreshLatestRelease = (
     && now - publishedAt < freshReleaseWindowMs;
 };
 
+export const packageJsonDependencyVersionStatusSuffix = (
+  state: PackageJsonDependencyHintState,
+): Pick<PackageJsonHintParts, "suffix" | "suffixTone"> => {
+  const { registryHint } = state;
+
+  if (!registryHint?.latestVersion) {
+    return { suffix: null, suffixTone: null };
+  }
+
+  if (state.status === "missing") {
+    return {
+      suffix: `install ${registryHint.latestVersion}`,
+      suffixTone: "install",
+    };
+  }
+
+  if (registryHint.isLatest === true) {
+    return { suffix: "latest", suffixTone: "latest" };
+  }
+
+  if (registryHint.isLatest === false) {
+    return {
+      suffix: `update ${registryHint.latestVersion}`,
+      suffixTone: "update",
+    };
+  }
+
+  return { suffix: null, suffixTone: null };
+};
+
 export const packageJsonDependencyVersionStatusLabel = (
   state: PackageJsonDependencyHintState,
   now: number = Date.now(),
 ): string | null => {
-  const { registryHint } = state;
+  const { suffix } = packageJsonDependencyVersionStatusSuffix(state);
 
-  if (!registryHint?.latestVersion) {
+  if (!suffix) {
     return null;
   }
 
-  let status: string | null = null;
-
-  if (state.status === "missing") {
-    status = `install ${registryHint.latestVersion}`;
-  } else if (registryHint.isLatest === true) {
-    status = "latest";
-  } else if (registryHint.isLatest === false) {
-    status = `update ${registryHint.latestVersion}`;
+  if (state.status === "missing" || !state.registryHint || !isFreshLatestRelease(state.registryHint, now)) {
+    return suffix;
   }
 
-  if (!status) {
-    return null;
-  }
-
-  return isFreshLatestRelease(registryHint, now) ? `✦ ${status}` : status;
+  return `✦ ${suffix}`;
 };
-
-const packageJsonDependencyLabel = (
-  primary: string,
-  state: PackageJsonDependencyHintState,
-): string =>
-  [primary, packageJsonDependencyVersionStatusLabel(state)]
-    .filter((part): part is string => Boolean(part))
-    .join(" · ");
 
 const selectedCompressionBytes = (
   result: ImportResult,
@@ -86,30 +106,60 @@ const selectedCompressionLabel = (compression: CompressionFormat): string => {
   return "br";
 };
 
-export const packageJsonDependencyHintLabel = (
+export const packageJsonDependencyHintParts = (
   state: PackageJsonDependencyHintState,
   config: ImportLensConfig,
-): string => {
+): PackageJsonHintParts => {
   if (state.status === "loading") {
-    return packageJsonDependencyLabel("checking...", state);
+    return {
+      primary: "checking...",
+      primaryTone: "neutral",
+      suffix: null,
+      suffixTone: null,
+    };
   }
 
   if (state.status === "missing") {
-    return packageJsonDependencyLabel("not installed", state);
+    return {
+      primary: "not installed",
+      primaryTone: "neutral",
+      ...packageJsonDependencyVersionStatusSuffix(state),
+    };
   }
 
   if (state.status === "unavailable" || !state.result || state.result.error) {
-    return packageJsonDependencyLabel("unavailable", state);
+    return {
+      primary: "unavailable",
+      primaryTone: "unavailable",
+      ...packageJsonDependencyVersionStatusSuffix(state),
+    };
   }
 
   if (isTypesOnlyResult(state.result)) {
-    return packageJsonDependencyLabel("types only", state);
+    return {
+      primary: "types only",
+      primaryTone: "neutral",
+      ...packageJsonDependencyVersionStatusSuffix(state),
+    };
   }
 
   const confidencePrefix = state.result.confidence === "low" ? "~" : "";
   const primary = `${confidencePrefix}${formatBytes(selectedCompressionBytes(state.result, config.compression))} ${selectedCompressionLabel(config.compression)}`;
 
-  return packageJsonDependencyLabel(primary, state);
+  return {
+    primary,
+    primaryTone: "neutral",
+    ...packageJsonDependencyVersionStatusSuffix(state),
+  };
+};
+
+export const packageJsonDependencyHintLabel = (
+  state: PackageJsonDependencyHintState,
+  config: ImportLensConfig,
+): string => {
+  const parts = packageJsonDependencyHintParts(state, config);
+
+  return [parts.primary, parts.suffix].filter((part): part is string => Boolean(part)).join(" · ");
 };
 
 export const packageJsonSectionSummaryLabel = (
