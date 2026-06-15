@@ -25,6 +25,32 @@ const document = (languageId: string, scheme = "file") => ({
   },
 });
 
+test("refreshVisibleImportLensDocuments uiOnly refresh does not schedule re-analysis", () => {
+  const scheduled: string[] = [];
+  let reapplyInsights = 0;
+
+  refreshVisibleImportLensDocuments(
+    [document("typescript"), document("javascriptreact")],
+    config(true),
+    {
+      schedule: (doc) => scheduled.push(doc.uri.toString()),
+      clear: () => undefined,
+      refreshDecorations: () => undefined,
+      refreshBudgetDiagnostics: () => undefined,
+      refreshInlayHints: () => undefined,
+      refreshCodeLens: () => undefined,
+      refreshPackageJsonHints: () => undefined,
+      reapplyInsights: () => {
+        reapplyInsights += 1;
+      },
+    },
+    "uiOnly",
+  );
+
+  assert.deepEqual(scheduled, []);
+  assert.equal(reapplyInsights, 1);
+});
+
 test("refreshVisibleImportLensDocuments reanalyzes supported visible file documents when enabled", () => {
   const scheduled: string[] = [];
   const cleared: string[] = [];
