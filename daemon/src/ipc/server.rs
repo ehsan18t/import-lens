@@ -94,7 +94,13 @@ where
         let read = tokio::select! {
             read = stream.read(&mut buffer) => read?,
             _ = tokio::time::sleep(LIFECYCLE_CHECK_INTERVAL) => {
-                if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                if recycle_if_needed(
+                    &lifecycle,
+                    service.cache_len(),
+                    storage_path.as_deref(),
+                    &prefetcher,
+                    &service,
+                ) {
                     return Ok(());
                 }
                 continue;
@@ -131,7 +137,13 @@ where
                         hello_workspace_root,
                     );
 
-                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                    if recycle_if_needed(
+                        &lifecycle,
+                        service.cache_len(),
+                        storage_path.as_deref(),
+                        &prefetcher,
+                        &service,
+                    ) {
                         return Ok(());
                     }
                 }
@@ -162,7 +174,13 @@ where
                         stream.write_all(&encode_frame(&response)?).await?;
                     }
 
-                    if recycle_if_needed(&lifecycle, service.cache_len(), storage_path.as_deref()) {
+                    if recycle_if_needed(
+                        &lifecycle,
+                        service.cache_len(),
+                        storage_path.as_deref(),
+                        &prefetcher,
+                        &service,
+                    ) {
                         return Ok(());
                     }
                 }
@@ -273,10 +291,18 @@ fn recycle_if_needed(
     lifecycle: &LifecycleState,
     cache_len: usize,
     storage_path: Option<&Path>,
+    prefetcher: &Prefetcher,
+    service: &ImportLensService,
 ) -> bool {
     let Some(reason) = lifecycle.should_recycle(Instant::now(), cache_len) else {
         return false;
     };
+
+    prefetcher.cancel();
+
+    if let Err(error) = service.flush_cache() {
+        eprintln!("[import-lens-daemon] failed to flush cache before recycle: {error}");
+    }
 
     if let Some(storage_path) = storage_path
         && let Err(error) = record_recycle_timestamp(storage_path, SystemTime::now())

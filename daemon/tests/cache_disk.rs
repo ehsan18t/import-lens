@@ -380,3 +380,21 @@ fn disk_cache_tracks_recent_entries_for_startup_prewarm() {
 
     fs::remove_dir_all(storage_path).expect("temp storage should be removed");
 }
+
+#[test]
+fn flush_to_disk_persists_memory_entries_for_reload() {
+    let storage_path = temp_storage();
+    let key = "react@18.3.1::default".to_owned();
+
+    {
+        let cache = ImportCache::new(Some(storage_path.clone()), true);
+        cache.insert(key.clone(), result("react"));
+        cache.flush_to_disk().expect("flush should succeed");
+    }
+
+    let reloaded = ImportCache::new(Some(storage_path.clone()), true);
+
+    assert!(reloaded.get(&key).is_some());
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}

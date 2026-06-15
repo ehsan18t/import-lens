@@ -92,7 +92,14 @@ impl ImportCache {
             result,
             dependency_fingerprints,
         };
-        self.disk.insert(&key, &cached);
+
+        if let Err(error) = self.disk.insert(&key, &cached) {
+            eprintln!(
+                "[import-lens-daemon] cache warning: skipping memory insert for {key}: {error}"
+            );
+            return;
+        }
+
         self.memory.pin().insert(key, cached);
     }
 
@@ -126,5 +133,22 @@ impl ImportCache {
 
     pub fn pending_recency_touch_count(&self) -> usize {
         self.disk.pending_touch_len()
+    }
+
+    pub fn flush_to_disk(&self) -> Result<(), String> {
+        let entries = {
+            let memory = self.memory.pin();
+            memory
+                .iter()
+                .map(|(key, cached)| (key.clone(), cached.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        for (key, cached) in entries {
+            self.disk.insert(&key, &cached)?;
+        }
+
+        self.disk.flush_pending_touches();
+        Ok(())
     }
 }

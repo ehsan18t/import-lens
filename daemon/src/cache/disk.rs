@@ -99,31 +99,44 @@ impl DiskCache {
         Some(cached)
     }
 
-    pub fn insert(&self, key: &str, cached: &CachedImport) {
+    pub fn insert(&self, key: &str, cached: &CachedImport) -> Result<(), String> {
         let db = match self.db.as_ref() {
             Some(db) => db,
-            None => return,
+            None => return Ok(()),
         };
 
         let mut persisted = cached.clone();
         persisted.result.cache_hit = false;
 
         let envelope = cache_envelope(key, persisted);
-        let bytes = match rmp_serde::to_vec(&envelope) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
+        let bytes = rmp_serde::to_vec(&envelope)
+            .map_err(|error| format!("failed to serialize cache entry: {error}"))?;
 
-        if let Ok(write_txn) = db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
-                let _ = table.insert(key, bytes.as_slice());
-            }
-            if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
-                let _ = recents.insert(key, unix_millis_now());
-            }
-            let _ = write_txn.commit();
+        let write_txn = db
+            .begin_write()
+            .map_err(|error| format!("failed to begin cache write: {error}"))?;
+
+        {
+            let mut table = write_txn
+                .open_table(CACHE_TABLE)
+                .map_err(|error| format!("failed to open cache table: {error}"))?;
+            table
+                .insert(key, bytes.as_slice())
+                .map_err(|error| format!("failed to insert cache entry: {error}"))?;
+
+            let mut recents = write_txn
+                .open_table(RECENTS_TABLE)
+                .map_err(|error| format!("failed to open recents table: {error}"))?;
+            recents
+                .insert(key, unix_millis_now())
+                .map_err(|error| format!("failed to update recents table: {error}"))?;
         }
+
+        write_txn
+            .commit()
+            .map_err(|error| format!("failed to commit cache write: {error}"))?;
         self.remove_pending_touch(key);
+        Ok(())
     }
 
     pub fn touch(&self, key: &str) {

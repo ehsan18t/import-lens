@@ -237,6 +237,10 @@ impl ImportLensService {
         self.cache.recent_keys(limit)
     }
 
+    pub fn flush_cache(&self) -> Result<(), String> {
+        self.cache.flush_to_disk()
+    }
+
     pub fn prewarm_import<F>(
         &self,
         context: &AnalysisContext,
