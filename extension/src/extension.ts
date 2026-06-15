@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
+import { applyImportAnalysisInsights } from "./analysis/insights.js";
+import { importCostHistoryKey, type ImportCostHistoryItem } from "./analysis/history.js";
 import { AnalysisStore } from "./analysis/state.js";
-import { refreshVisibleImportLensDocuments } from "./configRefresh.js";
+import { classifyImportLensConfigChange } from "./configChange.js";
+import { refreshVisibleImportLensDocuments, type ConfigRefreshMode } from "./configRefresh.js";
 import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
 import { PackageJsonAnalysisController } from "./guidance/packageJsonAnalysis.js";
@@ -12,6 +15,7 @@ import { registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
 import { prewarmPackageJsonDocuments } from "./prewarm/packageJsonHelpers.js";
 import { BudgetDiagnosticsController } from "./ui/budgetDiagnostics.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
+import { syncCodeLensRegistration } from "./ui/codeLensRegistration.js";
 import { compareImports, compareImportsCommand } from "./ui/compareImports.js";
 import { ImportMemberCompletionProvider } from "./ui/completions.js";
 import { DecorationController } from "./ui/decorations.js";
@@ -20,7 +24,7 @@ import { ImportLensHoverProvider } from "./ui/hoverProvider.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import { showNamedExportCandidates, showNamedExportCandidatesCommand } from "./ui/namedExportCandidates.js";
-import { PackageJsonDependencyInlayHintsProvider, packageJsonDocumentSelector } from "./ui/packageJsonInlayHints.js";
+import { PackageJsonDecorationController } from "./ui/packageJsonDecorations.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
@@ -59,20 +63,54 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 
   daemon = new DaemonManager(context, logger);
   const packageJsonAnalysis = new PackageJsonAnalysisController(context, daemon, logger);
-  const packageJsonInlayHints = new PackageJsonDependencyInlayHintsProvider(packageJsonAnalysis);
+  const packageJsonDecorations = new PackageJsonDecorationController(packageJsonAnalysis);
   const completions = new ImportMemberCompletionProvider(daemon);
-  context.subscriptions.push(logger, store, statusBar, decorations, budgetDiagnostics, inlayHints, codeLens, packageJsonAnalysis, packageJsonInlayHints, daemon);
+  let codeLensRegistration = syncCodeLensRegistration(config, codeLens, context, undefined);
+
+  context.subscriptions.push(
+    logger,
+    store,
+    statusBar,
+    decorations,
+    budgetDiagnostics,
+    inlayHints,
+    codeLens,
+    packageJsonAnalysis,
+    packageJsonDecorations,
+    daemon,
+  );
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(languageSelector, inlayHints));
-  context.subscriptions.push(vscode.languages.registerInlayHintsProvider(packageJsonDocumentSelector, packageJsonInlayHints));
   context.subscriptions.push(vscode.languages.registerHoverProvider(languageSelector, hoverProvider));
-  context.subscriptions.push(vscode.languages.registerCodeLensProvider(languageSelector, codeLens));
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider(languageSelector, completions, "{", ","));
   context.subscriptions.push(vscode.languages.registerCodeActionsProvider(languageSelector, treeShakeActions));
 
   const analysis = new DocumentAnalysisController(context, store, daemon, logger, statusBar);
   context.subscriptions.push(analysis);
 
-  const refreshVisibleDocuments = (nextConfig: ImportLensConfig): void => {
+  const reapplyInsightsForVisibleDocuments = (): void => {
+    const nextConfig = getImportLensConfig();
+    const history = context.globalState.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
+
+    for (const editor of vscode.window.visibleTextEditors) {
+      const states = store.get(editor.document.uri);
+
+      if (states.length === 0) {
+        continue;
+      }
+
+      store.set(
+        editor.document.uri,
+        applyImportAnalysisInsights(states, {
+          importCostHistory: history,
+          budgets: nextConfig.budgets,
+        }),
+      );
+    }
+  };
+
+  const refreshVisibleDocuments = (nextConfig: ImportLensConfig, mode: ConfigRefreshMode = "reanalyze"): void => {
+    codeLensRegistration = syncCodeLensRegistration(nextConfig, codeLens, context, codeLensRegistration);
+
     refreshVisibleImportLensDocuments(
       vscode.window.visibleTextEditors.map((editor) => editor.document),
       nextConfig,
@@ -85,10 +123,22 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         refreshCodeLens: () => codeLens.refresh(),
         refreshPackageJsonHints: () => {
           packageJsonAnalysis.refreshVisibleDocuments();
-          packageJsonInlayHints.refresh();
+          packageJsonDecorations.refreshVisibleEditors();
         },
+        reapplyInsights: reapplyInsightsForVisibleDocuments,
       },
+      mode,
     );
+  };
+
+  const restartDaemonAndRefresh = async (): Promise<void> => {
+    if (!daemon) {
+      return;
+    }
+
+    const state = await daemon.restart();
+    statusBar.setStatus(state === "ready" ? "ready" : "unavailable");
+    refreshVisibleDocuments(getImportLensConfig(), "reanalyze");
   };
 
   context.subscriptions.push(
@@ -143,12 +193,19 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
 
       const nextConfig = getImportLensConfig();
       logger.setLevel(nextConfig.logLevel);
-      logger.info("ImportLens configuration changed; refreshing visible documents.");
-      refreshVisibleDocuments(nextConfig);
+      const changeKind = classifyImportLensConfigChange(event);
+      logger.info(`ImportLens configuration changed (${changeKind}); refreshing visible documents.`);
+
+      if (changeKind === "daemonRestart") {
+        void restartDaemonAndRefresh();
+        return;
+      }
+
+      refreshVisibleDocuments(nextConfig, changeKind === "reanalyze" ? "reanalyze" : "uiOnly");
     }),
   );
 
-  registerNodeModulesWatchers(context, daemon, () => refreshVisibleDocuments(getImportLensConfig()));
+  registerNodeModulesWatchers(context, daemon, () => refreshVisibleDocuments(getImportLensConfig(), "reanalyze"));
   registerPackageJsonPrewarm(context, daemon);
   context.subscriptions.push(daemon.onDidChangeState((nextState) => {
     statusBar.setStatus(nextState === "ready" ? "ready" : "unavailable");
@@ -163,7 +220,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     }
 
     packageJsonAnalysis.refreshVisibleDocuments();
-    packageJsonInlayHints.refresh();
+    packageJsonDecorations.refreshVisibleEditors();
   }));
   const state = await daemon.start();
   logger.info(`ImportLens daemon startup completed with state: ${state}.`);

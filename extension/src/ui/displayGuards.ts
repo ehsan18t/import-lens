@@ -21,3 +21,6 @@ export const shouldShowCodeLens = (config: ImportLensConfig): boolean =>
 
 export const shouldOfferImportCompletions = (config: ImportLensConfig): boolean =>
   config.enabled;
+
+export const shouldShowPackageJsonDecorations = (config: ImportLensConfig): boolean =>
+  config.enabled;
