@@ -64,3 +64,18 @@ export const resolveInstalledPackage = async (specifier: string, activeDocumentP
 
   return { ok: false, packageName, reason: "package_not_found" };
 };
+
+export const resolveInstalledPackagesByName = async (
+  specifiers: readonly string[],
+  activeDocumentPath: string,
+): Promise<Map<string, PackageResolution>> => {
+  const packageNames = [...new Set(specifiers.map((specifier) => getPackageName(specifier)))];
+  const entries = await Promise.all(
+    packageNames.map(async (packageName) => {
+      const resolution = await resolveInstalledPackage(packageName, activeDocumentPath);
+      return [packageName, resolution] as const;
+    }),
+  );
+
+  return new Map(entries);
+};

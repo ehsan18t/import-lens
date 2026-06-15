@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { resolveInstalledPackage } from "../../src/imports/resolver.js";
+import { resolveInstalledPackage, resolveInstalledPackagesByName } from "../../src/imports/resolver.js";
 
 test("resolveInstalledPackage reads the nearest package version from node_modules", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "import-lens-resolver-"));
@@ -101,6 +101,27 @@ test("resolveInstalledPackage keeps versionless package manifest requestable for
       packageRoot: packageDir,
       version: "unknown",
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveInstalledPackagesByName memoizes duplicate package names", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "import-lens-resolver-"));
+
+  try {
+    const packageDir = path.join(root, "node_modules", "lodash-es");
+    await mkdir(packageDir, { recursive: true });
+    await writeFile(path.join(packageDir, "package.json"), JSON.stringify({ version: "4.17.21" }), "utf8");
+
+    const results = await resolveInstalledPackagesByName(
+      ["lodash-es/debounce", "lodash-es/map", "react"],
+      path.join(root, "src", "index.ts"),
+    );
+
+    assert.equal(results.size, 2);
+    assert.equal(results.get("lodash-es")?.ok, true);
+    assert.equal(results.get("react")?.ok, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

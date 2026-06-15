@@ -2,7 +2,8 @@ import path from "node:path";
 import { createImportRequest } from "../analysis/request.js";
 import { loadImportLensIgnore, shouldIgnoreImport } from "../imports/ignore.js";
 import { extractRuntimeImports } from "../imports/parser.js";
-import { resolveInstalledPackage } from "../imports/resolver.js";
+import { getPackageName } from "../imports/specifier.js";
+import { resolveInstalledPackagesByName } from "../imports/resolver.js";
 import type { DetectedImport } from "../imports/types.js";
 import type { BatchRequest, BatchResponse, ImportRequest } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
@@ -96,9 +97,15 @@ const scanWorkspaceUri = async (
     return [];
   }
 
+  const packageResolutions = await resolveInstalledPackagesByName(
+    detectedImports.map((detected) => detected.specifier),
+    document.fileName,
+  );
+
   for (const detected of detectedImports) {
     try {
-      const resolution = await resolveInstalledPackage(detected.specifier, document.fileName);
+      const resolution = packageResolutions.get(getPackageName(detected.specifier))
+        ?? { ok: false as const, packageName: getPackageName(detected.specifier), reason: "package_not_found" as const };
 
       if (!resolution.ok) {
         scannedImports.push({
