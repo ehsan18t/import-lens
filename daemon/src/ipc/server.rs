@@ -7,6 +7,7 @@ use crate::{
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
+    logging::{self, parse_log_level, set_log_level},
     prefetch::Prefetcher,
     service::{
         ImportLensService, protocol_error_batch_response, protocol_error_exports_response,
@@ -69,7 +70,10 @@ pub async fn run_server(
     .await;
 
     if let Err(error) = std::fs::remove_file(pipe_name) {
-        eprintln!("[import-lens-daemon] failed to remove IPC socket {pipe_name}: {error}");
+        logging::log_warn(
+            "ipc",
+            format!("failed to remove IPC socket {pipe_name}: {error}"),
+        );
     }
 
     result
@@ -117,12 +121,21 @@ where
             match message {
                 ClientMessage::Hello(hello) => {
                     if !is_supported_hello_version(hello.version) {
-                        eprintln!(
-                            "[import-lens-daemon] unsupported hello protocol version {}",
-                            hello.version
+                        logging::log_warn(
+                            "ipc",
+                            format!("unsupported hello protocol version {}", hello.version),
                         );
                         return Ok(());
                     }
+
+                    set_log_level(parse_log_level(&hello.log_level));
+                    logging::log_info(
+                        "ipc",
+                        format!(
+                            "hello accepted (protocol v{}, disk_cache={})",
+                            hello.version, hello.enable_disk_cache
+                        ),
+                    );
 
                     let hello_storage_path = PathBuf::from(&hello.storage_path);
                     let hello_workspace_root = PathBuf::from(&hello.workspace_root);
@@ -301,16 +314,22 @@ fn recycle_if_needed(
     prefetcher.cancel();
 
     if let Err(error) = service.flush_cache() {
-        eprintln!("[import-lens-daemon] failed to flush cache before recycle: {error}");
+        logging::log_warn(
+            "lifecycle",
+            format!("failed to flush cache before recycle: {error}"),
+        );
     }
 
     if let Some(storage_path) = storage_path
         && let Err(error) = record_recycle_timestamp(storage_path, SystemTime::now())
     {
-        eprintln!("[import-lens-daemon] failed to record recycle timestamp: {error}");
+        logging::log_warn(
+            "lifecycle",
+            format!("failed to record recycle timestamp: {error}"),
+        );
     }
 
-    eprintln!("[import-lens-daemon] lifecycle recycle requested: {reason:?}");
+    logging::log_info("lifecycle", format!("recycle requested: {reason:?}"));
     true
 }
 

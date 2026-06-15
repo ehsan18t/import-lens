@@ -73,7 +73,7 @@ test("ImportResultLogTracker deduplicates partial and final warning/debug logs",
     warn: (message: string) => warnings.push(message),
     debug: (message: string) => debug.push(message),
   };
-  const tracker = new ImportResultLogTracker(logger);
+  const tracker = new ImportResultLogTracker(logger, 7);
   const failed = result({
     raw_bytes: 0,
     minified_bytes: 0,

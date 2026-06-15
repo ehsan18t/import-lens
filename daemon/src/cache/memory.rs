@@ -94,8 +94,9 @@ impl ImportCache {
         };
 
         if let Err(error) = self.disk.insert(&key, &cached) {
-            eprintln!(
-                "[import-lens-daemon] cache warning: skipping memory insert for {key}: {error}"
+            crate::logging::log_warn(
+                "cache",
+                format!("skipping memory insert for {key}: {error}"),
             );
             return;
         }

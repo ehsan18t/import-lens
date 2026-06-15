@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
+import type { Logger } from "../logging/types.js";
 import { buildReportRows, buildReportSummary } from "../report/reportModel.js";
 import { buildWorkspaceReportItems, type WorkspaceScannerApi } from "../report/workspaceScanner.js";
 import { confidenceCssColor, confidenceVisualFor } from "./confidenceVisuals.js";
@@ -9,14 +10,25 @@ import { formatBytes } from "./format.js";
 export const showReport = async (
   context: vscode.ExtensionContext,
   daemon: DaemonManager,
+  logger: Pick<Logger, "info" | "warn">,
 ): Promise<void> => {
-  const items = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Building workspace report",
-    },
-    () => buildWorkspaceReportItems(workspaceScannerApi(), daemon),
-  );
+  logger.info("Building workspace report.");
+  let items;
+
+  try {
+    items = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "ImportLens: Building workspace report",
+      },
+      () => buildWorkspaceReportItems(workspaceScannerApi(), daemon),
+    );
+  } catch (error) {
+    logger.warn(`Workspace report failed: ${error instanceof Error ? error.message : String(error)}`);
+    throw error;
+  }
+
+  logger.info(`Workspace report built with ${items.length} import item(s).`);
   const config = getImportLensConfig();
   const reportRows = buildReportRows(items, config.budgets);
   const summary = buildReportSummary(reportRows);

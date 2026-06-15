@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   cleanupFailedDaemonStartup,
   pipeDaemonProcessLogs,
+  routeDaemonLogLine,
   terminateProcess,
 } from "../../src/daemon/processLifecycle.js";
 
@@ -68,7 +69,43 @@ test("terminateProcess does not kill an already exited process", async () => {
   assert.equal(killed, 0);
 });
 
-test("pipeDaemonProcessLogs forwards daemon stderr through the extension logger", async () => {
+test("routeDaemonLogLine routes structured daemon lines by level", () => {
+  const messages: string[] = [];
+  const logger = {
+    error: (message: string) => messages.push(`error:${message}`),
+    warn: (message: string) => messages.push(`warn:${message}`),
+    info: (message: string) => messages.push(`info:${message}`),
+    debug: (message: string) => messages.push(`debug:${message}`),
+  };
+
+  routeDaemonLogLine(
+    "[import-lens-daemon] 2026-06-15T12:00:00.000Z [WARN] [cache] flush failed",
+    logger,
+    "stderr",
+  );
+
+  assert.deepEqual(messages, ["warn:[cache] flush failed"]);
+});
+
+test("routeDaemonLogLine falls back to stream defaults for unstructured lines", () => {
+  const messages: string[] = [];
+  const logger = {
+    error: (message: string) => messages.push(`error:${message}`),
+    warn: (message: string) => messages.push(`warn:${message}`),
+    info: (message: string) => messages.push(`info:${message}`),
+    debug: (message: string) => messages.push(`debug:${message}`),
+  };
+
+  routeDaemonLogLine("startup ready", logger, "stdout");
+  routeDaemonLogLine("resolver failed", logger, "stderr");
+
+  assert.deepEqual(messages, [
+    "info:startup ready",
+    "warn:resolver failed",
+  ]);
+});
+
+test("pipeDaemonProcessLogs forwards daemon streams through routeDaemonLogLine", async () => {
   const stdout = new PassThrough();
   const stderr = new PassThrough();
   const messages: string[] = [];
@@ -76,17 +113,19 @@ test("pipeDaemonProcessLogs forwards daemon stderr through the extension logger"
   pipeDaemonProcessLogs(
     { stdout, stderr },
     {
-      info: (message: string) => messages.push(`info:${message}`),
+      error: (message: string) => messages.push(`error:${message}`),
       warn: (message: string) => messages.push(`warn:${message}`),
+      info: (message: string) => messages.push(`info:${message}`),
+      debug: (message: string) => messages.push(`debug:${message}`),
     },
   );
 
-  stdout.write("startup ready\n");
-  stderr.write("resolver failed\n");
+  stdout.write("[import-lens-daemon] 2026-06-15T12:00:00.000Z [INFO] daemon ready\n");
+  stderr.write("[import-lens-daemon] 2026-06-15T12:00:00.000Z [WARN] [ipc] resolver failed\n");
   await delay(0);
 
   assert.deepEqual(messages, [
-    "info:[daemon:stdout] startup ready",
-    "warn:[daemon:stderr] resolver failed",
+    "info:daemon ready",
+    "warn:[ipc] resolver failed",
   ]);
 });

@@ -9,7 +9,13 @@ import type {
   FileSizeRequest,
   FileSizeResponse,
 } from "./protocol.js";
+import type { Logger } from "../logging/types.js";
 import { FrameDecoder, encodeFrame } from "./codec.js";
+
+export interface IpcClientConnectOptions {
+  timeoutMs?: number;
+  logger?: Pick<Logger, "debug" | "warn">;
+}
 
 interface PendingBatchRequest {
   resolve: (response: BatchResponse) => void;
@@ -33,18 +39,22 @@ export class IpcClient extends EventEmitter {
   readonly #batchPending = new Map<number, PendingBatchRequest>();
   readonly #exportsPending = new Map<number, PendingExportsRequest>();
   readonly #fileSizePending = new Map<number, PendingFileSizeRequest>();
+  readonly #logger?: Pick<Logger, "debug" | "warn">;
   #closed = false;
   #disposed = false;
 
-  private constructor(socket: net.Socket) {
+  private constructor(socket: net.Socket, logger?: Pick<Logger, "debug" | "warn">) {
     super();
     this.#socket = socket;
+    this.#logger = logger;
     this.#socket.on("data", (chunk: Buffer) => this.#handleData(chunk));
     this.#socket.on("close", () => this.#handleClose(new Error("IPC socket closed")));
     this.#socket.on("error", (error) => this.#handleClose(error));
   }
 
-  static connect(pipeName: string, timeoutMs = 2000): Promise<IpcClient> {
+  static connect(pipeName: string, options: IpcClientConnectOptions = {}): Promise<IpcClient> {
+    const timeoutMs = options.timeoutMs ?? 2000;
+    const logger = options.logger;
     const startedAt = Date.now();
 
     return new Promise((resolve, reject) => {
@@ -54,7 +64,8 @@ export class IpcClient extends EventEmitter {
 
         socket.once("connect", () => {
           settled = true;
-          resolve(new IpcClient(socket));
+          logger?.debug(`IPC connected to ${pipeName}.`);
+          resolve(new IpcClient(socket, logger));
         });
         socket.once("error", (error) => {
           socket.destroy();
@@ -64,6 +75,7 @@ export class IpcClient extends EventEmitter {
           }
 
           if (Date.now() - startedAt >= timeoutMs) {
+            logger?.warn(`IPC connect timed out after ${timeoutMs}ms: ${error.message}`);
             reject(error);
             return;
           }
@@ -172,7 +184,13 @@ export class IpcClient extends EventEmitter {
     try {
       messages = this.#decoder.push(chunk);
     } catch (error) {
-      this.#handleClose(error instanceof Error ? error : new Error(String(error)));
+      const normalized = error instanceof Error ? error : new Error(String(error));
+
+      if (normalized.message.includes("too large")) {
+        this.#logger?.warn(normalized.message);
+      }
+
+      this.#handleClose(normalized);
       return;
     }
 
@@ -245,6 +263,7 @@ export class IpcClient extends EventEmitter {
     this.#fileSizePending.clear();
 
     if (emitDisconnect && !this.#disposed) {
+      this.#logger?.warn(`IPC disconnected: ${error.message}`);
       this.emit("disconnect", error);
     }
   }

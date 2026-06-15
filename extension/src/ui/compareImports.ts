@@ -7,12 +7,14 @@ import type { DetectedImport } from "../imports/types.js";
 import { protocolVersion, type ImportRequest } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import { analysisRootForFile } from "../workspaceContext.js";
+import type { Logger } from "../logging/types.js";
 import { compareImportItemsForResponse } from "./compareImportItems.js";
 
 export const compareImportsCommand = "importLens.compareImports";
 
 export const compareImports = async (
   daemon: DaemonManager,
+  logger: Pick<Logger, "debug" | "warn">,
   initialSpecifier?: string,
 ): Promise<void> => {
   const editor = vscode.window.activeTextEditor;
@@ -61,6 +63,8 @@ export const compareImports = async (
     return;
   }
 
+  logger.debug(`Comparing ${imports.length} import(s): ${specifiers.join(", ")}.`);
+
   let response: Awaited<ReturnType<DaemonManager["sendBatch"]>>;
 
   try {
@@ -71,7 +75,8 @@ export const compareImports = async (
       active_document_path: editor.document.fileName,
       imports,
     });
-  } catch {
+  } catch (error) {
+    logger.warn(`Import comparison failed: ${error instanceof Error ? error.message : String(error)}`);
     await vscode.window.showWarningMessage("ImportLens import comparison failed.");
     return;
   }

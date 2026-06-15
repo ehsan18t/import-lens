@@ -2,11 +2,13 @@ import path from "node:path";
 import * as vscode from "vscode";
 import type { DaemonManager } from "./daemon/manager.js";
 import { getPackageName } from "./imports/specifier.js";
+import type { Logger } from "./logging/types.js";
 import { flushNodeModulesInvalidations } from "./watcherActions.js";
 
 export const registerNodeModulesWatchers = (
   context: vscode.ExtensionContext,
   daemon: DaemonManager,
+  logger: Pick<Logger, "info">,
   onInvalidated?: () => void,
 ): void => {
   const pending = new Set<string>();
@@ -15,13 +17,14 @@ export const registerNodeModulesWatchers = (
   const flush = (): void => {
     const packages = [...pending];
     pending.clear();
-    flushNodeModulesInvalidations(packages, daemon, onInvalidated);
+    flushNodeModulesInvalidations(packages, daemon, onInvalidated, logger);
   };
 
   const queue = (uri: vscode.Uri): void => {
     const packageName = packageNameFromPackageJsonPath(uri.fsPath);
 
     if (!packageName) {
+      logger.info("node_modules package.json changed outside a package path; invalidating entire cache.");
       daemon.invalidateAll();
       onInvalidated?.();
       return;

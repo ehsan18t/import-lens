@@ -154,8 +154,8 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         void analysis.analyze(editor.document);
       }
     }),
-    vscode.commands.registerCommand("importLens.showReport", () => void showReport(context, daemon!)),
-    vscode.commands.registerCommand(compareImportsCommand, (initialSpecifier?: string) => void compareImports(daemon!, initialSpecifier)),
+    vscode.commands.registerCommand("importLens.showReport", () => void showReport(context, daemon!, logger)),
+    vscode.commands.registerCommand(compareImportsCommand, (initialSpecifier?: string) => void compareImports(daemon!, logger, initialSpecifier)),
     vscode.commands.registerCommand("importLens.copySubstitutionSuggestion", copySubstitutionSuggestion),
     vscode.commands.registerCommand("importLens.showImportDetails", async (result: ImportResult, runtime: ImportRuntime = "component") => {
       if (result.error) {
@@ -205,8 +205,13 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     }),
   );
 
-  registerNodeModulesWatchers(context, daemon, () => refreshVisibleDocuments(getImportLensConfig(), "reanalyze"));
-  registerPackageJsonPrewarm(context, daemon);
+  registerNodeModulesWatchers(
+    context,
+    daemon,
+    logger.child({ component: "watcher" }),
+    () => refreshVisibleDocuments(getImportLensConfig(), "reanalyze"),
+  );
+  registerPackageJsonPrewarm(context, daemon, logger.child({ component: "prewarm" }));
   context.subscriptions.push(daemon.onDidChangeState((nextState) => {
     statusBar.setStatus(nextState === "ready" ? "ready" : "unavailable");
 

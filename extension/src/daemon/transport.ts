@@ -7,6 +7,8 @@ import type {
   FileSizeResponse,
 } from "../ipc/protocol.js";
 
+import type { Logger } from "../logging/types.js";
+
 export type DaemonState = "ready" | "unavailable";
 export type DaemonStateEvent = (listener: (state: DaemonState) => void) => { dispose(): void };
 
@@ -27,12 +29,14 @@ export interface AnalysisTransport {
 export class TransportCoordinator implements AnalysisTransport {
   readonly #transports: readonly AnalysisTransport[];
   readonly #stateListeners = new Set<(state: DaemonState) => void>();
+  readonly #logger?: Pick<Logger, "debug" | "info">;
   #activeTransport: AnalysisTransport | null = null;
   #startPromise: Promise<DaemonState> | null = null;
   #state: DaemonState = "unavailable";
 
-  constructor(transports: readonly AnalysisTransport[]) {
+  constructor(transports: readonly AnalysisTransport[], logger?: Pick<Logger, "debug" | "info">) {
     this.#transports = transports;
+    this.#logger = logger;
 
     for (const transport of transports) {
       transport.onDidChangeState?.((state) => this.#handleTransportState(transport, state));
@@ -59,6 +63,7 @@ export class TransportCoordinator implements AnalysisTransport {
     }
 
     if (this.#startPromise) {
+      this.#logger?.debug("Coalescing concurrent daemon startup attempt.");
       return this.#startPromise;
     }
 
@@ -75,12 +80,14 @@ export class TransportCoordinator implements AnalysisTransport {
 
       if (state === "ready") {
         this.#activeTransport = transport;
+        this.#logger?.info("Daemon transport is ready.");
         this.#setState("ready");
         return this.#state;
       }
     }
 
     this.#activeTransport = null;
+    this.#logger?.info("All daemon transports unavailable.");
     this.#setState("unavailable");
     return this.#state;
   }

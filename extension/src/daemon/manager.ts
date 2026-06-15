@@ -8,6 +8,7 @@ import type {
   FileSizeResponse,
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
+import type { Logger } from "../logging/types.js";
 import { NativeDaemonTransport } from "./nativeTransport.js";
 import { TransportCoordinator, type DaemonState, type DaemonStateEvent } from "./transport.js";
 
@@ -15,9 +16,10 @@ export class DaemonManager implements vscode.Disposable {
   readonly #transport: TransportCoordinator;
 
   constructor(context: vscode.ExtensionContext, logger: ImportLensLogger) {
-    this.#transport = new TransportCoordinator([
-      new NativeDaemonTransport(context, logger),
-    ]);
+    this.#transport = new TransportCoordinator(
+      [new NativeDaemonTransport(context, logger.child({ component: "daemon" }))],
+      logger.child({ component: "transport" }),
+    );
   }
 
   get state(): DaemonState {

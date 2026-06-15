@@ -1,56 +1,15 @@
-import * as vscode from "vscode";
+import type * as vscode from "vscode";
 import type { LogLevel } from "./ipc/protocol.js";
-import { defaultLogLevel, formatLogLine, shouldWriteLog } from "./loggerCore.js";
+import {
+  defaultLogLevel,
+  VscodeOutputChannelLogger,
+} from "./logging/index.js";
+import type { Logger } from "./logging/types.js";
 
-export class ImportLensLogger implements vscode.Disposable {
-  readonly #channel: vscode.OutputChannel;
-  #level: LogLevel;
+export type { LogContext, Logger, LogLevel } from "./logging/index.js";
+export { defaultLogLevel, formatLogLine, shouldWriteLog } from "./logging/index.js";
 
-  constructor(level: LogLevel = defaultLogLevel) {
-    this.#channel = vscode.window.createOutputChannel("ImportLens");
-    this.#level = level;
-    this.#writeAlways("info", `Output channel initialized. Current log level: ${level}.`);
-  }
+export class ImportLensLogger extends VscodeOutputChannelLogger implements vscode.Disposable {}
 
-  setLevel(level: LogLevel): void {
-    this.#level = level;
-    this.#writeAlways("info", `Log level changed to ${level}.`);
-  }
-
-  error(message: string): void {
-    this.#write("error", message);
-  }
-
-  warn(message: string): void {
-    this.#write("warn", message);
-  }
-
-  info(message: string): void {
-    this.#write("info", message);
-  }
-
-  debug(message: string): void {
-    this.#write("debug", message);
-  }
-
-  show(): void {
-    this.#writeAlways("info", `Output channel opened. Current log level: ${this.#level}.`);
-    this.#channel.show(true);
-  }
-
-  dispose(): void {
-    this.#channel.dispose();
-  }
-
-  #write(level: LogLevel, message: string): void {
-    if (!shouldWriteLog(this.#level, level)) {
-      return;
-    }
-
-    this.#writeAlways(level, message);
-  }
-
-  #writeAlways(level: LogLevel, message: string): void {
-    this.#channel.appendLine(formatLogLine(level, message));
-  }
-}
+export const createImportLensLogger = (level: LogLevel = defaultLogLevel): ImportLensLogger =>
+  new ImportLensLogger(level);

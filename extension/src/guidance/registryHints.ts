@@ -28,10 +28,12 @@ type LegacyRegistryHintCacheEntry = Omit<RegistryHintCacheEntry, "status"> & {
   status?: RegistryHintCacheStatus;
 };
 
+import type { Logger } from "../logging/types.js";
+
 export interface RegistryHintFetchOptions {
   fetchImpl?: typeof fetch;
   installedVersion?: string;
-  logger?: Pick<Console, "debug" | "warn">;
+  logger?: Pick<Logger, "debug" | "warn">;
   now?: () => number;
   sleep?: (delayMs: number) => Promise<void>;
   timeoutMs?: number;

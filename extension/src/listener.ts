@@ -141,9 +141,13 @@ export class DocumentAnalysisController implements vscode.Disposable {
     }
 
     this.#statusBar.setStatus("computing");
+    this.#logger.debug(`Starting batch request ${requestId} with ${requestImports.length} import(s).`);
 
     try {
-      const resultLogger = new ImportResultLogTracker(this.#logger);
+      const resultLogger = new ImportResultLogTracker(
+        this.#logger.child({ component: "analysis" }),
+        requestId,
+      );
 
       const applyPartial = (partial: BatchResponse): void => {
         const nextStates = applyStreamingBatchPartial(partial, {
@@ -220,6 +224,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
         this.#logger.warn(`Import history update failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       this.#statusBar.setStatus("ready");
+      this.#logger.debug(`Completed batch request ${requestId}.`);
     } catch (error) {
       this.#logger.warn(`Analysis request failed: ${error instanceof Error ? error.message : String(error)}`);
       this.#store.set(document.uri, markLoadingStatesUnavailable(states, "Daemon unavailable"));

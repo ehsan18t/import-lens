@@ -1,6 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Readable } from "node:stream";
-import type { ImportLensLogger } from "../logger.js";
+import { parseDaemonLogLine } from "../logging/daemonLogParser.js";
+import type { Logger } from "../logging/types.js";
 
 export interface DisposableIpcClient {
   dispose(): void;
@@ -22,7 +23,7 @@ export interface DaemonLogStreams {
   readonly stderr: Readable;
 }
 
-type DaemonLogLogger = Pick<ImportLensLogger, "info" | "warn">;
+type DaemonLogLogger = Pick<Logger, "error" | "warn" | "info" | "debug">;
 
 export const cleanupFailedDaemonStartup = (
   client: DisposableIpcClient | null,
@@ -41,8 +42,29 @@ export const pipeDaemonProcessLogs = (
   childProcess: Pick<ChildProcessWithoutNullStreams, "stdout" | "stderr"> | DaemonLogStreams,
   logger: DaemonLogLogger,
 ): void => {
-  pipeStreamLines(childProcess.stdout, "stdout", (line) => logger.info(`[daemon:stdout] ${line}`));
-  pipeStreamLines(childProcess.stderr, "stderr", (line) => logger.warn(`[daemon:stderr] ${line}`));
+  pipeStreamLines(childProcess.stdout, (line) => routeDaemonLogLine(line, logger, "stdout"));
+  pipeStreamLines(childProcess.stderr, (line) => routeDaemonLogLine(line, logger, "stderr"));
+};
+
+export const routeDaemonLogLine = (
+  line: string,
+  logger: DaemonLogLogger,
+  stream: "stdout" | "stderr",
+): void => {
+  const parsed = parseDaemonLogLine(line);
+
+  if (parsed) {
+    const message = parsed.component ? `[${parsed.component}] ${parsed.message}` : parsed.message;
+    logger[parsed.level](message);
+    return;
+  }
+
+  if (stream === "stderr") {
+    logger.warn(line);
+    return;
+  }
+
+  logger.info(line);
 };
 
 export const terminateProcess = async (
@@ -90,7 +112,6 @@ const waitForExit = (
 
 const pipeStreamLines = (
   stream: Readable,
-  streamName: "stdout" | "stderr",
   writeLine: (line: string) => void,
 ): void => {
   let pending = "";
@@ -110,7 +131,7 @@ const pipeStreamLines = (
     pending = "";
   });
   stream.on("error", (error) => {
-    writeLine(`${streamName} stream error: ${error instanceof Error ? error.message : String(error)}`);
+    writeLine(`stream error: ${error instanceof Error ? error.message : String(error)}`);
   });
 };
 

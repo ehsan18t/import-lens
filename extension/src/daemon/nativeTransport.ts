@@ -16,7 +16,7 @@ import type {
   HelloMessage,
 } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
-import type { ImportLensLogger } from "../logger.js";
+import type { Logger } from "../logging/types.js";
 import { currentPlatformTarget, daemonBinaryName } from "./platform.js";
 import { knownDaemonHashes } from "./knownHashes.generated.js";
 import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs, terminateProcess } from "./processLifecycle.js";
@@ -30,7 +30,7 @@ const CLEAN_RECYCLE_SESSION_MS = 30 * 60 * 1000;
 
 export class NativeDaemonTransport implements AnalysisTransport {
   readonly #context: vscode.ExtensionContext;
-  readonly #logger: ImportLensLogger;
+  readonly #logger: Logger;
   readonly #recycleGuard: RecycleGuard;
   readonly #stateListeners = new Set<(state: DaemonState) => void>();
   #process: ChildProcessWithoutNullStreams | null = null;
@@ -45,7 +45,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
   #disconnectTimer: NodeJS.Timeout | null = null;
   #lastAnalysisRoot: string | undefined;
 
-  constructor(context: vscode.ExtensionContext, logger: ImportLensLogger) {
+  constructor(context: vscode.ExtensionContext, logger: Logger) {
     this.#context = context;
     this.#logger = logger;
     this.#recycleGuard = new RecycleGuard(context.globalStorageUri.fsPath);
@@ -141,7 +141,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     let client: IpcClient;
 
     try {
-      client = await IpcClient.connect(pipeName);
+      client = await IpcClient.connect(pipeName, { logger: this.#logger.child({ component: "ipc" }) });
       if (childProcess !== this.#process) {
         client.dispose();
         return this.#state;
@@ -160,13 +160,12 @@ export class NativeDaemonTransport implements AnalysisTransport {
       return this.#state;
     }
 
-    client.on("disconnect", (error) => {
+    client.on("disconnect", () => {
       if (client !== this.#client) {
         this.#logger.debug("Ignoring stale daemon IPC disconnect event.");
         return;
       }
 
-      this.#logger.warn(`IPC disconnected: ${error instanceof Error ? error.message : String(error)}`);
       this.#handleUnexpectedDisconnect();
     });
 

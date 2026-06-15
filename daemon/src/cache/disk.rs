@@ -509,5 +509,5 @@ fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
 }
 
 fn cache_warn(message: String) {
-    eprintln!("[import-lens-daemon] cache warning: {message}");
+    crate::logging::log_warn("cache", message);
 }
