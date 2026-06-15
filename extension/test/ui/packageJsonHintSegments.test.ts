@@ -41,7 +41,7 @@ const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
   ...overrides,
 });
 
-test("packageJsonHintSegments uses error primary and added-resource suffix for unavailable latest packages", () => {
+test("packageJsonHintSegments uses muted primary and info suffix for unavailable latest packages", () => {
   const parts = packageJsonDependencyHintParts(
     {
       name: "typescript",
@@ -55,19 +55,23 @@ test("packageJsonHintSegments uses error primary and added-resource suffix for u
   assert.deepEqual(packageJsonHintSegments(parts, config()), [
     {
       contentText: " unavailable",
+      tone: "neutral",
       themeColorId: "list.errorForeground",
       fontStyle: "normal",
+      fontWeight: "400",
       margin: "0 0 0 0.75rem",
     },
     {
       contentText: " · latest",
+      tone: "info",
       themeColorId: "gitDecoration.addedResourceForeground",
       fontStyle: "italic",
+      fontWeight: "400",
     },
   ]);
 });
 
-test("packageJsonHintSegments uses muted size and modified-resource update suffix", () => {
+test("packageJsonHintSegments uses neutral size and modified update suffix", () => {
   const parts = packageJsonDependencyHintParts(
     {
       name: "react",
@@ -82,14 +86,18 @@ test("packageJsonHintSegments uses muted size and modified-resource update suffi
   assert.deepEqual(packageJsonHintSegments(parts, config()), [
     {
       contentText: " 1.5 kB br",
+      tone: "neutral",
       themeColorId: "descriptionForeground",
       fontStyle: "normal",
+      fontWeight: "400",
       margin: "0 0 0 0.75rem",
     },
     {
       contentText: " · update 19.0.0",
+      tone: "action",
       themeColorId: "gitDecoration.modifiedResourceForeground",
       fontStyle: "italic",
+      fontWeight: "400",
     },
   ]);
 });

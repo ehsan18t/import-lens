@@ -13,24 +13,21 @@ import { tooltipForMessage } from "./tooltip.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import { packageJsonDependencyHintAnchorCharacter } from "./packageJsonDecorationAnchor.js";
 import {
-  packageJsonHintDecorationGroups,
-  packageJsonSectionSummaryDecorationOptions,
-} from "./packageJsonDecorationSegments.js";
+  emptyInlineHintDecorationLayers,
+  InlineHintSlotDecorationPool,
+  inlineHintDecorationLayers,
+  mergeInlineHintDecorationLayers,
+} from "./inlineHintDecorationTypes.js";
+import { packageJsonHintSegments, packageJsonSectionSummarySegment } from "./packageJsonHintSegments.js";
 
 export class PackageJsonDecorationController implements vscode.Disposable {
   readonly #analysis: PackageJsonAnalysisController;
-  readonly #primaryDecoration: vscode.TextEditorDecorationType;
-  readonly #suffixDecoration: vscode.TextEditorDecorationType;
+  readonly #decorationPool: InlineHintSlotDecorationPool;
   readonly #subscription: vscode.Disposable;
 
   constructor(analysis: PackageJsonAnalysisController) {
     this.#analysis = analysis;
-    this.#primaryDecoration = vscode.window.createTextEditorDecorationType({
-      rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-    });
-    this.#suffixDecoration = vscode.window.createTextEditorDecorationType({
-      rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-    });
+    this.#decorationPool = new InlineHintSlotDecorationPool();
     this.#subscription = this.#analysis.onDidChange((uri) => this.refreshUri(uri));
   }
 
@@ -56,62 +53,60 @@ export class PackageJsonDecorationController implements vscode.Disposable {
       || editor.document.uri.scheme !== "file"
       || !isPackageJsonPath(editor.document.fileName)
     ) {
-      editor.setDecorations(this.#primaryDecoration, []);
-      editor.setDecorations(this.#suffixDecoration, []);
+      this.#decorationPool.clearEditor(editor);
       return;
     }
 
     const states = this.#analysis.get(editor.document.uri);
     const sections = this.#analysis.sections(editor.document.uri);
-    const primaryDecorations: vscode.DecorationOptions[] = [];
-    const suffixDecorations: vscode.DecorationOptions[] = [];
+    const layers = emptyInlineHintDecorationLayers();
 
     for (const section of sections) {
-      const option = this.decorationForSection(editor.document, section, states, config);
+      const sectionLayers = this.decorationLayersForSection(editor.document, section, states, config);
 
-      if (option) {
-        primaryDecorations.push(option);
+      if (sectionLayers) {
+        mergeInlineHintDecorationLayers(layers, sectionLayers);
       }
     }
 
     for (const state of states) {
-      const groups = this.decorationGroupsForState(editor.document, state, config);
-      primaryDecorations.push(...groups.primary);
-      suffixDecorations.push(...groups.suffix);
+      mergeInlineHintDecorationLayers(layers, this.decorationLayersForState(editor.document, state, config));
     }
 
-    editor.setDecorations(this.#primaryDecoration, primaryDecorations);
-    editor.setDecorations(this.#suffixDecoration, suffixDecorations);
+    this.#decorationPool.applyToEditor(editor, layers);
   }
 
   dispose(): void {
     this.#subscription.dispose();
-    this.#primaryDecoration.dispose();
-    this.#suffixDecoration.dispose();
+    this.#decorationPool.dispose();
   }
 
-  private decorationGroupsForState(
+  private decorationLayersForState(
     document: vscode.TextDocument,
     state: PackageJsonDependencyAnalysisState,
     config: ReturnType<typeof getImportLensConfig>,
-  ): ReturnType<typeof packageJsonHintDecorationGroups> {
+  ): ReturnType<typeof inlineHintDecorationLayers> {
     const line = document.lineAt(state.entry.valueRange.end.line);
-    const position = new vscode.Position(
+    const anchor = new vscode.Position(
       line.lineNumber,
       packageJsonDependencyHintAnchorCharacter(line.text),
     );
     const parts = packageJsonDependencyHintParts(state, config);
     const tooltip = tooltipForPackageJsonState(state);
 
-    return packageJsonHintDecorationGroups(parts, position, config, tooltip);
+    return inlineHintDecorationLayers(
+      packageJsonHintSegments(parts, config),
+      anchor,
+      tooltip,
+    );
   }
 
-  private decorationForSection(
+  private decorationLayersForSection(
     document: vscode.TextDocument,
     section: PackageJsonDependencySection,
     states: readonly PackageJsonDependencyAnalysisState[],
     config: ReturnType<typeof getImportLensConfig>,
-  ): vscode.DecorationOptions | null {
+  ): ReturnType<typeof inlineHintDecorationLayers> | null {
     const label = packageJsonSectionSummaryLabel(section.section, states, config);
 
     if (!label) {
@@ -119,11 +114,11 @@ export class PackageJsonDecorationController implements vscode.Disposable {
     }
 
     const line = document.lineAt(section.objectRange.start.line);
-    const position = line.range.end;
+    const anchor = line.range.end;
 
-    return packageJsonSectionSummaryDecorationOptions(
-      label,
-      position,
+    return inlineHintDecorationLayers(
+      [packageJsonSectionSummarySegment(label)],
+      anchor,
       tooltipForMessage("ImportLens dependency summary", label),
     );
   }

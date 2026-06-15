@@ -1,9 +1,9 @@
 import * as vscode from "vscode";
-import { insightLabelSuffix } from "../analysis/insights.js";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
+import { inlineHintDisplayText } from "./inlineHintSegments.js";
+import { importHintParts } from "./importHintParts.js";
 import { shouldShowCodeLens } from "./displayGuards.js";
-import { formatImportSize } from "./format.js";
 
 export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -31,9 +31,11 @@ export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vsco
         const line = Math.max(0, state.detected.line);
         const range = new vscode.Range(line, 0, line, 0);
         const result = state.result!;
+        const parts = importHintParts(state, config);
+        const title = parts ? inlineHintDisplayText(parts) : "";
 
         return new vscode.CodeLens(range, {
-          title: `${formatImportSize(result, config, state.detected.runtime)}${insightLabelSuffix(state.insights)}`,
+          title,
           command: "importLens.showImportDetails",
           arguments: [result, state.detected.runtime],
         });

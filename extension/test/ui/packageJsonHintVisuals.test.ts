@@ -5,7 +5,7 @@ import {
   suffixToneThemeColor,
 } from "../../src/ui/packageJsonHintVisuals.js";
 
-test("primaryToneThemeColor maps unavailable to list error and neutral to muted foreground", () => {
+test("primaryToneThemeColor keeps package.json primaries muted", () => {
   assert.equal(primaryToneThemeColor("unavailable"), "list.errorForeground");
   assert.equal(primaryToneThemeColor("neutral"), "descriptionForeground");
 });

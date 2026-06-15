@@ -1,5 +1,6 @@
-import type { ImportResult } from "../ipc/protocol.js";
+import type { ConfidenceLevel, ImportResult } from "../ipc/protocol.js";
 import type { ImportRuntime } from "../imports/types.js";
+import type { InlineHintTone } from "./inlineHintVisuals.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
 export type DisplayMode = "minimal" | "standard" | "verbose" | "inlayHint";
@@ -68,7 +69,41 @@ const formatWarningSuffix = (result: ImportResult, showWarnings: boolean, runtim
 const confidencePrefix = (result: ImportResult): string =>
   result.confidence === "low" ? "~" : "";
 
-export const formatImportSize = (
+export const importSizePrimaryTone = (confidence: ConfidenceLevel): InlineHintTone => {
+  if (confidence === "medium") {
+    return "sizeMedium";
+  }
+
+  if (confidence === "low") {
+    return "sizeLow";
+  }
+
+  return "size";
+};
+
+export const importHintTagLabels = (
+  result: ImportResult,
+  showWarnings: boolean,
+  runtime: ImportRuntime,
+): string[] => {
+  const tags: string[] = [];
+
+  if (runtime === "server") {
+    tags.push("server");
+  }
+
+  if (isTypesOnlyResult(result)) {
+    tags.push("types only");
+  }
+
+  if (showWarnings && result.is_cjs) {
+    tags.push("CJS");
+  }
+
+  return tags;
+};
+
+export const formatImportSizePrimary = (
   result: ImportResult,
   options: FormatOptions,
   runtime: ImportRuntime = "component",
@@ -78,17 +113,28 @@ export const formatImportSize = (
   }
 
   if (options.display === "verbose" || options.compression === "all") {
-    return `${confidencePrefix(result)}${formatBytes(result.brotli_bytes)} br · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd · ${formatBytes(result.minified_bytes)} min${formatWarningSuffix(result, options.showWarnings, runtime)}`;
+    return `${confidencePrefix(result)}${formatBytes(result.brotli_bytes)} br · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd · ${formatBytes(result.minified_bytes)} min`;
   }
 
   const compressedBytes = bytesForCompression(result, options.compression);
   const compressed = formatBytes(compressedBytes);
   const label = labelForCompression(options.compression);
-  const suffix = formatWarningSuffix(result, options.showWarnings, runtime);
 
   if (options.display === "minimal" || options.display === "inlayHint") {
-    return `${confidencePrefix(result)}${compressed} ${label}${suffix}`;
+    return `${confidencePrefix(result)}${compressed} ${label}`;
   }
 
-  return `${confidencePrefix(result)}${compressed} ${label} · ${formatBytes(result.minified_bytes)} min${suffix}`;
+  return `${confidencePrefix(result)}${compressed} ${label} · ${formatBytes(result.minified_bytes)} min`;
+};
+
+export const formatImportSize = (
+  result: ImportResult,
+  options: FormatOptions,
+  runtime: ImportRuntime = "component",
+): string => {
+  if (result.error) {
+    return "Size unavailable";
+  }
+
+  return `${formatImportSizePrimary(result, options, runtime)}${formatWarningSuffix(result, options.showWarnings, runtime)}`;
 };

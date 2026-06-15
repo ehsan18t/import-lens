@@ -1,9 +1,10 @@
 import * as vscode from "vscode";
-import { insightLabelSuffix } from "../analysis/insights.js";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
 import { shouldShowNativeInlayHints } from "./displayGuards.js";
-import { formatImportSize } from "./format.js";
+import { importHintAnchorPosition } from "./importHintAnchor.js";
+import { importHintParts } from "./importHintParts.js";
+import { inlineHintSegmentsFromParts } from "./inlineHintSegments.js";
 import { tooltipForAnalysisState } from "./tooltip.js";
 
 export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, vscode.Disposable {
@@ -28,35 +29,35 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
     const hints: vscode.InlayHint[] = [];
 
     for (const state of this.#store.get(document.uri)) {
-      const position = new vscode.Position(state.detected.statementRange.end.line, state.detected.statementRange.end.character);
-      let labelString: string | undefined;
+      const parts = importHintParts(state, config);
 
-      if (state.status === "loading") {
-        labelString = "…";
-      } else if (state.status === "missing") {
-        labelString = state.message ?? "Package not found";
-      } else if (state.status === "unavailable") {
-        continue;
-      } else if (state.status === "ready" && state.result) {
-        labelString = `${formatImportSize(state.result, config, state.detected.runtime)}${insightLabelSuffix(state.insights)}`;
-      }
-
-      if (!labelString) {
+      if (!parts) {
         continue;
       }
 
-      const labelPart = new vscode.InlayHintLabelPart(labelString);
-      labelPart.tooltip = tooltipForAnalysisState(state);
+      const anchor = importHintAnchorPosition(document, state.detected);
+      const position = new vscode.Position(anchor.line, anchor.character);
+      const segments = inlineHintSegmentsFromParts(parts, {
+        primaryMargin: "0 0 0 0.35rem",
+      });
+      const stateTooltip = tooltipForAnalysisState(state);
+      const labelParts = segments.map((segment, index) => {
+        const value = index === 0 ? segment.contentText.trimStart() : segment.contentText;
+        const labelPart = new vscode.InlayHintLabelPart(value);
+        labelPart.tooltip = stateTooltip;
 
-      if (state.status === "ready" && state.result) {
-        labelPart.command = {
-          title: "Show Import Details",
-          command: "importLens.showImportDetails",
-          arguments: [state.result, state.detected.runtime],
-        };
-      }
+        if (state.status === "ready" && state.result && !state.result.error) {
+          labelPart.command = {
+            title: "Show Import Details",
+            command: "importLens.showImportDetails",
+            arguments: [state.result, state.detected.runtime],
+          };
+        }
 
-      const hint = new vscode.InlayHint(position, [labelPart], undefined);
+        return labelPart;
+      });
+
+      const hint = new vscode.InlayHint(position, labelParts, undefined);
       hint.paddingLeft = true;
       hints.push(hint);
     }

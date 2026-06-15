@@ -1,7 +1,7 @@
 export const knownDaemonHashes: Readonly<Record<string, string>> = {
-  "bin/darwin-arm64/import-lens-daemon": "19bb5eab368f83c9ad2742423c4e9cad94ac4b40ac23855da9a3f732967f594c",
-  "bin/darwin-x64/import-lens-daemon": "6e68eaf3efeb1f20f48a4ac788d9d2998e47b77e5a3ab2c0d5d1e004cfc35b54",
-  "bin/linux-arm64/import-lens-daemon": "44b8f627c8f94db0a7c0ec86b847ed0fce5c92a00a6bbba3d08439d18fc5a89b",
-  "bin/linux-x64/import-lens-daemon": "b9903743a3414b28700473b229c5601df5a8e0977ab31ad2049842e05f5a354d",
-  "bin/win32-x64/import-lens-daemon.exe": "dcc3695fbd75571911739489ef3bd0ff84a79333ef98307306c22d0734cc305d"
+  "bin/darwin-arm64/import-lens-daemon": "8680015f471eddd5d0264349f62ae38f923db1b07dc568c7e9513a7b40c20c6d",
+  "bin/darwin-x64/import-lens-daemon": "d8f5585b5b4e5bccc8505ca88f2e1911949e6eba5f743cacdfd807b6b545b00d",
+  "bin/linux-arm64/import-lens-daemon": "9cc834a86e5be16ea8d562388f7e5002cfd4d692dbf262e330a2fc099b69d63a",
+  "bin/linux-x64/import-lens-daemon": "9b88ff9ad0ef786f99a51a48525e16df43b75242b5acfec30bbbb315d40574ff",
+  "bin/win32-x64/import-lens-daemon.exe": "93edc44c2a97c5b229c8b7dbdc6566f50bb5866e15303c3ce9744b62a2480f8a"
 };
