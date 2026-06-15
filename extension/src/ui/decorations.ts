@@ -119,7 +119,7 @@ export class DecorationController implements vscode.Disposable {
     }
 
     if (state.status === "unavailable") {
-      return state.message ?? "Daemon unavailable";
+      return null;
     }
 
     if (state.status === "ready" && state.result) {
