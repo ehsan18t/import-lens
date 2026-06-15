@@ -130,7 +130,7 @@ const startDaemon = async (workspace) => {
   await mkdir(storagePath, { recursive: true });
   const pipeName = process.platform === "win32"
     ? `\\\\.\\pipe\\import-lens-accuracy-${process.pid}-${randomUUID()}`
-    : path.join(storagePath, `import-lens-accuracy-${process.pid}-${randomUUID()}.sock`);
+    : path.join(os.tmpdir(), `import-lens-accuracy-${process.pid}-${randomUUID()}.sock`);
   const child = spawn("cargo", [
     "run",
     "--quiet",
