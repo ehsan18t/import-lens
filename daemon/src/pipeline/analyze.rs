@@ -427,9 +427,7 @@ fn analyze_static_entry(
         zstd_bytes: compressed.zstd_bytes,
         cache_hit: false,
         side_effects,
-        truly_treeshakeable: !side_effects
-            && !is_cjs
-            && matches!(request.import_kind, ImportKind::Named),
+        truly_treeshakeable: false,
         is_cjs,
         confidence: ConfidenceLevel::Low,
         confidence_reasons: vec![

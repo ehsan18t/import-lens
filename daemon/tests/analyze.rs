@@ -752,6 +752,7 @@ fn analyze_named_import_falls_back_to_static_entry_after_oxc_failure() {
                 && diagnostic.message.contains("static entry")),
         "{result:?}",
     );
+    assert!(!result.truly_treeshakeable);
 }
 
 #[test]
