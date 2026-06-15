@@ -435,7 +435,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 - `verbose`: `1.5 kB br · 1.8 kB gz · 1.6 kB zstd · 5.3 kB min` (all three formats)
 - `inlayHint`: Displays the primary compression size as an inline hint after the import specifier. Rendering is selected by `importLens.inlineRenderer`: `native` uses the VS Code Inlay Hints API, while `colored` uses decoration-backed inline text with confidence colors.
 
-**FR-031** (High) - When `side_effects: true`, `is_cjs: true`, or `truly_treeshakeable: false`, the extension must display a warning indicator next to the size label indicating that the shown size may be conservative. The literal word `approximate` must not appear in inline size labels. Low-confidence size labels must use a leading `~`, for example `~1.6 kB br`. Medium- and high-confidence labels must not use `~`; confidence is conveyed through hover, report, diagnostic details, and confidence colors on surfaces that support per-result colors.
+**FR-031** (High) - When `side_effects: true`, `is_cjs: true`, or `truly_treeshakeable: false`, the extension must warn users that the shown size may be conservative. Inline labels may use short module-type tags such as `CJS`, `server`, and `types only`, but must not append the literal word `conservative`. Conservative-sizing context belongs in hover details, show-import-details, and the workspace report. The literal word `approximate` must not appear in inline size labels. Low-confidence size labels must use a leading `~`, for example `~1.6 kB br`. Medium- and high-confidence labels must not use `~`; confidence is conveyed through hover, report, diagnostic details, and confidence colors on surfaces that support per-result colors.
 
 **FR-031a** (Medium) - When an import is detected from Astro frontmatter, the extension must label the displayed size with `server` and include the runtime in the hover tooltip so users do not confuse server-only dependency cost with client bundle cost.
 
@@ -481,7 +481,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-036l** (Medium) - When `importLens.enableRegistryHints` is enabled, the extension may fetch npm metadata for registry-based hints. The setting must default to `true`; network work must use short timeouts, cache positive and negative results in VS Code globalState and session memory, and fail silently without affecting size computation.
 
-**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost inlay hints for dependency blocks using local package resolution and prewarm-friendly daemon requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from the `InlayHintsProvider`. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. Each dependency block should also expose a compact measured/total summary when analysis state is available.
+**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost end-of-line decorations for dependency blocks using local package resolution and prewarm-friendly daemon requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from a decoration refresh handler. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. Each dependency block should also expose a compact measured/total summary when analysis state is available.
 
 **FR-036n** (Medium) - The extension must provide `ImportLens: Compare Imports`, allowing users to compare two package specifiers side by side using the same local daemon sizing path as normal import analysis.
 
@@ -1344,7 +1344,7 @@ import-lens/
 │   │   │   ├── completions.ts         # Named import member completion provider
 │   │   │   ├── displayGuards.ts       # display-mode enablement helpers
 │   │   │   ├── format.ts              # size and display label formatting
-│   │   │   ├── packageJsonInlayHints.ts # package.json dependency inlay hint provider
+│   │   │   ├── packageJsonDecorations.ts # package.json dependency end-of-line decorations
 │   │   │   ├── packageJsonLabels.ts   # package.json dependency label formatting
 │   │   │   ├── namedExportCandidatePolicy.ts # pure policy for named export CodeAction eligibility
 │   │   │   ├── namedExportCandidates.ts # named export candidate QuickPick command

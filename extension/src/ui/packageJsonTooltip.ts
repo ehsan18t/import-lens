@@ -7,6 +7,7 @@ import {
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 import {
   copyDiagnosticsMarkdown,
+  conservativeSizingMarkdown,
   importResultSizeMarkdown,
 } from "./tooltipMarkdown.js";
 
@@ -54,6 +55,11 @@ export const packageJsonDependencyTooltipMarkdown = (
       parts.push("Type-only package: yes");
     } else {
       parts.push(importResultSizeMarkdown(state.result, config.compression));
+      const conservativeSizing = conservativeSizingMarkdown(state.result);
+
+      if (conservativeSizing) {
+        parts.push(conservativeSizing);
+      }
     }
   } else if (state.status === "ready" && state.result?.error) {
     parts.push("ImportLens could not compute this dependency size.");

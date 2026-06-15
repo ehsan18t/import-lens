@@ -7,6 +7,14 @@ import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import { formatBytes, type CompressionFormat } from "./format.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
+export const isConservativeEstimate = (result: ImportResult): boolean =>
+  !result.error && (result.side_effects || !result.truly_treeshakeable);
+
+export const conservativeSizingMarkdown = (result: ImportResult): string | null =>
+  isConservativeEstimate(result)
+    ? "**Conservative sizing:** yes — size may include unused exports or side-effect modules."
+    : null;
+
 const selectedCompressionSize = (
   result: ImportResult,
   compression: CompressionFormat,
@@ -90,6 +98,12 @@ export const tooltipForResultMarkdown = (
     `- CommonJS: ${result.is_cjs ? "yes" : "no"}`,
     `- Tree-shakeable: ${result.truly_treeshakeable ? "yes" : "no"}`,
   ].join("\n"));
+
+  const conservativeSizing = conservativeSizingMarkdown(result);
+
+  if (conservativeSizing) {
+    parts.push(conservativeSizing);
+  }
 
   if (insights.length > 0) {
     parts.push([
