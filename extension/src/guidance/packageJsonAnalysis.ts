@@ -7,6 +7,7 @@ import { protocolVersion, type BatchResponse, type ImportRequest } from "../ipc/
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { ImportLensLogger } from "../logger.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
+import { applyStreamingBatchPartial } from "../analysis/batchPartial.js";
 import { analysisRootForFile } from "../workspaceContext.js";
 import {
   packageJsonDependencyEntries,
@@ -173,30 +174,27 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
 
     try {
       const applyPartial = (partial: BatchResponse): void => {
-        if (!this.#freshness.isCurrent(key, partial.request_id) || !partial.indexes) {
-          return;
-        }
-
-        const nextStates = [...currentStates];
-
-        partial.indexes.forEach((requestImportIndex, partialIndex) => {
-          const stateIndex = requestStateIndexes[requestImportIndex];
-          const state = stateIndex === undefined ? undefined : nextStates[stateIndex];
-          const result = partial.imports[partialIndex];
-
-          if (!state || state.status === "missing" || !result || result.specifier !== state.name) {
-            return;
-          }
-
-          nextStates[stateIndex] = {
+        const nextStates = applyStreamingBatchPartial(partial, {
+          requestId,
+          isCurrent: (partialRequestId) => this.#freshness.isCurrent(key, partialRequestId),
+          requestStateIndexes,
+          states: currentStates,
+          isMissing: (state) => state.status === "missing",
+          matchesResult: (state, result) => result.specifier === state.name,
+          applyReady: (state, result) => ({
             ...state,
-            status: "ready",
+            status: "ready" as const,
             result,
-          };
+          }),
+          commit: (states) => {
+            currentStates = [...states];
+            this.setStates(document.uri, currentStates);
+          },
         });
 
-        currentStates = nextStates;
-        this.setStates(document.uri, currentStates);
+        if (nextStates) {
+          currentStates = [...nextStates];
+        }
       };
 
       const response = await this.#daemon.sendBatch(
