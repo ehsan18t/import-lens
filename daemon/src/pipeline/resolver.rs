@@ -1,3 +1,4 @@
+use crate::cache::key::CacheIdentityV3;
 use crate::ipc::protocol::{ImportRequest, ImportRuntime};
 use oxc_resolver::{ModuleType, ResolveOptions, Resolver};
 use serde_json::Value;
@@ -107,6 +108,28 @@ pub fn resolve_package_entry(
         package_json: manifest.json,
         entry_path,
         is_cjs,
+    })
+}
+
+pub fn resolved_from_cache_identity(identity: &CacheIdentityV3) -> Option<ResolvedPackage> {
+    let package_root = PathBuf::from(identity.package_root.as_ref()?);
+    let entry_path = PathBuf::from(identity.entry_path.as_ref()?);
+    let package_json_path = package_root.join("package.json");
+    let package_json: Value =
+        serde_json::from_str(&fs::read_to_string(&package_json_path).ok()?).ok()?;
+    let manifest = PackageManifest {
+        root: package_root.clone(),
+        json: package_json.clone(),
+    };
+    let is_cjs = resolved_entry_is_commonjs(&manifest, &entry_path, false);
+    let side_effects = side_effects_mode(&package_json, &entry_path);
+
+    Some(ResolvedPackage {
+        package_root,
+        package_json,
+        entry_path,
+        is_cjs,
+        side_effects,
     })
 }
 

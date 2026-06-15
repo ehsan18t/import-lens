@@ -3,7 +3,7 @@ use crate::{
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
-        resolver::{ResolvedPackage, resolve_package_entry},
+        resolver::{ResolvedPackage, resolve_package_entry, resolved_from_cache_identity},
     },
     service::ImportLensService,
 };
@@ -241,13 +241,13 @@ fn run_recent_prewarm_job(
         return;
     }
 
-    let active_document_path = workspace_root.join("package.json");
     let jobs = service
         .recent_cache_keys(RECENT_PREWARM_LIMIT)
         .into_iter()
-        .filter_map(|key| cached_import_request_from_key(&key))
-        .filter_map(|request| {
-            let resolved = resolve_package_entry(&active_document_path, &request).ok()?;
+        .filter_map(|key| {
+            let identity = decode_cache_identity(&key)?;
+            let request = cached_import_request_from_key(&key)?;
+            let resolved = resolved_from_cache_identity(&identity)?;
             Some(PrewarmJob { request, resolved })
         })
         .collect::<Vec<_>>();
@@ -256,6 +256,10 @@ fn run_recent_prewarm_job(
         return;
     }
 
+    let active_document_path = jobs
+        .first()
+        .and_then(|job| job.resolved.entry_path.parent().map(PathBuf::from))
+        .unwrap_or_else(|| workspace_root.join("package.json"));
     let context = AnalysisContext {
         workspace_root,
         active_document_path,
