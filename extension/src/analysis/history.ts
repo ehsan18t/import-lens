@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { DetectedImport } from "../imports/types.js";
+import type { DetectedImport } from "../ipc/protocol.js";
 import type { ImportResult } from "../ipc/protocol.js";
 import { formatBytes } from "../ui/format.js";
 

@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { ImportLensBudgets } from "../analysis/budgets.js";
-import type { DetectedImport } from "../imports/types.js";
+import type { DetectedImport } from "../ipc/protocol.js";
 import type { ConfidenceLevel, ImportResult } from "../ipc/protocol.js";
 
 export interface WorkspaceReportItem {

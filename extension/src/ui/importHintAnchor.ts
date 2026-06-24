@@ -1,4 +1,4 @@
-import type { DetectedImport, SourcePosition } from "../imports/types.js";
+import type { DetectedImport, SourcePosition } from "../ipc/protocol.js";
 
 export interface ImportHintAnchorDocument {
   readonly lineCount: number;

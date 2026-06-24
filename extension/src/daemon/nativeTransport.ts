@@ -7,10 +7,20 @@ import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
 import { IpcClient } from "../ipc/client.js";
 import type {
+  AnalyzeDocumentRequest,
+  AnalyzeDocumentResponse,
+  AnalyzePackageJsonRequest,
+  AnalyzePackageJsonResponse,
+  AnalyzeSpecifiersRequest,
+  AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CompleteImportMembersRequest,
+  CompleteImportMembersResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeDocumentRequest,
+  FileSizeDocumentResponse,
   FileSizeRequest,
   FileSizeResponse,
   HelloMessage,
@@ -310,6 +320,36 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#client.requestBatch(request, 10000, onPartial);
   }
 
+  async analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Document analysis ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting document analysis ${request.request_id}.`);
+    return this.#client.requestAnalyzeDocument(request);
+  }
+
+  async analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`package.json analysis ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting package.json analysis ${request.request_id}.`);
+    return this.#client.requestAnalyzePackageJson(request, 30000);
+  }
+
+  async analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Specifier analysis ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting specifier analysis ${request.request_id} for ${request.specifiers.length} import(s).`);
+    return this.#client.requestAnalyzeSpecifiers(request);
+  }
+
   async enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
     if (!this.#client || this.#state !== "ready") {
       this.#logger.warn(`Export enumeration ${request.request_id} skipped because daemon is ${this.#state}.`);
@@ -330,6 +370,26 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#client.requestFileSize(request);
   }
 
+  async requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Current-file size request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting current-file size ${request.request_id} from document source.`);
+    return this.#client.requestFileSizeDocument(request);
+  }
+
+  async completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Import member completion ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting import member completion ${request.request_id}.`);
+    return this.#client.requestCompleteImportMembers(request);
+  }
+
   invalidatePackage(packageName: string): void {
     this.#logger.info(`Invalidating ImportLens cache for ${packageName}.`);
     this.#client?.send({ type: "cache_invalidate", package: packageName });
@@ -338,6 +398,19 @@ export class NativeDaemonTransport implements AnalysisTransport {
   invalidateAll(): void {
     this.#logger.info("Invalidating entire ImportLens cache.");
     this.#client?.send({ type: "cache_invalidate_all" });
+  }
+
+  nodeModulesChanged(packageJsonPaths: readonly string[]): void {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.debug(`Skipping node_modules invalidation because daemon is ${this.#state}.`);
+      return;
+    }
+
+    this.#logger.info(`Sending ${packageJsonPaths.length} node_modules package.json invalidation(s).`);
+    this.#client.send({
+      type: "node_modules_changed",
+      package_json_paths: [...packageJsonPaths],
+    });
   }
 
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {

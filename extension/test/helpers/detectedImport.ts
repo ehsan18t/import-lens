@@ -1,4 +1,4 @@
-import type { DetectedImport, SourceRange } from "../../src/imports/types.js";
+import type { DetectedImport, SourceRange } from "../../src/ipc/protocol.js";
 
 export const sourceRange = (
   line: number,

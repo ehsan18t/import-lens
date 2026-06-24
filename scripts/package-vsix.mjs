@@ -55,7 +55,7 @@ if (!target) {
   fail("Usage: node scripts/package-vsix.mjs <target>");
 }
 
-const bindingPackage = targetInfo(target).oxcParserBinding;
+targetInfo(target);
 
 const manifestPath = path.join(repoRoot, "package.json");
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -75,10 +75,10 @@ mkdirSync(path.dirname(outputPath), { recursive: true });
 
 writeFileSync(
   path.join(stagingRoot, "package.json"),
-  `${JSON.stringify(createStagedManifest({ manifest, bindingPackage }), null, 2)}\n`,
+  `${JSON.stringify(createStagedManifest({ manifest }), null, 2)}\n`,
 );
 
-console.log(`Downloading ${bindingPackage} inside staging directory...`);
+console.log("Installing production dependencies inside staging directory...");
 run("pnpm", ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoisted", "--ignore-workspace"], stagingRoot);
 
 copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));

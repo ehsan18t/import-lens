@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
-import type { DetectedImport } from "../imports/types.js";
-import type { ImportResult } from "../ipc/protocol.js";
+import type { DetectedImport, ImportResult } from "../ipc/protocol.js";
 
 export type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
 

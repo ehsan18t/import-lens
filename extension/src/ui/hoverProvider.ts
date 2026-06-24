@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
-import type { SourceRange } from "../imports/types.js";
+import type { SourceRange } from "../ipc/protocol.js";
 import { shouldShowColoredSourceHovers } from "./displayGuards.js";
 import { stateForHoverPosition } from "./hoverRanges.js";
 import { tooltipForAnalysisState } from "./tooltip.js";

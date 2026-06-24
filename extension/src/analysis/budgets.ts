@@ -1,5 +1,5 @@
 import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
-import type { SourceRange } from "../imports/types.js";
+import type { SourceRange } from "../ipc/protocol.js";
 import { formatBytes } from "../ui/format.js";
 
 export interface ImportLensBudgets {

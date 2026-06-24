@@ -1,6 +1,6 @@
 use import_lens_daemon::ipc::codec::{FrameDecoder, decode_payload, encode_frame};
 use import_lens_daemon::ipc::protocol::{
-    ClientMessage, ImportKind, ImportRequest, ShutdownMessage,
+    ClientMessage, ImportKind, ImportRequest, PROTOCOL_VERSION, ShutdownMessage,
 };
 
 const OVERSIZED_FRAME_BYTES: usize = (32 * 1024 * 1024) + 1;
@@ -81,4 +81,78 @@ fn import_request_defaults_missing_runtime_to_component() {
     assert_eq!(request.specifier, "tiny-lib");
     assert_eq!(request.import_kind, ImportKind::Named);
     assert_eq!(request.runtime.as_str(), "component");
+}
+
+#[test]
+fn client_message_decodes_daemon_first_v5_requests() {
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "analyze_document",
+            "version": PROTOCOL_VERSION,
+            "request_id": 1,
+            "workspace_root": "C:/workspace",
+            "active_document_path": "C:/workspace/src/index.ts",
+            "source": "import x from 'tiny-lib';"
+        })),
+        ClientMessage::AnalyzeDocument(_),
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "analyze_package_json",
+            "version": PROTOCOL_VERSION,
+            "request_id": 2,
+            "workspace_root": "C:/workspace",
+            "active_document_path": "C:/workspace/package.json",
+            "source": "{\"dependencies\":{\"tiny-lib\":\"^1.0.0\"}}",
+            "include_registry_hints": false,
+            "force_registry_refresh": false
+        })),
+        ClientMessage::AnalyzePackageJson(_),
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "analyze_specifiers",
+            "version": PROTOCOL_VERSION,
+            "request_id": 3,
+            "workspace_root": "C:/workspace",
+            "active_document_path": "C:/workspace/src/index.ts",
+            "specifiers": ["tiny-lib"]
+        })),
+        ClientMessage::AnalyzeSpecifiers(_),
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "file_size_document",
+            "version": PROTOCOL_VERSION,
+            "request_id": 4,
+            "workspace_root": "C:/workspace",
+            "active_document_path": "C:/workspace/src/index.ts",
+            "source": "import x from 'tiny-lib';"
+        })),
+        ClientMessage::FileSizeDocument(_),
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "complete_import_members",
+            "version": PROTOCOL_VERSION,
+            "request_id": 5,
+            "workspace_root": "C:/workspace",
+            "active_document_path": "C:/workspace/src/index.ts",
+            "source": "import { value } from 'tiny-lib';",
+            "cursor_offset": 9
+        })),
+        ClientMessage::CompleteImportMembers(_),
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "node_modules_changed",
+            "package_json_paths": ["C:/workspace/node_modules/tiny-lib/package.json"]
+        })),
+        ClientMessage::NodeModulesChanged(_),
+    ));
+}
+
+fn decode_client_message(value: serde_json::Value) -> ClientMessage {
+    let payload = rmp_serde::to_vec(&value).expect("message should encode");
+    rmp_serde::from_slice(&payload).expect("message should decode")
 }

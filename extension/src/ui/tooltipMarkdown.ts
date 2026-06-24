@@ -1,7 +1,7 @@
 import type { ImportAnalysisInsight } from "../analysis/state.js";
 import type { ImportLensConfig } from "../config.js";
 import type { ImportResult } from "../ipc/protocol.js";
-import type { ImportRuntime } from "../imports/types.js";
+import type { ImportRuntime } from "../ipc/protocol.js";
 import { confidenceVisualFor } from "./confidenceVisuals.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import { formatBytes, type CompressionFormat } from "./format.js";

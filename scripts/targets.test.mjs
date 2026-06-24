@@ -21,18 +21,16 @@ test("platformTargets lists every supported native VSIX target", () => {
   ]);
 });
 
-test("targetInfo maps VSIX targets to Rust targets, binaries, and parser bindings", () => {
+test("targetInfo maps VSIX targets to Rust targets and binaries", () => {
   assert.deepEqual(targetInfo("win32-arm64"), {
     platformTarget: "win32-arm64",
     rustTarget: "aarch64-pc-windows-msvc",
     binaryName: "import-lens-daemon.exe",
-    oxcParserBinding: "@oxc-parser/binding-win32-arm64-msvc",
   });
   assert.deepEqual(targetInfo("linux-arm64"), {
     platformTarget: "linux-arm64",
     rustTarget: "aarch64-unknown-linux-gnu",
     binaryName: "import-lens-daemon",
-    oxcParserBinding: "@oxc-parser/binding-linux-arm64-gnu",
   });
 });
 

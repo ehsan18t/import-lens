@@ -13,6 +13,13 @@ export const showReport = async (
   logger: Pick<Logger, "info" | "warn">,
 ): Promise<void> => {
   logger.info("Building workspace report.");
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+  if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
+    await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
+    return;
+  }
+
   let items;
 
   try {

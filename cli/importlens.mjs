@@ -9,15 +9,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { decode, encode } from "@msgpack/msgpack";
-import {
-  ExportImportNameKind,
-  ImportNameKind,
-  parseSync,
-} from "oxc-parser";
 
 const execFile = promisify(execFileCallback);
-const protocolVersion = 4;
-const supportedExtensions = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts"]);
+const protocolVersion = 5;
+const supportedExtensions = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts", ".svelte", ".vue", ".astro"]);
 const defaultIpcTimeoutMs = 10000;
 
 export const parseCliArgs = (argv) => {
@@ -165,33 +160,13 @@ const changedFiles = async (cwd) => {
 
 const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
   const source = await readFile(filePath, "utf8");
-  const imports = [];
-
-  for (const detected of extractRuntimeImports(filePath, source)) {
-    const version = await resolveInstalledVersion(detected.packageName, filePath);
-    if (version) {
-      imports.push({
-        specifier: detected.specifier,
-        package: detected.packageName,
-        version,
-        named: detected.named,
-        import_kind: detected.importKind,
-        runtime: "component",
-      });
-    }
-  }
-
-  if (imports.length === 0) {
-    return { filePath, brotliBytes: 0, imports: [] };
-  }
-
   const response = await daemon.request({
-    type: "file_size",
+    type: "file_size_document",
     version: protocolVersion,
     request_id: Date.now(),
     workspace_root: workspaceRoot,
     active_document_path: filePath,
-    imports,
+    source,
   });
 
   if (response.error) {
@@ -411,119 +386,6 @@ const requestIdForMessage = (message) => {
   return message.request_id;
 };
 
-const extractRuntimeImports = (filePath, source) => {
-  const parsed = parseSync(filePath, source, {
-    sourceType: "module",
-    astType: "ts",
-    lang: filePath.endsWith("x") ? "tsx" : "ts",
-  });
-  const imports = [];
-
-  for (const item of parsed.module.staticImports) {
-    const specifier = item.moduleRequest.value;
-    if (!isRuntimePackageSpecifier(specifier)) {
-      continue;
-    }
-
-    const entries = item.entries.filter((entry) => !entry.isType);
-    const named = entries
-      .filter((entry) => entry.importName.kind === ImportNameKind.Name && entry.importName.name)
-      .map((entry) => entry.importName.name)
-      .sort();
-
-    if (entries.length === 0 && item.entries.length === 0) {
-      imports.push(detected(specifier, "namespace"));
-    }
-    if (entries.some((entry) => entry.importName.kind === ImportNameKind.Default)) {
-      imports.push(detected(specifier, "default"));
-    }
-    if (entries.some((entry) => entry.importName.kind === ImportNameKind.NamespaceObject)) {
-      imports.push(detected(specifier, "namespace"));
-    }
-    if (named.length > 0) {
-      imports.push(detected(specifier, "named", named));
-    }
-  }
-
-  for (const item of parsed.module.staticExports) {
-    const moduleRequest = item.entries.find((entry) => entry.moduleRequest)?.moduleRequest;
-    if (!moduleRequest || !isRuntimePackageSpecifier(moduleRequest.value)) {
-      continue;
-    }
-
-    const named = item.entries
-      .filter((entry) => entry.importName.kind === ExportImportNameKind.Name && entry.importName.name)
-      .map((entry) => entry.importName.name)
-      .sort();
-
-    if (item.entries.some((entry) => entry.importName.kind === ExportImportNameKind.All || entry.importName.kind === ExportImportNameKind.AllButDefault)) {
-      imports.push(detected(moduleRequest.value, "namespace"));
-    }
-    if (named.length > 0) {
-      imports.push(detected(moduleRequest.value, "named", named));
-    }
-  }
-
-  for (const item of parsed.module.dynamicImports) {
-    const specifier = literalDynamicImportSpecifier(source.slice(item.moduleRequest.start, item.moduleRequest.end));
-    if (specifier && isRuntimePackageSpecifier(specifier)) {
-      imports.push(detected(specifier, "dynamic"));
-    }
-  }
-
-  return imports;
-};
-
-const detected = (specifier, importKind, named = []) => ({
-  specifier,
-  packageName: packageNameForSpecifier(specifier),
-  importKind,
-  named,
-});
-
-const literalDynamicImportSpecifier = (value) => {
-  const first = value.at(0);
-  const last = value.at(-1);
-  if ((first === "'" || first === '"') && first === last) {
-    return value.slice(1, -1);
-  }
-  if (first === "`" && last === "`" && !value.includes("${")) {
-    return value.slice(1, -1);
-  }
-  return null;
-};
-
-const resolveInstalledVersion = async (packageName, activeFilePath) => {
-  const packageJson = resolvePackageJson(packageName, path.dirname(activeFilePath));
-  if (!packageJson) {
-    return null;
-  }
-
-  try {
-    const manifest = JSON.parse(await readFile(packageJson, "utf8"));
-    return typeof manifest.version === "string" ? manifest.version : "unknown";
-  } catch {
-    return "unknown";
-  }
-};
-
-const resolvePackageJson = (packageName, fromDirectory) => {
-  let current = fromDirectory;
-
-  while (true) {
-    const candidate = path.join(current, "node_modules", packageName, "package.json");
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-
-    const parent = path.dirname(current);
-    if (parent === current) {
-      return null;
-    }
-    current = parent;
-  }
-};
-
 const sanitizeBudgets = (value) => {
   if (!value || typeof value !== "object") {
     return {};
@@ -541,21 +403,6 @@ const sanitizeBudgets = (value) => {
 
 const hasBudgets = (budgets) =>
   budgets.perImportBrotliBytes !== undefined || budgets.perFileBrotliBytes !== undefined;
-
-const packageNameForSpecifier = (specifier) => {
-  if (specifier.startsWith("@")) {
-    return specifier.split("/").slice(0, 2).join("/");
-  }
-
-  return specifier.split("/")[0];
-};
-
-const isRuntimePackageSpecifier = (specifier) =>
-  Boolean(specifier)
-  && !specifier.startsWith(".")
-  && !specifier.startsWith("/")
-  && !specifier.startsWith("node:")
-  && !specifier.includes("://");
 
 const platformTarget = () => {
   const key = `${process.platform}-${os.arch()}`;

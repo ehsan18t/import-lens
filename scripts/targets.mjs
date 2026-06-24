@@ -16,7 +16,6 @@ const targets = new Map([
       platformTarget: "win32-x64",
       rustTarget: "x86_64-pc-windows-msvc",
       binaryName: "import-lens-daemon.exe",
-      oxcParserBinding: "@oxc-parser/binding-win32-x64-msvc",
     },
   ],
   [
@@ -25,7 +24,6 @@ const targets = new Map([
       platformTarget: "win32-arm64",
       rustTarget: "aarch64-pc-windows-msvc",
       binaryName: "import-lens-daemon.exe",
-      oxcParserBinding: "@oxc-parser/binding-win32-arm64-msvc",
     },
   ],
   [
@@ -34,7 +32,6 @@ const targets = new Map([
       platformTarget: "linux-x64",
       rustTarget: "x86_64-unknown-linux-gnu",
       binaryName: "import-lens-daemon",
-      oxcParserBinding: "@oxc-parser/binding-linux-x64-gnu",
     },
   ],
   [
@@ -43,7 +40,6 @@ const targets = new Map([
       platformTarget: "linux-arm64",
       rustTarget: "aarch64-unknown-linux-gnu",
       binaryName: "import-lens-daemon",
-      oxcParserBinding: "@oxc-parser/binding-linux-arm64-gnu",
     },
   ],
   [
@@ -52,7 +48,6 @@ const targets = new Map([
       platformTarget: "darwin-x64",
       rustTarget: "x86_64-apple-darwin",
       binaryName: "import-lens-daemon",
-      oxcParserBinding: "@oxc-parser/binding-darwin-x64",
     },
   ],
   [
@@ -61,7 +56,6 @@ const targets = new Map([
       platformTarget: "darwin-arm64",
       rustTarget: "aarch64-apple-darwin",
       binaryName: "import-lens-daemon",
-      oxcParserBinding: "@oxc-parser/binding-darwin-arm64",
     },
   ],
 ]);

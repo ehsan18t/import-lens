@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { budgetViolationsForStates } from "../analysis/budgets.js";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
-import type { SourceRange } from "../imports/types.js";
+import type { SourceRange } from "../ipc/protocol.js";
 
 export class BudgetDiagnosticsController implements vscode.Disposable {
   readonly #store: AnalysisStore;

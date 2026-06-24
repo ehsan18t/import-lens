@@ -6,13 +6,10 @@ import {
   recordBundleImpactHistory,
   type BundleImpactHistoryItem,
 } from "../analysis/history.js";
-import { createImportRequest } from "../analysis/request.js";
 import { formatCurrentFileSizeSummary } from "../analysis/fileSize.js";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
-import { extractRuntimeImports } from "../imports/parser.js";
-import { resolveInstalledPackage } from "../imports/resolver.js";
-import { protocolVersion, type ImportRequest } from "../ipc/protocol.js";
+import { protocolVersion } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import { supportedLanguageIds } from "../languages.js";
 import type { ImportLensLogger } from "../logger.js";
@@ -38,28 +35,6 @@ export const showCurrentFileSize = async (
   }
 
   const config = getImportLensConfig();
-  const detectedImports = extractRuntimeImports(document.fileName, document.getText());
-
-  if (detectedImports.length === 0) {
-    await vscode.window.showInformationMessage("Current file: no runtime package imports found.");
-    return;
-  }
-
-  const imports: ImportRequest[] = [];
-
-  for (const detected of detectedImports) {
-    const resolution = await resolveInstalledPackage(detected.specifier, document.fileName);
-
-    if (resolution.ok) {
-      imports.push(createImportRequest(detected, resolution.version));
-    }
-  }
-
-  if (imports.length === 0) {
-    await vscode.window.showWarningMessage("ImportLens could not resolve any runtime package imports in the current file.");
-    return;
-  }
-
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
   const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
 
@@ -74,13 +49,13 @@ export const showCurrentFileSize = async (
         location: vscode.ProgressLocation.Notification,
         title: "ImportLens: Calculating current file size",
       },
-      () => daemon.requestFileSize({
-        type: "file_size",
+      () => daemon.requestFileSizeDocument({
+        type: "file_size_document",
         version: protocolVersion,
         request_id: nextIpcRequestId(),
         workspace_root: workspaceRoot,
         active_document_path: document.fileName,
-        imports,
+        source: document.getText(),
       }),
     );
 
@@ -91,6 +66,16 @@ export const showCurrentFileSize = async (
 
     if (response.error) {
       await vscode.window.showWarningMessage(`ImportLens current-file size unavailable: ${response.error}`);
+      return;
+    }
+
+    if (response.states.length === 0) {
+      await vscode.window.showInformationMessage("Current file: no runtime package imports found.");
+      return;
+    }
+
+    if (response.imports.length === 0) {
+      await vscode.window.showWarningMessage("ImportLens could not resolve any runtime package imports in the current file.");
       return;
     }
 
@@ -110,7 +95,7 @@ export const showCurrentFileSize = async (
     );
     await recordBundleImpactHistory(context.globalState, currentHistoryItem);
 
-    const skipped = detectedImports.length - imports.length;
+    const skipped = response.states.length - response.imports.length;
     const skippedSuffix = skipped > 0 ? ` · ${skipped} skipped` : "";
     const diffSuffix = previous ? ` · ${bundleImpactHistoryDeltaLabel(currentHistoryItem, previous)}` : "";
     await vscode.window.showInformationMessage(`${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}${diffSuffix}`);

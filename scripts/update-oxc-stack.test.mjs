@@ -54,13 +54,18 @@ test("updateOxcStack dry-run reports planned edits without writing files or lock
 
   assert.equal(result.oxcVersion, "0.135.0");
   assert.equal(result.resolverVersion, "11.22.0");
-  assert.deepEqual(result.changedFiles.sort(), Object.values(repo.paths).sort());
+  assert.deepEqual(result.changedFiles.sort(), [
+    repo.paths.cargoToml,
+    repo.paths.config,
+    repo.paths.manifest,
+    repo.paths.srs,
+  ].sort());
   assert.deepEqual(writes, []);
   assert.deepEqual(execs, []);
   assert.match(await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8"), /oxc_parser = "0\.134\.0"/);
 });
 
-test("updateOxcStack updates manifests, policy tests, SRS, config, and lockfiles", async () => {
+test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () => {
   const repo = await tempRepo();
   const execs = [];
 
@@ -75,7 +80,6 @@ test("updateOxcStack updates manifests, policy tests, SRS, config, and lockfiles
 
   const cargoToml = await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8");
   const manifest = JSON.parse(await readFile(path.join(repo.root, repo.paths.manifest), "utf8"));
-  const dependencyPolicy = await readFile(path.join(repo.root, repo.paths.dependencyPolicyTest), "utf8");
   const packageVsix = await readFile(path.join(repo.root, repo.paths.packageVsixManifestTest), "utf8");
   const srs = await readFile(path.join(repo.root, repo.paths.srs), "utf8");
   const config = await readFile(path.join(repo.root, repo.paths.config), "utf8");
@@ -85,9 +89,8 @@ test("updateOxcStack updates manifests, policy tests, SRS, config, and lockfiles
   }
 
   assert.match(cargoToml, /^oxc_resolver = "11\.22\.0"$/mu);
-  assert.equal(manifest.dependencies["oxc-parser"], "0.135.0");
-  assert.match(dependencyPolicy, /0\.135\.0/);
-  assert.match(packageVsix, /0\.135\.0/);
+  assert.equal(manifest.dependencies["oxc-parser"], undefined);
+  assert.doesNotMatch(packageVsix, /oxc-parser/);
   assert.match(srs, /0\.135\.0/);
   assert.match(srs, /11\.22\.0/);
   assert.match(config, /currentOxcVersion: "0\.135\.0"/);
@@ -110,8 +113,8 @@ test("updateOxcStack resolves latest versions before editing", async () => {
     paths: repo.paths,
     dryRun: true,
     fetchJson: async (url) => {
-      if (url.endsWith("/oxc-parser/latest")) {
-        return { version: "0.136.0" };
+      if (url.endsWith("/oxc_parser")) {
+        return { crate: { max_stable_version: "0.136.0" }, versions: [] };
       }
       if (url.endsWith("/oxc_resolver")) {
         return { crate: { max_stable_version: "11.23.0" }, versions: [] };
@@ -138,11 +141,8 @@ test("updateOxcStack reports no changed files when target versions and scripts a
     paths: repo.paths,
     dryRun: true,
     oxcVersion: "0.134.0",
-    resolverVersion: "11.21.0",
-    fetchJson: async (url) => {
-      if (url.endsWith("/oxc-parser/0.134.0")) {
-        return { version: "0.134.0" };
-      }
+      resolverVersion: "11.21.0",
+      fetchJson: async (url) => {
       if (url.endsWith("/oxc_resolver/11.21.0")) {
         return { version: { num: "11.21.0" } };
       }
@@ -180,7 +180,7 @@ test("updateOxcStack rejects invalid or unavailable versions before edits", asyn
       resolverVersion: "11.22.0",
       fetchJson: availableVersions(),
     }),
-    /Unavailable OXC version/,
+    /Unavailable OXC crate/,
   );
 
   assert.equal(await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8"), before);
@@ -220,14 +220,8 @@ test("updateOxcStack rejects non-coordinated current OXC crates and oxc_mangler 
 const availableVersions = () => async (url) => availableVersionPayload(url);
 
 const availableVersionPayload = (url) => {
-  if (url.endsWith("/oxc-parser/latest")) {
-    return { version: "0.135.0" };
-  }
-  if (url.endsWith("/oxc-parser/0.135.0")) {
-    return { version: "0.135.0" };
-  }
-  if (url.endsWith("/oxc-parser/0.136.0")) {
-    return { version: "0.136.0" };
+  if (url.endsWith("/oxc_parser")) {
+    return { crate: { max_stable_version: "0.135.0" }, versions: [{ num: "0.135.0" }, { num: "0.136.0" }] };
   }
   if (url.endsWith("/oxc_resolver")) {
     return { crate: { max_stable_version: "11.22.0" }, versions: [{ num: "11.22.0" }, { num: "11.23.0" }] };
@@ -258,23 +252,20 @@ const manifestFixture = () => ({
   },
   dependencies: {
     "@msgpack/msgpack": "3.1.3",
-    "oxc-parser": "0.134.0",
   },
 });
 
 const dependencyPolicyFixture = () => `assert.match(cargoToml, /^oxc_parser = "0\\.134\\.0"$/mu);
 assert.match(cargoToml, /^oxc_resolver = "11\\.21\\.0"$/mu);
-assert.equal(manifest.dependencies["oxc-parser"], "0.134.0");
+assert.equal(manifest.dependencies["oxc-parser"], undefined);
 `;
 
-const packageVsixFixture = () => `const manifest = { dependencies: { "oxc-parser": "0.134.0" } };
-assert.equal(staged.dependencies["oxc-parser"], "0.134.0");
-assert.equal(staged.dependencies["@oxc-parser/binding-win32-x64-msvc"], "0.134.0");
+const packageVsixFixture = () => `const manifest = { dependencies: { "@msgpack/msgpack": "3.1.3" } };
+assert.deepEqual(staged.dependencies, { "@msgpack/msgpack": "3.1.3" });
 `;
 
 const srsFixture = () => `| \`oxc_parser\`      | 0.134.0 |
 | \`oxc_resolver\`    | 11.21.0 |
-| \`oxc-parser\`                         | 0.134.0 |
 currently resolved to 0.134.0
 Currently resolved to 11.21.0
 baseline v0.134.0

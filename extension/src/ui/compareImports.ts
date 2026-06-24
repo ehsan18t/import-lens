@@ -1,14 +1,10 @@
 import * as vscode from "vscode";
-import { createImportRequest } from "../analysis/request.js";
 import type { DaemonManager } from "../daemon/manager.js";
-import { getPackageName } from "../imports/specifier.js";
-import { resolveInstalledPackage } from "../imports/resolver.js";
-import type { DetectedImport } from "../imports/types.js";
-import { protocolVersion, type ImportRequest } from "../ipc/protocol.js";
+import { protocolVersion } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import { analysisRootForFile } from "../workspaceContext.js";
 import type { Logger } from "../logging/types.js";
-import { compareImportItemsForResponse } from "./compareImportItems.js";
+import { compareImportItemsForResults } from "./compareImportItems.js";
 
 export const compareImportsCommand = "importLens.compareImports";
 
@@ -39,22 +35,6 @@ export const compareImports = async (
     return;
   }
 
-  const imports: ImportRequest[] = [];
-
-  for (const specifier of specifiers) {
-    const resolution = await resolveInstalledPackage(specifier, editor.document.fileName);
-    if (!resolution.ok) {
-      continue;
-    }
-
-    imports.push(createImportRequest(detectedImport(specifier), resolution.version));
-  }
-
-  if (imports.length === 0) {
-    await vscode.window.showWarningMessage("ImportLens could not resolve any imports to compare.");
-    return;
-  }
-
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
   const workspaceRoot = await analysisRootForFile(editor.document.fileName, workspaceFolder?.uri.fsPath);
 
@@ -63,17 +43,18 @@ export const compareImports = async (
     return;
   }
 
-  logger.debug(`Comparing ${imports.length} import(s): ${specifiers.join(", ")}.`);
+  logger.debug(`Comparing ${specifiers.length} import(s): ${specifiers.join(", ")}.`);
 
-  let response: Awaited<ReturnType<DaemonManager["sendBatch"]>>;
+  let response: Awaited<ReturnType<DaemonManager["analyzeSpecifiers"]>>;
 
   try {
-    response = await daemon.sendBatch({
+    response = await daemon.analyzeSpecifiers({
+      type: "analyze_specifiers",
       version: protocolVersion,
       request_id: nextIpcRequestId(),
       workspace_root: workspaceRoot,
       active_document_path: editor.document.fileName,
-      imports,
+      specifiers,
     });
   } catch (error) {
     logger.warn(`Import comparison failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -81,7 +62,7 @@ export const compareImports = async (
     return;
   }
 
-  const { items, warning } = compareImportItemsForResponse(response);
+  const { items, warning } = compareImportItemsForResults(response?.imports.flatMap((item) => item.result ? [item.result] : []) ?? null);
 
   if (warning) {
     await vscode.window.showWarningMessage(warning);
@@ -93,22 +74,3 @@ export const compareImports = async (
     placeHolder: "Imports sorted by Brotli size",
   });
 };
-
-const detectedImport = (specifier: string): DetectedImport => ({
-  specifier,
-  packageName: getPackageName(specifier),
-  named: [],
-  importKind: "namespace",
-  syntax: "static",
-  runtime: "component",
-  line: 0,
-  quoteEnd: { line: 0, character: 0 },
-  specifierRange: {
-    start: { line: 0, character: 0 },
-    end: { line: 0, character: 0 },
-  },
-  statementRange: {
-    start: { line: 0, character: 0 },
-    end: { line: 0, character: 0 },
-  },
-});

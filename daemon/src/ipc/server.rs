@@ -2,8 +2,12 @@ use crate::{
     ipc::{
         codec::{FrameDecoder, decode_payload, encode_frame},
         protocol::{
-            BatchRequest, BatchResponse, ClientMessage, EnumerateExportsRequest,
-            EnumerateExportsResponse, FileSizeRequest, FileSizeResponse, PROTOCOL_VERSION,
+            AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
+            AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
+            BatchRequest, BatchResponse, ClientMessage, CompleteImportMembersRequest,
+            CompleteImportMembersResponse, EnumerateExportsRequest, EnumerateExportsResponse,
+            FileSizeDocumentRequest, FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse,
+            ImportDiagnostic, PROTOCOL_VERSION,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
@@ -204,6 +208,66 @@ where
                     );
                     stream.write_all(&encode_frame(&response)?).await?;
                 }
+                ClientMessage::AnalyzeDocument(request) if hello_received => {
+                    prefetcher.cancel();
+                    lifecycle.record_batch();
+                    let svc = std::sync::Arc::clone(&service);
+                    let request_for_error = request.clone();
+                    let response_handle =
+                        tokio::task::spawn_blocking(move || svc.handle_analyze_document(request));
+                    let response =
+                        analyze_document_response_from_join(response_handle, &request_for_error)
+                            .await;
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::AnalyzeDocument(request) => {
+                    let response = protocol_error_analyze_document_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    );
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::AnalyzePackageJson(request) if hello_received => {
+                    prefetcher.cancel();
+                    lifecycle.record_batch();
+                    let svc = std::sync::Arc::clone(&service);
+                    let request_for_error = request.clone();
+                    let response_handle = tokio::task::spawn_blocking(move || {
+                        svc.handle_analyze_package_json(request)
+                    });
+                    let response = analyze_package_json_response_from_join(
+                        response_handle,
+                        &request_for_error,
+                    )
+                    .await;
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::AnalyzePackageJson(request) => {
+                    let response = protocol_error_analyze_package_json_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    );
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::AnalyzeSpecifiers(request) if hello_received => {
+                    prefetcher.cancel();
+                    lifecycle.record_batch();
+                    let svc = std::sync::Arc::clone(&service);
+                    let request_for_error = request.clone();
+                    let response_handle =
+                        tokio::task::spawn_blocking(move || svc.handle_analyze_specifiers(request));
+                    let response =
+                        analyze_specifiers_response_from_join(response_handle, &request_for_error)
+                            .await;
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::AnalyzeSpecifiers(request) => {
+                    let response = protocol_error_analyze_specifiers_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    );
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
                 ClientMessage::CacheInvalidate(message) if hello_received => {
                     service.invalidate_package(&message.package_name);
                 }
@@ -216,6 +280,11 @@ where
                         PathBuf::from(message.package_json_path),
                         PathBuf::from(message.active_document_path),
                     );
+                }
+                ClientMessage::NodeModulesChanged(message) if hello_received => {
+                    if service.invalidate_package_json_paths(&message.package_json_paths) {
+                        prefetcher.cancel();
+                    }
                 }
                 ClientMessage::EnumerateExports(request) if hello_received => {
                     let svc = std::sync::Arc::clone(&service);
@@ -249,10 +318,47 @@ where
                     );
                     stream.write_all(&encode_frame(&response)?).await?;
                 }
+                ClientMessage::FileSizeDocument(request) if hello_received => {
+                    let svc = std::sync::Arc::clone(&service);
+                    let request_for_error = request.clone();
+                    let response_handle =
+                        tokio::task::spawn_blocking(move || svc.handle_file_size_document(request));
+                    let response =
+                        file_size_document_response_from_join(response_handle, &request_for_error)
+                            .await;
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::FileSizeDocument(request) => {
+                    let response = protocol_error_file_size_document_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    );
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::CompleteImportMembers(request) if hello_received => {
+                    let svc = std::sync::Arc::clone(&service);
+                    let request_for_error = request.clone();
+                    let response_handle =
+                        tokio::task::spawn_blocking(move || svc.complete_import_members(request));
+                    let response = complete_import_members_response_from_join(
+                        response_handle,
+                        &request_for_error,
+                    )
+                    .await;
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
+                ClientMessage::CompleteImportMembers(request) => {
+                    let response = protocol_error_complete_import_members_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    );
+                    stream.write_all(&encode_frame(&response)?).await?;
+                }
                 ClientMessage::Shutdown(_) => {
                     return Ok(());
                 }
                 ClientMessage::PrewarmPackageJson(_)
+                | ClientMessage::NodeModulesChanged(_)
                 | ClientMessage::CacheInvalidate(_)
                 | ClientMessage::CacheInvalidateAll(_) => {}
             }
@@ -292,8 +398,148 @@ async fn file_size_response_from_join(
     }
 }
 
+async fn analyze_document_response_from_join(
+    response_handle: JoinHandle<AnalyzeDocumentResponse>,
+    request: &AnalyzeDocumentRequest,
+) -> AnalyzeDocumentResponse {
+    match response_handle.await {
+        Ok(response) => response,
+        Err(error) => protocol_error_analyze_document_response(request, join_error_message(error)),
+    }
+}
+
+async fn analyze_package_json_response_from_join(
+    response_handle: JoinHandle<AnalyzePackageJsonResponse>,
+    request: &AnalyzePackageJsonRequest,
+) -> AnalyzePackageJsonResponse {
+    match response_handle.await {
+        Ok(response) => response,
+        Err(error) => {
+            protocol_error_analyze_package_json_response(request, join_error_message(error))
+        }
+    }
+}
+
+async fn analyze_specifiers_response_from_join(
+    response_handle: JoinHandle<AnalyzeSpecifiersResponse>,
+    request: &AnalyzeSpecifiersRequest,
+) -> AnalyzeSpecifiersResponse {
+    match response_handle.await {
+        Ok(response) => response,
+        Err(error) => {
+            protocol_error_analyze_specifiers_response(request, join_error_message(error))
+        }
+    }
+}
+
+async fn file_size_document_response_from_join(
+    response_handle: JoinHandle<FileSizeDocumentResponse>,
+    request: &FileSizeDocumentRequest,
+) -> FileSizeDocumentResponse {
+    match response_handle.await {
+        Ok(response) => response,
+        Err(error) => {
+            protocol_error_file_size_document_response(request, join_error_message(error))
+        }
+    }
+}
+
+async fn complete_import_members_response_from_join(
+    response_handle: JoinHandle<CompleteImportMembersResponse>,
+    request: &CompleteImportMembersRequest,
+) -> CompleteImportMembersResponse {
+    match response_handle.await {
+        Ok(response) => response,
+        Err(error) => {
+            protocol_error_complete_import_members_response(request, join_error_message(error))
+        }
+    }
+}
+
 fn join_error_message(error: tokio::task::JoinError) -> String {
     format!("analysis worker failed: {error}")
+}
+
+fn protocol_error_analyze_document_response(
+    request: &AnalyzeDocumentRequest,
+    message: String,
+) -> AnalyzeDocumentResponse {
+    AnalyzeDocumentResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        imports: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn protocol_error_analyze_package_json_response(
+    request: &AnalyzePackageJsonRequest,
+    message: String,
+) -> AnalyzePackageJsonResponse {
+    AnalyzePackageJsonResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        sections: Vec::new(),
+        states: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn protocol_error_analyze_specifiers_response(
+    request: &AnalyzeSpecifiersRequest,
+    message: String,
+) -> AnalyzeSpecifiersResponse {
+    AnalyzeSpecifiersResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        imports: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn protocol_error_file_size_document_response(
+    request: &FileSizeDocumentRequest,
+    message: String,
+) -> FileSizeDocumentResponse {
+    FileSizeDocumentResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        raw_bytes: 0,
+        minified_bytes: 0,
+        gzip_bytes: 0,
+        brotli_bytes: 0,
+        zstd_bytes: 0,
+        imports: Vec::new(),
+        states: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn protocol_error_complete_import_members_response(
+    request: &CompleteImportMembersRequest,
+    message: String,
+) -> CompleteImportMembersResponse {
+    CompleteImportMembersResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        specifier: None,
+        exports: Vec::new(),
+        imported_names: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn protocol_diagnostics(message: String) -> Vec<ImportDiagnostic> {
+    vec![ImportDiagnostic {
+        stage: "protocol".to_owned(),
+        message,
+        details: Vec::new(),
+    }]
 }
 
 fn is_supported_hello_version(version: u32) -> bool {

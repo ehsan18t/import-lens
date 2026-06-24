@@ -9,7 +9,6 @@ import { oxcStackConfig } from "./oxc-stack.config.mjs";
 import {
   formatOxcUpdateResult,
   latestCrateVersion,
-  latestNpmVersion,
   replaceKnownVersions,
   updateCargoToml,
   updateConfig,
@@ -85,7 +84,7 @@ export const updateOxcStack = async ({
   const files = await readFiles(absolutePaths, readFile);
   validateCurrentStack(files.cargoToml, files.manifestJson);
 
-  const targetOxcVersion = oxcVersion ?? (await latestNpmVersion(fetchJson, "oxc-parser"));
+  const targetOxcVersion = oxcVersion ?? (await latestCrateVersion(fetchJson, "oxc_parser"));
   const targetResolverVersion = resolverVersion ?? (await latestCrateVersion(fetchJson, "oxc_resolver"));
 
   validateVersion("OXC", targetOxcVersion);
@@ -176,7 +175,7 @@ const printHelp = () => {
   process.stdout.write(`Usage: pnpm deps:update:oxc -- [options]
 
 Options:
-  --oxc <version>       Target OXC monorepo version. Defaults to latest oxc-parser.
+  --oxc <version>       Target OXC monorepo version. Defaults to latest oxc_parser crate.
   --resolver <version>  Target oxc_resolver version. Defaults to latest stable crate.
   --dry-run            Validate and print planned file edits without writing.
   -h, --help           Show this help.

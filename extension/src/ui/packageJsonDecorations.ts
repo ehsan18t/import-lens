@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { PackageJsonAnalysisController, PackageJsonDependencyAnalysisState } from "../guidance/packageJsonAnalysis.js";
-import type { PackageJsonDependencySection } from "../guidance/packageJsonDependencies.js";
+import type { PackageJsonDependencySection } from "../ipc/protocol.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
 import { getImportLensConfig } from "../config.js";
 import { shouldShowPackageJsonDecorations } from "./displayGuards.js";

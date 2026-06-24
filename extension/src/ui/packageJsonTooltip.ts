@@ -1,6 +1,6 @@
 import type { ImportLensConfig } from "../config.js";
-import type { PackageJsonDependencySectionName } from "../guidance/packageJsonDependencies.js";
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
+import type { PackageJsonDependencySectionName } from "../ipc/protocol.js";
 import {
   isFreshLatestRelease,
   packageJsonDependencyVersionStatusLabel,

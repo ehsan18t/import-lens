@@ -1,11 +1,21 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
 import type {
+  AnalyzeDocumentRequest,
+  AnalyzeDocumentResponse,
+  AnalyzePackageJsonRequest,
+  AnalyzePackageJsonResponse,
+  AnalyzeSpecifiersRequest,
+  AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
   ClientMessage,
+  CompleteImportMembersRequest,
+  CompleteImportMembersResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeDocumentRequest,
+  FileSizeDocumentResponse,
   FileSizeRequest,
   FileSizeResponse,
 } from "./protocol.js";
@@ -23,13 +33,8 @@ interface PendingBatchRequest {
   onPartial?: (response: BatchResponse) => void;
 }
 
-interface PendingExportsRequest {
-  resolve: (response: EnumerateExportsResponse) => void;
-  reject: (error: Error) => void;
-}
-
-interface PendingFileSizeRequest {
-  resolve: (response: FileSizeResponse) => void;
+interface PendingRequest<TResponse> {
+  resolve: (response: TResponse) => void;
   reject: (error: Error) => void;
 }
 
@@ -37,8 +42,13 @@ export class IpcClient extends EventEmitter {
   readonly #socket: net.Socket;
   readonly #decoder = new FrameDecoder();
   readonly #batchPending = new Map<number, PendingBatchRequest>();
-  readonly #exportsPending = new Map<number, PendingExportsRequest>();
-  readonly #fileSizePending = new Map<number, PendingFileSizeRequest>();
+  readonly #documentPending = new Map<number, PendingRequest<AnalyzeDocumentResponse>>();
+  readonly #packageJsonPending = new Map<number, PendingRequest<AnalyzePackageJsonResponse>>();
+  readonly #specifiersPending = new Map<number, PendingRequest<AnalyzeSpecifiersResponse>>();
+  readonly #exportsPending = new Map<number, PendingRequest<EnumerateExportsResponse>>();
+  readonly #fileSizePending = new Map<number, PendingRequest<FileSizeResponse>>();
+  readonly #fileSizeDocumentPending = new Map<number, PendingRequest<FileSizeDocumentResponse>>();
+  readonly #completionPending = new Map<number, PendingRequest<CompleteImportMembersResponse>>();
   readonly #logger?: Pick<Logger, "debug" | "warn">;
   #closed = false;
   #disposed = false;
@@ -120,45 +130,69 @@ export class IpcClient extends EventEmitter {
     });
   }
 
+  requestAnalyzeDocument(
+    request: AnalyzeDocumentRequest,
+    timeoutMs = 10000,
+  ): Promise<AnalyzeDocumentResponse> {
+    return this.#requestWithPending(this.#documentPending, request, timeoutMs);
+  }
+
+  requestAnalyzePackageJson(
+    request: AnalyzePackageJsonRequest,
+    timeoutMs = 10000,
+  ): Promise<AnalyzePackageJsonResponse> {
+    return this.#requestWithPending(this.#packageJsonPending, request, timeoutMs);
+  }
+
+  requestAnalyzeSpecifiers(
+    request: AnalyzeSpecifiersRequest,
+    timeoutMs = 10000,
+  ): Promise<AnalyzeSpecifiersResponse> {
+    return this.#requestWithPending(this.#specifiersPending, request, timeoutMs);
+  }
+
   requestExports(
     request: EnumerateExportsRequest,
     timeoutMs = 10000,
   ): Promise<EnumerateExportsResponse> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.#exportsPending.has(request.request_id)) {
-          this.#exportsPending.delete(request.request_id);
-          reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
-        }
-      }, timeoutMs);
-
-      this.#exportsPending.set(request.request_id, {
-        resolve: (response) => {
-          clearTimeout(timer);
-          resolve(response);
-        },
-        reject: (error) => {
-          clearTimeout(timer);
-          reject(error);
-        },
-      });
-      this.send(request);
-    });
+    return this.#requestWithPending(this.#exportsPending, request, timeoutMs);
   }
 
   requestFileSize(
     request: FileSizeRequest,
     timeoutMs = 10000,
   ): Promise<FileSizeResponse> {
+    return this.#requestWithPending(this.#fileSizePending, request, timeoutMs);
+  }
+
+  requestFileSizeDocument(
+    request: FileSizeDocumentRequest,
+    timeoutMs = 10000,
+  ): Promise<FileSizeDocumentResponse> {
+    return this.#requestWithPending(this.#fileSizeDocumentPending, request, timeoutMs);
+  }
+
+  requestCompleteImportMembers(
+    request: CompleteImportMembersRequest,
+    timeoutMs = 10000,
+  ): Promise<CompleteImportMembersResponse> {
+    return this.#requestWithPending(this.#completionPending, request, timeoutMs);
+  }
+
+  #requestWithPending<TRequest extends { request_id: number }, TResponse>(
+    pendingMap: Map<number, PendingRequest<TResponse>>,
+    request: TRequest & ClientMessage,
+    timeoutMs: number,
+  ): Promise<TResponse> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (this.#fileSizePending.has(request.request_id)) {
-          this.#fileSizePending.delete(request.request_id);
+        if (pendingMap.has(request.request_id)) {
+          pendingMap.delete(request.request_id);
           reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
         }
       }, timeoutMs);
 
-      this.#fileSizePending.set(request.request_id, {
+      pendingMap.set(request.request_id, {
         resolve: (response) => {
           clearTimeout(timer);
           resolve(response);
@@ -195,14 +229,32 @@ export class IpcClient extends EventEmitter {
     }
 
     for (const message of messages) {
+      if (isAnalyzePackageJsonResponse(message)) {
+        this.#resolvePending(this.#packageJsonPending, message);
+        continue;
+      }
+
+      if (isCompleteImportMembersResponse(message)) {
+        this.#resolvePending(this.#completionPending, message);
+        continue;
+      }
+
+      if (isFileSizeDocumentResponse(message)) {
+        this.#resolvePending(this.#fileSizeDocumentPending, message);
+        continue;
+      }
+
       if (isFileSizeResponse(message)) {
-        const pending = this.#fileSizePending.get(message.request_id);
-        if (!pending) {
+        this.#resolvePending(this.#fileSizePending, message);
+        continue;
+      }
+
+      if (isAnalyzeDocumentResponse(message)) {
+        if (this.#resolvePending(this.#documentPending, message)) {
           continue;
         }
 
-        this.#fileSizePending.delete(message.request_id);
-        pending.resolve(message);
+        this.#resolvePending(this.#specifiersPending, message);
         continue;
       }
 
@@ -228,14 +280,23 @@ export class IpcClient extends EventEmitter {
         continue;
       }
 
-      const pending = this.#exportsPending.get(message.request_id);
-      if (!pending) {
-        continue;
-      }
-
-      this.#exportsPending.delete(message.request_id);
-      pending.resolve(message);
+      this.#resolvePending(this.#exportsPending, message);
     }
+  }
+
+  #resolvePending<TResponse extends { request_id: number }>(
+    pendingMap: Map<number, PendingRequest<TResponse>>,
+    response: TResponse,
+  ): boolean {
+    const pending = pendingMap.get(response.request_id);
+
+    if (!pending) {
+      return false;
+    }
+
+    pendingMap.delete(response.request_id);
+    pending.resolve(response);
+    return true;
   }
 
   #handleClose(error: Error, emitDisconnect = true): void {
@@ -250,6 +311,18 @@ export class IpcClient extends EventEmitter {
       pending.reject(error);
     }
 
+    for (const pending of this.#documentPending.values()) {
+      pending.reject(error);
+    }
+
+    for (const pending of this.#packageJsonPending.values()) {
+      pending.reject(error);
+    }
+
+    for (const pending of this.#specifiersPending.values()) {
+      pending.reject(error);
+    }
+
     for (const pending of this.#exportsPending.values()) {
       pending.reject(error);
     }
@@ -258,9 +331,22 @@ export class IpcClient extends EventEmitter {
       pending.reject(error);
     }
 
+    for (const pending of this.#fileSizeDocumentPending.values()) {
+      pending.reject(error);
+    }
+
+    for (const pending of this.#completionPending.values()) {
+      pending.reject(error);
+    }
+
     this.#batchPending.clear();
+    this.#documentPending.clear();
+    this.#packageJsonPending.clear();
+    this.#specifiersPending.clear();
     this.#exportsPending.clear();
     this.#fileSizePending.clear();
+    this.#fileSizeDocumentPending.clear();
+    this.#completionPending.clear();
 
     if (emitDisconnect && !this.#disposed) {
       this.#logger?.warn(`IPC disconnected: ${error.message}`);
@@ -286,6 +372,42 @@ const isBatchResponse = (value: unknown): value is BatchResponse => {
 const isStreamingPartial = (response: BatchResponse): boolean =>
   Array.isArray(response.indexes) && response.indexes.length > 0;
 
+const isAnalyzeDocumentResponse = (value: unknown): value is AnalyzeDocumentResponse => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<AnalyzeDocumentResponse>;
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    Array.isArray(candidate.imports) &&
+    (candidate.error === null || typeof candidate.error === "string") &&
+    Array.isArray(candidate.diagnostics) &&
+    candidate.imports.every((item) =>
+      !!item &&
+      typeof item === "object" &&
+      "detected" in item &&
+      typeof (item as { status?: unknown }).status === "string")
+  );
+};
+
+const isAnalyzePackageJsonResponse = (value: unknown): value is AnalyzePackageJsonResponse => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<AnalyzePackageJsonResponse>;
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    Array.isArray(candidate.sections) &&
+    Array.isArray(candidate.states) &&
+    (candidate.error === null || typeof candidate.error === "string") &&
+    Array.isArray(candidate.diagnostics)
+  );
+};
+
 const isEnumerateExportsResponse = (value: unknown): value is EnumerateExportsResponse => {
   if (!value || typeof value !== "object") {
     return false;
@@ -303,6 +425,14 @@ const isEnumerateExportsResponse = (value: unknown): value is EnumerateExportsRe
   );
 };
 
+const isFileSizeDocumentResponse = (value: unknown): value is FileSizeDocumentResponse => {
+  if (!isFileSizeResponse(value)) {
+    return false;
+  }
+
+  return Array.isArray((value as Partial<FileSizeDocumentResponse>).states);
+};
+
 const isFileSizeResponse = (value: unknown): value is FileSizeResponse => {
   if (!value || typeof value !== "object") {
     return false;
@@ -318,6 +448,25 @@ const isFileSizeResponse = (value: unknown): value is FileSizeResponse => {
     typeof candidate.brotli_bytes === "number" &&
     typeof candidate.zstd_bytes === "number" &&
     Array.isArray(candidate.imports) &&
+    (candidate.error === null || typeof candidate.error === "string") &&
+    Array.isArray(candidate.diagnostics)
+  );
+};
+
+const isCompleteImportMembersResponse = (value: unknown): value is CompleteImportMembersResponse => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<CompleteImportMembersResponse>;
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    (candidate.specifier === null || typeof candidate.specifier === "string") &&
+    Array.isArray(candidate.exports) &&
+    candidate.exports.every((exportedName) => typeof exportedName === "string") &&
+    Array.isArray(candidate.imported_names) &&
+    candidate.imported_names.every((importedName) => typeof importedName === "string") &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics)
   );

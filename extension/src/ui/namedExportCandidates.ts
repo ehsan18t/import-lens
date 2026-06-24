@@ -1,9 +1,7 @@
 import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
-import { resolveInstalledPackage } from "../imports/resolver.js";
-import type { DetectedImport } from "../imports/types.js";
-import { protocolVersion } from "../ipc/protocol.js";
+import { protocolVersion, type DetectedImport } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { ImportLensLogger } from "../logger.js";
 import { analysisRootForFile } from "../workspaceContext.js";
@@ -20,17 +18,26 @@ export const showNamedExportCandidates = async (
     return;
   }
 
-  const resolution = await resolveInstalledPackage(detected.specifier, uri.fsPath);
-  if (!resolution.ok) {
-    await vscode.window.showWarningMessage(`ImportLens could not resolve ${detected.specifier}.`);
-    return;
-  }
-
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
   const workspaceRoot = await analysisRootForFile(uri.fsPath, workspaceFolder?.uri.fsPath);
 
   if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
     await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
+    return;
+  }
+
+  const analysis = await daemon.analyzeSpecifiers({
+    type: "analyze_specifiers",
+    version: protocolVersion,
+    request_id: nextIpcRequestId(),
+    workspace_root: workspaceRoot,
+    active_document_path: uri.fsPath,
+    specifiers: [detected.specifier],
+  });
+  const request = analysis?.imports.find((item) => item.detected.specifier === detected.specifier)?.request;
+
+  if (!request) {
+    await vscode.window.showWarningMessage(`ImportLens could not resolve ${detected.specifier}.`);
     return;
   }
 
@@ -41,8 +48,8 @@ export const showNamedExportCandidates = async (
     workspace_root: workspaceRoot,
     active_document_path: uri.fsPath,
     specifier: detected.specifier,
-    package: resolution.packageName,
-    package_version: resolution.version,
+    package: request.package,
+    package_version: request.version,
   });
 
   if (!response || response.error) {

@@ -11,7 +11,7 @@ import {
   type ImportCostHistoryItem,
 } from "../../src/analysis/history.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
-import type { DetectedImport } from "../../src/imports/types.js";
+import type { DetectedImport } from "../../src/ipc/protocol.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
 import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 

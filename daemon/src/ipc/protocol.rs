@@ -1,8 +1,9 @@
+use crate::document::{PackageJsonDependencyEntry, PackageJsonDependencySection};
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportKind {
     Named,
@@ -37,6 +38,53 @@ impl ImportRuntime {
             Self::Server => "server",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportSyntax {
+    Static,
+    Reexport,
+    StarReexport,
+    Dynamic,
+}
+
+impl ImportSyntax {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Reexport => "reexport",
+            Self::StarReexport => "star_reexport",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourcePosition {
+    pub line: u32,
+    pub character: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRange {
+    pub start: SourcePosition,
+    pub end: SourcePosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedImport {
+    pub specifier: String,
+    pub package_name: String,
+    pub named: Vec<String>,
+    pub import_kind: ImportKind,
+    pub syntax: ImportSyntax,
+    pub runtime: ImportRuntime,
+    pub line: u32,
+    pub quote_end: SourcePosition,
+    pub specifier_range: SourceRange,
+    pub statement_range: SourceRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +158,180 @@ pub struct BatchResponse {
     pub indexes: Option<Vec<usize>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportAnalysisStatus {
+    Ready,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportAnalysisItem {
+    pub detected: DetectedImport,
+    pub status: ImportAnalysisStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<ImportRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ImportResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyzeDocumentRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "analyze_document_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub workspace_root: String,
+    pub active_document_path: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyzeDocumentResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub imports: Vec<ImportAnalysisItem>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyzeSpecifiersRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "analyze_specifiers_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub workspace_root: String,
+    pub active_document_path: String,
+    pub specifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyzeSpecifiersResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub imports: Vec<ImportAnalysisItem>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSizeDocumentRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "file_size_document_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub workspace_root: String,
+    pub active_document_path: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSizeDocumentResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub raw_bytes: u64,
+    pub minified_bytes: u64,
+    pub gzip_bytes: u64,
+    pub brotli_bytes: u64,
+    pub zstd_bytes: u64,
+    pub imports: Vec<ImportResult>,
+    pub states: Vec<ImportAnalysisItem>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryHint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_latest: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageJsonDependencyAnalysisItem {
+    pub entry: PackageJsonDependencyEntry,
+    pub name: String,
+    pub section: String,
+    pub status: ImportAnalysisStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_hint: Option<RegistryHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ImportResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyzePackageJsonRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "analyze_package_json_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub workspace_root: String,
+    pub active_document_path: String,
+    pub source: String,
+    #[serde(default)]
+    pub include_registry_hints: bool,
+    #[serde(default)]
+    pub force_registry_refresh: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_section: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalyzePackageJsonResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub sections: Vec<PackageJsonDependencySection>,
+    pub states: Vec<PackageJsonDependencyAnalysisItem>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteImportMembersRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "complete_import_members_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub workspace_root: String,
+    pub active_document_path: String,
+    pub source: String,
+    pub cursor_offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteImportMembersResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub specifier: Option<String>,
+    pub exports: Vec<String>,
+    pub imported_names: Vec<String>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloMessage {
     #[serde(rename = "type")]
@@ -145,6 +367,14 @@ pub struct PrewarmPackageJsonMessage {
     pub message_type: String,
     pub package_json_path: String,
     pub active_document_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeModulesChangedMessage {
+    #[serde(rename = "type")]
+    #[serde(default = "node_modules_changed_message_type")]
+    pub message_type: String,
+    pub package_json_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,12 +438,18 @@ pub struct ShutdownMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ClientMessage {
     Hello(HelloMessage),
+    AnalyzeDocument(AnalyzeDocumentRequest),
+    AnalyzePackageJson(AnalyzePackageJsonRequest),
+    AnalyzeSpecifiers(AnalyzeSpecifiersRequest),
     Batch(BatchRequest),
     CacheInvalidate(CacheInvalidateMessage),
     CacheInvalidateAll(CacheInvalidateAllMessage),
     PrewarmPackageJson(PrewarmPackageJsonMessage),
+    NodeModulesChanged(NodeModulesChangedMessage),
     EnumerateExports(EnumerateExportsRequest),
     FileSize(FileSizeRequest),
+    FileSizeDocument(FileSizeDocumentRequest),
+    CompleteImportMembers(CompleteImportMembersRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -228,11 +464,17 @@ enum ClientMessageWire {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum TypedClientMessage {
     Hello(HelloMessage),
+    AnalyzeDocument(AnalyzeDocumentRequest),
+    AnalyzePackageJson(AnalyzePackageJsonRequest),
+    AnalyzeSpecifiers(AnalyzeSpecifiersRequest),
     CacheInvalidate(CacheInvalidateMessage),
     CacheInvalidateAll(CacheInvalidateAllMessage),
     PrewarmPackageJson(PrewarmPackageJsonMessage),
+    NodeModulesChanged(NodeModulesChangedMessage),
     EnumerateExports(EnumerateExportsRequest),
     FileSize(FileSizeRequest),
+    FileSizeDocument(FileSizeDocumentRequest),
+    CompleteImportMembers(CompleteImportMembersRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -270,11 +512,19 @@ impl From<TypedClientMessage> for ClientMessage {
     fn from(message: TypedClientMessage) -> Self {
         match message {
             TypedClientMessage::Hello(message) => Self::Hello(message),
+            TypedClientMessage::AnalyzeDocument(message) => Self::AnalyzeDocument(message),
+            TypedClientMessage::AnalyzePackageJson(message) => Self::AnalyzePackageJson(message),
+            TypedClientMessage::AnalyzeSpecifiers(message) => Self::AnalyzeSpecifiers(message),
             TypedClientMessage::CacheInvalidate(message) => Self::CacheInvalidate(message),
             TypedClientMessage::CacheInvalidateAll(message) => Self::CacheInvalidateAll(message),
             TypedClientMessage::PrewarmPackageJson(message) => Self::PrewarmPackageJson(message),
+            TypedClientMessage::NodeModulesChanged(message) => Self::NodeModulesChanged(message),
             TypedClientMessage::EnumerateExports(message) => Self::EnumerateExports(message),
             TypedClientMessage::FileSize(message) => Self::FileSize(message),
+            TypedClientMessage::FileSizeDocument(message) => Self::FileSizeDocument(message),
+            TypedClientMessage::CompleteImportMembers(message) => {
+                Self::CompleteImportMembers(message)
+            }
             TypedClientMessage::Shutdown(message) => Self::Shutdown(message),
         }
     }
@@ -297,6 +547,18 @@ fn hello_message_type() -> String {
     "hello".to_owned()
 }
 
+fn analyze_document_message_type() -> String {
+    "analyze_document".to_owned()
+}
+
+fn analyze_package_json_message_type() -> String {
+    "analyze_package_json".to_owned()
+}
+
+fn analyze_specifiers_message_type() -> String {
+    "analyze_specifiers".to_owned()
+}
+
 fn cache_invalidate_message_type() -> String {
     "cache_invalidate".to_owned()
 }
@@ -309,12 +571,24 @@ fn prewarm_package_json_message_type() -> String {
     "prewarm_package_json".to_owned()
 }
 
+fn node_modules_changed_message_type() -> String {
+    "node_modules_changed".to_owned()
+}
+
 fn enumerate_exports_message_type() -> String {
     "enumerate_exports".to_owned()
 }
 
 fn file_size_message_type() -> String {
     "file_size".to_owned()
+}
+
+fn file_size_document_message_type() -> String {
+    "file_size_document".to_owned()
+}
+
+fn complete_import_members_message_type() -> String {
+    "complete_import_members".to_owned()
 }
 
 fn shutdown_message_type() -> String {

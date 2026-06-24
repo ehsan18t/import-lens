@@ -1,8 +1,18 @@
 import type {
+  AnalyzeDocumentRequest,
+  AnalyzeDocumentResponse,
+  AnalyzePackageJsonRequest,
+  AnalyzePackageJsonResponse,
+  AnalyzeSpecifiersRequest,
+  AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CompleteImportMembersRequest,
+  CompleteImportMembersResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeDocumentRequest,
+  FileSizeDocumentResponse,
   FileSizeRequest,
   FileSizeResponse,
 } from "../ipc/protocol.js";
@@ -17,10 +27,16 @@ export interface AnalysisTransport {
   readonly onDidChangeState?: DaemonStateEvent;
   start(analysisRoot?: string): Promise<DaemonState>;
   sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null>;
+  analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null>;
+  analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse | null>;
+  analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null>;
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null>;
   requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null>;
+  requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null>;
+  completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null>;
   invalidatePackage(packageName: string): void;
   invalidateAll(): void;
+  nodeModulesChanged(packageJsonPaths: readonly string[]): void;
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void;
   shutdown(): Promise<void>;
   dispose(): void | Promise<void>;
@@ -96,6 +112,18 @@ export class TransportCoordinator implements AnalysisTransport {
     return this.#activeTransport?.sendBatch(request, onPartial) ?? Promise.resolve(null);
   }
 
+  analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null> {
+    return this.#activeTransport?.analyzeDocument(request) ?? Promise.resolve(null);
+  }
+
+  analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse | null> {
+    return this.#activeTransport?.analyzePackageJson(request) ?? Promise.resolve(null);
+  }
+
+  analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null> {
+    return this.#activeTransport?.analyzeSpecifiers(request) ?? Promise.resolve(null);
+  }
+
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
     return this.#activeTransport?.enumerateExports(request) ?? Promise.resolve(null);
   }
@@ -104,12 +132,24 @@ export class TransportCoordinator implements AnalysisTransport {
     return this.#activeTransport?.requestFileSize(request) ?? Promise.resolve(null);
   }
 
+  requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {
+    return this.#activeTransport?.requestFileSizeDocument(request) ?? Promise.resolve(null);
+  }
+
+  completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null> {
+    return this.#activeTransport?.completeImportMembers(request) ?? Promise.resolve(null);
+  }
+
   invalidatePackage(packageName: string): void {
     this.#activeTransport?.invalidatePackage(packageName);
   }
 
   invalidateAll(): void {
     this.#activeTransport?.invalidateAll();
+  }
+
+  nodeModulesChanged(packageJsonPaths: readonly string[]): void {
+    this.#activeTransport?.nodeModulesChanged(packageJsonPaths);
   }
 
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {

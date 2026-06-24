@@ -11,21 +11,14 @@ import {
   type BundleImpactHistoryStore,
   type ImportCostHistoryItem,
 } from "./analysis/history.js";
-import { createImportRequest } from "./analysis/request.js";
 import { ImportResultLogTracker } from "./analysis/resultLogging.js";
-import { applyFinalBatchResults, markLoadingStatesUnavailable } from "./analysis/status.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
-import { extractRuntimeImports } from "./imports/parser.js";
-import { loadImportLensIgnore, shouldIgnoreImport } from "./imports/ignore.js";
-import { getPackageName } from "./imports/specifier.js";
-import { resolveInstalledPackagesByName } from "./imports/resolver.js";
 import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import type { StatusBarController } from "./ui/statusbar.js";
-import { applyStreamingBatchPartial } from "./analysis/batchPartial.js";
-import { protocolVersion, type BatchResponse } from "./ipc/protocol.js";
+import { protocolVersion, type ImportAnalysisItem } from "./ipc/protocol.js";
 import { nextIpcRequestId } from "./ipc/requestIds.js";
 import { analysisRootForFile } from "./workspaceContext.js";
 
@@ -89,107 +82,35 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
 
-    const ignoreRules = await loadImportLensIgnore(document.fileName);
-    const imports = extractRuntimeImports(document.fileName, document.getText())
-      .filter((detected) => !shouldIgnoreImport(detected, document.fileName, ignoreRules));
-
-    if (imports.length === 0) {
-      this.#store.clear(document.uri);
-      return;
-    }
-
-    const states: ImportAnalysisState[] = [];
-    const requestImports = [];
-    const requestStateIndexes: number[] = [];
     const changedLinesPromise = changedLinesForFile(document.fileName);
-    const packageResolutions = await resolveInstalledPackagesByName(
-      imports.map((detected) => detected.specifier),
-      document.fileName,
-    );
-
-    for (const detected of imports) {
-      const resolution = packageResolutions.get(getPackageName(detected.specifier))
-        ?? { ok: false as const, packageName: getPackageName(detected.specifier), reason: "package_not_found" as const };
-
-      if (!resolution.ok) {
-        states.push({
-          detected,
-          status: "missing",
-          message: resolution.reason === "package_not_found" ? "Package not found" : "Invalid package.json",
-        });
-        continue;
-      }
-
-      states.push({ detected, status: "loading" });
-      requestStateIndexes.push(states.length - 1);
-      requestImports.push(createImportRequest(detected, resolution.version));
-    }
-
-    let currentStates = states;
-    this.#store.set(document.uri, currentStates);
-
-    if (requestImports.length === 0) {
-      return;
-    }
-
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
     const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
 
     if (this.#daemon.state !== "ready" && await this.#daemon.start(workspaceRoot) !== "ready") {
-      this.#store.set(document.uri, markLoadingStatesUnavailable(states, "Daemon unavailable"));
+      this.#store.clear(document.uri);
+      this.#statusBar.setStatus("unavailable");
       return;
     }
 
     this.#statusBar.setStatus("computing");
-    this.#logger.debug(`Starting batch request ${requestId} with ${requestImports.length} import(s).`);
+    this.#logger.debug(`Starting document analysis request ${requestId}.`);
 
     try {
       const resultLogger = new ImportResultLogTracker(
         this.#logger.child({ component: "analysis" }),
         requestId,
       );
-
-      const applyPartial = (partial: BatchResponse): void => {
-        const nextStates = applyStreamingBatchPartial(partial, {
-          requestId,
-          isCurrent: (partialRequestId) => this.#freshness.isCurrent(documentKey, partialRequestId),
-          requestStateIndexes,
-          states: currentStates,
-          isMissing: (state) => state.status === "missing",
-          matchesResult: (state, result) => result.specifier === state.detected.specifier,
-          applyReady: (state, result) => {
-            resultLogger.logResult(result);
-            return {
-              detected: state.detected,
-              status: "ready" as const,
-              result,
-            };
-          },
-          commit: (states) => {
-            currentStates = [...states];
-            this.#store.set(document.uri, currentStates);
-          },
-        });
-
-        if (nextStates) {
-          currentStates = [...nextStates];
-        }
-      };
-
-      const response = await this.#daemon.sendBatch(
-        {
-          version: protocolVersion,
-          request_id: requestId,
-          workspace_root: workspaceRoot,
-          active_document_path: document.fileName,
-          imports: requestImports,
-          streaming: true,
-        },
-        applyPartial,
-      );
+      const response = await this.#daemon.analyzeDocument({
+        type: "analyze_document",
+        version: protocolVersion,
+        request_id: requestId,
+        workspace_root: workspaceRoot,
+        active_document_path: document.fileName,
+        source: document.getText(),
+      });
 
       if (!response) {
-        this.#store.set(document.uri, markLoadingStatesUnavailable(currentStates, "No daemon response"));
+        this.#store.clear(document.uri);
         this.#statusBar.setStatus("unavailable");
         return;
       }
@@ -198,11 +119,21 @@ export class DocumentAnalysisController implements vscode.Disposable {
         return;
       }
 
-      const responseStates = applyFinalBatchResults(
-        currentStates,
-        response.imports,
-        (specifier, reason) => resultLogger.logMissingResult(specifier, reason),
-      );
+      if (response.error) {
+        this.#logger.warn(`Document analysis failed: ${response.error}`);
+        this.#store.clear(document.uri);
+        this.#statusBar.setStatus("unavailable");
+        return;
+      }
+
+      if (response.imports.length === 0) {
+        this.#store.clear(document.uri);
+        this.#statusBar.setStatus("ready");
+        return;
+      }
+
+      const responseStates = response.imports.map((item) =>
+        importAnalysisStateFromDaemon(item, (specifier, reason) => resultLogger.logMissingResult(specifier, reason)));
 
       for (const state of responseStates) {
         if (state.status === "ready" && state.result) {
@@ -224,10 +155,10 @@ export class DocumentAnalysisController implements vscode.Disposable {
         this.#logger.warn(`Import history update failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       this.#statusBar.setStatus("ready");
-      this.#logger.debug(`Completed batch request ${requestId}.`);
+      this.#logger.debug(`Completed document analysis request ${requestId}.`);
     } catch (error) {
       this.#logger.warn(`Analysis request failed: ${error instanceof Error ? error.message : String(error)}`);
-      this.#store.set(document.uri, markLoadingStatesUnavailable(states, "Daemon unavailable"));
+      this.#store.clear(document.uri);
       this.#statusBar.setStatus("unavailable");
     }
   }
@@ -254,3 +185,31 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#freshness.clear();
   }
 }
+
+const importAnalysisStateFromDaemon = (
+  item: ImportAnalysisItem,
+  logMissingResult: (specifier: string, reason: string) => void,
+): ImportAnalysisState => {
+  if (item.status === "ready" && item.result) {
+    return {
+      detected: item.detected,
+      status: "ready",
+      result: item.result,
+    };
+  }
+
+  if (item.status === "missing") {
+    logMissingResult(item.detected.specifier, item.message ?? "Package not found");
+    return {
+      detected: item.detected,
+      status: "missing",
+      message: item.message ?? "Package not found",
+    };
+  }
+
+  return {
+    detected: item.detected,
+    status: "unavailable",
+    message: item.message ?? "Daemon unavailable",
+  };
+};

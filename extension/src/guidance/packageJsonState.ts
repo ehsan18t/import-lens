@@ -1,6 +1,4 @@
-import type { ImportResult } from "../ipc/protocol.js";
-import type { PackageJsonDependencySectionName } from "./packageJsonDependencies.js";
-import type { RegistryHint } from "./registryHints.js";
+import type { ImportResult, PackageJsonDependencySectionName, RegistryHint } from "../ipc/protocol.js";
 
 export type PackageJsonDependencyHintStatus = "loading" | "ready" | "missing" | "unavailable";
 

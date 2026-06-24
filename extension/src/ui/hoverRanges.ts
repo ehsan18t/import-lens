@@ -1,5 +1,5 @@
 import type { ImportAnalysisState } from "../analysis/state.js";
-import type { SourcePosition, SourceRange } from "../imports/types.js";
+import type { SourcePosition, SourceRange } from "../ipc/protocol.js";
 
 const compareSourcePositions = (left: SourcePosition, right: SourcePosition): number => {
   if (left.line !== right.line) {

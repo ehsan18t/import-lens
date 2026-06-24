@@ -9,7 +9,6 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   const workspaceCargoToml = repoFile("Cargo.toml");
   const cargoToml = repoFile("daemon/Cargo.toml");
   const dockerfile = repoFile("Dockerfile.build");
-  const manifest = JSON.parse(repoFile("package.json"));
   const rustToolchain = repoFile("rust-toolchain.toml");
   for (const crate of oxcStackConfig.oxcCrates) {
     assert.match(cargoToml, new RegExp(`^${crate} = "${escapedVersion(oxcStackConfig.currentOxcVersion)}"$`, "mu"));
@@ -29,7 +28,8 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   assert.doesNotMatch(dockerfile, /ZIG_VERSION=0\./);
   assert.doesNotMatch(dockerfile, /CARGO_ZIGBUILD_VERSION=0\./);
   assert.match(rustToolchain, /^channel = "stable"$/mu);
-  assert.equal(manifest.dependencies["oxc-parser"], oxcStackConfig.currentOxcVersion);
+  const manifest = JSON.parse(repoFile("package.json"));
+  assert.equal(manifest.dependencies["oxc-parser"], undefined);
   assert.equal(manifest.scripts["deps:update"], "pnpm deps:update:oxc");
   assert.equal(manifest.scripts["deps:update:oxc"], "node scripts/update-oxc-stack.mjs");
   assert.equal(manifest.scripts["deps:update:all"], "pnpm update --latest && cargo update");

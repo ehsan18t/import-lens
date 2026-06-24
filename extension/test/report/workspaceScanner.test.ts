@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { BatchRequest, BatchResponse, ImportRequest, ImportResult } from "../../src/ipc/protocol.js";
+import type { AnalyzeDocumentRequest, AnalyzeDocumentResponse, ImportResult } from "../../src/ipc/protocol.js";
 import {
   analyzeScannedImports,
   chunkArray,
@@ -68,7 +68,7 @@ test("scanWorkspaceImports opens files concurrently with deterministic output or
       },
     });
 
-    const scanned = await scanWorkspaceImports(workspace, { scanConcurrency: 2 });
+    const scanned = await scanWorkspaceImports(workspace, fakeDaemon(), { scanConcurrency: 2 });
 
     assert.equal(maxActiveOpenCount, 2);
     assert.deepEqual(scanned.map((item) => item.sourceFile), [
@@ -104,7 +104,7 @@ test("scanWorkspaceImports skips unreadable files instead of aborting the worksp
       },
     });
 
-    const scanned = await scanWorkspaceImports(workspace, { scanConcurrency: 2 });
+    const scanned = await scanWorkspaceImports(workspace, fakeDaemon(), { scanConcurrency: 2 });
 
     assert.equal(scanned.length, 1);
     assert.equal(scanned[0]?.sourceFile, readableFile);
@@ -114,71 +114,40 @@ test("scanWorkspaceImports skips unreadable files instead of aborting the worksp
   }
 });
 
-test("analyzeScannedImports sends daemon batches per source file", async () => {
-  const batches: BatchRequest[] = [];
-  const daemon = {
-    state: "ready" as const,
-    sendBatch: async (request: BatchRequest): Promise<BatchResponse> => {
-      batches.push(request);
-      return {
-        version: request.version,
-        request_id: request.request_id,
-        imports: request.imports.map((item) => result(item.specifier)),
-      };
-    },
-  };
-
-  const items = await analyzeScannedImports(
-    [
-      scanned("react", "/workspace/src/a.ts"),
-      scanned("lodash-es", "/workspace/src/b.ts"),
-    ],
-    daemon,
-    { chunkSize: 10, nextRequestId: requestIdGenerator() },
-  );
-
-  assert.deepEqual(batches.map((batch) => batch.active_document_path), [
-    "/workspace/src/a.ts",
-    "/workspace/src/b.ts",
+test("analyzeScannedImports maps daemon document states into report items", async () => {
+  const items = await analyzeScannedImports([
+    scanned("react", "/workspace/src/a.ts", result("react")),
+    scanned("lodash-es", "/workspace/src/b.ts", result("lodash-es")),
   ]);
+
   assert.deepEqual(items.map((item) => item.result?.specifier), ["react", "lodash-es"]);
 });
 
-test("analyzeScannedImports default request IDs stay unique across report scans", async () => {
-  const originalNow = Date.now;
+test("scanWorkspaceImports uses unique daemon request IDs", async () => {
   const requestIds: number[] = [];
-  Date.now = () => 1_700_000;
   const daemon = {
     state: "ready" as const,
-    sendBatch: async (request: BatchRequest): Promise<BatchResponse> => {
+    analyzeDocument: async (request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse> => {
       requestIds.push(request.request_id);
       return {
         version: request.version,
         request_id: request.request_id,
-        imports: request.imports.map((item) => result(item.specifier)),
+        imports: [],
+        error: null,
+        diagnostics: [],
       };
     },
   };
+  const workspace = fakeWorkspace({
+    root: "/workspace",
+    files: ["/workspace/src/a.ts", "/workspace/src/b.ts"],
+    openTextDocument: async (uri) => fakeDocument(uri, "import value from 'react';"),
+  });
 
-  try {
-    await Promise.all([
-      analyzeScannedImports([scanned("react", "/workspace/src/a.ts")], daemon),
-      analyzeScannedImports([scanned("lodash-es", "/workspace/src/b.ts")], daemon),
-    ]);
-  } finally {
-    Date.now = originalNow;
-  }
+  await scanWorkspaceImports(workspace, daemon);
 
   assert.equal(new Set(requestIds).size, requestIds.length);
 });
-
-const requestIdGenerator = (): (() => number) => {
-  let requestId = 0;
-  return () => {
-    requestId += 1;
-    return requestId;
-  };
-};
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => {
@@ -205,6 +174,27 @@ const fakeWorkspace = ({
   getWorkspaceFolder: () => ({ uri: { fsPath: root } }),
 });
 
+const fakeDaemon = () => ({
+  state: "ready" as const,
+  analyzeDocument: async (request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse> => {
+    const specifier = request.source.match(/['"]([^'"]+)['"]/)?.[1] ?? "missing";
+
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      imports: [
+        {
+          detected: detected(specifier),
+          status: "missing",
+          message: "Package not found",
+        },
+      ],
+      error: null,
+      diagnostics: [],
+    };
+  },
+});
+
 const detected = (specifier: string) => detectedImport({
   specifier,
   packageName: specifier,
@@ -213,20 +203,11 @@ const detected = (specifier: string) => detectedImport({
   statementRange: sourceRange(0, 0, 21),
 });
 
-const request = (specifier: string): ImportRequest => ({
-  specifier,
-  package: specifier,
-  version: "1.0.0",
-  named: [],
-  import_kind: "namespace",
-  runtime: "component",
-});
-
-const scanned = (specifier: string, sourceFile: string): ScannedImport => ({
+const scanned = (specifier: string, sourceFile: string, importResult?: ImportResult): ScannedImport => ({
   detected: detected(specifier),
   sourceFile,
   workspaceRoot: "/workspace",
-  request: request(specifier),
+  result: importResult,
 });
 
 const result = (specifier: string): ImportResult => ({

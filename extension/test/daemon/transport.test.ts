@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type {
+  AnalyzeDocumentRequest,
+  AnalyzeDocumentResponse,
+  AnalyzePackageJsonRequest,
+  AnalyzePackageJsonResponse,
+  AnalyzeSpecifiersRequest,
+  AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CompleteImportMembersRequest,
+  CompleteImportMembersResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeDocumentRequest,
+  FileSizeDocumentResponse,
   FileSizeRequest,
   FileSizeResponse,
 } from "../../src/ipc/protocol.js";
@@ -57,6 +67,40 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
+  async analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse> {
+    this.calls.push(`document:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      imports: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
+  async analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse> {
+    this.calls.push(`packageJson:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      sections: [],
+      states: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
+  async analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse> {
+    this.calls.push(`specifiers:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      imports: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
   async enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse> {
     this.calls.push(`exports:${request.request_id}:${request.specifier}`);
     return {
@@ -85,12 +129,46 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
+  async requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse> {
+    this.calls.push(`fileSizeDocument:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      raw_bytes: 10,
+      minified_bytes: 8,
+      gzip_bytes: 6,
+      brotli_bytes: 5,
+      zstd_bytes: 6,
+      imports: [],
+      states: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
+  async completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse> {
+    this.calls.push(`completion:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      specifier: null,
+      exports: [],
+      imported_names: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
   invalidatePackage(packageName: string): void {
     this.calls.push(`invalidate:${packageName}`);
   }
 
   invalidateAll(): void {
     this.calls.push("invalidateAll");
+  }
+
+  nodeModulesChanged(packageJsonPaths: readonly string[]): void {
+    this.calls.push(`nodeModules:${packageJsonPaths.length}`);
   }
 
   prewarmPackageJson(packageJsonPath: string): void {
@@ -136,6 +214,18 @@ class SlowReadyTransport implements AnalysisTransport {
     return null;
   }
 
+  async analyzeDocument(): Promise<AnalyzeDocumentResponse | null> {
+    return null;
+  }
+
+  async analyzePackageJson(): Promise<AnalyzePackageJsonResponse | null> {
+    return null;
+  }
+
+  async analyzeSpecifiers(): Promise<AnalyzeSpecifiersResponse | null> {
+    return null;
+  }
+
   async enumerateExports(): Promise<EnumerateExportsResponse | null> {
     return null;
   }
@@ -144,11 +234,23 @@ class SlowReadyTransport implements AnalysisTransport {
     return null;
   }
 
+  async requestFileSizeDocument(): Promise<FileSizeDocumentResponse | null> {
+    return null;
+  }
+
+  async completeImportMembers(): Promise<CompleteImportMembersResponse | null> {
+    return null;
+  }
+
   invalidatePackage(): void {
     return undefined;
   }
 
   invalidateAll(): void {
+    return undefined;
+  }
+
+  nodeModulesChanged(): void {
     return undefined;
   }
 

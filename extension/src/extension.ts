@@ -7,7 +7,6 @@ import { refreshVisibleImportLensDocuments, type ConfigRefreshMode } from "./con
 import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
 import { PackageJsonAnalysisController } from "./guidance/packageJsonAnalysis.js";
-import type { PackageJsonDependencySectionName } from "./guidance/packageJsonDependencies.js";
 import { DocumentAnalysisController } from "./listener.js";
 import { languageSelector } from "./languages.js";
 import { ImportLensLogger } from "./logger.js";
@@ -34,8 +33,12 @@ import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
 import { TreeShakeCodeActionProvider } from "./ui/treeShakeActions.js";
-import type { ImportResult } from "./ipc/protocol.js";
-import type { DetectedImport, ImportRuntime } from "./imports/types.js";
+import type {
+  DetectedImport,
+  ImportResult,
+  ImportRuntime,
+  PackageJsonDependencySectionName,
+} from "./ipc/protocol.js";
 
 let daemon: DaemonManager | undefined;
 

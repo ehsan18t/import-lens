@@ -172,8 +172,6 @@
     "bin/",
     "cli/",
     "media/icon.png",
-    "node_modules/oxc-parser/",
-    "node_modules/@oxc-project/types/",
     "README.md",
     "package.json"
   ],
@@ -220,8 +218,7 @@
     "deps:update:all": "pnpm update --latest && cargo update"
   },
   "dependencies": {
-    "@msgpack/msgpack": "3.1.3",
-    "oxc-parser": "0.134.0"
+    "@msgpack/msgpack": "3.1.3"
   },
   "devDependencies": {
     "@types/node": "22.15.3",

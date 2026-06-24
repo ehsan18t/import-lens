@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { oxcStackConfig } from "./oxc-stack.config.mjs";
 import { createStagedManifest } from "./package-vsix-manifest.mjs";
 
 const packageVsixScript = readFileSync(new URL("./package-vsix.mjs", import.meta.url), "utf8");
@@ -11,7 +10,7 @@ const manifest = {
   version: "0.1.0",
   icon: "media/icon.png",
   dependencies: {
-    "oxc-parser": oxcStackConfig.currentOxcVersion,
+    "@msgpack/msgpack": "3.1.3",
   },
   devDependencies: {
     typescript: "6.0.3",
@@ -22,23 +21,16 @@ const manifest = {
 };
 
 test("createStagedManifest includes the repository license in packaged files", () => {
-  const staged = createStagedManifest({
-    manifest,
-    bindingPackage: "@oxc-parser/binding-win32-x64-msvc",
-  });
+  const staged = createStagedManifest({ manifest });
 
   assert.ok(staged.files.includes("LICENSE"));
   assert.ok(staged.files.includes("cli/"));
 });
 
-test("createStagedManifest keeps target parser binding and strips development-only fields", () => {
-  const staged = createStagedManifest({
-    manifest,
-    bindingPackage: "@oxc-parser/binding-win32-x64-msvc",
-  });
+test("createStagedManifest keeps production dependencies and strips development-only fields", () => {
+  const staged = createStagedManifest({ manifest });
 
-  assert.equal(staged.dependencies["oxc-parser"], oxcStackConfig.currentOxcVersion);
-  assert.equal(staged.dependencies["@oxc-parser/binding-win32-x64-msvc"], oxcStackConfig.currentOxcVersion);
+  assert.deepEqual(staged.dependencies, { "@msgpack/msgpack": "3.1.3" });
   assert.equal(staged.devDependencies, undefined);
   assert.equal(staged.scripts, undefined);
 });

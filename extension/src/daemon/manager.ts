@@ -1,9 +1,19 @@
 import type * as vscode from "vscode";
 import type {
+  AnalyzeDocumentRequest,
+  AnalyzeDocumentResponse,
+  AnalyzePackageJsonRequest,
+  AnalyzePackageJsonResponse,
+  AnalyzeSpecifiersRequest,
+  AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CompleteImportMembersRequest,
+  CompleteImportMembersResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
+  FileSizeDocumentRequest,
+  FileSizeDocumentResponse,
   FileSizeRequest,
   FileSizeResponse,
 } from "../ipc/protocol.js";
@@ -38,6 +48,18 @@ export class DaemonManager implements vscode.Disposable {
     return this.#transport.sendBatch(request, onPartial);
   }
 
+  analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null> {
+    return this.#transport.analyzeDocument(request);
+  }
+
+  analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse | null> {
+    return this.#transport.analyzePackageJson(request);
+  }
+
+  analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null> {
+    return this.#transport.analyzeSpecifiers(request);
+  }
+
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
     return this.#transport.enumerateExports(request);
   }
@@ -46,12 +68,24 @@ export class DaemonManager implements vscode.Disposable {
     return this.#transport.requestFileSize(request);
   }
 
+  requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {
+    return this.#transport.requestFileSizeDocument(request);
+  }
+
+  completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null> {
+    return this.#transport.completeImportMembers(request);
+  }
+
   invalidatePackage(packageName: string): void {
     this.#transport.invalidatePackage(packageName);
   }
 
   invalidateAll(): void {
     this.#transport.invalidateAll();
+  }
+
+  nodeModulesChanged(packageJsonPaths: readonly string[]): void {
+    this.#transport.nodeModulesChanged(packageJsonPaths);
   }
 
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {

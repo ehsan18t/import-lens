@@ -1,13 +1,8 @@
-import path from "node:path";
-
-export const createStagedManifest = ({ manifest, bindingPackage }) => {
+export const createStagedManifest = ({ manifest }) => {
   const files = [
     "extension/dist/extension.cjs",
     "bin/",
     "cli/",
-    "node_modules/oxc-parser/",
-    `node_modules/@oxc-parser/${path.basename(bindingPackage)}/`,
-    "node_modules/@oxc-project/types/",
     "README.md",
     "LICENSE",
     "package.json",
@@ -19,10 +14,7 @@ export const createStagedManifest = ({ manifest, bindingPackage }) => {
 
   return {
     ...manifest,
-    dependencies: {
-      [bindingPackage]: manifest.dependencies[bindingPackage] ?? manifest.dependencies["oxc-parser"],
-      "oxc-parser": manifest.dependencies["oxc-parser"],
-    },
+    dependencies: manifest.dependencies,
     devDependencies: undefined,
     files,
     scripts: undefined,

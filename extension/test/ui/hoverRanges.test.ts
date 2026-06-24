@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import { stateForHoverPosition } from "../../src/ui/hoverRanges.js";
-import type { SourceRange } from "../../src/imports/types.js";
+import type { SourceRange } from "../../src/ipc/protocol.js";
 import { detectedImport } from "../helpers/detectedImport.js";
 
 const state = (

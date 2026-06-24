@@ -1,7 +1,9 @@
 use import_lens_daemon::{
     ipc::protocol::{
-        BatchRequest, EnumerateExportsRequest, FileSizeRequest, ImportKind, ImportRequest,
-        ImportRuntime, PROTOCOL_VERSION,
+        AnalyzeDocumentRequest, AnalyzePackageJsonRequest, AnalyzeSpecifiersRequest, BatchRequest,
+        CompleteImportMembersRequest, EnumerateExportsRequest, FileSizeDocumentRequest,
+        FileSizeRequest, ImportAnalysisStatus, ImportKind, ImportRequest, ImportRuntime,
+        PROTOCOL_VERSION,
     },
     pipeline::graph::{build_module_graph_cached, clear_module_graph_cache},
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
@@ -28,6 +30,14 @@ fn write_package(workspace: &Path) {
     .expect("package manifest should be written");
     fs::write(package_root.join("index.js"), "export const value = 1;")
         .expect("entry should be written");
+}
+
+fn active_document_path(workspace: &Path) -> String {
+    workspace
+        .join("src")
+        .join("index.ts")
+        .to_string_lossy()
+        .to_string()
 }
 
 fn write_tiny_package_with_source(workspace: &Path, source: &str) {
@@ -552,6 +562,185 @@ fn enumerate_exports_request(workspace: &Path, request_id: u64) -> EnumerateExpo
         package_name: "exports-lib".to_owned(),
         package_version: "1.0.0".to_owned(),
     }
+}
+
+#[test]
+fn service_analyzes_document_source_in_daemon() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_analyze_document(AnalyzeDocumentRequest {
+        message_type: "analyze_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 31,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        source: "import { value } from 'tiny-lib';\nimport type { Type } from 'tiny-lib';"
+            .to_owned(),
+    });
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 31);
+    assert_eq!(response.error, None);
+    assert_eq!(response.imports.len(), 1);
+    assert_eq!(response.imports[0].status, ImportAnalysisStatus::Ready);
+    assert_eq!(response.imports[0].detected.package_name, "tiny-lib");
+    assert_eq!(
+        response.imports[0]
+            .request
+            .as_ref()
+            .map(|request| request.version.as_str()),
+        Some("1.0.0"),
+    );
+    assert!(response.imports[0].result.is_some());
+}
+
+#[test]
+fn service_analyzes_raw_specifiers_with_daemon_filtering() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_analyze_specifiers(AnalyzeSpecifiersRequest {
+        message_type: "analyze_specifiers".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 32,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        specifiers: vec![
+            "node:fs".to_owned(),
+            "./local.js".to_owned(),
+            "tiny-lib".to_owned(),
+            "https://example.test/mod.js".to_owned(),
+            "@/app".to_owned(),
+        ],
+    });
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 32);
+    assert_eq!(response.error, None);
+    assert_eq!(response.imports.len(), 1);
+    assert_eq!(response.imports[0].detected.specifier, "tiny-lib");
+    assert_eq!(response.imports[0].status, ImportAnalysisStatus::Ready);
+}
+
+#[test]
+fn service_computes_file_size_from_document_source() {
+    let workspace = temp_workspace();
+    write_shared_packages(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_file_size_document(FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 33,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        source: "import { left } from 'left-lib';\nimport { right } from 'right-lib';".to_owned(),
+    });
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 33);
+    assert_eq!(response.error, None);
+    assert_eq!(response.states.len(), 2);
+    assert_eq!(response.imports.len(), 2);
+    assert!(response.raw_bytes > 0, "{response:?}");
+    assert!(
+        response
+            .imports
+            .iter()
+            .all(|result| result.shared_bytes.is_some_and(|bytes| bytes > 0)),
+        "{response:?}",
+    );
+}
+
+#[test]
+fn service_analyzes_package_json_dependencies_in_daemon() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_analyze_package_json(AnalyzePackageJsonRequest {
+        message_type: "analyze_package_json".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 34,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace.join("package.json").to_string_lossy().to_string(),
+        source: r#"{
+  "dependencies": { "tiny-lib": "^1.0.0", "missing-lib": "^1.0.0" },
+  "devDependencies": { "ignored-object": { "version": "1.0.0" } }
+}"#
+        .to_owned(),
+        include_registry_hints: false,
+        force_registry_refresh: false,
+        refresh_section: None,
+    });
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 34);
+    assert_eq!(response.error, None);
+    assert_eq!(response.sections.len(), 2);
+    assert_eq!(response.states.len(), 2);
+    let tiny = response
+        .states
+        .iter()
+        .find(|state| state.name == "tiny-lib")
+        .expect("tiny-lib state should exist");
+    let missing = response
+        .states
+        .iter()
+        .find(|state| state.name == "missing-lib")
+        .expect("missing-lib state should exist");
+    assert_eq!(tiny.status, ImportAnalysisStatus::Ready);
+    assert_eq!(tiny.installed_version.as_deref(), Some("1.0.0"));
+    assert_eq!(missing.status, ImportAnalysisStatus::Missing);
+}
+
+#[test]
+fn service_completes_import_members_from_document_context() {
+    let workspace = temp_workspace();
+    write_export_package(&workspace);
+    let service = ImportLensService::new(None, false);
+    let source = "import { local } from 'exports-lib';";
+    let cursor_offset = source.find("local").expect("member should exist");
+
+    let response = service.complete_import_members(CompleteImportMembersRequest {
+        message_type: "complete_import_members".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 35,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        source: source.to_owned(),
+        cursor_offset,
+    });
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 35);
+    assert_eq!(response.error, None);
+    assert_eq!(response.specifier.as_deref(), Some("exports-lib"));
+    assert_eq!(response.imported_names, vec!["local"]);
+    assert_eq!(response.exports, vec!["beta", "local", "renamed"]);
+}
+
+#[test]
+fn service_invalidates_packages_from_node_modules_package_json_paths() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let _ = service.handle_batch(batch(&workspace, 1));
+    let invalidated = service.invalidate_package_json_paths(&[workspace
+        .join("node_modules")
+        .join("tiny-lib")
+        .join("package.json")
+        .to_string_lossy()
+        .to_string()]);
+    let after_invalidate = service.handle_batch(batch(&workspace, 2));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(invalidated);
+    assert!(!after_invalidate.imports[0].cache_hit);
 }
 
 #[test]

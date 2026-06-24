@@ -1,9 +1,6 @@
-import path from "node:path";
 import * as vscode from "vscode";
 import type { DaemonManager } from "./daemon/manager.js";
-import { getPackageName } from "./imports/specifier.js";
 import type { Logger } from "./logging/types.js";
-import { flushNodeModulesInvalidations } from "./watcherActions.js";
 
 export const registerNodeModulesWatchers = (
   context: vscode.ExtensionContext,
@@ -15,22 +12,15 @@ export const registerNodeModulesWatchers = (
   let timer: NodeJS.Timeout | undefined;
 
   const flush = (): void => {
-    const packages = [...pending];
+    const packageJsonPaths = [...pending];
     pending.clear();
-    flushNodeModulesInvalidations(packages, daemon, onInvalidated, logger);
+    daemon.nodeModulesChanged(packageJsonPaths);
+    logger.info(`Queued ${packageJsonPaths.length} node_modules package.json invalidation(s).`);
+    onInvalidated?.();
   };
 
   const queue = (uri: vscode.Uri): void => {
-    const packageName = packageNameFromPackageJsonPath(uri.fsPath);
-
-    if (!packageName) {
-      logger.info("node_modules package.json changed outside a package path; invalidating entire cache.");
-      daemon.invalidateAll();
-      onInvalidated?.();
-      return;
-    }
-
-    pending.add(packageName);
+    pending.add(uri.fsPath);
 
     if (timer) {
       clearTimeout(timer);
@@ -46,17 +36,4 @@ export const registerNodeModulesWatchers = (
     watcher.onDidDelete(queue, undefined, context.subscriptions);
     context.subscriptions.push(watcher);
   }
-};
-
-const packageNameFromPackageJsonPath = (packageJsonPath: string): string | null => {
-  const normalized = packageJsonPath.split(path.sep).join("/");
-  const marker = "/node_modules/";
-  const index = normalized.lastIndexOf(marker);
-
-  if (index === -1) {
-    return null;
-  }
-
-  const afterNodeModules = normalized.slice(index + marker.length).replace(/\/package\.json$/u, "");
-  return getPackageName(afterNodeModules);
 };
