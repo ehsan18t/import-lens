@@ -3,5 +3,5 @@ export const knownDaemonHashes: Readonly<Record<string, string>> = {
   "bin/darwin-x64/import-lens-daemon": "d8f5585b5b4e5bccc8505ca88f2e1911949e6eba5f743cacdfd807b6b545b00d",
   "bin/linux-arm64/import-lens-daemon": "9cc834a86e5be16ea8d562388f7e5002cfd4d692dbf262e330a2fc099b69d63a",
   "bin/linux-x64/import-lens-daemon": "9b88ff9ad0ef786f99a51a48525e16df43b75242b5acfec30bbbb315d40574ff",
-  "bin/win32-x64/import-lens-daemon.exe": "93edc44c2a97c5b229c8b7dbdc6566f50bb5866e15303c3ce9744b62a2480f8a"
+  "bin/win32-x64/import-lens-daemon.exe": "61c3162d0d28d1c345e7ca8e0a63077995e97a3d8304f335a5521fe9b39695a2"
 };

@@ -13,6 +13,7 @@ export interface RegistryHint {
   latestPublishedAt?: string;
   isLatest?: boolean;
   deprecated?: boolean;
+  fetchedAt?: number;
 }
 
 type RegistryHintCacheStatus = "ok" | "not_found" | "error";
@@ -32,6 +33,7 @@ import type { Logger } from "../logging/types.js";
 
 export interface RegistryHintFetchOptions {
   fetchImpl?: typeof fetch;
+  forceRefresh?: boolean;
   installedVersion?: string;
   logger?: Pick<Logger, "debug" | "warn">;
   now?: () => number;
@@ -169,6 +171,7 @@ const hintFromEntry = (entry: RegistryHintCacheEntry | null): RegistryHint | nul
     hint.deprecated = entry.deprecated;
   }
 
+  hint.fetchedAt = entry.timestamp;
   return hint;
 };
 
@@ -279,15 +282,16 @@ const fetchRegistryHintUncached = async (
         if (response.ok) {
           const metadata = await response.json() as Parameters<typeof registryHintFromMetadata>[0];
           const hint = registryHintFromMetadata(metadata, options.installedVersion);
+          const timestamp = now();
           await storeEntry(context, packageName, options.installedVersion, {
             status: "ok",
-            timestamp: now(),
+            timestamp,
             latestVersion: hint.latestVersion,
             latestPublishedAt: hint.latestPublishedAt,
             isLatest: hint.isLatest,
             deprecated: hint.deprecated,
           });
-          return hint;
+          return { ...hint, fetchedAt: timestamp };
         }
 
         if (response.status === 404) {
@@ -341,7 +345,7 @@ export const fetchRegistryHint = async (
   const now = options.now ?? Date.now;
   const cached = cachedEntry(context, packageName, options.installedVersion, now());
 
-  if (cached) {
+  if (cached && !options.forceRefresh) {
     return hintFromEntry(cached);
   }
 
@@ -363,7 +367,9 @@ export const registryHintForPackage = async (
   packageName: string,
   options: RegistryHintFetchOptions = {},
 ): Promise<RegistryHint | null> => {
-  const cached = getCachedRegistryHint(context, packageName, options.installedVersion, options);
+  const cached = options.forceRefresh
+    ? null
+    : getCachedRegistryHint(context, packageName, options.installedVersion, options);
   if (cached) {
     return cached;
   }

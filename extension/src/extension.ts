@@ -7,6 +7,7 @@ import { refreshVisibleImportLensDocuments, type ConfigRefreshMode } from "./con
 import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
 import { PackageJsonAnalysisController } from "./guidance/packageJsonAnalysis.js";
+import type { PackageJsonDependencySectionName } from "./guidance/packageJsonDependencies.js";
 import { DocumentAnalysisController } from "./listener.js";
 import { languageSelector } from "./languages.js";
 import { ImportLensLogger } from "./logger.js";
@@ -25,6 +26,10 @@ import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import { showNamedExportCandidates, showNamedExportCandidatesCommand } from "./ui/namedExportCandidates.js";
 import { PackageJsonDecorationController } from "./ui/packageJsonDecorations.js";
+import {
+  refreshPackageJsonRegistryHintCommand,
+  refreshPackageJsonRegistryHintsCommand,
+} from "./ui/packageJsonRegistryCommands.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
@@ -47,6 +52,36 @@ const copySubstitutionSuggestion = async (
   await vscode.env.clipboard.writeText(`${currentSpecifier} -> ${replacementPackage}\n${reason}`);
   void vscode.window.showInformationMessage(`ImportLens alternative copied: ${replacementPackage}.`);
 };
+
+const packageJsonDependencySectionNames = new Set<string>([
+  "dependencies",
+  "devDependencies",
+  "peerDependencies",
+  "optionalDependencies",
+]);
+
+const uriFromCommandArg = (value: unknown): vscode.Uri | null => {
+  if (value instanceof vscode.Uri) {
+    return value;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  try {
+    return vscode.Uri.parse(value);
+  } catch {
+    return null;
+  }
+};
+
+const packageJsonDependencySectionFromArg = (
+  value: unknown,
+): PackageJsonDependencySectionName | undefined =>
+  typeof value === "string" && packageJsonDependencySectionNames.has(value)
+    ? value as PackageJsonDependencySectionName
+    : undefined;
 
 export const activate = async (context: vscode.ExtensionContext): Promise<void> => {
   const config = getImportLensConfig();
@@ -157,6 +192,40 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("importLens.showReport", () => void showReport(context, daemon!, logger)),
     vscode.commands.registerCommand(compareImportsCommand, (initialSpecifier?: string) => void compareImports(daemon!, logger, initialSpecifier)),
     vscode.commands.registerCommand("importLens.copySubstitutionSuggestion", copySubstitutionSuggestion),
+    vscode.commands.registerCommand(refreshPackageJsonRegistryHintCommand, async (
+      uriValue: unknown,
+      packageName: unknown,
+      installedVersion: unknown,
+    ) => {
+      const uri = uriFromCommandArg(uriValue);
+
+      if (!uri || typeof packageName !== "string") {
+        return;
+      }
+
+      await packageJsonAnalysis.refreshRegistryHint(
+        uri,
+        packageName,
+        typeof installedVersion === "string" ? installedVersion : undefined,
+      );
+      packageJsonDecorations.refreshUri(uri);
+    }),
+    vscode.commands.registerCommand(refreshPackageJsonRegistryHintsCommand, async (
+      uriValue: unknown,
+      sectionValue: unknown,
+    ) => {
+      const uri = uriFromCommandArg(uriValue);
+
+      if (!uri) {
+        return;
+      }
+
+      await packageJsonAnalysis.refreshRegistryHints(
+        uri,
+        packageJsonDependencySectionFromArg(sectionValue),
+      );
+      packageJsonDecorations.refreshUri(uri);
+    }),
     vscode.commands.registerCommand("importLens.showImportDetails", async (result: ImportResult, runtime: ImportRuntime = "component") => {
       if (result.error) {
         const action = await vscode.window.showWarningMessage(

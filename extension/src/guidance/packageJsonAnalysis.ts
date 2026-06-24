@@ -13,9 +13,10 @@ import {
   packageJsonDependencyEntries,
   packageJsonDependencySections,
   type PackageJsonDependencyEntry,
+  type PackageJsonDependencySectionName,
   type PackageJsonDependencySection,
 } from "./packageJsonDependencies.js";
-import { fetchRegistryHint, getCachedRegistryHint } from "./registryHints.js";
+import { fetchRegistryHint, getCachedRegistryHint, type RegistryHint } from "./registryHints.js";
 import type { PackageJsonDependencyHintState } from "./packageJsonState.js";
 
 export interface PackageJsonDependencyAnalysisState extends PackageJsonDependencyHintState {
@@ -254,6 +255,70 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     }
   }
 
+  async refreshRegistryHint(
+    uri: vscode.Uri,
+    packageName: string,
+    installedVersion?: string,
+  ): Promise<void> {
+    if (!getImportLensConfig().enableRegistryHints) {
+      return;
+    }
+
+    const hint = await fetchRegistryHint(this.#context, packageName, {
+      installedVersion,
+      forceRefresh: true,
+      logger: this.#logger,
+    });
+
+    this.replaceRegistryHints(
+      uri,
+      new Map([[registryTargetKey(packageName, installedVersion), hint]]),
+      (state) => state.name === packageName && state.installedVersion === installedVersion,
+    );
+  }
+
+  async refreshRegistryHints(
+    uri: vscode.Uri,
+    section?: PackageJsonDependencySectionName,
+  ): Promise<void> {
+    if (!getImportLensConfig().enableRegistryHints) {
+      return;
+    }
+
+    const states = this.#states.get(uri.toString()) ?? [];
+    const targets = new Map<string, { packageName: string; installedVersion?: string }>();
+
+    for (const state of states) {
+      if (section && state.section !== section) {
+        continue;
+      }
+
+      targets.set(registryTargetKey(state.name, state.installedVersion), {
+        packageName: state.name,
+        installedVersion: state.installedVersion,
+      });
+    }
+
+    const hints = new Map<string, RegistryHint | null>();
+
+    await Promise.all([...targets.entries()].map(async ([key, target]) => {
+      hints.set(
+        key,
+        await fetchRegistryHint(this.#context, target.packageName, {
+          installedVersion: target.installedVersion,
+          forceRefresh: true,
+          logger: this.#logger,
+        }),
+      );
+    }));
+
+    this.replaceRegistryHints(
+      uri,
+      hints,
+      (state) => !section || state.section === section,
+    );
+  }
+
   clear(uri: vscode.Uri): void {
     const key = uri.toString();
     this.#states.delete(key);
@@ -323,6 +388,42 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     }
   }
 
+  private replaceRegistryHints(
+    uri: vscode.Uri,
+    hints: ReadonlyMap<string, RegistryHint | null>,
+    shouldUpdate: (state: PackageJsonDependencyAnalysisState) => boolean,
+  ): void {
+    if (hints.size === 0) {
+      return;
+    }
+
+    const states = this.#states.get(uri.toString());
+
+    if (!states) {
+      return;
+    }
+
+    let changed = false;
+    const nextStates = states.map((state) => {
+      if (!shouldUpdate(state)) {
+        return state;
+      }
+
+      const key = registryTargetKey(state.name, state.installedVersion);
+
+      if (!hints.has(key)) {
+        return state;
+      }
+
+      changed = true;
+      return { ...state, registryHint: hints.get(key) ?? null };
+    });
+
+    if (changed) {
+      this.setStates(uri, nextStates);
+    }
+  }
+
   private setStates(uri: vscode.Uri, states: PackageJsonDependencyAnalysisState[]): void {
     this.#states.set(uri.toString(), states);
     this.#onDidChange.fire(uri);
@@ -362,3 +463,6 @@ const markLoadingUnavailable = (
     state.status === "loading"
       ? { ...state, status: "unavailable", message }
       : state);
+
+const registryTargetKey = (packageName: string, installedVersion?: string): string =>
+  `${packageName}\n${installedVersion ?? ""}`;

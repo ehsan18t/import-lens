@@ -8,9 +8,12 @@ import {
   packageJsonDependencyHintParts,
   packageJsonSectionSummaryLabel,
 } from "./packageJsonLabels.js";
-import { packageJsonDependencyTooltipMarkdown } from "./packageJsonTooltip.js";
-import { tooltipForMessage } from "./tooltip.js";
-import { copyImportDiagnosticsCommand } from "./diagnostics.js";
+import {
+  packageJsonDependencyTooltipMarkdown,
+  packageJsonDependencyTooltipTrustedCommands,
+  packageJsonSectionSummaryTooltipMarkdown,
+  packageJsonSectionSummaryTooltipTrustedCommands,
+} from "./packageJsonTooltip.js";
 import { packageJsonDependencyHintAnchorCharacter } from "./packageJsonDecorationAnchor.js";
 import {
   emptyInlineHintDecorationLayers,
@@ -92,7 +95,7 @@ export class PackageJsonDecorationController implements vscode.Disposable {
       packageJsonDependencyHintAnchorCharacter(line.text),
     );
     const parts = packageJsonDependencyHintParts(state, config);
-    const tooltip = tooltipForPackageJsonState(state);
+    const tooltip = tooltipForPackageJsonState(state, config, document.uri.toString());
 
     return inlineHintDecorationLayers(
       packageJsonHintSegments(parts, config),
@@ -115,29 +118,69 @@ export class PackageJsonDecorationController implements vscode.Disposable {
 
     const line = document.lineAt(section.objectRange.start.line);
     const anchor = line.range.end;
+    const sectionStates = states.filter((state) => state.section === section.section);
 
     return inlineHintDecorationLayers(
       [packageJsonSectionSummarySegment(label)],
       anchor,
-      tooltipForMessage("ImportLens dependency summary", label),
+      tooltipForPackageJsonSectionSummary(
+        label,
+        sectionStates,
+        config,
+        document.uri.toString(),
+        section.section,
+      ),
     );
   }
 }
 
 const tooltipForPackageJsonState = (
   state: PackageJsonDependencyAnalysisState,
+  config: ReturnType<typeof getImportLensConfig>,
+  packageJsonUri: string,
 ): vscode.MarkdownString | undefined => {
   if (state.status === "loading") {
     return undefined;
   }
 
   const tooltip = new vscode.MarkdownString(
-    packageJsonDependencyTooltipMarkdown(state, getImportLensConfig()),
+    packageJsonDependencyTooltipMarkdown(state, config, { packageJsonUri }),
     true,
   );
+  const trustedCommands = packageJsonDependencyTooltipTrustedCommands(
+    state,
+    config,
+    { packageJsonUri },
+  );
 
-  if (state.result?.diagnostics.length) {
-    tooltip.isTrusted = { enabledCommands: [copyImportDiagnosticsCommand] };
+  if (trustedCommands.length > 0) {
+    tooltip.isTrusted = { enabledCommands: trustedCommands };
+  }
+
+  return tooltip;
+};
+
+const tooltipForPackageJsonSectionSummary = (
+  label: string,
+  states: readonly PackageJsonDependencyAnalysisState[],
+  config: ReturnType<typeof getImportLensConfig>,
+  packageJsonUri: string,
+  section: PackageJsonDependencySection["section"],
+): vscode.MarkdownString => {
+  const tooltip = new vscode.MarkdownString(
+    packageJsonSectionSummaryTooltipMarkdown(label, states, config, {
+      packageJsonUri,
+      section,
+    }),
+    true,
+  );
+  const trustedCommands = packageJsonSectionSummaryTooltipTrustedCommands(config, {
+    packageJsonUri,
+    section,
+  });
+
+  if (trustedCommands.length > 0) {
+    tooltip.isTrusted = { enabledCommands: trustedCommands };
   }
 
   return tooltip;
