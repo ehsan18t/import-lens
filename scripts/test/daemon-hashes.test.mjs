@@ -8,7 +8,7 @@ import {
   knownHashesSource,
   parseKnownHashesSource,
   updateKnownDaemonHashes,
-} from "./daemon-hashes.mjs";
+} from "../daemon-hashes.mjs";
 
 const tempRepo = () => mkdtempSync(path.join(os.tmpdir(), "import-lens-hashes-"));
 

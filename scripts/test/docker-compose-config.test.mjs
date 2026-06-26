@@ -3,13 +3,13 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 test("docker build script delegates to the Compose builder service", () => {
-  const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const manifest = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
 
   assert.equal(manifest.scripts["docker:build"], "docker compose run --rm --build builder");
 });
 
 test("Compose builder keeps pnpm noninteractive and isolated from host installs", () => {
-  const compose = readFileSync(new URL("../compose.yaml", import.meta.url), "utf8");
+  const compose = readFileSync(new URL("../../compose.yaml", import.meta.url), "utf8");
 
   assert.match(compose, /dockerfile:\s*Dockerfile\.build/u);
   assert.match(compose, /CI:\s*"true"/u);

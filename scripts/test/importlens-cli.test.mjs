@@ -9,7 +9,7 @@ import {
   loadBudgetConfig,
   parseCliArgs,
   runImportLensCheck,
-} from "../cli/importlens.mjs";
+} from "../../cli/importlens.mjs";
 
 class FakeSocket extends EventEmitter {
   writes = [];

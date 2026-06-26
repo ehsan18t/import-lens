@@ -61,6 +61,10 @@ impl Prefetcher {
         Self::default()
     }
 
+    pub fn cancellation(&self) -> &Arc<CancellationToken> {
+        &self.cancellation
+    }
+
     pub fn cancel(&self) {
         self.cancellation.cancel();
     }
@@ -317,7 +321,7 @@ fn prewarm_thread_count() -> usize {
         .unwrap_or(1)
 }
 
-fn prewarm_pool() -> Result<&'static rayon::ThreadPool, String> {
+pub fn prewarm_pool() -> Result<&'static rayon::ThreadPool, String> {
     if PREWARM_POOL.get().is_none() {
         let pool = ThreadPoolBuilder::new()
             .num_threads(prewarm_thread_count())
@@ -329,33 +333,4 @@ fn prewarm_pool() -> Result<&'static rayon::ThreadPool, String> {
     PREWARM_POOL
         .get()
         .ok_or_else(|| "failed to initialize prewarm thread pool".to_owned())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prefetcher_drop_cancels_current_generation() {
-        let cancellation = Arc::new(CancellationToken::default());
-        let generation = cancellation.next_generation();
-        let prefetcher = Prefetcher {
-            cancellation: Arc::clone(&cancellation),
-        };
-
-        assert!(cancellation.is_current(generation));
-
-        drop(prefetcher);
-
-        assert!(!cancellation.is_current(generation));
-    }
-
-    #[test]
-    fn prewarm_pool_reuses_one_fallible_thread_pool() {
-        let first = prewarm_pool().expect("prewarm pool should build") as *const rayon::ThreadPool;
-        let second =
-            prewarm_pool().expect("prewarm pool should be reused") as *const rayon::ThreadPool;
-
-        assert_eq!(first, second);
-    }
 }

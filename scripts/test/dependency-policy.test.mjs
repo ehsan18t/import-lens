@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { oxcStackConfig } from "./oxc-stack.config.mjs";
+import { oxcStackConfig } from "../oxc-stack.config.mjs";
 
-const repoFile = (relativePath) => readFileSync(new URL(`../${relativePath}`, import.meta.url), "utf8");
+const repoFile = (relativePath) => readFileSync(new URL(`../../${relativePath}`, import.meta.url), "utf8");
 
 test("dependency policy pins the oxc analysis stack as one coordinated version", () => {
   const workspaceCargoToml = repoFile("Cargo.toml");

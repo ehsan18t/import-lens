@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { createStagedManifest } from "./package-vsix-manifest.mjs";
+import { createStagedManifest } from "../package-vsix-manifest.mjs";
 
-const packageVsixScript = readFileSync(new URL("./package-vsix.mjs", import.meta.url), "utf8");
+const packageVsixScript = readFileSync(new URL("../package-vsix.mjs", import.meta.url), "utf8");
 
 const manifest = {
   name: "import-lens",

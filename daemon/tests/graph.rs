@@ -355,3 +355,50 @@ fn graph_cache_rebuilds_when_dependency_file_changes() {
         "{second:?}",
     );
 }
+
+static NEXT_TEMP_GRAPH_WORKSPACE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn temp_graph_workspace() -> PathBuf {
+    use std::sync::atomic::Ordering;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let id = NEXT_TEMP_GRAPH_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
+    let process_id = std::process::id();
+    let path = std::env::temp_dir().join(format!("import-lens-graph-{process_id}-{suffix}-{id}"));
+    fs::create_dir_all(&path).expect("temp graph workspace should be created");
+    path
+}
+
+#[test]
+fn graph_resolves_and_transforms_mts_and_cts_modules() {
+    let workspace = temp_graph_workspace();
+
+    for extension in ["mts", "cts"] {
+        let entry = workspace.join(format!("entry.{extension}"));
+        let dep = workspace.join(format!("dep.{extension}"));
+        fs::write(
+            &entry,
+            "import { value } from './dep';\nexport const answer: number = value;\n",
+        )
+        .expect("entry module should be written");
+        fs::write(&dep, "export const value: number = 42;\n")
+            .expect("dep module should be written");
+
+        let graph = build_module_graph(&entry).expect("graph should build");
+
+        assert_eq!(graph.modules.len(), 2);
+        assert!(
+            graph
+                .modules
+                .iter()
+                .all(|module| !module.source.contains(": number")),
+            "{graph:?}",
+        );
+    }
+
+    fs::remove_dir_all(workspace).expect("temp graph workspace should be removed");
+}

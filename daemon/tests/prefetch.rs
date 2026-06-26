@@ -3,8 +3,8 @@ use import_lens_daemon::{
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::resolver::resolve_package_entry,
     prefetch::{
-        CancellationToken, cached_import_request_from_key, package_json_dependency_names,
-        package_json_prewarm_requests,
+        CancellationToken, Prefetcher, cached_import_request_from_key,
+        package_json_dependency_names, package_json_prewarm_requests, prewarm_pool,
     },
 };
 use std::{
@@ -146,4 +146,25 @@ fn cached_import_request_from_key_parses_recent_cache_keys() {
     );
     assert!(cached_import_request_from_key("react@19.2.3::default").is_none());
     assert!(cached_import_request_from_key("bad-key").is_none());
+}
+
+#[test]
+fn prefetcher_drop_cancels_current_generation() {
+    let prefetcher = Prefetcher::new();
+    let cancellation = std::sync::Arc::clone(prefetcher.cancellation());
+    let generation = cancellation.next_generation();
+
+    assert!(cancellation.is_current(generation));
+
+    drop(prefetcher);
+
+    assert!(!cancellation.is_current(generation));
+}
+
+#[test]
+fn prewarm_pool_reuses_one_fallible_thread_pool() {
+    let first = prewarm_pool().expect("prewarm pool should build") as *const rayon::ThreadPool;
+    let second = prewarm_pool().expect("prewarm pool should be reused") as *const rayon::ThreadPool;
+
+    assert_eq!(first, second);
 }

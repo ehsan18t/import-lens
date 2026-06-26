@@ -23,8 +23,8 @@ const execFilePromise = promisify(execFileCallback);
 const defaultPaths = {
   cargoToml: "daemon/Cargo.toml",
   manifest: "package.json",
-  dependencyPolicyTest: "scripts/dependency-policy.test.mjs",
-  packageVsixManifestTest: "scripts/package-vsix-manifest.test.mjs",
+  dependencyPolicyTest: "scripts/test/dependency-policy.test.mjs",
+  packageVsixManifestTest: "scripts/test/package-vsix-manifest.test.mjs",
   srs: "docs/ImportLens-SRS.md",
   config: "scripts/oxc-stack.config.mjs",
 };

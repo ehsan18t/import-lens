@@ -9,7 +9,7 @@ import test from "node:test";
  */
 const ESM_ONLY_DEPS = ["p-queue"];
 
-const bundlePath = new URL("../extension/dist/extension.cjs", import.meta.url);
+const bundlePath = new URL("../../extension/dist/extension.cjs", import.meta.url);
 
 test("CJS bundle must not externalize ESM-only dependencies", () => {
   let bundle;

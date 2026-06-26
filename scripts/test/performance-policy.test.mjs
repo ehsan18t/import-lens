@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-const performanceTest = readFileSync(new URL("../daemon/tests/performance.rs", import.meta.url), "utf8");
-const accuracyCompare = readFileSync(new URL("./accuracy-compare.mjs", import.meta.url), "utf8");
+const manifest = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+const performanceTest = readFileSync(new URL("../../daemon/tests/performance.rs", import.meta.url), "utf8");
+const accuracyCompare = readFileSync(new URL("../accuracy-compare.mjs", import.meta.url), "utf8");
 
 test("performance smoke is explicit and runs in release mode", () => {
   assert.equal(manifest.scripts["test:rust"], "cargo test --workspace");

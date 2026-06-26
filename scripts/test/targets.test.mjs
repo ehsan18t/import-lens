@@ -8,7 +8,7 @@ import {
   platformTargets,
   targetInfo,
   vsixNameForTarget,
-} from "./targets.mjs";
+} from "../targets.mjs";
 
 test("platformTargets lists every supported native VSIX target", () => {
   assert.deepEqual(platformTargets, [

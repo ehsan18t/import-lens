@@ -3,8 +3,8 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { oxcStackConfig } from "./oxc-stack.config.mjs";
-import { parseUpdateArgs, updateOxcStack } from "./update-oxc-stack.mjs";
+import { oxcStackConfig } from "../oxc-stack.config.mjs";
+import { parseUpdateArgs, updateOxcStack } from "../update-oxc-stack.mjs";
 
 const tempRepo = async ({ cargoToml = cargoTomlFixture(), manifest = manifestFixture(), srs = srsFixture() } = {}) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "importlens-oxc-update-"));
