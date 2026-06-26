@@ -675,6 +675,7 @@ fn service_analyzes_package_json_dependencies_in_daemon() {
         include_registry_hints: false,
         force_registry_refresh: false,
         refresh_section: None,
+        streaming: false,
     });
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
@@ -695,6 +696,99 @@ fn service_analyzes_package_json_dependencies_in_daemon() {
     assert_eq!(tiny.status, ImportAnalysisStatus::Ready);
     assert_eq!(tiny.installed_version.as_deref(), Some("1.0.0"));
     assert_eq!(missing.status, ImportAnalysisStatus::Missing);
+}
+
+#[test]
+fn service_streams_package_json_loading_states_before_ready_results() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new(None, false);
+    let partials = Mutex::new(Vec::new());
+
+    let response = service.handle_analyze_package_json_streaming(
+        AnalyzePackageJsonRequest {
+            message_type: "analyze_package_json".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 36,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            active_document_path: workspace.join("package.json").to_string_lossy().to_string(),
+            source: r#"{
+  "dependencies": { "tiny-lib": "^1.0.0", "missing-lib": "^1.0.0" }
+}"#
+            .to_owned(),
+            include_registry_hints: false,
+            force_registry_refresh: false,
+            refresh_section: None,
+            streaming: true,
+        },
+        |partial| {
+            partials
+                .lock()
+                .expect("partials lock should not be poisoned")
+                .push(partial);
+        },
+    );
+
+    let partials = partials
+        .into_inner()
+        .expect("partials lock should not be poisoned");
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.request_id, 36);
+    assert_eq!(response.error, None);
+    assert_eq!(response.indexes, None);
+    assert_eq!(response.states.len(), 2);
+    assert!(
+        response
+            .states
+            .iter()
+            .any(|state| state.name == "tiny-lib" && state.status == ImportAnalysisStatus::Ready),
+        "{response:?}",
+    );
+    assert!(
+        response
+            .states
+            .iter()
+            .any(|state| state.name == "missing-lib"
+                && state.status == ImportAnalysisStatus::Missing),
+        "{response:?}",
+    );
+
+    let initial = partials
+        .first()
+        .expect("initial package.json partial should be emitted");
+    assert_eq!(initial.request_id, 36);
+    assert_eq!(initial.indexes, Some(vec![0, 1]));
+    assert_eq!(initial.states.len(), 2);
+    assert!(
+        initial
+            .states
+            .iter()
+            .any(|state| state.name == "tiny-lib" && state.status == ImportAnalysisStatus::Loading),
+        "{initial:?}",
+    );
+    assert!(
+        initial
+            .states
+            .iter()
+            .any(|state| state.name == "missing-lib"
+                && state.status == ImportAnalysisStatus::Missing),
+        "{initial:?}",
+    );
+    let tiny_index = initial
+        .states
+        .iter()
+        .position(|state| state.name == "tiny-lib")
+        .expect("tiny-lib should be present in initial partial");
+    assert!(
+        partials.iter().any(|partial| {
+            partial.indexes.as_deref() == Some(&[tiny_index])
+                && partial.states.first().is_some_and(|state| {
+                    state.name == "tiny-lib" && state.status == ImportAnalysisStatus::Ready
+                })
+        }),
+        "{partials:?}",
+    );
 }
 
 #[test]

@@ -33,6 +33,13 @@ interface PendingBatchRequest {
   onPartial?: (response: BatchResponse) => void;
 }
 
+interface PendingPackageJsonRequest {
+  resolve: (response: AnalyzePackageJsonResponse) => void;
+  reject: (error: Error) => void;
+  onPartial?: (response: AnalyzePackageJsonResponse) => void;
+  resetTimeout: () => void;
+}
+
 interface PendingRequest<TResponse> {
   resolve: (response: TResponse) => void;
   reject: (error: Error) => void;
@@ -43,7 +50,7 @@ export class IpcClient extends EventEmitter {
   readonly #decoder = new FrameDecoder();
   readonly #batchPending = new Map<number, PendingBatchRequest>();
   readonly #documentPending = new Map<number, PendingRequest<AnalyzeDocumentResponse>>();
-  readonly #packageJsonPending = new Map<number, PendingRequest<AnalyzePackageJsonResponse>>();
+  readonly #packageJsonPending = new Map<number, PendingPackageJsonRequest>();
   readonly #specifiersPending = new Map<number, PendingRequest<AnalyzeSpecifiersResponse>>();
   readonly #exportsPending = new Map<number, PendingRequest<EnumerateExportsResponse>>();
   readonly #fileSizePending = new Map<number, PendingRequest<FileSizeResponse>>();
@@ -140,8 +147,44 @@ export class IpcClient extends EventEmitter {
   requestAnalyzePackageJson(
     request: AnalyzePackageJsonRequest,
     timeoutMs = 10000,
+    onPartial?: (response: AnalyzePackageJsonResponse) => void,
   ): Promise<AnalyzePackageJsonResponse> {
-    return this.#requestWithPending(this.#packageJsonPending, request, timeoutMs);
+    return new Promise((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+
+      const resetTimeout = (): void => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        timer = setTimeout(() => {
+          if (this.#packageJsonPending.has(request.request_id)) {
+            this.#packageJsonPending.delete(request.request_id);
+            reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
+          }
+        }, timeoutMs);
+      };
+
+      timer = setTimeout(() => {
+        if (this.#packageJsonPending.has(request.request_id)) {
+          this.#packageJsonPending.delete(request.request_id);
+          reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
+        }
+      }, timeoutMs);
+
+      this.#packageJsonPending.set(request.request_id, {
+        resolve: (response) => {
+          clearTimeout(timer);
+          resolve(response);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+        onPartial,
+        resetTimeout,
+      });
+      this.send(request);
+    });
   }
 
   requestAnalyzeSpecifiers(
@@ -230,7 +273,21 @@ export class IpcClient extends EventEmitter {
 
     for (const message of messages) {
       if (isAnalyzePackageJsonResponse(message)) {
-        this.#resolvePending(this.#packageJsonPending, message);
+        const pending = this.#packageJsonPending.get(message.request_id);
+
+        if (!pending) {
+          continue;
+        }
+
+        if (isPackageJsonStreamingPartial(message)) {
+          pending.resetTimeout();
+          pending.onPartial?.(message);
+          this.emit("packageJsonPartial", message);
+          continue;
+        }
+
+        this.#packageJsonPending.delete(message.request_id);
+        pending.resolve(message);
         continue;
       }
 
@@ -372,6 +429,9 @@ const isBatchResponse = (value: unknown): value is BatchResponse => {
 const isStreamingPartial = (response: BatchResponse): boolean =>
   Array.isArray(response.indexes) && response.indexes.length > 0;
 
+const isPackageJsonStreamingPartial = (response: AnalyzePackageJsonResponse): boolean =>
+  Array.isArray(response.indexes) && response.indexes.length > 0;
+
 const isAnalyzeDocumentResponse = (value: unknown): value is AnalyzeDocumentResponse => {
   if (!value || typeof value !== "object") {
     return false;
@@ -403,6 +463,7 @@ const isAnalyzePackageJsonResponse = (value: unknown): value is AnalyzePackageJs
     typeof candidate.request_id === "number" &&
     Array.isArray(candidate.sections) &&
     Array.isArray(candidate.states) &&
+    (candidate.indexes === undefined || candidate.indexes.every((index) => typeof index === "number")) &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics)
   );

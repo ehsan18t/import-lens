@@ -11,6 +11,7 @@ const manifest = {
   icon: "media/icon.png",
   dependencies: {
     "@msgpack/msgpack": "3.1.3",
+    "p-queue": "^9.3.0",
   },
   devDependencies: {
     typescript: "6.0.3",
@@ -30,7 +31,7 @@ test("createStagedManifest includes the repository license in packaged files", (
 test("createStagedManifest keeps production dependencies and strips development-only fields", () => {
   const staged = createStagedManifest({ manifest });
 
-  assert.deepEqual(staged.dependencies, { "@msgpack/msgpack": "3.1.3" });
+  assert.deepEqual(staged.dependencies, { "@msgpack/msgpack": "3.1.3", "p-queue": "^9.3.0" });
   assert.equal(staged.devDependencies, undefined);
   assert.equal(staged.scripts, undefined);
 });

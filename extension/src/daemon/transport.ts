@@ -28,7 +28,10 @@ export interface AnalysisTransport {
   start(analysisRoot?: string): Promise<DaemonState>;
   sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null>;
   analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null>;
-  analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse | null>;
+  analyzePackageJson(
+    request: AnalyzePackageJsonRequest,
+    onPartial?: (response: AnalyzePackageJsonResponse) => void,
+  ): Promise<AnalyzePackageJsonResponse | null>;
   analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null>;
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null>;
   requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null>;
@@ -116,8 +119,11 @@ export class TransportCoordinator implements AnalysisTransport {
     return this.#activeTransport?.analyzeDocument(request) ?? Promise.resolve(null);
   }
 
-  analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse | null> {
-    return this.#activeTransport?.analyzePackageJson(request) ?? Promise.resolve(null);
+  analyzePackageJson(
+    request: AnalyzePackageJsonRequest,
+    onPartial?: (response: AnalyzePackageJsonResponse) => void,
+  ): Promise<AnalyzePackageJsonResponse | null> {
+    return this.#activeTransport?.analyzePackageJson(request, onPartial) ?? Promise.resolve(null);
   }
 
   analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null> {

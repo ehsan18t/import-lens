@@ -52,8 +52,11 @@ export class DaemonManager implements vscode.Disposable {
     return this.#transport.analyzeDocument(request);
   }
 
-  analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse | null> {
-    return this.#transport.analyzePackageJson(request);
+  analyzePackageJson(
+    request: AnalyzePackageJsonRequest,
+    onPartial?: (response: AnalyzePackageJsonResponse) => void,
+  ): Promise<AnalyzePackageJsonResponse | null> {
+    return this.#transport.analyzePackageJson(request, onPartial);
   }
 
   analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null> {

@@ -25,7 +25,6 @@ use crate::{
         clear_module_graph_cache, invalidate_module_graph_cache_for_package,
     },
     pipeline::resolver::{ResolvedPackage, find_package_root, resolve_package_entry},
-    registry::RegistryHintStore,
 };
 use rayon::prelude::*;
 use serde_json::Value;
@@ -38,14 +37,12 @@ use std::{
 #[derive(Debug)]
 pub struct ImportLensService {
     cache: ImportCache,
-    registry_hints: RegistryHintStore,
 }
 
 impl ImportLensService {
     pub fn new(storage_path: Option<PathBuf>, enable_disk_cache: bool) -> Self {
         Self {
-            cache: ImportCache::new(storage_path.clone(), enable_disk_cache),
-            registry_hints: RegistryHintStore::new(storage_path),
+            cache: ImportCache::new(storage_path, enable_disk_cache),
         }
     }
 
@@ -310,12 +307,36 @@ impl ImportLensService {
         &self,
         request: AnalyzePackageJsonRequest,
     ) -> AnalyzePackageJsonResponse {
+        self.analyze_package_json(request, None::<fn(AnalyzePackageJsonResponse)>)
+    }
+
+    pub fn handle_analyze_package_json_streaming<F>(
+        &self,
+        request: AnalyzePackageJsonRequest,
+        emit_partial: F,
+    ) -> AnalyzePackageJsonResponse
+    where
+        F: Fn(AnalyzePackageJsonResponse) + Sync,
+    {
+        let streaming = request.streaming;
+        self.analyze_package_json(request, streaming.then_some(emit_partial))
+    }
+
+    fn analyze_package_json<F>(
+        &self,
+        request: AnalyzePackageJsonRequest,
+        emit_partial: Option<F>,
+    ) -> AnalyzePackageJsonResponse
+    where
+        F: Fn(AnalyzePackageJsonResponse) + Sync,
+    {
         if !is_supported_protocol_version(request.version) {
             return AnalyzePackageJsonResponse {
                 version: request.version.min(PROTOCOL_VERSION),
                 request_id: request.request_id,
                 sections: Vec::new(),
                 states: Vec::new(),
+                indexes: None,
                 error: Some(format!("unsupported protocol version {}", request.version)),
                 diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
             };
@@ -327,13 +348,9 @@ impl ImportLensService {
         };
         let sections = package_json_dependency_sections(&request.source);
         let mut states = Vec::new();
+        let mut import_requests = Vec::new();
 
         for entry in package_json_dependency_entries(&request.source) {
-            let force_registry_refresh = request.force_registry_refresh
-                && request
-                    .refresh_section
-                    .as_ref()
-                    .is_none_or(|section| section == &entry.section);
             let resolution =
                 resolve_installed_package_version(&context.active_document_path, &entry.name);
 
@@ -347,40 +364,21 @@ impl ImportLensService {
                         import_kind: ImportKind::Namespace,
                         runtime: ImportRuntime::Component,
                     };
-                    let result = self.analyze_with_cache(&context, &import_request);
-                    let registry_hint = request
-                        .include_registry_hints
-                        .then(|| {
-                            self.registry_hints.hint_for_package(
-                                &entry.name,
-                                Some(&version),
-                                force_registry_refresh,
-                            )
-                        })
-                        .flatten();
+                    import_requests.push(Some(import_request));
 
                     states.push(PackageJsonDependencyAnalysisItem {
                         name: entry.name.clone(),
                         section: entry.section.clone(),
                         entry,
-                        status: ImportAnalysisStatus::Ready,
+                        status: ImportAnalysisStatus::Loading,
                         installed_version: Some(version),
-                        registry_hint,
+                        registry_hint: None,
                         message: None,
-                        result: Some(result),
+                        result: None,
                     });
                 }
                 Err(message) => {
-                    let registry_hint = request
-                        .include_registry_hints
-                        .then(|| {
-                            self.registry_hints.hint_for_package(
-                                &entry.name,
-                                None,
-                                force_registry_refresh,
-                            )
-                        })
-                        .flatten();
+                    import_requests.push(None);
 
                     states.push(PackageJsonDependencyAnalysisItem {
                         name: entry.name.clone(),
@@ -388,7 +386,7 @@ impl ImportLensService {
                         entry,
                         status: ImportAnalysisStatus::Missing,
                         installed_version: None,
-                        registry_hint,
+                        registry_hint: None,
                         message: Some(message),
                         result: None,
                     });
@@ -396,16 +394,53 @@ impl ImportLensService {
             }
         }
 
-        let mut results = states
-            .iter_mut()
-            .filter_map(|state| state.result.take())
+        if let Some(emit_partial) = emit_partial.as_ref()
+            && !states.is_empty()
+        {
+            emit_partial(AnalyzePackageJsonResponse {
+                version: request.version,
+                request_id: request.request_id,
+                sections: sections.clone(),
+                states: states.clone(),
+                indexes: Some((0..states.len()).collect()),
+                error: None,
+                diagnostics: Vec::new(),
+            });
+        }
+
+        let indexed_results = import_requests
+            .par_iter()
+            .enumerate()
+            .filter_map(|(index, import_request)| import_request.as_ref().map(|item| (index, item)))
+            .map(|(index, import_request)| {
+                let result = self.analyze_with_cache(&context, import_request);
+
+                if let Some(emit_partial) = emit_partial.as_ref() {
+                    let mut state = states[index].clone();
+                    state.status = ImportAnalysisStatus::Ready;
+                    state.result = Some(result.clone());
+                    emit_partial(AnalyzePackageJsonResponse {
+                        version: request.version,
+                        request_id: request.request_id,
+                        sections: Vec::new(),
+                        states: vec![state],
+                        indexes: Some(vec![index]),
+                        error: None,
+                        diagnostics: Vec::new(),
+                    });
+                }
+
+                (index, result)
+            })
+            .collect::<Vec<_>>();
+        let mut results = indexed_results
+            .iter()
+            .map(|(_, result)| result.clone())
             .collect::<Vec<_>>();
         annotate_shared_bytes(&mut results);
-        let mut result_iter = results.into_iter();
-        for state in &mut states {
-            if state.status == ImportAnalysisStatus::Ready {
-                state.result = result_iter.next();
-            }
+        for ((index, _), result) in indexed_results.into_iter().zip(results.into_iter()) {
+            states[index].status = ImportAnalysisStatus::Ready;
+            states[index].result = Some(result);
         }
 
         AnalyzePackageJsonResponse {
@@ -413,6 +448,7 @@ impl ImportLensService {
             request_id: request.request_id,
             sections,
             states,
+            indexes: None,
             error: None,
             diagnostics: Vec::new(),
         }

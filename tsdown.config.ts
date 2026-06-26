@@ -9,9 +9,9 @@ export default defineConfig({
   sourcemap: false,
   dts: false,
   deps: {
-    alwaysBundle: ["@msgpack/msgpack"],
+    alwaysBundle: ["@msgpack/msgpack", "p-queue", "p-timeout", "eventemitter3"],
     neverBundle: ["vscode", "oxc-parser"],
-    onlyBundle: ["@msgpack/msgpack"],
+    onlyBundle: ["@msgpack/msgpack", "p-queue", "p-timeout", "eventemitter3"],
   },
   outputOptions: {
     entryFileNames: "extension.cjs",

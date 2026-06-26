@@ -5,5 +5,4 @@ pub mod lifecycle;
 pub mod logging;
 pub mod pipeline;
 pub mod prefetch;
-pub mod registry;
 pub mod service;

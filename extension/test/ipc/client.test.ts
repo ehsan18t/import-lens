@@ -7,6 +7,8 @@ import test from "node:test";
 import { IpcClient } from "../../src/ipc/client.js";
 import { encodeFrame } from "../../src/ipc/codec.js";
 import type {
+  AnalyzePackageJsonRequest,
+  AnalyzePackageJsonResponse,
   BatchRequest,
   BatchResponse,
   EnumerateExportsRequest,
@@ -14,6 +16,8 @@ import type {
   FileSizeRequest,
   FileSizeResponse,
   ImportResult,
+  PackageJsonDependencyAnalysisItem,
+  PackageJsonDependencyEntry,
 } from "../../src/ipc/protocol.js";
 
 const testPipeName = (): string => {
@@ -101,6 +105,47 @@ const fileSizeRequest = (requestId: number): FileSizeRequest => ({
   workspace_root: "/workspace",
   active_document_path: "/workspace/src/app.ts",
   imports: [],
+});
+
+const packageJsonRequest = (requestId: number): AnalyzePackageJsonRequest => ({
+  type: "analyze_package_json",
+  version: 5,
+  request_id: requestId,
+  workspace_root: "/workspace",
+  active_document_path: "/workspace/package.json",
+  source: "{\"dependencies\":{\"react\":\"^19.0.0\"}}",
+  include_registry_hints: false,
+  streaming: true,
+});
+
+const packageJsonEntry = (name: string): PackageJsonDependencyEntry => ({
+  name,
+  version: "^1.0.0",
+  section: "dependencies",
+  range: {
+    start: { line: 1, character: 2 },
+    end: { line: 1, character: 20 },
+  },
+  nameRange: {
+    start: { line: 1, character: 2 },
+    end: { line: 1, character: 9 },
+  },
+  valueRange: {
+    start: { line: 1, character: 12 },
+    end: { line: 1, character: 20 },
+  },
+});
+
+const packageJsonState = (
+  name: string,
+  status: PackageJsonDependencyAnalysisItem["status"],
+): PackageJsonDependencyAnalysisItem => ({
+  entry: packageJsonEntry(name),
+  name,
+  section: "dependencies",
+  status,
+  installedVersion: "1.0.0",
+  result: status === "ready" ? emptyResult(name) : undefined,
 });
 
 test("IpcClient.dispose does not emit disconnect for intentional disposal", async () => {
@@ -249,6 +294,107 @@ test("IpcClient ignores stale streaming partials for other request IDs", async (
 
     assert.equal(response.request_id, 99);
     assert.equal(response.imports.length, 1);
+    assert.equal(partials.length, 0);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+test("IpcClient emits package.json streaming partials and resolves final response", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const partial: AnalyzePackageJsonResponse = {
+    version: 5,
+    request_id: 199,
+    sections: [],
+    states: [packageJsonState("react", "loading")],
+    indexes: [0],
+    error: null,
+    diagnostics: [],
+  };
+  const final: AnalyzePackageJsonResponse = {
+    version: 5,
+    request_id: 199,
+    sections: [],
+    states: [packageJsonState("react", "ready")],
+    error: null,
+    diagnostics: [],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    setTimeout(() => {
+      socket.write(encodeFrame(partial));
+      socket.write(encodeFrame(final));
+    }, 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const partials: AnalyzePackageJsonResponse[] = [];
+    client.on("packageJsonPartial", (response: AnalyzePackageJsonResponse) => {
+      partials.push(response);
+    });
+
+    const response = await client.requestAnalyzePackageJson(packageJsonRequest(199));
+
+    assert.equal(response.indexes, undefined);
+    assert.equal(response.states[0]?.status, "ready");
+    assert.equal(partials.length, 1);
+    assert.deepEqual(partials[0]?.indexes, [0]);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+test("IpcClient ignores stale package.json partials for other request IDs", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const stalePartial: AnalyzePackageJsonResponse = {
+    version: 5,
+    request_id: 198,
+    sections: [],
+    states: [packageJsonState("stale-lib", "loading")],
+    indexes: [0],
+    error: null,
+    diagnostics: [],
+  };
+  const final: AnalyzePackageJsonResponse = {
+    version: 5,
+    request_id: 199,
+    sections: [],
+    states: [packageJsonState("react", "ready")],
+    error: null,
+    diagnostics: [],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    setTimeout(() => {
+      socket.write(encodeFrame(stalePartial));
+      socket.write(encodeFrame(final));
+    }, 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const partials: AnalyzePackageJsonResponse[] = [];
+    client.on("packageJsonPartial", (response: AnalyzePackageJsonResponse) => {
+      partials.push(response);
+    });
+
+    const response = await client.requestAnalyzePackageJson(packageJsonRequest(199));
+
+    assert.equal(response.request_id, 199);
+    assert.equal(response.states.length, 1);
     assert.equal(partials.length, 0);
     client.dispose();
   } finally {

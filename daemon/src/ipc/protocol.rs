@@ -161,6 +161,7 @@ pub struct BatchResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportAnalysisStatus {
+    Loading,
     Ready,
     Missing,
     Unavailable,
@@ -291,6 +292,8 @@ pub struct AnalyzePackageJsonRequest {
     pub active_document_path: String,
     pub source: String,
     #[serde(default)]
+    pub streaming: bool,
+    #[serde(default)]
     pub include_registry_hints: bool,
     #[serde(default)]
     pub force_registry_refresh: bool,
@@ -304,6 +307,8 @@ pub struct AnalyzePackageJsonResponse {
     pub request_id: u64,
     pub sections: Vec<PackageJsonDependencySection>,
     pub states: Vec<PackageJsonDependencyAnalysisItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexes: Option<Vec<usize>>,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }

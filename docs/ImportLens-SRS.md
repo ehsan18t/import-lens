@@ -4,8 +4,8 @@
 
 | Field    | Value            |
 | -------- | ---------------- |
-| Version  | 1.8              |
-| Date     | 5 June 2026      |
+| Version  | 1.9              |
+| Date     | 26 June 2026     |
 | Status   | Draft            |
 | Audience | Engineering Team |
 
@@ -346,7 +346,7 @@ The extension must retain the detected import syntax category (`static`, `reexpo
 
 **FR-010** (Critical) - The IPC protocol must use MessagePack as the serialization format on both the TypeScript and Rust sides.
 
-**FR-011** (Critical) - Messages must be length-prefixed with a 4-byte big-endian unsigned integer representing the byte length of the MessagePack payload that follows. This allows the socket to handle concurrent in-flight requests without message boundary ambiguity. Both the TypeScript and Rust decoders must reject frames larger than 32 MiB and must validate frame length arithmetic before allocating a payload buffer.
+**FR-011** (Critical) - Messages must be length-prefixed with a 4-byte big-endian unsigned integer representing the byte length of the MessagePack payload that follows. This allows the socket to handle concurrent in-flight requests without message boundary ambiguity. Both the TypeScript and Rust decoders must reject frames larger than 32 MiB and must validate frame length arithmetic before allocating a payload buffer. The Rust IPC server must use `tokio-util` length-delimited framing configured for the existing 4-byte big-endian prefix and 32 MiB maximum frame size; the TypeScript decoder keeps the compatible custom frame decoder.
 
 **FR-012** (Critical) - The extension must send all imports from a single debounce cycle as a single `BatchRequest`, not one request per import line.
 
@@ -355,6 +355,8 @@ The extension must retain the detected import syntax category (`static`, `reexpo
 **FR-013a** (High) - When the daemon encounters a computation error for one or more imports in a batch, it must return a partial `BatchResponse` containing successful results for all other imports in the same batch. For each failed import, the `ImportResult.error` field must be set to a non-null string describing the failure reason, `ImportResult.diagnostics` must include at least one structured diagnostic entry with the failing stage and real daemon context, and all numeric size fields must be set to `0`. The extension host must render a subtle "Size unavailable" decoration for imports whose `ImportResult.error` is non-null, and must not show a user-visible error dialog. The extension host must keep raw diagnostic details out of the inline UI while making them copyable from the hover.
 
 **FR-013b** (High) - Protocol v2+ clients may request streaming batch responses by setting `BatchRequest.streaming: true`. In streaming mode, the daemon must emit partial `BatchResponse` frames as import results become available and set `BatchResponse.indexes` to the zero-based import indexes represented by that frame. The IPC server must write each partial frame to the socket while the rest of the batch is still computing; it must not buffer all partials in memory and flush them only after the final result is ready. This index list is required because duplicate specifiers can appear multiple times in one file. A final full-batch `BatchResponse` with shared-byte annotations must still be emitted for compatibility with existing request-state handling. Protocol v1 clients and v2+ clients without `streaming: true` receive only a full batch response.
+
+**FR-013c** (High) - Protocol v5 clients may request streaming `package.json` dependency analysis by setting `AnalyzePackageJsonRequest.streaming: true`. In streaming mode, the daemon must emit an initial partial `AnalyzePackageJsonResponse` with `indexes` covering every dependency entry and `status: "loading"` for dependencies whose installed package version was resolved but whose size is still computing. Dependencies that cannot be resolved may be emitted as `status: "missing"` in the same initial partial. As each package size result becomes available, the daemon must emit an indexed partial response for that dependency. The final `AnalyzePackageJsonResponse` must omit `indexes` and contain complete size states, including shared-byte annotations where applicable. The extension host must merge indexed partials without overwriting newer extension-side registry hints.
 
 **FR-014** (High) - On socket disconnect, the extension must discard any stale MessagePack payloads currently in the receive buffer and wait for the next document change event to trigger a fresh request cycle.
 
@@ -474,9 +476,9 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-036k** (Medium) - The extension must offer curated import substitution suggestions through CodeActions using only a local mapping file. Suggestions may copy or show alternatives and size context, but must not rewrite source automatically.
 
-**FR-036l** (Medium) - When `importLens.enableRegistryHints` is enabled, the extension may fetch npm metadata for registry-based hints. The setting must default to `true`; network work must use short timeouts, cache positive and negative results in VS Code globalState and session memory, include the registry fetch timestamp in successful hint state, and fail silently without affecting size computation. Package dependency hovers must expose a trusted refresh action that bypasses the registry hint cache for that one package only. Dependency summary hovers must expose a trusted refresh action that bypasses the registry hint cache for all dependencies represented by that summary.
+**FR-036l** (Medium) - When `importLens.enableRegistryHints` is enabled, the extension host may fetch npm metadata for registry-based hints. The setting must default to `true`; registry network work must never run inside the daemon and must never block size computation or package.json analysis. The controller must render cached registry hints immediately on `package.json` open, including stale successful hints when no fresh value is available, then refresh missing or stale metadata automatically in the background. Background and manual refreshes must use the same throttled queue: default concurrency 8, default rate limit 20 requests per 1,000 ms, in-flight de-duplication by package name plus installed version, short per-request timeout around 3 seconds, transient retry with jitter, `Retry-After` handling for npm `429` responses, and cached retry windows after transient failures. Positive, negative, and transient-error states must be cached in VS Code globalState and session memory. Registry failures must fail silently without affecting size computation. Package dependency hovers must expose a trusted refresh action that bypasses the registry hint cache for that one package only while still using the shared queue/rate-limit path. Dependency summary hovers must expose a trusted refresh action that bypasses the registry hint cache for all dependencies represented by that summary, again using the shared queue/rate-limit path.
 
-**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost end-of-line decorations for dependency blocks using local package resolution and prewarm-friendly daemon requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from a decoration refresh handler. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. Each dependency block should also expose a compact measured/total summary when analysis state is available. Dependency hovers must show the individual registry fetched time when available. Summary hovers must show the oldest registry fetched time across represented dependencies, or state that some registry info has not been fetched yet. Inline decorations must use independent primary and suffix colors: primary text (size, `types only`, `checking...`, or `unavailable`) uses `descriptionForeground` except `unavailable`, which uses `list.errorForeground`; registry suffixes (`latest`, `update`, `install`) use `gitDecoration.addedResourceForeground` and `gitDecoration.modifiedResourceForeground` respectively, rendered in italic, and may appear even when sizing is unavailable. Section summaries use muted foreground only.
+**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost end-of-line decorations for dependency blocks using local package resolution and daemon-owned size requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from a decoration refresh handler. The package.json controller must request daemon streaming so dependency rows appear as soon as entries are parsed and package resolution completes, then update individual rows incrementally as package size results and registry hints arrive. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. A daemon timeout or failure after partial responses must preserve completed states and mark only remaining `checking...` rows unavailable. Each dependency block should also expose a compact measured/total summary when analysis state is available. Dependency hovers must show the individual registry fetched time when available. Summary hovers must show the oldest registry fetched time across represented dependencies, or state that some registry info has not been fetched yet. Inline decorations must use independent primary and suffix colors: primary text (size, `types only`, `checking...`, or `unavailable`) uses `descriptionForeground` except `unavailable`, which uses `list.errorForeground`; registry suffixes (`latest`, `update`, `install`) use `gitDecoration.addedResourceForeground` and `gitDecoration.modifiedResourceForeground` respectively, rendered in italic, and may appear even when sizing is unavailable. Section summaries use muted foreground only.
 
 **FR-036n** (Medium) - The extension must provide `ImportLens: Compare Imports`, allowing users to compare two package specifiers side by side using the same local daemon sizing path as normal import analysis.
 
@@ -621,7 +623,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 ### 7.6 Extensibility
 
-**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v5 is the current native protocol and adds daemon-first document, package.json, raw specifier, current-file size, named-export completion, and node_modules change endpoints on top of v4 confidence metadata, v3 runtime-aware imports, v2 streaming batch responses, export enumeration, file-level shared sizing, module breakdowns, and per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse`, v2 request, v3 request, and v4 request compatibility must be preserved where the missing fields have safe defaults.
+**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v5 is the current native protocol and adds daemon-first document, package.json, package.json streaming partials, raw specifier, current-file size, named-export completion, and node_modules change endpoints on top of v4 confidence metadata, v3 runtime-aware imports, v2 streaming batch responses, export enumeration, file-level shared sizing, module breakdowns, and per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse`, v2 request, v3 request, and v4 request compatibility must be preserved where the missing fields have safe defaults.
 
 ---
 
@@ -659,6 +661,7 @@ The following criteria constitute the definition of done for the v1.0 release. A
 | IPC encoding  | `@msgpack/msgpack`                                | Payloads typically 20-40% smaller than JSON; meaningful improvement for batch responses of 20+ imports                                                                                                                                        |
 | IPC transport | Unix socket (macOS/Linux) or Named pipe (Windows) | Multiplexed, no stdout pollution                                                                                                                                                                                                              |
 | File watching | `vscode.workspace.createFileSystemWatcher`        | Native VS Code API; manages inotify/FSEvents limits safely across all extensions; used to detect package.json changes in node_modules and trigger daemon cache invalidation                                                                   |
+| Registry queue | `p-queue` + native `fetch`                       | Extension-host npm registry refresh uses bounded concurrency, interval rate limits, in-flight de-duplication, timeout, retry, and `Retry-After` handling without occupying daemon IPC analysis work                                           |
 | Telemetry     | `vscode.env.createTelemetryLogger` (v1.1 target)  | Anonymised usage telemetry (cache hit rate, tier distribution, recycle frequency). Opt-out respects VS Code global telemetry setting. Instrumentation scaffolding may be added in v1.0 with reporting deferred to v1.1.                       |
 
 ### 9.2 Rust Daemon
@@ -677,10 +680,10 @@ The following criteria constitute the definition of done for the v1.0 release. A
 | Zstd compression           | `zstd` crate                 | Level 3 provides best speed-to-ratio balance                                                                                                                                                                                           |
 | In-memory cache            | `papaya` (v0.2.x)            | Lock-free, deadlock-safe, optimised for read-heavy workloads. Uses a pinning API (`map.pin()`) rather than traditional lock guards.                                                                                                    |
 | Persistent cache           | `redb` (v4.x)                | Stable release, pure Rust, ACID, copy-on-write B-trees                                                                                                                                                                                 |
-| Registry HTTP              | `ureq` (v3.3.x)              | Low-overhead blocking Rust HTTP client for npm registry hint GETs. Uses rustls, platform certificate verification, and gzip without enabling ureq's JSON feature.                                                                       |
 | Concurrency                | `rayon` (v1.12.x)            | Work-stealing thread pool for parallel batch processing. Note: `rayon::join` accepts exactly 2 closures; 3+ parallel tasks require nested `rayon::join` or `rayon::scope`.                                                             |
 | IPC serialization          | `rmp-serde` (v1.3.x)         | MessagePack integration with serde, no extra dependencies                                                                                                                                                                              |
 | Async runtime              | `tokio`                      | Async socket server for handling concurrent IPC requests                                                                                                                                                                               |
+| IPC framing                | `tokio-util` codec           | Production length-delimited framing for the existing 4-byte big-endian MessagePack payload prefix and 32 MiB maximum frame size                                                                                                      |
 
 ### 9.3 OXC Versioning Note
 
@@ -707,12 +710,14 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 | `oxc_syntax`      | 0.134.0                  | exact pin      | ✅ Stable API    | Syntax metadata used by the parser and downstream OXC stages. Must match parser resolved version.                                                                                          |
 | `papaya`          | 0.2.4            | `~0.2`       | Pre-1.0         | Uses pinning API (`map.pin()`). Recycle triggers at 200,000 cached entries (NFR-004a). Watch for breaking changes.                                                                         |
 | `redb`            | 4.1.0            | `^4`         | ✅ Stable (1.0+) | ACID, committed file format. Upgraded from v3 to v4 (April 2026). The redb file format is committed stable; the v3→v4 migration must be handled via cache schema versioning (see FR-026a). |
-| `ureq`            | 3.3.0            | exact pin    | ✅ Stable        | Daemon-owned npm registry hint fetching with `rustls`, `platform-verifier`, and `gzip`. Uses `serde_json` for metadata parsing instead of ureq's JSON feature.                            |
 | `rayon`           | 1.12.0           | `^1.12`      | ✅ Stable        | `join()` takes exactly 2 closures. Use nested calls for 3+.                                                                                                                                |
 | `rmp-serde`       | 1.3.1            | `^1.3`       | ✅ Stable        | MessagePack ↔ serde.                                                                                                                                                                       |
 | `serde`           | 1.0.228          | `^1`         | ✅ Stable        | With `derive` feature.                                                                                                                                                                     |
 | `serde_json`      | 1.0.x            | `^1`         | ✅ Stable        | Structured parsing for `package.json` metadata and small lifecycle files such as `importlens-recycles.json`; avoids ad hoc string parsing.                                                 |
 | `tokio`           | 1.52.3           | `^1.52`      | ✅ Stable        | Features: `rt-multi-thread`, `net`, `io-util`, `macros`.                                                                                                                                   |
+| `tokio-util`      | 0.7.18           | `^0.7`       | ✅ Stable        | Length-delimited codec for Rust IPC frames, configured for the existing 4-byte big-endian length prefix and 32 MiB max frame size.                                                         |
+| `bytes`           | 1.11.1           | `^1`         | ✅ Stable        | Frame payload buffer type used by `tokio-util` codec sinks.                                                                                                                                |
+| `futures-util`    | 0.3.32           | `^0.3`       | ✅ Stable        | `SinkExt`/`StreamExt` utilities for framed IPC read/write loops.                                                                                                                           |
 | `flate2`          | 1.1.9            | `^1.1`       | ✅ Stable        | Gzip level 6.                                                                                                                                                                              |
 | `brotli`          | 8.0.3            | `^8`         | ✅ Stable        | Brotli level 4.                                                                                                                                                                            |
 | `zstd`            | 0.13.3           | `~0.13`      | ✅ Stable API    | Zstd level 3.                                                                                                                                                                              |
@@ -723,6 +728,7 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 | Package                              | Current Resolved Version | Category                               | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------------ | ---------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `@msgpack/msgpack`                   | 3.1.3            | `dependency`                           | MessagePack encode/decode.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `p-queue`                            | 9.3.0            | `dependency`                           | Registry metadata refresh queue with concurrency and interval rate limits; keeps npm fetch work out of daemon analysis and prevents duplicate in-flight requests.                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `tsdown`                             | 0.22.1           | `devDependency`                        | Rolldown-based bundler. Output: single-file `extension.js`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `typescript`                         | 6.0.3            | `devDependency`                        | Bridge release to TS 7.0. Type checking only; not a runtime dep. **tsconfig must use**: `module: \"esnext\"`, `target: \"es2025\"`, `types: [\"node\", \"vscode\"]` (explicit), `moduleResolution: \"bundler\"`. Do NOT use TS 5.x.                                                                                                                                                                                                                                                                                                                                            |
 | `@types/vscode`                      | 1.90.0           | `devDependency`                        | Intentionally pinned to a baseline VS Code version, not the latest release. The extension's `package.json` must declare `"engines": { "vscode": "^1.90.0" }`. All VS Code APIs used by ImportLens (InlayHintsProvider, FileSystemWatcher, OutputChannel, TelemetryLogger, etc.) are available in 1.90+. VS Code 1.90 was released in May 2024; pinning here guarantees compatibility with almost all popular VS Code forks (Cursor, Windsurf, Antigravity) that often lag upstream. This version is intentionally pinned to match `@types/vscode` and is not the latest; bumping further requires a deliberate decision. |
@@ -761,7 +767,7 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 
 ```typescript
 interface BatchRequest {
-  version: number;              // Protocol version, currently 4
+  version: number;              // Protocol version, currently 5
   request_id: number;           // Monotonic counter incremented per debounce cycle.
                                 // The daemon echoes this value in BatchResponse.
                                 // The extension host discards responses whose
@@ -831,6 +837,76 @@ interface ModuleContribution {
 }
 ```
 
+#### AnalyzePackageJsonRequest / AnalyzePackageJsonResponse
+
+Used by package.json dependency decorations. Size analysis remains daemon-owned; live npm registry refresh remains extension-host-owned.
+
+```typescript
+type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
+type PackageJsonDependencySectionName =
+  | "dependencies"
+  | "devDependencies"
+  | "peerDependencies"
+  | "optionalDependencies";
+
+interface AnalyzePackageJsonRequest {
+  type: "analyze_package_json";
+  version: number;              // Protocol version, currently 5
+  request_id: number;
+  workspace_root: string;
+  active_document_path: string;
+  source: string;
+  streaming?: boolean;          // Protocol v5; request indexed package.json partial responses.
+  include_registry_hints?: boolean; // Compatibility field; daemon must not perform live registry fetches.
+  force_registry_refresh?: boolean; // Compatibility field; manual refresh is extension-host owned.
+  refresh_section?: "dependencies" | "devDependencies" | "peerDependencies" | "optionalDependencies";
+}
+
+interface AnalyzePackageJsonResponse {
+  version: number;
+  request_id: number;
+  sections: PackageJsonDependencySection[];
+  states: PackageJsonDependencyAnalysisItem[];
+  indexes?: number[];           // Present only on streaming partials; indexes into final dependency state order.
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
+interface PackageJsonDependencyAnalysisItem {
+  entry: PackageJsonDependencyEntry;
+  name: string;
+  section: PackageJsonDependencySectionName;
+  status: ImportAnalysisStatus;
+  installedVersion?: string;
+  registryHint?: RegistryHint | null;
+  message?: string;
+  result?: ImportResult;
+}
+
+interface PackageJsonDependencyEntry {
+  name: string;
+  version: string;
+  section: PackageJsonDependencySectionName;
+  range: SourceRange;
+  nameRange: SourceRange;
+  valueRange: SourceRange;
+}
+
+interface PackageJsonDependencySection {
+  section: PackageJsonDependencySectionName;
+  range: SourceRange;
+  objectRange: SourceRange;
+}
+
+interface RegistryHint {
+  latestVersion?: string;
+  latestPublishedAt?: string;
+  isLatest?: boolean;
+  deprecated?: boolean;
+  fetchedAt?: number;
+}
+```
+
 #### HelloMessage
 
 Sent by the extension host immediately after opening the socket connection. The daemon must validate the hello protocol version before accepting the handshake and must not process any request until a valid `HelloMessage` has been received.
@@ -838,7 +914,7 @@ Sent by the extension host immediately after opening the socket connection. The 
 ```typescript
 interface HelloMessage {
   type: "hello";
-  version: number;              // Protocol version, currently 4
+  version: number;              // Protocol version, currently 5
   workspace_root: string;       // Absolute path to the active analysis root.
   storage_path: string;         // Absolute VS Code globalStoragePath for cache and lifecycle files
   enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
@@ -1299,6 +1375,8 @@ import-lens/
 │   │   │   └── state.ts               # Per-document import analysis state
 │   │   ├── guidance/
 │   │   │   ├── packageJsonAnalysis.ts # daemon-backed package.json dependency analysis controller
+│   │   │   ├── packageJsonPartial.ts  # indexed package.json partial merge helpers
+│   │   │   ├── registryHints.ts       # extension-host registry cache, p-queue throttling, and refresh helpers
 │   │   │   ├── packageJsonState.ts    # package.json dependency analysis state types
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
@@ -1357,7 +1435,6 @@ import-lens/
 │       │   ├── ignore.rs              # .importlensignore parsing and matching
 │       │   ├── completion.rs          # named import completion context extraction
 │       │   └── positions.rs           # offset-to-position mapping helpers
-│       ├── registry.rs                # npm registry hints, TTLs, in-flight dedupe, persistence
 │       ├── ipc/
 │       │   ├── mod.rs
 │       │   ├── codec.rs               # MessagePack length-prefix codec

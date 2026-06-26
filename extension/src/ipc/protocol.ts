@@ -88,7 +88,7 @@ export interface BatchResponse {
   indexes?: number[];
 }
 
-export type ImportAnalysisStatus = "ready" | "missing" | "unavailable";
+export type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
 
 export interface ImportAnalysisItem {
   detected: DetectedImport;
@@ -202,6 +202,7 @@ export interface AnalyzePackageJsonRequest {
   workspace_root: string;
   active_document_path: string;
   source: string;
+  streaming?: boolean;
   include_registry_hints?: boolean;
   force_registry_refresh?: boolean;
   refresh_section?: PackageJsonDependencySectionName;
@@ -212,6 +213,7 @@ export interface AnalyzePackageJsonResponse {
   request_id: number;
   sections: PackageJsonDependencySection[];
   states: PackageJsonDependencyAnalysisItem[];
+  indexes?: number[];
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }

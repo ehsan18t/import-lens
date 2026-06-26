@@ -1,9 +1,13 @@
-use import_lens_daemon::ipc::codec::{FrameDecoder, decode_payload, encode_frame};
+use bytes::BytesMut;
+use import_lens_daemon::ipc::codec::{
+    FrameDecoder, MAX_FRAME_BYTES, decode_payload, encode_frame, message_frame_codec,
+};
 use import_lens_daemon::ipc::protocol::{
     ClientMessage, ImportKind, ImportRequest, PROTOCOL_VERSION, ShutdownMessage,
 };
+use tokio_util::codec::Decoder;
 
-const OVERSIZED_FRAME_BYTES: usize = (32 * 1024 * 1024) + 1;
+const OVERSIZED_FRAME_BYTES: usize = MAX_FRAME_BYTES + 1;
 
 #[test]
 fn encode_frame_writes_big_endian_payload_length() {
@@ -61,6 +65,22 @@ fn frame_decoder_rejects_oversized_frames_before_buffering_payload() {
     assert!(
         error.to_string().contains("too large"),
         "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn length_delimited_codec_rejects_oversized_frames_before_payload() {
+    let mut codec = message_frame_codec();
+    let mut input = BytesMut::new();
+    input.extend_from_slice(&(OVERSIZED_FRAME_BYTES as u32).to_be_bytes());
+
+    let error = codec
+        .decode(&mut input)
+        .expect_err("oversized frame should be rejected");
+
+    assert!(
+        error.to_string().contains("frame size too big") || error.to_string().contains("too large"),
+        "unexpected error: {error}",
     );
 }
 

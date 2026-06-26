@@ -330,14 +330,17 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#client.requestAnalyzeDocument(request);
   }
 
-  async analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse | null> {
+  async analyzePackageJson(
+    request: AnalyzePackageJsonRequest,
+    onPartial?: (response: AnalyzePackageJsonResponse) => void,
+  ): Promise<AnalyzePackageJsonResponse | null> {
     if (!this.#client || this.#state !== "ready") {
       this.#logger.warn(`package.json analysis ${request.request_id} skipped because daemon is ${this.#state}.`);
       return null;
     }
 
     this.#logger.debug(`Requesting package.json analysis ${request.request_id}.`);
-    return this.#client.requestAnalyzePackageJson(request, 30000);
+    return this.#client.requestAnalyzePackageJson(request, 30000, onPartial);
   }
 
   async analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null> {
