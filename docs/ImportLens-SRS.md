@@ -230,7 +230,7 @@ On each daemon respawn, the extension host reads `<globalStoragePath>/importlens
 5. The daemon parses each script region with Rust `oxc_parser`, extracts ESM import information from module records, maps region-relative ranges back to absolute document positions, and applies `.importlensignore` plus package/specifier filtering.
 6. For each remaining import, the daemon resolves the installed package by reading `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory. If the package directory exists but the manifest is malformed or lacks a string `version`, the daemon uses an unknown-version sentinel so size analysis can return an approximate fallback instead of marking the import missing.
 7. The daemon checks its `papaya` map for each import's cache key. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
-8. For each miss, the daemon runs the OXC pipeline: (a) resolve the package entry point via `oxc_resolver`, (b) build the module graph by recursively parsing reachable relative and bare transitive imports with `oxc_parser` and analysing them with `oxc_semantic`, (c) transform TypeScript and JSX modules with `oxc_transformer`, (d) concatenate reachable code or a conservative parsed graph when side-effect metadata requires it, (e) run `oxc_minifier` for dead code elimination and mangling, (f) emit the minified string via `oxc_codegen` using the minifier-provided scoping and private-member mappings, and (g) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
+8. For each miss, the daemon runs the OXC pipeline: (a) resolve the package entry point via `oxc_resolver`, (b) build the module graph by recursively parsing reachable relative and bare transitive imports with `oxc_parser`, (c) transform TypeScript and JSX modules with `oxc_transformer`, (d) use `oxc_semantic` at compiler-boundary stages that require validated scoping, including TS/JSX transform scoping, bundle renaming, and pre-minification validation, (e) concatenate reachable code or a conservative parsed graph when side-effect metadata requires it, (f) run `oxc_minifier` for dead code elimination and mangling, (g) emit the minified string via `oxc_codegen` using the minifier-provided scoping and private-member mappings, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
 9. Results are written to `papaya` (memory) and `redb` (disk).
 10. The daemon serialises one full `AnalyzeDocumentResponse` over the socket. Legacy `BatchRequest`/`BatchResponse` remains available for protocol compatibility, but document analysis clients must prefer the daemon-first document endpoint.
 11. The extension host deserialises responses, discards stale `request_id` values, and updates decorations without regressing newer results.
@@ -261,7 +261,7 @@ This section documents the key architectural decisions made before implementatio
 
 **SWC Core rejected:** SWC produces slightly better compression ratios but its platform-specific binary is approximately 25 to 27 MB depending on the target. Including SWC would push every platform VSIX over the 20 MB hard limit.
 
-**OXC Minifier selected:** It is part of OXC's stable 0.134.x toolchain. The 0.x version number does not indicate alpha quality; it reflects the Rust and npm package versioning scheme used before a 1.0 line. Minified output may vary by 1 to 2 percent from SWC, which is acceptable for a size estimation tool. See Section 13.1 for the upgrade policy.
+**OXC Minifier selected:** It is part of OXC's stable 0.138.x toolchain. The 0.x version number does not indicate alpha quality; it reflects the Rust and npm package versioning scheme used before a 1.0 line. Minified output may vary by 1 to 2 percent from SWC, which is acceptable for a size estimation tool. See Section 13.1 for the upgrade policy.
 
 ### 4.3 Extension-Side Parsing
 
@@ -382,10 +382,10 @@ The virtual entry must never use `console.log` or any pattern that can be static
 1. Construct a virtual ESM entry module (as defined in FR-016).
 2. Resolve the package entry point via `oxc_resolver`.
 3. Recursively parse all reachable modules using `oxc_parser`, building the module graph. Graph construction must enforce hard limits of 2,000 modules, 20 MiB per module source file, and 100 MiB total graph source bytes.
-4. Run `oxc_semantic` on each parsed module to produce scope trees, symbol tables, and binding information.
+4. Extract module-record edges, exports, re-exports, statement spans, and local binding names from the prepared parse. Unchanged JavaScript-like modules do not run a separate semantic pass during graph construction; this is an intentional performance tradeoff for an inline size estimator. The daemon still runs OXC semantic analysis at compiler-boundary stages that need validated scoping: before TS/JSX transform scoping, during binding-aware bundle renaming, and before minification. Semantic failures at those boundaries must fall back to conservative static entry sizing with structured diagnostics.
 5. Walk the module graph from the virtual entry's requested exports, marking all transitively reachable code.
 6. Concatenate only the reachable code into a single in-memory source.
-7. Before concatenating reachable code, the daemon must run `oxc_transformer` on each parsed module to strip TypeScript types and transform JSX. This produces plain JavaScript ASTs that can be processed by `oxc_minifier`. `oxc_transformer` does NOT perform tree-shaking; it only handles syntax lowering.
+7. Before concatenating reachable code, the daemon must run `oxc_transformer` on TypeScript and JSX modules to strip TypeScript types and transform JSX. JSON modules are synthesized into ESM source. The graph and bundler then parse prepared source with an ESM source type so `.mts`/`.cts` and transformed modules share one ESM-like intermediate representation. This prepared representation is not a CommonJS conversion path; true CommonJS entries follow FR-024a. `oxc_transformer` does NOT perform tree-shaking; it only handles syntax lowering.
 8. When concatenating reachable modules into a single source, the daemon must apply scope renaming to prevent collisions between identically-named bindings in different module scopes (e.g. two modules both declaring `const x = ...`). Renaming must be based on semantic binding and reference spans, not ad hoc string replacement, and must preserve object shorthand, object destructuring, array destructuring, and rest binding semantics. See Section 10.7 for the module graph walk algorithm.
 9. Circular dependency edges must be detected during graph construction and reported as `circular_dependency` diagnostics on affected import results. Cycles must not cause infinite traversal or duplicate module inclusion.
 
@@ -669,12 +669,12 @@ The following criteria constitute the definition of done for the v1.0 release. A
 | Component                  | Crate                        | Rationale                                                                                                                                                                                                                              |
 | -------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Module resolution          | `oxc_resolver` (v11.x)       | Production-ready, 30x faster than webpack's enhanced-resolve, used by Rolldown and Nuxt. Note: lives in a separate repository (`oxc-project/oxc-resolver`), versioned independently from the main OXC monorepo.                        |
-| Parsing                    | `oxc_parser` (v0.134.x)      | ~3x faster parsing throughput than SWC on JS/TS input, arena-allocated AST, production-ready                                                                                                                                           |
-| Semantic analysis          | `oxc_semantic` (v0.134.x)    | Produces scope trees, symbol tables, and binding information for each parsed module. Required for accurate tree-shaking reachability analysis.                                                                                         |
+| Parsing                    | `oxc_parser` (v0.138.x)      | ~3x faster parsing throughput than SWC on JS/TS input, arena-allocated AST, production-ready                                                                                                                                           |
+| Semantic analysis          | `oxc_semantic` (v0.138.x)    | Produces scope trees, symbol tables, and binding information for transform scoping, binding-aware bundle renaming, and generated-source validation boundaries.                                                                          |
 | Tree-shaking               | Custom module graph walker   | Built on `oxc_parser` + `oxc_resolver` + `oxc_semantic`. OXC does NOT provide a standalone tree-shaker; the daemon must implement module graph construction, cross-module reachability analysis, and side-effect tracking. See FR-018. |
-| TypeScript / JSX transform | `oxc_transformer` (v0.134.x) | Strips TypeScript types and transforms JSX before minification. Does NOT perform tree-shaking.                                                                                                                                         |
-| Minification and mangling  | `oxc_minifier` (v0.134.x)    | Dead code elimination, constant folding, branch pruning, and supported mangling metadata for codegen. Stable 0.x release line; acceptable for size estimation within 1-2% variance.                                                     |
-| Code generation            | `oxc_codegen` (v0.134.x)     | Converts the minified AST back to a JavaScript string. Required because `oxc_minifier` operates on the AST, not on text. Supports `minify: true` for whitespace removal.                                                               |
+| TypeScript / JSX transform | `oxc_transformer` (v0.138.x) | Strips TypeScript types and transforms JSX before minification. Does NOT perform tree-shaking.                                                                                                                                         |
+| Minification and mangling  | `oxc_minifier` (v0.138.x)    | Dead code elimination, constant folding, branch pruning, and supported mangling metadata for codegen. Stable 0.x release line; acceptable for size estimation within 1-2% variance.                                                     |
+| Code generation            | `oxc_codegen` (v0.138.x)     | Converts the minified AST back to a JavaScript string. Required because `oxc_minifier` operates on the AST, not on text. Supports `minify: true` for whitespace removal.                                                               |
 | Gzip compression           | `flate2`                     | Stable, widely used, level 6 default                                                                                                                                                                                                   |
 | Brotli compression         | `brotli` crate               | Level 4 balances speed and ratio for real-time use                                                                                                                                                                                     |
 | Zstd compression           | `zstd` crate                 | Level 3 provides best speed-to-ratio balance                                                                                                                                                                                           |
@@ -687,7 +687,7 @@ The following criteria constitute the definition of done for the v1.0 release. A
 
 ### 9.3 OXC Versioning Note
 
-OXC Rust crates use 0.x versions, but that does not mean they are alpha quality. OXC follows Rust package versioning before a 1.0 line while publishing production-ready crates. ImportLens pins the OXC analysis stack to one coordinated resolved version across Rust crates so parser, AST, semantic, transformer, minifier, and codegen APIs cannot drift independently. OXC upgrades must be performed as an intentional batch with lockfile updates and the dependency policy test suite. The repository must provide `pnpm deps:update:oxc` for targeted stack upgrades, supporting explicit versions, latest resolution, and dry-run mode while updating `daemon/Cargo.toml`, lockfiles, dependency-policy tests, VSIX manifest tests, and this SRS together. The updater must fail before edits when requested versions are invalid or unavailable, OXC monorepo crate versions are not coordinated, or `oxc_mangler` is reintroduced. `oxc_resolver` is versioned independently in a separate repository and is pinned separately. The Docker builder plus `rust-toolchain.toml` follow stable Rust so dependency MSRV bumps are picked up during deliberate upgrade runs. The Docker cross-build toolchain also follows latest stable Zig and latest `cargo-zigbuild` by default, with exact build-arg overrides available only for emergency bisects. Minifier output can differ from SWC by 1 to 2 percent; that variance is acceptable for inline size estimates. See constraint C-001 in Section 13.1.
+OXC Rust crates use 0.x versions, but that does not mean they are alpha quality. OXC follows Rust package versioning before a 1.0 line while publishing production-ready crates. ImportLens pins the OXC analysis stack to one coordinated resolved version across Rust crates so parser, AST, semantic, transformer, minifier, and codegen APIs cannot drift independently. `daemon/Cargo.toml` must use Cargo's exact requirement syntax (for example `=0.138.0`) for every OXC monorepo crate and for the independently versioned `oxc_resolver` crate. OXC upgrades must be performed as an intentional batch with lockfile updates and the dependency policy test suite. The repository must provide `pnpm deps:update:oxc` for targeted stack upgrades, supporting explicit versions, latest resolution, and dry-run mode while updating `daemon/Cargo.toml`, lockfiles, dependency-policy tests, VSIX manifest tests, and this SRS together. The updater must fail before edits when requested versions are invalid or unavailable, OXC monorepo crate versions are not coordinated, exact pins are missing, or `oxc_mangler` is reintroduced. `oxc_resolver` is versioned independently in a separate repository and is pinned separately. The Docker builder plus `rust-toolchain.toml` follow stable Rust so dependency MSRV bumps are picked up during deliberate upgrade runs. The Docker cross-build toolchain also follows latest stable Zig and latest `cargo-zigbuild` by default, with exact build-arg overrides available only for emergency bisects. Minifier output can differ from SWC by 1 to 2 percent; that variance is acceptable for inline size estimates. See constraint C-001 in Section 13.1.
 
 ### 9.4 Dependency Manifest (Current Resolved Versions)
 
@@ -1128,12 +1128,14 @@ ModuleGraph {
 
 Module {
   path: AbsolutePath,
-  ast: OxcAst,              // produced by oxc_parser
-  semantic: OxcSemantic,    // produced by oxc_semantic
+  source: String,           // prepared ESM-like source used by the bundler
+  original_source_bytes: u64,
   imports: Vec<ModuleEdge>, // resolved import statements
   external_imports: Vec<ExternalImportEdge>,
   exports: Vec<ExportDef>,  // named, default, re-export
-  transformed_src: String,  // output of oxc_transformer (TS stripped, JSX lowered)
+  reexports: Vec<ReExportDef>,
+  star_exports: Vec<StarExportDef>,
+  local_bindings: Vec<String>,
 }
 
 ModuleEdge {
@@ -1170,9 +1172,11 @@ fn build_graph(entry_path, resolver) -> ModuleGraph:
     if source.byte_length > 20 MiB: fail("module source size limit exceeded")
     total_source_bytes += source.byte_length
     if total_source_bytes > 100 MiB: fail("graph source size limit exceeded")
-    ast = oxc_parser::parse(source)
-    semantic = oxc_semantic::build(ast)
-    imports = collect_static_imports(ast)
+    prepared_source = prepare_module_source(path, source)
+    ast = oxc_parser::parse(prepared_source, SourceType::mjs())
+    imports = collect_static_imports(ast.module_record)
+    exports = collect_exports(ast.module_record)
+    local_bindings = collect_local_bindings(ast.program)
 
     resolved_edges = []
     for import in imports:

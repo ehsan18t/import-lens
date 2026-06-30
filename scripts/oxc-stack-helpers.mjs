@@ -8,17 +8,20 @@ export const validateCurrentStack = (cargoToml, _manifest) => {
   }
 
   const crateVersions = oxcStackConfig.oxcCrates.map((crate) => {
-    const match = cargoToml.match(new RegExp(`^${crate}\\s*=\\s*"([^"]+)"$`, "mu"));
+    const match = cargoToml.match(new RegExp(`^${crate}\\s*=\\s*"(=[^"]+)"$`, "mu"));
     if (!match) {
-      throw new Error(`Missing OXC crate pin: ${crate}`);
+      throw new Error(`Missing exact OXC crate pin: ${crate}`);
     }
-    return match[1];
+    return match[1].slice(1);
   });
   const uniqueCrateVersions = new Set(crateVersions);
   if (uniqueCrateVersions.size !== 1) {
     throw new Error(`Current OXC crate versions are not coordinated: ${[...uniqueCrateVersions].join(", ")}`);
   }
 
+  if (!/^oxc_resolver\s*=\s*"=[^"]+"$/mu.test(cargoToml)) {
+    throw new Error("Missing exact oxc_resolver pin");
+  }
 };
 
 export const validateVersion = (label, version) => {
@@ -53,9 +56,9 @@ export const latestCrateVersion = async (fetchJson, crate) => {
 export const updateCargoToml = (cargoToml, oxcVersion, resolverVersion) => {
   let next = cargoToml;
   for (const crate of oxcStackConfig.oxcCrates) {
-    next = next.replace(new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"), `${crate} = "${oxcVersion}"`);
+    next = next.replace(new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"), `${crate} = "=${oxcVersion}"`);
   }
-  return next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "${resolverVersion}"`);
+  return next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "=${resolverVersion}"`);
 };
 
 export const updateManifest = (manifest, oxcVersion) => {

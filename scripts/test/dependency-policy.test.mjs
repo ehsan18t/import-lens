@@ -11,11 +11,11 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   const dockerfile = repoFile("Dockerfile.build");
   const rustToolchain = repoFile("rust-toolchain.toml");
   for (const crate of oxcStackConfig.oxcCrates) {
-    assert.match(cargoToml, new RegExp(`^${crate} = "${escapedVersion(oxcStackConfig.currentOxcVersion)}"$`, "mu"));
+    assert.match(cargoToml, new RegExp(`^${crate} = "=${escapedVersion(oxcStackConfig.currentOxcVersion)}"$`, "mu"));
   }
 
   assert.doesNotMatch(cargoToml, /^oxc_mangler = /mu);
-  assert.match(cargoToml, new RegExp(`^oxc_resolver = "${escapedVersion(oxcStackConfig.currentResolverVersion)}"$`, "mu"));
+  assert.match(cargoToml, new RegExp(`^oxc_resolver = "=${escapedVersion(oxcStackConfig.currentResolverVersion)}"$`, "mu"));
   assert.doesNotMatch(workspaceCargoToml, /^rust-version = /mu);
   assert.doesNotMatch(cargoToml, /^rust-version\.workspace = /mu);
   assert.match(dockerfile, /^ARG RUST_VERSION=stable$/mu);
