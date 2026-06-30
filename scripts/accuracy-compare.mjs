@@ -22,20 +22,49 @@ const main = async () => {
   try {
     const fixture = await writeFixture(workspace);
     daemon = await startDaemon(workspace);
-    const importLens = await importLensNamedSize(daemon, workspace, fixture.activeDocumentPath);
-    const esbuildSize = await esbuildNamedSize(workspace, fixture.activeDocumentPath);
-    const delta = Math.abs(importLens.brotliBytes - esbuildSize.brotliBytes);
-    const relativeDelta = delta / Math.max(esbuildSize.brotliBytes, 1);
+    const benchmarks = [
+      {
+        label: "same-module unused export",
+        activeDocumentPath: fixture.flatActiveDocumentPath,
+        named: "light",
+      },
+      {
+        label: "branchy unused export dependency",
+        activeDocumentPath: fixture.branchyActiveDocumentPath,
+        named: "used",
+        excludedModule: "/huge.js",
+      },
+    ];
 
-    process.stdout.write([
-      `ImportLens named import: ${importLens.brotliBytes} B br (${importLens.minifiedBytes} B minified)`,
-      `esbuild named import: ${esbuildSize.brotliBytes} B br (${esbuildSize.minifiedBytes} B minified)`,
-      `relative delta: ${(relativeDelta * 100).toFixed(1)}%`,
-    ].join("\n"));
-    process.stdout.write("\n");
+    for (const [index, benchmark] of benchmarks.entries()) {
+      const importLens = await importLensNamedSize(
+        daemon,
+        workspace,
+        benchmark.activeDocumentPath,
+        benchmark.named,
+        index + 1,
+      );
+      const esbuildSize = await esbuildNamedSize(workspace, benchmark.activeDocumentPath);
+      const delta = Math.abs(importLens.brotliBytes - esbuildSize.brotliBytes);
+      const relativeDelta = delta / Math.max(esbuildSize.brotliBytes, 1);
 
-    if (relativeDelta > tolerance) {
-      throw new Error(`accuracy benchmark delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(tolerance * 100).toFixed(1)}% tolerance`);
+      process.stdout.write([
+        `${benchmark.label}:`,
+        `  ImportLens named import: ${importLens.brotliBytes} B br (${importLens.minifiedBytes} B minified)`,
+        `  esbuild named import: ${esbuildSize.brotliBytes} B br (${esbuildSize.minifiedBytes} B minified)`,
+        `  relative delta: ${(relativeDelta * 100).toFixed(1)}%`,
+      ].join("\n"));
+      process.stdout.write("\n");
+
+      if (relativeDelta > tolerance) {
+        throw new Error(`${benchmark.label} accuracy delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(tolerance * 100).toFixed(1)}% tolerance`);
+      }
+
+      if (benchmark.excludedModule && importLens.moduleBreakdown.some((module) =>
+        module.path.replaceAll("\\", "/").endsWith(benchmark.excludedModule)
+      )) {
+        throw new Error(`${benchmark.label} unexpectedly included ${benchmark.excludedModule}`);
+      }
     }
   } finally {
     await daemon?.shutdown();
@@ -63,28 +92,44 @@ const writeFixture = async (workspace) => {
   await writeFile(
     path.join(packageRoot, "index.js"),
     [
+      `import { small } from "./small.js";`,
+      `import { huge } from "./huge.js";`,
       `export const light = ${JSON.stringify(deterministicPayload(12_000))};`,
-      `export const unused = ${JSON.stringify(deterministicPayload(120_000))};`,
+      `export const unusedFlat = ${JSON.stringify(deterministicPayload(120_000))};`,
+      `export const used = small;`,
+      `export const unusedBranch = huge;`,
     ].join("\n"),
     "utf8",
   );
+  await writeFile(
+    path.join(packageRoot, "small.js"),
+    `export const small = ${JSON.stringify(deterministicPayload(12_000))};\n`,
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "huge.js"),
+    `export const huge = ${JSON.stringify(deterministicPayload(180_000))};\n`,
+    "utf8",
+  );
 
-  const activeDocumentPath = path.join(sourceRoot, "entry.js");
-  await writeFile(activeDocumentPath, `export { light } from "${packageName}";\n`, "utf8");
-  return { activeDocumentPath };
+  const flatActiveDocumentPath = path.join(sourceRoot, "flat-entry.js");
+  const branchyActiveDocumentPath = path.join(sourceRoot, "branchy-entry.js");
+  await writeFile(flatActiveDocumentPath, `export { light } from "${packageName}";\n`, "utf8");
+  await writeFile(branchyActiveDocumentPath, `export { used } from "${packageName}";\n`, "utf8");
+  return { flatActiveDocumentPath, branchyActiveDocumentPath };
 };
 
-const importLensNamedSize = async (daemon, workspace, activeDocumentPath) => {
+const importLensNamedSize = async (daemon, workspace, activeDocumentPath, named, requestId) => {
   const response = await daemon.request({
     version: protocolVersion,
-    request_id: 1,
+    request_id: requestId,
     workspace_root: workspace,
     active_document_path: activeDocumentPath,
     imports: [{
       specifier: packageName,
       package: packageName,
       version: "1.0.0",
-      named: ["light"],
+      named: [named],
       import_kind: "named",
       runtime: "component",
     }],
@@ -98,6 +143,7 @@ const importLensNamedSize = async (daemon, workspace, activeDocumentPath) => {
   return {
     brotliBytes: result.brotli_bytes,
     minifiedBytes: result.minified_bytes,
+    moduleBreakdown: result.module_breakdown ?? [],
   };
 };
 

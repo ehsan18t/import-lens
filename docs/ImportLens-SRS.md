@@ -5,7 +5,7 @@
 | Field    | Value            |
 | -------- | ---------------- |
 | Version  | 1.9              |
-| Date     | 26 June 2026     |
+| Date     | 1 July 2026      |
 | Status   | Draft            |
 | Audience | Engineering Team |
 
@@ -230,7 +230,7 @@ On each daemon respawn, the extension host reads `<globalStoragePath>/importlens
 5. The daemon parses each script region with Rust `oxc_parser`, extracts ESM import information from module records, maps region-relative ranges back to absolute document positions, and applies `.importlensignore` plus package/specifier filtering.
 6. For each remaining import, the daemon resolves the installed package by reading `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory. If the package directory exists but the manifest is malformed or lacks a string `version`, the daemon uses an unknown-version sentinel so size analysis can return an approximate fallback instead of marking the import missing.
 7. The daemon checks its `papaya` map for each import's cache key. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
-8. For each miss, the daemon runs the OXC pipeline: (a) resolve the package entry point via `oxc_resolver`, (b) build the module graph by recursively parsing reachable relative and bare transitive imports with `oxc_parser`, (c) transform TypeScript and JSX modules with `oxc_transformer`, (d) use `oxc_semantic` at compiler-boundary stages that require validated scoping, including TS/JSX transform scoping, bundle renaming, and pre-minification validation, (e) concatenate reachable code or a conservative parsed graph when side-effect metadata requires it, (f) run `oxc_minifier` for dead code elimination and mangling, (g) emit the minified string via `oxc_codegen` using the minifier-provided scoping and private-member mappings, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
+8. For each miss, the daemon runs the OXC pipeline: (a) resolve the package entry point via `oxc_resolver`, (b) build the module graph by recursively parsing reachable relative and bare transitive imports with `oxc_parser`, (c) transform TypeScript and JSX modules with `oxc_transformer`, (d) use `oxc_semantic` for module-level binding dependency extraction and at compiler-boundary stages that require validated scoping, including TS/JSX transform scoping, bundle renaming, and pre-minification validation, (e) concatenate reachable code or a conservative parsed graph when side-effect metadata requires it, (f) run `oxc_minifier` for dead code elimination and mangling, (g) emit the minified string via `oxc_codegen` using the minifier-provided scoping and private-member mappings, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
 9. Results are written to `papaya` (memory) and `redb` (disk).
 10. The daemon serialises one full `AnalyzeDocumentResponse` over the socket. Legacy `BatchRequest`/`BatchResponse` remains available for protocol compatibility, but document analysis clients must prefer the daemon-first document endpoint.
 11. The extension host deserialises responses, discards stale `request_id` values, and updates decorations without regressing newer results.
@@ -382,8 +382,8 @@ The virtual entry must never use `console.log` or any pattern that can be static
 1. Construct a virtual ESM entry module (as defined in FR-016).
 2. Resolve the package entry point via `oxc_resolver`.
 3. Recursively parse all reachable modules using `oxc_parser`, building the module graph. Graph construction must enforce hard limits of 2,000 modules, 20 MiB per module source file, and 100 MiB total graph source bytes.
-4. Extract module-record edges, exports, re-exports, statement spans, and local binding names from the prepared parse. Unchanged JavaScript-like modules do not run a separate semantic pass during graph construction; this is an intentional performance tradeoff for an inline size estimator. The daemon still runs OXC semantic analysis at compiler-boundary stages that need validated scoping: before TS/JSX transform scoping, during binding-aware bundle renaming, and before minification. Semantic failures at those boundaries must fall back to conservative static entry sizing with structured diagnostics.
-5. Walk the module graph from the virtual entry's requested exports, marking all transitively reachable code.
+4. Extract module-record edges, exports, re-exports, statement spans, local binding names, and per-module binding dependency records from the prepared parse. Binding dependencies must be derived from OXC semantic binding/reference spans, not text matching, so the bundler can tell which imported or local bindings are actually used by a retained export. The daemon also runs OXC semantic analysis at compiler-boundary stages that need validated scoping: before TS/JSX transform scoping, during binding-aware bundle renaming, and before minification. Semantic failures at those boundaries must fall back to conservative static entry sizing with structured diagnostics.
+5. Walk the module graph from the virtual entry's requested exports, then expand each included module through the retained local-binding closure before following imported bindings. Static imports used only by dead exports must not cause their target modules to be included.
 6. Concatenate only the reachable code into a single in-memory source.
 7. Before concatenating reachable code, the daemon must run `oxc_transformer` on TypeScript and JSX modules to strip TypeScript types and transform JSX. JSON modules are synthesized into ESM source. The graph and bundler then parse prepared source with an ESM source type so `.mts`/`.cts` and transformed modules share one ESM-like intermediate representation. This prepared representation is not a CommonJS conversion path; true CommonJS entries follow FR-024a. `oxc_transformer` does NOT perform tree-shaking; it only handles syntax lowering.
 8. When concatenating reachable modules into a single source, the daemon must apply scope renaming to prevent collisions between identically-named bindings in different module scopes (e.g. two modules both declaring `const x = ...`). Renaming must be based on semantic binding and reference spans, not ad hoc string replacement, and must preserve object shorthand, object destructuring, array destructuring, and rest binding semantics. See Section 10.7 for the module graph walk algorithm.
@@ -398,7 +398,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 - If the field is `false`: aggressive module pruning is permitted; the response sets `side_effects: false`.
 - If the field is an array of glob patterns (e.g., `["*.css", "dist/polyfill.js"]`): the daemon must evaluate the patterns against the resolved package entry path and every analyzed graph module path using webpack-compatible `*`, `?`, `**`, and simple brace alternatives. If the entry matches, the response must set `side_effects: true`, include the full parsed graph, set `truly_treeshakeable: false`, and add a structured side-effect diagnostic. If only non-entry graph modules match, those modules must be marked conservatively reachable, the response must set `side_effects: true`, `truly_treeshakeable: false`, and diagnostics must list the matched paths. If neither the entry nor analyzed graph modules match, named/default ESM imports may be tree-shaken normally.
 
-**FR-022** (High) - The daemon must detect when a package is not genuinely tree-shakeable by comparing the named-export size against the full-package size. If the named-export size is within 5% of the full-package size, `truly_treeshakeable` must be set to `false` in the response.
+**FR-022** (High) - The daemon must detect when a package is not genuinely tree-shakeable by comparing the named-export minified size against the full-package minified size. If the named-export minified size is within 5% of the full-package minified size, `truly_treeshakeable` must be set to `false` in the response.
 
 **FR-023** (High) - The daemon must process all imports in a single `BatchRequest` concurrently using a Rayon thread pool. The thread pool must be sized to `max(1, available_parallelism - 2)` to leave headroom for VS Code's renderer and extension host threads. This is configured via `rayon::ThreadPoolBuilder::new().num_threads(std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(1)).build_global()`. The `num_cpus` crate must not be used; `std::thread::available_parallelism()` (stable since Rust 1.59) is the stdlib replacement and correctly respects cgroup limits.
 
@@ -1104,13 +1104,13 @@ Extension activates
 
 ### 10.6 Tree-Shakeability Detection
 
-After computing the size of the requested named exports, the daemon computes the full-package variant. If:
+After computing the requested named exports, the daemon computes the full-package variant through the same bundle and minifier path. If:
 
 ```
-named_export_size / full_package_size >= 0.95
+named_export_minified_size / full_package_minified_size >= 0.95
 ```
 
-then `truly_treeshakeable` is set to `false`. This catches packages that declare `"sideEffects": false` in `package.json` but whose internal module graph does not actually support granular export isolation. The flag is also `false` when `sideEffects` is absent or `true` because the daemon must include the full parsed graph conservatively. For `sideEffects` arrays, the flag is false only when the resolved entry or included graph path matches a side-effect pattern; non-matching array entries may be tree-shaken normally.
+then `truly_treeshakeable` is set to `false`. The comparison uses minified bytes rather than raw source bytes because minified and compressed bytes are the primary user-facing size surfaces. This catches packages that declare `"sideEffects": false` in `package.json` but whose internal module graph does not actually support granular export isolation. The flag is also `false` when `sideEffects` is absent or `true` because the daemon must include the full parsed graph conservatively. For `sideEffects` arrays, the flag is false only when the resolved entry or included graph path matches a side-effect pattern; non-matching array entries may be tree-shaken normally.
 
 ### 10.7 Module Graph Walk Algorithm
 
@@ -1132,22 +1132,36 @@ Module {
   original_source_bytes: u64,
   imports: Vec<ModuleEdge>, // resolved import statements
   external_imports: Vec<ExternalImportEdge>,
+  import_statement_spans: Vec<(usize, usize)>,
+  export_specifier_statement_spans: Vec<(usize, usize)>,
   exports: Vec<ExportDef>,  // named, default, re-export
   reexports: Vec<ReExportDef>,
   star_exports: Vec<StarExportDef>,
   local_bindings: Vec<String>,
+  binding_dependencies: Vec<BindingDependency>,
 }
 
 ModuleEdge {
   specifier: String,        // raw specifier as written in source
   resolved: AbsolutePath,   // result of oxc_resolver
-  kind: ImportKind,         // Static | Dynamic
+  imported_names: Vec<String>,
+  imported_bindings: Vec<ImportedBinding>,
+}
+
+ImportedBinding {
+  imported_name: String,    // export name in the target module
+  local_name: String,       // binding name in this module
 }
 
 ExternalImportEdge {
   specifier: String,        // raw specifier for builtin, peer, or unresolved external
   imported_name: String,
   local_name: String,
+}
+
+BindingDependency {
+  binding_name: String,     // local binding whose declaration statement is retained
+  referenced_name: String,  // local or imported binding referenced by that statement
 }
 ```
 
@@ -1177,6 +1191,7 @@ fn build_graph(entry_path, resolver) -> ModuleGraph:
     imports = collect_static_imports(ast.module_record)
     exports = collect_exports(ast.module_record)
     local_bindings = collect_local_bindings(ast.program)
+    binding_dependencies = collect_binding_dependencies(ast.program)
 
     resolved_edges = []
     for import in imports:
@@ -1192,7 +1207,7 @@ fn build_graph(entry_path, resolver) -> ModuleGraph:
           // and keep a structured diagnostic instead of failing the whole import.
           graph.diagnostics.push(external_resolution(import.specifier, path, e))
 
-    graph.insert(path, Module { path, ast, semantic, imports: resolved_edges, ... })
+    graph.insert(path, Module { path, imports: resolved_edges, binding_dependencies, ... })
     active_stack.remove(path)
 
   return graph
@@ -1200,31 +1215,59 @@ fn build_graph(entry_path, resolver) -> ModuleGraph:
 
 The visited-set check on every dequeue prevents infinite loops on circular dependencies. A module that is visited twice (A imports B imports A) will have its edges walked once; the back-edge is recorded as a `circular_dependency` diagnostic and the second encounter is a no-op. Shared diamond dependencies must not be reported as cycles.
 
-**Reachability walk (reachability.rs)**
+**Reachability walk (reachability.rs and bundle.rs)**
 
 ```
-fn mark_reachable(graph, entry_exports) -> HashSet<(AbsolutePath, SymbolId)>:
-  reachable = HashSet::new()
-  worklist = entry_exports.map(|e| (graph.entry, e.symbol_id))
+fn reachable_exports(graph, requested_exports, include_full_entry) -> ReachableExports:
+  reachable = ReachableExports::new()
 
-  while worklist is not empty:
-    (module_path, symbol_id) = worklist.pop()
-    key = (module_path, symbol_id)
-    if key in reachable: continue
-    reachable.insert(key)
-
-    // follow re-exports and bindings through the semantic graph
-    for binding in graph[module_path].semantic.references_of(symbol_id):
-      match binding:
-        ReExport { from_module, from_symbol } =>
-          worklist.push((resolved_path_of(from_module), from_symbol))
-        ImportBinding { from_module, from_symbol } =>
-          worklist.push((resolved_path_of(from_module), from_symbol))
-        LocalBinding { .. } =>
-          // symbol is defined locally; no further traversal needed
+  if include_full_entry:
+    mark_module_full(graph.entry)
+  else:
+    mark_module_reachable(graph.entry)
+    for export_name in requested_exports:
+      mark_export(graph.entry, export_name)
+    include_side_effect_imports(graph.entry)
 
   return reachable
+
+fn mark_export(module, export_name):
+  if module has local export named export_name:
+    reachable.add_symbol(module.path, export_name)
+
+  for matching re-export:
+    reachable.add_symbol(module.path, export_name)
+    if re-export imports "*": mark_module_full(target_module)
+    else: mark_export(target_module, imported_name)
+
+  for star export whose target exports export_name:
+    reachable.add_symbol(module.path, export_name)
+    mark_export(target_module, export_name)
+
+  include_side_effect_imports(module)
+
+fn include_module_with_imports(module, reachable):
+  retained_bindings = retained local names for reachable exports in this module
+  if reachable marks module as full, or module is reachable without a reachable export:
+    retained_bindings = all local and imported binding names in the module
+
+  worklist = retained_bindings
+  while worklist is not empty:
+    binding = worklist.pop()
+    for dependency in module.binding_dependencies where dependency.binding_name == binding:
+      if retained_bindings.add(dependency.referenced_name):
+        worklist.push(dependency.referenced_name)
+
+  for import_edge in module.imports:
+    if import_edge has no imported bindings:
+      include_module_with_imports(import_edge.target, reachable) // side-effect-only import
+    for imported_binding in import_edge.imported_bindings:
+      if imported_binding.local_name in retained_bindings:
+        reachable.add_symbol(import_edge.target, imported_binding.imported_name)
+        include_module_with_imports(import_edge.target, reachable)
 ```
+
+Named/default import analysis must not recurse into every static import of an included module. It follows only side-effect-only imports, full-module conservative inclusion, explicit `sideEffects` array matches, and imported bindings reached from the retained export/local dependency closure. This prevents a dead export such as `export const unused = huge` from pulling in `huge.js` when the user imported only `used`.
 
 **Scope renaming before concatenation**
 
@@ -1232,7 +1275,7 @@ Before concatenating module sources, each module's local bindings must be rename
 
 **Side-effect handling**
 
-If `sideEffects: false` is set in the package's `package.json`, modules that contribute no reachable symbols are excluded from concatenation entirely. If `sideEffects` is absent or `true`, all parsed modules are included in concatenation regardless of reachability, and only the minification step removes dead code. If `sideEffects` is an array, the daemon evaluates the resolved entry and included module paths against the configured patterns: matching modules force conservative inclusion and side-effect diagnostics, while non-matching paths may still be pruned through normal reachability.
+If `sideEffects: false` is set in the package's `package.json`, modules that contribute no reachable symbols or side-effect-only imports are excluded from concatenation entirely. If `sideEffects` is absent or `true`, all parsed modules are included in concatenation regardless of reachability, and only the minification step removes dead code. If `sideEffects` is an array, the daemon evaluates the resolved entry and graph module paths against the configured patterns: matching modules force conservative inclusion and side-effect diagnostics, while non-matching paths may still be pruned through normal reachability and retained-binding closure.
 
 **Graph cache**
 
@@ -1244,7 +1287,7 @@ The daemon may keep parsed module graphs in a side in-memory cache keyed by cano
 
 ### 11.1 Persistent Cache Schema (redb)
 
-The `redb` database schema version is `3` and contains these tables:
+The `redb` database schema version is `4` and contains these tables:
 
 | Table name      | Key type                                      | Value type                                       |
 | --------------- | --------------------------------------------- | ------------------------------------------------ |
