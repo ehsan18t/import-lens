@@ -286,6 +286,7 @@ fn analyze_with_oxc_pipeline(
                 vec![format!("entry_path: {}", entry_path.display())],
             )
         })?;
+    let mut full_bundle_len_cache: Option<u64> = None;
     if bundled.source.trim().is_empty() && !include_full_entry {
         reachable = reachable_exports(&graph, &[], true);
         bundled = bundle_reachable_modules_with_metadata(&graph, &reachable).map_err(|error| {
@@ -297,6 +298,7 @@ fn analyze_with_oxc_pipeline(
                 vec![format!("entry_path: {}", entry_path.display())],
             )
         })?;
+        full_bundle_len_cache = Some(bundled.source.len() as u64);
     }
     let minified =
         minify_source_with_markers(&bundled.minifier_source, false).map_err(|error| {
@@ -345,6 +347,7 @@ fn analyze_with_oxc_pipeline(
             side_effects,
             &graph,
             bundled.source.len() as u64,
+            full_bundle_len_cache,
         ),
         is_cjs: false,
         confidence,
@@ -362,18 +365,23 @@ fn is_truly_treeshakeable(
     side_effects: bool,
     graph: &crate::pipeline::graph::ModuleGraph,
     bundled_len: u64,
+    cached_full_len: Option<u64>,
 ) -> bool {
     if side_effects || !matches!(request.import_kind, ImportKind::Named) {
         return false;
     }
 
     // To check if genuinely tree-shakeable, we compare against the full module size.
-    let reachable_full = reachable_exports(graph, &[], true);
-    let Ok(bundled_full) = bundle_reachable_modules(graph, &reachable_full) else {
-        return false;
+    let full_len = match cached_full_len {
+        Some(len) => len,
+        None => {
+            let reachable_full = reachable_exports(graph, &[], true);
+            let Ok(bundled_full) = bundle_reachable_modules(graph, &reachable_full) else {
+                return false;
+            };
+            bundled_full.len() as u64
+        }
     };
-
-    let full_len = bundled_full.len() as u64;
     if full_len == 0 {
         return false;
     }
