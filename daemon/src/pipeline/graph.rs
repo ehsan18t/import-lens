@@ -443,6 +443,10 @@ enum ModuleResolution {
     IgnoredExternal,
 }
 
+fn source_type_for_prepared_module() -> SourceType {
+    SourceType::mjs()
+}
+
 fn prepare_module_source(path: &Path, source: &str) -> Result<String, String> {
     if path_has_extension(path, "json") {
         return synthetic_json_module(path, source);
@@ -499,9 +503,7 @@ fn transform_module_source(path: &Path, source: &str) -> Result<String, String> 
     }
 
     let mut program = parsed.program;
-    let semantic = SemanticBuilder::new()
-        .with_check_syntax_error(true)
-        .build(&program);
+    let semantic = SemanticBuilder::new().build(&program);
     if semantic.diagnostics.has_errors() {
         return Err(format!(
             "semantic validation failed before transform {}; errors: {}",
@@ -612,7 +614,7 @@ fn parse_module(
     resolver_context: &mut ModuleResolverContext<'_>,
 ) -> Result<ParsedModule, String> {
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    let source_type = source_type_for_prepared_module();
     let parsed = Parser::new(&allocator, source, source_type).parse();
 
     if parsed.panicked || parsed.diagnostics.has_errors() {

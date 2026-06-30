@@ -420,7 +420,7 @@ fn semantic_rename_replacements(
     }
 
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(&module.path).unwrap_or_else(|_| SourceType::mjs());
+    let source_type = SourceType::mjs();
     let parsed = Parser::new(&allocator, &module.source, source_type).parse();
     if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(
@@ -437,7 +437,6 @@ fn semantic_rename_replacements(
 
     let semantic = SemanticBuilder::new()
         .with_build_nodes(true)
-        .with_check_syntax_error(true)
         .build(&parsed.program);
     if semantic.diagnostics.has_errors() {
         return Err(format!(
