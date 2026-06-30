@@ -10,7 +10,8 @@ use std::{
 };
 
 pub const CACHE_KEY_PREFIX_V3: &str = "v3:";
-pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const ANALYZER_REVISION: &str = "graph2";
+pub const ANALYZER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+graph2");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {

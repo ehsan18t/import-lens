@@ -28,6 +28,20 @@ fn resolved(root: &Path) -> ResolvedPackage {
 }
 
 #[test]
+fn cache_key_v3_includes_analyzer_revision() {
+    let key = cache_key_for_resolved_import(
+        &request(ImportKind::Named, &["used"], ImportRuntime::Component),
+        &resolved(&PathBuf::from("C:/workspace-a")),
+    );
+
+    let identity = decode_cache_identity(&key).expect("v3 key should decode");
+    assert!(
+        identity.analyzer_version.ends_with("+graph2"),
+        "analyzer version should invalidate graph2 accuracy changes: {identity:?}",
+    );
+}
+
+#[test]
 fn cache_key_v3_distinguishes_named_dynamic_from_dynamic_import() {
     let root = PathBuf::from("C:/workspace-a");
     let resolved = resolved(&root);
