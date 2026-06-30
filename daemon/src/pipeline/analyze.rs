@@ -11,7 +11,7 @@ use crate::{
         graph::{
             MAX_MODULE_SOURCE_BYTES, ModuleGraph, ModuleId, build_module_graph_cached_with_runtime,
         },
-        minify::{minify_source, minify_source_with_markers, validate_source},
+        minify::{minify_source, minify_source_with_markers},
         reachability::{reachable_exports, requested_exports},
         resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
         types_only::declaration_only_package_result,
@@ -298,18 +298,6 @@ fn analyze_with_oxc_pipeline(
             )
         })?;
     }
-    validate_source(&bundled.minifier_source, false).map_err(|error| {
-        error_with_context(
-            "bundle_validation",
-            format!("generated bundle failed validation before minification: {error}"),
-            context,
-            request,
-            vec![
-                format!("entry_path: {}", entry_path.display()),
-                source_excerpt_detail(&bundled.minifier_source),
-            ],
-        )
-    })?;
     let minified =
         minify_source_with_markers(&bundled.minifier_source, false).map_err(|error| {
             error_with_context(
