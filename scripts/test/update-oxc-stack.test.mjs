@@ -141,10 +141,10 @@ test("updateOxcStack reports no changed files when target versions and scripts a
     paths: repo.paths,
     dryRun: true,
     oxcVersion: "0.138.0",
-      resolverVersion: "11.21.3",
-      fetchJson: async (url) => {
-      if (url.endsWith("/oxc_resolver/11.21.3")) {
-        return { version: { num: "11.21.3" } };
+    resolverVersion: "11.22.0",
+    fetchJson: async (url) => {
+      if (url.endsWith("/oxc_resolver/11.22.0")) {
+        return { version: { num: "11.22.0" } };
       }
       const crate = oxcStackConfig.oxcCrates.find((crate) => url.endsWith(`/${crate}/0.138.0`));
       if (crate) {
@@ -242,7 +242,7 @@ const availableVersionPayload = (url) => {
 const cargoTomlFixture = () => `[dependencies]
 brotli = "^8"
 ${oxcStackConfig.oxcCrates.map((crate) => `${crate} = "=0.138.0"`).join("\n")}
-oxc_resolver = "=11.21.3"
+oxc_resolver = "=11.22.0"
 zstd = "^0.13"
 `;
 
@@ -256,7 +256,7 @@ const manifestFixture = () => ({
 });
 
 const dependencyPolicyFixture = () => `assert.match(cargoToml, /^oxc_parser = "=0\\.138\\.0"$/mu);
-assert.match(cargoToml, /^oxc_resolver = "=11\\.21\\.3"$/mu);
+assert.match(cargoToml, /^oxc_resolver = "=11\\.22\\.0"$/mu);
 assert.equal(manifest.dependencies["oxc-parser"], undefined);
 `;
 
@@ -265,14 +265,14 @@ assert.deepEqual(staged.dependencies, { "@msgpack/msgpack": "3.1.3" });
 `;
 
 const srsFixture = () => `| \`oxc_parser\`      | 0.138.0 |
-| \`oxc_resolver\`    | 11.21.3 |
+| \`oxc_resolver\`    | 11.22.0 |
 currently resolved to 0.138.0
-Currently resolved to 11.21.3
+Currently resolved to 11.22.0
 baseline v0.138.0
 `;
 
 const configFixture = () => `export const oxcStackConfig = {
   currentOxcVersion: "0.138.0",
-  currentResolverVersion: "11.21.3",
+  currentResolverVersion: "11.22.0",
 };
 `;
