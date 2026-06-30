@@ -372,7 +372,13 @@ impl ModuleGraphBuilder {
             dependency_paths: &mut self.dependency_paths,
         };
         let prepared_source = prepare_module_source(&path, &source)?;
-        let parsed = parse_module(&path, &prepared_source, &mut resolver_context)?;
+        let skip_semantic = module_needs_transform(&path);
+        let parsed = parse_module(
+            &path,
+            &prepared_source,
+            &mut resolver_context,
+            skip_semantic,
+        )?;
         let id = ModuleId(self.graph.modules.len());
         let next_paths = parsed
             .imports
@@ -612,6 +618,7 @@ fn parse_module(
     path: &Path,
     source: &str,
     resolver_context: &mut ModuleResolverContext<'_>,
+    skip_semantic: bool,
 ) -> Result<ParsedModule, String> {
     let allocator = Allocator::default();
     let source_type = source_type_for_prepared_module();
@@ -630,20 +637,22 @@ fn parse_module(
         ));
     }
 
-    let semantic = SemanticBuilder::new()
-        .with_check_syntax_error(true)
-        .build(&parsed.program);
-    if semantic.diagnostics.has_errors() {
-        return Err(format!(
-            "semantic validation failed for {}; errors: {}",
-            path.display(),
-            semantic
-                .diagnostics
-                .errors()
-                .map(|error| format!("{error:?}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
+    if !skip_semantic {
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        if semantic.diagnostics.has_errors() {
+            return Err(format!(
+                "semantic validation failed for {}; errors: {}",
+                path.display(),
+                semantic
+                    .diagnostics
+                    .errors()
+                    .map(|error| format!("{error:?}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
     }
 
     let edges_result = import_edges(path, &parsed.module_record, resolver_context)?;
