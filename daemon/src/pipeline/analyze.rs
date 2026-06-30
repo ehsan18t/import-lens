@@ -4,7 +4,7 @@ use crate::{
         ModuleContribution,
     },
     pipeline::{
-        bundle::{bundle_reachable_modules, bundle_reachable_modules_with_metadata},
+        bundle::bundle_reachable_modules_with_metadata,
         cjs::{CjsGraphAnalysis, analyze_cjs_graph_with_runtime},
         compress::compress_all,
         fallback::{approximate_directory_size, estimate_minified_source, source_excerpt_detail},
@@ -286,7 +286,7 @@ fn analyze_with_oxc_pipeline(
                 vec![format!("entry_path: {}", entry_path.display())],
             )
         })?;
-    let mut full_bundle_len_cache: Option<u64> = None;
+    let mut fallback_full_bundle = false;
     if bundled.source.trim().is_empty() && !include_full_entry {
         reachable = reachable_exports(&graph, &[], true);
         bundled = bundle_reachable_modules_with_metadata(&graph, &reachable).map_err(|error| {
@@ -298,8 +298,7 @@ fn analyze_with_oxc_pipeline(
                 vec![format!("entry_path: {}", entry_path.display())],
             )
         })?;
-        full_bundle_len_cache = Some(bundled.source.len() as u64);
-        graph.cache_full_bundle_raw_len(bundled.source.len() as u64);
+        fallback_full_bundle = true;
     }
     let minified =
         minify_source_with_markers(&bundled.minifier_source, false).map_err(|error| {
@@ -314,6 +313,9 @@ fn analyze_with_oxc_pipeline(
                 ],
             )
         })?;
+    if fallback_full_bundle {
+        graph.cache_full_bundle_minified_len(minified.len() as u64);
+    }
     let compressed = compress_all(&minified).map_err(|error| {
         error_with_context(
             "compression",
@@ -347,8 +349,8 @@ fn analyze_with_oxc_pipeline(
             request,
             side_effects,
             &graph,
-            bundled.source.len() as u64,
-            full_bundle_len_cache,
+            minified.len() as u64,
+            fallback_full_bundle.then_some(minified.len() as u64),
         ),
         is_cjs: false,
         confidence,
@@ -365,20 +367,24 @@ fn is_truly_treeshakeable(
     request: &ImportRequest,
     side_effects: bool,
     graph: &crate::pipeline::graph::ModuleGraph,
-    bundled_len: u64,
-    cached_full_len: Option<u64>,
+    minified_len: u64,
+    cached_full_minified_len: Option<u64>,
 ) -> bool {
     if side_effects || !matches!(request.import_kind, ImportKind::Named) {
         return false;
     }
 
-    // To check if genuinely tree-shakeable, we compare against the full module size.
-    let full_len = cached_full_len
+    // To check if genuinely tree-shakeable, compare against the same post-minify
+    // size surface that users see in ImportLens.
+    let full_len = cached_full_minified_len
         .or_else(|| {
-            graph.cached_full_bundle_raw_len_or_init(|| {
+            graph.cached_full_bundle_minified_len_or_init(|| {
                 let reachable_full = reachable_exports(graph, &[], true);
-                let bundled_full = bundle_reachable_modules(graph, &reachable_full).ok()?;
-                Some(bundled_full.len() as u64)
+                let bundled_full =
+                    bundle_reachable_modules_with_metadata(graph, &reachable_full).ok()?;
+                let minified_full =
+                    minify_source_with_markers(&bundled_full.minifier_source, false).ok()?;
+                Some(minified_full.len() as u64)
             })
         })
         .unwrap_or_default();
@@ -387,7 +393,7 @@ fn is_truly_treeshakeable(
     }
 
     // If the tree-shaken size is within 5% of the full size, it's not truly tree-shakeable
-    let ratio = (bundled_len as f64) / (full_len as f64);
+    let ratio = (minified_len as f64) / (full_len as f64);
     ratio <= 0.95
 }
 

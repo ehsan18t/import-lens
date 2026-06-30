@@ -140,7 +140,7 @@ pub struct ModuleGraph {
     pub diagnostics: Vec<GraphDiagnostic>,
     pub dependency_paths: Vec<PathBuf>,
     path_to_id: HashMap<PathBuf, ModuleId>,
-    full_bundle_raw_len: OnceLock<Option<u64>>,
+    full_bundle_minified_len: OnceLock<Option<u64>>,
 }
 
 impl Default for ModuleGraph {
@@ -151,7 +151,7 @@ impl Default for ModuleGraph {
             diagnostics: Vec::new(),
             dependency_paths: Vec::new(),
             path_to_id: HashMap::new(),
-            full_bundle_raw_len: OnceLock::new(),
+            full_bundle_minified_len: OnceLock::new(),
         }
     }
 }
@@ -174,7 +174,7 @@ impl ModuleGraph {
             diagnostics,
             dependency_paths,
             path_to_id,
-            full_bundle_raw_len: OnceLock::new(),
+            full_bundle_minified_len: OnceLock::new(),
         }
     }
 
@@ -186,15 +186,15 @@ impl ModuleGraph {
         self.path_to_id.get(path).copied()
     }
 
-    pub fn cached_full_bundle_raw_len_or_init(
+    pub fn cached_full_bundle_minified_len_or_init(
         &self,
         init: impl FnOnce() -> Option<u64>,
     ) -> Option<u64> {
-        *self.full_bundle_raw_len.get_or_init(init)
+        *self.full_bundle_minified_len.get_or_init(init)
     }
 
-    pub fn cache_full_bundle_raw_len(&self, len: u64) {
-        let _ = self.full_bundle_raw_len.set(Some(len));
+    pub fn cache_full_bundle_minified_len(&self, len: u64) {
+        let _ = self.full_bundle_minified_len.set(Some(len));
     }
 }
 

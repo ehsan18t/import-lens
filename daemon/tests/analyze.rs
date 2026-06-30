@@ -409,6 +409,43 @@ fn analyze_named_import_excludes_dependency_used_only_by_unreachable_export() {
 }
 
 #[test]
+fn analyze_truly_treeshakeable_uses_minified_size_ratio() {
+    let workspace = temp_workspace();
+    let removable_padding = format!("/* {} */", "x".repeat(200_000));
+    let dense_unused_payload = "y".repeat(8_000);
+    write_package(
+        &workspace,
+        "minified-ratio-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        &format!(
+            "export const used = {removable_padding} 1;\nexport const unused = '{dense_unused_payload}';\n"
+        ),
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "minified-ratio-lib",
+            "minified-ratio-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "{result:?}");
+    assert!(
+        result.truly_treeshakeable,
+        "tree-shakeability should compare minified sizes instead of raw source bytes: {result:?}",
+    );
+}
+
+#[test]
 fn analyze_import_includes_graph_modules_matching_side_effect_array_patterns() {
     let workspace = temp_workspace();
     write_package(
