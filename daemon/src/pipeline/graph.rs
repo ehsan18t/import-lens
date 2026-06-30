@@ -485,13 +485,13 @@ fn transform_module_source(path: &Path, source: &str) -> Result<String, String> 
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
     let parsed = Parser::new(&allocator, source, source_type).parse();
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(
             "failed to parse module before transform {}; errors: {}",
             path.display(),
             parsed
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -502,13 +502,13 @@ fn transform_module_source(path: &Path, source: &str) -> Result<String, String> 
     let semantic = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
-    if !semantic.errors.is_empty() {
+    if semantic.diagnostics.has_errors() {
         return Err(format!(
             "semantic validation failed before transform {}; errors: {}",
             path.display(),
             semantic
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -517,13 +517,13 @@ fn transform_module_source(path: &Path, source: &str) -> Result<String, String> 
 
     let transform = Transformer::new(&allocator, path, &TransformOptions::default())
         .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
-    if !transform.errors.is_empty() {
+    if transform.diagnostics.has_errors() {
         return Err(format!(
             "failed to transform module {}; errors: {}",
             path.display(),
             transform
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -615,13 +615,13 @@ fn parse_module(
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
     let parsed = Parser::new(&allocator, source, source_type).parse();
 
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(
             "failed to parse module {}; errors: {}",
             path.display(),
             parsed
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -631,13 +631,13 @@ fn parse_module(
     let semantic = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&parsed.program);
-    if !semantic.errors.is_empty() {
+    if semantic.diagnostics.has_errors() {
         return Err(format!(
             "semantic validation failed for {}; errors: {}",
             path.display(),
             semantic
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -799,6 +799,7 @@ fn import_name(entry: &ImportEntry<'_>) -> String {
         ImportImportName::Name(name) => name.name.as_str().to_owned(),
         ImportImportName::NamespaceObject => "*".to_owned(),
         ImportImportName::Default(_) => "default".to_owned(),
+        _ => "default".to_owned(),
     }
 }
 
@@ -898,6 +899,7 @@ fn export_import_name(name: &ExportImportName<'_>) -> Option<String> {
         ExportImportName::Name(name) => Some(name.name.as_str().to_owned()),
         ExportImportName::All => Some("*".to_owned()),
         ExportImportName::AllButDefault | ExportImportName::Null => None,
+        _ => None,
     }
 }
 
@@ -906,6 +908,7 @@ fn export_export_name(name: &ExportExportName<'_>) -> Option<String> {
         ExportExportName::Name(name) => Some(name.name.as_str().to_owned()),
         ExportExportName::Default(_) => Some("default".to_owned()),
         ExportExportName::Null => None,
+        _ => None,
     }
 }
 
@@ -915,6 +918,7 @@ fn export_local_name(name: &ExportLocalName<'_>) -> Option<String> {
             Some(name.name.as_str().to_owned())
         }
         ExportLocalName::Null => None,
+        _ => None,
     }
 }
 
@@ -1041,6 +1045,7 @@ fn collect_binding_pattern(pattern: &BindingPattern<'_>, bindings: &mut Vec<Stri
                 collect_binding_pattern(&rest.argument, bindings);
             }
         }
+        _ => {}
     }
 }
 

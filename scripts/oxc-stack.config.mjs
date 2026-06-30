@@ -1,6 +1,6 @@
 export const oxcStackConfig = {
-  currentOxcVersion: "0.134.0",
-  currentResolverVersion: "11.21.0",
+  currentOxcVersion: "0.138.0",
+  currentResolverVersion: "11.21.3",
   oxcCrates: [
     "oxc_allocator",
     "oxc_ast",

@@ -31,7 +31,7 @@ fn assert_parseable(source: &str) {
     let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
 
     assert!(
-        !parsed.panicked && parsed.errors.is_empty(),
+        !parsed.panicked && !parsed.diagnostics.has_errors(),
         "generated source should parse cleanly: {source}"
     );
 }
@@ -41,7 +41,7 @@ fn assert_semantic_valid(source: &str) {
     let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
 
     assert!(
-        !parsed.panicked && parsed.errors.is_empty(),
+        !parsed.panicked && !parsed.diagnostics.has_errors(),
         "generated source should parse cleanly: {source}"
     );
 
@@ -49,9 +49,9 @@ fn assert_semantic_valid(source: &str) {
         .with_check_syntax_error(true)
         .build(&parsed.program);
     assert!(
-        semantic.errors.is_empty(),
+        !semantic.diagnostics.has_errors(),
         "generated source should pass semantic checks: {source}\nerrors: {:?}",
-        semantic.errors
+        semantic.diagnostics.errors().collect::<Vec<_>>()
     );
 }
 

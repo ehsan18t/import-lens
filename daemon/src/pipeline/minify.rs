@@ -25,12 +25,12 @@ pub fn validate_source(source: &str, is_cjs: bool) -> Result<(), String> {
     };
     let parsed = Parser::new(&allocator, source, source_type).parse();
 
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(
             "failed to parse generated source: {}",
             parsed
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -40,12 +40,12 @@ pub fn validate_source(source: &str, is_cjs: bool) -> Result<(), String> {
     let semantic = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&parsed.program);
-    if !semantic.errors.is_empty() {
+    if semantic.diagnostics.has_errors() {
         return Err(format!(
             "semantic validation failed for generated source: {}",
             semantic
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -68,12 +68,12 @@ fn minify_source_inner(
     };
     let parsed = Parser::new(&allocator, source, source_type).parse();
 
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(
             "failed to parse bundled source before minification: {}",
             parsed
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -84,12 +84,12 @@ fn minify_source_inner(
     let semantic = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
-    if !semantic.errors.is_empty() {
+    if semantic.diagnostics.has_errors() {
         return Err(format!(
             "semantic validation failed before minification: {}",
             semantic
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -102,12 +102,12 @@ fn minify_source_inner(
         &TransformOptions::default(),
     )
     .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
-    if !transform.errors.is_empty() {
+    if transform.diagnostics.has_errors() {
         return Err(format!(
             "transform failed before minification: {}",
             transform
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -170,5 +170,6 @@ fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
         ModuleExportName::IdentifierName(name) => Some(name.name.as_str()),
         ModuleExportName::IdentifierReference(name) => Some(name.name.as_str()),
         ModuleExportName::StringLiteral(name) => Some(name.value.as_str()),
+        _ => None,
     }
 }

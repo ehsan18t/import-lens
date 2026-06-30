@@ -37,13 +37,13 @@ fn imports_from_region(
         SourceType::from_path(Path::new(&region.filename)).unwrap_or_else(|_| SourceType::mjs());
     let parsed = Parser::new(&allocator, region.source, source_type).parse();
 
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(
             "failed to parse document region {}; errors: {}",
             region.filename,
             parsed
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -168,6 +168,7 @@ fn apply_import_entry(group: &mut ImportGroup, entry: &ImportEntry<'_>) {
         ImportImportName::Default(_) => group.has_default = true,
         ImportImportName::NamespaceObject => group.has_namespace = true,
         ImportImportName::Name(name) => group.named.push(name.name.as_str().to_owned()),
+        _ => {}
     }
 }
 
@@ -245,6 +246,7 @@ fn apply_export_entry(
             groups[index].has_namespace = true;
         }
         ExportImportName::Null => {}
+        _ => {}
     }
 }
 

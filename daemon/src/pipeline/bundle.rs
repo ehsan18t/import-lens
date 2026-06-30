@@ -422,13 +422,13 @@ fn semantic_rename_replacements(
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(&module.path).unwrap_or_else(|_| SourceType::mjs());
     let parsed = Parser::new(&allocator, &module.source, source_type).parse();
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(
             "failed to parse module for renaming {}; errors: {}",
             module.path.display(),
             parsed
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -436,15 +436,16 @@ fn semantic_rename_replacements(
     }
 
     let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
         .with_check_syntax_error(true)
         .build(&parsed.program);
-    if !semantic.errors.is_empty() {
+    if semantic.diagnostics.has_errors() {
         return Err(format!(
             "semantic validation failed for renaming {}; errors: {}",
             module.path.display(),
             semantic
-                .errors
-                .iter()
+                .diagnostics
+                .errors()
                 .map(|error| format!("{error:?}"))
                 .collect::<Vec<_>>()
                 .join("; ")
@@ -603,6 +604,7 @@ fn collect_binding_pattern_spans(
                 collect_binding_pattern_spans(&rest.argument, spans);
             }
         }
+        _ => {}
     }
 }
 

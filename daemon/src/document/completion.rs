@@ -23,7 +23,7 @@ pub fn named_import_completion_context(
     )
     .parse();
 
-    if parsed.panicked || !parsed.errors.is_empty() {
+    if parsed.panicked || parsed.diagnostics.has_errors() {
         return None;
     }
 
