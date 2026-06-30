@@ -70,6 +70,7 @@ pub struct ModuleRecord {
     pub reexports: Vec<ReExportRecord>,
     pub star_exports: Vec<StarExportRecord>,
     pub local_bindings: Vec<String>,
+    pub binding_dependencies: Vec<BindingDependencyRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +99,12 @@ pub struct ExternalImportEdge {
 pub struct ImportedBinding {
     pub imported_name: String,
     pub local_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindingDependencyRecord {
+    pub binding_name: String,
+    pub referenced_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -427,6 +434,7 @@ impl ModuleGraphBuilder {
             reexports: parsed.reexports,
             star_exports: parsed.star_exports,
             local_bindings: parsed.local_bindings,
+            binding_dependencies: parsed.binding_dependencies,
         });
 
         for next_path in next_paths {
@@ -448,6 +456,7 @@ struct ParsedModule {
     reexports: Vec<ReExportRecord>,
     star_exports: Vec<StarExportRecord>,
     local_bindings: Vec<String>,
+    binding_dependencies: Vec<BindingDependencyRecord>,
 }
 
 struct ModuleResolverContext<'a> {
@@ -697,6 +706,7 @@ fn parse_module(
         reexports: reexport_records(path, &parsed.module_record, resolver_context)?,
         star_exports: star_export_records(path, &parsed.module_record, resolver_context)?,
         local_bindings: local_bindings(&parsed.program),
+        binding_dependencies: binding_dependencies(&parsed.program),
     })
 }
 
@@ -985,6 +995,124 @@ fn local_bindings(program: &Program<'_>) -> Vec<String> {
     bindings.sort();
     bindings.dedup();
     bindings
+}
+
+#[derive(Debug)]
+struct StatementBindingRange {
+    start: usize,
+    end: usize,
+    bindings: Vec<String>,
+}
+
+fn binding_dependencies(program: &Program<'_>) -> Vec<BindingDependencyRecord> {
+    let statement_ranges = statement_binding_ranges(program);
+    if statement_ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let semantic = SemanticBuilder::new().with_build_nodes(true).build(program);
+    if semantic.diagnostics.has_errors() {
+        return Vec::new();
+    }
+
+    let semantic = semantic.semantic;
+    let scoping = semantic.scoping();
+    let mut references = Vec::new();
+    for symbol_id in scoping.iter_bindings_in(scoping.root_scope_id()) {
+        let referenced_name = scoping.symbol_name(symbol_id).to_owned();
+        for reference in semantic.symbol_references(symbol_id) {
+            references.push((semantic.reference_span(reference), referenced_name.clone()));
+        }
+    }
+
+    let mut dependencies = Vec::new();
+    for range in &statement_ranges {
+        for (span, referenced_name) in &references {
+            let start = span_start(*span);
+            let end = span_end(*span);
+            if start < range.start || end > range.end {
+                continue;
+            }
+
+            for binding_name in &range.bindings {
+                if binding_name == referenced_name {
+                    continue;
+                }
+
+                dependencies.push(BindingDependencyRecord {
+                    binding_name: binding_name.clone(),
+                    referenced_name: referenced_name.clone(),
+                });
+            }
+        }
+    }
+
+    dependencies.sort_by(|left, right| {
+        left.binding_name
+            .cmp(&right.binding_name)
+            .then_with(|| left.referenced_name.cmp(&right.referenced_name))
+    });
+    dependencies.dedup_by(|left, right| {
+        left.binding_name == right.binding_name && left.referenced_name == right.referenced_name
+    });
+    dependencies
+}
+
+fn statement_binding_ranges(program: &Program<'_>) -> Vec<StatementBindingRange> {
+    program
+        .body
+        .iter()
+        .filter_map(|statement| {
+            let mut bindings = Vec::new();
+            collect_statement_bindings(statement, &mut bindings);
+            bindings.sort();
+            bindings.dedup();
+            let span = statement_span(statement)?;
+            (!bindings.is_empty()).then_some(StatementBindingRange {
+                start: span_start(span),
+                end: span_end(span),
+                bindings,
+            })
+        })
+        .collect()
+}
+
+fn statement_span(statement: &Statement<'_>) -> Option<Span> {
+    match statement {
+        Statement::BlockStatement(statement) => Some(statement.span),
+        Statement::BreakStatement(statement) => Some(statement.span),
+        Statement::ContinueStatement(statement) => Some(statement.span),
+        Statement::DebuggerStatement(statement) => Some(statement.span),
+        Statement::DoWhileStatement(statement) => Some(statement.span),
+        Statement::EmptyStatement(statement) => Some(statement.span),
+        Statement::ExpressionStatement(statement) => Some(statement.span),
+        Statement::ForInStatement(statement) => Some(statement.span),
+        Statement::ForOfStatement(statement) => Some(statement.span),
+        Statement::ForStatement(statement) => Some(statement.span),
+        Statement::IfStatement(statement) => Some(statement.span),
+        Statement::LabeledStatement(statement) => Some(statement.span),
+        Statement::ReturnStatement(statement) => Some(statement.span),
+        Statement::SwitchStatement(statement) => Some(statement.span),
+        Statement::ThrowStatement(statement) => Some(statement.span),
+        Statement::TryStatement(statement) => Some(statement.span),
+        Statement::WhileStatement(statement) => Some(statement.span),
+        Statement::WithStatement(statement) => Some(statement.span),
+        Statement::VariableDeclaration(statement) => Some(statement.span),
+        Statement::FunctionDeclaration(statement) => Some(statement.span),
+        Statement::ClassDeclaration(statement) => Some(statement.span),
+        Statement::ImportDeclaration(statement) => Some(statement.span),
+        Statement::ExportAllDeclaration(statement) => Some(statement.span),
+        Statement::ExportDefaultDeclaration(statement) => Some(statement.span),
+        Statement::ExportNamedDeclaration(statement) => Some(statement.span),
+        Statement::TSImportEqualsDeclaration(statement) => Some(statement.span),
+        Statement::TSExportAssignment(statement) => Some(statement.span),
+        Statement::TSNamespaceExportDeclaration(statement) => Some(statement.span),
+        Statement::TSEnumDeclaration(statement) => Some(statement.span),
+        Statement::TSGlobalDeclaration(statement) => Some(statement.span),
+        Statement::TSModuleDeclaration(statement) => Some(statement.span),
+        Statement::TSInterfaceDeclaration(statement) => Some(statement.span),
+        Statement::TSTypeAliasDeclaration(statement) => Some(statement.span),
+    }
 }
 
 fn collect_statement_bindings(statement: &Statement<'_>, bindings: &mut Vec<String>) {
