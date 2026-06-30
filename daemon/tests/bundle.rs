@@ -158,7 +158,10 @@ fn bundle_excludes_imports_used_only_by_unreachable_exports() {
 
     fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
     assert!(bundled.source.contains("small payload"), "{bundled:?}");
-    assert!(!bundled.source.contains("large unused payload"), "{bundled:?}");
+    assert!(
+        !bundled.source.contains("large unused payload"),
+        "{bundled:?}"
+    );
     assert!(
         !bundled
             .contributions
@@ -182,7 +185,11 @@ fn bundle_keeps_imports_referenced_by_reachable_local_helpers() {
         "helper.js",
         "import { payload } from './payload.js';\nconst local = payload;\nexport function helper() { return local; }",
     );
-    write_source(&root, "payload.js", "export const payload = 'required payload';");
+    write_source(
+        &root,
+        "payload.js",
+        "export const payload = 'required payload';",
+    );
 
     let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
     let reachable = reachable_exports(&graph, &["used".to_owned()], false);

@@ -151,6 +151,7 @@ fn included_module_ids_with_reachable(
     reachable: &mut ReachableExports,
 ) -> HashMap<ModuleId, bool> {
     let mut included = HashMap::new();
+    let mut processed_bindings = HashMap::<ModuleId, HashSet<String>>::new();
 
     for module in &graph.modules {
         if reachable.contains_module(&module.path) {
@@ -161,6 +162,7 @@ fn included_module_ids_with_reachable(
                 keep_all_exports,
                 reachable,
                 &mut included,
+                &mut processed_bindings,
             );
         }
     }
@@ -174,52 +176,181 @@ fn include_module_with_imports(
     keep_all_exports: bool,
     reachable: &mut ReachableExports,
     included: &mut HashMap<ModuleId, bool>,
+    processed_bindings: &mut HashMap<ModuleId, HashSet<String>>,
 ) {
     let previous_keep_all = included.get(&module_id).copied();
     let next_keep_all = previous_keep_all.unwrap_or(false) || keep_all_exports;
-    if previous_keep_all == Some(next_keep_all) {
-        return;
-    }
-    included.insert(module_id, next_keep_all);
 
     let Some(module) = graph.module_by_id(module_id) else {
         return;
     };
+
+    let retained_bindings = retained_binding_names(module, reachable);
+    if previous_keep_all == Some(next_keep_all)
+        && !retained_bindings_changed(
+            module_id,
+            next_keep_all,
+            &retained_bindings,
+            processed_bindings,
+        )
+    {
+        return;
+    }
+    included.insert(module_id, next_keep_all);
+
     if next_keep_all {
         reachable.mark_full_module(module.path.clone());
     } else {
         reachable.mark_module(module.path.clone());
     }
 
+    let include_all_static_imports =
+        next_keep_all || !module_has_reachable_export(module, reachable);
     for import in &module.imports {
         if let Some(target_id) = graph.module_id_by_path(&import.resolved_path) {
-            let target_keep_all =
-                keep_all_exports || import.imported_names.iter().any(|name| name == "*");
-            if let Some(target) = graph.module_by_id(target_id) {
-                if target_keep_all {
-                    reachable.mark_full_module(target.path.clone());
-                } else if import.imported_names.is_empty() {
-                    reachable.mark_module(target.path.clone());
-                } else {
-                    for imported_name in &import.imported_names {
-                        reachable.mark_module_symbol(target.path.clone(), imported_name.clone());
-                    }
-                }
+            let retained_import_names =
+                retained_import_names(import, include_all_static_imports, &retained_bindings);
+            if retained_import_names.is_empty() && !import.imported_names.is_empty() {
+                continue;
             }
-            include_module_with_imports(graph, target_id, target_keep_all, reachable, included);
+            let target_keep_all =
+                include_all_static_imports || retained_import_names.iter().any(|name| name == "*");
+            mark_reachable_import_target(
+                graph,
+                target_id,
+                &retained_import_names,
+                target_keep_all,
+                reachable,
+            );
+            include_module_with_imports(
+                graph,
+                target_id,
+                target_keep_all,
+                reachable,
+                included,
+                processed_bindings,
+            );
         }
     }
 
     if next_keep_all {
         for reexport in &module.reexports {
             if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path) {
-                include_module_with_imports(graph, target_id, true, reachable, included);
+                include_module_with_imports(
+                    graph,
+                    target_id,
+                    true,
+                    reachable,
+                    included,
+                    processed_bindings,
+                );
             }
         }
         for star_export in &module.star_exports {
             if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path) {
-                include_module_with_imports(graph, target_id, true, reachable, included);
+                include_module_with_imports(
+                    graph,
+                    target_id,
+                    true,
+                    reachable,
+                    included,
+                    processed_bindings,
+                );
             }
+        }
+    }
+}
+
+fn retained_bindings_changed(
+    module_id: ModuleId,
+    keep_all_exports: bool,
+    retained_bindings: &HashSet<String>,
+    processed_bindings: &mut HashMap<ModuleId, HashSet<String>>,
+) -> bool {
+    if keep_all_exports {
+        return false;
+    }
+
+    let processed = processed_bindings.entry(module_id).or_default();
+    let changed = retained_bindings
+        .iter()
+        .any(|binding| !processed.contains(binding));
+    processed.extend(retained_bindings.iter().cloned());
+    changed
+}
+
+fn retained_binding_names(module: &ModuleRecord, reachable: &ReachableExports) -> HashSet<String> {
+    let mut retained = module
+        .exports
+        .iter()
+        .filter(|export| reachable.contains_module_symbol(&module.path, &export.exported_name))
+        .map(|export| export.local_name.clone())
+        .collect::<HashSet<_>>();
+    let mut pending = retained.iter().cloned().collect::<Vec<_>>();
+
+    while let Some(binding_name) = pending.pop() {
+        for dependency in module
+            .binding_dependencies
+            .iter()
+            .filter(|dependency| dependency.binding_name == binding_name)
+        {
+            if retained.insert(dependency.referenced_name.clone()) {
+                pending.push(dependency.referenced_name.clone());
+            }
+        }
+    }
+
+    retained
+}
+
+fn module_has_reachable_export(module: &ModuleRecord, reachable: &ReachableExports) -> bool {
+    module
+        .exports
+        .iter()
+        .any(|export| reachable.contains_module_symbol(&module.path, &export.exported_name))
+}
+
+fn retained_import_names(
+    import: &crate::pipeline::graph::ImportEdge,
+    include_all_static_imports: bool,
+    retained_bindings: &HashSet<String>,
+) -> Vec<String> {
+    if import.imported_names.is_empty() {
+        return Vec::new();
+    }
+    if include_all_static_imports {
+        return import.imported_names.clone();
+    }
+
+    let mut names = import
+        .imported_bindings
+        .iter()
+        .filter(|binding| retained_bindings.contains(&binding.local_name))
+        .map(|binding| binding.imported_name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn mark_reachable_import_target(
+    graph: &ModuleGraph,
+    target_id: ModuleId,
+    retained_import_names: &[String],
+    target_keep_all: bool,
+    reachable: &mut ReachableExports,
+) {
+    let Some(target) = graph.module_by_id(target_id) else {
+        return;
+    };
+
+    if target_keep_all {
+        reachable.mark_full_module(target.path.clone());
+    } else if retained_import_names.is_empty() {
+        reachable.mark_module(target.path.clone());
+    } else {
+        for imported_name in retained_import_names {
+            reachable.mark_module_symbol(target.path.clone(), imported_name.clone());
         }
     }
 }
