@@ -299,6 +299,7 @@ fn analyze_with_oxc_pipeline(
             )
         })?;
         full_bundle_len_cache = Some(bundled.source.len() as u64);
+        graph.cache_full_bundle_raw_len(bundled.source.len() as u64);
     }
     let minified =
         minify_source_with_markers(&bundled.minifier_source, false).map_err(|error| {
@@ -372,16 +373,15 @@ fn is_truly_treeshakeable(
     }
 
     // To check if genuinely tree-shakeable, we compare against the full module size.
-    let full_len = match cached_full_len {
-        Some(len) => len,
-        None => {
-            let reachable_full = reachable_exports(graph, &[], true);
-            let Ok(bundled_full) = bundle_reachable_modules(graph, &reachable_full) else {
-                return false;
-            };
-            bundled_full.len() as u64
-        }
-    };
+    let full_len = cached_full_len
+        .or_else(|| {
+            graph.cached_full_bundle_raw_len_or_init(|| {
+                let reachable_full = reachable_exports(graph, &[], true);
+                let bundled_full = bundle_reachable_modules(graph, &reachable_full).ok()?;
+                Some(bundled_full.len() as u64)
+            })
+        })
+        .unwrap_or_default();
     if full_len == 0 {
         return false;
     }

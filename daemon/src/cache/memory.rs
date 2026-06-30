@@ -94,11 +94,7 @@ impl ImportCache {
         };
 
         if let Err(error) = self.disk.insert(&key, &cached) {
-            crate::logging::log_warn(
-                "cache",
-                format!("skipping memory insert for {key}: {error}"),
-            );
-            return;
+            crate::logging::log_warn("cache", format!("skipping disk insert for {key}: {error}"));
         }
 
         self.memory.pin().insert(key, cached);

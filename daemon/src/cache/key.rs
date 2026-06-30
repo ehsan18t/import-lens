@@ -61,7 +61,7 @@ fn cache_identity_for_import(
         package_root: resolved.map(|package| normalize_identity_path(&package.package_root)),
         entry_path: resolved.map(|package| normalize_identity_path(&package.entry_path)),
         runtime: request.runtime,
-        import_kind: request.import_kind.clone(),
+        import_kind: request.import_kind,
         named_exports,
         manifest_fingerprint: resolved
             .and_then(|package| file_fingerprint(package.package_root.join("package.json"))),

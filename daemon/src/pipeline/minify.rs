@@ -16,45 +16,6 @@ pub fn minify_source_with_markers(source: &str, is_cjs: bool) -> Result<String, 
     minify_source_inner(source, is_cjs, true)
 }
 
-pub fn validate_source(source: &str, is_cjs: bool) -> Result<(), String> {
-    let allocator = Allocator::default();
-    let source_type = if is_cjs {
-        SourceType::cjs()
-    } else {
-        SourceType::mjs()
-    };
-    let parsed = Parser::new(&allocator, source, source_type).parse();
-
-    if parsed.panicked || parsed.diagnostics.has_errors() {
-        return Err(format!(
-            "failed to parse generated source: {}",
-            parsed
-                .diagnostics
-                .errors()
-                .map(|error| format!("{error:?}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
-    }
-
-    let semantic = SemanticBuilder::new()
-        .with_check_syntax_error(true)
-        .build(&parsed.program);
-    if semantic.diagnostics.has_errors() {
-        return Err(format!(
-            "semantic validation failed for generated source: {}",
-            semantic
-                .diagnostics
-                .errors()
-                .map(|error| format!("{error:?}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
-    }
-
-    Ok(())
-}
-
 fn minify_source_inner(
     source: &str,
     is_cjs: bool,
@@ -81,9 +42,7 @@ fn minify_source_inner(
     }
 
     let mut program = parsed.program;
-    let semantic = SemanticBuilder::new()
-        .with_check_syntax_error(true)
-        .build(&program);
+    let semantic = SemanticBuilder::new_compiler().build(&program);
     if semantic.diagnostics.has_errors() {
         return Err(format!(
             "semantic validation failed before minification: {}",
@@ -160,16 +119,14 @@ fn is_import_lens_marker_export_statement(statement: &Statement<'_>) -> bool {
         && export.source.is_none()
         && !export.specifiers.is_empty()
         && export.specifiers.iter().all(|specifier| {
-            module_export_name(&specifier.exported)
-                .is_some_and(|name| name.starts_with("__importLensUse_"))
+            module_export_name(&specifier.exported).starts_with("__importLensUse_")
         })
 }
 
-fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
+fn module_export_name<'a>(name: &'a ModuleExportName<'a>) -> &'a str {
     match name {
-        ModuleExportName::IdentifierName(name) => Some(name.name.as_str()),
-        ModuleExportName::IdentifierReference(name) => Some(name.name.as_str()),
-        ModuleExportName::StringLiteral(name) => Some(name.value.as_str()),
-        _ => None,
+        ModuleExportName::IdentifierName(name) => name.name.as_str(),
+        ModuleExportName::IdentifierReference(name) => name.name.as_str(),
+        ModuleExportName::StringLiteral(name) => name.value.as_str(),
     }
 }

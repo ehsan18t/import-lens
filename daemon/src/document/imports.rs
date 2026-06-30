@@ -168,7 +168,6 @@ fn apply_import_entry(group: &mut ImportGroup, entry: &ImportEntry<'_>) {
         ImportImportName::Default(_) => group.has_default = true,
         ImportImportName::NamespaceObject => group.has_namespace = true,
         ImportImportName::Name(name) => group.named.push(name.name.as_str().to_owned()),
-        _ => {}
     }
 }
 
@@ -246,7 +245,6 @@ fn apply_export_entry(
             groups[index].has_namespace = true;
         }
         ExportImportName::Null => {}
-        _ => {}
     }
 }
 
@@ -269,12 +267,14 @@ fn imports_from_dynamic_imports(
             Some(create_detected_import(
                 document_source,
                 region,
-                &specifier,
-                ImportKind::Dynamic,
-                ImportSyntax::Dynamic,
-                Vec::new(),
-                item.span,
-                item.module_request,
+                DetectedImportParts {
+                    specifier: &specifier,
+                    import_kind: ImportKind::Dynamic,
+                    syntax: ImportSyntax::Dynamic,
+                    named: Vec::new(),
+                    statement_span: item.span,
+                    module_request_span: item.module_request,
+                },
             ))
         })
         .collect::<Vec<_>>();
@@ -316,12 +316,14 @@ fn detected_imports_from_group(
         imports.push(create_detected_import(
             document_source,
             region,
-            &group.specifier,
-            ImportKind::Default,
-            syntax,
-            Vec::new(),
-            group.statement_span,
-            group.module_request_span,
+            DetectedImportParts {
+                specifier: &group.specifier,
+                import_kind: ImportKind::Default,
+                syntax,
+                named: Vec::new(),
+                statement_span: group.statement_span,
+                module_request_span: group.module_request_span,
+            },
         ));
     }
 
@@ -329,16 +331,18 @@ fn detected_imports_from_group(
         imports.push(create_detected_import(
             document_source,
             region,
-            &group.specifier,
-            ImportKind::Namespace,
-            if syntax == ImportSyntax::Reexport {
-                ImportSyntax::StarReexport
-            } else {
-                syntax
+            DetectedImportParts {
+                specifier: &group.specifier,
+                import_kind: ImportKind::Namespace,
+                syntax: if syntax == ImportSyntax::Reexport {
+                    ImportSyntax::StarReexport
+                } else {
+                    syntax
+                },
+                named: Vec::new(),
+                statement_span: group.statement_span,
+                module_request_span: group.module_request_span,
             },
-            Vec::new(),
-            group.statement_span,
-            group.module_request_span,
         ));
     }
 
@@ -346,40 +350,46 @@ fn detected_imports_from_group(
         imports.push(create_detected_import(
             document_source,
             region,
-            &group.specifier,
-            ImportKind::Named,
-            syntax,
-            group.named,
-            group.statement_span,
-            group.module_request_span,
+            DetectedImportParts {
+                specifier: &group.specifier,
+                import_kind: ImportKind::Named,
+                syntax,
+                named: group.named,
+                statement_span: group.statement_span,
+                module_request_span: group.module_request_span,
+            },
         ));
     }
 
     imports
 }
 
-fn create_detected_import(
-    document_source: &str,
-    region: &ScriptRegion<'_>,
-    specifier: &str,
+struct DetectedImportParts<'a> {
+    specifier: &'a str,
     import_kind: ImportKind,
     syntax: ImportSyntax,
     named: Vec<String>,
     statement_span: Span,
     module_request_span: Span,
+}
+
+fn create_detected_import(
+    document_source: &str,
+    region: &ScriptRegion<'_>,
+    parts: DetectedImportParts<'_>,
 ) -> DetectedImport {
-    let statement_start = region.offset + span_start(statement_span);
-    let statement_end = region.offset + span_end(statement_span);
-    let specifier_start = region.offset + span_start(module_request_span);
-    let quote_end = region.offset + span_end(module_request_span);
+    let statement_start = region.offset + span_start(parts.statement_span);
+    let statement_end = region.offset + span_end(parts.statement_span);
+    let specifier_start = region.offset + span_start(parts.module_request_span);
+    let quote_end = region.offset + span_end(parts.module_request_span);
     let line = position_at(document_source, statement_start).line;
 
     DetectedImport {
-        specifier: specifier.to_owned(),
-        package_name: get_package_name(specifier),
-        named,
-        import_kind,
-        syntax,
+        specifier: parts.specifier.to_owned(),
+        package_name: get_package_name(parts.specifier),
+        named: parts.named,
+        import_kind: parts.import_kind,
+        syntax: parts.syntax,
         runtime: region.runtime,
         line,
         quote_end: position_at(document_source, quote_end),

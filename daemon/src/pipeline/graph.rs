@@ -133,6 +133,7 @@ pub struct ModuleGraph {
     pub diagnostics: Vec<GraphDiagnostic>,
     pub dependency_paths: Vec<PathBuf>,
     path_to_id: HashMap<PathBuf, ModuleId>,
+    full_bundle_raw_len: OnceLock<Option<u64>>,
 }
 
 impl Default for ModuleGraph {
@@ -143,6 +144,7 @@ impl Default for ModuleGraph {
             diagnostics: Vec::new(),
             dependency_paths: Vec::new(),
             path_to_id: HashMap::new(),
+            full_bundle_raw_len: OnceLock::new(),
         }
     }
 }
@@ -165,6 +167,7 @@ impl ModuleGraph {
             diagnostics,
             dependency_paths,
             path_to_id,
+            full_bundle_raw_len: OnceLock::new(),
         }
     }
 
@@ -174,6 +177,17 @@ impl ModuleGraph {
 
     pub fn module_id_by_path(&self, path: &Path) -> Option<ModuleId> {
         self.path_to_id.get(path).copied()
+    }
+
+    pub fn cached_full_bundle_raw_len_or_init(
+        &self,
+        init: impl FnOnce() -> Option<u64>,
+    ) -> Option<u64> {
+        *self.full_bundle_raw_len.get_or_init(init)
+    }
+
+    pub fn cache_full_bundle_raw_len(&self, len: u64) {
+        let _ = self.full_bundle_raw_len.set(Some(len));
     }
 }
 
@@ -371,14 +385,12 @@ impl ModuleGraphBuilder {
             diagnostics: &mut self.graph.diagnostics,
             dependency_paths: &mut self.dependency_paths,
         };
-        let prepared_source = prepare_module_source(&path, &source)?;
-        let skip_semantic = module_needs_transform(&path)
-            || (!path_has_extension(&path, "json") && prepared_source.as_str() == source);
+        let prepared_source = prepare_module_source(&path, source)?;
         let parsed = parse_module(
             &path,
-            &prepared_source,
+            &prepared_source.source,
             &mut resolver_context,
-            skip_semantic,
+            prepared_source.validate_semantics,
         )?;
         let id = ModuleId(self.graph.modules.len());
         let next_paths = parsed
@@ -405,7 +417,7 @@ impl ModuleGraphBuilder {
         self.graph.modules.push(ModuleRecord {
             id,
             path: path.clone(),
-            source: prepared_source,
+            source: prepared_source.source,
             original_source_bytes: source_bytes,
             imports: parsed.imports,
             external_imports: parsed.external_imports,
@@ -451,19 +463,40 @@ enum ModuleResolution {
 }
 
 fn source_type_for_prepared_module() -> SourceType {
+    // The graph and bundler operate on a prepared ESM-like source representation.
+    // JSON modules are synthesized as ESM, and TS/JSX inputs are transformed before
+    // graph parsing. Keep this as MJS even when the original file was .mts/.cts/.cjs.
     SourceType::mjs()
 }
 
-fn prepare_module_source(path: &Path, source: &str) -> Result<String, String> {
+struct PreparedModuleSource {
+    source: String,
+    // Graph parsing only needs module-record structure for unchanged JS-like files
+    // and transformed TS/JSX output. Full compiler syntax validation is deferred to
+    // generated bundle/minifier boundaries, where invalid reachable output falls
+    // back safely instead of spending a semantic pass on every dependency module.
+    validate_semantics: bool,
+}
+
+fn prepare_module_source(path: &Path, source: String) -> Result<PreparedModuleSource, String> {
     if path_has_extension(path, "json") {
-        return synthetic_json_module(path, source);
+        return Ok(PreparedModuleSource {
+            source: synthetic_json_module(path, &source)?,
+            validate_semantics: true,
+        });
     }
 
     if module_needs_transform(path) {
-        return transform_module_source(path, source);
+        return Ok(PreparedModuleSource {
+            source: transform_module_source(path, &source)?,
+            validate_semantics: false,
+        });
     }
 
-    Ok(source.to_owned())
+    Ok(PreparedModuleSource {
+        source,
+        validate_semantics: false,
+    })
 }
 
 fn synthetic_json_module(path: &Path, source: &str) -> Result<String, String> {
@@ -619,7 +652,7 @@ fn parse_module(
     path: &Path,
     source: &str,
     resolver_context: &mut ModuleResolverContext<'_>,
-    skip_semantic: bool,
+    validate_semantics: bool,
 ) -> Result<ParsedModule, String> {
     let allocator = Allocator::default();
     let source_type = source_type_for_prepared_module();
@@ -638,10 +671,8 @@ fn parse_module(
         ));
     }
 
-    if !skip_semantic {
-        let semantic = SemanticBuilder::new()
-            .with_check_syntax_error(true)
-            .build(&parsed.program);
+    if validate_semantics {
+        let semantic = SemanticBuilder::new_compiler().build(&parsed.program);
         if semantic.diagnostics.has_errors() {
             return Err(format!(
                 "semantic validation failed for {}; errors: {}",
@@ -811,7 +842,6 @@ fn import_name(entry: &ImportEntry<'_>) -> String {
         ImportImportName::Name(name) => name.name.as_str().to_owned(),
         ImportImportName::NamespaceObject => "*".to_owned(),
         ImportImportName::Default(_) => "default".to_owned(),
-        _ => "default".to_owned(),
     }
 }
 
@@ -911,7 +941,6 @@ fn export_import_name(name: &ExportImportName<'_>) -> Option<String> {
         ExportImportName::Name(name) => Some(name.name.as_str().to_owned()),
         ExportImportName::All => Some("*".to_owned()),
         ExportImportName::AllButDefault | ExportImportName::Null => None,
-        _ => None,
     }
 }
 
@@ -920,7 +949,6 @@ fn export_export_name(name: &ExportExportName<'_>) -> Option<String> {
         ExportExportName::Name(name) => Some(name.name.as_str().to_owned()),
         ExportExportName::Default(_) => Some("default".to_owned()),
         ExportExportName::Null => None,
-        _ => None,
     }
 }
 
@@ -930,7 +958,6 @@ fn export_local_name(name: &ExportLocalName<'_>) -> Option<String> {
             Some(name.name.as_str().to_owned())
         }
         ExportLocalName::Null => None,
-        _ => None,
     }
 }
 
@@ -1057,7 +1084,6 @@ fn collect_binding_pattern(pattern: &BindingPattern<'_>, bindings: &mut Vec<Stri
                 collect_binding_pattern(&rest.argument, bindings);
             }
         }
-        _ => {}
     }
 }
 

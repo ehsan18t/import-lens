@@ -756,6 +756,48 @@ fn analyze_named_import_falls_back_to_static_entry_after_oxc_failure() {
 }
 
 #[test]
+fn analyze_invalid_semantic_module_falls_back_at_bundle_boundary() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "semantic-invalid-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "export const value = 1;\nconst duplicate = 1;\nconst duplicate = 2;\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "semantic-invalid-lib",
+            "semantic-invalid-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["value"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None);
+    assert!(result.raw_bytes > 0);
+    assert!(!result.truly_treeshakeable);
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "oxc_fallback"
+                && diagnostic.message.contains("static entry")
+                && diagnostic
+                    .details
+                    .iter()
+                    .any(|detail| detail == "failed_stage: bundle")
+        }),
+        "{result:?}",
+    );
+}
+
+#[test]
 fn analyze_import_returns_partial_error_result_on_missing_entry() {
     let workspace = temp_workspace();
     write_package(

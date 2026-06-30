@@ -433,12 +433,9 @@ impl ImportLensService {
                 (index, result)
             })
             .collect::<Vec<_>>();
-        let mut results = indexed_results
-            .iter()
-            .map(|(_, result)| result.clone())
-            .collect::<Vec<_>>();
+        let (indexes, mut results): (Vec<_>, Vec<_>) = indexed_results.into_iter().unzip();
         annotate_shared_bytes(&mut results);
-        for ((index, _), result) in indexed_results.into_iter().zip(results.into_iter()) {
+        for (index, result) in indexes.into_iter().zip(results) {
             states[index].status = ImportAnalysisStatus::Ready;
             states[index].result = Some(result);
         }
@@ -704,18 +701,18 @@ impl ImportLensService {
         detected: Vec<DetectedImport>,
     ) -> Vec<ImportAnalysisItem> {
         let mut items = detected
-            .par_iter()
+            .into_par_iter()
             .map(|detected| {
-                match import_request_for_detected(&context.active_document_path, detected) {
+                match import_request_for_detected(&context.active_document_path, &detected) {
                     Ok(request) => ImportAnalysisItem {
-                        detected: detected.clone(),
+                        result: Some(self.analyze_with_cache(context, &request)),
+                        detected,
                         status: ImportAnalysisStatus::Ready,
                         message: None,
-                        request: Some(request.clone()),
-                        result: Some(self.analyze_with_cache(context, &request)),
+                        request: Some(request),
                     },
                     Err(message) => ImportAnalysisItem {
-                        detected: detected.clone(),
+                        detected,
                         status: ImportAnalysisStatus::Missing,
                         message: Some(message),
                         request: None,

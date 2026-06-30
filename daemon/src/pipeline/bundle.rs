@@ -1,7 +1,7 @@
 use crate::{
     ipc::protocol::ModuleContribution,
     pipeline::{
-        graph::{ModuleGraph, ModuleId, ModuleRecord},
+        graph::{ExternalImportEdge, ModuleGraph, ModuleId, ModuleRecord},
         reachability::ReachableExports,
         replacements::{Replacement, apply_replacements, span_overlaps_replacements},
     },
@@ -15,7 +15,10 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{SourceType, Span};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+};
 
 #[derive(Debug, Clone)]
 pub struct BundledModules {
@@ -40,7 +43,7 @@ pub fn bundle_reachable_modules_with_metadata(
     let mut source = String::new();
     let mut minifier_source = String::new();
     let mut contributions = Vec::new();
-    let mut deduplicated_external_imports = HashMap::new();
+    let mut deduplicated_external_imports = HashMap::<&str, Vec<&ExternalImportEdge>>::new();
 
     for module in graph
         .modules
@@ -49,9 +52,9 @@ pub fn bundle_reachable_modules_with_metadata(
     {
         for ext in &module.external_imports {
             deduplicated_external_imports
-                .entry(ext.specifier.clone())
-                .or_insert_with(Vec::new)
-                .push(ext.clone());
+                .entry(ext.specifier.as_str())
+                .or_default()
+                .push(ext);
         }
 
         let keep_all_exports = included.get(&module.id).copied().unwrap_or(false);
@@ -75,8 +78,11 @@ pub fn bundle_reachable_modules_with_metadata(
     }
 
     let mut synthetic_imports = String::new();
-    let mut specifiers: Vec<_> = deduplicated_external_imports.keys().collect();
-    specifiers.sort();
+    let mut specifiers = deduplicated_external_imports
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    specifiers.sort_unstable();
 
     for specifier in specifiers {
         let edges = deduplicated_external_imports.get(specifier).unwrap();
@@ -104,23 +110,27 @@ pub fn bundle_reachable_modules_with_metadata(
             default_local.is_some() || namespace_local.is_some() || !named_imports.is_empty();
 
         if let Some(local) = default_local {
-            synthetic_imports.push_str(&format!("import {} from '{}';\n", local, specifier));
+            writeln!(synthetic_imports, "import {local} from '{specifier}';")
+                .expect("writing to String should not fail");
         }
         if let Some(local) = namespace_local {
-            synthetic_imports.push_str(&format!("import * as {} from '{}';\n", local, specifier));
+            writeln!(synthetic_imports, "import * as {local} from '{specifier}';")
+                .expect("writing to String should not fail");
         }
         if !named_imports.is_empty() {
-            named_imports.sort();
+            named_imports.sort_unstable();
             named_imports.dedup();
-            synthetic_imports.push_str(&format!(
-                "import {{ {} }} from '{}';\n",
-                named_imports.join(", "),
-                specifier
-            ));
+            writeln!(
+                synthetic_imports,
+                "import {{ {} }} from '{specifier}';",
+                named_imports.join(", ")
+            )
+            .expect("writing to String should not fail");
         }
 
         if !has_bindings {
-            synthetic_imports.push_str(&format!("import '{}';\n", specifier));
+            writeln!(synthetic_imports, "import '{specifier}';")
+                .expect("writing to String should not fail");
         }
     }
 
@@ -603,7 +613,6 @@ fn collect_binding_pattern_spans(
                 collect_binding_pattern_spans(&rest.argument, spans);
             }
         }
-        _ => {}
     }
 }
 
