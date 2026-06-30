@@ -137,6 +137,65 @@ fn bundle_keeps_only_reachable_bindings_from_imported_modules() {
 }
 
 #[test]
+fn bundle_excludes_imports_used_only_by_unreachable_exports() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { small } from './small.js';\nimport { huge } from './huge.js';\nexport const used = small;\nexport const unused = huge;",
+    );
+    write_source(&root, "small.js", "export const small = 'small payload';");
+    write_source(
+        &root,
+        "huge.js",
+        "export const huge = 'large unused payload';",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(bundled.source.contains("small payload"), "{bundled:?}");
+    assert!(!bundled.source.contains("large unused payload"), "{bundled:?}");
+    assert!(
+        !bundled
+            .contributions
+            .iter()
+            .any(|module| module.path.ends_with("huge.js")),
+        "{bundled:?}"
+    );
+    assert_parseable(&bundled.source);
+}
+
+#[test]
+fn bundle_keeps_imports_referenced_by_reachable_local_helpers() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { helper } from './helper.js';\nexport const used = helper();\nexport const unused = 'unused';",
+    );
+    write_source(
+        &root,
+        "helper.js",
+        "import { payload } from './payload.js';\nconst local = payload;\nexport function helper() { return local; }",
+    );
+    write_source(&root, "payload.js", "export const payload = 'required payload';");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(bundled.contains("required payload"), "{bundled}");
+    assert!(!bundled.contains("export const unused"), "{bundled}");
+    assert_parseable(&bundled);
+}
+
+#[test]
 fn bundle_hoists_and_deduplicates_external_imports() {
     let root = temp_workspace();
     write_source(

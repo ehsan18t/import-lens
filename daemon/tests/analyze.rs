@@ -337,6 +337,78 @@ fn analyze_import_treats_unmatched_side_effect_array_as_treeshakeable() {
 }
 
 #[test]
+fn analyze_named_import_excludes_dependency_used_only_by_unreachable_export() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "branchy-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "import { small } from './small.js';\nimport { huge } from './huge.js';\nexport const used = small;\nexport const unused = huge;\n",
+    );
+    write_package_file(
+        &workspace,
+        "branchy-lib",
+        "small.js",
+        "export const small = 'small payload';\n",
+    );
+    write_package_file(
+        &workspace,
+        "branchy-lib",
+        "huge.js",
+        &format!("export const huge = '{}';\n", "x".repeat(120_000)),
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let named = analyze_import(
+        &context,
+        &import_request(
+            "branchy-lib",
+            "branchy-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+    let namespace = analyze_import(
+        &context,
+        &import_request(
+            "branchy-lib",
+            "branchy-lib",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(named.error, None, "{named:?}");
+    assert_eq!(namespace.error, None, "{namespace:?}");
+    assert!(
+        named.raw_bytes * 4 < namespace.raw_bytes,
+        "named import should prune unused huge dependency: named={named:?}, namespace={namespace:?}",
+    );
+    assert!(
+        !named.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.replace('\\', "/").ends_with("huge.js"))
+        }),
+        "{named:?}",
+    );
+    assert!(
+        namespace.module_breakdown.as_ref().is_some_and(|modules| {
+            modules
+                .iter()
+                .any(|module| module.path.replace('\\', "/").ends_with("huge.js"))
+        }),
+        "{namespace:?}",
+    );
+}
+
+#[test]
 fn analyze_import_includes_graph_modules_matching_side_effect_array_patterns() {
     let workspace = temp_workspace();
     write_package(
