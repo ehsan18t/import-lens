@@ -372,7 +372,8 @@ impl ModuleGraphBuilder {
             dependency_paths: &mut self.dependency_paths,
         };
         let prepared_source = prepare_module_source(&path, &source)?;
-        let skip_semantic = module_needs_transform(&path);
+        let skip_semantic = module_needs_transform(&path)
+            || (!path_has_extension(&path, "json") && prepared_source.as_str() == source);
         let parsed = parse_module(
             &path,
             &prepared_source,
