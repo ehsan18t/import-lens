@@ -324,9 +324,11 @@ where
                 send_message!(response);
             }
             ClientMessage::CacheInvalidate(message) if hello_received => {
+                prefetcher.cancel();
                 service.invalidate_package(&message.package_name);
             }
             ClientMessage::CacheInvalidateAll(_) if hello_received => {
+                prefetcher.cancel();
                 service.invalidate_all();
             }
             ClientMessage::CacheStatus(request) if hello_received => {
@@ -401,6 +403,8 @@ where
                 }
             }
             ClientMessage::EnumerateExports(request) if hello_received => {
+                prefetcher.cancel();
+                lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
                 let request_for_error = request.clone();
                 let response_handle =
@@ -417,6 +421,8 @@ where
                 send_message!(response);
             }
             ClientMessage::FileSize(request) if hello_received => {
+                prefetcher.cancel();
+                lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
                 let request_for_error = request.clone();
                 let response_handle =
@@ -433,6 +439,8 @@ where
                 send_message!(response);
             }
             ClientMessage::FileSizeDocument(request) if hello_received => {
+                prefetcher.cancel();
+                lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
                 let request_for_error = request.clone();
                 let response_handle =
@@ -450,6 +458,8 @@ where
                 send_message!(response);
             }
             ClientMessage::CompleteImportMembers(request) if hello_received => {
+                prefetcher.cancel();
+                lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
                 let request_for_error = request.clone();
                 let response_handle =
@@ -467,6 +477,8 @@ where
                 send_message!(response);
             }
             ClientMessage::Shutdown(_) => {
+                prefetcher.cancel();
+                service.flush_cache_recency_touches();
                 return Ok(());
             }
             ClientMessage::PrewarmPackageJson(_)

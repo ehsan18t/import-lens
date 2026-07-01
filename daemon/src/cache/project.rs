@@ -293,6 +293,23 @@ impl ProjectCacheRegistry {
         Ok(())
     }
 
+    pub fn flush_recency_touches(&self) {
+        let caches = self
+            .loaded
+            .lock()
+            .map(|loaded| {
+                loaded
+                    .values()
+                    .map(|shard| Arc::clone(&shard.cache))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for cache in caches {
+            cache.flush_recency_touches();
+        }
+    }
+
     fn total_size_bytes(&self) -> u64 {
         self.list_shards()
             .iter()

@@ -784,6 +784,10 @@ impl ImportLensService {
         self.cache_registry.flush_to_disk()
     }
 
+    pub fn flush_cache_recency_touches(&self) {
+        self.cache_registry.flush_recency_touches();
+    }
+
     pub fn prewarm_import<F>(
         &self,
         context: &AnalysisContext,

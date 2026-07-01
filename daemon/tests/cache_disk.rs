@@ -283,6 +283,27 @@ fn disk_cache_coalesces_repeated_memory_hit_recency_writes() {
 }
 
 #[test]
+fn flush_recency_touches_persists_pending_memory_hit_touches() {
+    let storage_path = temp_storage();
+    let key = "react@18.3.1::default";
+
+    {
+        let cache = ImportCache::new(Some(storage_path.clone()), true);
+        cache.insert(key.to_owned(), result("react"));
+    }
+
+    let cache = ImportCache::new_with_recent_preload_limit(Some(storage_path.clone()), true, 0);
+    assert!(cache.get(key).is_some());
+    assert_eq!(cache.pending_recency_touch_count(), 1);
+
+    cache.flush_recency_touches();
+
+    assert_eq!(cache.pending_recency_touch_count(), 0);
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
 fn disk_cache_skips_corrupt_entries_without_poisoning_memory() {
     let storage_path = temp_storage();
     let key = "corrupt@1.0.0::default";

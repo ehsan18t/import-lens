@@ -3,12 +3,13 @@ use import_lens_daemon::{
         codec::{FrameDecoder, decode_payload, encode_frame},
         protocol::{
             AnalyzePackageJsonRequest, AnalyzePackageJsonResponse, BatchRequest, BatchResponse,
-            CacheStatusRequest, CacheStatusResponse, HelloMessage, ImportAnalysisStatus,
-            ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION, ShutdownMessage,
+            CacheStatusRequest, CacheStatusResponse, FileSizeRequest, FileSizeResponse,
+            HelloMessage, ImportAnalysisStatus, ImportKind, ImportRequest, ImportRuntime,
+            PROTOCOL_VERSION, ShutdownMessage,
         },
         server::{batch_response_from_join, handle_connection},
     },
-    prefetch::Prefetcher,
+    prefetch::{CancellationToken, Prefetcher},
     service::ImportLensService,
 };
 use std::{
@@ -33,6 +34,48 @@ struct ResponseReader {
 struct CacheStatusResponseReader {
     decoder: FrameDecoder,
     pending: VecDeque<CacheStatusResponse>,
+}
+
+struct FileSizeResponseReader {
+    decoder: FrameDecoder,
+    pending: VecDeque<FileSizeResponse>,
+}
+
+impl FileSizeResponseReader {
+    fn new() -> Self {
+        Self {
+            decoder: FrameDecoder::default(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    async fn read_response(&mut self, stream: &mut DuplexStream) -> FileSizeResponse {
+        if let Some(response) = self.pending.pop_front() {
+            return response;
+        }
+
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("server response should be readable");
+            assert!(read > 0, "server closed before writing response");
+            for payload in self
+                .decoder
+                .push(&buffer[..read])
+                .expect("server frame should decode")
+            {
+                self.pending.push_back(
+                    decode_payload::<FileSizeResponse>(&payload)
+                        .expect("file-size response should decode"),
+                );
+            }
+            if let Some(response) = self.pending.pop_front() {
+                return response;
+            }
+        }
+    }
 }
 
 impl CacheStatusResponseReader {
@@ -281,6 +324,39 @@ fn cache_status(workspace: &Path, request_id: u64) -> CacheStatusRequest {
     }
 }
 
+fn file_size(workspace: &Path, request_id: u64) -> FileSizeRequest {
+    FileSizeRequest {
+        message_type: "file_size".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        imports: vec![ImportRequest {
+            specifier: "tiny-stream-lib".to_owned(),
+            package_name: "tiny-stream-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec!["value".to_owned()],
+            import_kind: ImportKind::Named,
+            runtime: ImportRuntime::Component,
+        }],
+    }
+}
+
+async fn wait_for_generation_above(cancellation: &Arc<CancellationToken>, baseline: u64) {
+    for _ in 0..20 {
+        if cancellation.generation() > baseline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    panic!("prewarm generation should advance");
+}
+
 #[tokio::test]
 async fn server_responds_to_cache_status_request() {
     let workspace = temp_workspace();
@@ -310,6 +386,58 @@ async fn server_responds_to_cache_status_request() {
     assert_eq!(response.request_id, 11);
     assert_eq!(response.version, PROTOCOL_VERSION);
     assert_eq!(response.error, None);
+
+    client_stream
+        .write_all(
+            &encode_frame(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("shutdown should encode"),
+        )
+        .await
+        .expect("shutdown should be written");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should exit cleanly");
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[tokio::test]
+async fn server_cancels_prewarm_before_file_size_requests() {
+    let workspace = temp_workspace();
+    write_tiny_package(&workspace);
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let prefetcher = Prefetcher::new();
+    let cancellation = Arc::clone(prefetcher.cancellation());
+    let initial_generation = cancellation.generation();
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new(None, false)),
+            prefetcher,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = FileSizeResponseReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+    wait_for_generation_above(&cancellation, initial_generation).await;
+    let prewarm_generation = cancellation.generation();
+
+    client_stream
+        .write_all(&encode_frame(&file_size(&workspace, 12)).expect("file size should encode"))
+        .await
+        .expect("file size should be written");
+
+    let response = reader.read_response(&mut client_stream).await;
+    assert_eq!(response.request_id, 12);
+    assert!(cancellation.generation() > prewarm_generation);
 
     client_stream
         .write_all(

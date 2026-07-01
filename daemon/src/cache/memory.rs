@@ -132,6 +132,10 @@ impl ImportCache {
         self.disk.pending_touch_len()
     }
 
+    pub fn flush_recency_touches(&self) {
+        self.disk.flush_pending_touches();
+    }
+
     pub fn flush_to_disk(&self) -> Result<(), String> {
         let entries = {
             let memory = self.memory.pin();
