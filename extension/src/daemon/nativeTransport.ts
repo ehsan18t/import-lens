@@ -15,6 +15,14 @@ import type {
   AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CacheCleanupRequest,
+  CacheCleanupResponse,
+  CacheListRequest,
+  CacheListResponse,
+  CacheRemoveRequest,
+  CacheRemoveResponse,
+  CacheStatusRequest,
+  CacheStatusResponse,
   CompleteImportMembersRequest,
   CompleteImportMembersResponse,
   EnumerateExportsRequest,
@@ -33,6 +41,7 @@ import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs, terminateProcess } f
 import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 import { resolveDaemonStartRoot } from "./startRoot.js";
+import { resolveDaemonStoragePaths } from "./storagePaths.js";
 import type { AnalysisTransport, DaemonState, DaemonStateEvent } from "./transport.js";
 
 const STABLE_SESSION_RESET_MS = 60_000;
@@ -58,7 +67,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
   constructor(context: vscode.ExtensionContext, logger: Logger) {
     this.#context = context;
     this.#logger = logger;
-    this.#recycleGuard = new RecycleGuard(context.globalStorageUri.fsPath);
+    this.#recycleGuard = new RecycleGuard(resolveDaemonStoragePaths(context).lifecycleStoragePath);
   }
 
   get state(): DaemonState {
@@ -121,7 +130,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
     this.#logger.info(`Daemon binary verified: ${relativeBinaryPath}.`);
 
-    await mkdir(this.#context.globalStorageUri.fsPath, { recursive: true });
+    const storagePaths = resolveDaemonStoragePaths(this.#context);
+    await mkdir(storagePaths.lifecycleStoragePath, { recursive: true });
+    await mkdir(storagePaths.cacheBasePath, { recursive: true });
 
     const pipeName = process.platform === "win32"
       ? `\\\\.\\pipe\\import-lens-${process.pid}-${randomUUID()}`
@@ -133,7 +144,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       "--workspace",
       workspaceRoot,
       "--storage",
-      this.#context.globalStorageUri.fsPath,
+      storagePaths.lifecycleStoragePath,
     ]);
     this.#process = childProcess;
     this.#logger.info(`Spawned ImportLens daemon process ${childProcess.pid ?? "unknown"}.`);
@@ -393,6 +404,46 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#client.requestCompleteImportMembers(request);
   }
 
+  async cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Cache status request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting cache status ${request.request_id}.`);
+    return this.#client.requestCacheStatus(request);
+  }
+
+  async cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Cache cleanup request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.info(`Requesting cache cleanup ${request.request_id}.`);
+    return this.#client.requestCacheCleanup(request);
+  }
+
+  async listCache(request: CacheListRequest): Promise<CacheListResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Cache list request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting cache list ${request.request_id}.`);
+    return this.#client.requestCacheList(request);
+  }
+
+  async removeCache(request: CacheRemoveRequest): Promise<CacheRemoveResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Cache remove request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.info(`Requesting cache removal ${request.request_id} with scope ${request.scope}.`);
+    return this.#client.requestCacheRemove(request);
+  }
+
   invalidatePackage(packageName: string): void {
     this.#logger.info(`Invalidating ImportLens cache for ${packageName}.`);
     this.#client?.send({ type: "cache_invalidate", package: packageName });
@@ -498,13 +549,16 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   #hello(workspaceRoot: string): HelloMessage {
     const config = getImportLensConfig();
+    const storagePaths = resolveDaemonStoragePaths(this.#context);
 
     return {
       type: "hello",
       version: protocolVersion,
       workspace_root: workspaceRoot,
-      storage_path: this.#context.globalStorageUri.fsPath,
+      storage_path: storagePaths.cacheBasePath,
       enable_disk_cache: config.enableDiskCache,
+      cache_max_size_mb: config.cacheMaxSizeMB,
+      cache_max_age_days: config.cacheMaxAgeDays,
       log_level: config.logLevel,
     };
   }

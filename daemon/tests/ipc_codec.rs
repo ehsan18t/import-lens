@@ -3,7 +3,7 @@ use import_lens_daemon::ipc::codec::{
     FrameDecoder, MAX_FRAME_BYTES, decode_payload, encode_frame, message_frame_codec,
 };
 use import_lens_daemon::ipc::protocol::{
-    ClientMessage, ImportKind, ImportRequest, PROTOCOL_VERSION, ShutdownMessage,
+    CacheRemoveScope, ClientMessage, ImportKind, ImportRequest, PROTOCOL_VERSION, ShutdownMessage,
 };
 use tokio_util::codec::Decoder;
 
@@ -104,7 +104,8 @@ fn import_request_defaults_missing_runtime_to_component() {
 }
 
 #[test]
-fn client_message_decodes_daemon_first_v5_requests() {
+fn client_message_decodes_daemon_first_v6_requests() {
+    assert_eq!(PROTOCOL_VERSION, 6);
     assert!(matches!(
         decode_client_message(serde_json::json!({
             "type": "analyze_document",
@@ -169,6 +170,61 @@ fn client_message_decodes_daemon_first_v5_requests() {
             "package_json_paths": ["C:/workspace/node_modules/tiny-lib/package.json"]
         })),
         ClientMessage::NodeModulesChanged(_),
+    ));
+}
+
+#[test]
+fn client_message_decodes_cache_management_requests() {
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "hello",
+            "version": PROTOCOL_VERSION,
+            "workspace_root": "C:/workspace",
+            "storage_path": "C:/Code/User/workspaceStorage/importlens/daemon-cache",
+            "enable_disk_cache": true,
+            "cache_max_size_mb": 512,
+            "cache_max_age_days": 30,
+            "log_level": "info"
+        })),
+        ClientMessage::Hello(message)
+            if message.cache_max_size_mb == 512 && message.cache_max_age_days == 30,
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "cache_status",
+            "version": PROTOCOL_VERSION,
+            "request_id": 21,
+            "workspace_root": "C:/workspace"
+        })),
+        ClientMessage::CacheStatus(message)
+            if message.request_id == 21 && message.workspace_root.as_deref() == Some("C:/workspace"),
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "cache_cleanup",
+            "version": PROTOCOL_VERSION,
+            "request_id": 22
+        })),
+        ClientMessage::CacheCleanup(message) if message.request_id == 22,
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "cache_list",
+            "version": PROTOCOL_VERSION,
+            "request_id": 23
+        })),
+        ClientMessage::CacheList(message) if message.request_id == 23,
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "cache_remove",
+            "version": PROTOCOL_VERSION,
+            "request_id": 24,
+            "scope": "current_project",
+            "workspace_root": "C:/workspace"
+        })),
+        ClientMessage::CacheRemove(message)
+            if message.request_id == 24 && message.scope == CacheRemoveScope::CurrentProject,
     ));
 }
 

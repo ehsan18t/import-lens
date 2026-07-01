@@ -5,12 +5,20 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { IpcClient } from "../../src/ipc/client.js";
-import { encodeFrame } from "../../src/ipc/codec.js";
+import { FrameDecoder, encodeFrame } from "../../src/ipc/codec.js";
 import type {
   AnalyzePackageJsonRequest,
   AnalyzePackageJsonResponse,
   BatchRequest,
   BatchResponse,
+  CacheCleanupRequest,
+  CacheCleanupResponse,
+  CacheListRequest,
+  CacheListResponse,
+  CacheRemoveRequest,
+  CacheRemoveResponse,
+  CacheStatusRequest,
+  CacheStatusResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
   FileSizeRequest,
@@ -105,6 +113,33 @@ const fileSizeRequest = (requestId: number): FileSizeRequest => ({
   workspace_root: "/workspace",
   active_document_path: "/workspace/src/app.ts",
   imports: [],
+});
+
+const cacheStatusRequest = (requestId: number): CacheStatusRequest => ({
+  type: "cache_status",
+  version: 6,
+  request_id: requestId,
+  workspace_root: "/workspace",
+});
+
+const cacheCleanupRequest = (requestId: number): CacheCleanupRequest => ({
+  type: "cache_cleanup",
+  version: 6,
+  request_id: requestId,
+});
+
+const cacheListRequest = (requestId: number): CacheListRequest => ({
+  type: "cache_list",
+  version: 6,
+  request_id: requestId,
+});
+
+const cacheRemoveRequest = (requestId: number): CacheRemoveRequest => ({
+  type: "cache_remove",
+  version: 6,
+  request_id: requestId,
+  scope: "current_project",
+  workspace_root: "/workspace",
 });
 
 const packageJsonRequest = (requestId: number): AnalyzePackageJsonRequest => ({
@@ -473,4 +508,120 @@ test("IpcClient resolves file size responses independently from batches", async 
     destroySockets(sockets);
     await closeServer(server);
   }
+});
+
+test("IpcClient resolves cache management responses independently from analysis responses", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const observed: string[] = [];
+  const server = net.createServer((socket) => {
+    const decoder = new FrameDecoder();
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("data", (chunk) => {
+      for (const message of decoder.push(chunk)) {
+        const request = message as { type?: string; request_id?: number; version?: number };
+        observed.push(`${request.type}:${request.request_id}`);
+
+        if (request.type === "cache_status") {
+          socket.write(encodeFrame(cacheStatusResponse(request.request_id ?? 0)));
+        }
+
+        if (request.type === "cache_cleanup") {
+          socket.write(encodeFrame(cacheCleanupResponse(request.request_id ?? 0)));
+        }
+
+        if (request.type === "cache_list") {
+          socket.write(encodeFrame(cacheListResponse(request.request_id ?? 0)));
+        }
+
+        if (request.type === "cache_remove") {
+          socket.write(encodeFrame(cacheRemoveResponse(request.request_id ?? 0)));
+        }
+      }
+    });
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+
+    const status = await client.requestCacheStatus(cacheStatusRequest(201));
+    const cleanup = await client.requestCacheCleanup(cacheCleanupRequest(202));
+    const list = await client.requestCacheList(cacheListRequest(203));
+    const remove = await client.requestCacheRemove(cacheRemoveRequest(204));
+
+    assert.equal(status.project_count, 2);
+    assert.equal(cleanup.total_size_bytes, 1024);
+    assert.equal(list.shards.length, 1);
+    assert.equal(remove.removed.length, 1);
+    assert.deepEqual(observed, [
+      "cache_status:201",
+      "cache_cleanup:202",
+      "cache_list:203",
+      "cache_remove:204",
+    ]);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+const cacheStatusResponse = (requestId: number): CacheStatusResponse => ({
+  version: 6,
+  request_id: requestId,
+  total_size_bytes: 4096,
+  project_count: 2,
+  max_size_mb: 512,
+  max_age_days: 30,
+  last_cleanup_millis: null,
+  current_project: null,
+  error: null,
+  diagnostics: [],
+});
+
+const cacheCleanupResponse = (requestId: number): CacheCleanupResponse => ({
+  version: 6,
+  request_id: requestId,
+  total_size_bytes: 1024,
+  removed: [],
+  failed: [],
+  error: null,
+  diagnostics: [],
+});
+
+const cacheListResponse = (requestId: number): CacheListResponse => ({
+  version: 6,
+  request_id: requestId,
+  shards: [
+    {
+      shard_id: "v1-abc",
+      project_root: "/workspace",
+      normalized_root: "/workspace",
+      cache_path: "/cache/v1-abc/cache.redb",
+      size_bytes: 1024,
+      last_used_millis: null,
+      loaded: true,
+    },
+  ],
+  error: null,
+  diagnostics: [],
+});
+
+const cacheRemoveResponse = (requestId: number): CacheRemoveResponse => ({
+  version: 6,
+  request_id: requestId,
+  removed: [
+    {
+      shard_id: "v1-abc",
+      project_root: "/workspace",
+      cache_path: "/cache/v1-abc/cache.redb",
+      removed: true,
+      error: null,
+    },
+  ],
+  failed: [],
+  error: null,
+  diagnostics: [],
 });

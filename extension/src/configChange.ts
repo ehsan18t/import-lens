@@ -9,6 +9,14 @@ export const classifyImportLensConfigChange = (
     return "daemonRestart";
   }
 
+  if (event.affectsConfiguration("importLens.cacheMaxSizeMB")) {
+    return "daemonRestart";
+  }
+
+  if (event.affectsConfiguration("importLens.cacheMaxAgeDays")) {
+    return "daemonRestart";
+  }
+
   if (event.affectsConfiguration("importLens.enabled")) {
     return "reanalyze";
   }

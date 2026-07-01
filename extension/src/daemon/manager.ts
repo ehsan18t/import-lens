@@ -8,6 +8,14 @@ import type {
   AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CacheCleanupRequest,
+  CacheCleanupResponse,
+  CacheListRequest,
+  CacheListResponse,
+  CacheRemoveRequest,
+  CacheRemoveResponse,
+  CacheStatusRequest,
+  CacheStatusResponse,
   CompleteImportMembersRequest,
   CompleteImportMembersResponse,
   EnumerateExportsRequest,
@@ -77,6 +85,22 @@ export class DaemonManager implements vscode.Disposable {
 
   completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null> {
     return this.#transport.completeImportMembers(request);
+  }
+
+  cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null> {
+    return this.#transport.cacheStatus(request);
+  }
+
+  cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null> {
+    return this.#transport.cleanupCache(request);
+  }
+
+  listCache(request: CacheListRequest): Promise<CacheListResponse | null> {
+    return this.#transport.listCache(request);
+  }
+
+  removeCache(request: CacheRemoveRequest): Promise<CacheRemoveResponse | null> {
+    return this.#transport.removeCache(request);
   }
 
   invalidatePackage(packageName: string): void {

@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import { decode, encode } from "@msgpack/msgpack";
 
 const execFile = promisify(execFileCallback);
-const protocolVersion = 5;
+const protocolVersion = 6;
 const supportedExtensions = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts", ".svelte", ".vue", ".astro"]);
 const defaultIpcTimeoutMs = 10000;
 
@@ -193,18 +193,19 @@ const startDaemon = async (workspaceRoot) => {
     throw new Error(`ImportLens daemon binary is unavailable at ${binary}`);
   }
 
-  const storagePath = path.resolve(".importlens", "cache");
-  await mkdir(storagePath, { recursive: true });
+  const { cachePath, lifecyclePath } = resolveCliStoragePaths();
+  await mkdir(cachePath, { recursive: true });
+  await mkdir(lifecyclePath, { recursive: true });
   const pipeName = process.platform === "win32"
     ? `\\\\.\\pipe\\import-lens-cli-${process.pid}-${randomUUID()}`
-    : path.join(storagePath, `import-lens-cli-${process.pid}-${randomUUID()}.sock`);
+    : path.join(lifecyclePath, `import-lens-cli-${process.pid}-${randomUUID()}.sock`);
   const child = spawn(binary, [
     "--pipe",
     pipeName,
     "--workspace",
     workspaceRoot,
     "--storage",
-    storagePath,
+    lifecyclePath,
   ], { stdio: ["ignore", "ignore", "inherit"] });
   let socket;
   let client;
@@ -216,8 +217,10 @@ const startDaemon = async (workspaceRoot) => {
       type: "hello",
       version: protocolVersion,
       workspace_root: workspaceRoot,
-      storage_path: storagePath,
+      storage_path: cachePath,
       enable_disk_cache: true,
+      cache_max_size_mb: 512,
+      cache_max_age_days: 30,
       log_level: "warn",
     });
   } catch (error) {
@@ -245,6 +248,23 @@ const startDaemon = async (workspaceRoot) => {
 };
 
 const cliPackageRoot = () => path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+export const resolveCliStoragePaths = ({
+  env = process.env,
+  platform = process.platform,
+  homeDir = os.homedir(),
+} = {}) => {
+  const basePath = platform === "win32"
+    ? path.join(env.LOCALAPPDATA ?? path.join(homeDir, "AppData", "Local"), "ImportLens")
+    : platform === "darwin"
+      ? path.join(homeDir, "Library", "Caches", "ImportLens")
+      : path.join(env.XDG_CACHE_HOME ?? path.join(homeDir, ".cache"), "import-lens");
+
+  return {
+    cachePath: path.join(basePath, "daemon-cache"),
+    lifecyclePath: path.join(basePath, "daemon-lifecycle"),
+  };
+};
 
 export const daemonBinaryPath = ({
   packageRoot = cliPackageRoot(),

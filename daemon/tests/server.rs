@@ -3,8 +3,8 @@ use import_lens_daemon::{
         codec::{FrameDecoder, decode_payload, encode_frame},
         protocol::{
             AnalyzePackageJsonRequest, AnalyzePackageJsonResponse, BatchRequest, BatchResponse,
-            HelloMessage, ImportAnalysisStatus, ImportKind, ImportRequest, ImportRuntime,
-            PROTOCOL_VERSION, ShutdownMessage,
+            CacheStatusRequest, CacheStatusResponse, HelloMessage, ImportAnalysisStatus,
+            ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION, ShutdownMessage,
         },
         server::{batch_response_from_join, handle_connection},
     },
@@ -28,6 +28,48 @@ static NEXT_TEMP_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 struct ResponseReader {
     decoder: FrameDecoder,
     pending: VecDeque<BatchResponse>,
+}
+
+struct CacheStatusResponseReader {
+    decoder: FrameDecoder,
+    pending: VecDeque<CacheStatusResponse>,
+}
+
+impl CacheStatusResponseReader {
+    fn new() -> Self {
+        Self {
+            decoder: FrameDecoder::default(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    async fn read_response(&mut self, stream: &mut DuplexStream) -> CacheStatusResponse {
+        if let Some(response) = self.pending.pop_front() {
+            return response;
+        }
+
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("server response should be readable");
+            assert!(read > 0, "server closed before writing response");
+            for payload in self
+                .decoder
+                .push(&buffer[..read])
+                .expect("server frame should decode")
+            {
+                self.pending.push_back(
+                    decode_payload::<CacheStatusResponse>(&payload)
+                        .expect("cache status response should decode"),
+                );
+            }
+            if let Some(response) = self.pending.pop_front() {
+                return response;
+            }
+        }
+    }
 }
 
 impl ResponseReader {
@@ -165,6 +207,8 @@ fn hello(workspace: &Path) -> HelloMessage {
         workspace_root: workspace.to_string_lossy().to_string(),
         storage_path: workspace.join(".import-lens").to_string_lossy().to_string(),
         enable_disk_cache: false,
+        cache_max_size_mb: 512,
+        cache_max_age_days: 30,
         log_level: "error".to_owned(),
     }
 }
@@ -226,6 +270,61 @@ fn streaming_package_json(workspace: &Path, request_id: u64) -> AnalyzePackageJs
         refresh_section: None,
         streaming: true,
     }
+}
+
+fn cache_status(workspace: &Path, request_id: u64) -> CacheStatusRequest {
+    CacheStatusRequest {
+        message_type: "cache_status".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: Some(workspace.to_string_lossy().to_string()),
+    }
+}
+
+#[tokio::test]
+async fn server_responds_to_cache_status_request() {
+    let workspace = temp_workspace();
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new(None, false)),
+            Prefetcher::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = CacheStatusResponseReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+    client_stream
+        .write_all(&encode_frame(&cache_status(&workspace, 11)).expect("status should encode"))
+        .await
+        .expect("status should be written");
+
+    let response = reader.read_response(&mut client_stream).await;
+    assert_eq!(response.request_id, 11);
+    assert_eq!(response.version, PROTOCOL_VERSION);
+    assert_eq!(response.error, None);
+
+    client_stream
+        .write_all(
+            &encode_frame(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("shutdown should encode"),
+        )
+        .await
+        .expect("shutdown should be written");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should exit cleanly");
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
 #[tokio::test]

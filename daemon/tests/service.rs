@@ -1,9 +1,9 @@
 use import_lens_daemon::{
     ipc::protocol::{
         AnalyzeDocumentRequest, AnalyzePackageJsonRequest, AnalyzeSpecifiersRequest, BatchRequest,
-        CompleteImportMembersRequest, EnumerateExportsRequest, FileSizeDocumentRequest,
-        FileSizeRequest, ImportAnalysisStatus, ImportKind, ImportRequest, ImportRuntime,
-        PROTOCOL_VERSION,
+        CacheRemoveRequest, CacheRemoveScope, CacheStatusRequest, CompleteImportMembersRequest,
+        EnumerateExportsRequest, FileSizeDocumentRequest, FileSizeRequest, ImportAnalysisStatus,
+        ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION,
     },
     pipeline::graph::{build_module_graph_cached, clear_module_graph_cache},
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
@@ -901,6 +901,61 @@ fn service_cache_invalidation_removes_matching_package_entries() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!after_invalidate.imports[0].cache_hit);
+}
+
+#[test]
+fn service_reports_and_removes_per_project_cache_shards() {
+    let storage = common::temp_workspace("import-lens-service-cache-storage");
+    let left_workspace = temp_workspace();
+    let right_workspace = temp_workspace();
+    write_package(&left_workspace);
+    write_tiny_package_with_source(
+        &right_workspace,
+        "export const value = 'right workspace has different package bytes';",
+    );
+    let service = ImportLensService::new_with_cache_policy(Some(storage.clone()), true, 512, 30);
+
+    let _ = service.handle_batch(batch(&left_workspace, 1));
+    let _ = service.handle_batch(batch(&right_workspace, 2));
+
+    let status = service.cache_status(CacheStatusRequest {
+        message_type: "cache_status".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 3,
+        workspace_root: Some(left_workspace.to_string_lossy().to_string()),
+    });
+    assert_eq!(status.project_count, 2);
+    assert_eq!(
+        status
+            .current_project
+            .as_ref()
+            .map(|shard| shard.project_root.as_str()),
+        Some(left_workspace.to_string_lossy().as_ref())
+    );
+
+    let removed = service.remove_cache(CacheRemoveRequest {
+        message_type: "cache_remove".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 4,
+        scope: CacheRemoveScope::CurrentProject,
+        workspace_root: Some(left_workspace.to_string_lossy().to_string()),
+        shard_ids: None,
+    });
+    assert_eq!(removed.removed.len(), 1);
+    assert!(removed.failed.is_empty(), "{removed:?}");
+
+    let after_remove = service.cache_status(CacheStatusRequest {
+        message_type: "cache_status".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 5,
+        workspace_root: Some(left_workspace.to_string_lossy().to_string()),
+    });
+    assert_eq!(after_remove.project_count, 1);
+    assert!(after_remove.current_project.is_none());
+
+    fs::remove_dir_all(left_workspace).expect("left workspace should be removed");
+    fs::remove_dir_all(right_workspace).expect("right workspace should be removed");
+    fs::remove_dir_all(storage).expect("cache storage should be removed");
 }
 
 #[test]

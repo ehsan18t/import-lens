@@ -1,7 +1,7 @@
 use crate::document::{PackageJsonDependencyEntry, PackageJsonDependencySection};
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -346,6 +346,10 @@ pub struct HelloMessage {
     pub workspace_root: String,
     pub storage_path: String,
     pub enable_disk_cache: bool,
+    #[serde(default = "default_cache_max_size_mb")]
+    pub cache_max_size_mb: u64,
+    #[serde(default = "default_cache_max_age_days")]
+    pub cache_max_age_days: u64,
     pub log_level: String,
 }
 
@@ -434,6 +438,121 @@ pub struct FileSizeResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheShardInfo {
+    pub shard_id: String,
+    pub project_root: String,
+    pub normalized_root: String,
+    pub cache_path: String,
+    pub size_bytes: u64,
+    pub last_used_millis: Option<u64>,
+    pub loaded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheOperationResult {
+    pub shard_id: String,
+    pub project_root: String,
+    pub cache_path: String,
+    pub removed: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheStatusRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "cache_status_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheStatusResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub total_size_bytes: u64,
+    pub project_count: usize,
+    pub max_size_mb: u64,
+    pub max_age_days: u64,
+    pub last_cleanup_millis: Option<u64>,
+    pub current_project: Option<CacheShardInfo>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCleanupRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "cache_cleanup_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCleanupResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub total_size_bytes: u64,
+    pub removed: Vec<CacheOperationResult>,
+    pub failed: Vec<CacheOperationResult>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheListRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "cache_list_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheListResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub shards: Vec<CacheShardInfo>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRemoveScope {
+    CurrentProject,
+    Selected,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheRemoveRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "cache_remove_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub scope: CacheRemoveScope,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub shard_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheRemoveResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub removed: Vec<CacheOperationResult>,
+    pub failed: Vec<CacheOperationResult>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShutdownMessage {
     #[serde(rename = "type")]
     #[serde(default = "shutdown_message_type")]
@@ -455,6 +574,10 @@ pub enum ClientMessage {
     FileSize(FileSizeRequest),
     FileSizeDocument(FileSizeDocumentRequest),
     CompleteImportMembers(CompleteImportMembersRequest),
+    CacheStatus(CacheStatusRequest),
+    CacheCleanup(CacheCleanupRequest),
+    CacheList(CacheListRequest),
+    CacheRemove(CacheRemoveRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -480,6 +603,10 @@ enum TypedClientMessage {
     FileSize(FileSizeRequest),
     FileSizeDocument(FileSizeDocumentRequest),
     CompleteImportMembers(CompleteImportMembersRequest),
+    CacheStatus(CacheStatusRequest),
+    CacheCleanup(CacheCleanupRequest),
+    CacheList(CacheListRequest),
+    CacheRemove(CacheRemoveRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -530,6 +657,10 @@ impl From<TypedClientMessage> for ClientMessage {
             TypedClientMessage::CompleteImportMembers(message) => {
                 Self::CompleteImportMembers(message)
             }
+            TypedClientMessage::CacheStatus(message) => Self::CacheStatus(message),
+            TypedClientMessage::CacheCleanup(message) => Self::CacheCleanup(message),
+            TypedClientMessage::CacheList(message) => Self::CacheList(message),
+            TypedClientMessage::CacheRemove(message) => Self::CacheRemove(message),
             TypedClientMessage::Shutdown(message) => Self::Shutdown(message),
         }
     }
@@ -550,6 +681,14 @@ impl From<BatchRequestWire> for BatchRequest {
 
 fn hello_message_type() -> String {
     "hello".to_owned()
+}
+
+fn default_cache_max_size_mb() -> u64 {
+    512
+}
+
+fn default_cache_max_age_days() -> u64 {
+    30
 }
 
 fn analyze_document_message_type() -> String {
@@ -594,6 +733,22 @@ fn file_size_document_message_type() -> String {
 
 fn complete_import_members_message_type() -> String {
     "complete_import_members".to_owned()
+}
+
+fn cache_status_message_type() -> String {
+    "cache_status".to_owned()
+}
+
+fn cache_cleanup_message_type() -> String {
+    "cache_cleanup".to_owned()
+}
+
+fn cache_list_message_type() -> String {
+    "cache_list".to_owned()
+}
+
+fn cache_remove_message_type() -> String {
+    "cache_remove".to_owned()
 }
 
 fn shutdown_message_type() -> String {

@@ -7,6 +7,14 @@ import type {
   AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CacheCleanupRequest,
+  CacheCleanupResponse,
+  CacheListRequest,
+  CacheListResponse,
+  CacheRemoveRequest,
+  CacheRemoveResponse,
+  CacheStatusRequest,
+  CacheStatusResponse,
   CompleteImportMembersRequest,
   CompleteImportMembersResponse,
   EnumerateExportsRequest,
@@ -37,6 +45,10 @@ export interface AnalysisTransport {
   requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null>;
   requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null>;
   completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null>;
+  cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null>;
+  cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null>;
+  listCache(request: CacheListRequest): Promise<CacheListResponse | null>;
+  removeCache(request: CacheRemoveRequest): Promise<CacheRemoveResponse | null>;
   invalidatePackage(packageName: string): void;
   invalidateAll(): void;
   nodeModulesChanged(packageJsonPaths: readonly string[]): void;
@@ -144,6 +156,22 @@ export class TransportCoordinator implements AnalysisTransport {
 
   completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null> {
     return this.#activeTransport?.completeImportMembers(request) ?? Promise.resolve(null);
+  }
+
+  cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null> {
+    return this.#activeTransport?.cacheStatus(request) ?? Promise.resolve(null);
+  }
+
+  cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null> {
+    return this.#activeTransport?.cleanupCache(request) ?? Promise.resolve(null);
+  }
+
+  listCache(request: CacheListRequest): Promise<CacheListResponse | null> {
+    return this.#activeTransport?.listCache(request) ?? Promise.resolve(null);
+  }
+
+  removeCache(request: CacheRemoveRequest): Promise<CacheRemoveResponse | null> {
+    return this.#activeTransport?.removeCache(request) ?? Promise.resolve(null);
   }
 
   invalidatePackage(packageName: string): void {

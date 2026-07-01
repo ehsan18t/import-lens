@@ -8,6 +8,7 @@ import {
   daemonBinaryPath,
   loadBudgetConfig,
   parseCliArgs,
+  resolveCliStoragePaths,
   runImportLensCheck,
 } from "../../cli/importlens.mjs";
 
@@ -94,6 +95,25 @@ test("daemonBinaryPath resolves from the installed package root", () => {
     daemonBinaryPath({ packageRoot: path.join("C:", "ImportLens"), platformTarget: "win32-x64" }),
     path.join("C:", "ImportLens", "bin", "win32-x64", "import-lens-daemon.exe"),
   );
+});
+
+test("resolveCliStoragePaths keeps daemon cache outside the project directory", () => {
+  const cwd = path.join("C:", "workspace", "app");
+  const paths = resolveCliStoragePaths({
+    env: { LOCALAPPDATA: path.join("C:", "Users", "Ehsan", "AppData", "Local") },
+    platform: "win32",
+    homeDir: path.join("C:", "Users", "Ehsan"),
+  });
+
+  assert.equal(
+    paths.cachePath,
+    path.join("C:", "Users", "Ehsan", "AppData", "Local", "ImportLens", "daemon-cache"),
+  );
+  assert.equal(
+    paths.lifecyclePath,
+    path.join("C:", "Users", "Ehsan", "AppData", "Local", "ImportLens", "daemon-lifecycle"),
+  );
+  assert.equal(paths.cachePath.startsWith(cwd), false);
 });
 
 test("createDaemonClient resolves concurrent responses by request id", async () => {

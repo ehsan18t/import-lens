@@ -9,6 +9,14 @@ import type {
   AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CacheCleanupRequest,
+  CacheCleanupResponse,
+  CacheListRequest,
+  CacheListResponse,
+  CacheRemoveRequest,
+  CacheRemoveResponse,
+  CacheStatusRequest,
+  CacheStatusResponse,
   ClientMessage,
   CompleteImportMembersRequest,
   CompleteImportMembersResponse,
@@ -56,6 +64,10 @@ export class IpcClient extends EventEmitter {
   readonly #fileSizePending = new Map<number, PendingRequest<FileSizeResponse>>();
   readonly #fileSizeDocumentPending = new Map<number, PendingRequest<FileSizeDocumentResponse>>();
   readonly #completionPending = new Map<number, PendingRequest<CompleteImportMembersResponse>>();
+  readonly #cacheStatusPending = new Map<number, PendingRequest<CacheStatusResponse>>();
+  readonly #cacheCleanupPending = new Map<number, PendingRequest<CacheCleanupResponse>>();
+  readonly #cacheListPending = new Map<number, PendingRequest<CacheListResponse>>();
+  readonly #cacheRemovePending = new Map<number, PendingRequest<CacheRemoveResponse>>();
   readonly #logger?: Pick<Logger, "debug" | "warn">;
   #closed = false;
   #disposed = false;
@@ -222,6 +234,34 @@ export class IpcClient extends EventEmitter {
     return this.#requestWithPending(this.#completionPending, request, timeoutMs);
   }
 
+  requestCacheStatus(
+    request: CacheStatusRequest,
+    timeoutMs = 10000,
+  ): Promise<CacheStatusResponse> {
+    return this.#requestWithPending(this.#cacheStatusPending, request, timeoutMs);
+  }
+
+  requestCacheCleanup(
+    request: CacheCleanupRequest,
+    timeoutMs = 30000,
+  ): Promise<CacheCleanupResponse> {
+    return this.#requestWithPending(this.#cacheCleanupPending, request, timeoutMs);
+  }
+
+  requestCacheList(
+    request: CacheListRequest,
+    timeoutMs = 10000,
+  ): Promise<CacheListResponse> {
+    return this.#requestWithPending(this.#cacheListPending, request, timeoutMs);
+  }
+
+  requestCacheRemove(
+    request: CacheRemoveRequest,
+    timeoutMs = 30000,
+  ): Promise<CacheRemoveResponse> {
+    return this.#requestWithPending(this.#cacheRemovePending, request, timeoutMs);
+  }
+
   #requestWithPending<TRequest extends { request_id: number }, TResponse>(
     pendingMap: Map<number, PendingRequest<TResponse>>,
     request: TRequest & ClientMessage,
@@ -272,6 +312,26 @@ export class IpcClient extends EventEmitter {
     }
 
     for (const message of messages) {
+      if (isCacheStatusResponse(message)) {
+        this.#resolvePending(this.#cacheStatusPending, message);
+        continue;
+      }
+
+      if (isCacheCleanupResponse(message)) {
+        this.#resolvePending(this.#cacheCleanupPending, message);
+        continue;
+      }
+
+      if (isCacheListResponse(message)) {
+        this.#resolvePending(this.#cacheListPending, message);
+        continue;
+      }
+
+      if (isCacheRemoveResponse(message)) {
+        this.#resolvePending(this.#cacheRemovePending, message);
+        continue;
+      }
+
       if (isAnalyzePackageJsonResponse(message)) {
         const pending = this.#packageJsonPending.get(message.request_id);
 
@@ -396,6 +456,22 @@ export class IpcClient extends EventEmitter {
       pending.reject(error);
     }
 
+    for (const pending of this.#cacheStatusPending.values()) {
+      pending.reject(error);
+    }
+
+    for (const pending of this.#cacheCleanupPending.values()) {
+      pending.reject(error);
+    }
+
+    for (const pending of this.#cacheListPending.values()) {
+      pending.reject(error);
+    }
+
+    for (const pending of this.#cacheRemovePending.values()) {
+      pending.reject(error);
+    }
+
     this.#batchPending.clear();
     this.#documentPending.clear();
     this.#packageJsonPending.clear();
@@ -404,6 +480,10 @@ export class IpcClient extends EventEmitter {
     this.#fileSizePending.clear();
     this.#fileSizeDocumentPending.clear();
     this.#completionPending.clear();
+    this.#cacheStatusPending.clear();
+    this.#cacheCleanupPending.clear();
+    this.#cacheListPending.clear();
+    this.#cacheRemovePending.clear();
 
     if (emitDisconnect && !this.#disposed) {
       this.#logger?.warn(`IPC disconnected: ${error.message}`);
@@ -530,5 +610,115 @@ const isCompleteImportMembersResponse = (value: unknown): value is CompleteImpor
     candidate.imported_names.every((importedName) => typeof importedName === "string") &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics)
+  );
+};
+
+const isCacheShardInfo = (value: unknown): boolean => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<NonNullable<CacheStatusResponse["current_project"]>>;
+  return (
+    typeof candidate.shard_id === "string" &&
+    typeof candidate.project_root === "string" &&
+    typeof candidate.normalized_root === "string" &&
+    typeof candidate.cache_path === "string" &&
+    typeof candidate.size_bytes === "number" &&
+    (candidate.last_used_millis === null || typeof candidate.last_used_millis === "number") &&
+    typeof candidate.loaded === "boolean"
+  );
+};
+
+const isCacheOperationResult = (value: unknown): boolean => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<CacheRemoveResponse["removed"][number]>;
+  return (
+    typeof candidate.shard_id === "string" &&
+    typeof candidate.project_root === "string" &&
+    typeof candidate.cache_path === "string" &&
+    typeof candidate.removed === "boolean" &&
+    (candidate.error === null || typeof candidate.error === "string")
+  );
+};
+
+const hasCacheResponseBase = (value: unknown): value is {
+  version: number;
+  request_id: number;
+  error: string | null;
+  diagnostics: unknown[];
+} => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as {
+    version?: unknown;
+    request_id?: unknown;
+    error?: unknown;
+    diagnostics?: unknown;
+  };
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    (candidate.error === null || typeof candidate.error === "string") &&
+    Array.isArray(candidate.diagnostics)
+  );
+};
+
+const isCacheStatusResponse = (value: unknown): value is CacheStatusResponse => {
+  if (!hasCacheResponseBase(value)) {
+    return false;
+  }
+
+  const candidate = value as Partial<CacheStatusResponse>;
+  return (
+    typeof candidate.total_size_bytes === "number" &&
+    typeof candidate.project_count === "number" &&
+    typeof candidate.max_size_mb === "number" &&
+    typeof candidate.max_age_days === "number" &&
+    (candidate.last_cleanup_millis === null || typeof candidate.last_cleanup_millis === "number") &&
+    (candidate.current_project === null || isCacheShardInfo(candidate.current_project))
+  );
+};
+
+const isCacheCleanupResponse = (value: unknown): value is CacheCleanupResponse => {
+  if (!hasCacheResponseBase(value)) {
+    return false;
+  }
+
+  const candidate = value as Partial<CacheCleanupResponse>;
+  return (
+    typeof candidate.total_size_bytes === "number" &&
+    Array.isArray(candidate.removed) &&
+    candidate.removed.every(isCacheOperationResult) &&
+    Array.isArray(candidate.failed) &&
+    candidate.failed.every(isCacheOperationResult)
+  );
+};
+
+const isCacheListResponse = (value: unknown): value is CacheListResponse => {
+  if (!hasCacheResponseBase(value)) {
+    return false;
+  }
+
+  const candidate = value as Partial<CacheListResponse>;
+  return Array.isArray(candidate.shards) && candidate.shards.every(isCacheShardInfo);
+};
+
+const isCacheRemoveResponse = (value: unknown): value is CacheRemoveResponse => {
+  if (!hasCacheResponseBase(value)) {
+    return false;
+  }
+
+  const candidate = value as Partial<CacheRemoveResponse>;
+  return (
+    Array.isArray(candidate.removed) &&
+    candidate.removed.every(isCacheOperationResult) &&
+    Array.isArray(candidate.failed) &&
+    candidate.failed.every(isCacheOperationResult)
   );
 };

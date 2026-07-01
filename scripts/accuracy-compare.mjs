@@ -11,7 +11,7 @@ import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 import { decode, encode } from "@msgpack/msgpack";
 import * as esbuild from "esbuild";
 
-const protocolVersion = 4;
+const protocolVersion = 6;
 const packageName = "importlens-accuracy-fixture";
 const tolerance = Number(process.env.IMPORT_LENS_ACCURACY_TOLERANCE ?? "0.75");
 
@@ -205,6 +205,8 @@ const startDaemon = async (workspace) => {
       workspace_root: workspace,
       storage_path: storagePath,
       enable_disk_cache: false,
+      cache_max_size_mb: 512,
+      cache_max_age_days: 30,
       log_level: "warn",
     });
 

@@ -2,6 +2,7 @@ use crate::{
     cache::{
         key::{cache_key_for_resolved_import, fingerprints_for_paths},
         memory::ImportCache,
+        project::ProjectCacheRegistry,
     },
     document::{
         analyze_imports, get_package_name, is_runtime_package_specifier, load_import_lens_ignore,
@@ -11,12 +12,14 @@ use crate::{
     ipc::protocol::{
         AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
         AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-        BatchRequest, BatchResponse, CompleteImportMembersRequest, CompleteImportMembersResponse,
-        ConfidenceLevel, DetectedImport, EnumerateExportsRequest, EnumerateExportsResponse,
-        FileSizeDocumentRequest, FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse,
-        ImportAnalysisItem, ImportAnalysisStatus, ImportDiagnostic, ImportKind, ImportRequest,
-        ImportResult, ImportRuntime, ImportSyntax, PROTOCOL_VERSION,
-        PackageJsonDependencyAnalysisItem,
+        BatchRequest, BatchResponse, CacheCleanupRequest, CacheCleanupResponse, CacheListRequest,
+        CacheListResponse, CacheRemoveRequest, CacheRemoveResponse, CacheRemoveScope,
+        CacheStatusRequest, CacheStatusResponse, CompleteImportMembersRequest,
+        CompleteImportMembersResponse, ConfidenceLevel, DetectedImport, EnumerateExportsRequest,
+        EnumerateExportsResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
+        FileSizeRequest, FileSizeResponse, ImportAnalysisItem, ImportAnalysisStatus,
+        ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ImportRuntime, ImportSyntax,
+        PROTOCOL_VERSION, PackageJsonDependencyAnalysisItem,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
@@ -36,13 +39,27 @@ use std::{
 
 #[derive(Debug)]
 pub struct ImportLensService {
-    cache: ImportCache,
+    cache_registry: ProjectCacheRegistry,
 }
 
 impl ImportLensService {
     pub fn new(storage_path: Option<PathBuf>, enable_disk_cache: bool) -> Self {
+        Self::new_with_cache_policy(storage_path, enable_disk_cache, 512, 30)
+    }
+
+    pub fn new_with_cache_policy(
+        storage_path: Option<PathBuf>,
+        enable_disk_cache: bool,
+        cache_max_size_mb: u64,
+        cache_max_age_days: u64,
+    ) -> Self {
         Self {
-            cache: ImportCache::new(storage_path, enable_disk_cache),
+            cache_registry: ProjectCacheRegistry::new(
+                storage_path,
+                enable_disk_cache,
+                cache_max_size_mb,
+                cache_max_age_days,
+            ),
         }
     }
 
@@ -604,26 +621,165 @@ impl ImportLensService {
         }
     }
 
+    pub fn cache_status(&self, request: CacheStatusRequest) -> CacheStatusResponse {
+        if !is_supported_protocol_version(request.version) {
+            return CacheStatusResponse {
+                version: request.version.min(PROTOCOL_VERSION),
+                request_id: request.request_id,
+                total_size_bytes: 0,
+                project_count: 0,
+                max_size_mb: 0,
+                max_age_days: 0,
+                last_cleanup_millis: None,
+                current_project: None,
+                error: Some(format!("unsupported protocol version {}", request.version)),
+                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+            };
+        }
+
+        let project_root = request.workspace_root.as_deref().map(Path::new);
+        let status = self.cache_registry.status_for_root(project_root);
+
+        CacheStatusResponse {
+            version: request.version,
+            request_id: request.request_id,
+            total_size_bytes: status.total_size_bytes,
+            project_count: status.project_count,
+            max_size_mb: status.max_size_mb,
+            max_age_days: status.max_age_days,
+            last_cleanup_millis: status.last_cleanup_millis,
+            current_project: status.current_project,
+            error: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn cleanup_cache(&self, request: CacheCleanupRequest) -> CacheCleanupResponse {
+        if !is_supported_protocol_version(request.version) {
+            return CacheCleanupResponse {
+                version: request.version.min(PROTOCOL_VERSION),
+                request_id: request.request_id,
+                total_size_bytes: 0,
+                removed: Vec::new(),
+                failed: Vec::new(),
+                error: Some(format!("unsupported protocol version {}", request.version)),
+                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+            };
+        }
+
+        let cleanup = self.cache_registry.cleanup();
+
+        if !cleanup.removed.is_empty() {
+            clear_module_graph_cache();
+        }
+
+        CacheCleanupResponse {
+            version: request.version,
+            request_id: request.request_id,
+            total_size_bytes: cleanup.total_size_bytes,
+            removed: cleanup.removed,
+            failed: cleanup.failed,
+            error: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn list_cache(&self, request: CacheListRequest) -> CacheListResponse {
+        if !is_supported_protocol_version(request.version) {
+            return CacheListResponse {
+                version: request.version.min(PROTOCOL_VERSION),
+                request_id: request.request_id,
+                shards: Vec::new(),
+                error: Some(format!("unsupported protocol version {}", request.version)),
+                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+            };
+        }
+
+        CacheListResponse {
+            version: request.version,
+            request_id: request.request_id,
+            shards: self.cache_registry.list_shards(),
+            error: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn remove_cache(&self, request: CacheRemoveRequest) -> CacheRemoveResponse {
+        if !is_supported_protocol_version(request.version) {
+            return CacheRemoveResponse {
+                version: request.version.min(PROTOCOL_VERSION),
+                request_id: request.request_id,
+                removed: Vec::new(),
+                failed: Vec::new(),
+                error: Some(format!("unsupported protocol version {}", request.version)),
+                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+            };
+        }
+
+        let results = match request.scope {
+            CacheRemoveScope::CurrentProject => match request.workspace_root.as_deref() {
+                Some(project_root) => self
+                    .cache_registry
+                    .remove_current_project(Path::new(project_root)),
+                None => {
+                    return CacheRemoveResponse {
+                        version: request.version,
+                        request_id: request.request_id,
+                        removed: Vec::new(),
+                        failed: Vec::new(),
+                        error: Some(
+                            "workspace_root is required for current_project cache removal"
+                                .to_owned(),
+                        ),
+                        diagnostics: protocol_diagnostics(
+                            "protocol",
+                            "workspace_root is required for current_project cache removal",
+                        ),
+                    };
+                }
+            },
+            CacheRemoveScope::Selected => self
+                .cache_registry
+                .remove_selected(request.shard_ids.as_deref().unwrap_or(&[])),
+            CacheRemoveScope::All => self.cache_registry.remove_all(),
+        };
+        let (removed, failed): (Vec<_>, Vec<_>) =
+            results.into_iter().partition(|result| result.removed);
+
+        if !removed.is_empty() {
+            clear_module_graph_cache();
+        }
+
+        CacheRemoveResponse {
+            version: request.version,
+            request_id: request.request_id,
+            removed,
+            failed,
+            error: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
     pub fn invalidate_package(&self, package_name: &str) {
-        self.cache.invalidate_package(package_name);
+        self.cache_registry.invalidate_package(package_name);
         invalidate_module_graph_cache_for_package(package_name);
     }
 
     pub fn invalidate_all(&self) {
-        self.cache.clear();
+        self.cache_registry.clear_all();
         clear_module_graph_cache();
     }
 
     pub fn cache_len(&self) -> usize {
-        self.cache.memory_len()
+        self.cache_registry.memory_len()
     }
 
-    pub fn recent_cache_keys(&self, limit: usize) -> Vec<String> {
-        self.cache.recent_keys(limit)
+    pub fn recent_cache_keys(&self, workspace_root: &Path, limit: usize) -> Vec<String> {
+        self.cache_registry.recent_keys(workspace_root, limit)
     }
 
     pub fn flush_cache(&self) -> Result<(), String> {
-        self.cache.flush_to_disk()
+        self.cache_registry.flush_to_disk()
     }
 
     pub fn prewarm_import<F>(
@@ -639,8 +795,9 @@ impl ImportLensService {
             Err(_) => return,
         };
         let key = cache_key_for_resolved_import(request, &resolved);
+        let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
-        if self.cache.get(&key).is_some() || !should_continue() {
+        if cache.get(&key).is_some() || !should_continue() {
             return;
         }
 
@@ -648,9 +805,14 @@ impl ImportLensService {
 
         if should_cache_result(&result) && should_continue() {
             let fingerprints = dependency_fingerprints(request, &resolved, &result);
-            self.cache_full_variant_alias(request, &result, &resolved, &fingerprints);
-            self.cache
-                .insert_with_fingerprints(key, result, fingerprints);
+            self.cache_full_variant_alias(
+                cache.as_ref(),
+                request,
+                &result,
+                &resolved,
+                &fingerprints,
+            );
+            cache.insert_with_fingerprints(key, result, fingerprints);
         }
     }
 
@@ -664,8 +826,9 @@ impl ImportLensService {
         F: Fn() -> bool,
     {
         let key = cache_key_for_resolved_import(request, &resolved);
+        let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
-        if self.cache.get(&key).is_some() || !should_continue() {
+        if cache.get(&key).is_some() || !should_continue() {
             return;
         }
 
@@ -673,9 +836,14 @@ impl ImportLensService {
 
         if should_cache_result(&result) && should_continue() {
             let fingerprints = dependency_fingerprints(request, &resolved, &result);
-            self.cache_full_variant_alias(request, &result, &resolved, &fingerprints);
-            self.cache
-                .insert_with_fingerprints(key, result, fingerprints);
+            self.cache_full_variant_alias(
+                cache.as_ref(),
+                request,
+                &result,
+                &resolved,
+                &fingerprints,
+            );
+            cache.insert_with_fingerprints(key, result, fingerprints);
         }
     }
 
@@ -747,8 +915,9 @@ impl ImportLensService {
             Err(_) => return analyze_import(context, request),
         };
         let key = cache_key_for_resolved_import(request, &resolved);
+        let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
-        if let Some(result) = self.cache.get(&key) {
+        if let Some(result) = cache.get(&key) {
             return result;
         }
 
@@ -756,9 +925,14 @@ impl ImportLensService {
 
         if should_cache_result(&result) {
             let fingerprints = dependency_fingerprints(request, &resolved, &result);
-            self.cache_full_variant_alias(request, &result, &resolved, &fingerprints);
-            self.cache
-                .insert_with_fingerprints(key, result.clone(), fingerprints);
+            self.cache_full_variant_alias(
+                cache.as_ref(),
+                request,
+                &result,
+                &resolved,
+                &fingerprints,
+            );
+            cache.insert_with_fingerprints(key, result.clone(), fingerprints);
         }
 
         result
@@ -766,6 +940,7 @@ impl ImportLensService {
 
     fn cache_full_variant_alias(
         &self,
+        cache: &ImportCache,
         request: &ImportRequest,
         result: &ImportResult,
         resolved: &ResolvedPackage,
@@ -787,14 +962,14 @@ impl ImportLensService {
         namespace_request.named.clear();
         let namespace_key = cache_key_for_resolved_import(&namespace_request, resolved);
 
-        if self.cache.get(&namespace_key).is_some() {
+        if cache.get(&namespace_key).is_some() {
             return;
         }
 
         let mut namespace_result = result.clone();
         namespace_result.cache_hit = false;
         namespace_result.truly_treeshakeable = false;
-        self.cache.insert_with_fingerprints(
+        cache.insert_with_fingerprints(
             namespace_key,
             namespace_result,
             dependency_fingerprints.to_vec(),

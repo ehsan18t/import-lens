@@ -12,6 +12,8 @@ const config = (enabled: boolean): ImportLensConfig => ({
   showWarnings: true,
   useCodeLens: false,
   enableDiskCache: true,
+  cacheMaxSizeMB: 512,
+  cacheMaxAgeDays: 30,
   enableRegistryHints: false,
   logLevel: "error",
   budgets: {},

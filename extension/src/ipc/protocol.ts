@@ -1,4 +1,4 @@
-export const protocolVersion = 5;
+export const protocolVersion = 6;
 
 export type ImportKind = "named" | "default" | "namespace" | "dynamic";
 
@@ -224,6 +224,8 @@ export interface HelloMessage {
   workspace_root: string;
   storage_path: string;
   enable_disk_cache: boolean;
+  cache_max_size_mb: number;
+  cache_max_age_days: number;
   log_level: LogLevel;
 }
 
@@ -309,6 +311,94 @@ export interface CompleteImportMembersResponse {
   diagnostics: ImportDiagnostic[];
 }
 
+export interface CacheShardInfo {
+  shard_id: string;
+  project_root: string;
+  normalized_root: string;
+  cache_path: string;
+  size_bytes: number;
+  last_used_millis: number | null;
+  loaded: boolean;
+}
+
+export interface CacheOperationResult {
+  shard_id: string;
+  project_root: string;
+  cache_path: string;
+  removed: boolean;
+  error: string | null;
+}
+
+export interface CacheStatusRequest {
+  type: "cache_status";
+  version: number;
+  request_id: number;
+  workspace_root?: string;
+}
+
+export interface CacheStatusResponse {
+  version: number;
+  request_id: number;
+  total_size_bytes: number;
+  project_count: number;
+  max_size_mb: number;
+  max_age_days: number;
+  last_cleanup_millis: number | null;
+  current_project: CacheShardInfo | null;
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
+export interface CacheCleanupRequest {
+  type: "cache_cleanup";
+  version: number;
+  request_id: number;
+}
+
+export interface CacheCleanupResponse {
+  version: number;
+  request_id: number;
+  total_size_bytes: number;
+  removed: CacheOperationResult[];
+  failed: CacheOperationResult[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
+export interface CacheListRequest {
+  type: "cache_list";
+  version: number;
+  request_id: number;
+}
+
+export interface CacheListResponse {
+  version: number;
+  request_id: number;
+  shards: CacheShardInfo[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
+export type CacheRemoveScope = "current_project" | "selected" | "all";
+
+export interface CacheRemoveRequest {
+  type: "cache_remove";
+  version: number;
+  request_id: number;
+  scope: CacheRemoveScope;
+  workspace_root?: string;
+  shard_ids?: string[];
+}
+
+export interface CacheRemoveResponse {
+  version: number;
+  request_id: number;
+  removed: CacheOperationResult[];
+  failed: CacheOperationResult[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
 export interface ShutdownMessage {
   type: "shutdown";
 }
@@ -327,4 +417,8 @@ export type ClientMessage =
   | FileSizeRequest
   | FileSizeDocumentRequest
   | CompleteImportMembersRequest
+  | CacheStatusRequest
+  | CacheCleanupRequest
+  | CacheListRequest
+  | CacheRemoveRequest
   | ShutdownMessage;

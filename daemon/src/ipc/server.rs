@@ -1,13 +1,16 @@
 use crate::{
+    cache::project::remove_legacy_central_cache,
     ipc::{
         codec::{decode_payload, message_frame_codec, payload_bytes},
         protocol::{
             AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
             AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-            BatchRequest, BatchResponse, ClientMessage, CompleteImportMembersRequest,
-            CompleteImportMembersResponse, EnumerateExportsRequest, EnumerateExportsResponse,
-            FileSizeDocumentRequest, FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse,
-            ImportDiagnostic, PROTOCOL_VERSION,
+            BatchRequest, BatchResponse, CacheCleanupRequest, CacheCleanupResponse,
+            CacheListRequest, CacheListResponse, CacheRemoveRequest, CacheRemoveResponse,
+            CacheRemoveScope, CacheStatusRequest, CacheStatusResponse, ClientMessage,
+            CompleteImportMembersRequest, CompleteImportMembersResponse, EnumerateExportsRequest,
+            EnumerateExportsResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
+            FileSizeRequest, FileSizeResponse, ImportDiagnostic, PROTOCOL_VERSION,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
@@ -97,7 +100,7 @@ where
     let mut framed = Framed::new(stream, message_frame_codec());
     let mut hello_received = false;
     let mut lifecycle = LifecycleState::new();
-    let mut storage_path = storage_path;
+    let lifecycle_storage_path = storage_path;
 
     macro_rules! send_message {
         ($message:expr) => {
@@ -112,7 +115,7 @@ where
                 if recycle_if_needed(
                     &lifecycle,
                     service.cache_len(),
-                    storage_path.as_deref(),
+                    lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
                 ) {
@@ -148,12 +151,41 @@ where
 
                 let hello_storage_path = PathBuf::from(&hello.storage_path);
                 let hello_workspace_root = PathBuf::from(&hello.workspace_root);
-                service = std::sync::Arc::new(ImportLensService::new(
-                    Some(hello_storage_path.clone()),
+                service = std::sync::Arc::new(ImportLensService::new_with_cache_policy(
+                    Some(hello_storage_path),
                     hello.enable_disk_cache,
+                    hello.cache_max_size_mb,
+                    hello.cache_max_age_days,
                 ));
-                storage_path = Some(hello_storage_path);
                 hello_received = true;
+                if let Some(storage_path) = lifecycle_storage_path.as_deref() {
+                    if let Some(result) = remove_legacy_central_cache(storage_path) {
+                        log_legacy_cache_removal(&result);
+                    }
+                }
+                let cleanup = service.cleanup_cache(CacheCleanupRequest {
+                    message_type: "cache_cleanup".to_owned(),
+                    version: PROTOCOL_VERSION,
+                    request_id: 0,
+                });
+                if !cleanup.removed.is_empty() {
+                    logging::log_info(
+                        "cache",
+                        format!(
+                            "startup cache cleanup removed {} shard(s)",
+                            cleanup.removed.len()
+                        ),
+                    );
+                }
+                if !cleanup.failed.is_empty() {
+                    logging::log_warn(
+                        "cache",
+                        format!(
+                            "startup cache cleanup failed for {} shard(s)",
+                            cleanup.failed.len()
+                        ),
+                    );
+                }
                 prefetcher.prewarm_recent_cache_entries(
                     std::sync::Arc::clone(&service),
                     hello_workspace_root,
@@ -162,7 +194,7 @@ where
                 if recycle_if_needed(
                     &lifecycle,
                     service.cache_len(),
-                    storage_path.as_deref(),
+                    lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
                 ) {
@@ -199,7 +231,7 @@ where
                 if recycle_if_needed(
                     &lifecycle,
                     service.cache_len(),
-                    storage_path.as_deref(),
+                    lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
                 ) {
@@ -296,6 +328,65 @@ where
             }
             ClientMessage::CacheInvalidateAll(_) if hello_received => {
                 service.invalidate_all();
+            }
+            ClientMessage::CacheStatus(request) if hello_received => {
+                let response = service.cache_status(request);
+                send_message!(response);
+            }
+            ClientMessage::CacheStatus(request) => {
+                let response = protocol_error_cache_status_response(
+                    &request,
+                    "hello message not received".to_owned(),
+                );
+                send_message!(response);
+            }
+            ClientMessage::CacheCleanup(request) if hello_received => {
+                prefetcher.cancel();
+                let response = service.cleanup_cache(request);
+                send_message!(response);
+            }
+            ClientMessage::CacheCleanup(request) => {
+                let response = protocol_error_cache_cleanup_response(
+                    &request,
+                    "hello message not received".to_owned(),
+                );
+                send_message!(response);
+            }
+            ClientMessage::CacheList(request) if hello_received => {
+                let response = service.list_cache(request);
+                send_message!(response);
+            }
+            ClientMessage::CacheList(request) => {
+                let response = protocol_error_cache_list_response(
+                    &request,
+                    "hello message not received".to_owned(),
+                );
+                send_message!(response);
+            }
+            ClientMessage::CacheRemove(request) if hello_received => {
+                prefetcher.cancel();
+                let remove_legacy_cache = matches!(request.scope, CacheRemoveScope::All);
+                let mut response = service.remove_cache(request);
+                if remove_legacy_cache {
+                    if let Some(storage_path) = lifecycle_storage_path.as_deref() {
+                        if let Some(result) = remove_legacy_central_cache(storage_path) {
+                            log_legacy_cache_removal(&result);
+                            if result.removed {
+                                response.removed.push(result);
+                            } else {
+                                response.failed.push(result);
+                            }
+                        }
+                    }
+                }
+                send_message!(response);
+            }
+            ClientMessage::CacheRemove(request) => {
+                let response = protocol_error_cache_remove_response(
+                    &request,
+                    "hello message not received".to_owned(),
+                );
+                send_message!(response);
             }
             ClientMessage::PrewarmPackageJson(message) if hello_received => {
                 prefetcher.prewarm_package_json(
@@ -550,6 +641,86 @@ fn protocol_error_complete_import_members_response(
         specifier: None,
         exports: Vec::new(),
         imported_names: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn log_legacy_cache_removal(result: &crate::ipc::protocol::CacheOperationResult) {
+    if result.removed {
+        logging::log_info(
+            "cache",
+            format!("removed legacy central cache {}", result.cache_path),
+        );
+        return;
+    }
+
+    if let Some(error) = result.error.as_ref() {
+        logging::log_warn(
+            "cache",
+            format!(
+                "failed to remove legacy central cache {}: {}",
+                result.cache_path, error
+            ),
+        );
+    }
+}
+
+fn protocol_error_cache_status_response(
+    request: &CacheStatusRequest,
+    message: String,
+) -> CacheStatusResponse {
+    CacheStatusResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        total_size_bytes: 0,
+        project_count: 0,
+        max_size_mb: 0,
+        max_age_days: 0,
+        last_cleanup_millis: None,
+        current_project: None,
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn protocol_error_cache_cleanup_response(
+    request: &CacheCleanupRequest,
+    message: String,
+) -> CacheCleanupResponse {
+    CacheCleanupResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        total_size_bytes: 0,
+        removed: Vec::new(),
+        failed: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn protocol_error_cache_list_response(
+    request: &CacheListRequest,
+    message: String,
+) -> CacheListResponse {
+    CacheListResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        shards: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: protocol_diagnostics(message),
+    }
+}
+
+fn protocol_error_cache_remove_response(
+    request: &CacheRemoveRequest,
+    message: String,
+) -> CacheRemoveResponse {
+    CacheRemoveResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        removed: Vec::new(),
+        failed: Vec::new(),
         error: Some(message.clone()),
         diagnostics: protocol_diagnostics(message),
     }

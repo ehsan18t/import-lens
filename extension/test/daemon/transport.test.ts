@@ -9,6 +9,14 @@ import type {
   AnalyzeSpecifiersResponse,
   BatchRequest,
   BatchResponse,
+  CacheCleanupRequest,
+  CacheCleanupResponse,
+  CacheListRequest,
+  CacheListResponse,
+  CacheRemoveRequest,
+  CacheRemoveResponse,
+  CacheStatusRequest,
+  CacheStatusResponse,
   CompleteImportMembersRequest,
   CompleteImportMembersResponse,
   EnumerateExportsRequest,
@@ -159,6 +167,58 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
+  async cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse> {
+    this.calls.push(`cacheStatus:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      total_size_bytes: 2048,
+      project_count: 1,
+      max_size_mb: 512,
+      max_age_days: 30,
+      last_cleanup_millis: null,
+      current_project: null,
+      error: null,
+      diagnostics: [],
+    };
+  }
+
+  async cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse> {
+    this.calls.push(`cleanupCache:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      total_size_bytes: 1024,
+      removed: [],
+      failed: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
+  async listCache(request: CacheListRequest): Promise<CacheListResponse> {
+    this.calls.push(`listCache:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      shards: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
+  async removeCache(request: CacheRemoveRequest): Promise<CacheRemoveResponse> {
+    this.calls.push(`removeCache:${request.request_id}:${request.scope}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      removed: [],
+      failed: [],
+      error: null,
+      diagnostics: [],
+    };
+  }
+
   invalidatePackage(packageName: string): void {
     this.calls.push(`invalidate:${packageName}`);
   }
@@ -242,6 +302,22 @@ class SlowReadyTransport implements AnalysisTransport {
     return null;
   }
 
+  async cacheStatus(): Promise<CacheStatusResponse | null> {
+    return null;
+  }
+
+  async cleanupCache(): Promise<CacheCleanupResponse | null> {
+    return null;
+  }
+
+  async listCache(): Promise<CacheListResponse | null> {
+    return null;
+  }
+
+  async removeCache(): Promise<CacheRemoveResponse | null> {
+    return null;
+  }
+
   invalidatePackage(): void {
     return undefined;
   }
@@ -276,6 +352,10 @@ test("TransportCoordinator selects the first ready transport and delegates reque
   await coordinator.sendBatch(batch(7));
   await coordinator.enumerateExports(exportsRequest(8));
   await coordinator.requestFileSize(fileSizeRequest(9));
+  await coordinator.cacheStatus(cacheStatusRequest(10));
+  await coordinator.cleanupCache(cacheCleanupRequest(11));
+  await coordinator.listCache(cacheListRequest(12));
+  await coordinator.removeCache(cacheRemoveRequest(13));
   coordinator.invalidatePackage("react");
   coordinator.prewarmPackageJson("/workspace/package.json", "/workspace/package.json");
 
@@ -285,6 +365,10 @@ test("TransportCoordinator selects the first ready transport and delegates reque
     "batch:7",
     "exports:8:tiny-lib",
     "fileSize:9",
+    "cacheStatus:10",
+    "cleanupCache:11",
+    "listCache:12",
+    "removeCache:13:current_project",
     "invalidate:react",
     "prewarm:/workspace/package.json",
   ]);
@@ -372,4 +456,31 @@ const fileSizeRequest = (requestId: number): FileSizeRequest => ({
   workspace_root: "/workspace",
   active_document_path: "/workspace/src/app.ts",
   imports: [],
+});
+
+const cacheStatusRequest = (requestId: number): CacheStatusRequest => ({
+  type: "cache_status",
+  version: 6,
+  request_id: requestId,
+  workspace_root: "/workspace",
+});
+
+const cacheCleanupRequest = (requestId: number): CacheCleanupRequest => ({
+  type: "cache_cleanup",
+  version: 6,
+  request_id: requestId,
+});
+
+const cacheListRequest = (requestId: number): CacheListRequest => ({
+  type: "cache_list",
+  version: 6,
+  request_id: requestId,
+});
+
+const cacheRemoveRequest = (requestId: number): CacheRemoveRequest => ({
+  type: "cache_remove",
+  version: 6,
+  request_id: requestId,
+  scope: "current_project",
+  workspace_root: "/workspace",
 });

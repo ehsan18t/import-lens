@@ -246,7 +246,7 @@ fn run_recent_prewarm_job(
     }
 
     let jobs = service
-        .recent_cache_keys(RECENT_PREWARM_LIMIT)
+        .recent_cache_keys(&workspace_root, RECENT_PREWARM_LIMIT)
         .into_iter()
         .filter_map(|key| {
             let identity = decode_cache_identity(&key)?;
