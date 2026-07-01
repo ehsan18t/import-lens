@@ -9,6 +9,7 @@ use crate::{
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -158,6 +159,10 @@ impl DiskCache {
     }
 
     pub fn flush_pending_touches(&self) {
+        let db = match self.db.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
         let pending_touches = match self.pending_touches.lock() {
             Ok(mut pending_touches) => {
                 if pending_touches.is_empty() {
@@ -167,18 +172,12 @@ impl DiskCache {
             }
             Err(_) => return,
         };
-        let db = match self.db.as_ref() {
-            Some(db) => db,
-            None => return,
-        };
 
-        if let Ok(write_txn) = db.begin_write() {
-            if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
-                for (key, timestamp) in pending_touches {
-                    let _ = recents.insert(key.as_str(), timestamp);
-                }
+        if let Err(error) = write_pending_touches(db, &pending_touches) {
+            if let Ok(mut current) = self.pending_touches.lock() {
+                merge_pending_touches(&mut current, pending_touches);
             }
-            let _ = write_txn.commit();
+            cache_warn(format!("failed to flush cache recency touches: {error}"));
         }
     }
 
@@ -207,6 +206,10 @@ impl DiskCache {
     }
 
     pub fn recent_keys(&self, limit: usize) -> Vec<String> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
         self.flush_pending_touches();
 
         let db = match self.db.as_ref() {
@@ -241,8 +244,11 @@ impl DiskCache {
             })
             .collect::<Vec<_>>();
 
-        keys.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-        keys.truncate(limit);
+        if keys.len() > limit {
+            keys.select_nth_unstable_by(limit, compare_recent_keys);
+            keys.truncate(limit);
+        }
+        keys.sort_by(compare_recent_keys);
         keys.into_iter().map(|(key, _)| key).collect()
     }
 
@@ -253,9 +259,9 @@ impl DiskCache {
         };
 
         if let Ok(write_txn) = db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
-                let mut keys_to_remove = Vec::new();
+            let mut keys_to_remove = Vec::new();
 
+            if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
                 if let Ok(iter) = table.iter() {
                     for result in iter {
                         if let Ok((key, _)) = result
@@ -266,15 +272,22 @@ impl DiskCache {
                     }
                 }
 
-                for key in keys_to_remove {
+                for key in &keys_to_remove {
                     let _ = table.remove(key.as_str());
-                    if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
-                        let _ = recents.remove(key.as_str());
-                    }
-                    self.remove_pending_touch(&key);
                 }
             }
+
+            if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
+                for key in &keys_to_remove {
+                    let _ = recents.remove(key.as_str());
+                }
+            }
+
             let _ = write_txn.commit();
+
+            for key in keys_to_remove {
+                self.remove_pending_touch(&key);
+            }
         }
     }
 
@@ -462,6 +475,45 @@ fn unix_millis_now() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+fn write_pending_touches(
+    db: &Database,
+    pending_touches: &HashMap<String, u64>,
+) -> Result<(), String> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|error| format!("failed to begin recency touch write: {error}"))?;
+
+    {
+        let mut recents = write_txn
+            .open_table(RECENTS_TABLE)
+            .map_err(|error| format!("failed to open recents table: {error}"))?;
+        for (key, timestamp) in pending_touches {
+            recents
+                .insert(key.as_str(), *timestamp)
+                .map_err(|error| format!("failed to update recents table: {error}"))?;
+        }
+    }
+
+    write_txn
+        .commit()
+        .map_err(|error| format!("failed to commit recency touch write: {error}"))
+}
+
+fn merge_pending_touches(current: &mut HashMap<String, u64>, restored: HashMap<String, u64>) {
+    for (key, timestamp) in restored {
+        current
+            .entry(key)
+            .and_modify(|current_timestamp| {
+                *current_timestamp = (*current_timestamp).max(timestamp);
+            })
+            .or_insert(timestamp);
+    }
+}
+
+fn compare_recent_keys(left: &(String, u64), right: &(String, u64)) -> Ordering {
+    right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+}
+
 fn cache_envelope(key: &str, cached: CachedImport) -> CacheEnvelope {
     let package_identity = decode_cache_identity(key);
     let mut dependency_fingerprints = cached.dependency_fingerprints.clone();
@@ -510,4 +562,22 @@ fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
 
 fn cache_warn(message: String) {
     crate::logging::log_warn("cache", message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_pending_touches;
+    use std::collections::HashMap;
+
+    #[test]
+    fn merge_pending_touches_preserves_newer_pending_timestamp() {
+        let mut current = HashMap::from([("react".to_owned(), 30), ("vue".to_owned(), 20)]);
+        let restored = HashMap::from([("react".to_owned(), 10), ("svelte".to_owned(), 40)]);
+
+        merge_pending_touches(&mut current, restored);
+
+        assert_eq!(current.get("react"), Some(&30));
+        assert_eq!(current.get("vue"), Some(&20));
+        assert_eq!(current.get("svelte"), Some(&40));
+    }
 }
