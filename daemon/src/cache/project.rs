@@ -14,6 +14,7 @@ use std::{
 const SHARD_METADATA_FILE_NAME: &str = "importlens-project-cache.json";
 const LEGACY_CENTRAL_CACHE_DB_FILE_NAME: &str = "importlens.redb";
 const LEGACY_CENTRAL_CACHE_SHARD_ID: &str = "legacy-central";
+const PROJECT_METADATA_WRITE_INTERVAL_MILLIS: u64 = 60_000;
 
 #[derive(Debug)]
 pub struct ProjectCacheRegistry {
@@ -32,6 +33,7 @@ struct LoadedProjectCache {
     cache_path: PathBuf,
     cache: Arc<ImportCache>,
     last_used_millis: u64,
+    last_metadata_write_millis: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +68,10 @@ impl ProjectCacheRegistry {
         if let Ok(mut loaded) = self.loaded.lock() {
             if let Some(shard) = loaded.get_mut(&shard_id) {
                 shard.last_used_millis = now;
-                self.write_metadata_for_loaded(&shard_id, shard);
+                if should_write_project_metadata(shard.last_metadata_write_millis, now) {
+                    self.write_metadata_for_loaded(&shard_id, shard);
+                    shard.last_metadata_write_millis = now;
+                }
                 return Arc::clone(&shard.cache);
             }
 
@@ -80,6 +85,7 @@ impl ProjectCacheRegistry {
                 cache_path,
                 cache: Arc::clone(&cache),
                 last_used_millis: now,
+                last_metadata_write_millis: now,
             };
             self.write_metadata_for_loaded(&shard_id, &shard);
             loaded.insert(shard_id, shard);
@@ -247,7 +253,7 @@ impl ProjectCacheRegistry {
             if cache_path.as_os_str().is_empty() {
                 continue;
             }
-            ImportCache::new(Some(cache_path), self.enable_disk_cache)
+            ImportCache::new_with_recent_preload_limit(Some(cache_path), self.enable_disk_cache, 0)
                 .invalidate_package(package_name);
         }
     }
@@ -535,6 +541,10 @@ fn push_operation_result(
     } else {
         failed.push(result);
     }
+}
+
+fn should_write_project_metadata(last_write_millis: u64, now_millis: u64) -> bool {
+    now_millis.saturating_sub(last_write_millis) >= PROJECT_METADATA_WRITE_INTERVAL_MILLIS
 }
 
 fn read_metadata(path: &Path) -> Option<ProjectCacheMetadata> {

@@ -1,13 +1,26 @@
 use import_lens_daemon::{
-    cache::project::{
-        ProjectCacheRegistry, normalize_project_root, project_cache_shard_id,
-        remove_legacy_central_cache,
+    cache::{
+        key::fingerprints_for_paths,
+        project::{
+            ProjectCacheRegistry, normalize_project_root, project_cache_shard_id,
+            remove_legacy_central_cache,
+        },
     },
     ipc::protocol::{ConfidenceLevel, ImportResult},
 };
-use std::{fs, path::PathBuf};
+use redb::{Database, ReadableDatabase, TableDefinition};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 
 mod common;
+
+const CACHE_DB_FILE_NAME: &str = "importlens.redb";
+const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
+const SHARD_METADATA_FILE_NAME: &str = "importlens-project-cache.json";
 
 fn result(specifier: &str) -> ImportResult {
     ImportResult {
@@ -79,6 +92,65 @@ fn project_cache_registry_stores_projects_in_separate_shards() {
 }
 
 #[test]
+fn project_cache_registry_throttles_loaded_shard_metadata_writes() {
+    let storage = common::temp_workspace("import-lens-project-cache-metadata-throttle");
+    let project_root = storage.join("app");
+    let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512, 30);
+    let shard_id = project_cache_shard_id(&project_root);
+    let metadata_path = storage.join(&shard_id).join(SHARD_METADATA_FILE_NAME);
+
+    registry.cache_for_root(&project_root);
+    let first_metadata_last_used = metadata_last_used_millis(&metadata_path);
+
+    thread::sleep(Duration::from_millis(20));
+    registry.cache_for_root(&project_root);
+
+    let second_metadata_last_used = metadata_last_used_millis(&metadata_path);
+    let status_last_used = registry
+        .status_for_root(Some(&project_root))
+        .current_project
+        .and_then(|shard| shard.last_used_millis)
+        .expect("loaded project should have last-used metadata");
+
+    assert_eq!(second_metadata_last_used, first_metadata_last_used);
+    assert!(status_last_used > first_metadata_last_used);
+
+    fs::remove_dir_all(storage).expect("temp storage should be removed");
+}
+
+#[test]
+fn project_cache_registry_invalidates_unloaded_shards_without_recent_preload() {
+    let storage = common::temp_workspace("import-lens-project-cache-unloaded-invalidate");
+    let project_root = storage.join("app");
+    let stale_dependency = storage.join("stale-dependency.js");
+    fs::write(&stale_dependency, b"stale fixture")
+        .expect("stale dependency fixture should be written");
+
+    {
+        let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512, 30);
+        let cache = registry.cache_for_root(&project_root);
+        cache.insert_with_fingerprints(
+            "vue@3.4.0::default".to_owned(),
+            result("vue"),
+            fingerprints_for_paths([stale_dependency.clone()]),
+        );
+        cache.insert("react@18.3.1::default".to_owned(), result("react"));
+    }
+
+    fs::remove_file(&stale_dependency).expect("stale dependency fixture should be removed");
+
+    let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512, 30);
+    registry.invalidate_package("react");
+
+    let cache_path = storage.join(project_cache_shard_id(&project_root));
+    let db_path = cache_path.join(CACHE_DB_FILE_NAME);
+    assert!(!disk_cache_entry_exists(&db_path, "react@18.3.1::default"));
+    assert!(disk_cache_entry_exists(&db_path, "vue@3.4.0::default"));
+
+    fs::remove_dir_all(storage).expect("temp storage should be removed");
+}
+
+#[test]
 fn project_cache_registry_removes_current_project_without_removing_other_shards() {
     let storage = common::temp_workspace("import-lens-project-cache-remove");
     let first_root = storage.join("first-app");
@@ -109,6 +181,29 @@ fn project_cache_registry_removes_current_project_without_removing_other_shards(
     );
 
     fs::remove_dir_all(storage).expect("temp storage should be removed");
+}
+
+fn metadata_last_used_millis(path: &Path) -> u64 {
+    let contents = fs::read_to_string(path).expect("project cache metadata should exist");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&contents).expect("project cache metadata should parse");
+    metadata["last_used_millis"]
+        .as_u64()
+        .expect("project cache metadata should include last_used_millis")
+}
+
+fn disk_cache_entry_exists(db_path: &Path, key: &str) -> bool {
+    let db = Database::open(db_path).expect("cache database should open");
+    let read_txn = db
+        .begin_read()
+        .expect("cache read transaction should begin");
+    let table = read_txn
+        .open_table(CACHE_TABLE)
+        .expect("cache table should open");
+    table
+        .get(key)
+        .expect("cache table lookup should succeed")
+        .is_some()
 }
 
 #[test]
