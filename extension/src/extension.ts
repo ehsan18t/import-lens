@@ -17,6 +17,14 @@ import { BudgetDiagnosticsController } from "./ui/budgetDiagnostics.js";
 import { ImportLensCodeLensProvider } from "./ui/codelens.js";
 import { syncCodeLensRegistration } from "./ui/codeLensRegistration.js";
 import { compareImports, compareImportsCommand } from "./ui/compareImports.js";
+import {
+  clearAllCaches,
+  clearAllCachesCommand,
+  clearCurrentProjectCache,
+  clearCurrentProjectCacheCommand,
+  manageCacheCommand,
+  showCacheManager,
+} from "./ui/cacheManager.js";
 import { ImportMemberCompletionProvider } from "./ui/completions.js";
 import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
@@ -183,15 +191,18 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("importLens.showLogs", () => logger.show()),
     vscode.commands.registerCommand("importLens.showCurrentFileSize", () => void showCurrentFileSize(context, daemon!, logger)),
     vscode.commands.registerCommand("importLens.showBundleImpactHistory", () => void showBundleImpactHistory(context)),
-    vscode.commands.registerCommand("importLens.clearCache", () => {
-      logger.info("Clearing ImportLens daemon cache.");
-      daemon?.invalidateAll();
-      const editor = vscode.window.activeTextEditor;
-
-      if (editor) {
-        void analysis.analyze(editor.document);
-      }
-    }),
+    vscode.commands.registerCommand(
+      clearCurrentProjectCacheCommand,
+      () => void clearCurrentProjectCache(daemon!, logger, () => refreshVisibleDocuments(getImportLensConfig(), "reanalyze")),
+    ),
+    vscode.commands.registerCommand(
+      clearAllCachesCommand,
+      () => void clearAllCaches(daemon!, logger, () => refreshVisibleDocuments(getImportLensConfig(), "reanalyze")),
+    ),
+    vscode.commands.registerCommand(
+      manageCacheCommand,
+      () => void showCacheManager(daemon!, logger, () => refreshVisibleDocuments(getImportLensConfig(), "reanalyze")),
+    ),
     vscode.commands.registerCommand("importLens.showReport", () => void showReport(context, daemon!, logger)),
     vscode.commands.registerCommand(compareImportsCommand, (initialSpecifier?: string) => void compareImports(daemon!, logger, initialSpecifier)),
     vscode.commands.registerCommand("importLens.copySubstitutionSuggestion", copySubstitutionSuggestion),

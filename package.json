@@ -35,7 +35,17 @@
     "commands": [
       {
         "command": "importLens.clearCache",
-        "title": "ImportLens: Clear Cache",
+        "title": "ImportLens: Clear Current Project Cache",
+        "category": "ImportLens"
+      },
+      {
+        "command": "importLens.clearAllCaches",
+        "title": "ImportLens: Clear All Caches",
+        "category": "ImportLens"
+      },
+      {
+        "command": "importLens.manageCache",
+        "title": "ImportLens: Manage Cache",
         "category": "ImportLens"
       },
       {
@@ -146,7 +156,19 @@
         "importLens.enableDiskCache": {
           "type": "boolean",
           "default": true,
-          "description": "Persist computed sizes to disk across editor restarts."
+          "markdownDescription": "Persist computed sizes to disk across editor restarts. Use the `ImportLens: Manage Cache` command to inspect or clean cached data."
+        },
+        "importLens.cacheMaxSizeMB": {
+          "type": "number",
+          "default": 512,
+          "minimum": 64,
+          "description": "Maximum disk space in megabytes used by ImportLens project caches before least-recently-used cleanup runs."
+        },
+        "importLens.cacheMaxAgeDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "Maximum age in days for inactive ImportLens project caches before automatic cleanup removes them."
         },
         "importLens.enableRegistryHints": {
           "type": "boolean",
