@@ -37,6 +37,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const NODE_MODULES_BULK_INVALIDATION_LIMIT: usize = 20;
+
 #[derive(Debug)]
 pub struct ImportLensService {
     cache_registry: ProjectCacheRegistry,
@@ -848,6 +850,11 @@ impl ImportLensService {
     }
 
     pub fn invalidate_package_json_paths(&self, package_json_paths: &[String]) -> bool {
+        if package_json_paths.len() > NODE_MODULES_BULK_INVALIDATION_LIMIT {
+            self.invalidate_all();
+            return true;
+        }
+
         let mut invalidated_any = false;
 
         for package_json_path in package_json_paths {

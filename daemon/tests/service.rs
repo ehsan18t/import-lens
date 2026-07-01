@@ -838,6 +838,31 @@ fn service_invalidates_packages_from_node_modules_package_json_paths() {
 }
 
 #[test]
+fn service_bulk_invalidates_all_from_large_node_modules_package_json_bursts() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let _ = service.handle_batch(batch(&workspace, 1));
+    let package_json_paths = (0..21)
+        .map(|index| {
+            workspace
+                .join("node_modules")
+                .join(format!("package-{index}"))
+                .join("package.json")
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    let invalidated = service.invalidate_package_json_paths(&package_json_paths);
+    let after_invalidate = service.handle_batch(batch(&workspace, 2));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(invalidated);
+    assert!(!after_invalidate.imports[0].cache_hit);
+}
+
+#[test]
 fn service_processes_batch_and_serves_second_request_from_cache() {
     let workspace = temp_workspace();
     write_package(&workspace);
