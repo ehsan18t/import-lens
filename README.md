@@ -9,7 +9,7 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 - ⚡ **Instant Feedback:** See post-tree-shake, minified, and compressed (Gzip, Brotli, Zstd) sizes inline.
 - 🌳 **Real Tree-shaking:** Calculates sizes for named, default, namespace, dynamic imports, re-exports, and named export candidates.
 - 🦀 **Rust Daemon Engine:** Built on `oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`, and parallel Rust compression.
-- 💾 **Persistent Caching:** Results are cached in-memory and to disk using `papaya` and `redb`, with startup prewarm for recent entries.
+- 💾 **Persistent Caching:** Results are cached in-memory and to per-project disk shards using `papaya` and `redb`, with startup prewarm for recent entries.
 - 🧩 **Multi-Framework Support:** Native support for JavaScript, TypeScript, JSX/TSX, `.mts`, `.cts`, Svelte (`<script>` blocks), Astro (frontmatter and client scripts), and Vue (`<script>` / `<script setup>` blocks).
 - 🎨 **Flexible UI Options:** Displays colored confidence hints by default, with native accessible Inlay Hints, end-of-line decorations, and CodeLens annotations available.
 - 📈 **Impact Insights:** Shows confidence levels, working-tree import cost deltas, per-import history trends, current-file totals, shared dependency explanations, and barrel re-export warnings.
@@ -58,7 +58,9 @@ ImportLens does not rewrite source files automatically. Actions that suggest nam
 | `ImportLens: Show Bundle Impact History` | Opens a script-free SVG history panel from recent current-file measurements in VS Code global storage. |
 | `ImportLens: Show Report` | Scans the workspace and opens a report of imports sorted by Brotli size, with duplicate imports, shared modules, budget counts, and an SVG treemap. |
 | `ImportLens: Compare Imports` | Compares comma-separated package imports from the active workspace and lists them by Brotli size. |
-| `ImportLens: Clear Cache` | Clears daemon memory and disk cache, then reanalyzes the active document. |
+| `ImportLens: Manage Cache` | Opens cache status, cleanup, and per-project cache removal actions. |
+| `ImportLens: Clear Current Project Cache` | Clears only the cache shard for the active project, then reanalyzes visible documents. |
+| `ImportLens: Clear All Caches` | Clears every ImportLens project cache shard, then reanalyzes visible documents. |
 | `ImportLens: Show Logs` | Opens the ImportLens output channel. |
 
 ## Configuration
@@ -73,6 +75,8 @@ ImportLens is highly customizable to fit your workflow. You can tweak these sett
 | `importLens.budgets` | Optional budget object with `perImportBrotliBytes` and `perFileBrotliBytes` thresholds. |
 | `importLens.enableRegistryHints` | Enable short-timeout npm metadata hints in package.json dependency surfaces (`true` by default). |
 | `importLens.enableDiskCache` | Enable persistent caching to disk (`true` by default). |
+| `importLens.cacheMaxSizeMB` | Maximum total disk space in MB for ImportLens project cache shards before least-recently-used cleanup (`512` by default). |
+| `importLens.cacheMaxAgeDays` | Maximum inactive age in days for project cache shards before cleanup removes them (`30` by default). |
 | `importLens.useCodeLens` | Show sizes as a CodeLens above the import instead of inline (`false` by default). |
 | `importLens.showWarnings` | Show warning indicators when a package cannot be efficiently tree-shaken. |
 | `importLens.logLevel` | Controls output-channel verbosity: `error`, `warn`, `info`, or `debug` (`info` by default). |

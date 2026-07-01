@@ -118,7 +118,7 @@ At a high level, ImportLens:
 5. Receives computed size data (raw, minified, and compressed) for each import
 6. Renders the size inline in the editor as confidence-styled inline hints by default, native accessible inlay hints, end-of-line decorations, or code lens annotations
 7. Adds contextual insights such as Git working-tree deltas, per-import history trends, shared-byte explanations, and barrel re-export warnings
-8. Provides commands for current-file totals, bundle impact history, workspace reports, diagnostic copying, and cache clearing
+8. Provides commands for current-file totals, bundle impact history, workspace reports, diagnostic copying, and cache management
 9. Provides CodeActions for non-tree-shakeable imports, including named-export candidate enumeration for namespace imports
 10. Caches all results so subsequent lookups are instantaneous
 
@@ -215,7 +215,7 @@ A WebAssembly daemon fallback may be added in v1.1 or later using the existing a
 3. If found, it verifies the binary's SHA-256 hash against the known-good hash embedded in the extension package (NFR-014a). If the hash does not match, the extension logs a security warning and enters degraded mode.
 4. If the hash matches, it spawns the daemon process, pipes daemon stdout/stderr into the ImportLens output channel according to the configured log level, opens a socket connection, and sends a versioned `HelloMessage`. The socket path includes a window-unique identifier (NFR-014b).
 5. If no native binary is found, or if the binary cannot be verified, spawned, connected, or sent a hello message, the extension disposes any partial IPC client state, terminates the spawned daemon process when it is still alive, and enters the restart/degraded-mode path defined in FR-015.
-6. The daemon opens its persistent `redb` cache from the VS Code global storage directory, verifies the schema version (FR-026a), and preloads only a bounded set of recent valid size entries into the in-memory `papaya` cache.
+6. The daemon opens the persistent `redb` cache shard for the active project from the extension-managed VS Code workspace storage cache base, verifies the schema version (FR-026a), and preloads only a bounded set of recent valid size entries into the in-memory `papaya` cache. The daemon must never create cache folders inside the user's project tree.
 7. The extension is ready to accept requests.
 
 ### 3.4 Request Lifecycle
@@ -356,7 +356,7 @@ The extension must retain the detected import syntax category (`static`, `reexpo
 
 **FR-013b** (High) - Protocol v2+ clients may request streaming batch responses by setting `BatchRequest.streaming: true`. In streaming mode, the daemon must emit partial `BatchResponse` frames as import results become available and set `BatchResponse.indexes` to the zero-based import indexes represented by that frame. The IPC server must write each partial frame to the socket while the rest of the batch is still computing; it must not buffer all partials in memory and flush them only after the final result is ready. This index list is required because duplicate specifiers can appear multiple times in one file. A final full-batch `BatchResponse` with shared-byte annotations must still be emitted for compatibility with existing request-state handling. Protocol v1 clients and v2+ clients without `streaming: true` receive only a full batch response.
 
-**FR-013c** (High) - Protocol v5 clients may request streaming `package.json` dependency analysis by setting `AnalyzePackageJsonRequest.streaming: true`. In streaming mode, the daemon must emit an initial partial `AnalyzePackageJsonResponse` with `indexes` covering every dependency entry and `status: "loading"` for dependencies whose installed package version was resolved but whose size is still computing. Dependencies that cannot be resolved may be emitted as `status: "missing"` in the same initial partial. As each package size result becomes available, the daemon must emit an indexed partial response for that dependency. The final `AnalyzePackageJsonResponse` must omit `indexes` and contain complete size states, including shared-byte annotations where applicable. The extension host must merge indexed partials without overwriting newer extension-side registry hints.
+**FR-013c** (High) - Protocol v5 and newer clients may request streaming `package.json` dependency analysis by setting `AnalyzePackageJsonRequest.streaming: true`. In streaming mode, the daemon must emit an initial partial `AnalyzePackageJsonResponse` with `indexes` covering every dependency entry and `status: "loading"` for dependencies whose installed package version was resolved but whose size is still computing. Dependencies that cannot be resolved may be emitted as `status: "missing"` in the same initial partial. As each package size result becomes available, the daemon must emit an indexed partial response for that dependency. The final `AnalyzePackageJsonResponse` must omit `indexes` and contain complete size states, including shared-byte annotations where applicable. The extension host must merge indexed partials without overwriting newer extension-side registry hints.
 
 **FR-014** (High) - On socket disconnect, the extension must discard any stale MessagePack payloads currently in the receive buffer and wait for the next document change event to trigger a fresh request cycle.
 
@@ -412,11 +412,11 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. Cache keys must use the structured v3 identity format described in Section 10.2, including analyzer version, package identity, runtime profile, import kind, sorted named exports, resolved package paths when known, and relevant file fingerprints. Valid cache hits must be returned without running any computation.
 
-**FR-026** (Critical) - When `importLens.enableDiskCache` is `true` (the default), the daemon must persist computed cache entries to a `redb` database stored in the VS Code global storage directory. On startup, the daemon must preload only the configured bounded recent-entry set into `papaya`; other valid disk entries remain available through lazy disk lookup and are promoted into memory on first hit.
+**FR-026** (Critical) - When `importLens.enableDiskCache` is `true` (the default), the daemon must persist computed cache entries to `redb` databases under an extension-owned cache base. VS Code Desktop must prefer the workspace-specific `ExtensionContext.storageUri` cache base and fall back to `globalStorageUri/workspace-cache` only when workspace storage is unavailable. The daemon must create one stable project shard per normalized analysis root under that cache base, so multi-root windows and loose-file projects do not share one growing database. The extension and daemon must not create cache folders inside the user's project tree. On startup or first project use, the daemon must preload only the configured bounded recent-entry set into the matching project's `papaya` cache; other valid disk entries remain available through lazy disk lookup and are promoted into memory on first hit. During upgrade from the previous centralized-cache design, the daemon must remove the legacy central `globalStorageUri/importlens.redb` file when present.
 
 **FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer. The current schema version is `4`. On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration and protocol-result shape changes).
 
-**FR-026b** (Medium) - The daemon must track recent cache usage in persistent metadata so that startup can prewarm the most useful entries. Each successful disk insert must update the recent-entry timestamp for the corresponding cache key. Disk and memory hits may batch or debounce recency updates to avoid synchronous redb writes on every hot memory hit, but pending recency updates must be flushed during normal shutdown/drop. On handshake completion, the daemon must prewarm up to the 20 most recent valid entries after resolving them from the active workspace dependency tree.
+**FR-026b** (Medium) - The daemon must track recent cache usage in persistent per-project metadata so that startup can prewarm the most useful entries for the active project shard. Each successful disk insert must update the recent-entry timestamp for the corresponding cache key. Disk and memory hits may batch or debounce recency updates to avoid synchronous redb writes on every hot memory hit, but pending recency updates must be flushed during normal shutdown/drop. On handshake completion, the daemon must prewarm up to the 20 most recent valid entries from the active project shard after resolving them from the active workspace dependency tree.
 
 **FR-027** (High) - The TypeScript extension host must watch `node_modules` for package version changes using VS Code's native `vscode.workspace.createFileSystemWatcher` API with two glob patterns: `**/node_modules/*/package.json` for regular packages and `**/node_modules/@*/*/package.json` for scoped packages (e.g. `@babel/core`). Both watchers must be registered at activation and both must send `CacheInvalidate` messages to the daemon when they fire. The `notify` Rust crate must not be used for this purpose. On Linux, a Rust process watching `node_modules` directly would register one `inotify` file descriptor per directory, which on kernels before 5.11 could rapidly exhaust the system-wide `inotify` limit (`fs.inotify.max_user_watches`, which defaulted to 8,192 prior to kernel 5.11). Since kernel 5.11 (February 2021), the default is dynamically scaled based on available memory (up to 1,048,576 on 64-bit systems with >=128 GB RAM), but the old default persists on older kernels and in constrained containers. Regardless of kernel version, VS Code's file watcher already manages file descriptor budgets safely for all extensions combined, making it the correct abstraction. When the watcher fires for a given package, the extension host must send a `CacheInvalidate` message over the existing IPC socket to the daemon. On receiving this message, the daemon must evict all cache entries for that package from both `papaya` and `redb`. When an entire `node_modules` directory is deleted or more than 20 packages are invalidated in a single burst, the extension host must send a single `CacheInvalidateAll` message instead of individual per-package messages. See Section 10.1 for the `CacheInvalidateAllMessage` schema.
 
@@ -452,7 +452,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-034** (High) - Changing the `importLens.compression` setting must immediately update all currently visible inline decorations to reflect the new format selection without requiring a file change or editor reload.
 
-**FR-035** (Medium) - The extension must provide a command `ImportLens: Clear Cache` that evicts all entries from both `papaya` and `redb` and triggers a fresh computation for the active document.
+**FR-035** (Medium) - The extension must provide cache management commands. `ImportLens: Clear Current Project Cache` must remove only the cache shard for the active project's analysis root, `ImportLens: Clear All Caches` must remove every ImportLens project cache shard and any leftover legacy central cache file, and `ImportLens: Manage Cache` must show a Quick Pick UI with cache status, cleanup, current-project removal, all-cache removal, and per-project inspection/removal actions. Destructive actions must ask for confirmation and trigger a fresh computation for visible documents after successful removal.
 
 **FR-036** (Medium) - The extension must provide a command `ImportLens: Show Report` that opens a webview panel listing all imports in the workspace along with their sizes, sorted by brotli size descending. The report must include workspace summary metrics, duplicate import aggregation, duplicate/vendored module insights, a static SVG treemap sized by Brotli bytes, confidence legend colors, and a static shared-module table so users can quickly identify dominant dependencies without running scripts in the webview.
 
@@ -500,6 +500,8 @@ The virtual entry must never use `console.log` or any pattern that can be static
 | `importLens.showWarnings`    | boolean | `true`      | Show warning indicator for non-tree-shakeable imports                                                    |
 | `importLens.useCodeLens`     | boolean | `false`     | Use code lens above the line instead of end-of-line decorations                                          |
 | `importLens.enableDiskCache` | boolean | `true`      | Persist computed sizes to disk via redb across editor restarts                                           |
+| `importLens.cacheMaxSizeMB`  | number  | `512`       | Maximum total disk space for ImportLens project cache shards before least-recently-used cleanup          |
+| `importLens.cacheMaxAgeDays` | number  | `30`        | Maximum inactive age for project cache shards before cleanup removes them                                |
 | `importLens.budgets`         | object  | `{}`        | Optional per-import and per-file Brotli thresholds for diagnostics and CLI checks                         |
 | `importLens.enableRegistryHints` | boolean | `true`   | Enable short-timeout npm metadata hints cached in globalState and session memory                         |
 | `importLens.logLevel`        | enum    | `info`      | Logging verbosity for the ImportLens output channel. Options: `error`, `warn`, `info`, `debug`           |
@@ -605,7 +607,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 **NFR-012** (Critical) - The daemon must operate exclusively via static AST analysis and is prohibited from executing any code found within third-party packages. No subprocess execution, `eval`, dynamic loading, or script interpretation of package contents is permitted under any circumstance.
 
-**NFR-013** (Critical) - The daemon must operate with read-only access limited to `node_modules` packages discovered by walking upward from the active document path. It must not use the first VS Code workspace folder as a hard read boundary, because multi-root windows and nested package workspaces can place the active document in a different dependency tree. The daemon must not write any files other than its own cache database in the VS Code global storage directory.
+**NFR-013** (Critical) - The daemon must operate with read-only access limited to `node_modules` packages discovered by walking upward from the active document path. It must not use the first VS Code workspace folder as a hard read boundary, because multi-root windows and nested package workspaces can place the active document in a different dependency tree. The daemon must not write any files into the user's project tree. It may write only its own lifecycle files under VS Code global storage and cache shards under VS Code workspace storage or the configured global fallback cache base.
 
 **NFR-014** (High) - The IPC socket or named pipe must be created with permissions that restrict access to the current user only (mode `0600` on Unix systems). On Unix targets, the daemon must remove the socket file on normal shutdown or lifecycle recycle.
 
@@ -623,7 +625,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 ### 7.6 Extensibility
 
-**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v5 is the current native protocol and adds daemon-first document, package.json, package.json streaming partials, raw specifier, current-file size, named-export completion, and node_modules change endpoints on top of v4 confidence metadata, v3 runtime-aware imports, v2 streaming batch responses, export enumeration, file-level shared sizing, module breakdowns, and per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse`, v2 request, v3 request, and v4 request compatibility must be preserved where the missing fields have safe defaults.
+**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v6 is the current native protocol and adds cache policy fields plus cache status, cleanup, list, and remove endpoints on top of v5 daemon-first document, package.json, package.json streaming partials, raw specifier, current-file size, named-export completion, and node_modules change endpoints; v4 confidence metadata; v3 runtime-aware imports; and v2 streaming batch responses, export enumeration, file-level shared sizing, module breakdowns, and per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse`, v2 request, v3 request, v4 request, and v5 request compatibility must be preserved where the missing fields have safe defaults.
 
 ---
 
@@ -767,7 +769,7 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 
 ```typescript
 interface BatchRequest {
-  version: number;              // Protocol version, currently 5
+  version: number;              // Protocol version, currently 6
   request_id: number;           // Monotonic counter incremented per debounce cycle.
                                 // The daemon echoes this value in BatchResponse.
                                 // The extension host discards responses whose
@@ -851,12 +853,12 @@ type PackageJsonDependencySectionName =
 
 interface AnalyzePackageJsonRequest {
   type: "analyze_package_json";
-  version: number;              // Protocol version, currently 5
+  version: number;              // Protocol version, currently 6
   request_id: number;
   workspace_root: string;
   active_document_path: string;
   source: string;
-  streaming?: boolean;          // Protocol v5; request indexed package.json partial responses.
+  streaming?: boolean;          // Protocol v5+; request indexed package.json partial responses.
   include_registry_hints?: boolean; // Compatibility field; daemon must not perform live registry fetches.
   force_registry_refresh?: boolean; // Compatibility field; manual refresh is extension-host owned.
   refresh_section?: "dependencies" | "devDependencies" | "peerDependencies" | "optionalDependencies";
@@ -914,10 +916,12 @@ Sent by the extension host immediately after opening the socket connection. The 
 ```typescript
 interface HelloMessage {
   type: "hello";
-  version: number;              // Protocol version, currently 5
+  version: number;              // Protocol version, currently 6
   workspace_root: string;       // Absolute path to the active analysis root.
-  storage_path: string;         // Absolute VS Code globalStoragePath for cache and lifecycle files
+  storage_path: string;         // Absolute extension-owned cache base; daemon creates project shards below it
   enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
+  cache_max_size_mb: number;    // From importLens.cacheMaxSizeMB
+  cache_max_age_days: number;   // From importLens.cacheMaxAgeDays
   log_level: "error" | "warn" | "info" | "debug";
 }
 ```
@@ -1011,6 +1015,98 @@ interface FileSizeResponse {
 }
 ```
 
+#### Cache Management Requests / Responses
+
+Used by `ImportLens: Manage Cache`, `ImportLens: Clear Current Project Cache`, and `ImportLens: Clear All Caches`. Cache management requests are protocol v6+ and require a successful hello first.
+
+```typescript
+interface CacheShardInfo {
+  shard_id: string;
+  project_root: string;
+  normalized_root: string;
+  cache_path: string;
+  size_bytes: number;
+  last_used_millis: number | null;
+  loaded: boolean;
+}
+
+interface CacheOperationResult {
+  shard_id: string;
+  project_root: string;
+  cache_path: string;
+  removed: boolean;
+  error: string | null;
+}
+
+interface CacheStatusRequest {
+  type: "cache_status";
+  version: number;
+  request_id: number;
+  workspace_root?: string;
+}
+
+interface CacheStatusResponse {
+  version: number;
+  request_id: number;
+  total_size_bytes: number;
+  project_count: number;
+  max_size_mb: number;
+  max_age_days: number;
+  last_cleanup_millis: number | null;
+  current_project: CacheShardInfo | null;
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
+interface CacheCleanupRequest {
+  type: "cache_cleanup";
+  version: number;
+  request_id: number;
+}
+
+interface CacheCleanupResponse {
+  version: number;
+  request_id: number;
+  total_size_bytes: number;
+  removed: CacheOperationResult[];
+  failed: CacheOperationResult[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
+interface CacheListRequest {
+  type: "cache_list";
+  version: number;
+  request_id: number;
+}
+
+interface CacheListResponse {
+  version: number;
+  request_id: number;
+  shards: CacheShardInfo[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
+interface CacheRemoveRequest {
+  type: "cache_remove";
+  version: number;
+  request_id: number;
+  scope: "current_project" | "selected" | "all";
+  workspace_root?: string;
+  shard_ids?: string[];
+}
+
+interface CacheRemoveResponse {
+  version: number;
+  request_id: number;
+  removed: CacheOperationResult[];
+  failed: CacheOperationResult[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+```
+
 #### ShutdownMessage
 
 Sent by the extension host on extension deactivation. The daemon must flush caches and exit. See FR-038.
@@ -1094,10 +1190,11 @@ Extension activates
         |
         ├─ Read <globalStoragePath>/importlens-recycles.json (NFR-004b)
         │   └─ If recycle rate exceeds threshold: enter degraded mode immediately
-        ├─ Open redb database at <globalStoragePath>/importlens.redb
+        ├─ Remove legacy central cache at <globalStoragePath>/importlens.redb when present
+        ├─ Open redb database shard at <workspaceStorage>/daemon-cache/<project-shard>/importlens.redb
         │   └─ If corrupted: delete, create fresh, log warning
-        ├─ Preload at most the configured recent valid entries into papaya
-        ├─ Serve other disk entries lazily and promote them into memory on hit
+        ├─ Preload at most the configured recent valid entries into papaya for the active project shard
+        ├─ Serve other active-shard disk entries lazily and promote them into memory on hit
         ├─ Begin listening on socket / named pipe
         └─ After hello, prewarm up to 20 recent valid cache entries
 ```
@@ -1287,6 +1384,8 @@ The daemon may keep parsed module graphs in a side in-memory cache keyed by cano
 
 ### 11.1 Persistent Cache Schema (redb)
 
+Each project cache shard is a directory under the extension-owned cache base. The shard directory name is a stable `v1-<hash>` identifier derived from the normalized analysis root. Each shard contains one `redb` database and a small JSON metadata file recording `shard_id`, `project_root`, `normalized_root`, and `last_used_millis`. The metadata file powers cache management UI and least-recently-used cleanup without opening every database.
+
 The `redb` database schema version is `4` and contains these tables:
 
 | Table name      | Key type                                      | Value type                                       |
@@ -1295,7 +1394,7 @@ The `redb` database schema version is `4` and contains these tables:
 | `size_cache`    | `&str` (cache key as defined in Section 10.2) | `&[u8]` (MessagePack-encoded cache envelope)     |
 | `cache_recents` | `&str` (cache key as defined in Section 10.2) | `u64` (last-used Unix timestamp in milliseconds) |
 
-`size_cache` values persist an internal cache envelope containing the public `ImportResult`, analyzer version, package identity, dependency fingerprints, and full contribution list needed for accurate shared-byte accounting. The daemon normalizes `cache_hit` to `false` before writing and sets it to `true` when serving a memory or disk hit. `cache_recents` is updated on insert and through batched/debounced hit touches, and is used to select up to 20 recent entries for bounded startup preload and best-effort prewarm after hello.
+`size_cache` values persist an internal cache envelope containing the public `ImportResult`, analyzer version, package identity, dependency fingerprints, and full contribution list needed for accurate shared-byte accounting. The daemon normalizes `cache_hit` to `false` before writing and sets it to `true` when serving a memory or disk hit. `cache_recents` is updated on insert and through batched/debounced hit touches, and is used to select up to 20 recent entries for bounded startup preload and best-effort prewarm after hello for the active project shard.
 
 ### 11.2 Extension Global Storage
 
@@ -1388,10 +1487,15 @@ strip = true
 ### 13.3 Assumptions
 
 - Users have npm, yarn, or pnpm with hoisting installed and have run a package install command. The extension does not install packages itself.
-- The VS Code global storage path is writable. If it is not, the persistent cache is skipped gracefully and all results are held in memory for the duration of the session.
+- VS Code extension storage is writable. If workspace storage is unavailable, ImportLens falls back to its global cache base; if neither cache base is writable, the persistent cache is skipped gracefully and all results are held in memory for the duration of the session.
 - Packages shipping only CommonJS are analyzed statically where possible. Literal relative `require()` graphs and common export forms produce better approximations, but dynamic or unsupported CJS still falls back conservatively. The extension will display a `CJS` indicator next to the size for these packages.
 - The extension assumes `node_modules` is fully installed. It will not trigger or assist with package installation.
 - The user's environment is VS Code Desktop for full functionality. VS Code for the Web provides degraded mode only.
+
+### 13.4 Future Feature Plan
+
+- **Dedicated cache management view:** The v1 implementation uses VS Code commands and Quick Pick flows for cache status, cleanup, current-project removal, all-cache removal, and selected project removal. A future richer view may replace or supplement this with an ImportLens-owned webview or tree view showing project name, root path, cache size, last used time, loaded state, and actions per row. The view should be more task-focused than a generic settings glob-list editor: it should make the common decisions obvious, avoid raw path editing, keep destructive actions behind confirmation, and still store cache data only in extension-owned storage.
+- **Status bar icon menu:** Replace the current text-first status item behavior with an icon-led ImportLens status entry similar in density to the Copilot status item. The icon should be a simple monochrome vector asset, square `16x16` viewBox, transparent background, `currentColor`/theme-tint friendly, no gradients, shadows, bitmap embeds, or detailed text, and legible in light, dark, and high-contrast themes. If VS Code product-icon contribution is used, expose a stable icon id such as `importlens-logo` and render the status text with that icon plus short state text. Clicking the icon must open an ImportLens action menu instead of jumping directly to logs. The menu should include at least Manage Cache, Show Logs, Show Report, Compare Imports, Toggle Display Mode, and Enable/Disable ImportLens, with logs kept as one explicit option rather than the default click destination.
 
 ---
 
@@ -1427,7 +1531,7 @@ import-lens/
 │   │   │   ├── packageJsonState.ts    # package.json dependency analysis state types
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
-│   │   │   ├── protocol.ts            # Protocol v5 IPC types
+│   │   │   ├── protocol.ts            # Protocol v6 IPC types
 │   │   │   ├── requestIds.ts          # shared monotonic IPC request ID generator
 │   │   │   └── codec.ts               # MessagePack encode/decode
 │   │   ├── daemon/
@@ -1448,6 +1552,9 @@ import-lens/
 │   │   ├── watcher.ts                 # vscode.workspace.createFileSystemWatcher; sends CacheInvalidate IPC messages
 │   │   ├── ui/
 │   │   │   ├── currentFileSize.ts     # current-file total and bundle impact history commands
+│   │   │   ├── cacheManager.ts        # cache management Quick Pick commands
+│   │   │   ├── cacheManagerItems.ts   # cache management item/label builders
+│   │   │   ├── cacheManagerRequests.ts # cache management IPC request builders
 │   │   │   ├── decorations.ts         # End-of-line text decorations
 │   │   │   ├── inlayHints.ts          # InlayHintsProvider for inlayHint display mode
 │   │   │   ├── codelens.ts            # Code lens provider
@@ -1486,7 +1593,7 @@ import-lens/
 │       │   ├── mod.rs
 │       │   ├── codec.rs               # MessagePack length-prefix codec
 │       │   ├── server.rs              # Unix socket / named pipe listener
-│       │   └── protocol.rs            # Protocol v5 serde types
+│       │   └── protocol.rs            # Protocol v6 serde types
 │       ├── pipeline/
 │       │   ├── mod.rs
 │       │   ├── resolver.rs            # oxc_resolver usage
@@ -1501,7 +1608,8 @@ import-lens/
 │       │   ├── mod.rs
 │       │   ├── key.rs                 # Cache key formatting
 │       │   ├── memory.rs              # papaya HashMap (pinning API)
-│       │   └── disk.rs                # redb read/write
+│       │   ├── disk.rs                # redb read/write
+│       │   └── project.rs             # per-project cache shard registry and cleanup
 │       ├── lifecycle.rs                # Graceful shutdown, self-recycle (NFR-004a), recycle counter write (NFR-004b)
 │       └── prefetch.rs                # Background pre-warm logic
 │
