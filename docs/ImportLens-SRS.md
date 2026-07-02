@@ -416,11 +416,11 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer. The current schema version is `4`. On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration and protocol-result shape changes).
 
-**FR-026b** (Medium) - The daemon must track recent cache usage in persistent per-project metadata so that startup can prewarm the most useful entries for the active project shard. Each successful disk insert must update the recent-entry timestamp for the corresponding cache key. Disk and memory hits may batch or debounce recency updates to avoid synchronous redb writes on every hot memory hit, but pending recency updates must be flushed during normal shutdown/drop. On handshake completion, the daemon must prewarm up to the 20 most recent valid entries from the active project shard after resolving them from the active workspace dependency tree.
+**FR-026b** (Medium) - The daemon must track recent cache usage in each project shard's `cache_recents` table so that startup can preload and prewarm the most useful entries for the active project shard. Each successful disk insert must update the recent-entry timestamp for the corresponding cache key. Disk and memory hits may batch or debounce recency updates to avoid synchronous redb writes on every hot memory hit, but failed pending-recency flushes must be logged and requeued so touches are not silently dropped. Pending recency updates must be flushed during normal shutdown/drop without forcing a full memory-to-disk rewrite because computed entries are inserted write-through. On handshake completion, the daemon must prewarm up to the 20 most recent valid entries from the active project shard after resolving them from the active workspace dependency tree.
 
-**FR-027** (High) - The TypeScript extension host must watch `node_modules` for package version changes using VS Code's native `vscode.workspace.createFileSystemWatcher` API with two glob patterns: `**/node_modules/*/package.json` for regular packages and `**/node_modules/@*/*/package.json` for scoped packages (e.g. `@babel/core`). Both watchers must be registered at activation and both must send `CacheInvalidate` messages to the daemon when they fire. The `notify` Rust crate must not be used for this purpose. On Linux, a Rust process watching `node_modules` directly would register one `inotify` file descriptor per directory, which on kernels before 5.11 could rapidly exhaust the system-wide `inotify` limit (`fs.inotify.max_user_watches`, which defaulted to 8,192 prior to kernel 5.11). Since kernel 5.11 (February 2021), the default is dynamically scaled based on available memory (up to 1,048,576 on 64-bit systems with >=128 GB RAM), but the old default persists on older kernels and in constrained containers. Regardless of kernel version, VS Code's file watcher already manages file descriptor budgets safely for all extensions combined, making it the correct abstraction. When the watcher fires for a given package, the extension host must send a `CacheInvalidate` message over the existing IPC socket to the daemon. On receiving this message, the daemon must evict all cache entries for that package from both `papaya` and `redb`. When an entire `node_modules` directory is deleted or more than 20 packages are invalidated in a single burst, the extension host must send a single `CacheInvalidateAll` message instead of individual per-package messages. See Section 10.1 for the `CacheInvalidateAllMessage` schema.
+**FR-027** (High) - The TypeScript extension host must watch `node_modules` for package version changes using VS Code's native `vscode.workspace.createFileSystemWatcher` API with two glob patterns: `**/node_modules/*/package.json` for regular packages and `**/node_modules/@*/*/package.json` for scoped packages (e.g. `@babel/core`). Both watchers must be registered at activation and disposed on extension deactivation. The `notify` Rust crate must not be used for this purpose. On Linux, a Rust process watching `node_modules` directly would register one `inotify` file descriptor per directory, which on kernels before 5.11 could rapidly exhaust the system-wide `inotify` limit (`fs.inotify.max_user_watches`, which defaulted to 8,192 prior to kernel 5.11). Since kernel 5.11 (February 2021), the default is dynamically scaled based on available memory (up to 1,048,576 on 64-bit systems with >=128 GB RAM), but the old default persists on older kernels and in constrained containers. Regardless of kernel version, VS Code's file watcher already manages file descriptor budgets safely for all extensions combined, making it the correct abstraction. Watcher events must be debounced into bursts. Empty bursts must be ignored. For 1 through 20 changed `package.json` paths in one burst, the extension host must send a single `NodeModulesChanged` message containing the changed paths; the daemon then resolves package names from those paths and evicts matching cache entries from both `papaya` and `redb`. For entire `node_modules` deletion/replacement, malformed package paths, or more than 20 changed packages in one burst, the extension host or daemon must use `CacheInvalidateAll` semantics and evict all entries from both cache tiers. See Section 10.1 for the `NodeModulesChangedMessage` and `CacheInvalidateAllMessage` schemas.
 
-**FR-028** (Medium) - When a user opens or saves a `package.json` file in the workspace, the daemon must pre-calculate and cache the sizes of the default export and the namespace export (`*`) for each dependency listed in that file's `dependencies` and `devDependencies` objects. These two export variants are the most common and cover the majority of real-world import patterns. Pre-warm tasks must run on a dedicated secondary Rayon thread pool configured with half the threads of the primary pool, so that the primary pool remains fully available for real user requests. Because Rayon does not expose OS-level thread priority, reduced pool size is the correct mechanism for deprioritisation. Pre-warm work must stop immediately when a real `BatchRequest` arrives or when the prefetcher is dropped during shutdown/recycle, and must reuse already-resolved package entries rather than resolving the same package twice.
+**FR-028** (Medium) - When a user opens or saves a `package.json` file in the workspace, the daemon must pre-calculate and cache the sizes of the default export and the namespace export (`*`) for each dependency listed in that file's `dependencies` and `devDependencies` objects. These two export variants are the most common and cover the majority of real-world import patterns. Pre-warm tasks must run on a dedicated secondary Rayon thread pool configured with half the threads of the primary pool, so that the primary pool remains fully available for real user requests. Because Rayon does not expose OS-level thread priority, reduced pool size is the correct mechanism for deprioritisation. Pre-warm work must stop immediately when foreground analysis or cache-mutating work arrives, including batch, document, package.json, raw-specifier, export-enumeration, file-size, completion, invalidation, cleanup, removal, shutdown, and recycle paths. Prewarm must reuse already-resolved package entries rather than resolving the same package twice.
 
 ### 5.6 User Interface
 
@@ -510,10 +510,11 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-038** (High) - On extension deactivation (or VS Code window close), the extension host must send a `Shutdown` message over the IPC socket. On receiving this message, the daemon must:
 1. Stop accepting new requests.
-2. Flush all pending `papaya` entries to `redb`.
-3. Close the `redb` database.
-4. Remove the Unix socket file (macOS/Linux) or release the named pipe (Windows).
-5. Exit the process cleanly within 5 seconds.
+2. Cancel active prewarm work.
+3. Flush pending recency touches to `redb` without performing a full `papaya`-to-`redb` rewrite.
+4. Close/drop the `redb` database handles.
+5. Remove the Unix socket file (macOS/Linux) or release the named pipe (Windows).
+6. Exit the process cleanly within 5 seconds.
 
 If the daemon closes the IPC socket cleanly before the 5-second timeout elapses, the extension host must treat that as a successful exit and skip the escalation sequence below. If the daemon does not exit within 5 seconds of the `Shutdown` message, the extension host must send `SIGTERM` (Unix) or call `TerminateProcess` (Windows) to request termination. If the daemon still has not exited after an additional 2 seconds following the `SIGTERM`, the extension host must send `SIGKILL` (Unix) to forcefully terminate it. (`SIGTERM` can be caught or ignored by the process; `SIGKILL` cannot.) On Windows, `TerminateProcess` is already unconditional and no second step is needed.
 
@@ -553,7 +554,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 | Unsupported `HelloMessage.version`                                  | Log the unsupported version on the daemon side, close the connection without accepting subsequent requests from that socket, and rely on the extension host startup/connection recovery path.                                                                               |
 | Blocking analysis worker panic or join failure                      | Do not panic the Tokio IPC server. Return a protocol diagnostic response for the affected request when the request shape allows it, and keep the daemon process alive for future requests.                                                                                  |
 | node_modules folder deleted while extension is running              | The file watcher must detect the deletion. The extension host must send a `CacheInvalidateAll` message (see Section 10.1). The daemon must evict all entries from both `papaya` and `redb`. The extension host must update all affected decorations to "Package not found". |
-| redb database corrupted on startup                                  | Log the corruption, delete the corrupted database file, and create a fresh empty database. Continue operation using only the in-memory cache for the current session.                                                                                                       |
+| redb database corrupted on startup                                  | Log the corruption, delete the corrupted database file, and create a fresh empty database with the current schema. Continue with disk cache enabled when the fresh database can be created; otherwise skip only the persistent tier and keep the in-memory cache for the current session. |
 | Requested named export missing from a package                       | Return a normal `ImportResult` when partial sizing can continue, include a `missing_export` diagnostic naming the export, and keep the raw diagnostic details in hover-copy output rather than inline UI.                                                                   |
 | Namespace import needs conservative fallback                        | Return the best available static size, include an OXC fallback diagnostic, and keep successful imports from the same batch intact.                                                                                                                                          |
 | Package entry file exceeds module graph source limit (20 MiB)       | Skip module graph analysis, use static entry sizing, mark the result as low confidence with a leading `~` on the inline size label, and expose an `oversized_entry` diagnostic in hover/report/copy output.                                                                  |
@@ -949,6 +950,17 @@ interface CacheInvalidateAllMessage {
 }
 ```
 
+#### NodeModulesChangedMessage
+
+Sent by the extension host for debounced watcher bursts containing 1 through 20 concrete `node_modules/**/package.json` paths. The daemon must derive package names from the paths and evict those packages. If the path set is larger than 20 or contains a path that cannot be mapped to a package name, the daemon must treat the message as `CacheInvalidateAll`.
+
+```typescript
+interface NodeModulesChangedMessage {
+  type: "node_modules_changed";
+  package_json_paths: string[];
+}
+```
+
 #### PrewarmPackageJsonMessage
 
 Sent by the extension host when a workspace `package.json` is opened or saved.
@@ -1109,7 +1121,7 @@ interface CacheRemoveResponse {
 
 #### ShutdownMessage
 
-Sent by the extension host on extension deactivation. The daemon must flush caches and exit. See FR-038.
+Sent by the extension host on extension deactivation. The daemon must cancel prewarm work, flush pending recency touches, and exit. See FR-038.
 
 ```typescript
 interface ShutdownMessage {
@@ -1128,6 +1140,8 @@ v3:<hex-msgpack-cache-identity>
 The identity payload contains `analyzer_version`, `specifier`, root `package_name`, `package_version`, optional canonical `package_root`, optional canonical `entry_path`, `runtime`, `import_kind`, sorted/deduplicated `named_exports`, and manifest/entry fingerprints when available. Sorting named exports ensures import order does not create duplicate entries. Namespace, default, and dynamic imports are distinguished by `import_kind`, so a named export literally called `"dynamic"` cannot collide with dynamic-import analysis.
 
 The `specifier` field in `ImportRequest` must carry the full subpath (e.g. `"date-fns/format"`) so the daemon can resolve the correct entry point via `oxc_resolver`. The `package` field carries the root package name only (e.g. `"date-fns"`) for `node_modules` lookup purposes. The `version` field is read from the root package's `package.json` regardless of subpath, since subpaths do not have independent versions.
+
+Malformed or versionless manifest fallback results must not be persisted to `papaya` or `redb` yet. Those results use package-directory approximation and are intentionally uncached until ImportLens has a cheap directory-wide freshness fingerprint or package file index that can prove the approximate fallback is still current.
 
 ### 10.3 Virtual Entry Module
 
@@ -1384,7 +1398,7 @@ The daemon may keep parsed module graphs in a side in-memory cache keyed by cano
 
 ### 11.1 Persistent Cache Schema (redb)
 
-Each project cache shard is a directory under the extension-owned cache base. The shard directory name is a stable `v1-<hash>` identifier derived from the normalized analysis root. Each shard contains one `redb` database and a small JSON metadata file recording `shard_id`, `project_root`, `normalized_root`, and `last_used_millis`. The metadata file powers cache management UI and least-recently-used cleanup without opening every database.
+Each project cache shard is a directory under the extension-owned cache base. The shard directory name is a stable `v1-<hash>` identifier derived from the normalized analysis root. Each shard contains one `redb` database and a small JSON metadata file recording `shard_id`, `project_root`, `normalized_root`, and `last_used_millis`. The metadata file powers cache management UI and least-recently-used cleanup without opening every database. Loaded shards must update `last_used_millis` in memory on each access, but JSON metadata writes may be throttled to avoid repeated filesystem writes during parallel import batches.
 
 The `redb` database schema version is `4` and contains these tables:
 

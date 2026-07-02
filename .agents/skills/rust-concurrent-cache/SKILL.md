@@ -5,133 +5,121 @@ description: "Two-tier caching architecture using papaya (lock-free pin) and red
 
 # Instructions
 
-The project uses a strict two-tier caching strategy to avoid re-parsing massive `node_modules` ASTs.
+The daemon uses a two-tier cache for import size results:
+
+- memory tier: `papaya::HashMap`
+- persistent tier: per-project `redb` v4 database shards
+
+Computed cache entries are write-through: successful cacheable results are inserted into `redb` and `papaya` on the hot path. Shutdown only needs to flush pending recency touches, not rewrite the whole memory tier to disk.
 
 ## 1. Cache Key Format
 
-Cache keys MUST follow this exact string format for both stores:
-`<package>@<version>::<export1>,<export2>,...<exportN>`
+Cache keys for both tiers use the structured v3 identity format:
 
-- The exports string MUST be sorted lexicographically before joining.
-- A default import is keyed as `default`.
-- A namespace import is keyed as `*`.
-- A dynamic import is keyed as `dynamic`.
-
-Examples:
-
-```
-lodash-es@4.17.21::debounce,throttle
-lodash-es@4.17.21::*
-react@18.3.1::default
-date-fns@3.6.0::dynamic
-@babel/core@7.24.0::default
-@tanstack/react-query@5.28.0::useMutation,useQuery
+```text
+v3:<hex-msgpack-cache-identity>
 ```
 
-## 2. Memory Tier: `papaya` (v0.2.4)
+The MessagePack payload is `CacheIdentityV3` and includes:
 
-`papaya` is lock-free, avoiding the deadlocks present in `dashmap`. It requires a pinning API for memory reclamation.
+- `analyzer_version`
+- full import `specifier`
+- root `package_name`
+- `package_version`
+- optional canonical `package_root`
+- optional canonical `entry_path`
+- `runtime`
+- `import_kind`
+- sorted and deduplicated `named_exports`
+- manifest and entry fingerprints when available
+
+Do not reintroduce the legacy `<package>@<version>::exports` key format. It collides across runtime, import kind, subpath, resolver output, and file freshness dimensions.
+
+## 2. Memory Tier: papaya
+
+Use `papaya::HashMap<String, CachedImport>` for the memory tier. Pin before iterating, reading, inserting, or removing.
 
 ```rust
-use papaya::HashMap;
-
-let map = HashMap::new();
-
-// You MUST pin the thread context to perform lookups or insertions
-let pin = map.pin();
-
-if let Some(val) = map.get(&key, &pin) {
-    return val;
-} else {
-    map.insert(key, computed_val, &pin);
+let memory = self.memory.pin();
+if let Some(cached) = memory.get(key) {
+    return Some(cached.clone());
 }
+memory.insert(key.to_owned(), cached);
 ```
 
-## 3. Persistent Tier: `redb` (v4.0.0)
+Do not use `dashmap` for daemon cache state. `dashmap` can deadlock when references are held across nested operations; this workload is read-heavy and fits papaya's pinning model.
 
-> [!IMPORTANT]
-> The SRS pins `redb` at v4.0.0 (`^4`), NOT v3.x. Do not use `redb` v3.
+## 3. Persistent Tier: redb v4
 
-If `enable_disk_cache` is true, results are flushed to disk using `redb`. `redb` provides a stable ACID architecture without a C FFI requirement (unlike SQLite).
+Each project gets a stable cache shard directory under the extension-owned cache base. The shard id is derived from the normalized analysis root, so multi-root workspaces and loose files do not share one growing database.
+
+Each shard contains:
+
+- `importlens.redb`
+- `importlens-project-cache.json`
+
+The JSON metadata records `shard_id`, `project_root`, `normalized_root`, and `last_used_millis` for cache management and LRU cleanup. Loaded shards update `last_used_millis` in memory on every access, but JSON writes should be throttled to avoid repeated filesystem writes during parallel import batches.
+
+## 4. redb Schema Versioning
+
+The current redb schema version is `4`.
+
+Tables:
 
 ```rust
-use redb::{Database, TableDefinition};
-
+const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
-const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
+const RECENTS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_recents");
 ```
 
-## 4. Schema Versioning (FR-026a) — CRITICAL
+- `metadata["schema_version"]` stores `4`.
+- `size_cache` maps v3 cache keys to MessagePack cache envelopes.
+- `cache_recents` maps v3 cache keys to last-used Unix milliseconds.
 
-The `redb` database MUST include a metadata table with a `schema_version` integer (initially `1`).
+On open, read `schema_version` before loading entries. If the value is missing or mismatched, delete the database file, create a fresh database with schema version `4`, and log a warning. If the file is corrupted, use the same recreate path; if recreation fails, skip only the persistent tier and continue in memory.
 
-On startup, the daemon must:
+## 5. Stored Value Shape
 
-1. Open the database.
-2. Read `schema_version` from the metadata table.
-3. If the key is missing or the value does not match the current daemon's expected version, **delete the database file and create a fresh empty database**.
-4. Log a warning when a migration wipe occurs.
+`size_cache` values are MessagePack cache envelopes containing:
 
-```rust
-const EXPECTED_SCHEMA_VERSION: u64 = 1;
+- analyzer version
+- public `ImportResult`
+- decoded package identity when available
+- dependency fingerprints
+- full module contributions for shared-byte accounting
 
-fn open_or_create_db(path: &Path) -> Database {
-    match Database::open(path) {
-        Ok(db) => {
-            let rtx = db.begin_read().unwrap();
-            let table = rtx.open_table(META_TABLE);
-            match table {
-                Ok(t) => {
-                    if let Some(v) = t.get("schema_version").ok().flatten() {
-                        let version: u64 = rmp_serde::from_slice(v.value()).unwrap_or(0);
-                        if version == EXPECTED_SCHEMA_VERSION {
-                            return db;
-                        }
-                    }
-                    // Schema mismatch — wipe and recreate
-                    drop(rtx);
-                    drop(db);
-                    std::fs::remove_file(path).ok();
-                }
-                Err(_) => {
-                    drop(rtx);
-                    drop(db);
-                    std::fs::remove_file(path).ok();
-                }
-            }
-        }
-        Err(_) => {
-            // Corrupted or incompatible — delete
-            std::fs::remove_file(path).ok();
-        }
-    }
-    create_fresh_db(path)
-}
-```
+Normalize `cache_hit` to `false` before writing. Set `cache_hit` to `true` only when serving a memory or disk hit.
 
-## 5. CachedResult Schema
+## 6. Recency
 
-The value stored in both `papaya` and `redb` must be a MessagePack-encoded struct:
+Every disk insert updates `cache_recents` immediately. Memory and disk hits may batch recency touches in memory to avoid a redb write on every hot cache hit.
 
-```rust
-#[derive(Serialize, Deserialize)]
-struct CachedResult {
-    raw_bytes: u64,
-    minified_bytes: u64,
-    gzip_bytes: u64,
-    brotli_bytes: u64,
-    zstd_bytes: u64,
-    side_effects: bool,
-    truly_treeshakeable: bool,
-    is_cjs: bool,
-    computed_at: u64,        // Unix timestamp in seconds
-}
-```
+Rules:
+
+- Flush pending recency touches on drop and graceful shutdown.
+- A failed pending-touch flush must log and requeue the touches.
+- Recent-key selection should avoid sorting every row when only the top N keys are needed.
+- Opening disk-only shards for package invalidation must use recent preload limit `0`.
+
+## 7. Invalidation
+
+`CacheInvalidate` invalidates one package across all loaded project shards and disk-only shards. Remove matching keys from both `papaya` and `redb`.
+
+`NodeModulesChanged` carries 1 through 20 changed `node_modules/**/package.json` paths. Derive package names from the paths and invalidate those packages. If the message contains more than 20 paths or any path cannot be mapped to a package, call `invalidate_all`.
+
+`CacheInvalidateAll` clears all project shards and the module graph cache.
+
+For disk-only shard invalidation, avoid recent-entry preload and avoid opening the recents table once per removed key.
+
+## 8. Cacheability
+
+Only cache successful results that are stable for the cache identity. Results with request-specific export diagnostics are not cacheable.
+
+Malformed or versionless manifest fallback results are intentionally not cached. They use approximate directory sizing and cannot be cheaply proven fresh until the daemon has a directory-wide fingerprint or package file index.
 
 ## Rules
 
-- **Do not** use `dashmap` or `sled`. They are explicitly forbidden (§9.4.4).
-- **Do not** use `num_cpus`. It is banned. Use `std::thread::available_parallelism()`.
-- On `CacheInvalidate` IPC, you must clear entries belonging to that specific package from BOTH `papaya` and `redb`.
-- Suppress OS permission errors gracefully: if the VS Code global storage directory is inaccessible, the daemon skips `redb` and runs solely on `papaya`.
-- The self-recycle threshold for `papaya` is **200,000 entries** (NFR-004a). See the `rust-daemon-lifecycle` skill.
+- Do not use `dashmap`, `sled`, or `num_cpus`.
+- Use `std::thread::available_parallelism()` for thread counts.
+- Keep cache folders under extension-owned storage, never inside the user's project tree.
+- Keep schema, key format, and SRS updates together when cache persistence changes.

@@ -32,6 +32,18 @@ fn write_package(workspace: &Path) {
         .expect("entry should be written");
 }
 
+fn write_versionless_package(workspace: &Path) {
+    let package_root = workspace.join("node_modules").join("versionless-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"module":"index.js","sideEffects":false}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(package_root.join("index.js"), "export const value = 1;")
+        .expect("entry should be written");
+}
+
 fn active_document_path(workspace: &Path) -> String {
     workspace
         .join("src")
@@ -1059,6 +1071,30 @@ fn service_revalidates_cache_when_transitive_package_dependency_changes() {
     assert!(!first.imports[0].cache_hit);
     assert!(!second.imports[0].cache_hit);
     assert_ne!(first.imports[0].raw_bytes, second.imports[0].raw_bytes);
+}
+
+#[test]
+fn service_does_not_cache_manifest_fallback_results() {
+    let workspace = temp_workspace();
+    write_versionless_package(&workspace);
+    let service = ImportLensService::new(None, false);
+    let request = package_batch(&workspace, 1, "versionless-lib", "value");
+    let mut second_request = request.clone();
+    second_request.request_id = 2;
+
+    let first = service.handle_batch(request);
+    let second = service.handle_batch(second_request);
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(!first.imports[0].cache_hit);
+    assert!(!second.imports[0].cache_hit);
+    assert!(
+        first.imports[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "manifest_fallback"),
+        "{first:?}",
+    );
 }
 
 #[test]
