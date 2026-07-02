@@ -1624,6 +1624,8 @@ import-lens/
 │   │   │   ├── packageJsonAnalysis.ts # daemon-backed package.json dependency analysis controller
 │   │   │   ├── packageJsonPartial.ts  # indexed package.json partial merge helpers
 │   │   │   ├── packageJsonState.ts    # package.json dependency analysis state types
+│   │   │   ├── registryRefresh.ts     # daemon registry refresh orchestration and stale-hint state
+│   │   │   └── substitutions.ts       # curated import substitution suggestion mapping (FR-036k)
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
 │   │   │   ├── protocol.ts            # Protocol v7 IPC types
@@ -1702,6 +1704,19 @@ import-lens/
 │       │   ├── memory.rs              # papaya HashMap (pinning API)
 │       │   ├── disk.rs                # redb read/write
 │       │   └── project.rs             # per-project cache shard registry and cleanup
+│       ├── registry/
+│       │   ├── mod.rs
+│       │   ├── constants.rs           # registry TTL, timeout, retry, and concurrency constants
+│       │   ├── types.rs               # normalized npm package metadata and cache entry types
+│       │   ├── client.rs              # bounded ureq npm registry HTTP client
+│       │   ├── cache.rs               # persistent JSON package metadata cache (atomic writes)
+│       │   ├── service.rs             # refresh modes, single-flight de-dup, retry, stale fallback
+│       │   └── executor.rs            # dedicated registry refresh worker pool
+│       ├── report/
+│       │   ├── mod.rs
+│       │   ├── executor.rs            # bounded workspace report worker pool
+│       │   ├── scanner.rs             # symlink-safe workspace source scanner
+│       │   └── model.rs               # report rows, summary counts, duplicate groups, treemap
 │       ├── lifecycle.rs                # Graceful shutdown, self-recycle (NFR-004a), recycle counter write (NFR-004b)
 │       └── prefetch.rs                # Background pre-warm logic
 │
