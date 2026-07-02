@@ -5,6 +5,10 @@
   "version": "0.1.0",
   "publisher": "importlens",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ehsan18t/import-lens.git"
+  },
   "icon": "media/icon.png",
   "private": true,
   "type": "module",
