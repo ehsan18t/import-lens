@@ -28,6 +28,8 @@ import type {
   FileSizeResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
+  WorkspaceReportRequest,
+  WorkspaceReportResponse,
 } from "./protocol.js";
 import type { Logger } from "../logging/types.js";
 import { FrameDecoder, encodeFrame } from "./codec.js";
@@ -78,6 +80,7 @@ export class IpcClient extends EventEmitter {
   readonly #cacheListPending = new Map<number, PendingRequest<CacheListResponse>>();
   readonly #cacheRemovePending = new Map<number, PendingRequest<CacheRemoveResponse>>();
   readonly #registryHintRefreshPending = new Map<number, PendingRegistryHintRefreshRequest>();
+  readonly #workspaceReportPending = new Map<number, PendingRequest<WorkspaceReportResponse>>();
   readonly #logger?: Pick<Logger, "debug" | "warn">;
   #closed = false;
   #disposed = false;
@@ -313,6 +316,13 @@ export class IpcClient extends EventEmitter {
     return this.#requestWithPending(this.#cacheRemovePending, request, timeoutMs);
   }
 
+  requestWorkspaceReport(
+    request: WorkspaceReportRequest,
+    timeoutMs = 60000,
+  ): Promise<WorkspaceReportResponse> {
+    return this.#requestWithPending(this.#workspaceReportPending, request, timeoutMs);
+  }
+
   #requestWithPending<TRequest extends { request_id: number }, TResponse>(
     pendingMap: Map<number, PendingRequest<TResponse>>,
     request: TRequest & ClientMessage,
@@ -435,6 +445,11 @@ export class IpcClient extends EventEmitter {
         continue;
       }
 
+      if (isWorkspaceReportResponse(message)) {
+        this.#resolvePending(this.#workspaceReportPending, message);
+        continue;
+      }
+
       if (isAnalyzeDocumentResponse(message)) {
         if (this.#resolvePending(this.#documentPending, message)) {
           continue;
@@ -546,6 +561,11 @@ export class IpcClient extends EventEmitter {
     }
     this.#registryHintRefreshPending.clear();
 
+    for (const pending of this.#workspaceReportPending.values()) {
+      pending.reject(error);
+    }
+    this.#workspaceReportPending.clear();
+
     this.#batchPending.clear();
     this.#documentPending.clear();
     this.#packageJsonPending.clear();
@@ -610,6 +630,23 @@ const isRefreshRegistryHintsResponse = (value: unknown): value is RefreshRegistr
 
 const isRegistryHintRefreshPartial = (response: RefreshRegistryHintsResponse): boolean =>
   Array.isArray(response.indexes) && response.indexes.length > 0;
+
+const isWorkspaceReportResponse = (value: unknown): value is WorkspaceReportResponse => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<WorkspaceReportResponse>;
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    Array.isArray(candidate.rows) &&
+    !!candidate.summary &&
+    typeof candidate.summary === "object" &&
+    (candidate.error === null || typeof candidate.error === "string") &&
+    Array.isArray(candidate.diagnostics)
+  );
+};
 
 const isAnalyzeDocumentResponse = (value: unknown): value is AnalyzeDocumentResponse => {
   if (!value || typeof value !== "object") {

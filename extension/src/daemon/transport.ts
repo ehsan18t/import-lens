@@ -25,6 +25,8 @@ import type {
   FileSizeResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
+  WorkspaceReportRequest,
+  WorkspaceReportResponse,
 } from "../ipc/protocol.js";
 
 import type { Logger } from "../logging/types.js";
@@ -55,6 +57,7 @@ export interface AnalysisTransport {
     request: RefreshRegistryHintsRequest,
     onPartial?: (response: RefreshRegistryHintsResponse) => void,
   ): Promise<RefreshRegistryHintsResponse | null>;
+  requestWorkspaceReport(request: WorkspaceReportRequest): Promise<WorkspaceReportResponse | null>;
   invalidatePackage(packageName: string): void;
   invalidateAll(): void;
   nodeModulesChanged(packageJsonPaths: readonly string[]): void;
@@ -185,6 +188,10 @@ export class TransportCoordinator implements AnalysisTransport {
     onPartial?: (response: RefreshRegistryHintsResponse) => void,
   ): Promise<RefreshRegistryHintsResponse | null> {
     return this.#activeTransport?.refreshRegistryHints(request, onPartial) ?? Promise.resolve(null);
+  }
+
+  requestWorkspaceReport(request: WorkspaceReportRequest): Promise<WorkspaceReportResponse | null> {
+    return this.#activeTransport?.requestWorkspaceReport(request) ?? Promise.resolve(null);
   }
 
   invalidatePackage(packageName: string): void {

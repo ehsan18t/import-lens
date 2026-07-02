@@ -330,6 +330,102 @@ pub struct RefreshRegistryHintsResponse {
     pub diagnostics: Vec<ImportDiagnostic>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceReportBudgets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_import_brotli_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_file_brotli_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReportRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "workspace_report_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub workspace_root: String,
+    #[serde(default)]
+    pub budgets: WorkspaceReportBudgets,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceReportRow {
+    pub package_name: String,
+    pub specifier: String,
+    pub source_file: String,
+    pub line: u32,
+    pub runtime: String,
+    pub minified_bytes: u64,
+    pub gzip_bytes: u64,
+    pub brotli_bytes: u64,
+    pub zstd_bytes: u64,
+    pub shared_bytes: u64,
+    pub confidence: String,
+    pub confidence_reasons: String,
+    pub top_modules: String,
+    pub warning: String,
+    pub module_contributions: Vec<ModuleContribution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceReportTreemapItem {
+    pub package_name: String,
+    pub specifier: String,
+    pub source_file: String,
+    pub brotli_bytes: u64,
+    pub percentage: u64,
+    pub confidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateImportGroup {
+    pub specifier: String,
+    pub count: u64,
+    pub total_brotli_bytes: u64,
+    pub source_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateModuleGroup {
+    pub module_path: String,
+    pub basename: String,
+    pub count: u64,
+    pub total_bytes: u64,
+    pub specifiers: Vec<String>,
+    pub vendored: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceReportSummary {
+    pub import_count: u64,
+    pub total_brotli_bytes: u64,
+    pub low_confidence_count: u64,
+    pub medium_confidence_count: u64,
+    pub conservative_count: u64,
+    pub budget_violation_count: u64,
+    pub duplicate_imports: Vec<DuplicateImportGroup>,
+    pub shared_modules: Vec<DuplicateModuleGroup>,
+    pub treemap: Vec<WorkspaceReportTreemapItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReportResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub rows: Vec<WorkspaceReportRow>,
+    pub summary: WorkspaceReportSummary,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalyzePackageJsonRequest {
     #[serde(rename = "type")]
@@ -630,6 +726,7 @@ pub enum ClientMessage {
     CacheList(CacheListRequest),
     CacheRemove(CacheRemoveRequest),
     RefreshRegistryHints(RefreshRegistryHintsRequest),
+    WorkspaceReport(WorkspaceReportRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -660,6 +757,7 @@ enum TypedClientMessage {
     CacheList(CacheListRequest),
     CacheRemove(CacheRemoveRequest),
     RefreshRegistryHints(RefreshRegistryHintsRequest),
+    WorkspaceReport(WorkspaceReportRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -717,6 +815,7 @@ impl From<TypedClientMessage> for ClientMessage {
             TypedClientMessage::RefreshRegistryHints(message) => {
                 Self::RefreshRegistryHints(message)
             }
+            TypedClientMessage::WorkspaceReport(message) => Self::WorkspaceReport(message),
             TypedClientMessage::Shutdown(message) => Self::Shutdown(message),
         }
     }
@@ -813,4 +912,8 @@ fn shutdown_message_type() -> String {
 
 fn refresh_registry_hints_message_type() -> String {
     "refresh_registry_hints".to_owned()
+}
+
+fn workspace_report_message_type() -> String {
+    "workspace_report".to_owned()
 }

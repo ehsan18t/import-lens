@@ -434,6 +434,83 @@ export interface ShutdownMessage {
   type: "shutdown";
 }
 
+export interface WorkspaceReportRequest {
+  type: "workspace_report";
+  version: number;
+  request_id: number;
+  workspace_root: string;
+  budgets?: WorkspaceReportBudgets;
+}
+
+export interface WorkspaceReportBudgets {
+  perImportBrotliBytes?: number;
+  perFileBrotliBytes?: number;
+}
+
+export interface WorkspaceReportRow {
+  packageName: string;
+  specifier: string;
+  sourceFile: string;
+  line: number;
+  runtime: string;
+  minifiedBytes: number;
+  gzipBytes: number;
+  brotliBytes: number;
+  zstdBytes: number;
+  sharedBytes: number;
+  confidence: ConfidenceLevel | "unknown";
+  confidenceReasons: string;
+  topModules: string;
+  warning: string;
+  moduleContributions: ModuleContribution[];
+}
+
+export interface WorkspaceReportTreemapItem {
+  packageName: string;
+  specifier: string;
+  sourceFile: string;
+  brotliBytes: number;
+  percentage: number;
+  confidence: ConfidenceLevel | "unknown";
+}
+
+export interface DuplicateImportGroup {
+  specifier: string;
+  count: number;
+  totalBrotliBytes: number;
+  sourceFiles: string[];
+}
+
+export interface DuplicateModuleGroup {
+  modulePath: string;
+  basename: string;
+  count: number;
+  totalBytes: number;
+  specifiers: string[];
+  vendored: boolean;
+}
+
+export interface WorkspaceReportSummary {
+  importCount: number;
+  totalBrotliBytes: number;
+  lowConfidenceCount: number;
+  mediumConfidenceCount: number;
+  conservativeCount: number;
+  budgetViolationCount: number;
+  duplicateImports: DuplicateImportGroup[];
+  sharedModules: DuplicateModuleGroup[];
+  treemap: WorkspaceReportTreemapItem[];
+}
+
+export interface WorkspaceReportResponse {
+  version: number;
+  request_id: number;
+  rows: WorkspaceReportRow[];
+  summary: WorkspaceReportSummary;
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
 export type ClientMessage =
   | HelloMessage
   | AnalyzeDocumentRequest
@@ -453,4 +530,5 @@ export type ClientMessage =
   | CacheCleanupRequest
   | CacheListRequest
   | CacheRemoveRequest
+  | WorkspaceReportRequest
   | ShutdownMessage;

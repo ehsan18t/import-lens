@@ -1,9 +1,9 @@
 import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
+import { protocolVersion, type WorkspaceReportSummary } from "../ipc/protocol.js";
+import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { Logger } from "../logging/types.js";
-import { buildReportRows, buildReportSummary } from "../report/reportModel.js";
-import { buildWorkspaceReportItems, type WorkspaceScannerApi } from "../report/workspaceScanner.js";
 import { confidenceCssColor, confidenceVisualFor } from "./confidenceVisuals.js";
 import { formatBytes } from "./format.js";
 
@@ -20,25 +20,34 @@ export const showReport = async (
     return;
   }
 
-  let items;
-
-  try {
-    items = await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: "ImportLens: Building workspace report",
-      },
-      () => buildWorkspaceReportItems(workspaceScannerApi(), daemon),
-    );
-  } catch (error) {
-    logger.warn(`Workspace report failed: ${error instanceof Error ? error.message : String(error)}`);
-    throw error;
+  if (!workspaceRoot) {
+    await vscode.window.showWarningMessage("ImportLens report requires an open workspace folder.");
+    return;
   }
 
-  logger.info(`Workspace report built with ${items.length} import item(s).`);
   const config = getImportLensConfig();
-  const reportRows = buildReportRows(items, config.budgets);
-  const summary = buildReportSummary(reportRows);
+  const response = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "ImportLens: Building workspace report",
+    },
+    () => daemon.requestWorkspaceReport({
+      type: "workspace_report",
+      version: protocolVersion,
+      request_id: nextIpcRequestId(),
+      workspace_root: workspaceRoot,
+      budgets: config.budgets,
+    }),
+  );
+
+  if (!response || response.error) {
+    await vscode.window.showWarningMessage(`ImportLens report unavailable${response?.error ? `: ${response.error}` : "."}`);
+    return;
+  }
+
+  logger.info(`Workspace report built with ${response.rows.length} import item(s).`);
+  const reportRows = response.rows;
+  const summary = response.summary;
   const panel = vscode.window.createWebviewPanel("importLensReport", "ImportLens Report", vscode.ViewColumn.Beside, {
     enableScripts: false,
   });
@@ -136,12 +145,6 @@ th{font-weight:600}
   context.subscriptions.push(panel);
 };
 
-const workspaceScannerApi = (): WorkspaceScannerApi => ({
-  findFiles: async (include, exclude) => vscode.workspace.findFiles(include, exclude),
-  openTextDocument: async (uri) => vscode.workspace.openTextDocument(uri as vscode.Uri),
-  getWorkspaceFolder: (uri) => vscode.workspace.getWorkspaceFolder(uri as vscode.Uri),
-});
-
 const escapeHtml = (value: string): string =>
   value
     .replaceAll("&", "&amp;")
@@ -150,7 +153,7 @@ const escapeHtml = (value: string): string =>
     .replaceAll('"', "&quot;");
 
 const svgTreemap = (
-  items: ReturnType<typeof buildReportSummary>["treemap"],
+  items: WorkspaceReportSummary["treemap"],
 ): string => {
   if (items.length === 0) {
     return "";

@@ -21,6 +21,7 @@ use crate::{
         ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ImportRuntime, ImportSyntax,
         PROTOCOL_VERSION, PackageJsonDependencyAnalysisItem,
         RegistryHintMode as ProtocolRegistryHintMode, RegistryHintResult, RegistryHintTarget,
+        WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
@@ -46,6 +47,7 @@ pub struct ImportLensService {
     cache_registry: ProjectCacheRegistry,
     registry_hints: crate::registry::service::RegistryHintService,
     registry_executor: crate::registry::executor::RegistryRefreshExecutor,
+    report_executor: crate::report::executor::WorkspaceReportExecutor,
     // Set only by `new_with_registry_hints_for_tests`. When true, the IPC
     // server's Hello handler preserves `registry_hints`/`registry_executor`
     // across the Hello-driven service rebuild instead of reconstructing them
@@ -85,10 +87,12 @@ impl ImportLensService {
         let registry_executor = crate::registry::executor::RegistryRefreshExecutor::new(
             crate::registry::constants::REGISTRY_REFRESH_CONCURRENCY,
         );
+        let report_executor = crate::report::executor::WorkspaceReportExecutor::new();
         Self {
             cache_registry,
             registry_hints,
             registry_executor,
+            report_executor,
             preserve_registry_across_hello: false,
         }
     }
@@ -107,6 +111,7 @@ impl ImportLensService {
             registry_executor: crate::registry::executor::RegistryRefreshExecutor::new(
                 crate::registry::constants::REGISTRY_REFRESH_CONCURRENCY,
             ),
+            report_executor: crate::report::executor::WorkspaceReportExecutor::new(),
             preserve_registry_across_hello: true,
         }
     }
@@ -143,6 +148,7 @@ impl ImportLensService {
             ),
             registry_hints: self.registry_hints,
             registry_executor: self.registry_executor,
+            report_executor: self.report_executor,
             preserve_registry_across_hello: self.preserve_registry_across_hello,
         }
     }
@@ -185,6 +191,94 @@ impl ImportLensService {
 
     pub fn spawn_registry_refresh(&self, job: impl FnOnce() + Send + 'static) {
         self.registry_executor.spawn(job);
+    }
+
+    pub fn build_workspace_report(
+        &self,
+        request: WorkspaceReportRequest,
+    ) -> WorkspaceReportResponse {
+        self.report_executor
+            .install(|| self.build_workspace_report_on_worker(request))
+    }
+
+    fn build_workspace_report_on_worker(
+        &self,
+        request: WorkspaceReportRequest,
+    ) -> WorkspaceReportResponse {
+        if !is_supported_protocol_version(request.version) {
+            return WorkspaceReportResponse {
+                version: request.version.min(PROTOCOL_VERSION),
+                request_id: request.request_id,
+                rows: Vec::new(),
+                summary: empty_workspace_report_summary(),
+                error: Some(format!("unsupported protocol version {}", request.version)),
+                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+            };
+        }
+
+        self.build_workspace_report_inner(request)
+    }
+
+    fn build_workspace_report_inner(
+        &self,
+        request: WorkspaceReportRequest,
+    ) -> WorkspaceReportResponse {
+        let workspace_root = PathBuf::from(&request.workspace_root);
+        let files = crate::report::scanner::scan_workspace_sources(&workspace_root);
+        let items = files
+            .par_iter()
+            .flat_map(|source_path| {
+                let source = match fs::read_to_string(source_path) {
+                    Ok(source) => source,
+                    Err(_) => return Vec::new(),
+                };
+                let document_request = AnalyzeDocumentRequest {
+                    message_type: "analyze_document".to_owned(),
+                    version: request.version,
+                    request_id: request.request_id,
+                    workspace_root: request.workspace_root.clone(),
+                    active_document_path: source_path.to_string_lossy().to_string(),
+                    source,
+                };
+                self.handle_analyze_document(document_request)
+                    .imports
+                    .into_iter()
+                    .map(|item| crate::report::model::WorkspaceReportItem {
+                        source_file: source_path.to_string_lossy().to_string(),
+                        workspace_root: request.workspace_root.clone(),
+                        warning: if item.result.is_some() {
+                            None
+                        } else {
+                            item.message.clone()
+                        },
+                        detected: item.detected,
+                        result: item.result,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let row_set = crate::report::model::build_report_rows(&items, &request.budgets);
+        let summary = crate::report::model::build_report_summary(&row_set);
+
+        WorkspaceReportResponse {
+            version: request.version,
+            request_id: request.request_id,
+            rows: row_set.rows,
+            summary,
+            error: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn spawn_workspace_report(
+        self: &std::sync::Arc<Self>,
+        request: WorkspaceReportRequest,
+        tx: tokio::sync::oneshot::Sender<WorkspaceReportResponse>,
+    ) {
+        let service = std::sync::Arc::clone(self);
+        self.report_executor.spawn(move || {
+            let _ = tx.send(service.build_workspace_report_on_worker(request));
+        });
     }
 
     pub fn handle_batch(&self, request: BatchRequest) -> BatchResponse {
@@ -1258,6 +1352,20 @@ fn protocol_diagnostics(stage: &str, message: &str) -> Vec<ImportDiagnostic> {
         message: message.to_owned(),
         details: Vec::new(),
     }]
+}
+
+fn empty_workspace_report_summary() -> WorkspaceReportSummary {
+    WorkspaceReportSummary {
+        import_count: 0,
+        total_brotli_bytes: 0,
+        low_confidence_count: 0,
+        medium_confidence_count: 0,
+        conservative_count: 0,
+        budget_violation_count: 0,
+        duplicate_imports: Vec::new(),
+        shared_modules: Vec::new(),
+        treemap: Vec::new(),
+    }
 }
 
 fn has_request_specific_diagnostics(result: &ImportResult) -> bool {

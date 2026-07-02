@@ -34,6 +34,8 @@ import type {
   HelloMessage,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
+  WorkspaceReportRequest,
+  WorkspaceReportResponse,
 } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import type { Logger } from "../logging/types.js";
@@ -457,6 +459,16 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     this.#logger.debug(`Requesting registry hint refresh ${request.request_id} for ${request.targets.length} package(s).`);
     return this.#client.requestRefreshRegistryHints(request, 30000, onPartial);
+  }
+
+  async requestWorkspaceReport(request: WorkspaceReportRequest): Promise<WorkspaceReportResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Workspace report ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting workspace report ${request.request_id} for ${request.workspace_root}.`);
+    return this.#client.requestWorkspaceReport(request, 60000);
   }
 
   invalidatePackage(packageName: string): void {

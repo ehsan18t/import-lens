@@ -181,6 +181,15 @@ fn client_message_decodes_daemon_first_v7_requests() {
         })),
         ClientMessage::RefreshRegistryHints(_),
     ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "workspace_report",
+            "version": PROTOCOL_VERSION,
+            "request_id": 7,
+            "workspace_root": "C:/workspace"
+        })),
+        ClientMessage::WorkspaceReport(_),
+    ));
 }
 
 #[test]

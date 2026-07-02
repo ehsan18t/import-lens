@@ -28,6 +28,8 @@ import type {
   PackageJsonDependencyEntry,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
+  WorkspaceReportRequest,
+  WorkspaceReportResponse,
 } from "../../src/ipc/protocol.js";
 import { protocolVersion } from "../../src/ipc/protocol.js";
 
@@ -661,6 +663,58 @@ test("IpcClient resolves cache management responses independently from analysis 
       "cache_list:203",
       "cache_remove:204",
     ]);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+const workspaceReportRequest = (requestId: number): WorkspaceReportRequest => ({
+  type: "workspace_report",
+  version: protocolVersion,
+  request_id: requestId,
+  workspace_root: "C:/workspace",
+  budgets: {
+    perImportBrotliBytes: 1,
+    perFileBrotliBytes: 1,
+  },
+});
+
+test("IpcClient routes workspace report responses by request id", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const final: WorkspaceReportResponse = {
+    version: protocolVersion,
+    request_id: 46,
+    rows: [],
+    summary: {
+      importCount: 0,
+      totalBrotliBytes: 0,
+      lowConfidenceCount: 0,
+      mediumConfidenceCount: 0,
+      conservativeCount: 0,
+      budgetViolationCount: 0,
+      duplicateImports: [],
+      sharedModules: [],
+      treemap: [],
+    },
+    error: null,
+    diagnostics: [],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    setTimeout(() => socket.write(encodeFrame(final)), 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const response = await client.requestWorkspaceReport(workspaceReportRequest(46));
+
+    assert.equal(response.summary.importCount, 0);
     client.dispose();
   } finally {
     destroySockets(sockets);

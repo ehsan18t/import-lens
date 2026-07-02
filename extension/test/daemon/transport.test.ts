@@ -27,6 +27,8 @@ import type {
   FileSizeResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
+  WorkspaceReportRequest,
+  WorkspaceReportResponse,
 } from "../../src/ipc/protocol.js";
 import { protocolVersion } from "../../src/ipc/protocol.js";
 import { TransportCoordinator, type AnalysisTransport, type DaemonState } from "../../src/daemon/transport.js";
@@ -246,6 +248,28 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
+  async requestWorkspaceReport(request: WorkspaceReportRequest): Promise<WorkspaceReportResponse> {
+    this.calls.push(`workspaceReport:${request.request_id}`);
+    return {
+      version: request.version,
+      request_id: request.request_id,
+      rows: [],
+      summary: {
+        importCount: 0,
+        totalBrotliBytes: 0,
+        lowConfidenceCount: 0,
+        mediumConfidenceCount: 0,
+        conservativeCount: 0,
+        budgetViolationCount: 0,
+        duplicateImports: [],
+        sharedModules: [],
+        treemap: [],
+      },
+      error: null,
+      diagnostics: [],
+    };
+  }
+
   invalidatePackage(packageName: string): void {
     this.calls.push(`invalidate:${packageName}`);
   }
@@ -346,6 +370,10 @@ class SlowReadyTransport implements AnalysisTransport {
   }
 
   async refreshRegistryHints(): Promise<RefreshRegistryHintsResponse | null> {
+    return null;
+  }
+
+  async requestWorkspaceReport(): Promise<WorkspaceReportResponse | null> {
     return null;
   }
 

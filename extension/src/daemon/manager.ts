@@ -26,6 +26,8 @@ import type {
   FileSizeResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
+  WorkspaceReportRequest,
+  WorkspaceReportResponse,
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import type { Logger } from "../logging/types.js";
@@ -110,6 +112,10 @@ export class DaemonManager implements vscode.Disposable {
     onPartial?: (response: RefreshRegistryHintsResponse) => void,
   ): Promise<RefreshRegistryHintsResponse | null> {
     return this.#transport.refreshRegistryHints(request, onPartial);
+  }
+
+  requestWorkspaceReport(request: WorkspaceReportRequest): Promise<WorkspaceReportResponse | null> {
+    return this.#transport.requestWorkspaceReport(request);
   }
 
   invalidatePackage(packageName: string): void {

@@ -11,7 +11,8 @@ use crate::{
             CompleteImportMembersRequest, CompleteImportMembersResponse, EnumerateExportsRequest,
             EnumerateExportsResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
             FileSizeRequest, FileSizeResponse, ImportDiagnostic, PROTOCOL_VERSION,
-            RefreshRegistryHintsResponse, RegistryHintResult,
+            RefreshRegistryHintsResponse, RegistryHintResult, WorkspaceReportRequest,
+            WorkspaceReportResponse, WorkspaceReportSummary,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
@@ -37,6 +38,7 @@ const LIFECYCLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 enum ServerOutboundMessage {
     RefreshRegistryHints(RefreshRegistryHintsResponse),
+    WorkspaceReport(WorkspaceReportResponse),
 }
 
 async fn send_outbound_message<S>(
@@ -48,6 +50,9 @@ where
 {
     match message {
         ServerOutboundMessage::RefreshRegistryHints(response) => {
+            framed.send(payload_bytes(&response)?).await?
+        }
+        ServerOutboundMessage::WorkspaceReport(response) => {
             framed.send(payload_bytes(&response)?).await?
         }
     }
@@ -67,6 +72,30 @@ fn protocol_diagnostics_for_stage(stage: &str, message: &str) -> Vec<ImportDiagn
         message: message.to_owned(),
         details: Vec::new(),
     }]
+}
+
+fn workspace_report_protocol_error(
+    request: &WorkspaceReportRequest,
+    message: &str,
+) -> WorkspaceReportResponse {
+    WorkspaceReportResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        rows: Vec::new(),
+        summary: WorkspaceReportSummary {
+            import_count: 0,
+            total_brotli_bytes: 0,
+            low_confidence_count: 0,
+            medium_confidence_count: 0,
+            conservative_count: 0,
+            budget_violation_count: 0,
+            duplicate_imports: Vec::new(),
+            shared_modules: Vec::new(),
+            treemap: Vec::new(),
+        },
+        error: Some(message.to_owned()),
+        diagnostics: protocol_diagnostics_for_stage("workspace_report", message),
+    }
 }
 
 // `server.rs` has no existing wall-clock helper; the registry handler needs
@@ -573,6 +602,30 @@ where
                     error: Some(message.clone()),
                     diagnostics: protocol_diagnostics_for_stage("protocol", &message),
                 });
+            }
+            ClientMessage::WorkspaceReport(request) if hello_received => {
+                prefetcher.cancel();
+                lifecycle.record_batch();
+                let request_for_error = request.clone();
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                service.spawn_workspace_report(request, response_tx);
+                let outbound = outbound_tx.clone();
+                tokio::spawn(async move {
+                    let response = response_rx.await.unwrap_or_else(|_| {
+                        workspace_report_protocol_error(
+                            &request_for_error,
+                            "workspace report worker stopped before sending a response",
+                        )
+                    });
+                    let _ = outbound.send(ServerOutboundMessage::WorkspaceReport(response));
+                });
+                continue;
+            }
+            ClientMessage::WorkspaceReport(request) => {
+                send_message!(workspace_report_protocol_error(
+                    &request,
+                    "hello message not received"
+                ));
             }
             ClientMessage::PrewarmPackageJson(message) if hello_received => {
                 prefetcher.prewarm_package_json(

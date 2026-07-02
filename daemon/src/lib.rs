@@ -6,4 +6,5 @@ pub mod logging;
 pub mod pipeline;
 pub mod prefetch;
 pub mod registry;
+pub mod report;
 pub mod service;
