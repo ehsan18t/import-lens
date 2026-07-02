@@ -34,7 +34,7 @@ The current `release.yml`:
 - Automated version bumping / changelog authoring (release notes are auto-generated from git history via `gh --generate-notes`, but the version input is still supplied manually).
 - Tag-push triggering (kept as manual `workflow_dispatch` per decision).
 
-Note: the Docker/zig cross-compilation machinery is **fully removed** in this change (see §7.2), since native per-OS builds make it dead weight.
+Note: the Docker/zig cross-compilation machinery is **kept** — it is the local cross-build path for developers. It is simply no longer used by CI/release, which now builds natively per OS (see §7.2).
 
 ---
 
@@ -207,25 +207,15 @@ Both the AI-rendered and git-cliff-rendered output feed `gh release create --not
 - **New:** `cliff.toml` — git-cliff config for the deterministic changelog.
 - **Edited:** `package.json` — add `ovsx` devDependency (pinned). git-cliff itself is installed in CI (not an npm dependency).
 
-### 7.2 Docker/zig removal (complete)
+### 7.2 Docker/zig — kept (local cross-build path)
 
-Native per-OS builds make the Docker + `cargo-zigbuild` cross-compilation path dead code. It is removed entirely.
+The Docker + `cargo-zigbuild` machinery is the **local** way developers cross-build all targets from one machine, so it stays in the repo untouched:
 
-**Deleted files:**
-- `Dockerfile.build`
-- `compose.yaml`
-- `scripts/docker-build-entrypoint.sh`
-- `scripts/test/docker-compose-config.test.mjs`
+- `Dockerfile.build`, `compose.yaml`, `scripts/docker-build-entrypoint.sh`, `scripts/test/docker-compose-config.test.mjs` — retained.
+- `package.json` scripts `docker:build`, `package:*:zig`, `package:all:zig` — retained.
+- `scripts/targets.mjs` `cargoZigbuildArgsForTarget`, and the `--zigbuild` handling in `build-daemon.mjs` / `package-target.mjs` — retained.
 
-**Edited files:**
-- `package.json` — remove scripts: `docker:build`, `package:linux-x64:zig`, `package:linux-arm64:zig`, `package:darwin-x64:zig`, `package:darwin-arm64:zig`, `package:all:zig`.
-- `scripts/targets.mjs` — remove the `cargoZigbuildArgsForTarget` export.
-- `scripts/build-daemon.mjs` — remove the `--zigbuild` flag handling and the `cargoZigbuildArgsForTarget` import (native `cargo build` only).
-- `scripts/package-target.mjs` — remove the `--zigbuild` flag handling and update the usage string.
-- `scripts/test/targets.test.mjs` — remove the `cargoZigbuildArgsForTarget` test and its import.
-- `scripts/test/dependency-policy.test.mjs` — remove all `Dockerfile.build` / zig / `cargo-zigbuild` assertions (the `dockerfile` reads and the ZIG/CARGO_ZIGBUILD/zig-download matchers in both tests).
-
-**Verification after removal:** `pnpm test` (specifically `test:scripts`) passes with no dangling references to zig/docker; `pnpm package:<target>` still builds each target natively.
+The change is only that **CI/release no longer uses this path** — the new `build.yml` matrix compiles each target natively on its own OS (the non-`:zig` `package:<target>` scripts). Docker/zig and native per-OS builds coexist: Docker for local convenience, native runners for reliable CI.
 
 ---
 

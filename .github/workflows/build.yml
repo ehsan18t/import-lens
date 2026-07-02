@@ -1,0 +1,175 @@
+name: Build
+run-name: Build v${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build. Must match package.json."
+        required: true
+        type: string
+      force:
+        description: "Rebuild every target, ignoring cached artifacts."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  PNPM_VERSION: 11.9.0
+  RUST_VERSION: 1.89.0
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6.0.9
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+          rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+
+      - name: Verify release version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          node -e "const pkg = require('./package.json'); if (pkg.version !== process.env.RELEASE_VERSION) { console.error(\`package.json version \${pkg.version} does not match build input \${process.env.RELEASE_VERSION}\`); process.exit(1); }"
+
+      - name: Verify release icon
+        run: |
+          node -e "const fs = require('node:fs'); const pkg = require('./package.json'); if (pkg.icon && !fs.existsSync(pkg.icon)) { console.error(\`release icon is declared at \${pkg.icon}, but the file does not exist\`); process.exit(1); }"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check TypeScript
+        run: pnpm check
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Run performance smoke test
+        env:
+          IMPORT_LENS_PERF_MULTIPLIER: 8
+        run: pnpm test:performance
+
+      - name: Check Rust coverage
+        run: pnpm coverage:rust
+
+  package:
+    name: Package ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: win32-x64
+            runner: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+          - target: win32-arm64
+            runner: windows-latest
+            rust-target: aarch64-pc-windows-msvc
+          - target: linux-x64
+            runner: ubuntu-24.04
+            rust-target: x86_64-unknown-linux-gnu
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            rust-target: aarch64-unknown-linux-gnu
+          - target: darwin-x64
+            runner: macos-latest
+            rust-target: x86_64-apple-darwin
+          - target: darwin-arm64
+            runner: macos-latest
+            rust-target: aarch64-apple-darwin
+
+    env:
+      VSIX_PATH: builds/import-lens-${{ matrix.target }}-${{ inputs.version }}.vsix
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      # Skip the restore entirely when forcing a rebuild, so a stale cache never
+      # short-circuits the build.
+      - name: Restore cached VSIX
+        id: cache
+        if: ${{ !inputs.force }}
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ env.VSIX_PATH }}
+          key: vsix-${{ matrix.target }}-${{ inputs.version }}
+
+      # Everything below only runs when we actually need to build this target
+      # (cache miss, or force). On a cache hit the restored VSIX is uploaded as-is.
+      - name: Install pnpm
+        if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
+        uses: pnpm/action-setup@v6.0.9
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Node.js
+        if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust
+        if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
+        run: |
+          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal --target ${{ matrix.rust-target }}
+          rustup default ${{ env.RUST_VERSION }}
+
+      - name: Install dependencies
+        if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Package VSIX
+        if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
+        run: pnpm run package:${{ matrix.target }}
+
+      - name: Save VSIX to cache
+        if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ env.VSIX_PATH }}
+          key: vsix-${{ matrix.target }}-${{ inputs.version }}
+
+      # Always upload, whether the VSIX was restored from cache or freshly built,
+      # so this run's artifact set accumulates to the full six targets.
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: import-lens-${{ matrix.target }}-${{ inputs.version }}
+          path: ${{ env.VSIX_PATH }}
+          if-no-files-found: error
+          retention-days: 1
