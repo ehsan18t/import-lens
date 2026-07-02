@@ -27,9 +27,9 @@ export interface NodeModulesInvalidationBufferOptions {
 
 export const nodeModulesInvalidationDecision = (
   packageJsonPaths: readonly string[],
-  burstLimit = nodeModulesInvalidationBurstLimit,
+  burstLimit: number = nodeModulesInvalidationBurstLimit,
 ): NodeModulesInvalidationDecision => {
-  const uniquePaths = [...new Set(packageJsonPaths.filter((path) => path.length > 0))];
+  const uniquePaths = [...new Set(packageJsonPaths.filter((path: string) => path.length > 0))];
 
   if (uniquePaths.length === 0) {
     return { kind: "none" };
