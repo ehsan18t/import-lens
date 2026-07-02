@@ -1,0 +1,10 @@
+pub const FRESH_HINT_TTL_MS: u64 = 6 * 60 * 60 * 1000;
+pub const NOT_FOUND_TTL_MS: u64 = 6 * 60 * 60 * 1000;
+pub const TRANSIENT_ERROR_RETRY_MS: u64 = 5 * 60 * 1000;
+pub const DEFAULT_TIMEOUT_MS: u64 = 3_000;
+pub const MAX_ATTEMPTS: usize = 3;
+pub const REGISTRY_REFRESH_CONCURRENCY: usize = 4;
+pub const REGISTRY_RATE_LIMIT_REQUESTS: usize = 20;
+pub const REGISTRY_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
+pub const REGISTRY_RETRY_BASE_DELAY_MS: u64 = 100;
+pub const REGISTRY_CACHE_FILE_NAME: &str = "registry-metadata.json";
