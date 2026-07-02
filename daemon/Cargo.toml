@@ -12,6 +12,7 @@ brotli = "^8"
 bytes = "^1"
 flate2 = "^1.1"
 futures-util = { version = "^0.3", default-features = false, features = ["sink", "std"] }
+httpdate = "^1"
 oxc_allocator = "=0.138.0"
 oxc_ast = "=0.138.0"
 oxc_ast_visit = "=0.138.0"
