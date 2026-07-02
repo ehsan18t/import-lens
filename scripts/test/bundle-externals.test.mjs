@@ -2,16 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-/**
- * ESM-only packages that the extension uses at runtime.
- * If any of these appear as bare `require("...")` calls in the CJS bundle,
- * Node / VS Code will throw ERR_REQUIRE_ESM on activation.
- */
-const ESM_ONLY_DEPS = ["p-queue"];
+const BUNDLED_RUNTIME_DEPS = ["@msgpack/msgpack"];
 
 const bundlePath = new URL("../../extension/dist/extension.cjs", import.meta.url);
 
-test("CJS bundle must not externalize ESM-only dependencies", () => {
+test("CJS bundle must not externalize bundled runtime dependencies", () => {
   let bundle;
   try {
     bundle = readFileSync(bundlePath, "utf8");
@@ -21,12 +16,14 @@ test("CJS bundle must not externalize ESM-only dependencies", () => {
     );
   }
 
-  for (const dep of ESM_ONLY_DEPS) {
+  for (const dep of BUNDLED_RUNTIME_DEPS) {
     assert.doesNotMatch(
       bundle,
-      new RegExp(`require\\(["']${dep}["']\\)`),
+      new RegExp(`require\\(["']${escapeRegExp(dep)}["']\\)`),
       `Found externalized require("${dep}") in the CJS bundle. ` +
         `Add "${dep}" to alwaysBundle / onlyBundle in tsdown.config.ts.`,
     );
   }
 });
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");

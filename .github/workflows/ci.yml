@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PNPM_VERSION: 11.5.0
+  PNPM_VERSION: 11.9.0
   RUST_VERSION: 1.89.0
 
 jobs:
@@ -34,7 +34,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v6.4.0
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
       - name: Install Rust

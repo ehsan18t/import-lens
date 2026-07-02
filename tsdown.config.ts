@@ -6,12 +6,14 @@ export default defineConfig({
   outDir: "./extension/dist",
   clean: true,
   minify: true,
+  target: "node20",
+  platform: "node",
   sourcemap: false,
   dts: false,
   deps: {
-    alwaysBundle: ["@msgpack/msgpack", "p-queue", "p-timeout", "eventemitter3"],
+    alwaysBundle: ["@msgpack/msgpack"],
     neverBundle: ["vscode", "oxc-parser"],
-    onlyBundle: ["@msgpack/msgpack", "p-queue", "p-timeout", "eventemitter3"],
+    onlyBundle: ["@msgpack/msgpack"],
   },
   outputOptions: {
     entryFileNames: "extension.cjs",

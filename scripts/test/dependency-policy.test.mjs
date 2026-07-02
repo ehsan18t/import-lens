@@ -4,6 +4,7 @@ import test from "node:test";
 import { oxcStackConfig } from "../oxc-stack.config.mjs";
 
 const repoFile = (relativePath) => readFileSync(new URL(`../../${relativePath}`, import.meta.url), "utf8");
+const REMOVED_EXTENSION_DEPS = ["p-" + "queue", "p-" + "timeout", "eventemitter" + "3"];
 
 test("dependency policy pins the oxc analysis stack as one coordinated version", () => {
   const workspaceCargoToml = repoFile("Cargo.toml");
@@ -33,6 +34,38 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   assert.equal(manifest.scripts["deps:update"], "pnpm deps:update:oxc");
   assert.equal(manifest.scripts["deps:update:oxc"], "node scripts/update-oxc-stack.mjs");
   assert.equal(manifest.scripts["deps:update:all"], "pnpm update --latest && cargo update");
+});
+
+test("dependency policy pins build tooling and removes stale extension-host queue deps", () => {
+  const manifest = JSON.parse(repoFile("package.json"));
+  const ciWorkflow = repoFile(".github/workflows/ci.yml");
+  const releaseWorkflow = repoFile(".github/workflows/release.yml");
+  const dockerfile = repoFile("Dockerfile.build");
+  const tsdownConfig = repoFile("tsdown.config.ts");
+
+  assert.match(manifest.packageManager, /^pnpm@11[.]9[.]0[+]sha512[.]/u);
+  assert.equal(manifest.devDependencies.esbuild, "0.28.1");
+  assert.equal(manifest.devDependencies.tsdown, "0.22.3");
+  assert.equal(manifest.devDependencies["@vscode/vsce"], "3.9.2");
+
+  assert.match(ciWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
+  assert.match(releaseWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
+  assert.match(ciWorkflow, /node-version: 24/u);
+  assert.match(releaseWorkflow, /node-version: 24/u);
+  assert.doesNotMatch(ciWorkflow, new RegExp(`node-version: ${22}`, "u"));
+  assert.doesNotMatch(releaseWorkflow, new RegExp(`node-version: ${22}`, "u"));
+
+  assert.match(dockerfile, /^FROM node:24-bookworm$/mu);
+  assert.match(dockerfile, /^ARG PNPM_VERSION=11[.]9[.]0$/mu);
+  assert.match(dockerfile, /Expected Node 24[.]11[+] build image/u);
+  assert.match(tsdownConfig, /target: "node20"/u);
+  assert.match(tsdownConfig, /platform: "node"/u);
+
+  for (const dependency of REMOVED_EXTENSION_DEPS) {
+    assert.equal(manifest.dependencies[dependency], undefined);
+    assert.equal(manifest.devDependencies[dependency], undefined);
+    assert.doesNotMatch(tsdownConfig, new RegExp(escapedVersion(dependency), "u"));
+  }
 });
 
 const escapedVersion = (version) => version.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");

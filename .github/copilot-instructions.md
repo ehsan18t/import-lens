@@ -20,10 +20,12 @@ Before writing ANY code, verify these versions. They are the most common source 
 | `oxc_resolver` (Rust) | `~11.19`       | Independent repo, independent version. |
 | `redb` (Rust)         | `^4`           | NOT v3. v4.0.0 minimum.                |
 | `papaya` (Rust)       | `~0.2`         | Lock-free, requires pin API.           |
-| `@types/vscode`       | `1.100.0`      | Matches `engines.vscode`.              |
+| Node.js (build)       | `24 LTS`       | Build/test/package only.               |
+| `pnpm`                | `11.9.0`       | Pinned through Corepack and CI.         |
+| `@types/vscode`       | `1.90.0`       | Matches `engines.vscode`.              |
 | `typescript`          | `6.0.3`        | TS 6.x, NOT 5.x.                       |
-| `tsdown`              | `0.22.1`       | Rolldown-powered bundler.              |
-| `@vscode/vsce`        | `3.9.1`        | Use `--no-dependencies` flag.          |
+| `tsdown`              | `0.22.3`       | Rolldown-powered bundler.              |
+| `@vscode/vsce`        | `3.9.2`        | VSIX package/publish tooling.          |
 
 ## Banned Packages — DO NOT USE
 

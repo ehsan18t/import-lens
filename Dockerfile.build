@@ -1,7 +1,7 @@
-FROM node:22-bookworm
+FROM node:24-bookworm
 
 ARG RUST_VERSION=stable
-ARG PNPM_VERSION=11.5.0
+ARG PNPM_VERSION=11.9.0
 ARG ZIG_VERSION=latest
 ARG CARGO_ZIGBUILD_VERSION=latest
 
@@ -30,6 +30,8 @@ RUN rustup target add \
   aarch64-unknown-linux-gnu \
   x86_64-apple-darwin \
   aarch64-apple-darwin
+
+RUN node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major !== 24 || minor < 11) { throw new Error(`Expected Node 24.11+ build image, got ${process.version}`); }'
 
 RUN corepack enable \
   && corepack prepare pnpm@${PNPM_VERSION} --activate
