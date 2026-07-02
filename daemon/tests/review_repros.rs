@@ -29,33 +29,6 @@ fn write_source(root: &Path, relative_path: &str, source: &str) {
     fs::write(path, source).expect("source file should be written");
 }
 
-/// SUSPICION 1: reachability misses names provided through `export *` chains
-/// where the star target re-exports (rather than locally exports) the name.
-#[test]
-fn repro_star_reexport_chain_is_missed_by_reachability() {
-    let root = temp_workspace();
-    write_source(&root, "entry.js", "export * from './b.js';");
-    write_source(&root, "b.js", "export { x } from './c.js';");
-    write_source(
-        &root,
-        "c.js",
-        "export const x = 1;\nexport const y = 'HEAVY_UNUSED_PAYLOAD';",
-    );
-
-    let graph = build_module_graph(&root.join("entry.js")).expect("graph should build");
-    let reachable = reachable_exports(&graph, &["x".to_owned()], false);
-    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
-        .expect("bundle should not error");
-
-    fs::remove_dir_all(&root).expect("cleanup");
-    // CURRENT (buggy) behavior: x is never reached, so the bundle is empty.
-    assert!(
-        bundled.source.trim().is_empty(),
-        "expected empty bundle demonstrating the miss, got: {}",
-        bundled.source
-    );
-}
-
 /// Control: the same chain with a DIRECT export in the star target works.
 #[test]
 fn control_star_direct_export_is_reached() {

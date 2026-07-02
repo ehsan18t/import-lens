@@ -1,6 +1,6 @@
 use crate::{
     ipc::protocol::{ImportKind, ImportRequest},
-    pipeline::graph::{ModuleGraph, ModuleId},
+    pipeline::graph::{ModuleGraph, ModuleId, module_provides_export},
 };
 use std::{
     collections::HashSet,
@@ -144,14 +144,7 @@ impl ReachabilityMarker<'_> {
             let Some(target_id) = self.graph.module_id_by_path(&star_export.resolved_path) else {
                 continue;
             };
-            let Some(target) = self.graph.module_by_id(target_id) else {
-                continue;
-            };
-            if target
-                .exports
-                .iter()
-                .any(|export| export.exported_name == exported_name)
-            {
+            if module_provides_export(self.graph, target_id, exported_name, &mut HashSet::new()) {
                 self.reachable
                     .symbols
                     .insert((module.path.clone(), exported_name.to_owned()));

@@ -1388,6 +1388,55 @@ pub fn is_node_builtin_specifier(specifier: &str) -> bool {
     )
 }
 
+pub fn module_provides_export(
+    graph: &ModuleGraph,
+    module_id: ModuleId,
+    exported_name: &str,
+    visited: &mut HashSet<(ModuleId, String)>,
+) -> bool {
+    if !visited.insert((module_id, exported_name.to_owned())) {
+        return false;
+    }
+
+    let Some(module) = graph.module_by_id(module_id) else {
+        return false;
+    };
+
+    if module
+        .exports
+        .iter()
+        .any(|export| export.exported_name == exported_name)
+    {
+        return true;
+    }
+
+    for reexport in module
+        .reexports
+        .iter()
+        .filter(|reexport| reexport.exported_name == exported_name)
+    {
+        if reexport.imported_name == "*" {
+            return true;
+        }
+
+        if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path)
+            && module_provides_export(graph, target_id, &reexport.imported_name, visited)
+        {
+            return true;
+        }
+    }
+
+    for star_export in &module.star_exports {
+        if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path)
+            && module_provides_export(graph, target_id, exported_name, visited)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn span_start(span: Span) -> usize {
     span.start as usize
 }

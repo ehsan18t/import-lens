@@ -356,6 +356,56 @@ fn bundle_namespace_reexport_does_not_emit_marker_for_missing_entry_binding() {
 }
 
 #[test]
+fn reachability_follows_star_export_to_reexport_chains() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export * from './b.js';");
+    write_source(&root, "b.js", "export { x } from './c.js';");
+    write_source(
+        &root,
+        "c.js",
+        "export const x = 1;\nexport const y = 'HEAVY_UNUSED_PAYLOAD';",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["x".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(bundled.source.contains("__il_m2_x"), "{}", bundled.source);
+    assert!(
+        !bundled.source.contains("HEAVY_UNUSED_PAYLOAD"),
+        "{}",
+        bundled.source
+    );
+}
+
+#[test]
+fn reachability_follows_nested_star_export_chains() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export * from './b.js';");
+    write_source(&root, "b.js", "export * from './c.js';");
+    write_source(
+        &root,
+        "c.js",
+        "export const x = 1;\nexport const y = 'HEAVY_UNUSED_PAYLOAD';",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["x".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(bundled.source.contains("__il_m2_x"), "{}", bundled.source);
+    assert!(
+        !bundled.source.contains("HEAVY_UNUSED_PAYLOAD"),
+        "{}",
+        bundled.source
+    );
+}
+
+#[test]
 fn bundle_survives_star_export_cycles_without_stack_overflow() {
     let root = temp_workspace();
     write_source(

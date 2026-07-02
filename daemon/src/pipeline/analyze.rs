@@ -9,7 +9,8 @@ use crate::{
         compress::compress_all,
         fallback::{approximate_directory_size, estimate_minified_source, source_excerpt_detail},
         graph::{
-            MAX_MODULE_SOURCE_BYTES, ModuleGraph, ModuleId, build_module_graph_cached_with_runtime,
+            MAX_MODULE_SOURCE_BYTES, ModuleGraph, build_module_graph_cached_with_runtime,
+            module_provides_export,
         },
         minify::{minify_source, minify_source_with_markers},
         reachability::{reachable_exports, requested_exports},
@@ -625,7 +626,7 @@ fn missing_export_diagnostics(
     let missing = requested_exports
         .iter()
         .filter(|exported_name| {
-            !graph_exports_name(graph, graph.entry_id, exported_name, &mut HashSet::new())
+            !module_provides_export(graph, graph.entry_id, exported_name, &mut HashSet::new())
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -692,55 +693,6 @@ fn missing_cjs_export_message(request: &ImportRequest, missing: &[String]) -> St
         ImportKind::Default => "default CommonJS export not found".to_owned(),
         _ => format!("named CommonJS export(s) not found: {}", missing.join(", ")),
     }
-}
-
-fn graph_exports_name(
-    graph: &ModuleGraph,
-    module_id: ModuleId,
-    exported_name: &str,
-    visited: &mut HashSet<(ModuleId, String)>,
-) -> bool {
-    if !visited.insert((module_id, exported_name.to_owned())) {
-        return false;
-    }
-
-    let Some(module) = graph.module_by_id(module_id) else {
-        return false;
-    };
-
-    if module
-        .exports
-        .iter()
-        .any(|export| export.exported_name == exported_name)
-    {
-        return true;
-    }
-
-    for reexport in module
-        .reexports
-        .iter()
-        .filter(|reexport| reexport.exported_name == exported_name)
-    {
-        if reexport.imported_name == "*" {
-            return true;
-        }
-
-        if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path)
-            && graph_exports_name(graph, target_id, &reexport.imported_name, visited)
-        {
-            return true;
-        }
-    }
-
-    for star_export in &module.star_exports {
-        if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path)
-            && graph_exports_name(graph, target_id, exported_name, visited)
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
 fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
