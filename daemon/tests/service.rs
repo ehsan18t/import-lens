@@ -689,6 +689,7 @@ fn service_analyzes_package_json_dependencies_in_daemon() {
         include_registry_hints: false,
         force_registry_refresh: false,
         refresh_section: None,
+        registry_hint_mode: None,
         streaming: false,
     });
 
@@ -733,6 +734,7 @@ fn service_streams_package_json_loading_states_before_ready_results() {
             include_registry_hints: false,
             force_registry_refresh: false,
             refresh_section: None,
+            registry_hint_mode: None,
             streaming: true,
         },
         |partial| {
@@ -1382,4 +1384,38 @@ fn protocol_error_exports_response_returns_request_scoped_error() {
         Some("hello message not received")
     );
     assert_eq!(response.diagnostics[0].stage, "protocol");
+}
+
+#[test]
+fn package_json_analysis_includes_cached_registry_hints_when_requested() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new_with_cache_policy(None, false, 512, 30);
+    service
+        .registry_hints_for_tests()
+        .write_metadata_for_tests("tiny-lib", "1.1.0", 100);
+
+    let response = service.handle_analyze_package_json(AnalyzePackageJsonRequest {
+        message_type: "analyze_package_json".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 40,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace.join("package.json").to_string_lossy().to_string(),
+        source: r#"{"dependencies":{"tiny-lib":"^1.0.0"}}"#.to_owned(),
+        streaming: false,
+        include_registry_hints: true,
+        force_registry_refresh: false,
+        refresh_section: None,
+        registry_hint_mode: Some(import_lens_daemon::ipc::protocol::RegistryHintMode::Cached),
+    });
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.error, None);
+    assert_eq!(
+        response.states[0]
+            .registry_hint
+            .as_ref()
+            .and_then(|hint| hint.latest_version.as_deref()),
+        Some("1.1.0")
+    );
 }

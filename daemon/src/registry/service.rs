@@ -377,6 +377,27 @@ impl RegistryHintService {
         entry
     }
 
+    /// Test-only: seeds the cache directly so integration tests (which
+    /// compile this crate as an external dependency and cannot see
+    /// `#[cfg(test)]` items) can exercise cached-hint lookups without a real
+    /// network fetch.
+    pub fn write_metadata_for_tests(
+        &self,
+        package_name: &str,
+        latest_version: &str,
+        fetched_at: u64,
+    ) -> Result<(), String> {
+        self.cache.write_metadata(
+            package_name,
+            RegistryPackageMetadata {
+                latest_version: Some(latest_version.to_owned()),
+                latest_published_at: None,
+                deprecated_versions: Vec::new(),
+            },
+            fetched_at,
+        )
+    }
+
     fn wait_for_rate_limit_slot(&self) {
         // Poisoned rate limiter: proceed without throttling rather than
         // failing the fetch.

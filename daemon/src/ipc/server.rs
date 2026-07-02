@@ -11,6 +11,7 @@ use crate::{
             CompleteImportMembersRequest, CompleteImportMembersResponse, EnumerateExportsRequest,
             EnumerateExportsResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
             FileSizeRequest, FileSizeResponse, ImportDiagnostic, PROTOCOL_VERSION,
+            RefreshRegistryHintsResponse, RegistryHintResult,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
@@ -30,9 +31,53 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const LIFECYCLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+enum ServerOutboundMessage {
+    RefreshRegistryHints(RefreshRegistryHintsResponse),
+}
+
+async fn send_outbound_message<S>(
+    framed: &mut Framed<S, LengthDelimitedCodec>,
+    message: ServerOutboundMessage,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match message {
+        ServerOutboundMessage::RefreshRegistryHints(response) => {
+            framed.send(payload_bytes(&response)?).await?
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_protocol_version(version: u32) -> bool {
+    // The registry-refresh variant was introduced in protocol v7; older
+    // negotiated clients never emit it, so accepting the full supported
+    // range here is safe and matches `is_supported_version`.
+    (1..=PROTOCOL_VERSION).contains(&version)
+}
+
+fn protocol_diagnostics_for_stage(stage: &str, message: &str) -> Vec<ImportDiagnostic> {
+    vec![ImportDiagnostic {
+        stage: stage.to_owned(),
+        message: message.to_owned(),
+        details: Vec::new(),
+    }]
+}
+
+// `server.rs` has no existing wall-clock helper; the registry handler needs
+// one to stamp `now_ms` for cache freshness/retry decisions.
+fn current_time_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ServerOptions;
@@ -101,6 +146,7 @@ where
     let mut hello_received = false;
     let mut lifecycle = LifecycleState::new();
     let lifecycle_storage_path = storage_path;
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerOutboundMessage>();
 
     macro_rules! send_message {
         ($message:expr) => {
@@ -110,6 +156,12 @@ where
 
     loop {
         let payload = tokio::select! {
+            outbound = outbound_rx.recv() => {
+                if let Some(message) = outbound {
+                    send_outbound_message(&mut framed, message).await?;
+                }
+                continue;
+            }
             payload = framed.next() => payload.transpose()?,
             _ = tokio::time::sleep(LIFECYCLE_CHECK_INTERVAL) => {
                 if recycle_if_needed(
@@ -151,12 +203,44 @@ where
 
                 let hello_storage_path = PathBuf::from(&hello.storage_path);
                 let hello_workspace_root = PathBuf::from(&hello.workspace_root);
-                service = std::sync::Arc::new(ImportLensService::new_with_cache_policy(
-                    Some(hello_storage_path),
-                    hello.enable_disk_cache,
-                    hello.cache_max_size_mb,
-                    hello.cache_max_age_days,
-                ));
+                // Integration tests that inject a fake `RegistryHttpClient` via
+                // `ImportLensService::new_with_registry_hints_for_tests` need that
+                // client to survive the Hello handshake; otherwise this
+                // reconstruction would silently replace it with a real
+                // `UreqRegistryHttpClient` built from `hello.storage_path`. Only
+                // those test-constructed services set `preserve_registry_across_hello`.
+                service = if service.preserve_registry_across_hello() {
+                    match std::sync::Arc::try_unwrap(service) {
+                        Ok(previous) => {
+                            std::sync::Arc::new(previous.rebuild_cache_registry_for_hello(
+                                Some(hello_storage_path),
+                                hello.enable_disk_cache,
+                                hello.cache_max_size_mb,
+                                hello.cache_max_age_days,
+                            ))
+                        }
+                        Err(_shared) => {
+                            logging::log_debug(
+                                "server",
+                                "injected registry service was unexpectedly shared during hello; \
+                                 building a fresh production service instead",
+                            );
+                            std::sync::Arc::new(ImportLensService::new_with_cache_policy(
+                                Some(hello_storage_path),
+                                hello.enable_disk_cache,
+                                hello.cache_max_size_mb,
+                                hello.cache_max_age_days,
+                            ))
+                        }
+                    }
+                } else {
+                    std::sync::Arc::new(ImportLensService::new_with_cache_policy(
+                        Some(hello_storage_path),
+                        hello.enable_disk_cache,
+                        hello.cache_max_size_mb,
+                        hello.cache_max_age_days,
+                    ))
+                };
                 hello_received = true;
                 if let Some(storage_path) = lifecycle_storage_path.as_deref() {
                     if let Some(result) = remove_legacy_central_cache(storage_path) {
@@ -389,6 +473,106 @@ where
                     "hello message not received".to_owned(),
                 );
                 send_message!(response);
+            }
+            ClientMessage::RefreshRegistryHints(request) if hello_received => {
+                if !is_supported_protocol_version(request.version) {
+                    let message = format!("unsupported protocol version {}", request.version);
+                    send_message!(RefreshRegistryHintsResponse {
+                        version: request.version.min(PROTOCOL_VERSION),
+                        request_id: request.request_id,
+                        results: Vec::new(),
+                        indexes: None,
+                        error: Some(message.clone()),
+                        diagnostics: protocol_diagnostics_for_stage("protocol", &message),
+                    });
+                    continue;
+                }
+
+                let version = request.version;
+                let request_id = request.request_id;
+                let mode = request.mode;
+                let targets = request.targets;
+                let now_ms = current_time_millis();
+                let (partial_tx, mut partial_rx) = mpsc::unbounded_channel();
+                let outbound = outbound_tx.clone();
+
+                for (index, target) in targets.iter().cloned().enumerate() {
+                    let svc = std::sync::Arc::clone(&service);
+                    let tx = partial_tx.clone();
+                    service.spawn_registry_refresh(move || {
+                        let target_for_error = target.clone();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            svc.refresh_registry_hint_target(target, mode, now_ms)
+                        }))
+                        .unwrap_or_else(|_| {
+                            logging::log_warn(
+                                "registry",
+                                format!("registry worker panicked for {}", target_for_error.name),
+                            );
+                            RegistryHintResult {
+                                target: target_for_error,
+                                hint: None,
+                                error: Some("registry worker panicked".to_owned()),
+                            }
+                        });
+                        let _ = tx.send((index, result));
+                    });
+                }
+                drop(partial_tx);
+
+                tokio::spawn(async move {
+                    let mut ordered_results = vec![None; targets.len()];
+                    while let Some((index, result)) = partial_rx.recv().await {
+                        ordered_results[index] = Some(result.clone());
+                        let _ = outbound.send(ServerOutboundMessage::RefreshRegistryHints(
+                            RefreshRegistryHintsResponse {
+                                version,
+                                request_id,
+                                results: vec![result],
+                                indexes: Some(vec![index]),
+                                error: None,
+                                diagnostics: Vec::new(),
+                            },
+                        ));
+                    }
+
+                    let results = ordered_results
+                        .into_iter()
+                        .zip(targets)
+                        .map(|(result, target)| {
+                            result.unwrap_or(RegistryHintResult {
+                                target,
+                                hint: None,
+                                error: Some(
+                                    "registry refresh worker did not return a result".to_owned(),
+                                ),
+                            })
+                        })
+                        .collect();
+
+                    let _ = outbound.send(ServerOutboundMessage::RefreshRegistryHints(
+                        RefreshRegistryHintsResponse {
+                            version,
+                            request_id,
+                            results,
+                            indexes: None,
+                            error: None,
+                            diagnostics: Vec::new(),
+                        },
+                    ));
+                });
+                continue;
+            }
+            ClientMessage::RefreshRegistryHints(request) => {
+                let message = "hello message not received".to_owned();
+                send_message!(RefreshRegistryHintsResponse {
+                    version: request.version.min(PROTOCOL_VERSION),
+                    request_id: request.request_id,
+                    results: Vec::new(),
+                    indexes: None,
+                    error: Some(message.clone()),
+                    diagnostics: protocol_diagnostics_for_stage("protocol", &message),
+                });
             }
             ClientMessage::PrewarmPackageJson(message) if hello_received => {
                 prefetcher.prewarm_package_json(

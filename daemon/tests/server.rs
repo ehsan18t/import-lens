@@ -5,11 +5,17 @@ use import_lens_daemon::{
             AnalyzePackageJsonRequest, AnalyzePackageJsonResponse, BatchRequest, BatchResponse,
             CacheStatusRequest, CacheStatusResponse, FileSizeRequest, FileSizeResponse,
             HelloMessage, ImportAnalysisStatus, ImportKind, ImportRequest, ImportRuntime,
-            PROTOCOL_VERSION, ShutdownMessage,
+            PROTOCOL_VERSION, RefreshRegistryHintsRequest, RefreshRegistryHintsResponse,
+            RegistryHintMode, RegistryHintTarget, ShutdownMessage,
         },
         server::{batch_response_from_join, handle_connection},
     },
     prefetch::{CancellationToken, Prefetcher},
+    registry::{
+        cache::RegistryMetadataCache,
+        service::RegistryHintService,
+        types::{HttpRegistryResponse, RegistryHttpClient},
+    },
     service::ImportLensService,
 };
 use std::{
@@ -112,6 +118,66 @@ impl CacheStatusResponseReader {
                 return response;
             }
         }
+    }
+}
+
+struct RegistryRefreshResponseReader {
+    decoder: FrameDecoder,
+    pending: VecDeque<RefreshRegistryHintsResponse>,
+}
+
+impl RegistryRefreshResponseReader {
+    fn new() -> Self {
+        Self {
+            decoder: FrameDecoder::default(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    async fn read_response(&mut self, stream: &mut DuplexStream) -> RefreshRegistryHintsResponse {
+        if let Some(response) = self.pending.pop_front() {
+            return response;
+        }
+
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("server response should be readable");
+            assert!(read > 0, "server closed before writing response");
+            for payload in self
+                .decoder
+                .push(&buffer[..read])
+                .expect("server frame should decode")
+            {
+                self.pending.push_back(
+                    decode_payload::<RefreshRegistryHintsResponse>(&payload)
+                        .expect("registry refresh response should decode"),
+                );
+            }
+            if let Some(response) = self.pending.pop_front() {
+                return response;
+            }
+        }
+    }
+}
+
+struct DelayedRegistryClient;
+
+impl RegistryHttpClient for DelayedRegistryClient {
+    fn get_package_metadata(&self, package_name: &str) -> Result<HttpRegistryResponse, String> {
+        if package_name == "slow-lib" {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if package_name == "fail-lib" {
+            return Err("simulated registry failure".to_owned());
+        }
+        Ok(HttpRegistryResponse {
+            status: 200,
+            retry_after_ms: None,
+            body: r#"{"dist-tags":{"latest":"2.0.0"},"versions":{"1.0.0":{}},"time":{"2.0.0":"2026-01-01T00:00:00.000Z"}}"#.to_owned(),
+        })
     }
 }
 
@@ -311,6 +377,7 @@ fn streaming_package_json(workspace: &Path, request_id: u64) -> AnalyzePackageJs
         include_registry_hints: false,
         force_registry_refresh: false,
         refresh_section: None,
+        registry_hint_mode: None,
         streaming: true,
     }
 }
@@ -683,4 +750,126 @@ async fn spawn_blocking_join_error_returns_protocol_batch_error() {
             .is_some_and(|message| message.contains("analysis worker failed")),
         "{response:?}",
     );
+}
+
+#[tokio::test]
+async fn server_streams_registry_hint_partials_before_final_response() {
+    let workspace = temp_workspace();
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let registry_hints = RegistryHintService::new(
+        RegistryMetadataCache::empty(),
+        Box::new(DelayedRegistryClient),
+    );
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new_with_registry_hints_for_tests(
+                registry_hints,
+            )),
+            Prefetcher::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = RegistryRefreshResponseReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+    client_stream
+        .write_all(
+            &encode_frame(&RefreshRegistryHintsRequest {
+                message_type: "refresh_registry_hints".to_owned(),
+                version: PROTOCOL_VERSION,
+                request_id: 8,
+                targets: vec![
+                    RegistryHintTarget {
+                        name: "fast-lib".to_owned(),
+                        installed_version: Some("1.0.0".to_owned()),
+                    },
+                    RegistryHintTarget {
+                        name: "slow-lib".to_owned(),
+                        installed_version: Some("1.0.0".to_owned()),
+                    },
+                    RegistryHintTarget {
+                        name: "fail-lib".to_owned(),
+                        installed_version: Some("1.0.0".to_owned()),
+                    },
+                ],
+                mode: RegistryHintMode::RefreshStale,
+            })
+            .expect("registry refresh request should encode"),
+        )
+        .await
+        .expect("request should be written");
+
+    let first_partial = tokio::time::timeout(
+        Duration::from_millis(200),
+        reader.read_response(&mut client_stream),
+    )
+    .await
+    .expect("first registry partial should arrive before the slow package finishes");
+    assert_eq!(first_partial.request_id, 8);
+    assert!(first_partial.indexes.is_some());
+    assert_eq!(first_partial.results.len(), 1);
+
+    // This 20ms probe only proves the final response is not buffered with the
+    // first partial because the two remaining targets are still in flight at
+    // that point: `slow-lib` sleeps an explicit 300ms in
+    // `DelayedRegistryClient`, and `fail-lib` errors on every attempt, so its
+    // MAX_ATTEMPTS(3) fetch spends ~REGISTRY_RETRY_BASE_DELAY_MS(100) * (1+2)
+    // = ~300ms in retry backoff. If those registry constants (in
+    // `daemon/src/registry/constants.rs`) or the client's sleep shrink below
+    // this probe window, the final response may legitimately arrive early and
+    // this assertion will flake.
+    let early_final = tokio::time::timeout(
+        Duration::from_millis(20),
+        reader.read_response(&mut client_stream),
+    )
+    .await;
+    assert!(
+        early_final.is_err(),
+        "final response should not be buffered with the first partial"
+    );
+
+    let final_response = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let response = reader.read_response(&mut client_stream).await;
+            if response.indexes.is_none() {
+                return response;
+            }
+        }
+    })
+    .await
+    .expect("final registry refresh response should arrive");
+    assert_eq!(final_response.results.len(), 3);
+    assert!(
+        final_response
+            .results
+            .iter()
+            .any(|result| result.target.name == "fail-lib" && result.error.is_some())
+    );
+    assert!(
+        final_response
+            .results
+            .iter()
+            .any(|result| result.target.name == "fast-lib" && result.hint.is_some())
+    );
+
+    client_stream
+        .write_all(
+            &encode_frame(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("shutdown should encode"),
+        )
+        .await
+        .expect("shutdown should be written");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should exit cleanly");
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }

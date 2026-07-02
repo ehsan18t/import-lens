@@ -20,6 +20,7 @@ use crate::{
         FileSizeRequest, FileSizeResponse, ImportAnalysisItem, ImportAnalysisStatus,
         ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ImportRuntime, ImportSyntax,
         PROTOCOL_VERSION, PackageJsonDependencyAnalysisItem,
+        RegistryHintMode as ProtocolRegistryHintMode, RegistryHintResult, RegistryHintTarget,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
@@ -39,9 +40,20 @@ use std::{
 
 const NODE_MODULES_BULK_INVALIDATION_LIMIT: usize = 20;
 
-#[derive(Debug)]
+// `RegistryHintService` and `RegistryRefreshExecutor` hold trait objects and a
+// thread pool respectively, so `ImportLensService` no longer derives `Debug`.
 pub struct ImportLensService {
     cache_registry: ProjectCacheRegistry,
+    registry_hints: crate::registry::service::RegistryHintService,
+    registry_executor: crate::registry::executor::RegistryRefreshExecutor,
+    // Set only by `new_with_registry_hints_for_tests`. When true, the IPC
+    // server's Hello handler preserves `registry_hints`/`registry_executor`
+    // across the Hello-driven service rebuild instead of reconstructing them
+    // from `hello.storage_path` with the real `UreqRegistryHttpClient`. This
+    // lets integration tests inject a fake `RegistryHttpClient` (e.g. to
+    // control fetch timing/failure deterministically) that survives the
+    // handshake. See `daemon/src/ipc/server.rs`'s `Hello` handling.
+    preserve_registry_across_hello: bool,
 }
 
 impl ImportLensService {
@@ -55,6 +67,73 @@ impl ImportLensService {
         cache_max_size_mb: u64,
         cache_max_age_days: u64,
     ) -> Self {
+        let cache_registry = ProjectCacheRegistry::new(
+            storage_path.clone(),
+            enable_disk_cache,
+            cache_max_size_mb,
+            cache_max_age_days,
+        );
+        let registry_hints = storage_path
+            .clone()
+            .map(|path| {
+                crate::registry::service::RegistryHintService::new(
+                    crate::registry::cache::RegistryMetadataCache::new(path),
+                    Box::new(crate::registry::client::UreqRegistryHttpClient::default()),
+                )
+            })
+            .unwrap_or_else(crate::registry::service::RegistryHintService::disabled);
+        let registry_executor = crate::registry::executor::RegistryRefreshExecutor::new(
+            crate::registry::constants::REGISTRY_REFRESH_CONCURRENCY,
+        );
+        Self {
+            cache_registry,
+            registry_hints,
+            registry_executor,
+            preserve_registry_across_hello: false,
+        }
+    }
+
+    /// Test-only: exists so integration tests (`daemon/tests/*.rs`, which
+    /// compile the daemon lib as an external crate and therefore cannot see
+    /// `#[cfg(test)]` items) can inject a fake `RegistryHintService`. See the
+    /// `preserve_registry_across_hello` field doc comment for why the IPC
+    /// server must special-case services constructed this way.
+    pub fn new_with_registry_hints_for_tests(
+        registry_hints: crate::registry::service::RegistryHintService,
+    ) -> Self {
+        Self {
+            cache_registry: ProjectCacheRegistry::new(None, false, 512, 30),
+            registry_hints,
+            registry_executor: crate::registry::executor::RegistryRefreshExecutor::new(
+                crate::registry::constants::REGISTRY_REFRESH_CONCURRENCY,
+            ),
+            preserve_registry_across_hello: true,
+        }
+    }
+
+    /// Test-only: exists so integration tests can seed cached registry
+    /// metadata without a real network fetch. See
+    /// `new_with_registry_hints_for_tests` for why this cannot be
+    /// `#[cfg(test)]`-gated.
+    pub fn registry_hints_for_tests(&self) -> RegistryHintTestHandle<'_> {
+        RegistryHintTestHandle { service: self }
+    }
+
+    /// Rebuilds only the cache-registry portion of the service for a freshly
+    /// negotiated Hello handshake while preserving the existing
+    /// `registry_hints`/`registry_executor`. Only called by the IPC server
+    /// when `preserve_registry_across_hello()` is true (i.e. the service was
+    /// constructed via `new_with_registry_hints_for_tests`); production
+    /// connections always rebuild via `new_with_cache_policy` so that
+    /// `hello.storage_path` remains the source of truth for registry
+    /// configuration.
+    pub fn rebuild_cache_registry_for_hello(
+        self,
+        storage_path: Option<PathBuf>,
+        enable_disk_cache: bool,
+        cache_max_size_mb: u64,
+        cache_max_age_days: u64,
+    ) -> Self {
         Self {
             cache_registry: ProjectCacheRegistry::new(
                 storage_path,
@@ -62,7 +141,50 @@ impl ImportLensService {
                 cache_max_size_mb,
                 cache_max_age_days,
             ),
+            registry_hints: self.registry_hints,
+            registry_executor: self.registry_executor,
+            preserve_registry_across_hello: self.preserve_registry_across_hello,
         }
+    }
+
+    pub fn preserve_registry_across_hello(&self) -> bool {
+        self.preserve_registry_across_hello
+    }
+
+    pub fn refresh_registry_hint_target(
+        &self,
+        target: RegistryHintTarget,
+        mode: ProtocolRegistryHintMode,
+        now_ms: u64,
+    ) -> RegistryHintResult {
+        let service_mode = match mode {
+            ProtocolRegistryHintMode::RefreshStale => {
+                crate::registry::service::RegistryHintMode::RefreshStale
+            }
+            ProtocolRegistryHintMode::ForceRefresh => {
+                crate::registry::service::RegistryHintMode::ForceRefresh
+            }
+            ProtocolRegistryHintMode::Off | ProtocolRegistryHintMode::Cached => {
+                crate::registry::service::RegistryHintMode::Cached
+            }
+        };
+
+        let lookup = self.registry_hints.hint_for(
+            &target.name,
+            target.installed_version.as_deref(),
+            service_mode,
+            now_ms,
+        );
+
+        RegistryHintResult {
+            target,
+            hint: lookup.hint,
+            error: lookup.error,
+        }
+    }
+
+    pub fn spawn_registry_refresh(&self, job: impl FnOnce() + Send + 'static) {
+        self.registry_executor.spawn(job);
     }
 
     pub fn handle_batch(&self, request: BatchRequest) -> BatchResponse {
@@ -366,6 +488,8 @@ impl ImportLensService {
             active_document_path: PathBuf::from(&request.active_document_path),
         };
         let sections = package_json_dependency_sections(&request.source);
+        let registry_hint_mode = effective_registry_hint_mode(&request);
+        let now_ms = current_time_millis();
         let mut states = Vec::new();
         let mut import_requests = Vec::new();
 
@@ -385,13 +509,18 @@ impl ImportLensService {
                     };
                     import_requests.push(Some(import_request));
 
+                    let registry_hint = self
+                        .registry_hints
+                        .hint_for(&entry.name, Some(&version), registry_hint_mode, now_ms)
+                        .hint;
+
                     states.push(PackageJsonDependencyAnalysisItem {
                         name: entry.name.clone(),
                         section: entry.section.clone(),
                         entry,
                         status: ImportAnalysisStatus::Loading,
                         installed_version: Some(version),
-                        registry_hint: None,
+                        registry_hint,
                         message: None,
                         result: None,
                     });
@@ -985,6 +1114,59 @@ impl ImportLensService {
             namespace_result,
             dependency_fingerprints.to_vec(),
         );
+    }
+}
+
+/// Test-only handle: exists so integration tests can seed cached registry
+/// metadata via `ImportLensService::registry_hints_for_tests`. See that
+/// method's doc comment for why this cannot be `#[cfg(test)]`-gated.
+pub struct RegistryHintTestHandle<'a> {
+    service: &'a ImportLensService,
+}
+
+impl RegistryHintTestHandle<'_> {
+    pub fn write_metadata_for_tests(
+        &self,
+        package_name: &str,
+        latest_version: &str,
+        fetched_at: u64,
+    ) {
+        let _ = self.service.registry_hints.write_metadata_for_tests(
+            package_name,
+            latest_version,
+            fetched_at,
+        );
+    }
+}
+
+fn current_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn effective_registry_hint_mode(
+    request: &AnalyzePackageJsonRequest,
+) -> crate::registry::service::RegistryHintMode {
+    match request.registry_hint_mode {
+        Some(ProtocolRegistryHintMode::Off) => crate::registry::service::RegistryHintMode::Off,
+        Some(ProtocolRegistryHintMode::Cached) => {
+            crate::registry::service::RegistryHintMode::Cached
+        }
+        Some(ProtocolRegistryHintMode::RefreshStale) => {
+            crate::registry::service::RegistryHintMode::RefreshStale
+        }
+        Some(ProtocolRegistryHintMode::ForceRefresh) => {
+            crate::registry::service::RegistryHintMode::ForceRefresh
+        }
+        None if request.force_registry_refresh => {
+            crate::registry::service::RegistryHintMode::ForceRefresh
+        }
+        None if request.include_registry_hints => {
+            crate::registry::service::RegistryHintMode::Cached
+        }
+        None => crate::registry::service::RegistryHintMode::Off,
     }
 }
 

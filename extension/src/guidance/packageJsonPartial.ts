@@ -3,11 +3,19 @@ import type {
   PackageJsonDependencyAnalysisItem,
   RegistryHint,
 } from "../ipc/protocol.js";
+import type { RegistryHintRefreshStatus } from "./packageJsonState.js";
+
+type PackageJsonRefreshStateFields = {
+  registryHintRefreshStatus?: RegistryHintRefreshStatus;
+  registryHintRefreshError?: string | null;
+};
+
+type PackageJsonMergeState = PackageJsonDependencyAnalysisItem & PackageJsonRefreshStateFields;
 
 export const mergePackageJsonAnalysisPartial = (
-  currentStates: readonly PackageJsonDependencyAnalysisItem[],
+  currentStates: readonly PackageJsonMergeState[],
   partial: AnalyzePackageJsonResponse,
-): PackageJsonDependencyAnalysisItem[] => {
+): PackageJsonMergeState[] => {
   if (!partial.indexes) {
     return mergePackageJsonFinalStates(currentStates, partial.states);
   }
@@ -34,9 +42,9 @@ export const mergePackageJsonAnalysisPartial = (
 };
 
 export const mergePackageJsonFinalStates = (
-  currentStates: readonly PackageJsonDependencyAnalysisItem[],
+  currentStates: readonly PackageJsonMergeState[],
   finalStates: readonly PackageJsonDependencyAnalysisItem[],
-): PackageJsonDependencyAnalysisItem[] =>
+): PackageJsonMergeState[] =>
   finalStates.map((incoming, index) => mergePackageJsonState(currentStates[index], incoming));
 
 export const markPackageJsonLoadingUnavailable = (
@@ -53,9 +61,9 @@ export const markPackageJsonLoadingUnavailable = (
       : state);
 
 const mergePackageJsonState = (
-  current: PackageJsonDependencyAnalysisItem | undefined,
+  current: PackageJsonMergeState | undefined,
   incoming: PackageJsonDependencyAnalysisItem,
-): PackageJsonDependencyAnalysisItem => {
+): PackageJsonMergeState => {
   if (!current) {
     return incoming;
   }
@@ -65,10 +73,12 @@ const mergePackageJsonState = (
   return {
     ...incoming,
     registryHint,
+    registryHintRefreshStatus: current.registryHintRefreshStatus,
+    registryHintRefreshError: current.registryHintRefreshError,
   };
 };
 
-const newerRegistryHint = (
+export const newerRegistryHint = (
   current: RegistryHint | null | undefined,
   incoming: RegistryHint | null | undefined,
 ): RegistryHint | null | undefined => {

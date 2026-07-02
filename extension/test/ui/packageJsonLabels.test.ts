@@ -221,6 +221,20 @@ test("packageJsonSectionSummaryLabel totals measured dependencies and problem co
   );
 });
 
+test("packageJsonDependencyVersionStatusLabel marks stale cached registry hints", () => {
+  const label = packageJsonDependencyVersionStatusLabel({
+    name: "react",
+    section: "dependencies",
+    status: "ready",
+    installedVersion: "18.2.0",
+    registryHint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+    registryHintRefreshStatus: "stale",
+    registryHintRefreshError: "temporary registry failure",
+  });
+
+  assert.equal(label, "stale · update 19.0.0");
+});
+
 test("packageJsonSectionSummaryLabel shows checking state before measurements arrive", () => {
   const states: PackageJsonDependencyHintState[] = [
     { name: "react", section: "dependencies", status: "loading" },

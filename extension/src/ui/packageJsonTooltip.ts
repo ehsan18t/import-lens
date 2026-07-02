@@ -95,6 +95,14 @@ const registryDetailsMarkdown = (
     details.push("✦ New release under 24h");
   }
 
+  if (state.registryHintRefreshStatus === "stale") {
+    details.push("$(warning) Showing cached registry data because the latest refresh failed");
+  }
+
+  if (state.registryHintRefreshError) {
+    details.push(`Refresh error: ${state.registryHintRefreshError}`);
+  }
+
   return details;
 };
 

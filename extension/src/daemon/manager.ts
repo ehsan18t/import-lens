@@ -24,6 +24,8 @@ import type {
   FileSizeDocumentResponse,
   FileSizeRequest,
   FileSizeResponse,
+  RefreshRegistryHintsRequest,
+  RefreshRegistryHintsResponse,
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import type { Logger } from "../logging/types.js";
@@ -101,6 +103,13 @@ export class DaemonManager implements vscode.Disposable {
 
   removeCache(request: CacheRemoveRequest): Promise<CacheRemoveResponse | null> {
     return this.#transport.removeCache(request);
+  }
+
+  refreshRegistryHints(
+    request: RefreshRegistryHintsRequest,
+    onPartial?: (response: RefreshRegistryHintsResponse) => void,
+  ): Promise<RefreshRegistryHintsResponse | null> {
+    return this.#transport.refreshRegistryHints(request, onPartial);
   }
 
   invalidatePackage(packageName: string): void {

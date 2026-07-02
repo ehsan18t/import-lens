@@ -32,6 +32,8 @@ import type {
   FileSizeRequest,
   FileSizeResponse,
   HelloMessage,
+  RefreshRegistryHintsRequest,
+  RefreshRegistryHintsResponse,
 } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import type { Logger } from "../logging/types.js";
@@ -442,6 +444,19 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     this.#logger.info(`Requesting cache removal ${request.request_id} with scope ${request.scope}.`);
     return this.#client.requestCacheRemove(request);
+  }
+
+  async refreshRegistryHints(
+    request: RefreshRegistryHintsRequest,
+    onPartial?: (response: RefreshRegistryHintsResponse) => void,
+  ): Promise<RefreshRegistryHintsResponse | null> {
+    if (!this.#client || this.#state !== "ready") {
+      this.#logger.warn(`Registry hint refresh ${request.request_id} skipped because daemon is ${this.#state}.`);
+      return null;
+    }
+
+    this.#logger.debug(`Requesting registry hint refresh ${request.request_id} for ${request.targets.length} package(s).`);
+    return this.#client.requestRefreshRegistryHints(request, 30000, onPartial);
   }
 
   invalidatePackage(packageName: string): void {

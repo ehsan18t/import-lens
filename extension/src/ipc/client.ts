@@ -26,6 +26,8 @@ import type {
   FileSizeDocumentResponse,
   FileSizeRequest,
   FileSizeResponse,
+  RefreshRegistryHintsRequest,
+  RefreshRegistryHintsResponse,
 } from "./protocol.js";
 import type { Logger } from "../logging/types.js";
 import { FrameDecoder, encodeFrame } from "./codec.js";
@@ -53,6 +55,13 @@ interface PendingRequest<TResponse> {
   reject: (error: Error) => void;
 }
 
+interface PendingRegistryHintRefreshRequest {
+  resolve: (response: RefreshRegistryHintsResponse) => void;
+  reject: (error: Error) => void;
+  onPartial?: (response: RefreshRegistryHintsResponse) => void;
+  resetTimeout: () => void;
+}
+
 export class IpcClient extends EventEmitter {
   readonly #socket: net.Socket;
   readonly #decoder = new FrameDecoder();
@@ -68,6 +77,7 @@ export class IpcClient extends EventEmitter {
   readonly #cacheCleanupPending = new Map<number, PendingRequest<CacheCleanupResponse>>();
   readonly #cacheListPending = new Map<number, PendingRequest<CacheListResponse>>();
   readonly #cacheRemovePending = new Map<number, PendingRequest<CacheRemoveResponse>>();
+  readonly #registryHintRefreshPending = new Map<number, PendingRegistryHintRefreshRequest>();
   readonly #logger?: Pick<Logger, "debug" | "warn">;
   #closed = false;
   #disposed = false;
@@ -190,6 +200,47 @@ export class IpcClient extends EventEmitter {
         },
         reject: (error) => {
           clearTimeout(timer);
+          reject(error);
+        },
+        onPartial,
+        resetTimeout,
+      });
+      this.send(request);
+    });
+  }
+
+  requestRefreshRegistryHints(
+    request: RefreshRegistryHintsRequest,
+    timeoutMs = 30000,
+    onPartial?: (response: RefreshRegistryHintsResponse) => void,
+  ): Promise<RefreshRegistryHintsResponse> {
+    return new Promise((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+
+      const resetTimeout = (): void => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        timer = setTimeout(() => {
+          if (this.#registryHintRefreshPending.has(request.request_id)) {
+            this.#registryHintRefreshPending.delete(request.request_id);
+            reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
+          }
+        }, timeoutMs);
+      };
+
+      resetTimeout();
+      this.#registryHintRefreshPending.set(request.request_id, {
+        resolve: (response) => {
+          if (timer) {
+            clearTimeout(timer);
+          }
+          resolve(response);
+        },
+        reject: (error) => {
+          if (timer) {
+            clearTimeout(timer);
+          }
           reject(error);
         },
         onPartial,
@@ -366,6 +417,24 @@ export class IpcClient extends EventEmitter {
         continue;
       }
 
+      if (isRefreshRegistryHintsResponse(message)) {
+        const pending = this.#registryHintRefreshPending.get(message.request_id);
+
+        if (!pending) {
+          continue;
+        }
+
+        if (isRegistryHintRefreshPartial(message)) {
+          pending.resetTimeout();
+          pending.onPartial?.(message);
+          continue;
+        }
+
+        this.#registryHintRefreshPending.delete(message.request_id);
+        pending.resolve(message);
+        continue;
+      }
+
       if (isAnalyzeDocumentResponse(message)) {
         if (this.#resolvePending(this.#documentPending, message)) {
           continue;
@@ -472,6 +541,11 @@ export class IpcClient extends EventEmitter {
       pending.reject(error);
     }
 
+    for (const pending of this.#registryHintRefreshPending.values()) {
+      pending.reject(error);
+    }
+    this.#registryHintRefreshPending.clear();
+
     this.#batchPending.clear();
     this.#documentPending.clear();
     this.#packageJsonPending.clear();
@@ -510,6 +584,31 @@ const isStreamingPartial = (response: BatchResponse): boolean =>
   Array.isArray(response.indexes) && response.indexes.length > 0;
 
 const isPackageJsonStreamingPartial = (response: AnalyzePackageJsonResponse): boolean =>
+  Array.isArray(response.indexes) && response.indexes.length > 0;
+
+const isRefreshRegistryHintsResponse = (value: unknown): value is RefreshRegistryHintsResponse => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<RefreshRegistryHintsResponse>;
+  return (
+    typeof candidate.version === "number" &&
+    typeof candidate.request_id === "number" &&
+    Array.isArray(candidate.results) &&
+    candidate.results.every((result) =>
+      !!result &&
+      typeof result === "object" &&
+      !!(result as { target?: unknown }).target &&
+      typeof ((result as { target: { name?: unknown } }).target.name) === "string") &&
+    (candidate.indexes === undefined ||
+      (Array.isArray(candidate.indexes) && candidate.indexes.every((index) => typeof index === "number"))) &&
+    (candidate.error === null || typeof candidate.error === "string") &&
+    Array.isArray(candidate.diagnostics)
+  );
+};
+
+const isRegistryHintRefreshPartial = (response: RefreshRegistryHintsResponse): boolean =>
   Array.isArray(response.indexes) && response.indexes.length > 0;
 
 const isAnalyzeDocumentResponse = (value: unknown): value is AnalyzeDocumentResponse => {

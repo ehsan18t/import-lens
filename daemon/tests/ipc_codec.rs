@@ -104,8 +104,8 @@ fn import_request_defaults_missing_runtime_to_component() {
 }
 
 #[test]
-fn client_message_decodes_daemon_first_v6_requests() {
-    assert_eq!(PROTOCOL_VERSION, 6);
+fn client_message_decodes_daemon_first_v7_requests() {
+    assert_eq!(PROTOCOL_VERSION, 7);
     assert!(matches!(
         decode_client_message(serde_json::json!({
             "type": "analyze_document",
@@ -170,6 +170,16 @@ fn client_message_decodes_daemon_first_v6_requests() {
             "package_json_paths": ["C:/workspace/node_modules/tiny-lib/package.json"]
         })),
         ClientMessage::NodeModulesChanged(_),
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "refresh_registry_hints",
+            "version": PROTOCOL_VERSION,
+            "request_id": 6,
+            "targets": [{"name": "react", "installedVersion": "18.2.0"}],
+            "mode": "refresh_stale"
+        })),
+        ClientMessage::RefreshRegistryHints(_),
     ));
 }
 

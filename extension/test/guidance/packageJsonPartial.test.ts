@@ -105,6 +105,31 @@ test("mergePackageJsonAnalysisPartial ignores stale indexes and mismatched packa
   assert.deepEqual(mergePackageJsonAnalysisPartial(current, partial), current);
 });
 
+test("mergePackageJsonAnalysisPartial preserves stale registry refresh status", () => {
+  const current = [{
+    ...stateFor("react", "ready"),
+    registryHint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+    registryHintRefreshStatus: "stale" as const,
+    registryHintRefreshError: "temporary registry failure",
+  }];
+  const partial: AnalyzePackageJsonResponse = {
+    version: 7,
+    request_id: 9,
+    sections: [],
+    states: [{
+      ...stateFor("react", "ready"),
+      result: resultFor("react"),
+    }],
+    error: null,
+    diagnostics: [],
+  };
+
+  const merged = mergePackageJsonAnalysisPartial(current, partial);
+
+  assert.equal(merged[0]?.registryHintRefreshStatus, "stale");
+  assert.equal(merged[0]?.registryHintRefreshError, "temporary registry failure");
+});
+
 test("markPackageJsonLoadingUnavailable preserves completed states and marks only loading states", () => {
   const ready = {
     ...stateFor("react", "ready"),

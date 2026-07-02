@@ -37,28 +37,33 @@ export const packageJsonDependencyVersionStatusSuffix = (
   const { registryHint } = state;
 
   if (!registryHint?.latestVersion) {
-    return { suffix: null, suffixTone: null };
+    return state.registryHintRefreshStatus === "stale"
+      ? { suffix: "registry stale", suffixTone: "stale" }
+      : { suffix: null, suffixTone: null };
   }
+
+  let suffix: string | null = null;
+  let suffixTone: PackageJsonSuffixTone | null = null;
 
   if (state.status === "missing") {
+    suffix = `install ${registryHint.latestVersion}`;
+    suffixTone = "install";
+  } else if (registryHint.isLatest === true) {
+    suffix = "latest";
+    suffixTone = "latest";
+  } else if (registryHint.isLatest === false) {
+    suffix = `update ${registryHint.latestVersion}`;
+    suffixTone = "update";
+  }
+
+  if (state.registryHintRefreshStatus === "stale") {
     return {
-      suffix: `install ${registryHint.latestVersion}`,
-      suffixTone: "install",
+      suffix: suffix ? `stale · ${suffix}` : "registry stale",
+      suffixTone: "stale",
     };
   }
 
-  if (registryHint.isLatest === true) {
-    return { suffix: "latest", suffixTone: "latest" };
-  }
-
-  if (registryHint.isLatest === false) {
-    return {
-      suffix: `update ${registryHint.latestVersion}`,
-      suffixTone: "update",
-    };
-  }
-
-  return { suffix: null, suffixTone: null };
+  return { suffix, suffixTone };
 };
 
 export const packageJsonDependencyVersionStatusLabel = (

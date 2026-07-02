@@ -241,6 +241,25 @@ test("packageJsonDependencyTooltipMarkdown includes type-only status", () => {
   assert.doesNotMatch(markdown, /0 B br · types only/u);
 });
 
+test("packageJsonDependencyTooltipMarkdown explains stale cached registry data", () => {
+  const markdown = packageJsonDependencyTooltipMarkdown(
+    {
+      name: "react",
+      section: "dependencies",
+      status: "ready",
+      installedVersion: "18.2.0",
+      registryHint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+      registryHintRefreshStatus: "stale",
+      registryHintRefreshError: "temporary registry failure",
+    },
+    config({ enableRegistryHints: true }),
+    { formatFetchedAt: () => "cached-time" },
+  );
+
+  assert.match(markdown, /\$\(warning\) Showing cached registry data/);
+  assert.match(markdown, /Refresh error: temporary registry failure/);
+});
+
 test("tooltipForResultMarkdown keeps normal import hover free of package registry details", () => {
   const markdown = tooltipForResultMarkdown(result(), config());
 

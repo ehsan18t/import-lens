@@ -1,7 +1,7 @@
 use crate::document::{PackageJsonDependencyEntry, PackageJsonDependencySection};
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -281,6 +281,55 @@ pub struct PackageJsonDependencyAnalysisItem {
     pub result: Option<ImportResult>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryHintMode {
+    Off,
+    Cached,
+    RefreshStale,
+    ForceRefresh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryHintTarget {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryHintResult {
+    pub target: RegistryHintTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<RegistryHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshRegistryHintsRequest {
+    #[serde(rename = "type")]
+    #[serde(default = "refresh_registry_hints_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub request_id: u64,
+    pub targets: Vec<RegistryHintTarget>,
+    pub mode: RegistryHintMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshRegistryHintsResponse {
+    pub version: u32,
+    pub request_id: u64,
+    pub results: Vec<RegistryHintResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexes: Option<Vec<usize>>,
+    pub error: Option<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalyzePackageJsonRequest {
     #[serde(rename = "type")]
@@ -299,6 +348,8 @@ pub struct AnalyzePackageJsonRequest {
     pub force_registry_refresh: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_section: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_hint_mode: Option<RegistryHintMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,6 +629,7 @@ pub enum ClientMessage {
     CacheCleanup(CacheCleanupRequest),
     CacheList(CacheListRequest),
     CacheRemove(CacheRemoveRequest),
+    RefreshRegistryHints(RefreshRegistryHintsRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -607,6 +659,7 @@ enum TypedClientMessage {
     CacheCleanup(CacheCleanupRequest),
     CacheList(CacheListRequest),
     CacheRemove(CacheRemoveRequest),
+    RefreshRegistryHints(RefreshRegistryHintsRequest),
     Shutdown(ShutdownMessage),
 }
 
@@ -661,6 +714,9 @@ impl From<TypedClientMessage> for ClientMessage {
             TypedClientMessage::CacheCleanup(message) => Self::CacheCleanup(message),
             TypedClientMessage::CacheList(message) => Self::CacheList(message),
             TypedClientMessage::CacheRemove(message) => Self::CacheRemove(message),
+            TypedClientMessage::RefreshRegistryHints(message) => {
+                Self::RefreshRegistryHints(message)
+            }
             TypedClientMessage::Shutdown(message) => Self::Shutdown(message),
         }
     }
@@ -753,4 +809,8 @@ fn cache_remove_message_type() -> String {
 
 fn shutdown_message_type() -> String {
     "shutdown".to_owned()
+}
+
+fn refresh_registry_hints_message_type() -> String {
+    "refresh_registry_hints".to_owned()
 }

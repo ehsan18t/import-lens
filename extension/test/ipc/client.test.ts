@@ -26,7 +26,10 @@ import type {
   ImportResult,
   PackageJsonDependencyAnalysisItem,
   PackageJsonDependencyEntry,
+  RefreshRegistryHintsRequest,
+  RefreshRegistryHintsResponse,
 } from "../../src/ipc/protocol.js";
+import { protocolVersion } from "../../src/ipc/protocol.js";
 
 const testPipeName = (): string => {
   const unique = `import-lens-ipc-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -181,6 +184,14 @@ const packageJsonState = (
   status,
   installedVersion: "1.0.0",
   result: status === "ready" ? emptyResult(name) : undefined,
+});
+
+const registryRefreshRequest = (requestId: number): RefreshRegistryHintsRequest => ({
+  type: "refresh_registry_hints",
+  version: protocolVersion,
+  request_id: requestId,
+  targets: [{ name: "react", installedVersion: "18.2.0" }],
+  mode: "refresh_stale",
 });
 
 test("IpcClient.dispose does not emit disconnect for intentional disposal", async () => {
@@ -431,6 +442,95 @@ test("IpcClient ignores stale package.json partials for other request IDs", asyn
     assert.equal(response.request_id, 199);
     assert.equal(response.states.length, 1);
     assert.equal(partials.length, 0);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+test("IpcClient routes registry hint refresh responses by request id", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const final: RefreshRegistryHintsResponse = {
+    version: protocolVersion,
+    request_id: 45,
+    results: [{
+      target: { name: "react", installedVersion: "18.2.0" },
+      hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+      error: null,
+    }],
+    error: null,
+    diagnostics: [],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    setTimeout(() => socket.write(encodeFrame(final)), 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const response = await client.requestRefreshRegistryHints(registryRefreshRequest(45));
+
+    assert.equal(response.results[0]?.hint?.latestVersion, "19.0.0");
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+test("IpcClient delivers registry hint refresh partials before final response", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const partial: RefreshRegistryHintsResponse = {
+    version: protocolVersion,
+    request_id: 46,
+    results: [{
+      target: { name: "react", installedVersion: "18.2.0" },
+      hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+      error: null,
+    }],
+    indexes: [0],
+    error: null,
+    diagnostics: [],
+  };
+  const final: RefreshRegistryHintsResponse = {
+    version: protocolVersion,
+    request_id: 46,
+    results: [{
+      target: { name: "react", installedVersion: "18.2.0" },
+      hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+      error: null,
+    }],
+    error: null,
+    diagnostics: [],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    setTimeout(() => {
+      socket.write(encodeFrame(partial));
+      socket.write(encodeFrame(final));
+    }, 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const partials: RefreshRegistryHintsResponse[] = [];
+    const response = await client.requestRefreshRegistryHints(
+      registryRefreshRequest(46),
+      30000,
+      (item) => partials.push(item),
+    );
+
+    assert.deepEqual(partials[0]?.indexes, [0]);
+    assert.equal(response.results[0]?.hint?.latestVersion, "19.0.0");
     client.dispose();
   } finally {
     destroySockets(sockets);

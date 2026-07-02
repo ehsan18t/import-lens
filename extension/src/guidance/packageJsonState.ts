@@ -2,6 +2,8 @@ import type { ImportResult, PackageJsonDependencySectionName, RegistryHint } fro
 
 export type PackageJsonDependencyHintStatus = "loading" | "ready" | "missing" | "unavailable";
 
+export type RegistryHintRefreshStatus = "fresh" | "stale";
+
 export interface PackageJsonDependencyHintState {
   name: string;
   section: PackageJsonDependencySectionName;
@@ -9,4 +11,6 @@ export interface PackageJsonDependencyHintState {
   installedVersion?: string;
   result?: ImportResult;
   registryHint?: RegistryHint | null;
+  registryHintRefreshStatus?: RegistryHintRefreshStatus;
+  registryHintRefreshError?: string | null;
 }

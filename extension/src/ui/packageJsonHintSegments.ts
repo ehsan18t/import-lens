@@ -19,6 +19,10 @@ const suffixInlineTone = (tone: PackageJsonSuffixTone): InlineHintSegment["tone"
     return "info";
   }
 
+  if (tone === "stale") {
+    return "caution";
+  }
+
   return "action";
 };
 

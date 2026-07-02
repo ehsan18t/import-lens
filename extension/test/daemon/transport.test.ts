@@ -25,7 +25,10 @@ import type {
   FileSizeDocumentResponse,
   FileSizeRequest,
   FileSizeResponse,
+  RefreshRegistryHintsRequest,
+  RefreshRegistryHintsResponse,
 } from "../../src/ipc/protocol.js";
+import { protocolVersion } from "../../src/ipc/protocol.js";
 import { TransportCoordinator, type AnalysisTransport, type DaemonState } from "../../src/daemon/transport.js";
 
 class FakeTransport implements AnalysisTransport {
@@ -219,6 +222,30 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
+  async refreshRegistryHints(
+    request: RefreshRegistryHintsRequest,
+    onPartial?: (response: RefreshRegistryHintsResponse) => void,
+  ): Promise<RefreshRegistryHintsResponse> {
+    this.calls.push(`registryHints:${request.request_id}`);
+    const partial: RefreshRegistryHintsResponse = {
+      version: request.version,
+      request_id: request.request_id,
+      indexes: [0],
+      results: [{
+        target: request.targets[0]!,
+        hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+        error: null,
+      }],
+      error: null,
+      diagnostics: [],
+    };
+    onPartial?.(partial);
+    return {
+      ...partial,
+      indexes: undefined,
+    };
+  }
+
   invalidatePackage(packageName: string): void {
     this.calls.push(`invalidate:${packageName}`);
   }
@@ -315,6 +342,10 @@ class SlowReadyTransport implements AnalysisTransport {
   }
 
   async removeCache(): Promise<CacheRemoveResponse | null> {
+    return null;
+  }
+
+  async refreshRegistryHints(): Promise<RefreshRegistryHintsResponse | null> {
     return null;
   }
 
@@ -428,6 +459,25 @@ test("TransportCoordinator emits active transport state changes", async () => {
 
   assert.deepEqual(states, ["ready", "unavailable", "ready", "unavailable"]);
   assert.equal(coordinator.state, "unavailable");
+});
+
+test("TransportCoordinator forwards registry refresh partial callbacks", async () => {
+  const transport = new FakeTransport("ready");
+  const coordinator = new TransportCoordinator([transport]);
+  const partials: RefreshRegistryHintsResponse[] = [];
+
+  await coordinator.start("/workspace");
+  const response = await coordinator.refreshRegistryHints({
+    type: "refresh_registry_hints",
+    version: protocolVersion,
+    request_id: 88,
+    targets: [{ name: "react", installedVersion: "18.2.0" }],
+    mode: "refresh_stale",
+  }, (partial) => partials.push(partial));
+
+  assert.deepEqual(transport.calls, ["start:/workspace", "registryHints:88"]);
+  assert.equal(partials.length, 1);
+  assert.equal(response?.results[0]?.hint?.latestVersion, "19.0.0");
 });
 
 const batch = (requestId: number): BatchRequest => ({

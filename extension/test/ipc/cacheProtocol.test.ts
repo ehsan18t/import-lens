@@ -10,8 +10,8 @@ import {
   type HelloMessage,
 } from "../../src/ipc/protocol.js";
 
-test("cache management protocol uses protocol version 6", () => {
-  assert.equal(protocolVersion, 6);
+test("cache management protocol uses protocol version 7", () => {
+  assert.equal(protocolVersion, 7);
 });
 
 test("hello message carries cache policy fields", () => {

@@ -1,4 +1,4 @@
-export const protocolVersion = 6;
+export const protocolVersion = 7;
 
 export type ImportKind = "named" | "default" | "namespace" | "dynamic";
 
@@ -163,6 +163,36 @@ export interface RegistryHint {
   fetchedAt?: number;
 }
 
+export type RegistryHintMode = "off" | "cached" | "refresh_stale" | "force_refresh";
+
+export interface RegistryHintTarget {
+  name: string;
+  installedVersion?: string;
+}
+
+export interface RegistryHintResult {
+  target: RegistryHintTarget;
+  hint?: RegistryHint | null;
+  error?: string | null;
+}
+
+export interface RefreshRegistryHintsRequest {
+  type: "refresh_registry_hints";
+  version: number;
+  request_id: number;
+  targets: RegistryHintTarget[];
+  mode: "refresh_stale" | "force_refresh";
+}
+
+export interface RefreshRegistryHintsResponse {
+  version: number;
+  request_id: number;
+  results: RegistryHintResult[];
+  indexes?: number[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+
 export type PackageJsonDependencySectionName =
   | "dependencies"
   | "devDependencies"
@@ -206,6 +236,7 @@ export interface AnalyzePackageJsonRequest {
   include_registry_hints?: boolean;
   force_registry_refresh?: boolean;
   refresh_section?: PackageJsonDependencySectionName;
+  registry_hint_mode?: RegistryHintMode;
 }
 
 export interface AnalyzePackageJsonResponse {
@@ -407,6 +438,7 @@ export type ClientMessage =
   | HelloMessage
   | AnalyzeDocumentRequest
   | AnalyzePackageJsonRequest
+  | RefreshRegistryHintsRequest
   | AnalyzeSpecifiersRequest
   | BatchRequest
   | CacheInvalidateMessage
