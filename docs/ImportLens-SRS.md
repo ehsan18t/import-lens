@@ -356,7 +356,7 @@ The extension must retain the detected import syntax category (`static`, `reexpo
 
 **FR-013b** (High) - Protocol v2+ clients may request streaming batch responses by setting `BatchRequest.streaming: true`. In streaming mode, the daemon must emit partial `BatchResponse` frames as import results become available and set `BatchResponse.indexes` to the zero-based import indexes represented by that frame. The IPC server must write each partial frame to the socket while the rest of the batch is still computing; it must not buffer all partials in memory and flush them only after the final result is ready. This index list is required because duplicate specifiers can appear multiple times in one file. A final full-batch `BatchResponse` with shared-byte annotations must still be emitted for compatibility with existing request-state handling. Protocol v1 clients and v2+ clients without `streaming: true` receive only a full batch response.
 
-**FR-013c** (High) - Protocol v5 and newer clients may request streaming `package.json` dependency analysis by setting `AnalyzePackageJsonRequest.streaming: true`. In streaming mode, the daemon must emit an initial partial `AnalyzePackageJsonResponse` with `indexes` covering every dependency entry and `status: "loading"` for dependencies whose installed package version was resolved but whose size is still computing. Dependencies that cannot be resolved may be emitted as `status: "missing"` in the same initial partial. As each package size result becomes available, the daemon must emit an indexed partial response for that dependency. The final `AnalyzePackageJsonResponse` must omit `indexes` and contain complete size states, including shared-byte annotations where applicable. The extension host must merge indexed partials without overwriting newer extension-side registry hints.
+**FR-013c** (High) - Protocol v5 and newer clients may request streaming `package.json` dependency analysis by setting `AnalyzePackageJsonRequest.streaming: true`. In streaming mode, the daemon must emit an initial partial `AnalyzePackageJsonResponse` with `indexes` covering every dependency entry and `status: "loading"` for dependencies whose installed package version was resolved but whose size is still computing. Dependencies that cannot be resolved may be emitted as `status: "missing"` in the same initial partial. As each package size result becomes available, the daemon must emit an indexed partial response for that dependency. The final `AnalyzePackageJsonResponse` must omit `indexes` and contain complete size states, including shared-byte annotations where applicable. The extension host must merge indexed partials without overwriting newer daemon-provided registry hints.
 
 **FR-014** (High) - On socket disconnect, the extension must discard any stale MessagePack payloads currently in the receive buffer and wait for the next document change event to trigger a fresh request cycle.
 
@@ -476,7 +476,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 **FR-036k** (Medium) - The extension must offer curated import substitution suggestions through CodeActions using only a local mapping file. Suggestions may copy or show alternatives and size context, but must not rewrite source automatically.
 
-**FR-036l** (Medium) - When `importLens.enableRegistryHints` is enabled, the extension host may fetch npm metadata for registry-based hints. The setting must default to `true`; registry network work must never run inside the daemon and must never block size computation or package.json analysis. The controller must render cached registry hints immediately on `package.json` open, including stale successful hints when no fresh value is available, then refresh missing or stale metadata automatically in the background. Background and manual refreshes must use the same throttled queue: default concurrency 8, default rate limit 20 requests per 1,000 ms, in-flight de-duplication by package name plus installed version, short per-request timeout around 3 seconds, transient retry with jitter, `Retry-After` handling for npm `429` responses, and cached retry windows after transient failures. Positive, negative, and transient-error states must be cached in VS Code globalState and session memory. Registry failures must fail silently without affecting size computation. Package dependency hovers must expose a trusted refresh action that bypasses the registry hint cache for that one package only while still using the shared queue/rate-limit path. Dependency summary hovers must expose a trusted refresh action that bypasses the registry hint cache for all dependencies represented by that summary, again using the shared queue/rate-limit path.
+**FR-036l** (Medium) - When `importLens.enableRegistryHints` is enabled, the daemon performs all npm registry fetches for registry-based hints via the protocol v7 `RefreshRegistryHintsRequest`. The setting must default to `true`; the extension host must never call the npm registry directly and registry work must never block size computation or package.json analysis. The extension host only requests refreshes and renders the returned results. The controller must render cached registry hints immediately on `package.json` open, including stale successful hints when no fresh value is available, then request a `refresh_stale` mode refresh for missing or stale metadata automatically in the background. Automatic and manual refreshes must use the daemon's shared refresh path: bounded concurrency, shared interval rate limiting, package-level in-flight de-duplication, short per-request timeouts, hard retry limits, `Retry-After` handling for npm `429` responses, and cached retry windows after transient failures. Positive, negative, and transient-error states are cached in the daemon's centralized package metadata cache under the extension-managed daemon cache base. Registry failures must fail silently without affecting size computation. Package dependency hovers must expose a trusted refresh action that sends a `force_refresh` mode request for that one package only while still using the daemon's shared concurrency/rate-limit path. Dependency summary hovers must expose a trusted refresh action that sends a `force_refresh` mode request for all dependencies represented by that summary, again using the daemon's shared concurrency/rate-limit path.
 
 **FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost end-of-line decorations for dependency blocks using local package resolution and daemon-owned size requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from a decoration refresh handler. The package.json controller must request daemon streaming so dependency rows appear as soon as entries are parsed and package resolution completes, then update individual rows incrementally as package size results and registry hints arrive. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. A daemon timeout or failure after partial responses must preserve completed states and mark only remaining `checking...` rows unavailable. Each dependency block should also expose a compact measured/total summary when analysis state is available. Dependency hovers must show the individual registry fetched time when available. Summary hovers must show the oldest registry fetched time across represented dependencies, or state that some registry info has not been fetched yet. Inline decorations must use independent primary and suffix colors: primary text (size, `types only`, `checking...`, or `unavailable`) uses `descriptionForeground` except `unavailable`, which uses `list.errorForeground`; registry suffixes (`latest`, `update`, `install`) use `gitDecoration.addedResourceForeground` and `gitDecoration.modifiedResourceForeground` respectively, rendered in italic, and may appear even when sizing is unavailable. Section summaries use muted foreground only.
 
@@ -485,6 +485,8 @@ The virtual entry must never use `console.log` or any pattern that can be static
 **FR-036o** (Medium) - The extension must provide a static SVG history panel generated from existing bundle impact history data. The webview must keep scripts disabled.
 
 **FR-036p** (Medium) - The extension must support `.importlensignore` using gitignore-style package, path, and import-pattern rules to suppress analysis and decorations for matching imports.
+
+**FR-036q** (High) - The daemon must own workspace report source scanning and report data aggregation. The extension host may request a workspace report for a workspace root and render the returned report model, but it must not enumerate/open every source file or rebuild duplicate-import/shared-module summaries itself. The request carries the editor's current report budgets so per-import and per-file budget warnings remain user-configurable while the aggregation stays daemon-owned. The daemon scan is read-only, limited to supported source extensions, and skips `node_modules`, `dist`, `build`, `out`, and `coverage` directories.
 
 ### 5.7 Configuration
 
@@ -503,7 +505,7 @@ The virtual entry must never use `console.log` or any pattern that can be static
 | `importLens.cacheMaxSizeMB`  | number  | `512`       | Maximum total disk space for ImportLens project cache shards before least-recently-used cleanup          |
 | `importLens.cacheMaxAgeDays` | number  | `30`        | Maximum inactive age for project cache shards before cleanup removes them                                |
 | `importLens.budgets`         | object  | `{}`        | Optional per-import and per-file Brotli thresholds for diagnostics and CLI checks                         |
-| `importLens.enableRegistryHints` | boolean | `true`   | Enable short-timeout npm metadata hints cached in globalState and session memory                         |
+| `importLens.enableRegistryHints` | boolean | `true`   | Enable short-timeout npm metadata hints cached in the daemon's centralized package metadata cache        |
 | `importLens.logLevel`        | enum    | `info`      | Logging verbosity for the ImportLens output channel. Options: `error`, `warn`, `info`, `debug`           |
 
 ### 5.8 Daemon Lifecycle
@@ -604,7 +606,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 ### 7.4 Security
 
-**NFR-011** (Critical) - The daemon must make no outbound network connections. All module resolution must be performed against the local `node_modules` directory only.
+**NFR-011** (Critical) - The daemon must make no outbound network connections during import size computation, package resolution, module graph construction, tree-shaking, minification, compression, cache lookup, or cache invalidation. The only permitted outbound network path is the registry-hint refresh endpoint, which may call the public npm registry when `importLens.enableRegistryHints` is enabled and a client explicitly requests stale or forced registry refresh. Registry refresh must use centralized package metadata caching, short timeouts, bounded concurrency, shared interval rate limiting, package-level in-flight de-duplication, retry-after handling, hard retry limits, cached retry windows for automatic refresh, manual refresh cache bypass, and stale-cache fallback. Each package failure must be logged and returned as a per-package nullable registry hint result without failing the whole refresh request. A result with both `hint` and `error` means cached metadata is being returned after live refresh failed. Registry refresh must stream partial responses as individual packages finish and must not affect import size computation.
 
 **NFR-012** (Critical) - The daemon must operate exclusively via static AST analysis and is prohibited from executing any code found within third-party packages. No subprocess execution, `eval`, dynamic loading, or script interpretation of package contents is permitted under any circumstance.
 
@@ -626,7 +628,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 ### 7.6 Extensibility
 
-**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v6 is the current native protocol and adds cache policy fields plus cache status, cleanup, list, and remove endpoints on top of v5 daemon-first document, package.json, package.json streaming partials, raw specifier, current-file size, named-export completion, and node_modules change endpoints; v4 confidence metadata; v3 runtime-aware imports; and v2 streaming batch responses, export enumeration, file-level shared sizing, module breakdowns, and per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse`, v2 request, v3 request, v4 request, and v5 request compatibility must be preserved where the missing fields have safe defaults.
+**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v7 is the current native protocol and adds daemon-owned registry refresh and workspace report endpoints on top of v6 cache policy fields, cache status/cleanup/list/remove endpoints, v5 daemon-first document/package.json/package.json streaming partials/raw specifier/current-file size/named-export completion/node_modules change endpoints, v4 confidence metadata, v3 runtime-aware imports, and v2 streaming batch responses/export enumeration/file-level shared sizing/module breakdowns/per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Protocol v1 full-batch `BatchRequest`/`BatchResponse`, v2 request, v3 request, v4 request, v5 request, and v6 request compatibility must be preserved where the missing fields have safe defaults.
 
 ---
 
@@ -664,7 +666,7 @@ The following criteria constitute the definition of done for the v1.0 release. A
 | IPC encoding  | `@msgpack/msgpack`                                | Payloads typically 20-40% smaller than JSON; meaningful improvement for batch responses of 20+ imports                                                                                                                                        |
 | IPC transport | Unix socket (macOS/Linux) or Named pipe (Windows) | Multiplexed, no stdout pollution                                                                                                                                                                                                              |
 | File watching | `vscode.workspace.createFileSystemWatcher`        | Native VS Code API; manages inotify/FSEvents limits safely across all extensions; used to detect package.json changes in node_modules and trigger daemon cache invalidation                                                                   |
-| Registry queue | `p-queue` + native `fetch`                       | Extension-host npm registry refresh uses bounded concurrency, interval rate limits, in-flight de-duplication, timeout, retry, and `Retry-After` handling without occupying daemon IPC analysis work                                           |
+| Registry queue | Daemon-owned queue (v7+)                        | Daemon npm registry refresh uses bounded concurrency, interval rate limits, in-flight de-duplication, timeout, retry, and `Retry-After` handling; `p-queue` will be removed from runtime dependencies in a future task                         |
 | Telemetry     | `vscode.env.createTelemetryLogger` (v1.1 target)  | Anonymised usage telemetry (cache hit rate, tier distribution, recycle frequency). Opt-out respects VS Code global telemetry setting. Instrumentation scaffolding may be added in v1.0 with reporting deferred to v1.1.                       |
 
 ### 9.2 Rust Daemon
@@ -731,7 +733,7 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 | Package                              | Current Resolved Version | Category                               | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------------ | ---------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `@msgpack/msgpack`                   | 3.1.3            | `dependency`                           | MessagePack encode/decode.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `p-queue`                            | 9.3.0            | `dependency`                           | Registry metadata refresh queue with concurrency and interval rate limits; keeps npm fetch work out of daemon analysis and prevents duplicate in-flight requests.                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `p-queue`                            | 9.3.0            | `dependency`                           | Registry metadata refresh queue; will be removed from runtime dependencies in a future task when daemon-owned registry refresh is fully implemented (protocol v7).                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `tsdown`                             | 0.22.1           | `devDependency`                        | Rolldown-based bundler. Output: single-file `extension.js`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `typescript`                         | 6.0.3            | `devDependency`                        | Bridge release to TS 7.0. Type checking only; not a runtime dep. **tsconfig must use**: `module: \"esnext\"`, `target: \"es2025\"`, `types: [\"node\", \"vscode\"]` (explicit), `moduleResolution: \"bundler\"`. Do NOT use TS 5.x.                                                                                                                                                                                                                                                                                                                                            |
 | `@types/vscode`                      | 1.90.0           | `devDependency`                        | Intentionally pinned to a baseline VS Code version, not the latest release. The extension's `package.json` must declare `"engines": { "vscode": "^1.90.0" }`. All VS Code APIs used by ImportLens (InlayHintsProvider, FileSystemWatcher, OutputChannel, TelemetryLogger, etc.) are available in 1.90+. VS Code 1.90 was released in May 2024; pinning here guarantees compatibility with almost all popular VS Code forks (Cursor, Windsurf, Antigravity) that often lag upstream. This version is intentionally pinned to match `@types/vscode` and is not the latest; bumping further requires a deliberate decision. |
@@ -770,7 +772,7 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 
 ```typescript
 interface BatchRequest {
-  version: number;              // Protocol version, currently 6
+  version: number;              // Protocol version, currently 7
   request_id: number;           // Monotonic counter incremented per debounce cycle.
                                 // The daemon echoes this value in BatchResponse.
                                 // The extension host discards responses whose
@@ -842,7 +844,7 @@ interface ModuleContribution {
 
 #### AnalyzePackageJsonRequest / AnalyzePackageJsonResponse
 
-Used by package.json dependency decorations. Size analysis remains daemon-owned; live npm registry refresh remains extension-host-owned.
+Used by package.json dependency decorations. Size analysis remains daemon-owned. Registry latest/deprecation metadata is daemon-owned. The extension host never calls the npm registry directly. The daemon maintains a centralized normalized npm package metadata cache keyed by package name. Package.json dependency analysis may request cached registry hints from the daemon without network I/O; the daemon derives each per-installed-version hint from the cached package metadata. A separate registry refresh request asks the daemon to fetch npm metadata only when the package metadata cache is missing or expired. Automatic refreshes respect freshness TTLs and cached retry windows. Manual refreshes use `force_refresh`, bypass TTL and retry-window checks, and fetch from npm unless the same package already has an active in-flight fetch to join. Refresh uses bounded concurrency, shared interval rate limiting, short timeouts, retry-after handling, hard retry limits, per-package failure isolation, per-package failure logging, and daemon-owned persistent cache storage under the extension-managed daemon cache base. The refresh request streams one partial response for each completed package so the extension can update visible package rows as soon as each registry result is available. If live refresh fails but cached metadata exists, the daemon returns both the cached hint and a per-package error; editors must keep the cached hint visible and mark it stale.
 
 ```typescript
 type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
@@ -854,14 +856,14 @@ type PackageJsonDependencySectionName =
 
 interface AnalyzePackageJsonRequest {
   type: "analyze_package_json";
-  version: number;              // Protocol version, currently 6
+  version: number;              // Protocol version, currently 7
   request_id: number;
   workspace_root: string;
   active_document_path: string;
   source: string;
   streaming?: boolean;          // Protocol v5+; request indexed package.json partial responses.
-  include_registry_hints?: boolean; // Compatibility field; daemon must not perform live registry fetches.
-  force_registry_refresh?: boolean; // Compatibility field; manual refresh is extension-host owned.
+  include_registry_hints?: boolean; // Deprecated in v7+; daemon-owned registry refresh via RefreshRegistryHintsRequest.
+  force_registry_refresh?: boolean; // Deprecated in v7+; use RefreshRegistryHintsRequest with mode: "force_refresh".
   refresh_section?: "dependencies" | "devDependencies" | "peerDependencies" | "optionalDependencies";
 }
 
@@ -917,7 +919,7 @@ Sent by the extension host immediately after opening the socket connection. The 
 ```typescript
 interface HelloMessage {
   type: "hello";
-  version: number;              // Protocol version, currently 6
+  version: number;              // Protocol version, currently 7
   workspace_root: string;       // Absolute path to the active analysis root.
   storage_path: string;         // Absolute extension-owned cache base; daemon creates project shards below it
   enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
@@ -1027,9 +1029,88 @@ interface FileSizeResponse {
 }
 ```
 
+#### RefreshRegistryHintsRequest / RefreshRegistryHintsResponse
+
+Protocol v7+. Used to request daemon-owned registry metadata refresh for npm package versions. The daemon fetches the latest npm registry metadata when the cache is missing or expired, returning partial results as each package completes.
+
+```typescript
+type RegistryHintMode = "off" | "cached" | "refresh_stale" | "force_refresh";
+
+interface RegistryHintTarget {
+  name: string;
+  installedVersion?: string;
+}
+
+interface RegistryHintResult {
+  target: RegistryHintTarget;
+  hint?: RegistryHint | null;
+  error?: string | null;
+}
+
+interface RefreshRegistryHintsRequest {
+  type: "refresh_registry_hints";
+  version: number;
+  request_id: number;
+  targets: RegistryHintTarget[];
+  mode: "refresh_stale" | "force_refresh";
+}
+
+interface RefreshRegistryHintsResponse {
+  version: number;
+  request_id: number;
+  results: RegistryHintResult[];
+  indexes?: number[];
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+```
+
+`RefreshRegistryHintsResponse` may be emitted multiple times for the same `request_id`. Partial responses contain `indexes` for the completed target positions and one result per completed package. The final response omits `indexes` and contains the full ordered result set. A package fetch failure sets `RegistryHintResult.error` for that package and leaves `RefreshRegistryHintsResponse.error` null unless the whole request is invalid. When stale cache fallback is available, `RegistryHintResult.hint` contains the cached metadata and `RegistryHintResult.error` contains the live refresh failure reason.
+
+#### WorkspaceReportRequest / WorkspaceReportResponse
+
+Protocol v7+. Used to request daemon-owned workspace report generation. The daemon scans the workspace for source files, aggregates import-related metrics, and returns the report model for the extension to render.
+
+```typescript
+interface WorkspaceReportRequest {
+  type: "workspace_report";
+  version: number;
+  request_id: number;
+  workspace_root: string;
+  budgets?: {
+    perImportBrotliBytes?: number;
+    perFileBrotliBytes?: number;
+  };
+}
+
+interface WorkspaceReportRow {
+  file: string;
+  imports: ImportResult[];
+  totalBrotliBytes: number;
+  budgetWarnings?: string[];
+}
+
+interface WorkspaceReportSummary {
+  totalFiles: number;
+  totalImports: number;
+  totalBrotliBytes: number;
+  filesOverBudget: number;
+  importsOverBudget: number;
+}
+
+interface WorkspaceReportResponse {
+  version: number;
+  request_id: number;
+  rows: WorkspaceReportRow[];
+  summary: WorkspaceReportSummary;
+  error: string | null;
+  diagnostics: ImportDiagnostic[];
+}
+```
+
 #### Cache Management Requests / Responses
 
-Used by `ImportLens: Manage Cache`, `ImportLens: Clear Current Project Cache`, and `ImportLens: Clear All Caches`. Cache management requests are protocol v6+ and require a successful hello first.
+Used by `ImportLens: Manage Cache`, `ImportLens: Clear Current Project Cache`, and `ImportLens: Clear All Caches`. Cache management requests are protocol v7+ and require a successful hello first.
 
 ```typescript
 interface CacheShardInfo {
@@ -1541,11 +1622,10 @@ import-lens/
 │   │   ├── guidance/
 │   │   │   ├── packageJsonAnalysis.ts # daemon-backed package.json dependency analysis controller
 │   │   │   ├── packageJsonPartial.ts  # indexed package.json partial merge helpers
-│   │   │   ├── registryHints.ts       # extension-host registry cache, p-queue throttling, and refresh helpers
 │   │   │   ├── packageJsonState.ts    # package.json dependency analysis state types
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
-│   │   │   ├── protocol.ts            # Protocol v6 IPC types
+│   │   │   ├── protocol.ts            # Protocol v7 IPC types
 │   │   │   ├── requestIds.ts          # shared monotonic IPC request ID generator
 │   │   │   └── codec.ts               # MessagePack encode/decode
 │   │   ├── daemon/
@@ -1607,7 +1687,7 @@ import-lens/
 │       │   ├── mod.rs
 │       │   ├── codec.rs               # MessagePack length-prefix codec
 │       │   ├── server.rs              # Unix socket / named pipe listener
-│       │   └── protocol.rs            # Protocol v6 serde types
+│       │   └── protocol.rs            # Protocol v7 serde types
 │       ├── pipeline/
 │       │   ├── mod.rs
 │       │   ├── resolver.rs            # oxc_resolver usage
