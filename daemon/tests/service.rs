@@ -16,6 +16,8 @@ use std::{
 
 mod common;
 
+static GRAPH_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn temp_workspace() -> PathBuf {
     common::temp_workspace("import-lens-service")
 }
@@ -851,6 +853,9 @@ fn service_invalidates_packages_from_node_modules_package_json_paths() {
 
 #[test]
 fn service_bulk_invalidates_all_from_large_node_modules_package_json_bursts() {
+    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+        .lock()
+        .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
     write_package(&workspace);
     let service = ImportLensService::new(None, false);
@@ -942,6 +947,9 @@ fn service_cache_invalidation_removes_matching_package_entries() {
 
 #[test]
 fn service_reports_and_removes_per_project_cache_shards() {
+    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+        .lock()
+        .expect("graph cache test lock should be available");
     let storage = common::temp_workspace("import-lens-service-cache-storage");
     let left_workspace = temp_workspace();
     let right_workspace = temp_workspace();
@@ -997,6 +1005,9 @@ fn service_reports_and_removes_per_project_cache_shards() {
 
 #[test]
 fn service_cache_miss_preserves_existing_module_graph_cache() {
+    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+        .lock()
+        .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
     let package_root = workspace.join("node_modules").join("graph-cache-lib");
     fs::create_dir_all(&package_root).expect("package root should be created");
