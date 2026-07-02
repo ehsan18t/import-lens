@@ -506,8 +506,13 @@ fn rename_map(
                 continue;
             }
 
-            let target_name = resolve_export_binding(graph, target_id, &binding.imported_name)
-                .unwrap_or_else(|| module_binding_name(target_id, &binding.imported_name));
+            let target_name = resolve_export_binding(
+                graph,
+                target_id,
+                &binding.imported_name,
+                &mut HashSet::new(),
+            )
+            .unwrap_or_else(|| module_binding_name(target_id, &binding.imported_name));
             renames.insert(binding.local_name.clone(), target_name);
         }
     }
@@ -519,7 +524,12 @@ fn resolve_export_binding(
     graph: &ModuleGraph,
     module_id: ModuleId,
     exported_name: &str,
+    visited: &mut HashSet<(ModuleId, String)>,
 ) -> Option<String> {
+    if !visited.insert((module_id, exported_name.to_owned())) {
+        return None;
+    }
+
     let module = graph.module_by_id(module_id)?;
     if let Some(export) = module
         .exports
@@ -535,7 +545,8 @@ fn resolve_export_binding(
         .filter(|reexport| reexport.exported_name == exported_name)
     {
         if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path)
-            && let Some(binding) = resolve_export_binding(graph, target_id, &reexport.imported_name)
+            && let Some(binding) =
+                resolve_export_binding(graph, target_id, &reexport.imported_name, visited)
         {
             return Some(binding);
         }
@@ -543,7 +554,7 @@ fn resolve_export_binding(
 
     for star_export in &module.star_exports {
         let target_id = graph.module_id_by_path(&star_export.resolved_path)?;
-        if let Some(binding) = resolve_export_binding(graph, target_id, exported_name) {
+        if let Some(binding) = resolve_export_binding(graph, target_id, exported_name, visited) {
             return Some(binding);
         }
     }

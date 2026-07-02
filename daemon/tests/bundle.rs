@@ -356,6 +356,26 @@ fn bundle_namespace_reexport_does_not_emit_marker_for_missing_entry_binding() {
 }
 
 #[test]
+fn bundle_survives_star_export_cycles_without_stack_overflow() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { x } from './a.js';\nexport const value = x;",
+    );
+    write_source(&root, "a.js", "export * from './b.js';");
+    write_source(&root, "b.js", "export * from './a.js';");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["value".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("cyclic star exports should still bundle");
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(bundled.source.contains("__il_m0_value"), "{}", bundled.source);
+}
+
+#[test]
 fn bundle_imported_then_exported_binding_marker_references_target_binding() {
     let root = temp_workspace();
     write_source(
