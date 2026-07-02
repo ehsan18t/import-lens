@@ -722,6 +722,31 @@ test("IpcClient routes workspace report responses by request id", async () => {
   }
 });
 
+test("IpcClient.requestWorkspaceReport rejects with a timeout error when no response arrives in time", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    // Intentionally never respond, to force the client-side timeout.
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+
+    await assert.rejects(
+      client.requestWorkspaceReport(workspaceReportRequest(47), 25),
+      /IPC request timed out after 25ms/,
+    );
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
 const cacheStatusResponse = (requestId: number): CacheStatusResponse => ({
   version: 6,
   request_id: requestId,

@@ -1641,9 +1641,6 @@ import-lens/
 │   │   ├── prewarm/
 │   │   │   ├── packageJson.ts         # package.json open/save prewarm registration
 │   │   │   └── packageJsonHelpers.ts  # package.json path and prewarm payload helpers
-│   │   ├── report/
-│   │   │   ├── reportModel.ts         # Workspace report rows, confidence summaries, module breakdown
-│   │   │   └── workspaceScanner.ts    # Workspace import scanner for report command
 │   │   ├── watcher.ts                 # vscode.workspace.createFileSystemWatcher; sends CacheInvalidate IPC messages
 │   │   ├── ui/
 │   │   │   ├── currentFileSize.ts     # current-file total and bundle impact history commands

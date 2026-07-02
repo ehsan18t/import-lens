@@ -50,6 +50,9 @@ import type { AnalysisTransport, DaemonState, DaemonStateEvent } from "./transpo
 
 const STABLE_SESSION_RESET_MS = 60_000;
 const CLEAN_RECYCLE_SESSION_MS = 30 * 60 * 1000;
+// A whole-workspace report scans, resolves, graphs, minifies, and compresses every file, so it
+// can exceed the 60s per-document budget on large monorepos.
+const WORKSPACE_REPORT_TIMEOUT_MS = 300_000;
 
 export class NativeDaemonTransport implements AnalysisTransport {
   readonly #context: vscode.ExtensionContext;
@@ -468,7 +471,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
 
     this.#logger.debug(`Requesting workspace report ${request.request_id} for ${request.workspace_root}.`);
-    return this.#client.requestWorkspaceReport(request, 60000);
+    return this.#client.requestWorkspaceReport(request, WORKSPACE_REPORT_TIMEOUT_MS);
   }
 
   invalidatePackage(packageName: string): void {

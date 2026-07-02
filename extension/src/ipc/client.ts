@@ -643,6 +643,9 @@ const isWorkspaceReportResponse = (value: unknown): value is WorkspaceReportResp
     Array.isArray(candidate.rows) &&
     !!candidate.summary &&
     typeof candidate.summary === "object" &&
+    Array.isArray(candidate.summary.treemap) &&
+    Array.isArray(candidate.summary.duplicateImports) &&
+    Array.isArray(candidate.summary.sharedModules) &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics)
   );

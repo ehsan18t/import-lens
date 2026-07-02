@@ -15,57 +15,58 @@ export const showReport = async (
   logger.info("Building workspace report.");
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
-  if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
-    await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
-    return;
-  }
-
   if (!workspaceRoot) {
     await vscode.window.showWarningMessage("ImportLens report requires an open workspace folder.");
     return;
   }
 
-  const config = getImportLensConfig();
-  const response = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Building workspace report",
-    },
-    () => daemon.requestWorkspaceReport({
-      type: "workspace_report",
-      version: protocolVersion,
-      request_id: nextIpcRequestId(),
-      workspace_root: workspaceRoot,
-      budgets: config.budgets,
-    }),
-  );
-
-  if (!response || response.error) {
-    await vscode.window.showWarningMessage(`ImportLens report unavailable${response?.error ? `: ${response.error}` : "."}`);
+  if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
+    await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
     return;
   }
 
-  logger.info(`Workspace report built with ${response.rows.length} import item(s).`);
-  const reportRows = response.rows;
-  const summary = response.summary;
-  const panel = vscode.window.createWebviewPanel("importLensReport", "ImportLens Report", vscode.ViewColumn.Beside, {
-    enableScripts: false,
-  });
-  const treemap = svgTreemap(summary.treemap);
-  const confidenceLegend = (["high", "medium", "low"] as const)
-    .map((confidence) => {
-      const visual = confidenceVisualFor(confidence);
-      return `<span class="legend-item ${visual.cssClass}"><span class="legend-swatch"></span>${visual.label}</span>`;
-    })
-    .join("");
-  const duplicateImports = summary.duplicateImports
-    .map((item) => `<tr><td>${escapeHtml(item.specifier)}</td><td>${item.count}</td><td>${formatBytes(item.totalBrotliBytes)}</td><td>${escapeHtml(item.sourceFiles.join(", "))}</td></tr>`)
-    .join("");
-  const sharedModules = summary.sharedModules
-    .map((item) => `<tr><td>${escapeHtml(item.basename)}</td><td>${item.count}</td><td>${formatBytes(item.totalBytes)}</td><td>${escapeHtml(item.specifiers.join(", "))}</td><td>${item.vendored ? "yes" : "no"}</td><td>${escapeHtml(item.modulePath)}</td></tr>`)
-    .join("");
-  const rows = reportRows
-    .map((row) => `<tr>
+  try {
+    const config = getImportLensConfig();
+    const response = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "ImportLens: Building workspace report",
+      },
+      () => daemon.requestWorkspaceReport({
+        type: "workspace_report",
+        version: protocolVersion,
+        request_id: nextIpcRequestId(),
+        workspace_root: workspaceRoot,
+        budgets: config.budgets,
+      }),
+    );
+
+    if (!response || response.error) {
+      await vscode.window.showWarningMessage(`ImportLens report unavailable${response?.error ? `: ${response.error}` : "."}`);
+      return;
+    }
+
+    logger.info(`Workspace report built with ${response.rows.length} import item(s).`);
+    const reportRows = response.rows;
+    const summary = response.summary;
+    const panel = vscode.window.createWebviewPanel("importLensReport", "ImportLens Report", vscode.ViewColumn.Beside, {
+      enableScripts: false,
+    });
+    const treemap = svgTreemap(summary.treemap);
+    const confidenceLegend = (["high", "medium", "low"] as const)
+      .map((confidence) => {
+        const visual = confidenceVisualFor(confidence);
+        return `<span class="legend-item ${visual.cssClass}"><span class="legend-swatch"></span>${visual.label}</span>`;
+      })
+      .join("");
+    const duplicateImports = summary.duplicateImports
+      .map((item) => `<tr><td>${escapeHtml(item.specifier)}</td><td>${item.count}</td><td>${formatBytes(item.totalBrotliBytes)}</td><td>${escapeHtml(item.sourceFiles.join(", "))}</td></tr>`)
+      .join("");
+    const sharedModules = summary.sharedModules
+      .map((item) => `<tr><td>${escapeHtml(item.basename)}</td><td>${item.count}</td><td>${formatBytes(item.totalBytes)}</td><td>${escapeHtml(item.specifiers.join(", "))}</td><td>${item.vendored ? "yes" : "no"}</td><td>${escapeHtml(item.modulePath)}</td></tr>`)
+      .join("");
+    const rows = reportRows
+      .map((row) => `<tr>
 <td>${escapeHtml(row.packageName)}</td>
 <td>${escapeHtml(row.specifier)}</td>
 <td>${escapeHtml(row.sourceFile)}</td>
@@ -81,9 +82,9 @@ export const showReport = async (
 <td>${escapeHtml(row.topModules)}</td>
 <td>${escapeHtml(row.warning)}</td>
 </tr>`)
-    .join("");
+      .join("");
 
-  panel.webview.html = `<!doctype html>
+    panel.webview.html = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -142,7 +143,11 @@ th{font-weight:600}
 </table>
 </body>
 </html>`;
-  context.subscriptions.push(panel);
+    context.subscriptions.push(panel);
+  } catch (error) {
+    logger.warn(`Workspace report request failed: ${error instanceof Error ? error.message : String(error)}`);
+    await vscode.window.showWarningMessage(`ImportLens report request failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 };
 
 const escapeHtml = (value: string): string =>
