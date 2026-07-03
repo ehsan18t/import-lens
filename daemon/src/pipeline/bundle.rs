@@ -6,10 +6,6 @@ use crate::{
         replacements::{Replacement, apply_replacements, span_overlaps_replacements},
     },
 };
-use oxc_allocator::Allocator;
-use oxc_parser::Parser;
-use oxc_semantic::SemanticBuilder;
-use oxc_span::{SourceType, Span};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
@@ -598,64 +594,23 @@ fn semantic_rename_replacements(
         return Ok(Vec::new());
     }
 
-    let allocator = Allocator::default();
-    let source_type = SourceType::mjs();
-    let parsed = Parser::new(&allocator, &module.source, source_type).parse();
-    if parsed.panicked || parsed.diagnostics.has_errors() {
-        return Err(format!(
-            "failed to parse module for renaming {}; errors: {}",
-            module.path.display(),
-            parsed
-                .diagnostics
-                .errors()
-                .map(|error| format!("{error:?}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
-    }
-
-    let semantic = SemanticBuilder::new()
-        .with_build_nodes(true)
-        .build(&parsed.program);
-    if semantic.diagnostics.has_errors() {
-        return Err(format!(
-            "semantic validation failed for renaming {}; errors: {}",
-            module.path.display(),
-            semantic
-                .diagnostics
-                .errors()
-                .map(|error| format!("{error:?}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
-    }
-
-    let shorthand_spans = crate::pipeline::graph::shorthand_identifier_spans(&parsed.program);
-    let semantic = semantic.semantic;
-    let scoping = semantic.scoping();
+    // Spans were recorded once at graph build (module.root_symbol_spans /
+    // module.shorthand_spans); reuse them instead of re-parsing and re-running
+    // semantic analysis on every bundle request.
+    let shorthand_spans: HashSet<(usize, usize)> =
+        module.shorthand_spans.iter().copied().collect();
     let mut replacements = Vec::new();
     let mut seen_spans = HashSet::new();
 
-    for symbol_id in scoping.iter_bindings_in(scoping.root_scope_id()) {
-        let symbol_name = scoping.symbol_name(symbol_id);
-        let Some(new_name) = renames.get(symbol_name) else {
+    for symbol in &module.root_symbol_spans {
+        let Some(new_name) = renames.get(&symbol.name) else {
             continue;
         };
 
-        push_semantic_rename(
-            &module.source,
-            scoping.symbol_span(symbol_id),
-            new_name,
-            &shorthand_spans,
-            protected_replacements,
-            &mut seen_spans,
-            &mut replacements,
-        )?;
-
-        for reference in semantic.symbol_references(symbol_id) {
+        for &span in std::iter::once(&symbol.decl).chain(symbol.references.iter()) {
             push_semantic_rename(
                 &module.source,
-                semantic.reference_span(reference),
+                span,
                 new_name,
                 &shorthand_spans,
                 protected_replacements,
@@ -670,15 +625,13 @@ fn semantic_rename_replacements(
 
 fn push_semantic_rename(
     source: &str,
-    span: Span,
+    (start, end): (usize, usize),
     new_name: &str,
     shorthand_spans: &HashSet<(usize, usize)>,
     protected_replacements: &[Replacement],
     seen_spans: &mut HashSet<(usize, usize)>,
     replacements: &mut Vec<Replacement>,
 ) -> Result<(), String> {
-    let start = span.start as usize;
-    let end = span.end as usize;
     let Some(original_name) = source.get(start..end) else {
         return Err(format!("invalid semantic rename span {start}..{end}"));
     };

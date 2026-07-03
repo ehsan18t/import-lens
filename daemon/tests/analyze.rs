@@ -865,7 +865,12 @@ fn analyze_named_import_falls_back_to_static_entry_after_oxc_failure() {
 }
 
 #[test]
-fn analyze_invalid_semantic_module_falls_back_at_bundle_boundary() {
+fn analyze_invalid_semantic_module_falls_back_at_minify_boundary() {
+    // Semantically invalid modules (here a duplicate `const`) still fall back to
+    // static-entry sizing, but the detection now happens at the minifier's
+    // semantic pass rather than a redundant one in the bundle rewriter (which was
+    // removed so bundling no longer re-parses every module per request). The
+    // user-visible outcome — a safe oxc_fallback with no error — is unchanged.
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -900,7 +905,7 @@ fn analyze_invalid_semantic_module_falls_back_at_bundle_boundary() {
                 && diagnostic
                     .details
                     .iter()
-                    .any(|detail| detail == "failed_stage: bundle")
+                    .any(|detail| detail == "failed_stage: minify")
         }),
         "{result:?}",
     );
