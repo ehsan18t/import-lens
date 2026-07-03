@@ -153,7 +153,7 @@ impl ProjectCacheRegistry {
         let max_size_bytes = self.max_size_mb.saturating_mul(1024 * 1024);
         let mut removed = Vec::new();
         let mut failed = Vec::new();
-        let mut removed_ids = HashSet::new();
+        let mut remaining = Vec::new();
 
         for shard in self.list_shards() {
             let expired = shard
@@ -162,16 +162,12 @@ impl ProjectCacheRegistry {
 
             if expired {
                 let result = self.remove_shard_by_id(&shard.shard_id);
-                removed_ids.insert(shard.shard_id);
                 push_operation_result(result, &mut removed, &mut failed);
+            } else {
+                remaining.push(shard);
             }
         }
 
-        let mut remaining = self
-            .list_shards()
-            .into_iter()
-            .filter(|shard| !removed_ids.contains(&shard.shard_id))
-            .collect::<Vec<_>>();
         let mut total_size_bytes = remaining.iter().map(|shard| shard.size_bytes).sum::<u64>();
 
         if max_size_bytes > 0 && total_size_bytes > max_size_bytes {
@@ -200,7 +196,7 @@ impl ProjectCacheRegistry {
         }
 
         ProjectCacheCleanup {
-            total_size_bytes: self.total_size_bytes(),
+            total_size_bytes,
             removed,
             failed,
         }
@@ -308,13 +304,6 @@ impl ProjectCacheRegistry {
         for cache in caches {
             cache.flush_recency_touches();
         }
-    }
-
-    fn total_size_bytes(&self) -> u64 {
-        self.list_shards()
-            .iter()
-            .map(|shard| shard.size_bytes)
-            .sum()
     }
 
     fn remove_shard_by_id(&self, shard_id: &str) -> CacheOperationResult {
