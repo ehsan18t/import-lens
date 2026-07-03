@@ -104,13 +104,21 @@ impl ImportCache {
                     return None;
                 }
                 // Re-verified: restamp so subsequent hits can skip the re-stat.
+                // Clone the result once from the restamped entry rather than
+                // re-fetching the entry and cloning again after the insert. The
+                // stored entry keeps cache_hit=false; only the returned copy is
+                // flagged as a hit.
                 let mut restamped = cached.clone();
                 restamped.verified_generation = generation;
                 restamped.verified_at_millis = now;
+                let mut result = restamped.result.clone();
                 memory.insert(key.to_owned(), restamped);
+                result.cache_hit = true;
+                self.disk.touch(key);
+                return Some(result);
             }
 
-            let mut result = memory.get(key)?.result.clone();
+            let mut result = cached.result.clone();
             result.cache_hit = true;
             self.disk.touch(key);
             return Some(result);
