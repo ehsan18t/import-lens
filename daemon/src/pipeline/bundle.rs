@@ -45,11 +45,25 @@ pub fn bundle_reachable_modules_with_metadata(
     let mut contributions = Vec::new();
     let mut deduplicated_external_imports = HashMap::<&str, Vec<&ExternalImportEdge>>::new();
 
-    for module in graph
+    let included_modules = graph
         .modules
         .iter()
         .filter(|module| included.contains_key(&module.id))
-    {
+        .collect::<Vec<_>>();
+    let mut external_specifiers = included_modules
+        .iter()
+        .flat_map(|module| module.external_imports.iter())
+        .map(|ext| ext.specifier.clone())
+        .collect::<Vec<_>>();
+    external_specifiers.sort_unstable();
+    external_specifiers.dedup();
+    let external_indexes = external_specifiers
+        .iter()
+        .enumerate()
+        .map(|(index, specifier)| (specifier.clone(), index))
+        .collect::<HashMap<String, usize>>();
+
+    for module in included_modules {
         for ext in &module.external_imports {
             deduplicated_external_imports
                 .entry(ext.specifier.as_str())
@@ -58,7 +72,8 @@ pub fn bundle_reachable_modules_with_metadata(
         }
 
         let keep_all_exports = included.get(&module.id).copied().unwrap_or(false);
-        let rewritten = rewrite_module(graph, module, &expanded_reachable, keep_all_exports)?;
+        let renames = rename_map(graph, module, &external_indexes)?;
+        let rewritten = rewrite_module(module, &expanded_reachable, keep_all_exports, &renames)?;
         if !rewritten.trim().is_empty() {
             contributions.push(ModuleContribution {
                 path: module.path.to_string_lossy().to_string(),
@@ -68,7 +83,7 @@ pub fn bundle_reachable_modules_with_metadata(
             source.push('\n');
 
             minifier_source.push_str(&rewritten);
-            let markers = usage_markers(module, &expanded_reachable, keep_all_exports);
+            let markers = usage_markers(module, &expanded_reachable, keep_all_exports, &renames);
             if !markers.is_empty() {
                 minifier_source.push('\n');
                 minifier_source.push_str(&markers);
@@ -85,47 +100,49 @@ pub fn bundle_reachable_modules_with_metadata(
     specifiers.sort_unstable();
 
     for specifier in specifiers {
+        let index = external_indexes[specifier];
         let edges = deduplicated_external_imports.get(specifier).unwrap();
-        let mut default_local = None;
-        let mut namespace_local = None;
+        let mut has_default = false;
+        let mut has_namespace = false;
         let mut named_imports = Vec::new();
+        let mut has_bindings = false;
 
         for edge in edges {
-            if edge.imported_name.is_empty() {
-                continue;
-            } else if edge.imported_name == "default" {
-                default_local = Some(edge.local_name.clone());
-            } else if edge.imported_name == "*" {
-                namespace_local = Some(edge.local_name.clone());
-            } else {
-                if edge.imported_name == edge.local_name {
-                    named_imports.push(edge.imported_name.clone());
-                } else {
-                    named_imports.push(format!("{} as {}", edge.imported_name, edge.local_name));
-                }
+            match edge.imported_name.as_str() {
+                "" => {}
+                "default" => has_default = true,
+                "*" => has_namespace = true,
+                name => named_imports.push(name.to_owned()),
             }
+            has_bindings |= !edge.imported_name.is_empty();
         }
 
-        let has_bindings =
-            default_local.is_some() || namespace_local.is_some() || !named_imports.is_empty();
-
-        if let Some(local) = default_local {
-            writeln!(synthetic_imports, "import {local} from '{specifier}';")
-                .expect("writing to String should not fail");
+        if has_default {
+            writeln!(
+                synthetic_imports,
+                "import {} from '{specifier}';",
+                external_binding_name(index, "default")
+            )
+            .expect("writing to String should not fail");
         }
-        if let Some(local) = namespace_local {
-            writeln!(synthetic_imports, "import * as {local} from '{specifier}';")
-                .expect("writing to String should not fail");
+        if has_namespace {
+            writeln!(
+                synthetic_imports,
+                "import * as {} from '{specifier}';",
+                external_binding_name(index, "*")
+            )
+            .expect("writing to String should not fail");
         }
         if !named_imports.is_empty() {
             named_imports.sort_unstable();
             named_imports.dedup();
-            writeln!(
-                synthetic_imports,
-                "import {{ {} }} from '{specifier}';",
-                named_imports.join(", ")
-            )
-            .expect("writing to String should not fail");
+            let named = named_imports
+                .iter()
+                .map(|name| format!("{name} as {}", external_binding_name(index, name)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(synthetic_imports, "import {{ {named} }} from '{specifier}';")
+                .expect("writing to String should not fail");
         }
 
         if !has_bindings {
@@ -356,10 +373,10 @@ fn mark_reachable_import_target(
 }
 
 fn rewrite_module(
-    graph: &ModuleGraph,
     module: &ModuleRecord,
     reachable: &ReachableExports,
     keep_all_exports: bool,
+    renames: &HashMap<String, String>,
 ) -> Result<String, String> {
     let mut replacements = Vec::new();
 
@@ -415,8 +432,7 @@ fn rewrite_module(
         }
     }
 
-    let renames = rename_map(graph, module)?;
-    let rename_replacements = semantic_rename_replacements(module, &renames, &replacements)?;
+    let rename_replacements = semantic_rename_replacements(module, renames, &replacements)?;
     replacements.extend(rename_replacements);
 
     let rewritten = apply_replacements(&module.source, replacements)?;
@@ -486,11 +502,24 @@ fn is_named_default_declaration(trimmed_after_default: &str) -> bool {
 fn rename_map(
     graph: &ModuleGraph,
     module: &ModuleRecord,
+    external_indexes: &HashMap<String, usize>,
 ) -> Result<HashMap<String, String>, String> {
     let mut renames = HashMap::new();
 
     for binding in &module.local_bindings {
         renames.insert(binding.clone(), module_binding_name(module.id, binding));
+    }
+
+    for ext in &module.external_imports {
+        if ext.local_name.is_empty() {
+            continue;
+        }
+        if let Some(index) = external_indexes.get(&ext.specifier) {
+            renames.insert(
+                ext.local_name.clone(),
+                external_binding_name(*index, &ext.imported_name),
+            );
+        }
     }
 
     for import in &module.imports {
@@ -674,13 +703,18 @@ fn usage_markers(
     module: &ModuleRecord,
     reachable: &ReachableExports,
     keep_all_exports: bool,
+    renames: &HashMap<String, String>,
 ) -> String {
     let mut markers = String::new();
     for export in &module.exports {
         if keep_all_exports || reachable.contains_module_symbol(&module.path, &export.exported_name)
         {
+            let local_binding = renames
+                .get(&export.local_name)
+                .cloned()
+                .unwrap_or_else(|| module_binding_name(module.id, &export.local_name));
             markers.push_str("export { ");
-            markers.push_str(&module_binding_name(module.id, &export.local_name));
+            markers.push_str(&local_binding);
             markers.push_str(" as __importLensUse_");
             markers.push_str(&module_binding_name(module.id, &export.exported_name));
             markers.push_str(" };\n");
@@ -764,6 +798,15 @@ fn span_bounds(span: Span) -> (usize, usize) {
 
 fn module_binding_name(module_id: ModuleId, name: &str) -> String {
     format!("__il_m{}_{}", module_id.0, sanitize_identifier(name))
+}
+
+fn external_binding_name(index: usize, imported_name: &str) -> String {
+    let suffix = match imported_name {
+        "default" => "default".to_owned(),
+        "*" => "ns".to_owned(),
+        name => sanitize_identifier(name),
+    };
+    format!("__il_ext{index}_{suffix}")
 }
 
 fn sanitize_identifier(name: &str) -> String {

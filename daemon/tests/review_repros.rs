@@ -7,7 +7,6 @@ use import_lens_daemon::{
     pipeline::{
         bundle::bundle_reachable_modules_with_metadata,
         graph::build_module_graph,
-        minify::minify_source_with_markers,
         reachability::reachable_exports,
     },
 };
@@ -124,38 +123,6 @@ fn repro_builtin_subpath_treated_as_package() {
     // Controls that already work:
     assert!(!is_runtime_package_specifier("fs"));
     assert!(!is_runtime_package_specifier("node:fs/promises"));
-}
-
-/// SUSPICION 5: two modules importing the same local name from different
-/// externals produce a duplicate top-level binding, so minification fails.
-#[test]
-fn repro_external_local_name_collision_breaks_minify() {
-    let root = temp_workspace();
-    write_source(
-        &root,
-        "entry.js",
-        "import a from './m1.js';\nimport b from './m2.js';\nexport const value = [a, b];",
-    );
-    write_source(
-        &root,
-        "m1.js",
-        "import shared from 'ext-one';\nexport default shared;",
-    );
-    write_source(
-        &root,
-        "m2.js",
-        "import shared from 'ext-two';\nexport default shared;",
-    );
-
-    let graph = build_module_graph(&root.join("entry.js")).expect("graph should build");
-    let reachable = reachable_exports(&graph, &["value".to_owned()], false);
-    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
-        .expect("bundle should not error");
-    let minified = minify_source_with_markers(&bundled.minifier_source, false);
-
-    fs::remove_dir_all(&root).expect("cleanup");
-    // CURRENT (buggy) behavior: duplicate `shared` bindings → semantic error.
-    assert!(minified.is_err(), "minified ok: {minified:?}");
 }
 
 /// SUSPICION 7 (oxc source-type cross-check): `.js` documents parse without

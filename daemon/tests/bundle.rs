@@ -1,7 +1,7 @@
 use import_lens_daemon::pipeline::{
     bundle::{bundle_reachable_modules, bundle_reachable_modules_with_metadata},
     graph::build_module_graph,
-    minify::minify_source,
+    minify::{minify_source, minify_source_with_markers},
     reachability::reachable_exports,
 };
 use oxc_allocator::Allocator;
@@ -226,10 +226,47 @@ fn bundle_hoists_and_deduplicates_external_imports() {
     let bundled =
         bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
 
-    assert!(bundled.starts_with("import React from 'react';\nimport * as ReactNamespace from 'react';\nimport { forwardRef, forwardRef as fr, useState } from 'react';\n"));
+    assert!(bundled.starts_with("import __il_ext0_default from 'react';\nimport * as __il_ext0_ns from 'react';\nimport { forwardRef as __il_ext0_forwardRef, useState as __il_ext0_useState } from 'react';\n"), "{bundled}");
+    // Both the direct `forwardRef` local and the `fr` alias collapse onto the
+    // same canonical binding because they import the same external symbol.
+    assert!(bundled.contains("__il_ext0_forwardRef("), "{bundled}");
 
     // Ensure the AST parses without any redeclaration errors from oxc
     assert_parseable(&bundled);
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+}
+
+#[test]
+fn bundle_renames_colliding_external_import_locals() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import a from './m1.js';\nimport b from './m2.js';\nexport const value = [a, b];",
+    );
+    write_source(
+        &root,
+        "m1.js",
+        "import shared from 'ext-one';\nexport default shared;",
+    );
+    write_source(
+        &root,
+        "m2.js",
+        "import shared from 'ext-two';\nexport default shared;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["value".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+
+    assert!(bundled.source.contains("from 'ext-one'"), "{}", bundled.source);
+    assert!(bundled.source.contains("from 'ext-two'"), "{}", bundled.source);
+    assert_semantic_valid(&bundled.source);
+    let minified = minify_source_with_markers(&bundled.minifier_source, false)
+        .expect("bundle with colliding external locals should minify");
+    assert!(!minified.is_empty());
+
     fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
 }
 
