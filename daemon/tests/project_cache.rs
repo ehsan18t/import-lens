@@ -151,6 +151,33 @@ fn project_cache_registry_invalidates_unloaded_shards_without_recent_preload() {
 }
 
 #[test]
+fn project_cache_registry_invalidates_multiple_packages_in_one_pass() {
+    let storage = common::temp_workspace("import-lens-project-cache-batch-invalidate");
+    let project_root = storage.join("app");
+
+    {
+        let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512, 30);
+        let cache = registry.cache_for_root(&project_root);
+        cache.insert("react@18.3.1::default".to_owned(), result("react"));
+        cache.insert("vue@3.4.0::default".to_owned(), result("vue"));
+        cache.insert("lodash@4.17.21::default".to_owned(), result("lodash"));
+    }
+
+    // Fresh registry: the shard is on disk (unloaded), exercising the batched
+    // disk-shard invalidation path.
+    let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512, 30);
+    registry.invalidate_packages(&["react".to_owned(), "vue".to_owned()]);
+
+    let cache_path = storage.join(project_cache_shard_id(&project_root));
+    let db_path = cache_path.join(CACHE_DB_FILE_NAME);
+    assert!(!disk_cache_entry_exists(&db_path, "react@18.3.1::default"));
+    assert!(!disk_cache_entry_exists(&db_path, "vue@3.4.0::default"));
+    assert!(disk_cache_entry_exists(&db_path, "lodash@4.17.21::default"));
+
+    fs::remove_dir_all(storage).expect("temp storage should be removed");
+}
+
+#[test]
 fn project_cache_registry_removes_current_project_without_removing_other_shards() {
     let storage = common::temp_workspace("import-lens-project-cache-remove");
     let first_root = storage.join("first-app");

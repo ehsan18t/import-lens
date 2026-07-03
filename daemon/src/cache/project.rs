@@ -240,29 +240,44 @@ impl ProjectCacheRegistry {
     }
 
     pub fn invalidate_package(&self, package_name: &str) {
+        self.invalidate_packages(&[package_name.to_owned()]);
+    }
+
+    /// Invalidates every named package across all loaded and on-disk shards in a
+    /// single pass: each on-disk shard's database is opened once (not once per
+    /// package), and the recursive per-shard size walk is skipped since only ids
+    /// and paths are needed for invalidation.
+    pub fn invalidate_packages(&self, package_names: &[String]) {
+        if package_names.is_empty() {
+            return;
+        }
+
         let loaded_ids = self
             .loaded
             .lock()
             .map(|loaded| {
                 for shard in loaded.values() {
-                    shard.cache.invalidate_package(package_name);
+                    for package_name in package_names {
+                        shard.cache.invalidate_package(package_name);
+                    }
                 }
 
                 loaded.keys().cloned().collect::<HashSet<_>>()
             })
             .unwrap_or_default();
 
-        for shard in self
-            .scan_disk_shards()
-            .into_iter()
-            .filter(|shard| !loaded_ids.contains(&shard.shard_id))
-        {
-            let cache_path = PathBuf::from(shard.cache_path);
-            if cache_path.as_os_str().is_empty() {
+        for (shard_id, cache_path) in self.scan_disk_shard_paths() {
+            if loaded_ids.contains(&shard_id) || cache_path.as_os_str().is_empty() {
                 continue;
             }
-            ImportCache::new_with_recent_preload_limit(Some(cache_path), self.enable_disk_cache, 0)
-                .invalidate_package(package_name);
+            let cache = ImportCache::new_with_recent_preload_limit(
+                Some(cache_path),
+                self.enable_disk_cache,
+                0,
+            );
+            for package_name in package_names {
+                cache.invalidate_package(package_name);
+            }
         }
     }
 
@@ -434,6 +449,31 @@ impl ProjectCacheRegistry {
                     last_used_millis: Some(metadata.last_used_millis),
                     loaded: false,
                 })
+            })
+            .collect()
+    }
+
+    /// Like `scan_disk_shards` but returns only each shard's id and path,
+    /// skipping the recursive directory-size walk that invalidation never uses.
+    fn scan_disk_shard_paths(&self) -> Vec<(String, PathBuf)> {
+        let Some(base_path) = self.base_path.as_ref() else {
+            return Vec::new();
+        };
+
+        let entries = match fs::read_dir(base_path) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let cache_path = entry.path();
+                if !cache_path.is_dir() {
+                    return None;
+                }
+                let metadata = read_metadata(&cache_path.join(SHARD_METADATA_FILE_NAME))?;
+                Some((metadata.shard_id, cache_path))
             })
             .collect()
     }

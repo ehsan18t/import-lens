@@ -1148,19 +1148,29 @@ impl ImportLensService {
             return true;
         }
 
-        let mut invalidated_any = false;
-
+        let mut package_names = Vec::with_capacity(package_json_paths.len());
         for package_json_path in package_json_paths {
             let Some(package_name) = package_name_from_package_json_path(package_json_path) else {
                 self.invalidate_all();
                 return true;
             };
-
-            self.invalidate_package(&package_name);
-            invalidated_any = true;
+            package_names.push(package_name);
         }
 
-        invalidated_any
+        if package_names.is_empty() {
+            return false;
+        }
+
+        // Batch the cache eviction into a single shard-scan/open pass, and run
+        // the global graph/resolver/generation invalidations once for the whole
+        // burst instead of once per package.
+        self.cache_registry.invalidate_packages(&package_names);
+        for package_name in &package_names {
+            invalidate_module_graph_cache_for_package(package_name);
+        }
+        crate::pipeline::resolver::invalidate_shared_resolvers();
+        crate::cache::memory::bump_cache_generation();
+        true
     }
 
     fn analysis_items_for_detected(
