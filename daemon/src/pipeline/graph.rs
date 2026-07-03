@@ -9,7 +9,7 @@ use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
 use oxc_resolver::Resolver;
 use oxc_semantic::SemanticBuilder;
-use oxc_span::{SourceType, Span};
+use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::module_record::{
     ExportEntry, ExportExportName, ExportImportName, ExportLocalName, ImportEntry,
     ImportImportName, ModuleRecord as OxcModuleRecord,
@@ -1069,7 +1069,7 @@ fn statement_binding_ranges(program: &Program<'_>) -> Vec<StatementBindingRange>
             collect_statement_bindings(statement, &mut bindings);
             bindings.sort();
             bindings.dedup();
-            let span = statement_span(statement)?;
+            let span = statement.span();
             (!bindings.is_empty()).then_some(StatementBindingRange {
                 start: span_start(span),
                 end: span_end(span),
@@ -1077,44 +1077,6 @@ fn statement_binding_ranges(program: &Program<'_>) -> Vec<StatementBindingRange>
             })
         })
         .collect()
-}
-
-fn statement_span(statement: &Statement<'_>) -> Option<Span> {
-    match statement {
-        Statement::BlockStatement(statement) => Some(statement.span),
-        Statement::BreakStatement(statement) => Some(statement.span),
-        Statement::ContinueStatement(statement) => Some(statement.span),
-        Statement::DebuggerStatement(statement) => Some(statement.span),
-        Statement::DoWhileStatement(statement) => Some(statement.span),
-        Statement::EmptyStatement(statement) => Some(statement.span),
-        Statement::ExpressionStatement(statement) => Some(statement.span),
-        Statement::ForInStatement(statement) => Some(statement.span),
-        Statement::ForOfStatement(statement) => Some(statement.span),
-        Statement::ForStatement(statement) => Some(statement.span),
-        Statement::IfStatement(statement) => Some(statement.span),
-        Statement::LabeledStatement(statement) => Some(statement.span),
-        Statement::ReturnStatement(statement) => Some(statement.span),
-        Statement::SwitchStatement(statement) => Some(statement.span),
-        Statement::ThrowStatement(statement) => Some(statement.span),
-        Statement::TryStatement(statement) => Some(statement.span),
-        Statement::WhileStatement(statement) => Some(statement.span),
-        Statement::WithStatement(statement) => Some(statement.span),
-        Statement::VariableDeclaration(statement) => Some(statement.span),
-        Statement::FunctionDeclaration(statement) => Some(statement.span),
-        Statement::ClassDeclaration(statement) => Some(statement.span),
-        Statement::ImportDeclaration(statement) => Some(statement.span),
-        Statement::ExportAllDeclaration(statement) => Some(statement.span),
-        Statement::ExportDefaultDeclaration(statement) => Some(statement.span),
-        Statement::ExportNamedDeclaration(statement) => Some(statement.span),
-        Statement::TSImportEqualsDeclaration(statement) => Some(statement.span),
-        Statement::TSExportAssignment(statement) => Some(statement.span),
-        Statement::TSNamespaceExportDeclaration(statement) => Some(statement.span),
-        Statement::TSEnumDeclaration(statement) => Some(statement.span),
-        Statement::TSGlobalDeclaration(statement) => Some(statement.span),
-        Statement::TSModuleDeclaration(statement) => Some(statement.span),
-        Statement::TSInterfaceDeclaration(statement) => Some(statement.span),
-        Statement::TSTypeAliasDeclaration(statement) => Some(statement.span),
-    }
 }
 
 fn collect_statement_bindings(statement: &Statement<'_>, bindings: &mut Vec<String>) {
