@@ -481,13 +481,48 @@ fn transform_export_statement(
     Ok(Vec::new())
 }
 
+/// Strip `keyword` from the front of `text` only when it appears as a whole
+/// word, i.e. the following byte is not an identifier continuation. This keeps
+/// identifiers such as `functionRegistry` or `classNames` from being mistaken
+/// for the `function`/`class` keywords.
+fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(keyword)?;
+    match rest.bytes().next() {
+        Some(next) if is_identifier_continue(next) => None,
+        _ => Some(rest),
+    }
+}
+
+/// An `export default` declaration is *named* only when a binding identifier
+/// follows the (optionally `async`-prefixed, optionally `*`-suffixed) keyword.
+/// Anonymous forms (`class {}`, `class extends X {}`, `function () {}`,
+/// `function* () {}`, and their `async` variants) and plain expressions must be
+/// wrapped as `const <default binding> = <expr>` instead of being left as a
+/// nameless declaration statement, which is a syntax error.
 fn is_named_default_declaration(trimmed_after_default: &str) -> bool {
-    if let Some(after_function) = trimmed_after_default.strip_prefix("function") {
-        return !after_function.trim_start().starts_with('(');
+    let rest = strip_keyword(trimmed_after_default, "async")
+        .map(str::trim_start)
+        .unwrap_or(trimmed_after_default);
+
+    if let Some(after_function) = strip_keyword(rest, "function") {
+        let after_star = after_function
+            .trim_start()
+            .strip_prefix('*')
+            .unwrap_or(after_function);
+        return after_star
+            .trim_start()
+            .bytes()
+            .next()
+            .is_some_and(is_identifier_start);
     }
 
-    if let Some(after_class) = trimmed_after_default.strip_prefix("class") {
-        return !after_class.trim_start().starts_with('{');
+    if let Some(after_class) = strip_keyword(rest, "class") {
+        let next = after_class.trim_start();
+        // `class Foo ...` is named; `class {` and `class extends ...` are
+        // anonymous. `extends` must be a whole word so a class literally named
+        // `extendsFoo` is still treated as a named declaration.
+        return next.bytes().next().is_some_and(is_identifier_start)
+            && strip_keyword(next, "extends").is_none();
     }
 
     false

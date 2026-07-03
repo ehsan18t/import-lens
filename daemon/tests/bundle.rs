@@ -111,6 +111,77 @@ fn minify_source_removes_whitespace_and_preserves_parseability() {
 }
 
 #[test]
+fn bundle_wraps_anonymous_default_class_with_extends() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "export class Base { value() { return 1; } }\n\
+         export default class extends Base { extra() { return 2; } }",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["default".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+    let minified = minify_source(&bundled, false);
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(
+        minified.is_ok(),
+        "anonymous default class with extends must produce a parseable bundle, got:\n{bundled}"
+    );
+}
+
+#[test]
+fn bundle_wraps_anonymous_default_generator() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "export default function* () { yield 1; }",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["default".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+    let minified = minify_source(&bundled, false);
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(
+        minified.is_ok(),
+        "anonymous default generator must produce a parseable bundle, got:\n{bundled}"
+    );
+}
+
+#[test]
+fn bundle_keeps_named_default_function_as_declaration() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "export default function loadThing() { return 1; }",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["default".to_owned()], false);
+    let bundled =
+        bundle_reachable_modules(&graph, &reachable).expect("reachable modules should bundle");
+    let minified = minify_source(&bundled, false);
+
+    fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
+    assert!(
+        bundled.contains("loadThing"),
+        "named default fn must be retained: {bundled}"
+    );
+    assert!(
+        minified.is_ok(),
+        "named default function must remain a valid declaration, got:\n{bundled}"
+    );
+}
+
+#[test]
 fn bundle_keeps_only_reachable_bindings_from_imported_modules() {
     let root = temp_workspace();
     write_source(
