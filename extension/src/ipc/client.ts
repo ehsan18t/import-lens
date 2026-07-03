@@ -150,13 +150,7 @@ export class IpcClient extends EventEmitter {
         }, timeoutMs);
       };
 
-      timer = setTimeout(() => {
-        if (this.#packageJsonPending.has(request.request_id)) {
-          this.#packageJsonPending.delete(request.request_id);
-          reject(new Error(`IPC request timed out after ${timeoutMs}ms`));
-        }
-      }, timeoutMs);
-
+      resetTimeout();
       this.#packageJsonPending.set(request.request_id, {
         resolve: (response) => {
           clearTimeout(timer);
