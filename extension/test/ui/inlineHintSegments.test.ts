@@ -4,6 +4,7 @@ import {
   inlineHintDisplayText,
   inlineHintSegmentsFromParts,
 } from "../../src/ui/inlineHintSegments.js";
+import { inlineHintDecorationLayerBuckets } from "../../src/ui/inlineHintDecorationLayerBuilder.js";
 
 test("inlineHintSegmentsFromParts builds primary and suffix segments", () => {
   assert.deepEqual(
@@ -51,4 +52,27 @@ test("inlineHintDisplayText joins primary and suffix labels", () => {
     }),
     "1.5 kB br · barrel",
   );
+});
+
+test("suffixes beyond the four slots fold into the last slot instead of dropping", () => {
+  const segments = inlineHintSegmentsFromParts({
+    primary: "1.2 kB br",
+    primaryTone: "size",
+    suffixes: [
+      { text: "server", tone: "tag" },
+      { text: "types only", tone: "tag" },
+      { text: "CJS", tone: "tag" },
+      { text: "+2 kB br", tone: "delta" },
+      { text: "over budget", tone: "alert" },
+      { text: "barrel", tone: "caution" },
+    ],
+  });
+  const buckets = inlineHintDecorationLayerBuckets(segments);
+
+  const rendered = [...buckets.suffix0, ...buckets.suffix1, ...buckets.suffix2, ...buckets.suffix3]
+    .map((segment) => segment.contentText)
+    .join("");
+  for (const label of ["server", "types only", "CJS", "+2 kB br", "over budget", "barrel"]) {
+    assert.ok(rendered.includes(label), `dropped suffix: ${label}`);
+  }
 });

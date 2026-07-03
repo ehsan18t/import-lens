@@ -49,11 +49,24 @@ export const inlineHintDecorationLayerBuckets = (
   for (const [index, segment] of segments.entries()) {
     const slot = slotForSegmentIndex(index);
 
-    if (!slot) {
+    if (slot) {
+      buckets[slot].push(segment);
       continue;
     }
 
-    buckets[slot].push(segment);
+    // No fixed slot remains: fold the overflow segment's text into the last
+    // suffix slot so no tag is silently dropped. The native inlay and CodeLens
+    // renderers show every suffix, and all renderers must agree.
+    const lastSlot = buckets.suffix3;
+    const last = lastSlot[lastSlot.length - 1];
+    if (last) {
+      lastSlot[lastSlot.length - 1] = {
+        ...last,
+        contentText: `${last.contentText}${segment.contentText}`,
+      };
+    } else {
+      lastSlot.push(segment);
+    }
   }
 
   return buckets;
