@@ -207,3 +207,37 @@ test("late failure from a superseded refresh does not downgrade fresh status", a
   assert.equal(harness.current("react")?.registryHintRefreshError, null);
   assert.equal(harness.current("react")?.registryHint?.fetchedAt, 200);
 });
+
+test("a later refresh of a disjoint target does not supersede an earlier target's response", async () => {
+  const react = stateFor("react");
+  const vue = stateFor("vue");
+  const harness = createHarness([react, vue]);
+
+  let reactRequest: RefreshRegistryHintsRequest | undefined;
+  let resolveReact: ((response: RefreshRegistryHintsResponse | null) => void) | undefined;
+  const daemon: RegistryRefreshTransport = {
+    refreshRegistryHints: (request) => {
+      if (request.targets.some((target) => target.name === "react")) {
+        reactRequest = request;
+        return new Promise((resolve) => {
+          resolveReact = resolve;
+        });
+      }
+      return Promise.resolve(successResponse(request, 200));
+    },
+  };
+  const refresher = new RegistryHintRefresher(daemon, harness.host, silentLogger);
+
+  // The react refresh stays pending; the vue refresh (a disjoint target)
+  // completes and bumps the generation.
+  const reactRefresh = refresher.refresh(uriKey, [targetFor(react)], "refresh_stale");
+  await refresher.refresh(uriKey, [targetFor(vue)], "refresh_stale");
+
+  // Completing react's response must still apply react's fresh status, because
+  // the vue refresh never touched the react target.
+  assert.ok(reactRequest, "react refresh should have called the daemon");
+  resolveReact?.(successResponse(reactRequest, 300));
+  await reactRefresh;
+
+  assert.equal(harness.current("react")?.registryHintRefreshStatus, "fresh");
+});
