@@ -1,5 +1,5 @@
 use crate::{
-    cache::key::decode_cache_identity,
+    cache::key::{CacheIdentityV3, decode_cache_identity},
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
@@ -251,14 +251,7 @@ fn run_recent_prewarm_job(
         .filter_map(|key| {
             let identity = decode_cache_identity(&key)?;
             let resolved = resolved_from_cache_identity(&identity)?;
-            let request = ImportRequest {
-                specifier: identity.specifier,
-                package_name: identity.package_name,
-                version: identity.package_version,
-                named: identity.named_exports,
-                import_kind: identity.import_kind,
-                runtime: identity.runtime,
-            };
+            let request = import_request_from_identity(identity);
             Some(PrewarmJob { request, resolved })
         })
         .collect::<Vec<_>>();
@@ -299,16 +292,18 @@ fn installed_package(active_document_path: &Path, package_name: &str) -> Option<
 }
 
 pub fn cached_import_request_from_key(key: &str) -> Option<ImportRequest> {
-    let identity = decode_cache_identity(key)?;
+    decode_cache_identity(key).map(import_request_from_identity)
+}
 
-    Some(ImportRequest {
+fn import_request_from_identity(identity: CacheIdentityV3) -> ImportRequest {
+    ImportRequest {
         specifier: identity.specifier,
         package_name: identity.package_name,
         version: identity.package_version,
         named: identity.named_exports,
         import_kind: identity.import_kind,
         runtime: identity.runtime,
-    })
+    }
 }
 
 fn prewarm_request(package_name: &str, version: &str, import_kind: ImportKind) -> ImportRequest {
