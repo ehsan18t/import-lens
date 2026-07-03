@@ -77,25 +77,6 @@ fn repro_star_cycle_stack_overflow() {
     fs::remove_dir_all(&root).expect("cleanup");
 }
 
-/// SUSPICION 3: completion bails when any earlier import statement lacks
-/// braces (e.g. a default import on line 1).
-#[test]
-fn repro_completion_bails_on_earlier_braceless_import() {
-    let source = "import React from 'react';\nimport { map } from 'lodash';\n";
-    let cursor = source.rfind('{').expect("brace exists") + 1;
-
-    let context = named_import_completion_context(source, cursor);
-
-    // CURRENT (buggy) behavior: None even though the cursor is inside braces.
-    assert!(context.is_none(), "got: {context:?}");
-
-    // Control: without the braceless import first, completion works.
-    let control_source = "import { map } from 'lodash';\n";
-    let control_cursor = control_source.rfind('{').expect("brace exists") + 1;
-    let control = named_import_completion_context(control_source, control_cursor);
-    assert!(control.is_some());
-}
-
 /// SUSPICION 3b (extension cross-check): the extension sends
 /// `document.offsetAt(position)` — a UTF-16 code-unit offset — but the daemon
 /// compares `cursor_offset` against byte offsets from oxc spans. Any

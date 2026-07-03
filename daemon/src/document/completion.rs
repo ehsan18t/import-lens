@@ -58,7 +58,9 @@ fn completion_context_from_module_record(
     groups.sort_by_key(|group| group.statement_span.start);
 
     for mut group in groups {
-        let range = named_import_member_range(source, group.statement_span)?;
+        let Some(range) = named_import_member_range(source, group.statement_span) else {
+            continue;
+        };
         if offset < range.start || offset > range.end {
             continue;
         }
@@ -85,6 +87,23 @@ struct NamedImportGroup {
 struct OffsetRange {
     start: usize,
     end: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_import_completion_context;
+
+    #[test]
+    fn completion_skips_earlier_imports_without_braces() {
+        let source = "import React from 'react';\nimport { map } from 'lodash';\n";
+        let cursor = source.rfind('{').expect("brace should exist") + 1;
+
+        let context =
+            named_import_completion_context(source, cursor).expect("completion context");
+
+        assert_eq!(context.specifier, "lodash");
+        assert_eq!(context.imported_names, vec!["map"]);
+    }
 }
 
 fn named_import_member_range(source: &str, statement_span: Span) -> Option<OffsetRange> {
