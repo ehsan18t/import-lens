@@ -258,9 +258,35 @@ const connectWithRetry = async (pipeName, timeoutMs, child, stderr) => {
   throw new Error(`failed to connect to ImportLens daemon: ${lastError?.message ?? "timeout"}${suffix}`);
 };
 
-const daemonClient = (socket) => {
+const daemonClient = (socket, { requestTimeoutMs = 60000 } = {}) => {
+  // Responses are correlated positionally (this harness sends one request at a
+  // time in order), so close/timeout/parse failures must reject the stragglers
+  // rather than leave their promises pending forever.
   const pending = [];
   let buffer = Buffer.alloc(0);
+
+  const remove = (item) => {
+    const index = pending.indexOf(item);
+    if (index !== -1) {
+      pending.splice(index, 1);
+    }
+  };
+
+  const settle = (item, apply) => {
+    if (item.settled) {
+      return;
+    }
+    item.settled = true;
+    clearTimeout(item.timer);
+    remove(item);
+    apply();
+  };
+
+  const rejectAll = (error) => {
+    for (const item of [...pending]) {
+      settle(item, () => item.reject(error));
+    }
+  };
 
   socket.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -273,15 +299,24 @@ const daemonClient = (socket) => {
 
       const payload = buffer.subarray(4, 4 + length);
       buffer = buffer.subarray(4 + length);
-      pending.shift()?.resolve(decode(payload));
+
+      let message;
+      try {
+        message = decode(payload);
+      } catch (error) {
+        rejectAll(error instanceof Error ? error : new Error(String(error)));
+        socket.destroy();
+        return;
+      }
+
+      const item = pending[0];
+      if (item) {
+        settle(item, () => item.resolve(message));
+      }
     }
   });
-  socket.on("error", (error) => {
-    for (const item of pending) {
-      item.reject(error);
-    }
-    pending.length = 0;
-  });
+  socket.on("error", (error) => rejectAll(error));
+  socket.on("close", () => rejectAll(new Error("ImportLens daemon connection closed")));
 
   const send = (message) => {
     const payload = Buffer.from(encode(message));
@@ -293,7 +328,12 @@ const daemonClient = (socket) => {
   return {
     send,
     request: (message) => new Promise((resolve, reject) => {
-      pending.push({ resolve, reject });
+      const item = { resolve, reject, settled: false, timer: null };
+      item.timer = setTimeout(
+        () => settle(item, () => reject(new Error(`ImportLens daemon request timed out after ${requestTimeoutMs}ms`))),
+        requestTimeoutMs,
+      );
+      pending.push(item);
       send(message);
     }),
   };
