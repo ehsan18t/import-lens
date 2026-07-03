@@ -709,8 +709,11 @@ impl ImportLensService {
             };
         }
 
-        let Some(context) = named_import_completion_context(&request.source, request.cursor_offset)
-        else {
+        let Some(context) = named_import_completion_context(
+            &request.active_document_path,
+            &request.source,
+            request.cursor_offset,
+        ) else {
             return CompleteImportMembersResponse {
                 version: request.version,
                 request_id: request.request_id,

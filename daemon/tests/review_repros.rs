@@ -3,7 +3,7 @@
 //! was wrong. This file is deleted once findings are confirmed.
 
 use import_lens_daemon::{
-    document::{is_runtime_package_specifier, named_import_completion_context},
+    document::is_runtime_package_specifier,
     pipeline::{
         bundle::bundle_reachable_modules_with_metadata,
         graph::build_module_graph,
@@ -75,25 +75,6 @@ fn repro_star_cycle_stack_overflow() {
     let _ = bundle_reachable_modules_with_metadata(&graph, &reachable);
 
     fs::remove_dir_all(&root).expect("cleanup");
-}
-
-/// SUSPICION 3b (extension cross-check): the extension sends
-/// `document.offsetAt(position)` — a UTF-16 code-unit offset — but the daemon
-/// compares `cursor_offset` against byte offsets from oxc spans. Any
-/// non-ASCII character before the cursor desynchronizes the two.
-#[test]
-fn repro_completion_cursor_offset_is_bytes_but_client_sends_utf16() {
-    let source = "const s = '\u{20AC}\u{20AC}';\nimport { map } from 'lodash';\n";
-    let byte_cursor = source.rfind('{').expect("brace exists") + 1;
-    let utf16_cursor: usize = source[..byte_cursor].chars().map(char::len_utf16).sum();
-
-    // Two euro signs: 6 bytes but 2 UTF-16 units, so the offsets diverge.
-    assert_eq!(byte_cursor, utf16_cursor + 4);
-
-    // CURRENT (buggy) behavior: the client's UTF-16 offset misses the braces.
-    assert!(named_import_completion_context(source, utf16_cursor).is_none());
-    // Control: the byte offset the daemon actually expects works.
-    assert!(named_import_completion_context(source, byte_cursor).is_some());
 }
 
 /// SUSPICION 4: bare Node builtin subpaths are treated as npm packages.
