@@ -183,17 +183,13 @@ fn script_blocks(source: &str) -> Vec<ScriptBlock<'_>> {
         };
         let tag_end = tag_start + relative_tag_end;
         let content_start = tag_end + 1;
-        // Match the closing tag as `</script` followed by optional whitespace
-        // and `>`, so a legal `</script >` is not missed (which would drop this
-        // block and every later block).
-        let Some(relative_close) = lower_source[content_start..].find("</script") else {
+        // The close tag is the next real `</script...>` (see find_script_close):
+        // a legal `</script >` must not be missed, and a `</scriptx>` inside the
+        // script text must not be mistaken for it - either error would drop this
+        // block and every later block.
+        let Some((content_end, close_end)) = find_script_close(&lower_source, content_start) else {
             break;
         };
-        let content_end = content_start + relative_close;
-        let Some(relative_gt) = lower_source[content_end..].find('>') else {
-            break;
-        };
-        let close_end = content_end + relative_gt + 1;
 
         blocks.push(ScriptBlock {
             attributes: &source[after_name..tag_end],
@@ -204,6 +200,28 @@ fn script_blocks(source: &str) -> Vec<ScriptBlock<'_>> {
     }
 
     blocks
+}
+
+/// Finds the next real `</script...>` close tag at or after `from`, skipping
+/// pseudo-closes such as `</scriptx>` that appear inside script text: the byte
+/// after `</script` must be a tag boundary (whitespace, `/`, `>`, or EOF),
+/// mirroring the open-tag check, while still allowing trailing whitespace
+/// before `>` (`</script >`). Returns `(content_end, close_end)`.
+fn find_script_close(lower_source: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = lower_source.as_bytes();
+    let mut scan = from;
+
+    loop {
+        let content_end = scan + lower_source[scan..].find("</script")?;
+        let after_close_name = content_end + "</script".len();
+
+        if is_tag_boundary(bytes.get(after_close_name).copied()) {
+            let close_end = after_close_name + lower_source[after_close_name..].find('>')? + 1;
+            return Some((content_end, close_end));
+        }
+
+        scan = after_close_name;
+    }
 }
 
 fn is_tag_boundary(byte: Option<u8>) -> bool {
@@ -359,5 +377,29 @@ mod tests {
             language_from_attributes("setup"),
             ScriptLanguage::Js
         ));
+    }
+
+    #[test]
+    fn script_blocks_ignore_pseudo_close_tag_glued_to_content() {
+        // `</scriptx>` inside script text is not a real close tag; the block must
+        // extend to the real `</script>` so later imports are still analyzed.
+        let source = "<script>\nconst s = \"</scriptx>\";\nimport foo from './real';\n</script>";
+        let blocks = script_blocks(source);
+
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            blocks[0].source.contains("import foo from './real'"),
+            "block source truncated at a pseudo-close tag: {:?}",
+            blocks[0].source,
+        );
+    }
+
+    #[test]
+    fn script_blocks_accept_close_tag_with_trailing_whitespace() {
+        let source = "<script>\nimport foo from './real';\n</script >";
+        let blocks = script_blocks(source);
+
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].source.contains("import foo from './real'"));
     }
 }
