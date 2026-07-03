@@ -73,21 +73,3 @@ fn repro_star_cycle_stack_overflow() {
     fs::remove_dir_all(&root).expect("cleanup");
 }
 
-/// SUSPICION 6: JSON with `eval`/`arguments` keys synthesizes an invalid
-/// module (`export const eval = ...` is a strict-mode SyntaxError).
-#[test]
-fn repro_json_eval_key_breaks_graph() {
-    let root = temp_workspace();
-    write_source(
-        &root,
-        "entry.js",
-        "import data from './data.json';\nexport const value = data;",
-    );
-    write_source(&root, "data.json", "{\"eval\": 1, \"safe\": 2}");
-
-    let result = build_module_graph(&root.join("entry.js"));
-
-    fs::remove_dir_all(&root).expect("cleanup");
-    // CURRENT (buggy) behavior: graph build fails on the synthetic module.
-    assert!(result.is_err(), "graph built: {result:?}");
-}

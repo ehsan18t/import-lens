@@ -402,3 +402,31 @@ fn graph_resolves_and_transforms_mts_and_cts_modules() {
 
     fs::remove_dir_all(workspace).expect("temp graph workspace should be removed");
 }
+
+#[test]
+fn json_modules_with_strict_mode_restricted_keys_still_build() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import data from './data.json';\nexport const value = data;",
+    );
+    write_source(
+        &root,
+        "data.json",
+        "{\"eval\": 1, \"arguments\": 2, \"safe\": 3}",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js"));
+
+    fs::remove_dir_all(root).expect("temp workspace should be removed");
+    let graph = graph.expect("JSON with eval/arguments keys should build");
+    let json_module = graph
+        .modules
+        .iter()
+        .find(|module| module.path.extension().is_some_and(|ext| ext == "json"))
+        .expect("json module should be in the graph");
+    assert!(json_module.source.contains("export const safe"));
+    assert!(!json_module.source.contains("export const eval"));
+    assert!(!json_module.source.contains("export const arguments"));
+}

@@ -608,7 +608,8 @@ fn is_safe_js_identifier(value: &str) -> bool {
         && chars.all(|char| char == '_' || char == '$' || char.is_ascii_alphanumeric())
         && !matches!(
             value,
-            "break"
+            "arguments"
+                | "break"
                 | "case"
                 | "catch"
                 | "class"
@@ -620,6 +621,7 @@ fn is_safe_js_identifier(value: &str) -> bool {
                 | "do"
                 | "else"
                 | "enum"
+                | "eval"
                 | "export"
                 | "extends"
                 | "false"
