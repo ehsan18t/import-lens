@@ -130,3 +130,61 @@ fn multi_module_rebundle_stays_under_release_threshold() {
         "multi-module re-bundle exceeded threshold: {elapsed_ms}ms"
     );
 }
+
+#[test]
+#[ignore = "release-only performance smoke run by pnpm test:performance"]
+fn warm_reanalysis_of_multi_module_dependency_stays_under_threshold() {
+    use std::fs;
+    let workspace = common::temp_workspace("import-lens-perf-warm");
+    let pkg = workspace.join("node_modules").join("wide-lib");
+    fs::create_dir_all(&pkg).expect("pkg dir");
+    fs::create_dir_all(workspace.join("src")).expect("src dir");
+    fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"wide-lib","version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("manifest");
+    let mut index = String::new();
+    for i in 0..60 {
+        fs::write(
+            pkg.join(format!("leaf{i}.js")),
+            format!("export const fn{i} = () => {i};\n"),
+        )
+        .expect("leaf");
+        index.push_str(&format!("export {{ fn{i} }} from './leaf{i}.js';\n"));
+    }
+    fs::write(pkg.join("index.js"), index).expect("index");
+
+    let service = ImportLensService::new(None, false);
+    let document = workspace.join("src").join("app.ts");
+    let batch = |request_id: u64| BatchRequest {
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document.to_string_lossy().to_string(),
+        imports: vec![ImportRequest {
+            specifier: "wide-lib".to_owned(),
+            package_name: "wide-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec!["fn0".to_owned()],
+            import_kind: ImportKind::Named,
+            runtime: ImportRuntime::Component,
+        }],
+        streaming: false,
+    };
+
+    assert_eq!(service.handle_batch(batch(0)).imports[0].error, None);
+    let start = Instant::now();
+    for i in 1..=50 {
+        let response = service.handle_batch(batch(i));
+        assert!(response.imports[0].cache_hit, "expected warm hit");
+    }
+    let elapsed_ms = start.elapsed().as_millis();
+
+    fs::remove_dir_all(&workspace).expect("cleanup");
+    eprintln!("warm_reanalysis: {elapsed_ms}ms for 50 hits");
+    assert!(
+        elapsed_ms <= threshold_ms(2000),
+        "warm re-analysis exceeded threshold: {elapsed_ms}ms"
+    );
+}
