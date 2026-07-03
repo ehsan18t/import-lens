@@ -129,6 +129,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       }, (partial) => this.handlePackageJsonPartial(document.uri, key, partial));
 
       if (!response) {
+        if (!this.#freshness.isCurrent(key, requestId)) {
+          return;
+        }
         this.markLoadingUnavailable(document.uri, "Daemon unavailable");
         return;
       }
@@ -148,6 +151,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       this.queueRegistryRefreshes(document.uri, states);
     } catch (error) {
       this.#logger.warn(`Package.json dependency analysis failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!this.#freshness.isCurrent(key, requestId)) {
+        return;
+      }
       this.markLoadingUnavailable(
         document.uri,
         error instanceof Error ? error.message : "Daemon unavailable",
