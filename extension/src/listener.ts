@@ -82,7 +82,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
 
-    const changedLinesPromise = changedLinesForFile(document.fileName);
+    const changedLinesPromise = changedLinesForFile(document.fileName, document.getText());
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
     const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
 
