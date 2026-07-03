@@ -75,6 +75,7 @@ test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () =>
     oxcVersion: "0.139.0",
     resolverVersion: "11.22.0",
     fetchJson: availableVersions(),
+    platform: "linux",
     execFile: async (command, args) => execs.push([command, args]),
   });
 
@@ -103,6 +104,26 @@ test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () =>
       ["update", "-p", crate, "--precise", "0.139.0"],
     ]),
   ]);
+});
+
+test("updateOxcStack launches pnpm through a shell on Windows for the lockfile update", async () => {
+  const repo = await tempRepo();
+  const execs = [];
+
+  await updateOxcStack({
+    rootDir: repo.root,
+    paths: repo.paths,
+    oxcVersion: "0.139.0",
+    resolverVersion: "11.22.0",
+    fetchJson: availableVersions(),
+    platform: "win32",
+    execFile: async (...args) => execs.push(args),
+  });
+
+  // pnpm resolves to pnpm.CMD on Windows; it must go through the shell.
+  assert.deepEqual(execs[0], ["pnpm install --lockfile-only", { shell: true }]);
+  // cargo is a real executable and stays on execFile without a shell.
+  assert.deepEqual(execs[1], ["cargo", ["update", "-p", "oxc_resolver", "--precise", "11.22.0"]]);
 });
 
 test("updateOxcStack resolves latest versions before editing", async () => {

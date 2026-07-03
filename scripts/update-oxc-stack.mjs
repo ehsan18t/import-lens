@@ -72,6 +72,7 @@ export const updateOxcStack = async ({
   readFile = fsReadFile,
   writeFile = fsWriteFile,
   execFile = execFilePromise,
+  platform = process.platform,
   stdout = undefined,
 } = {}) => {
   const absolutePaths = Object.fromEntries(
@@ -110,7 +111,7 @@ export const updateOxcStack = async ({
         await writeFile(absolutePaths[key], next, "utf8");
       }
     }
-    await updateLockfiles(execFile, targetOxcVersion, targetResolverVersion);
+    await updateLockfiles(execFile, targetOxcVersion, targetResolverVersion, platform);
   }
 
   const result = {
@@ -150,8 +151,15 @@ const valueAfter = (argv, index, option) => {
   return value;
 };
 
-const updateLockfiles = async (execFile, oxcVersion, resolverVersion) => {
-  await execFile("pnpm", ["install", "--lockfile-only"]);
+const updateLockfiles = async (execFile, oxcVersion, resolverVersion, platform = process.platform) => {
+  // On Windows `pnpm` resolves to `pnpm.CMD`, which execFile (CreateProcess)
+  // cannot launch directly; run it through the shell, mirroring the packaging
+  // scripts. cargo is a real executable and stays on execFile.
+  if (platform === "win32") {
+    await execFile("pnpm install --lockfile-only", { shell: true });
+  } else {
+    await execFile("pnpm", ["install", "--lockfile-only"]);
+  }
   await execFile("cargo", ["update", "-p", "oxc_resolver", "--precise", resolverVersion]);
   for (const crate of oxcStackConfig.oxcCrates) {
     await execFile("cargo", ["update", "-p", crate, "--precise", oxcVersion]);
