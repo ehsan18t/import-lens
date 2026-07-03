@@ -75,10 +75,25 @@ export const updateManifest = (manifest, oxcVersion) => {
   return `${JSON.stringify(next, null, 2)}\n`;
 };
 
-export const replaceKnownVersions = (content, oxcVersion, resolverVersion) =>
-  content
-    .replaceAll(oxcStackConfig.currentOxcVersion, oxcVersion)
-    .replaceAll(oxcStackConfig.currentResolverVersion, resolverVersion);
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+export const replaceKnownVersions = (content, oxcVersion, resolverVersion) => {
+  // Replace both pinned versions in a single word-boundary pass. Word
+  // boundaries keep a version that is only a substring of a longer number (a
+  // build id, an unrelated figure) intact, and a single pass means replacing
+  // one version can never corrupt the other's needle - a hazard of the
+  // previous chained replaceAll if one version string ever contained the other.
+  const replacements = new Map([
+    [oxcStackConfig.currentOxcVersion, oxcVersion],
+    [oxcStackConfig.currentResolverVersion, resolverVersion],
+  ]);
+  const needles = [...replacements.keys()]
+    .sort((left, right) => right.length - left.length)
+    .map(escapeRegExp);
+  const pattern = new RegExp(`\\b(?:${needles.join("|")})\\b`, "gu");
+
+  return content.replace(pattern, (match) => replacements.get(match) ?? match);
+};
 
 export const updateConfig = (content, oxcVersion, resolverVersion) =>
   content

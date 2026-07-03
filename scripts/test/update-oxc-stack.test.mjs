@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { oxcStackConfig } from "../oxc-stack.config.mjs";
+import { replaceKnownVersions } from "../oxc-stack-helpers.mjs";
 import { parseUpdateArgs, updateOxcStack } from "../update-oxc-stack.mjs";
 
 const tempRepo = async ({ cargoToml = cargoTomlFixture(), manifest = manifestFixture(), srs = srsFixture() } = {}) => {
@@ -27,6 +28,31 @@ const tempRepo = async ({ cargoToml = cargoTomlFixture(), manifest = manifestFix
     },
   };
 };
+
+test("replaceKnownVersions updates pinned tokens without touching substrings or overlapping versions", () => {
+  const oldOxc = oxcStackConfig.currentOxcVersion;
+  const oldResolver = oxcStackConfig.currentResolverVersion;
+
+  const content = [
+    `| \`oxc_parser\` | ${oldOxc} | exact pin |`,
+    `currently resolved to ${oldResolver}.`,
+    `unrelated build number 10${oldOxc}9 must survive`,
+  ].join("\n");
+
+  const lines = replaceKnownVersions(content, "0.139.0", "11.23.0").split("\n");
+
+  assert.equal(lines[0], "| `oxc_parser` | 0.139.0 | exact pin |");
+  assert.equal(lines[1], "currently resolved to 11.23.0.");
+  // The old version embedded inside a longer number is not a pinned token.
+  assert.equal(lines[2], `unrelated build number 10${oldOxc}9 must survive`);
+
+  // A new oxc version that embeds the old resolver version must not then be
+  // corrupted by the resolver replacement (a chained replaceAll would be).
+  assert.equal(
+    replaceKnownVersions(`pin ${oldOxc}`, `${oldResolver}-oxc`, "11.23.0"),
+    `pin ${oldResolver}-oxc`,
+  );
+});
 
 test("parseUpdateArgs supports explicit versions and dry-run", () => {
   assert.deepEqual(parseUpdateArgs(["--oxc", "0.139.0", "--resolver", "11.22.0", "--dry-run"]), {
