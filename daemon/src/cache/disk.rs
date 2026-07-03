@@ -5,6 +5,7 @@ use crate::{
     },
     cache::memory::CachedImport,
     ipc::protocol::{ImportResult, ModuleContribution},
+    time::unix_millis_now,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 const CACHE_DB_FILE_NAME: &str = "importlens.redb";
@@ -465,14 +465,6 @@ impl Drop for DiskCache {
     fn drop(&mut self) {
         self.flush_pending_touches();
     }
-}
-
-fn unix_millis_now() -> u64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 fn write_pending_touches(

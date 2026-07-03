@@ -1,8 +1,9 @@
+use crate::time::unix_millis;
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     path::Path,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const CACHE_RECYCLE_ENTRY_LIMIT: usize = 200_000;
@@ -90,12 +91,4 @@ pub fn record_recycle_timestamp(storage_path: &Path, now: SystemTime) -> io::Res
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn unix_millis(now: SystemTime) -> u64 {
-    let millis = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
 }

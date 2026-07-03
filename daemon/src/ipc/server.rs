@@ -12,7 +12,7 @@ use crate::{
             EnumerateExportsResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
             FileSizeRequest, FileSizeResponse, ImportDiagnostic, PROTOCOL_VERSION,
             RefreshRegistryHintsResponse, RegistryHintResult, WorkspaceReportRequest,
-            WorkspaceReportResponse, WorkspaceReportSummary,
+            WorkspaceReportResponse, WorkspaceReportSummary, is_supported_protocol_version,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
@@ -59,21 +59,6 @@ where
     Ok(())
 }
 
-fn is_supported_protocol_version(version: u32) -> bool {
-    // The registry-refresh variant was introduced in protocol v7; older
-    // negotiated clients never emit it, so accepting the full supported
-    // range here is safe and matches `is_supported_version`.
-    (1..=PROTOCOL_VERSION).contains(&version)
-}
-
-fn protocol_diagnostics_for_stage(stage: &str, message: &str) -> Vec<ImportDiagnostic> {
-    vec![ImportDiagnostic {
-        stage: stage.to_owned(),
-        message: message.to_owned(),
-        details: Vec::new(),
-    }]
-}
-
 fn workspace_report_protocol_error(
     request: &WorkspaceReportRequest,
     message: &str,
@@ -82,30 +67,10 @@ fn workspace_report_protocol_error(
         version: request.version.min(PROTOCOL_VERSION),
         request_id: request.request_id,
         rows: Vec::new(),
-        summary: WorkspaceReportSummary {
-            import_count: 0,
-            total_brotli_bytes: 0,
-            low_confidence_count: 0,
-            medium_confidence_count: 0,
-            conservative_count: 0,
-            budget_violation_count: 0,
-            duplicate_imports: Vec::new(),
-            shared_modules: Vec::new(),
-            treemap: Vec::new(),
-        },
+        summary: WorkspaceReportSummary::default(),
         error: Some(message.to_owned()),
-        diagnostics: protocol_diagnostics_for_stage("workspace_report", message),
+        diagnostics: vec![ImportDiagnostic::for_stage("workspace_report", message)],
     }
-}
-
-// `server.rs` has no existing wall-clock helper; the registry handler needs
-// one to stamp `now_ms` for cache freshness/retry decisions.
-fn current_time_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(windows)]
@@ -213,7 +178,7 @@ where
 
         match message {
             ClientMessage::Hello(hello) => {
-                if !is_supported_hello_version(hello.version) {
+                if !is_supported_protocol_version(hello.version) {
                     logging::log_warn(
                         "ipc",
                         format!("unsupported hello protocol version {}", hello.version),
@@ -512,7 +477,7 @@ where
                         results: Vec::new(),
                         indexes: None,
                         error: Some(message.clone()),
-                        diagnostics: protocol_diagnostics_for_stage("protocol", &message),
+                        diagnostics: vec![ImportDiagnostic::for_stage("protocol", &message)],
                     });
                     continue;
                 }
@@ -521,7 +486,7 @@ where
                 let request_id = request.request_id;
                 let mode = request.mode;
                 let targets = request.targets;
-                let now_ms = current_time_millis();
+                let now_ms = crate::time::unix_millis_now();
                 let (partial_tx, mut partial_rx) = mpsc::unbounded_channel();
                 let outbound = outbound_tx.clone();
 
@@ -600,7 +565,7 @@ where
                     results: Vec::new(),
                     indexes: None,
                     error: Some(message.clone()),
-                    diagnostics: protocol_diagnostics_for_stage("protocol", &message),
+                    diagnostics: vec![ImportDiagnostic::for_stage("protocol", &message)],
                 });
             }
             ClientMessage::WorkspaceReport(request) if hello_received => {
@@ -976,15 +941,7 @@ fn protocol_error_cache_remove_response(
 }
 
 fn protocol_diagnostics(message: String) -> Vec<ImportDiagnostic> {
-    vec![ImportDiagnostic {
-        stage: "protocol".to_owned(),
-        message,
-        details: Vec::new(),
-    }]
-}
-
-fn is_supported_hello_version(version: u32) -> bool {
-    (1..=PROTOCOL_VERSION).contains(&version)
+    vec![ImportDiagnostic::for_stage("protocol", message)]
 }
 
 fn recycle_if_needed(

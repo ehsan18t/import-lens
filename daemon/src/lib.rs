@@ -8,3 +8,4 @@ pub mod prefetch;
 pub mod registry;
 pub mod report;
 pub mod service;
+pub mod time;

@@ -3,6 +3,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 7;
 
+pub fn is_supported_protocol_version(version: u32) -> bool {
+    (1..=PROTOCOL_VERSION).contains(&version)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportKind {
@@ -141,6 +145,16 @@ pub struct ImportDiagnostic {
     pub stage: String,
     pub message: String,
     pub details: Vec<String>,
+}
+
+impl ImportDiagnostic {
+    pub fn for_stage(stage: &str, message: impl Into<String>) -> Self {
+        Self {
+            stage: stage.to_owned(),
+            message: message.into(),
+            details: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,7 +416,7 @@ pub struct DuplicateModuleGroup {
     pub vendored: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceReportSummary {
     pub import_count: u64,

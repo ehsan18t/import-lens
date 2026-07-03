@@ -1,6 +1,7 @@
 use crate::{
     cache::memory::ImportCache,
     ipc::protocol::{CacheOperationResult, CacheShardInfo},
+    time::unix_millis_now,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,7 +9,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 const SHARD_METADATA_FILE_NAME: &str = "importlens-project-cache.json";
@@ -603,10 +603,3 @@ fn directory_size(path: &Path) -> u64 {
         .sum()
 }
 
-fn unix_millis_now() -> u64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
-}

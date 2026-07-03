@@ -22,6 +22,7 @@ use crate::{
         PROTOCOL_VERSION, PackageJsonDependencyAnalysisItem,
         RegistryHintMode as ProtocolRegistryHintMode, RegistryHintResult, RegistryHintTarget,
         WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
+        is_supported_protocol_version,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
@@ -210,9 +211,9 @@ impl ImportLensService {
                 version: request.version.min(PROTOCOL_VERSION),
                 request_id: request.request_id,
                 rows: Vec::new(),
-                summary: empty_workspace_report_summary(),
+                summary: WorkspaceReportSummary::default(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -396,7 +397,7 @@ impl ImportLensService {
                 request_id: request.request_id,
                 imports: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -416,7 +417,7 @@ impl ImportLensService {
                     request_id: request.request_id,
                     imports: Vec::new(),
                     error: Some(error.clone()),
-                    diagnostics: protocol_diagnostics("document_parse", &error),
+                    diagnostics: vec![ImportDiagnostic::for_stage("document_parse", &error)],
                 };
             }
         };
@@ -441,7 +442,7 @@ impl ImportLensService {
                 request_id: request.request_id,
                 imports: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -482,7 +483,7 @@ impl ImportLensService {
                 imports: Vec::new(),
                 states: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -508,7 +509,7 @@ impl ImportLensService {
                     imports: Vec::new(),
                     states: Vec::new(),
                     error: Some(error.clone()),
-                    diagnostics: protocol_diagnostics("document_parse", &error),
+                    diagnostics: vec![ImportDiagnostic::for_stage("document_parse", &error)],
                 };
             }
         };
@@ -573,7 +574,7 @@ impl ImportLensService {
                 states: Vec::new(),
                 indexes: None,
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -583,7 +584,7 @@ impl ImportLensService {
         };
         let sections = package_json_dependency_sections(&request.source);
         let registry_hint_mode = effective_registry_hint_mode(&request);
-        let now_ms = current_time_millis();
+        let now_ms = crate::time::unix_millis_now();
         let mut states = Vec::new();
         let mut import_requests = Vec::new();
 
@@ -705,7 +706,7 @@ impl ImportLensService {
                 exports: Vec::new(),
                 imported_names: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -739,7 +740,7 @@ impl ImportLensService {
                     exports: Vec::new(),
                     imported_names: context.imported_names,
                     error: Some(error.clone()),
-                    diagnostics: protocol_diagnostics("package_resolution", &error),
+                    diagnostics: vec![ImportDiagnostic::for_stage("package_resolution", &error)],
                 };
             }
         };
@@ -861,7 +862,7 @@ impl ImportLensService {
                 last_cleanup_millis: None,
                 current_project: None,
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -891,7 +892,7 @@ impl ImportLensService {
                 removed: Vec::new(),
                 failed: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -919,7 +920,7 @@ impl ImportLensService {
                 request_id: request.request_id,
                 shards: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -940,7 +941,7 @@ impl ImportLensService {
                 removed: Vec::new(),
                 failed: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: protocol_diagnostics("protocol", "unsupported protocol version"),
+                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
             };
         }
 
@@ -959,10 +960,10 @@ impl ImportLensService {
                             "workspace_root is required for current_project cache removal"
                                 .to_owned(),
                         ),
-                        diagnostics: protocol_diagnostics(
+                        diagnostics: vec![ImportDiagnostic::for_stage(
                             "protocol",
                             "workspace_root is required for current_project cache removal",
-                        ),
+                        )],
                     };
                 }
             },
@@ -1236,13 +1237,6 @@ impl RegistryHintTestHandle<'_> {
     }
 }
 
-fn current_time_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn effective_registry_hint_mode(
     request: &AnalyzePackageJsonRequest,
 ) -> crate::registry::service::RegistryHintMode {
@@ -1349,28 +1343,6 @@ fn package_name_from_package_json_path(package_json_path: &str) -> Option<String
     Some(get_package_name(after_node_modules))
 }
 
-fn protocol_diagnostics(stage: &str, message: &str) -> Vec<ImportDiagnostic> {
-    vec![ImportDiagnostic {
-        stage: stage.to_owned(),
-        message: message.to_owned(),
-        details: Vec::new(),
-    }]
-}
-
-fn empty_workspace_report_summary() -> WorkspaceReportSummary {
-    WorkspaceReportSummary {
-        import_count: 0,
-        total_brotli_bytes: 0,
-        low_confidence_count: 0,
-        medium_confidence_count: 0,
-        conservative_count: 0,
-        budget_violation_count: 0,
-        duplicate_imports: Vec::new(),
-        shared_modules: Vec::new(),
-        treemap: Vec::new(),
-    }
-}
-
 fn has_request_specific_diagnostics(result: &ImportResult) -> bool {
     result
         .diagnostics
@@ -1454,10 +1426,6 @@ pub fn protocol_error_file_size_response(
             details: Vec::new(),
         }],
     }
-}
-
-fn is_supported_protocol_version(version: u32) -> bool {
-    (1..=PROTOCOL_VERSION).contains(&version)
 }
 
 fn enumerate_graph_exports(graph: &ModuleGraph) -> Vec<String> {
