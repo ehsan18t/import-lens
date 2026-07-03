@@ -551,9 +551,20 @@ fn write_pending_inserts(
             table
                 .insert(key.as_str(), entry.bytes.as_slice())
                 .map_err(|error| format!("failed to insert cache entry: {error}"))?;
-            recents
-                .insert(key.as_str(), entry.recorded_at_millis)
-                .map_err(|error| format!("failed to update recents table: {error}"))?;
+            // Never lower an existing (newer) recents timestamp: the insert and
+            // touch queues flush independently, so an insert flushing after a
+            // later touch of the same key must not regress its recency and demote
+            // it out of the startup preload/prewarm set.
+            let keep_existing = recents
+                .get(key.as_str())
+                .map_err(|error| format!("failed to read recents table: {error}"))?
+                .map(|existing| existing.value() >= entry.recorded_at_millis)
+                .unwrap_or(false);
+            if !keep_existing {
+                recents
+                    .insert(key.as_str(), entry.recorded_at_millis)
+                    .map_err(|error| format!("failed to update recents table: {error}"))?;
+            }
         }
     }
 
@@ -670,5 +681,51 @@ mod tests {
         assert_eq!(current.get("react"), Some(&30));
         assert_eq!(current.get("vue"), Some(&20));
         assert_eq!(current.get("svelte"), Some(&40));
+    }
+
+    #[test]
+    fn write_pending_inserts_does_not_lower_a_newer_recents_timestamp() {
+        use super::{PendingInsert, RECENTS_TABLE, write_pending_inserts};
+        use redb::{Database, ReadableDatabase};
+
+        let dir = std::env::temp_dir().join(format!(
+            "import-lens-disk-recents-monotonic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let db = Database::create(dir.join("recents.redb")).expect("db should open");
+
+        // Seed a newer recents timestamp, as a touch flush would.
+        {
+            let txn = db.begin_write().expect("write txn");
+            {
+                let mut recents = txn.open_table(RECENTS_TABLE).expect("recents table");
+                recents.insert("k", 2_000_u64).expect("seed recents");
+            }
+            txn.commit().expect("commit");
+        }
+
+        // Flush an insert carrying an OLDER recorded-at, as the insert queue would.
+        let pending = HashMap::from([(
+            "k".to_owned(),
+            PendingInsert {
+                bytes: vec![1, 2, 3],
+                recorded_at_millis: 1_000,
+            },
+        )]);
+        write_pending_inserts(&db, &pending).expect("insert flush should succeed");
+
+        let stored = {
+            let txn = db.begin_read().expect("read txn");
+            let recents = txn.open_table(RECENTS_TABLE).expect("recents table");
+            recents.get("k").expect("get").expect("present").value()
+        };
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            stored, 2_000,
+            "insert flush must not lower a newer recents timestamp"
+        );
     }
 }
