@@ -3,25 +3,22 @@ import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
 import { getImportLensConfig, type ImportLensConfig } from "../config.js";
 import {
   emptyInlineHintDecorationLayers,
-  InlineHintSlotDecorationPool,
   inlineHintDecorationLayers,
   mergeInlineHintDecorationLayers,
 } from "./inlineHintDecorationTypes.js";
+import { InlineHintDecorationController } from "./inlineHintDecorationController.js";
 import { inlineHintSegmentsFromParts } from "./inlineHintSegments.js";
 import { importHintAnchorPosition } from "./importHintAnchor.js";
 import { importHintParts } from "./importHintParts.js";
 import { shouldShowDecorations } from "./displayGuards.js";
 import { tooltipForAnalysisState } from "./tooltip.js";
 
-export class DecorationController implements vscode.Disposable {
+export class DecorationController extends InlineHintDecorationController {
   readonly #store: AnalysisStore;
-  readonly #decorationPool: InlineHintSlotDecorationPool;
-  readonly #subscription: vscode.Disposable;
 
   constructor(store: AnalysisStore) {
+    super(store);
     this.#store = store;
-    this.#decorationPool = new InlineHintSlotDecorationPool();
-    this.#subscription = this.#store.onDidChange((uri) => this.refreshUri(uri));
   }
 
   refreshActiveEditor(): void {
@@ -32,25 +29,11 @@ export class DecorationController implements vscode.Disposable {
     }
   }
 
-  refreshVisibleEditors(): void {
-    for (const editor of vscode.window.visibleTextEditors) {
-      this.refreshEditor(editor);
-    }
-  }
-
-  refreshUri(uri: vscode.Uri): void {
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.toString() === uri.toString()) {
-        this.refreshEditor(editor);
-      }
-    }
-  }
-
   refreshEditor(editor: vscode.TextEditor): void {
     const config = getImportLensConfig();
 
     if (!shouldShowDecorations(config)) {
-      this.#decorationPool.clearEditor(editor);
+      this.decorationPool.clearEditor(editor);
       return;
     }
 
@@ -66,12 +49,7 @@ export class DecorationController implements vscode.Disposable {
       mergeInlineHintDecorationLayers(layers, stateLayers);
     }
 
-    this.#decorationPool.applyToEditor(editor, layers);
-  }
-
-  dispose(): void {
-    this.#subscription.dispose();
-    this.#decorationPool.dispose();
+    this.decorationPool.applyToEditor(editor, layers);
   }
 
   private decorationLayersForState(

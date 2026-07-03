@@ -17,35 +17,18 @@ import {
 import { packageJsonDependencyHintAnchorCharacter } from "./packageJsonDecorationAnchor.js";
 import {
   emptyInlineHintDecorationLayers,
-  InlineHintSlotDecorationPool,
   inlineHintDecorationLayers,
   mergeInlineHintDecorationLayers,
 } from "./inlineHintDecorationTypes.js";
+import { InlineHintDecorationController } from "./inlineHintDecorationController.js";
 import { packageJsonHintSegments, packageJsonSectionSummarySegment } from "./packageJsonHintSegments.js";
 
-export class PackageJsonDecorationController implements vscode.Disposable {
+export class PackageJsonDecorationController extends InlineHintDecorationController {
   readonly #analysis: PackageJsonAnalysisController;
-  readonly #decorationPool: InlineHintSlotDecorationPool;
-  readonly #subscription: vscode.Disposable;
 
   constructor(analysis: PackageJsonAnalysisController) {
+    super(analysis);
     this.#analysis = analysis;
-    this.#decorationPool = new InlineHintSlotDecorationPool();
-    this.#subscription = this.#analysis.onDidChange((uri) => this.refreshUri(uri));
-  }
-
-  refreshVisibleEditors(): void {
-    for (const editor of vscode.window.visibleTextEditors) {
-      this.refreshEditor(editor);
-    }
-  }
-
-  refreshUri(uri: vscode.Uri): void {
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.toString() === uri.toString()) {
-        this.refreshEditor(editor);
-      }
-    }
   }
 
   refreshEditor(editor: vscode.TextEditor): void {
@@ -56,7 +39,7 @@ export class PackageJsonDecorationController implements vscode.Disposable {
       || editor.document.uri.scheme !== "file"
       || !isPackageJsonPath(editor.document.fileName)
     ) {
-      this.#decorationPool.clearEditor(editor);
+      this.decorationPool.clearEditor(editor);
       return;
     }
 
@@ -76,12 +59,7 @@ export class PackageJsonDecorationController implements vscode.Disposable {
       mergeInlineHintDecorationLayers(layers, this.decorationLayersForState(editor.document, state, config));
     }
 
-    this.#decorationPool.applyToEditor(editor, layers);
-  }
-
-  dispose(): void {
-    this.#subscription.dispose();
-    this.#decorationPool.dispose();
+    this.decorationPool.applyToEditor(editor, layers);
   }
 
   private decorationLayersForState(
