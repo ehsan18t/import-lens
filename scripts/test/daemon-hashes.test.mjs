@@ -43,6 +43,36 @@ test("updateKnownDaemonHashes preserves unrelated target hashes during a target 
   }
 });
 
+test("updateKnownDaemonHashes throws instead of stripping when a selected target's binary is missing", () => {
+  const repoRoot = tempRepo();
+
+  try {
+    // win32-x64 is built locally; win32-arm64 is not.
+    writeBinary(repoRoot, "bin/win32-x64/import-lens-daemon.exe", "win-x64");
+    const existingSource = knownHashesSource({
+      "bin/win32-arm64/import-lens-daemon.exe": "old-arm64-hash",
+    });
+
+    assert.throws(
+      () =>
+        updateKnownDaemonHashes({
+          repoRoot,
+          selectedTargets: ["win32-x64", "win32-arm64"],
+          existingSource,
+        }),
+      /daemon binary missing for win32-arm64/u,
+    );
+
+    // Aborting before any write leaves the previously trusted hash intact.
+    assert.equal(
+      parseKnownHashesSource(existingSource)["bin/win32-arm64/import-lens-daemon.exe"],
+      "old-arm64-hash",
+    );
+  } finally {
+    rmSync(repoRoot, { force: true, recursive: true });
+  }
+});
+
 test("knownHashesSource emits deterministic sorted TypeScript", () => {
   assert.equal(
     knownHashesSource({

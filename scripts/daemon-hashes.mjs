@@ -61,7 +61,9 @@ export const collectDaemonHashes = ({ repoRoot, selectedTargets }) => {
     const absolutePath = join(repoRoot, relativePath);
 
     if (!existsSync(absolutePath)) {
-      continue;
+      throw new Error(
+        `daemon binary missing for ${target} at ${absolutePath}; build it or pass an explicit target list`,
+      );
     }
 
     const digest = createHash("sha256").update(readFileSync(absolutePath)).digest("hex");
@@ -72,14 +74,17 @@ export const collectDaemonHashes = ({ repoRoot, selectedTargets }) => {
 };
 
 export const updateKnownDaemonHashes = ({ repoRoot, selectedTargets, existingSource = "" }) => {
-  const existingHashes = parseKnownHashesSource(existingSource);
-  const nextHashes = { ...existingHashes };
+  // Hash the selected targets first: a missing binary must abort before we
+  // mutate (and, in the caller, write) the known-hash set, so a partial local
+  // build can never silently strip another platform's trusted hash.
+  const refreshed = collectDaemonHashes({ repoRoot, selectedTargets });
+  const nextHashes = { ...parseKnownHashesSource(existingSource) };
 
   for (const target of selectedTargets) {
     delete nextHashes[relativeDaemonPath(target)];
   }
 
-  Object.assign(nextHashes, collectDaemonHashes({ repoRoot, selectedTargets }));
+  Object.assign(nextHashes, refreshed);
 
   return {
     hashes: nextHashes,
