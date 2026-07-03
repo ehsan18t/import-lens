@@ -307,26 +307,31 @@ pub fn find_package_root(
         .parent()
         .ok_or_else(|| "active document path has no parent directory".to_owned())?
         .to_path_buf();
-    let mut checked_paths = Vec::new();
+    let mut checked_paths: Vec<PathBuf> = Vec::new();
 
     loop {
         let package_root = current.join("node_modules").join(package_name);
         let package_json_path = package_root.join("package.json");
-        checked_paths.push(format!("checked: {}", package_json_path.display()));
 
         if package_json_path.exists() {
             return Ok(package_root);
         }
+        // Record only after the existence check so the common success path
+        // allocates nothing; format the diagnostic lazily on failure below.
+        checked_paths.push(package_json_path);
 
         if !current.pop() {
             break;
         }
     }
 
+    let details = checked_paths
+        .iter()
+        .map(|path| format!("checked: {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("; ");
     Err(format!(
-        "package manifest not found for {}; {}",
-        package_name,
-        checked_paths.join("; ")
+        "package manifest not found for {package_name}; {details}"
     ))
 }
 

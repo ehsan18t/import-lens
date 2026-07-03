@@ -277,3 +277,17 @@ fn shared_resolver_reflects_node_modules_change_only_after_invalidation() {
         "resolution should update after invalidation: {fresh:?}"
     );
 }
+
+#[test]
+fn find_package_root_error_lists_probed_paths() {
+    let root = temp_workspace();
+    write_source(&root, "src/app.ts", "");
+    let document = root.join("src").join("app.ts");
+
+    let error = import_lens_daemon::pipeline::resolver::find_package_root(&document, "nope-lib")
+        .expect_err("missing package should error");
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(error.contains("nope-lib"), "{error}");
+    assert!(error.contains("checked:"), "error should list probed paths: {error}");
+}
