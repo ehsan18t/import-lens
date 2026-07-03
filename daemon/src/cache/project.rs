@@ -68,11 +68,23 @@ impl ProjectCacheRegistry {
         if let Ok(mut loaded) = self.loaded.lock() {
             if let Some(shard) = loaded.get_mut(&shard_id) {
                 shard.last_used_millis = now;
-                if should_write_project_metadata(shard.last_metadata_write_millis, now) {
-                    self.write_metadata_for_loaded(&shard_id, shard);
-                    shard.last_metadata_write_millis = now;
+                let pending_metadata =
+                    if should_write_project_metadata(shard.last_metadata_write_millis, now) {
+                        shard.last_metadata_write_millis = now;
+                        self.metadata_write_for_loaded(&shard_id, shard)
+                    } else {
+                        None
+                    };
+                let cache = Arc::clone(&shard.cache);
+                drop(loaded);
+                // Perform the metadata fs::write after releasing the shards lock
+                // so a warm-project hit does not block peers on disk I/O. The
+                // timestamp is advanced under the lock above, so only one thread
+                // per interval captures a pending write.
+                if let Some((path, metadata)) = pending_metadata {
+                    let _ = write_metadata(&path, &metadata);
                 }
-                return Arc::clone(&shard.cache);
+                return cache;
             }
 
             let normalized_root = normalize_project_root(project_root);
@@ -427,8 +439,21 @@ impl ProjectCacheRegistry {
     }
 
     fn write_metadata_for_loaded(&self, shard_id: &str, shard: &LoadedProjectCache) {
+        if let Some((path, metadata)) = self.metadata_write_for_loaded(shard_id, shard) {
+            let _ = write_metadata(&path, &metadata);
+        }
+    }
+
+    // Builds the metadata write target (path + payload) without performing the
+    // I/O, so callers on the hot path can capture it under the shards lock and
+    // then release the lock before the `fs::write`.
+    fn metadata_write_for_loaded(
+        &self,
+        shard_id: &str,
+        shard: &LoadedProjectCache,
+    ) -> Option<(PathBuf, ProjectCacheMetadata)> {
         if !self.storage_enabled() {
-            return;
+            return None;
         }
 
         let metadata = ProjectCacheMetadata {
@@ -437,7 +462,7 @@ impl ProjectCacheRegistry {
             normalized_root: shard.normalized_root.clone(),
             last_used_millis: shard.last_used_millis,
         };
-        let _ = write_metadata(&shard.cache_path.join(SHARD_METADATA_FILE_NAME), &metadata);
+        Some((shard.cache_path.join(SHARD_METADATA_FILE_NAME), metadata))
     }
 
     fn read_metadata_for_shard(&self, shard_id: &str) -> Option<ProjectCacheMetadata> {
