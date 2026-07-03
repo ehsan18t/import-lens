@@ -451,3 +451,32 @@ fn graph_cache_evicts_least_recently_used_beyond_cap() {
     assert!(module_graph_cache_len() <= MAX_CACHED_GRAPHS);
     clear_module_graph_cache();
 }
+
+#[test]
+fn module_record_carries_root_symbol_and_shorthand_spans() {
+    let (root, _entry, graph) = graph_from_sources([(
+        "entry.js",
+        "const helper = 1;\nconst obj = { helper };\nexport const value = helper + obj.helper;",
+    )]);
+
+    let entry = graph
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("entry.js"))
+        .expect("entry module");
+
+    let helper = entry
+        .root_symbol_spans
+        .iter()
+        .find(|symbol| symbol.name == "helper")
+        .expect("helper symbol spans");
+    assert!(helper.decl.0 < helper.decl.1);
+    assert!(!helper.references.is_empty());
+
+    assert!(
+        !entry.shorthand_spans.is_empty(),
+        "shorthand object property should be recorded"
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
+}

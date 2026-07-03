@@ -4,7 +4,11 @@ use crate::{
     pipeline::resolver::{create_resolver, normalize_existing_path, resolve_module_path},
 };
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{BindingPattern, Declaration, ExportDefaultDeclarationKind, Program, Statement};
+use oxc_ast::ast::{
+    AssignmentTargetPropertyIdentifier, BindingPattern, BindingProperty, Declaration,
+    ExportDefaultDeclarationKind, Expression, ObjectProperty, Program, Statement,
+};
+use oxc_ast_visit::{Visit, walk};
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
 use oxc_resolver::Resolver;
@@ -78,6 +82,17 @@ pub struct ModuleRecord {
     pub star_exports: Vec<StarExportRecord>,
     pub local_bindings: Vec<String>,
     pub binding_dependencies: Vec<BindingDependencyRecord>,
+    // Root-scope symbol declaration + reference spans, computed once here so the
+    // bundle rewriter does not re-parse and re-run semantic analysis per request.
+    pub root_symbol_spans: Vec<RootSymbolSpans>,
+    pub shorthand_spans: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RootSymbolSpans {
+    pub name: String,
+    pub decl: (usize, usize),
+    pub references: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -462,6 +477,8 @@ impl ModuleGraphBuilder {
             exports: parsed.exports,
             reexports: parsed.reexports,
             star_exports: parsed.star_exports,
+            root_symbol_spans: parsed.root_symbol_spans,
+            shorthand_spans: parsed.shorthand_spans,
             local_bindings: parsed.local_bindings,
             binding_dependencies: parsed.binding_dependencies,
         });
@@ -486,6 +503,8 @@ struct ParsedModule {
     star_exports: Vec<StarExportRecord>,
     local_bindings: Vec<String>,
     binding_dependencies: Vec<BindingDependencyRecord>,
+    root_symbol_spans: Vec<RootSymbolSpans>,
+    shorthand_spans: Vec<(usize, usize)>,
 }
 
 struct ModuleResolverContext<'a> {
@@ -728,6 +747,7 @@ fn parse_module(
     }
 
     let edges_result = import_edges(path, &parsed.module_record, resolver_context)?;
+    let analysis = root_scope_analysis(&parsed.program);
     Ok(ParsedModule {
         imports: edges_result.imports,
         external_imports: edges_result.external_imports,
@@ -737,7 +757,11 @@ fn parse_module(
         reexports: reexport_records(path, &parsed.module_record, resolver_context)?,
         star_exports: star_export_records(path, &parsed.module_record, resolver_context)?,
         local_bindings: local_bindings(&parsed.program),
-        binding_dependencies: binding_dependencies(&parsed.program),
+        binding_dependencies: analysis.dependencies,
+        root_symbol_spans: analysis.symbol_spans,
+        shorthand_spans: shorthand_identifier_spans(&parsed.program)
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -1035,30 +1059,62 @@ struct StatementBindingRange {
     bindings: Vec<String>,
 }
 
-fn binding_dependencies(program: &Program<'_>) -> Vec<BindingDependencyRecord> {
-    let statement_ranges = statement_binding_ranges(program);
-    if statement_ranges.is_empty() {
-        return Vec::new();
-    }
+struct RootScopeAnalysis {
+    dependencies: Vec<BindingDependencyRecord>,
+    symbol_spans: Vec<RootSymbolSpans>,
+}
 
+// One root-scope semantic pass yields both the binding-dependency edges and the
+// declaration/reference spans the bundle rewriter needs, so the rewriter no
+// longer re-parses each module per request. Always builds semantic (not gated on
+// binding statements) so import bindings that have no declaration statement still
+// get their rename spans recorded.
+fn root_scope_analysis(program: &Program<'_>) -> RootScopeAnalysis {
     let semantic = SemanticBuilder::new().with_build_nodes(true).build(program);
     if semantic.diagnostics.has_errors() {
-        return Vec::new();
+        return RootScopeAnalysis {
+            dependencies: Vec::new(),
+            symbol_spans: Vec::new(),
+        };
     }
 
     let semantic = semantic.semantic;
     let scoping = semantic.scoping();
     let mut references = Vec::new();
+    let mut symbol_spans = Vec::new();
     for symbol_id in scoping.iter_bindings_in(scoping.root_scope_id()) {
-        let referenced_name = scoping.symbol_name(symbol_id).to_owned();
+        let name = scoping.symbol_name(symbol_id).to_owned();
+        let decl_span = scoping.symbol_span(symbol_id);
+        let mut symbol_references = Vec::new();
         for reference in semantic.symbol_references(symbol_id) {
-            references.push((semantic.reference_span(reference), referenced_name.clone()));
+            let span = semantic.reference_span(reference);
+            references.push((span, name.clone()));
+            symbol_references.push((span_start(span), span_end(span)));
         }
+        symbol_spans.push(RootSymbolSpans {
+            name,
+            decl: (span_start(decl_span), span_end(decl_span)),
+            references: symbol_references,
+        });
+    }
+
+    RootScopeAnalysis {
+        dependencies: binding_dependencies_from(&statement_binding_ranges(program), &references),
+        symbol_spans,
+    }
+}
+
+fn binding_dependencies_from(
+    statement_ranges: &[StatementBindingRange],
+    references: &[(Span, String)],
+) -> Vec<BindingDependencyRecord> {
+    if statement_ranges.is_empty() {
+        return Vec::new();
     }
 
     let mut dependencies = Vec::new();
-    for range in &statement_ranges {
-        for (span, referenced_name) in &references {
+    for range in statement_ranges {
+        for (span, referenced_name) in references {
             let start = span_start(*span);
             let end = span_end(*span);
             if start < range.start || end > range.end {
@@ -1448,4 +1504,74 @@ fn span_start(span: Span) -> usize {
 
 fn span_end(span: Span) -> usize {
     span.end as usize
+}
+
+fn span_bounds(span: Span) -> (usize, usize) {
+    (span_start(span), span_end(span))
+}
+
+pub(crate) fn shorthand_identifier_spans(program: &Program<'_>) -> HashSet<(usize, usize)> {
+    let mut collector = ShorthandIdentifierCollector::default();
+    collector.visit_program(program);
+    collector.spans
+}
+
+#[derive(Default)]
+struct ShorthandIdentifierCollector {
+    spans: HashSet<(usize, usize)>,
+}
+
+impl<'a> Visit<'a> for ShorthandIdentifierCollector {
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        if property.shorthand
+            && let Expression::Identifier(identifier) = &property.value
+        {
+            self.spans.insert(span_bounds(identifier.span));
+        }
+
+        walk::walk_object_property(self, property);
+    }
+
+    fn visit_binding_property(&mut self, property: &BindingProperty<'a>) {
+        if property.shorthand {
+            collect_binding_pattern_spans(&property.value, &mut self.spans);
+        }
+
+        walk::walk_binding_property(self, property);
+    }
+
+    fn visit_assignment_target_property_identifier(
+        &mut self,
+        property: &AssignmentTargetPropertyIdentifier<'a>,
+    ) {
+        self.spans.insert(span_bounds(property.binding.span));
+        walk::walk_assignment_target_property_identifier(self, property);
+    }
+}
+
+fn collect_binding_pattern_spans(pattern: &BindingPattern<'_>, spans: &mut HashSet<(usize, usize)>) {
+    match pattern {
+        BindingPattern::BindingIdentifier(identifier) => {
+            spans.insert(span_bounds(identifier.span));
+        }
+        BindingPattern::AssignmentPattern(pattern) => {
+            collect_binding_pattern_spans(&pattern.left, spans);
+        }
+        BindingPattern::ObjectPattern(pattern) => {
+            for property in &pattern.properties {
+                collect_binding_pattern_spans(&property.value, spans);
+            }
+            if let Some(rest) = &pattern.rest {
+                collect_binding_pattern_spans(&rest.argument, spans);
+            }
+        }
+        BindingPattern::ArrayPattern(pattern) => {
+            for element in pattern.elements.iter().flatten() {
+                collect_binding_pattern_spans(element, spans);
+            }
+            if let Some(rest) = &pattern.rest {
+                collect_binding_pattern_spans(&rest.argument, spans);
+            }
+        }
+    }
 }

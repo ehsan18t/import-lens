@@ -7,11 +7,6 @@ use crate::{
     },
 };
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{
-    AssignmentTargetPropertyIdentifier, BindingPattern, BindingProperty, Expression,
-    ObjectProperty, Program,
-};
-use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{SourceType, Span};
@@ -635,7 +630,7 @@ fn semantic_rename_replacements(
         ));
     }
 
-    let shorthand_spans = shorthand_identifier_spans(&parsed.program);
+    let shorthand_spans = crate::pipeline::graph::shorthand_identifier_spans(&parsed.program);
     let semantic = semantic.semantic;
     let scoping = semantic.scoping();
     let mut replacements = Vec::new();
@@ -724,79 +719,6 @@ fn usage_markers(
         }
     }
     markers
-}
-
-fn shorthand_identifier_spans(program: &Program<'_>) -> HashSet<(usize, usize)> {
-    let mut collector = ShorthandIdentifierCollector::default();
-    collector.visit_program(program);
-    collector.spans
-}
-
-#[derive(Default)]
-struct ShorthandIdentifierCollector {
-    spans: HashSet<(usize, usize)>,
-}
-
-impl<'a> Visit<'a> for ShorthandIdentifierCollector {
-    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
-        if property.shorthand
-            && let Expression::Identifier(identifier) = &property.value
-        {
-            self.spans.insert(span_bounds(identifier.span));
-        }
-
-        walk::walk_object_property(self, property);
-    }
-
-    fn visit_binding_property(&mut self, property: &BindingProperty<'a>) {
-        if property.shorthand {
-            collect_binding_pattern_spans(&property.value, &mut self.spans);
-        }
-
-        walk::walk_binding_property(self, property);
-    }
-
-    fn visit_assignment_target_property_identifier(
-        &mut self,
-        property: &AssignmentTargetPropertyIdentifier<'a>,
-    ) {
-        self.spans.insert(span_bounds(property.binding.span));
-        walk::walk_assignment_target_property_identifier(self, property);
-    }
-}
-
-fn collect_binding_pattern_spans(
-    pattern: &BindingPattern<'_>,
-    spans: &mut HashSet<(usize, usize)>,
-) {
-    match pattern {
-        BindingPattern::BindingIdentifier(identifier) => {
-            spans.insert(span_bounds(identifier.span));
-        }
-        BindingPattern::AssignmentPattern(pattern) => {
-            collect_binding_pattern_spans(&pattern.left, spans);
-        }
-        BindingPattern::ObjectPattern(pattern) => {
-            for property in &pattern.properties {
-                collect_binding_pattern_spans(&property.value, spans);
-            }
-            if let Some(rest) = &pattern.rest {
-                collect_binding_pattern_spans(&rest.argument, spans);
-            }
-        }
-        BindingPattern::ArrayPattern(pattern) => {
-            for element in pattern.elements.iter().flatten() {
-                collect_binding_pattern_spans(element, spans);
-            }
-            if let Some(rest) = &pattern.rest {
-                collect_binding_pattern_spans(&rest.argument, spans);
-            }
-        }
-    }
-}
-
-fn span_bounds(span: Span) -> (usize, usize) {
-    (span.start as usize, span.end as usize)
 }
 
 fn module_binding_name(module_id: ModuleId, name: &str) -> String {
