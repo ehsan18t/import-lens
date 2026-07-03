@@ -43,6 +43,39 @@ fn graph_from_sources<const N: usize>(
 }
 
 #[test]
+fn binding_dependencies_track_top_level_references() {
+    let (root, _entry_path, graph) = graph_from_sources([(
+        "entry.js",
+        "const helper = 1;\nconst value = helper + 1;\nexport const total = value + helper;\n",
+    )]);
+
+    let entry = graph
+        .module_by_id(graph.entry_id)
+        .expect("entry module should exist");
+    let mut deps: Vec<(String, String)> = entry
+        .binding_dependencies
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.binding_name.clone(),
+                dependency.referenced_name.clone(),
+            )
+        })
+        .collect();
+    deps.sort();
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+    assert_eq!(
+        deps,
+        vec![
+            ("total".to_owned(), "helper".to_owned()),
+            ("total".to_owned(), "value".to_owned()),
+            ("value".to_owned(), "helper".to_owned()),
+        ]
+    );
+}
+
+#[test]
 fn graph_marks_only_requested_named_export_reachable() {
     let (root, _entry_path, graph) = graph_from_sources([
         ("entry.js", "export { used } from './lib.js';"),

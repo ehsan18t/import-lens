@@ -1152,12 +1152,22 @@ fn binding_dependencies_from(
         return Vec::new();
     }
 
+    // Sort references by start once and, for each (source-ordered, non-
+    // overlapping) statement range, binary-search to the first reference at or
+    // after its start and walk forward until past its end. This replaces the
+    // O(statements x references) rescan with O((statements + references) log n),
+    // which matters for large single-file modules (up to the 20 MiB cap).
+    let mut sorted_refs: Vec<&(Span, String)> = references.iter().collect();
+    sorted_refs.sort_by_key(|(span, _)| span_start(*span));
+
     let mut dependencies = Vec::new();
     for range in statement_ranges {
-        for (span, referenced_name) in references {
-            let start = span_start(*span);
-            let end = span_end(*span);
-            if start < range.start || end > range.end {
+        let first = sorted_refs.partition_point(|(span, _)| span_start(*span) < range.start);
+        for (span, referenced_name) in &sorted_refs[first..] {
+            if span_start(*span) > range.end {
+                break;
+            }
+            if span_end(*span) > range.end {
                 continue;
             }
 
