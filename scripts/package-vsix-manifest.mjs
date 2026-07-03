@@ -14,7 +14,6 @@ export const createStagedManifest = ({ manifest }) => {
 
   return {
     ...manifest,
-    dependencies: manifest.dependencies,
     devDependencies: undefined,
     files,
     scripts: undefined,
