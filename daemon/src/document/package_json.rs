@@ -1,4 +1,4 @@
-use super::positions::range_from_offsets;
+use super::positions::LineIndex;
 use crate::ipc::protocol::SourceRange;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,6 +53,7 @@ pub fn package_json_dependency_entries(source: &str) -> Vec<PackageJsonDependenc
         return Vec::new();
     };
 
+    let line_index = LineIndex::new(source);
     let mut entries = Vec::new();
     for section in dependency_section_objects(source) {
         let Some(dependencies) = root.get(&section.section).and_then(Value::as_object) else {
@@ -63,7 +64,7 @@ pub fn package_json_dependency_entries(source: &str) -> Vec<PackageJsonDependenc
             continue;
         }
 
-        entries.extend(dependency_entries_for_section(source, &section));
+        entries.extend(dependency_entries_for_section(source, &line_index, &section));
     }
 
     entries.sort_by(|left, right| {
@@ -81,18 +82,24 @@ pub fn package_json_dependency_sections(source: &str) -> Vec<PackageJsonDependen
         return Vec::new();
     }
 
+    let line_index = LineIndex::new(source);
     dependency_section_objects(source)
         .into_iter()
         .map(|section| PackageJsonDependencySection {
             section: section.section,
-            range: range_from_offsets(source, section.key_start, section.key_end),
-            object_range: range_from_offsets(source, section.object_start, section.object_end),
+            range: line_index.range_from_offsets(source, section.key_start, section.key_end),
+            object_range: line_index.range_from_offsets(
+                source,
+                section.object_start,
+                section.object_end,
+            ),
         })
         .collect()
 }
 
 fn dependency_entries_for_section(
     source: &str,
+    line_index: &LineIndex,
     section: &DependencySectionObject,
 ) -> Vec<PackageJsonDependencyEntry> {
     let mut entries = Vec::new();
@@ -118,14 +125,19 @@ fn dependency_entries_for_section(
             if depth == 1
                 && let Some(value_token) = value_token
             {
-                let name_range = range_from_offsets(source, name_token.start, name_token.end);
+                let name_range =
+                    line_index.range_from_offsets(source, name_token.start, name_token.end);
                 entries.push(PackageJsonDependencyEntry {
                     name: name_token.value,
                     version: value_token.value,
                     section: section.section.clone(),
                     range: name_range,
                     name_range,
-                    value_range: range_from_offsets(source, value_token.start, value_token.end),
+                    value_range: line_index.range_from_offsets(
+                        source,
+                        value_token.start,
+                        value_token.end,
+                    ),
                 });
             }
 

@@ -1,5 +1,5 @@
 use super::{
-    positions::{position_at, range_from_offsets},
+    positions::LineIndex,
     script_regions::{ScriptRegion, script_regions_for_document},
     specifier::{get_package_name, is_runtime_package_specifier},
 };
@@ -14,9 +14,10 @@ use std::collections::HashMap;
 
 pub fn analyze_imports(filename: &str, source: &str) -> Result<Vec<DetectedImport>, String> {
     let mut imports = Vec::new();
+    let line_index = LineIndex::new(source);
 
     for region in script_regions_for_document(filename, source) {
-        imports.extend(imports_from_region(source, &region)?);
+        imports.extend(imports_from_region(source, &line_index, &region)?);
     }
 
     imports.sort_by_key(|item| {
@@ -30,6 +31,7 @@ pub fn analyze_imports(filename: &str, source: &str) -> Result<Vec<DetectedImpor
 
 fn imports_from_region(
     document_source: &str,
+    line_index: &LineIndex,
     region: &ScriptRegion<'_>,
 ) -> Result<Vec<DetectedImport>, String> {
     let allocator = Allocator::default();
@@ -52,16 +54,19 @@ fn imports_from_region(
     let mut imports = Vec::new();
     imports.extend(imports_from_static_imports(
         document_source,
+        line_index,
         region,
         &parsed.module_record,
     ));
     imports.extend(imports_from_static_exports(
         document_source,
+        line_index,
         region,
         &parsed.module_record,
     ));
     imports.extend(imports_from_dynamic_imports(
         document_source,
+        line_index,
         region,
         &parsed.module_record,
     ));
@@ -81,6 +86,7 @@ struct ImportGroup {
 
 fn imports_from_static_imports(
     document_source: &str,
+    line_index: &LineIndex,
     region: &ScriptRegion<'_>,
     module_record: &OxcModuleRecord<'_>,
 ) -> Vec<DetectedImport> {
@@ -157,7 +163,13 @@ fn imports_from_static_imports(
     groups
         .into_iter()
         .flat_map(|group| {
-            detected_imports_from_group(document_source, region, group, ImportSyntax::Static)
+            detected_imports_from_group(
+                document_source,
+                line_index,
+                region,
+                group,
+                ImportSyntax::Static,
+            )
         })
         .collect()
 }
@@ -172,6 +184,7 @@ fn apply_import_entry(group: &mut ImportGroup, entry: &ImportEntry<'_>) {
 
 fn imports_from_static_exports(
     document_source: &str,
+    line_index: &LineIndex,
     region: &ScriptRegion<'_>,
     module_record: &OxcModuleRecord<'_>,
 ) -> Vec<DetectedImport> {
@@ -198,7 +211,13 @@ fn imports_from_static_exports(
     groups
         .into_iter()
         .flat_map(|group| {
-            detected_imports_from_group(document_source, region, group, ImportSyntax::Reexport)
+            detected_imports_from_group(
+                document_source,
+                line_index,
+                region,
+                group,
+                ImportSyntax::Reexport,
+            )
         })
         .collect()
 }
@@ -249,6 +268,7 @@ fn apply_export_entry(
 
 fn imports_from_dynamic_imports(
     document_source: &str,
+    line_index: &LineIndex,
     region: &ScriptRegion<'_>,
     module_record: &OxcModuleRecord<'_>,
 ) -> Vec<DetectedImport> {
@@ -265,6 +285,7 @@ fn imports_from_dynamic_imports(
 
             Some(create_detected_import(
                 document_source,
+                line_index,
                 region,
                 DetectedImportParts {
                     specifier: &specifier,
@@ -303,6 +324,7 @@ fn literal_dynamic_import_specifier(value: &str) -> Option<String> {
 
 fn detected_imports_from_group(
     document_source: &str,
+    line_index: &LineIndex,
     region: &ScriptRegion<'_>,
     mut group: ImportGroup,
     syntax: ImportSyntax,
@@ -314,6 +336,7 @@ fn detected_imports_from_group(
     if group.has_default {
         imports.push(create_detected_import(
             document_source,
+            line_index,
             region,
             DetectedImportParts {
                 specifier: &group.specifier,
@@ -329,6 +352,7 @@ fn detected_imports_from_group(
     if group.has_namespace {
         imports.push(create_detected_import(
             document_source,
+            line_index,
             region,
             DetectedImportParts {
                 specifier: &group.specifier,
@@ -348,6 +372,7 @@ fn detected_imports_from_group(
     if !group.named.is_empty() {
         imports.push(create_detected_import(
             document_source,
+            line_index,
             region,
             DetectedImportParts {
                 specifier: &group.specifier,
@@ -374,6 +399,7 @@ struct DetectedImportParts<'a> {
 
 fn create_detected_import(
     document_source: &str,
+    line_index: &LineIndex,
     region: &ScriptRegion<'_>,
     parts: DetectedImportParts<'_>,
 ) -> DetectedImport {
@@ -381,7 +407,7 @@ fn create_detected_import(
     let statement_end = region.offset + span_end(parts.statement_span);
     let specifier_start = region.offset + span_start(parts.module_request_span);
     let quote_end = region.offset + span_end(parts.module_request_span);
-    let line = position_at(document_source, statement_start).line;
+    let line = line_index.position_at(document_source, statement_start).line;
 
     DetectedImport {
         specifier: parts.specifier.to_owned(),
@@ -391,9 +417,17 @@ fn create_detected_import(
         syntax: parts.syntax,
         runtime: region.runtime,
         line,
-        quote_end: position_at(document_source, quote_end),
-        specifier_range: range_from_offsets(document_source, specifier_start, quote_end),
-        statement_range: range_from_offsets(document_source, statement_start, statement_end),
+        quote_end: line_index.position_at(document_source, quote_end),
+        specifier_range: line_index.range_from_offsets(
+            document_source,
+            specifier_start,
+            quote_end,
+        ),
+        statement_range: line_index.range_from_offsets(
+            document_source,
+            statement_start,
+            statement_end,
+        ),
     }
 }
 
