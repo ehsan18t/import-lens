@@ -689,18 +689,41 @@ fn external_binding_name(index: usize, imported_name: &str) -> String {
 
 fn sanitize_identifier(name: &str) -> String {
     let mut sanitized = String::new();
+    let mut lossy = name.is_empty();
     for (index, byte) in name.bytes().enumerate() {
         let valid = if index == 0 {
             is_identifier_start(byte)
         } else {
             is_identifier_continue(byte)
         };
-        sanitized.push(if valid { byte as char } else { '_' });
+        if valid {
+            sanitized.push(byte as char);
+        } else {
+            sanitized.push('_');
+            lossy = true;
+        }
     }
     if sanitized.is_empty() {
-        return "_".to_owned();
+        sanitized.push('_');
+    }
+    if lossy {
+        // Distinct identifiers that lose information to '_' replacement (e.g.
+        // two non-ASCII names differing only in replaced bytes) would otherwise
+        // collide into one binding. Append a short deterministic hash of the
+        // original so they stay distinct. Pure-ASCII identifiers are untouched.
+        use std::fmt::Write as _;
+        let _ = write!(sanitized, "_{:08x}", fnv1a_32(name));
     }
     sanitized
+}
+
+fn fnv1a_32(value: &str) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in value.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 fn is_identifier_start(byte: u8) -> bool {

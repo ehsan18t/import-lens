@@ -506,3 +506,27 @@ fn bundle_imported_then_exported_binding_marker_references_target_binding() {
     assert_semantic_valid(&bundled.minifier_source);
     fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
 }
+
+#[test]
+fn bundle_distinguishes_non_ascii_identifiers_that_sanitize_alike() {
+    let root = temp_workspace();
+    // `café` and `cafÉ` differ only in a non-ASCII byte; sanitize_identifier maps
+    // both non-ASCII bytes to '_', so a naive scheme collides them.
+    write_source(
+        &root,
+        "entry.js",
+        "export const caf\u{e9} = 1;\nexport const caf\u{c9} = 2;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &[], true);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+
+    assert_semantic_valid(&bundled.source);
+    let minified = minify_source_with_markers(&bundled.minifier_source, false)
+        .expect("distinct non-ASCII identifiers must not collide into one binding");
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(!minified.is_empty());
+}
