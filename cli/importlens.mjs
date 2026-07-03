@@ -66,6 +66,7 @@ export const loadBudgetConfig = async ({
 
 export const runImportLensCheck = async ({
   cwd = process.cwd(),
+  resolveRoot = cwd,
   budgets,
   changedFiles,
   analyzeFile,
@@ -82,7 +83,7 @@ export const runImportLensCheck = async ({
   const violations = [];
 
   for (const filePath of files) {
-    const result = await analyzeFile(path.resolve(cwd, filePath));
+    const result = await analyzeFile(path.resolve(resolveRoot, filePath));
     const relative = path.relative(cwd, result.filePath).split(path.sep).join("/");
 
     if (budgets.perFileBrotliBytes !== undefined && result.brotliBytes > budgets.perFileBrotliBytes) {
@@ -111,7 +112,9 @@ const main = async () => {
   const args = parseCliArgs(process.argv.slice(2));
   const cwd = process.cwd();
   const budgets = await loadBudgetConfig({ configPath: args.configPath });
-  const files = hasBudgets(budgets) ? await changedFiles(cwd) : [];
+  const { topLevel, files } = hasBudgets(budgets)
+    ? await changedFiles(cwd)
+    : { topLevel: cwd, files: [] };
   const supportedFiles = files.filter((filePath) => supportedExtensions.has(path.extname(filePath)));
   let daemon;
 
@@ -126,12 +129,13 @@ const main = async () => {
       return;
     }
 
-    daemon = await startDaemon(cwd);
+    daemon = await startDaemon(topLevel);
     const exitCode = await runImportLensCheck({
       cwd,
+      resolveRoot: topLevel,
       budgets,
       changedFiles: async () => supportedFiles,
-      analyzeFile: (filePath) => analyzeFileWithDaemon(filePath, cwd, daemon),
+      analyzeFile: (filePath) => analyzeFileWithDaemon(filePath, topLevel, daemon),
     });
     process.exitCode = exitCode;
   } finally {
@@ -154,8 +158,18 @@ const findDefaultBudgetConfig = async (readText) => {
 };
 
 const changedFiles = async (cwd) => {
-  const { stdout } = await execFile("git", ["diff", "--name-only", "--diff-filter=ACMRTUXB", "HEAD", "--"], { cwd });
-  return stdout.split(/\r?\n/u).filter(Boolean);
+  // `git diff --name-only` prints repository-root-relative paths regardless of
+  // cwd, so file resolution must anchor at the git top level, not the
+  // invocation directory (budget discovery stays cwd-scoped).
+  const [{ stdout: diff }, { stdout: topLevel }] = await Promise.all([
+    execFile("git", ["diff", "--name-only", "--diff-filter=ACMRTUXB", "HEAD", "--"], { cwd }),
+    execFile("git", ["rev-parse", "--show-toplevel"], { cwd }),
+  ]);
+
+  return {
+    topLevel: topLevel.trim(),
+    files: diff.split(/\r?\n/u).filter(Boolean),
+  };
 };
 
 const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {

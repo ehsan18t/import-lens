@@ -90,6 +90,30 @@ test("runImportLensCheck passes when changed files are within budgets", async ()
   assert.deepEqual(output, ["ImportLens budgets passed for 1 changed file."]);
 });
 
+test("runImportLensCheck resolves changed files against resolveRoot but reports relative to cwd", async () => {
+  const repoRoot = path.resolve("/repo");
+  const packageDir = path.join(repoRoot, "packages", "app");
+  const analyzedPaths = [];
+  const output = [];
+
+  const exitCode = await runImportLensCheck({
+    cwd: packageDir,
+    resolveRoot: repoRoot,
+    budgets: { perFileBrotliBytes: 1000 },
+    // git diff prints repository-root-relative paths regardless of cwd.
+    changedFiles: async () => ["packages/app/src/index.ts"],
+    analyzeFile: async (filePath) => {
+      analyzedPaths.push(filePath);
+      return { filePath, brotliBytes: 2500, imports: [] };
+    },
+    writeLine: (line) => output.push(line),
+  });
+
+  assert.deepEqual(analyzedPaths, [path.join(repoRoot, "packages", "app", "src", "index.ts")]);
+  assert.equal(exitCode, 1);
+  assert.deepEqual(output, ["src/index.ts: file Brotli budget exceeded: 2.5 kB > 1.0 kB"]);
+});
+
 test("daemonBinaryPath resolves from the installed package root", () => {
   assert.equal(
     daemonBinaryPath({ packageRoot: path.join("C:", "ImportLens"), platformTarget: "win32-x64" }),
