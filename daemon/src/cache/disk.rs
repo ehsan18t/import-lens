@@ -24,6 +24,13 @@ const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadat
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CURRENT_SCHEMA_VERSION: u64 = 4;
 const RECENCY_TOUCH_FLUSH_BATCH: usize = 64;
+const INSERT_FLUSH_BATCH: usize = 64;
+
+#[derive(Debug, Clone)]
+struct PendingInsert {
+    bytes: Vec<u8>,
+    recorded_at_millis: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEnvelope {
@@ -38,6 +45,9 @@ struct CacheEnvelope {
 pub struct DiskCache {
     db: Option<Database>,
     pending_touches: Mutex<HashMap<String, u64>>,
+    // Serialized envelopes awaiting a batched commit; drained at a size
+    // threshold, on recent_keys, on recycle (flush_to_disk), and on Drop.
+    pending_inserts: Mutex<HashMap<String, PendingInsert>>,
 }
 
 impl DiskCache {
@@ -54,6 +64,7 @@ impl DiskCache {
         Self {
             db: Self::open_database(&storage_path),
             pending_touches: Mutex::new(HashMap::new()),
+            pending_inserts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -73,6 +84,14 @@ impl DiskCache {
     }
 
     fn get_entry(&self, key: &str, touch: bool) -> Option<CachedImport> {
+        // Read-your-writes: a queued insert not yet flushed is not in the table.
+        if let Some(cached) = self.pending_insert_entry(key) {
+            if touch {
+                self.touch(key);
+            }
+            return Some(cached);
+        }
+
         let db = self.db.as_ref()?;
         let read_txn = db.begin_read().ok()?;
         let table = read_txn.open_table(CACHE_TABLE).ok()?;
@@ -101,10 +120,9 @@ impl DiskCache {
     }
 
     pub fn insert(&self, key: &str, cached: &CachedImport) -> Result<(), String> {
-        let db = match self.db.as_ref() {
-            Some(db) => db,
-            None => return Ok(()),
-        };
+        if self.db.is_none() {
+            return Ok(());
+        }
 
         let mut persisted = cached.clone();
         persisted.result.cache_hit = false;
@@ -113,31 +131,65 @@ impl DiskCache {
         let bytes = rmp_serde::to_vec(&envelope)
             .map_err(|error| format!("failed to serialize cache entry: {error}"))?;
 
-        let write_txn = db
-            .begin_write()
-            .map_err(|error| format!("failed to begin cache write: {error}"))?;
-
-        {
-            let mut table = write_txn
-                .open_table(CACHE_TABLE)
-                .map_err(|error| format!("failed to open cache table: {error}"))?;
-            table
-                .insert(key, bytes.as_slice())
-                .map_err(|error| format!("failed to insert cache entry: {error}"))?;
-
-            let mut recents = write_txn
-                .open_table(RECENTS_TABLE)
-                .map_err(|error| format!("failed to open recents table: {error}"))?;
-            recents
-                .insert(key, unix_millis_now())
-                .map_err(|error| format!("failed to update recents table: {error}"))?;
-        }
-
-        write_txn
-            .commit()
-            .map_err(|error| format!("failed to commit cache write: {error}"))?;
+        // Queue for a batched commit instead of one durable transaction per
+        // entry; a cold parallel batch otherwise serialized N fsyncs on redb's
+        // single writer.
+        let should_flush = match self.pending_inserts.lock() {
+            Ok(mut pending) => {
+                pending.insert(
+                    key.to_owned(),
+                    PendingInsert {
+                        bytes,
+                        recorded_at_millis: unix_millis_now(),
+                    },
+                );
+                pending.len() >= INSERT_FLUSH_BATCH
+            }
+            Err(_) => return Err("cache pending-insert lock poisoned".to_owned()),
+        };
         self.remove_pending_touch(key);
+        if should_flush {
+            self.flush_pending_inserts();
+        }
         Ok(())
+    }
+
+    pub fn flush_pending_inserts(&self) {
+        let db = match self.db.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
+        let pending = match self.pending_inserts.lock() {
+            Ok(mut pending) => {
+                if pending.is_empty() {
+                    return;
+                }
+                std::mem::take(&mut *pending)
+            }
+            Err(_) => return,
+        };
+
+        if let Err(error) = write_pending_inserts(db, &pending) {
+            if let Ok(mut current) = self.pending_inserts.lock() {
+                for (key, entry) in pending {
+                    current.entry(key).or_insert(entry);
+                }
+            }
+            cache_warn(format!("failed to flush cache inserts: {error}"));
+        }
+    }
+
+    fn pending_insert_entry(&self, key: &str) -> Option<CachedImport> {
+        let bytes = {
+            let pending = self.pending_inserts.lock().ok()?;
+            pending.get(key)?.bytes.clone()
+        };
+        let cached = decode_cached_result(&bytes)?;
+        if !fingerprints_are_current(&cached.dependency_fingerprints) {
+            self.remove(key);
+            return None;
+        }
+        Some(cached)
     }
 
     pub fn touch(&self, key: &str) {
@@ -189,6 +241,9 @@ impl DiskCache {
     }
 
     pub fn remove(&self, key: &str) {
+        if let Ok(mut pending) = self.pending_inserts.lock() {
+            pending.remove(key);
+        }
         let db = match self.db.as_ref() {
             Some(db) => db,
             None => return,
@@ -210,6 +265,7 @@ impl DiskCache {
             return Vec::new();
         }
 
+        self.flush_pending_inserts();
         self.flush_pending_touches();
 
         let db = match self.db.as_ref() {
@@ -253,6 +309,9 @@ impl DiskCache {
     }
 
     pub fn invalidate_package(&self, package_name: &str) {
+        if let Ok(mut pending) = self.pending_inserts.lock() {
+            pending.retain(|key, _| !cache_key_matches_package(key, package_name));
+        }
         let db = match self.db.as_ref() {
             Some(db) => db,
             None => return,
@@ -323,12 +382,16 @@ impl DiskCache {
             let _ = write_txn.commit();
         }
         self.clear_pending_touches();
+        if let Ok(mut pending) = self.pending_inserts.lock() {
+            pending.clear();
+        }
     }
 
     fn disabled() -> Self {
         Self {
             db: None,
             pending_touches: Mutex::new(HashMap::new()),
+            pending_inserts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -463,8 +526,40 @@ impl DiskCache {
 
 impl Drop for DiskCache {
     fn drop(&mut self) {
+        // Inserts first: each also writes its recents row.
+        self.flush_pending_inserts();
         self.flush_pending_touches();
     }
+}
+
+fn write_pending_inserts(
+    db: &Database,
+    pending: &HashMap<String, PendingInsert>,
+) -> Result<(), String> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|error| format!("failed to begin cache write: {error}"))?;
+
+    {
+        let mut table = write_txn
+            .open_table(CACHE_TABLE)
+            .map_err(|error| format!("failed to open cache table: {error}"))?;
+        let mut recents = write_txn
+            .open_table(RECENTS_TABLE)
+            .map_err(|error| format!("failed to open recents table: {error}"))?;
+        for (key, entry) in pending {
+            table
+                .insert(key.as_str(), entry.bytes.as_slice())
+                .map_err(|error| format!("failed to insert cache entry: {error}"))?;
+            recents
+                .insert(key.as_str(), entry.recorded_at_millis)
+                .map_err(|error| format!("failed to update recents table: {error}"))?;
+        }
+    }
+
+    write_txn
+        .commit()
+        .map_err(|error| format!("failed to commit cache write: {error}"))
 }
 
 fn write_pending_touches(

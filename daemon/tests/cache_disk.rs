@@ -438,3 +438,42 @@ fn flush_to_disk_persists_memory_entries_for_reload() {
 
     fs::remove_dir_all(storage_path).expect("temp storage should be removed");
 }
+
+#[test]
+fn insert_is_readable_before_flush_and_persists_after_flush() {
+    let storage_path = temp_storage();
+    let key = "react@18.3.1::default".to_owned();
+
+    {
+        let cache = ImportCache::new(Some(storage_path.clone()), true);
+        cache.insert(key.clone(), result("react"));
+        // Read-your-writes: visible immediately while still queued (unflushed).
+        assert!(cache.get(&key).is_some(), "read-your-writes before flush");
+        // No explicit flush — rely on Drop to drain the queue on teardown.
+    }
+
+    let reloaded = ImportCache::new(Some(storage_path.clone()), true);
+    assert!(
+        reloaded.get(&key).is_some(),
+        "Drop should flush queued inserts so they survive reload"
+    );
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
+fn many_inserts_flush_in_batches_without_loss() {
+    let storage_path = temp_storage();
+    {
+        let cache = ImportCache::new(Some(storage_path.clone()), true);
+        for index in 0..200 {
+            cache.insert(format!("pkg{index}@1.0.0::default"), result("pkg"));
+        }
+        cache.flush_to_disk().expect("flush should succeed");
+    }
+
+    let reloaded = ImportCache::new(Some(storage_path.clone()), true);
+    assert_eq!(reloaded.recent_keys(1000).len(), 200);
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}

@@ -196,9 +196,9 @@ impl ImportCache {
         self.disk.flush_pending_touches();
     }
 
-    // Inserts persist synchronously, so only entries whose disk insert failed
-    // need replaying; rewriting the whole map issued one committed transaction
-    // per entry on every recycle.
+    // Inserts are queued in the disk cache for batched commit; a recycle must
+    // drain that queue. Any entry whose enqueue failed (serialization error) is
+    // marked dirty and re-enqueued here before the queue is flushed.
     pub fn flush_to_disk(&self) -> Result<(), String> {
         let dirty_keys = match self.dirty.lock() {
             Ok(mut dirty) => std::mem::take(&mut *dirty),
@@ -222,6 +222,7 @@ impl ImportCache {
             }
         }
 
+        self.disk.flush_pending_inserts();
         self.disk.flush_pending_touches();
         Ok(())
     }
