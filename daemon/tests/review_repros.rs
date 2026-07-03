@@ -2,13 +2,9 @@
 //! Each test asserts what the code does TODAY so a failure means the suspicion
 //! was wrong. This file is deleted once findings are confirmed.
 
-use import_lens_daemon::{
-    document::is_runtime_package_specifier,
-    pipeline::{
-        bundle::bundle_reachable_modules_with_metadata,
-        graph::build_module_graph,
-        reachability::reachable_exports,
-    },
+use import_lens_daemon::pipeline::{
+    bundle::bundle_reachable_modules_with_metadata, graph::build_module_graph,
+    reachability::reachable_exports,
 };
 use std::{
     fs,
@@ -75,16 +71,6 @@ fn repro_star_cycle_stack_overflow() {
     let _ = bundle_reachable_modules_with_metadata(&graph, &reachable);
 
     fs::remove_dir_all(&root).expect("cleanup");
-}
-
-/// SUSPICION 4: bare Node builtin subpaths are treated as npm packages.
-#[test]
-fn repro_builtin_subpath_treated_as_package() {
-    // CURRENT (buggy) behavior: true (analyzed as npm package "fs").
-    assert!(is_runtime_package_specifier("fs/promises"));
-    // Controls that already work:
-    assert!(!is_runtime_package_specifier("fs"));
-    assert!(!is_runtime_package_specifier("node:fs/promises"));
 }
 
 /// SUSPICION 6: JSON with `eval`/`arguments` keys synthesizes an invalid

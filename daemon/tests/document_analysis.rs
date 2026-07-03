@@ -194,3 +194,30 @@ fn comparison_chains_in_plain_js_still_parse_with_jsx_enabled() {
 
     assert_eq!(imports.len(), 1);
 }
+
+#[test]
+fn builtin_subpath_specifiers_are_not_runtime_packages() {
+    for specifier in [
+        "fs/promises",
+        "dns/promises",
+        "stream/promises",
+        "stream/web",
+        "stream/consumers",
+        "timers/promises",
+        "readline/promises",
+        "path/posix",
+        "path/win32",
+        "util/types",
+        "assert/strict",
+        "inspector/promises",
+    ] {
+        assert!(
+            !import_lens_daemon::document::is_runtime_package_specifier(specifier),
+            "{specifier} should be treated as a Node builtin"
+        );
+    }
+
+    assert!(import_lens_daemon::document::is_runtime_package_specifier(
+        "fs-extra"
+    ));
+}
