@@ -1,7 +1,7 @@
 import type { ImportLensConfig } from "../config.js";
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
-import type { ImportResult, PackageJsonDependencySectionName } from "../ipc/protocol.js";
-import { formatBytes, type CompressionFormat } from "./format.js";
+import type { PackageJsonDependencySectionName } from "../ipc/protocol.js";
+import { bytesForCompression, formatBytes, labelForCompression, type CompressionFormat } from "./format.js";
 import type { PackageJsonPrimaryTone, PackageJsonSuffixTone } from "./packageJsonHintVisuals.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
@@ -83,33 +83,6 @@ export const packageJsonDependencyVersionStatusLabel = (
   return `✦ ${suffix}`;
 };
 
-const selectedCompressionBytes = (
-  result: ImportResult,
-  compression: CompressionFormat,
-): number => {
-  if (compression === "gzip") {
-    return result.gzip_bytes;
-  }
-
-  if (compression === "zstd") {
-    return result.zstd_bytes;
-  }
-
-  return result.brotli_bytes;
-};
-
-const selectedCompressionLabel = (compression: CompressionFormat): string => {
-  if (compression === "gzip") {
-    return "gz";
-  }
-
-  if (compression === "zstd") {
-    return "zstd";
-  }
-
-  return "br";
-};
-
 export const packageJsonDependencyHintParts = (
   state: PackageJsonDependencyHintState,
   config: ImportLensConfig,
@@ -148,7 +121,7 @@ export const packageJsonDependencyHintParts = (
   }
 
   const confidencePrefix = state.result.confidence === "low" ? "~" : "";
-  const primary = `${confidencePrefix}${formatBytes(selectedCompressionBytes(state.result, config.compression))} ${selectedCompressionLabel(config.compression)}`;
+  const primary = `${confidencePrefix}${formatBytes(bytesForCompression(state.result, config.compression))} ${labelForCompression(config.compression)}`;
 
   return {
     primary,
@@ -180,7 +153,7 @@ export const packageJsonSectionSummaryLabel = (
   const measuredStates = sectionStates.filter((state) =>
     state.status === "ready" && state.result && !state.result.error);
   const totalBytes = measuredStates.reduce(
-    (sum, state) => sum + selectedCompressionBytes(state.result!, config.compression),
+    (sum, state) => sum + bytesForCompression(state.result!, config.compression),
     0,
   );
   const missingCount = sectionStates.filter((state) => state.status === "missing").length;
@@ -194,7 +167,7 @@ export const packageJsonSectionSummaryLabel = (
 
   const parts = [
     `${measuredStates.length}/${sectionStates.length} measured`,
-    `${formatBytes(totalBytes)} ${selectedCompressionLabel(config.compression)}`,
+    `${formatBytes(totalBytes)} ${labelForCompression(config.compression)}`,
   ];
 
   if (missingCount > 0) {

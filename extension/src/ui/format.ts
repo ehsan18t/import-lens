@@ -19,19 +19,25 @@ const compressionLabels = {
   zstd: "zstd",
 } as const;
 
-const bytesForCompression = (result: ImportResult, compression: CompressionFormat): number => {
+export interface CompressionByteSizes {
+  brotli_bytes: number;
+  gzip_bytes: number;
+  zstd_bytes: number;
+}
+
+export const bytesForCompression = (sizes: CompressionByteSizes, compression: CompressionFormat): number => {
   if (compression === "gzip") {
-    return result.gzip_bytes;
+    return sizes.gzip_bytes;
   }
 
   if (compression === "zstd") {
-    return result.zstd_bytes;
+    return sizes.zstd_bytes;
   }
 
-  return result.brotli_bytes;
+  return sizes.brotli_bytes;
 };
 
-const labelForCompression = (compression: CompressionFormat): string =>
+export const labelForCompression = (compression: CompressionFormat): string =>
   compression === "all" ? "br" : compressionLabels[compression];
 
 export const formatBytes = (bytes: number): string => {

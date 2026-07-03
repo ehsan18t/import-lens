@@ -4,7 +4,7 @@ import type { ImportResult } from "../ipc/protocol.js";
 import type { ImportRuntime } from "../ipc/protocol.js";
 import { confidenceVisualFor } from "./confidenceVisuals.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
-import { formatBytes, type CompressionFormat } from "./format.js";
+import { bytesForCompression, formatBytes, labelForCompression, type CompressionFormat } from "./format.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
 export const isConservativeEstimate = (result: ImportResult): boolean =>
@@ -15,20 +15,19 @@ export const conservativeSizingMarkdown = (result: ImportResult): string | null 
     ? "**Conservative sizing:** yes — size may include unused exports or side-effect modules."
     : null;
 
+const compressionTitles: Record<Exclude<CompressionFormat, "all">, string> = {
+  brotli: "Brotli",
+  gzip: "Gzip",
+  zstd: "Zstd",
+};
+
 const selectedCompressionSize = (
   result: ImportResult,
   compression: CompressionFormat,
-): { label: string; value: string } => {
-  if (compression === "gzip") {
-    return { label: "Gzip", value: `${formatBytes(result.gzip_bytes)} gz` };
-  }
-
-  if (compression === "zstd") {
-    return { label: "Zstd", value: `${formatBytes(result.zstd_bytes)} zstd` };
-  }
-
-  return { label: "Brotli", value: `${formatBytes(result.brotli_bytes)} br` };
-};
+): { label: string; value: string } => ({
+  label: compression === "all" ? "Brotli" : compressionTitles[compression],
+  value: `${formatBytes(bytesForCompression(result, compression))} ${labelForCompression(compression)}`,
+});
 
 export const copyDiagnosticsMarkdown = (result: ImportResult): string => {
   const args = encodeURIComponent(JSON.stringify([result]));
