@@ -11,6 +11,7 @@ use crate::{
         minify::minify_source_with_markers,
         reachability::{ReachableExports, reachable_exports, requested_exports},
         resolver::resolve_package_entry,
+        util::diagnostic,
     },
 };
 use std::{
@@ -246,13 +247,5 @@ fn error_computation(
         error: Some(message),
         diagnostics,
         ..FileSizeComputation::default()
-    }
-}
-
-fn diagnostic(stage: &str, message: String, details: Vec<String>) -> ImportDiagnostic {
-    ImportDiagnostic {
-        stage: stage.to_owned(),
-        message,
-        details,
     }
 }

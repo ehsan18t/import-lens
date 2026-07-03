@@ -4,6 +4,7 @@ use crate::{
         cjs_scan::scan_cjs_source,
         graph::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES},
         resolver::{normalize_existing_path, resolve_module_path, shared_resolvers},
+        util::diagnostic,
     },
 };
 use oxc_resolver::Resolver;
@@ -151,12 +152,4 @@ fn resolve_require(
                 from_path.display()
             )
         })
-}
-
-fn diagnostic(stage: &str, message: String, details: Vec<String>) -> ImportDiagnostic {
-    ImportDiagnostic {
-        stage: stage.to_owned(),
-        message,
-        details,
-    }
 }

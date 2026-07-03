@@ -1,4 +1,5 @@
 use crate::ipc::protocol::ImportDiagnostic;
+use crate::pipeline::util::should_skip_package_directory;
 use std::{fs, path::Path};
 
 const APPROXIMATE_MAX_FILES: usize = 10_000;
@@ -33,7 +34,7 @@ pub(crate) fn approximate_directory_size(package_root: &Path) -> (u64, Vec<Impor
             };
 
             if file_type.is_dir() {
-                if !should_skip_approximate_directory(&path) {
+                if !should_skip_package_directory(&path) {
                     stack.push(path);
                 }
                 continue;
@@ -142,26 +143,4 @@ pub(crate) fn source_excerpt_detail(source: &str) -> String {
     } else {
         format!("source_excerpt: {excerpt}")
     }
-}
-
-fn should_skip_approximate_directory(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    matches!(
-        name,
-        "node_modules"
-            | ".git"
-            | ".hg"
-            | ".svn"
-            | ".cache"
-            | ".turbo"
-            | ".parcel-cache"
-            | ".next"
-            | ".nuxt"
-            | ".vite"
-            | "coverage"
-            | "target"
-    )
 }

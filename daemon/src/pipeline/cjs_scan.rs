@@ -1,3 +1,5 @@
+use crate::pipeline::util::{is_identifier_continue, is_identifier_start};
+
 #[derive(Debug, Default)]
 pub(crate) struct CjsSourceScan {
     pub(crate) requires: Vec<String>,
@@ -447,7 +449,10 @@ fn read_identifier(bytes: &[u8], start: usize) -> Option<(String, usize)> {
     }
 
     let mut end = start + 1;
-    while bytes.get(end).is_some_and(|byte| is_identifier_part(*byte)) {
+    while bytes
+        .get(end)
+        .is_some_and(|byte| is_identifier_continue(*byte))
+    {
         end += 1;
     }
     Some((String::from_utf8_lossy(&bytes[start..end]).to_string(), end))
@@ -457,14 +462,8 @@ fn is_identifier_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
     start
         .checked_sub(1)
         .and_then(|index| bytes.get(index))
-        .is_none_or(|byte| !is_identifier_part(*byte))
-        && bytes.get(end).is_none_or(|byte| !is_identifier_part(*byte))
-}
-
-fn is_identifier_start(byte: u8) -> bool {
-    byte == b'_' || byte == b'$' || byte.is_ascii_alphabetic()
-}
-
-fn is_identifier_part(byte: u8) -> bool {
-    is_identifier_start(byte) || byte.is_ascii_digit()
+        .is_none_or(|byte| !is_identifier_continue(*byte))
+        && bytes
+            .get(end)
+            .is_none_or(|byte| !is_identifier_continue(*byte))
 }

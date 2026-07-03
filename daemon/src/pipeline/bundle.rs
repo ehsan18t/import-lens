@@ -4,6 +4,7 @@ use crate::{
         graph::{ExternalImportEdge, ModuleGraph, ModuleId, ModuleRecord},
         reachability::ReachableExports,
         replacements::{Replacement, apply_replacements, span_overlaps_replacements},
+        util::{is_identifier_continue, is_identifier_start},
     },
 };
 use std::{
@@ -758,12 +759,4 @@ fn fnv1a_32(value: &str) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
-}
-
-fn is_identifier_start(byte: u8) -> bool {
-    byte == b'_' || byte == b'$' || byte.is_ascii_alphabetic()
-}
-
-fn is_identifier_continue(byte: u8) -> bool {
-    is_identifier_start(byte) || byte.is_ascii_digit()
 }

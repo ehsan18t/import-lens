@@ -1,6 +1,6 @@
 use crate::{
     ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportRequest, ImportResult},
-    pipeline::resolver::find_package_root,
+    pipeline::{resolver::find_package_root, util::should_skip_package_directory},
 };
 use std::{
     fs::{self, DirEntry},
@@ -98,7 +98,7 @@ fn scan_entry(
     let path = entry.path();
 
     if file_type.is_dir() {
-        if !should_skip_package_scan_directory(&path) {
+        if !should_skip_package_directory(&path) {
             stack.push(path);
         }
         return;
@@ -122,28 +122,6 @@ fn scan_entry(
     if is_runtime_source_file(&path) {
         scan.has_runtime_file = true;
     }
-}
-
-fn should_skip_package_scan_directory(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    matches!(
-        name,
-        "node_modules"
-            | ".git"
-            | ".hg"
-            | ".svn"
-            | ".cache"
-            | ".turbo"
-            | ".parcel-cache"
-            | ".next"
-            | ".nuxt"
-            | ".vite"
-            | "coverage"
-            | "target"
-    )
 }
 
 fn is_declaration_file(path: &Path) -> bool {
