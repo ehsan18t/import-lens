@@ -6,11 +6,11 @@ use super::{
 use crate::ipc::protocol::{DetectedImport, ImportKind, ImportSyntax};
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
-use oxc_span::{SourceType, Span};
+use oxc_span::Span;
 use oxc_syntax::module_record::{
     ExportEntry, ExportImportName, ImportEntry, ImportImportName, ModuleRecord as OxcModuleRecord,
 };
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 pub fn analyze_imports(filename: &str, source: &str) -> Result<Vec<DetectedImport>, String> {
     let mut imports = Vec::new();
@@ -33,8 +33,7 @@ fn imports_from_region(
     region: &ScriptRegion<'_>,
 ) -> Result<Vec<DetectedImport>, String> {
     let allocator = Allocator::default();
-    let source_type =
-        SourceType::from_path(Path::new(&region.filename)).unwrap_or_else(|_| SourceType::mjs());
+    let source_type = super::script_regions::source_type_for_region(&region.filename);
     let parsed = Parser::new(&allocator, region.source, source_type).parse();
 
     if parsed.panicked || parsed.diagnostics.has_errors() {

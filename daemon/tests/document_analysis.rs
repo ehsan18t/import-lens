@@ -171,3 +171,26 @@ fn import_lens_ignore_rules_match_package_import_and_path() {
         &rules
     ));
 }
+
+#[test]
+fn jsx_in_plain_js_documents_still_analyzes() {
+    let imports = analyze_imports(
+        "App.js",
+        "import { useState } from 'react';\nexport const App = () => <div />;\n",
+    )
+    .expect("JSX in .js should analyze");
+
+    assert_eq!(imports.len(), 1);
+    assert_eq!(imports[0].specifier, "react");
+}
+
+#[test]
+fn comparison_chains_in_plain_js_still_parse_with_jsx_enabled() {
+    let imports = analyze_imports(
+        "math.js",
+        "import { clamp } from 'lodash';\nexport const inRange = (a, b, c) => a < b && b > c;\n",
+    )
+    .expect("comparison operators must keep parsing");
+
+    assert_eq!(imports.len(), 1);
+}

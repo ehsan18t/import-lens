@@ -87,26 +87,6 @@ fn repro_builtin_subpath_treated_as_package() {
     assert!(!is_runtime_package_specifier("node:fs/promises"));
 }
 
-/// SUSPICION 7 (oxc source-type cross-check): `.js` documents parse without
-/// the JSX variant, so CRA-style JSX in `.js` files fails import analysis.
-#[test]
-fn repro_jsx_in_js_documents_fails_analysis() {
-    let result = import_lens_daemon::document::analyze_imports(
-        "App.js",
-        "import { useState } from 'react';\nexport const App = () => <div />;\n",
-    );
-
-    // CURRENT (buggy) behavior: the whole document fails to analyze.
-    assert!(result.is_err(), "got: {result:?}");
-
-    // Control: the same source as .jsx analyzes fine.
-    let control = import_lens_daemon::document::analyze_imports(
-        "App.jsx",
-        "import { useState } from 'react';\nexport const App = () => <div />;\n",
-    );
-    assert_eq!(control.expect("jsx should analyze").len(), 1);
-}
-
 /// SUSPICION 6: JSON with `eval`/`arguments` keys synthesizes an invalid
 /// module (`export const eval = ...` is a strict-mode SyntaxError).
 #[test]

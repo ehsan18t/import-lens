@@ -1,4 +1,6 @@
 use crate::ipc::protocol::ImportRuntime;
+use oxc_span::SourceType;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScriptLanguage {
@@ -44,6 +46,21 @@ pub fn script_regions_for_document<'a>(filename: &str, source: &'a str) -> Vec<S
         offset: 0,
         runtime: ImportRuntime::Component,
     }]
+}
+
+pub(super) fn source_type_for_region(filename: &str) -> SourceType {
+    let source_type =
+        SourceType::from_path(Path::new(filename)).unwrap_or_else(|_| SourceType::mjs());
+
+    // JSX in plain .js is widespread (CRA-era apps, React Native). Enabling the
+    // JSX variant only accepts a superset: a bare `<` can never start a valid
+    // plain-JS expression, so no existing program changes meaning. TypeScript
+    // stays untouched because `<T>x` assertions conflict with TSX.
+    if source_type.is_javascript() {
+        return source_type.with_jsx(true);
+    }
+
+    source_type
 }
 
 fn language_from_filename(filename: &str) -> ScriptLanguage {

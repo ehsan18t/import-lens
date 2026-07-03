@@ -1,9 +1,9 @@
 use super::script_regions::{ScriptRegion, script_regions_for_document};
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
-use oxc_span::{SourceType, Span};
+use oxc_span::Span;
 use oxc_syntax::module_record::{ImportImportName, ModuleRecord as OxcModuleRecord};
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedImportCompletionContext {
@@ -52,8 +52,7 @@ fn region_completion_context(
     offset: usize,
 ) -> Option<NamedImportCompletionContext> {
     let allocator = Allocator::default();
-    let source_type =
-        SourceType::from_path(Path::new(&region.filename)).unwrap_or_else(|_| SourceType::tsx());
+    let source_type = super::script_regions::source_type_for_region(&region.filename);
     let parsed = Parser::new(&allocator, region.source, source_type).parse();
 
     if parsed.panicked || parsed.diagnostics.has_errors() {
