@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { budgetViolationsForStates } from "../analysis/budgets.js";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
-import type { SourceRange } from "../ipc/protocol.js";
+import { rangeFromSourceRange } from "./vscodeRanges.js";
 
 export class BudgetDiagnosticsController implements vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -49,11 +49,3 @@ export class BudgetDiagnosticsController implements vscode.Disposable {
     this.#collection.dispose();
   }
 }
-
-const rangeFromSourceRange = (range: SourceRange): vscode.Range =>
-  new vscode.Range(
-    range.start.line,
-    range.start.character,
-    range.end.line,
-    range.end.character,
-  );

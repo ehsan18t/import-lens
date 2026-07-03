@@ -1,16 +1,10 @@
 import * as vscode from "vscode";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
-import type { SourceRange } from "../ipc/protocol.js";
 import { shouldShowColoredSourceHovers } from "./displayGuards.js";
 import { stateForHoverPosition } from "./hoverRanges.js";
 import { tooltipForAnalysisState } from "./tooltip.js";
-
-const vscodeRangeFromSourceRange = (range: SourceRange): vscode.Range =>
-  new vscode.Range(
-    new vscode.Position(range.start.line, range.start.character),
-    new vscode.Position(range.end.line, range.end.character),
-  );
+import { rangeFromSourceRange } from "./vscodeRanges.js";
 
 export class ImportLensHoverProvider implements vscode.HoverProvider {
   readonly #store: AnalysisStore;
@@ -43,6 +37,6 @@ export class ImportLensHoverProvider implements vscode.HoverProvider {
       return undefined;
     }
 
-    return new vscode.Hover(tooltip, vscodeRangeFromSourceRange(state.detected.specifierRange));
+    return new vscode.Hover(tooltip, rangeFromSourceRange(state.detected.specifierRange));
   }
 }
