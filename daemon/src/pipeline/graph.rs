@@ -20,7 +20,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 static GRAPH_CACHE: OnceLock<papaya::HashMap<(PathBuf, ImportRuntime), CachedModuleGraph>> =
@@ -29,11 +32,15 @@ static GRAPH_CACHE: OnceLock<papaya::HashMap<(PathBuf, ImportRuntime), CachedMod
 pub const MAX_GRAPH_MODULES: usize = 2_000;
 pub const MAX_MODULE_SOURCE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_GRAPH_SOURCE_BYTES: usize = 100 * 1024 * 1024;
+// Every cached graph retains the full prepared source of all its modules, so
+// an unbounded cache can hold gigabytes across a long multi-package session.
+pub const MAX_CACHED_GRAPHS: usize = 32;
 
 #[derive(Debug, Clone)]
 struct CachedModuleGraph {
     graph: Arc<ModuleGraph>,
     fingerprints: Vec<FileFingerprint>,
+    last_used_millis: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +230,9 @@ pub fn build_module_graph_cached_with_runtime(
     let cache_key = (entry_path.clone(), runtime);
     if let Some(graph) = pinned.get(&cache_key) {
         if fingerprints_are_current(&graph.fingerprints) {
+            graph
+                .last_used_millis
+                .store(crate::time::unix_millis_now(), Ordering::Relaxed);
             return Ok(Arc::clone(&graph.graph));
         }
 
@@ -235,9 +245,28 @@ pub fn build_module_graph_cached_with_runtime(
         CachedModuleGraph {
             fingerprints: module_graph_fingerprints(&entry_path, &graph),
             graph: Arc::clone(&graph),
+            last_used_millis: Arc::new(AtomicU64::new(crate::time::unix_millis_now())),
         },
     );
+
+    if pinned.len() > MAX_CACHED_GRAPHS {
+        let oldest = pinned
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used_millis.load(Ordering::Relaxed))
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest {
+            pinned.remove(&key);
+        }
+    }
+
     Ok(graph)
+}
+
+pub fn module_graph_cache_len() -> usize {
+    GRAPH_CACHE
+        .get()
+        .map(|cache| cache.pin().len())
+        .unwrap_or(0)
 }
 
 fn module_graph_fingerprints(entry_path: &Path, graph: &ModuleGraph) -> Vec<FileFingerprint> {

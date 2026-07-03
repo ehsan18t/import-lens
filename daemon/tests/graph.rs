@@ -1,7 +1,8 @@
 use import_lens_daemon::pipeline::{
     graph::{
-        GraphLimits, ModuleGraph, build_module_graph, build_module_graph_cached,
-        build_module_graph_with_limits, clear_module_graph_cache,
+        GraphLimits, MAX_CACHED_GRAPHS, ModuleGraph, build_module_graph,
+        build_module_graph_cached, build_module_graph_with_limits, clear_module_graph_cache,
+        module_graph_cache_len,
     },
     reachability::reachable_exports,
 };
@@ -429,4 +430,25 @@ fn json_modules_with_strict_mode_restricted_keys_still_build() {
     assert!(json_module.source.contains("export const safe"));
     assert!(!json_module.source.contains("export const eval"));
     assert!(!json_module.source.contains("export const arguments"));
+}
+
+#[test]
+fn graph_cache_evicts_least_recently_used_beyond_cap() {
+    let _guard = GRAPH_CACHE_TEST_LOCK.lock().expect("graph cache test lock");
+    clear_module_graph_cache();
+    let root = temp_workspace();
+
+    for index in 0..(MAX_CACHED_GRAPHS + 3) {
+        let entry = format!("entry{index}.js");
+        write_source(
+            &root,
+            &entry,
+            &format!("export const value{index} = {index};"),
+        );
+        build_module_graph_cached(&root.join(&entry)).expect("graph should build");
+    }
+
+    fs::remove_dir_all(root).expect("temp workspace should be removed");
+    assert!(module_graph_cache_len() <= MAX_CACHED_GRAPHS);
+    clear_module_graph_cache();
 }
