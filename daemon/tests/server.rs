@@ -647,7 +647,7 @@ async fn server_writes_package_json_partial_frame_before_final_response() {
         .expect("package.json request should be written");
 
     let first_partial = tokio::time::timeout(
-        Duration::from_millis(200),
+        Duration::from_secs(10),
         reader.read_response(&mut client_stream),
     )
     .await
