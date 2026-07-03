@@ -3,7 +3,7 @@ use crate::{
     pipeline::{
         cjs_scan::scan_cjs_source,
         graph::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES},
-        resolver::{create_resolver, normalize_existing_path, resolve_module_path},
+        resolver::{normalize_existing_path, resolve_module_path, shared_resolvers},
     },
 };
 use oxc_resolver::Resolver;
@@ -36,7 +36,8 @@ pub fn analyze_cjs_graph_with_runtime(
     let mut diagnostics = Vec::new();
     let mut total_source_bytes = 0_usize;
     let mut unsupported = false;
-    let resolver = create_resolver(runtime);
+    let resolvers = shared_resolvers();
+    let resolver = resolvers.resolver(runtime);
 
     while let Some(path) = queue.pop_front() {
         if !seen.insert(path.clone()) {
@@ -77,7 +78,7 @@ pub fn analyze_cjs_graph_with_runtime(
         let scan = scan_cjs_source(&source);
         unsupported |= scan.unsupported;
         for specifier in scan.requires {
-            match resolve_require(&resolver, &path, &specifier) {
+            match resolve_require(resolver, &path, &specifier) {
                 Ok(Some(resolved_path)) => queue.push_back(resolved_path),
                 Ok(None) => diagnostics.push(diagnostic(
                     "cjs_resolution",

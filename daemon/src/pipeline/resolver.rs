@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock, RwLock},
 };
 
 #[derive(Debug, Clone)]
@@ -147,8 +148,8 @@ fn resolve_with_oxc(
         .parent()
         .ok_or_else(|| "active document path has no parent directory".to_owned())?;
 
-    let resolver = create_resolver(request.runtime);
-    let resolved = resolve_module_path(&resolver, directory, &request.specifier)?;
+    let resolvers = shared_resolvers();
+    let resolved = resolve_module_path(resolvers.resolver(request.runtime), directory, &request.specifier)?;
 
     Ok(ResolvedEntry {
         entry_path: resolved.path,
@@ -227,9 +228,10 @@ fn validate_declared_entry_resolution(
         return Ok(());
     }
 
-    let resolver = create_resolver(runtime);
+    let resolvers = shared_resolvers();
+    let resolver = resolvers.resolver(runtime);
     for (_, target) in &declared_entries {
-        if resolve_manifest_target(&resolver, &manifest.root, target).is_ok() {
+        if resolve_manifest_target(resolver, &manifest.root, target).is_ok() {
             return Ok(());
         }
     }
@@ -512,8 +514,52 @@ fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
     Ok(found_path)
 }
 
-pub(crate) fn create_resolver(runtime: ImportRuntime) -> Resolver {
-    Resolver::new(resolve_options(runtime))
+/// The three runtime resolvers share one `oxc_resolver` FS cache (Component and
+/// Client use identical options, so they share a resolver; Server has its own).
+/// Building a fresh resolver per request threw that cache away every time.
+pub struct ResolverSet {
+    browser: Resolver,
+    server: Resolver,
+}
+
+impl ResolverSet {
+    fn new() -> Self {
+        let browser = Resolver::new(resolve_options(ImportRuntime::Component));
+        // clone_with_options shares the same Arc<Cache>, so all runtimes reuse
+        // one set of memoized (option-independent) filesystem facts.
+        let server = browser.clone_with_options(resolve_options(ImportRuntime::Server));
+        Self { browser, server }
+    }
+
+    pub fn resolver(&self, runtime: ImportRuntime) -> &Resolver {
+        match runtime {
+            ImportRuntime::Component | ImportRuntime::Client => &self.browser,
+            ImportRuntime::Server => &self.server,
+        }
+    }
+}
+
+static SHARED_RESOLVERS: OnceLock<RwLock<Arc<ResolverSet>>> = OnceLock::new();
+
+fn resolver_slot() -> &'static RwLock<Arc<ResolverSet>> {
+    SHARED_RESOLVERS.get_or_init(|| RwLock::new(Arc::new(ResolverSet::new())))
+}
+
+pub fn shared_resolvers() -> Arc<ResolverSet> {
+    resolver_slot()
+        .read()
+        .map(|guard| Arc::clone(&guard))
+        .unwrap_or_else(|_| Arc::new(ResolverSet::new()))
+}
+
+/// Publishes a fresh `ResolverSet` (empty cache). In-flight resolutions keep
+/// their `Arc` snapshot and finish against the old cache, so this is safe to
+/// call while background prewarm/report resolutions run — unlike oxc's in-place
+/// `clear_cache`, which is documented as unsafe against concurrent resolution.
+pub fn invalidate_shared_resolvers() {
+    if let Ok(mut guard) = resolver_slot().write() {
+        *guard = Arc::new(ResolverSet::new());
+    }
 }
 
 fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {

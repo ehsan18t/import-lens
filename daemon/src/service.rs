@@ -1022,11 +1022,13 @@ impl ImportLensService {
     pub fn invalidate_package(&self, package_name: &str) {
         self.cache_registry.invalidate_package(package_name);
         invalidate_module_graph_cache_for_package(package_name);
+        crate::pipeline::resolver::invalidate_shared_resolvers();
     }
 
     pub fn invalidate_all(&self) {
         self.cache_registry.clear_all();
         clear_module_graph_cache();
+        crate::pipeline::resolver::invalidate_shared_resolvers();
     }
 
     pub fn cache_len(&self) -> usize {

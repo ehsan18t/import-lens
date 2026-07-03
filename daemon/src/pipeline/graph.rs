@@ -1,7 +1,9 @@
 use crate::{
     cache::key::{FileFingerprint, fingerprints_are_current, fingerprints_for_paths},
     ipc::protocol::ImportRuntime,
-    pipeline::resolver::{create_resolver, normalize_existing_path, resolve_module_path},
+    pipeline::resolver::{
+        ResolverSet, normalize_existing_path, resolve_module_path, shared_resolvers,
+    },
 };
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -345,7 +347,8 @@ struct ModuleGraphBuilder {
     graph: ModuleGraph,
     limits: GraphLimits,
     graph_source_bytes: usize,
-    resolver: Resolver,
+    resolvers: Arc<ResolverSet>,
+    runtime: ImportRuntime,
     dependency_paths: HashSet<PathBuf>,
     circular_edges: HashSet<(PathBuf, PathBuf)>,
     loading_paths: HashSet<PathBuf>,
@@ -357,7 +360,8 @@ impl ModuleGraphBuilder {
             graph: ModuleGraph::default(),
             limits,
             graph_source_bytes: 0,
-            resolver: create_resolver(runtime),
+            resolvers: shared_resolvers(),
+            runtime,
             dependency_paths: HashSet::new(),
             circular_edges: HashSet::new(),
             loading_paths: HashSet::new(),
@@ -431,8 +435,11 @@ impl ModuleGraphBuilder {
             ));
         }
 
+        // Clone the Arc into a local so the resolver borrow is independent of the
+        // mutable self borrows below (diagnostics / dependency_paths).
+        let resolvers = Arc::clone(&self.resolvers);
         let mut resolver_context = ModuleResolverContext {
-            resolver: &self.resolver,
+            resolver: resolvers.resolver(self.runtime),
             diagnostics: &mut self.graph.diagnostics,
             dependency_paths: &mut self.dependency_paths,
         };

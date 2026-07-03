@@ -234,3 +234,46 @@ fn resolver_keeps_mjs_and_module_type_entries_as_esm() {
     assert!(!mjs.is_cjs, "{mjs:?}");
     assert!(!module_type.is_cjs, "{module_type:?}");
 }
+
+#[test]
+fn shared_resolver_reflects_node_modules_change_only_after_invalidation() {
+    let root = temp_workspace();
+    write_source(&root, "src/app.ts", "");
+    write_source(
+        &root,
+        "node_modules/swap-lib/package.json",
+        r#"{"version":"1.0.0","module":"a.js"}"#,
+    );
+    write_source(&root, "node_modules/swap-lib/a.js", "export const value = 'a';");
+    write_source(&root, "node_modules/swap-lib/b.js", "export const value = 'b';");
+    let document = root.join("src").join("app.ts");
+
+    let first = resolve_package_entry(&document, &request("swap-lib", ImportRuntime::Component))
+        .expect("first resolve")
+        .entry_path;
+    assert!(first.ends_with("a.js"), "{first:?}");
+
+    write_source(
+        &root,
+        "node_modules/swap-lib/package.json",
+        r#"{"version":"1.0.0","module":"b.js"}"#,
+    );
+    let stale = resolve_package_entry(&document, &request("swap-lib", ImportRuntime::Component))
+        .expect("stale resolve")
+        .entry_path;
+    assert!(
+        stale.ends_with("a.js"),
+        "shared resolver cache should persist until invalidated: {stale:?}"
+    );
+
+    import_lens_daemon::pipeline::resolver::invalidate_shared_resolvers();
+    let fresh = resolve_package_entry(&document, &request("swap-lib", ImportRuntime::Component))
+        .expect("fresh resolve")
+        .entry_path;
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        fresh.ends_with("b.js"),
+        "resolution should update after invalidation: {fresh:?}"
+    );
+}
