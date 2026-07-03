@@ -3,8 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import * as vscode from "vscode";
-import { getImportLensConfig } from "../config.js";
+import type { ImportLensConfig } from "../config.js";
 import { IpcClient } from "../ipc/client.js";
 import type {
   AnalyzeDocumentRequest,
@@ -45,17 +44,23 @@ import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs, terminateProcess } f
 import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 import { resolveDaemonStartRoot } from "./startRoot.js";
-import { resolveDaemonStoragePaths } from "./storagePaths.js";
+import { resolveDaemonStoragePaths, type DaemonStorageContext } from "./storagePaths.js";
 import type { AnalysisTransport, DaemonState, DaemonStateEvent } from "./transport.js";
 
 const STABLE_SESSION_RESET_MS = 60_000;
 const CLEAN_RECYCLE_SESSION_MS = 30 * 60 * 1000;
 // A whole-workspace report scans, resolves, graphs, minifies, and compresses every file, so it
 // can exceed the 60s per-document budget on large monorepos.
+// The subset of `vscode.ExtensionContext` this transport reads. Typing against
+// it (rather than the full `ExtensionContext`) keeps the module free of any
+// `vscode` value/type dependency, so it loads under the extension-host-free
+// test runner; a real `ExtensionContext` still satisfies it structurally.
+type DaemonHostContext = DaemonStorageContext & { readonly extensionPath: string };
+
 const WORKSPACE_REPORT_TIMEOUT_MS = 300_000;
 
 export class NativeDaemonTransport implements AnalysisTransport {
-  readonly #context: vscode.ExtensionContext;
+  readonly #context: DaemonHostContext;
   readonly #logger: Logger;
   readonly #recycleGuard: RecycleGuard;
   readonly #stateListeners = new Set<(state: DaemonState) => void>();
@@ -70,10 +75,22 @@ export class NativeDaemonTransport implements AnalysisTransport {
   #cleanRecycleTimer: NodeJS.Timeout | null = null;
   #disconnectTimer: NodeJS.Timeout | null = null;
   #lastAnalysisRoot: string | undefined;
+  // Injected so this module depends on `vscode` for types only and can be
+  // constructed under the extension-host-free test runner. In production the
+  // manager supplies the active workspace folder's path.
+  readonly #workspaceFallbackRoot: () => string | undefined;
+  readonly #getConfig: () => ImportLensConfig;
 
-  constructor(context: vscode.ExtensionContext, logger: Logger) {
+  constructor(
+    context: DaemonHostContext,
+    logger: Logger,
+    workspaceFallbackRoot: () => string | undefined,
+    getConfig: () => ImportLensConfig,
+  ) {
     this.#context = context;
     this.#logger = logger;
+    this.#workspaceFallbackRoot = workspaceFallbackRoot;
+    this.#getConfig = getConfig;
     this.#recycleGuard = new RecycleGuard(resolveDaemonStoragePaths(context).lifecycleStoragePath);
   }
 
@@ -92,7 +109,11 @@ export class NativeDaemonTransport implements AnalysisTransport {
   };
 
   async start(analysisRoot?: string): Promise<DaemonState> {
-    if (this.#isDisposed) return "unavailable";
+    // An explicit start() (including the one DaemonManager.restart() performs
+    // after shutdown()) is a request to run, so clear the disposal latch that
+    // shutdown() set. The auto-restart timer still checks #isDisposed before
+    // calling start(), so a genuine dispose still prevents self-resurrection.
+    this.#isDisposed = false;
     if (this.#state === "ready" && this.#process && this.#client) return "ready";
     this.#clearRestartTimer();
     this.#clearDisconnectTimer();
@@ -103,7 +124,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     const workspaceRoot = resolveDaemonStartRoot(
       analysisRoot,
-      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      this.#workspaceFallbackRoot(),
       this.#lastAnalysisRoot,
     );
 
@@ -279,12 +300,29 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#logger[level](message);
     this.#restartTimer = setTimeout(() => {
       this.#restartTimer = null;
-      if (!this.#isDisposed) void this.start(this.#lastAnalysisRoot);
+      if (this.#isDisposed) return;
+      void this.start(this.#lastAnalysisRoot).catch((error: unknown) => {
+        this.#logger.warn(
+          `Scheduled daemon restart failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        this.#setState("unavailable");
+      });
     }, delay);
   }
 
   #cleanup(killProcess = true): void {
     this.#clearDisconnectTimer();
+    // Clear the session-scoped stability/clean-recycle timers so a timer armed
+    // by a previous (now-ended) session cannot later fire and reset the crash
+    // breaker and backoff after a crash.
+    if (this.#stabilityTimer) {
+      clearTimeout(this.#stabilityTimer);
+      this.#stabilityTimer = null;
+    }
+    if (this.#cleanRecycleTimer) {
+      clearTimeout(this.#cleanRecycleTimer);
+      this.#cleanRecycleTimer = null;
+    }
     const client = this.#client;
     const childProcess = this.#process;
 
@@ -578,7 +616,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
   }
 
   #hello(workspaceRoot: string): HelloMessage {
-    const config = getImportLensConfig();
+    const config = this.#getConfig();
     const storagePaths = resolveDaemonStoragePaths(this.#context);
 
     return {
