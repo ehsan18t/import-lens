@@ -604,57 +604,60 @@ impl ImportLensService {
         let sections = package_json_dependency_sections(&request.source);
         let registry_hint_mode = effective_registry_hint_mode(&request);
         let now_ms = crate::time::unix_millis_now();
-        let mut states = Vec::new();
-        let mut import_requests = Vec::new();
-
-        for entry in package_json_dependency_entries(&request.source) {
-            let resolution =
-                resolve_installed_package_version(&context.active_document_path, &entry.name);
-
-            match resolution {
-                Ok(version) => {
-                    let import_request = ImportRequest {
-                        specifier: entry.name.clone(),
-                        package_name: entry.name.clone(),
-                        version: version.clone(),
-                        named: Vec::new(),
-                        import_kind: ImportKind::Namespace,
-                        runtime: ImportRuntime::Component,
-                    };
-                    import_requests.push(Some(import_request));
-
-                    let registry_hint = self
-                        .registry_hints
-                        .hint_for(&entry.name, Some(&version), registry_hint_mode, now_ms)
-                        .hint;
-
-                    states.push(PackageJsonDependencyAnalysisItem {
-                        name: entry.name.clone(),
-                        section: entry.section.clone(),
-                        entry,
-                        status: ImportAnalysisStatus::Loading,
-                        installed_version: Some(version),
-                        registry_hint,
-                        message: None,
-                        result: None,
-                    });
-                }
-                Err(message) => {
-                    import_requests.push(None);
-
-                    states.push(PackageJsonDependencyAnalysisItem {
-                        name: entry.name.clone(),
-                        section: entry.section.clone(),
-                        entry,
-                        status: ImportAnalysisStatus::Missing,
-                        installed_version: None,
-                        registry_hint: None,
-                        message: Some(message),
-                        result: None,
-                    });
-                }
-            }
-        }
+        // Resolve each dependency's installed version (an ancestor walk plus a
+        // package.json read) in parallel; into_par_iter preserves order, so the
+        // resulting states and import_requests still line up with streaming
+        // indexes exactly as the sequential loop did.
+        let resolved: Vec<(PackageJsonDependencyAnalysisItem, Option<ImportRequest>)> =
+            package_json_dependency_entries(&request.source)
+                .into_par_iter()
+                .map(|entry| {
+                    match resolve_installed_package_version(
+                        &context.active_document_path,
+                        &entry.name,
+                    ) {
+                        Ok(version) => {
+                            let import_request = ImportRequest {
+                                specifier: entry.name.clone(),
+                                package_name: entry.name.clone(),
+                                version: version.clone(),
+                                named: Vec::new(),
+                                import_kind: ImportKind::Namespace,
+                                runtime: ImportRuntime::Component,
+                            };
+                            let registry_hint = self
+                                .registry_hints
+                                .hint_for(&entry.name, Some(&version), registry_hint_mode, now_ms)
+                                .hint;
+                            let state = PackageJsonDependencyAnalysisItem {
+                                name: entry.name.clone(),
+                                section: entry.section.clone(),
+                                entry,
+                                status: ImportAnalysisStatus::Loading,
+                                installed_version: Some(version),
+                                registry_hint,
+                                message: None,
+                                result: None,
+                            };
+                            (state, Some(import_request))
+                        }
+                        Err(message) => {
+                            let state = PackageJsonDependencyAnalysisItem {
+                                name: entry.name.clone(),
+                                section: entry.section.clone(),
+                                entry,
+                                status: ImportAnalysisStatus::Missing,
+                                installed_version: None,
+                                registry_hint: None,
+                                message: Some(message),
+                                result: None,
+                            };
+                            (state, None)
+                        }
+                    }
+                })
+                .collect();
+        let (mut states, import_requests): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
         // Persist any registry metadata fetched above in one snapshot write.
         self.registry_hints.flush();
 
