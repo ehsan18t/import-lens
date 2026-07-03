@@ -480,3 +480,45 @@ fn module_record_carries_root_symbol_and_shorthand_spans() {
 
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn graph_transforms_plain_jsx_shipped_in_js_modules() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { Widget } from './widget.js';\nexport const value = Widget;",
+    );
+    write_source(
+        &root,
+        "widget.js",
+        "export const Widget = () => <div className=\"x\">hi</div>;",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("plain JSX in .js should build");
+
+    let widget = graph
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("widget.js"))
+        .expect("widget module");
+    let widget_source = widget.source.clone();
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(!widget_source.contains("<div"), "{widget_source}");
+}
+
+#[test]
+fn graph_still_fails_gracefully_on_flow_typed_js() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { x } from './flow.js';\nexport const value = x;",
+    );
+    write_source(&root, "flow.js", "export const x: number = 1;");
+
+    let result = build_module_graph(&root.join("entry.js"));
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(result.is_err(), "Flow-typed .js should fail, not panic");
+}

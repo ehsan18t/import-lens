@@ -436,13 +436,34 @@ impl ModuleGraphBuilder {
             diagnostics: &mut self.graph.diagnostics,
             dependency_paths: &mut self.dependency_paths,
         };
-        let prepared_source = prepare_module_source(&path, source)?;
-        let parsed = parse_module(
+        let mut prepared_source = prepare_module_source(&path, source)?;
+        let parsed = match parse_module(
             &path,
             &prepared_source.source,
             &mut resolver_context,
             prepared_source.validate_semantics,
-        )?;
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                // A JS-like module shipping plain JSX (a package whose .js entry
+                // ships untranspiled JSX) fails the mjs parse; retry via the JSX
+                // transform so the bundler/minifier see JSX-free source. Anything
+                // that still fails (Flow types, genuine syntax errors) returns the
+                // original error and falls back safely.
+                if module_can_retry_as_jsx(&path)
+                    && let Ok(transformed) = transform_module_source_as(
+                        &path,
+                        &prepared_source.source,
+                        SourceType::jsx(),
+                    )
+                {
+                    prepared_source.source = transformed;
+                    parse_module(&path, &prepared_source.source, &mut resolver_context, false)?
+                } else {
+                    return Err(error);
+                }
+            }
+        };
         let id = ModuleId(self.graph.modules.len());
         let next_paths = parsed
             .imports
@@ -583,8 +604,16 @@ fn synthetic_json_module(path: &Path, source: &str) -> Result<String, String> {
 }
 
 fn transform_module_source(path: &Path, source: &str) -> Result<String, String> {
-    let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::mjs());
+    transform_module_source_as(path, source, source_type)
+}
+
+fn transform_module_source_as(
+    path: &Path,
+    source: &str,
+    source_type: SourceType,
+) -> Result<String, String> {
+    let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(
@@ -633,6 +662,10 @@ fn transform_module_source(path: &Path, source: &str) -> Result<String, String> 
         .with_options(CodegenOptions::default())
         .build(&program)
         .code)
+}
+
+fn module_can_retry_as_jsx(path: &Path) -> bool {
+    !path_has_extension(path, "json") && !module_needs_transform(path)
 }
 
 fn module_needs_transform(path: &Path) -> bool {
