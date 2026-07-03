@@ -1023,30 +1023,10 @@ impl ImportLensService {
     ) where
         F: Fn() -> bool,
     {
-        let resolved = match resolve_package_entry(&context.active_document_path, request) {
-            Ok(resolved) => resolved,
-            Err(_) => return,
-        };
-        let key = cache_key_for_resolved_import(request, &resolved);
-        let cache = self.cache_registry.cache_for_root(&context.workspace_root);
-
-        if cache.get(&key).is_some() || !should_continue() {
+        let Ok(resolved) = resolve_package_entry(&context.active_document_path, request) else {
             return;
-        }
-
-        let result = analyze_resolved_import(context, request, resolved.clone());
-
-        if should_cache_result(&result) && should_continue() {
-            let fingerprints = dependency_fingerprints(request, &resolved, &result);
-            self.cache_full_variant_alias(
-                cache.as_ref(),
-                request,
-                &result,
-                &resolved,
-                &fingerprints,
-            );
-            cache.insert_with_fingerprints(key, result, fingerprints);
-        }
+        };
+        self.prewarm_resolved_import(context, request, resolved, should_continue);
     }
 
     pub fn prewarm_resolved_import<F>(
@@ -1065,19 +1045,7 @@ impl ImportLensService {
             return;
         }
 
-        let result = analyze_resolved_import(context, request, resolved.clone());
-
-        if should_cache_result(&result) && should_continue() {
-            let fingerprints = dependency_fingerprints(request, &resolved, &result);
-            self.cache_full_variant_alias(
-                cache.as_ref(),
-                request,
-                &result,
-                &resolved,
-                &fingerprints,
-            );
-            cache.insert_with_fingerprints(key, result, fingerprints);
-        }
+        let _ = self.analyze_and_cache(cache.as_ref(), context, request, key, resolved, should_continue);
     }
 
     pub fn invalidate_package_json_paths(&self, package_json_paths: &[String]) -> bool {
@@ -1159,17 +1127,23 @@ impl ImportLensService {
             return result;
         }
 
+        self.analyze_and_cache(cache.as_ref(), context, request, key, resolved, || true)
+    }
+
+    fn analyze_and_cache(
+        &self,
+        cache: &ImportCache,
+        context: &AnalysisContext,
+        request: &ImportRequest,
+        key: String,
+        resolved: ResolvedPackage,
+        should_store: impl Fn() -> bool,
+    ) -> ImportResult {
         let result = analyze_resolved_import(context, request, resolved.clone());
 
-        if should_cache_result(&result) {
+        if should_cache_result(&result) && should_store() {
             let fingerprints = dependency_fingerprints(request, &resolved, &result);
-            self.cache_full_variant_alias(
-                cache.as_ref(),
-                request,
-                &result,
-                &resolved,
-                &fingerprints,
-            );
+            self.cache_full_variant_alias(cache, request, &result, &resolved, &fingerprints);
             cache.insert_with_fingerprints(key, result.clone(), fingerprints);
         }
 
