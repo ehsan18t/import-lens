@@ -105,6 +105,28 @@ fn completion_context_from_module_record(
         });
     }
 
+    // Empty-brace imports (`import {} from "pkg"`) produce no import entries, so
+    // recover the specifier from the requested modules, matching the cursor to
+    // the statement's `{...}` range so exports can still be offered.
+    for (specifier, requested_modules) in &module_record.requested_modules {
+        for request in requested_modules
+            .iter()
+            .filter(|request| request.is_import && !request.is_type)
+        {
+            let Some(range) = named_import_member_range(source, request.statement_span) else {
+                continue;
+            };
+            if offset < range.start || offset > range.end {
+                continue;
+            }
+
+            return Some(NamedImportCompletionContext {
+                specifier: specifier.as_str().to_owned(),
+                imported_names: Vec::new(),
+            });
+        }
+    }
+
     None
 }
 
@@ -184,5 +206,17 @@ mod tests {
             .expect("UTF-16 offset should resolve");
 
         assert_eq!(context.specifier, "lodash");
+    }
+
+    #[test]
+    fn completion_recovers_specifier_for_empty_braces() {
+        let source = "import {} from 'lodash';\n";
+        let cursor = source.find('{').expect("brace should exist") + 1;
+
+        let context = named_import_completion_context("main.ts", source, cursor)
+            .expect("empty-brace completion should recover the specifier");
+
+        assert_eq!(context.specifier, "lodash");
+        assert!(context.imported_names.is_empty());
     }
 }
