@@ -199,7 +199,10 @@ fn astro_frontmatter(source: &str) -> Option<Frontmatter> {
     while line_start < source.len() {
         let line_end = next_line_end(source, line_start);
         if source[line_start..line_end].trim_end_matches('\r') == "---" {
-            let content_end = previous_line_end(source, line_start);
+            // Empty frontmatter (`---` immediately followed by `---`) walks the
+            // end back past the content start; clamp so the region is empty
+            // rather than an inverted, panicking slice range.
+            let content_end = previous_line_end(source, line_start).max(content_start);
             return Some(Frontmatter {
                 source_start: content_start,
                 source_end: content_end,

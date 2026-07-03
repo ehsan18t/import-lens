@@ -100,6 +100,17 @@ import ignored from "ignored-lib";
 }
 
 #[test]
+fn analyze_imports_handles_empty_astro_frontmatter_without_panicking() {
+    let empty_lf = analyze_imports("Page.astro", "---\n---\n<h1>Hi</h1>\n")
+        .expect("empty astro frontmatter should parse");
+    assert!(empty_lf.is_empty());
+
+    let empty_crlf = analyze_imports("Page.astro", "---\r\n---\r\n<h1>Hi</h1>\r\n")
+        .expect("empty CRLF astro frontmatter should parse");
+    assert!(empty_crlf.is_empty());
+}
+
+#[test]
 fn package_json_dependency_ranges_and_sections_are_extracted_in_rust() {
     let source = r#"{
   "dependencies": {
