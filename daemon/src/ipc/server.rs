@@ -512,6 +512,7 @@ where
                     });
                 }
                 drop(partial_tx);
+                let flush_service = std::sync::Arc::clone(&service);
 
                 tokio::spawn(async move {
                     let mut ordered_results = vec![None; targets.len()];
@@ -528,6 +529,9 @@ where
                             },
                         ));
                     }
+                    // All refresh workers have finished; persist their fetched
+                    // metadata in one snapshot write.
+                    flush_service.flush_registry_hints();
 
                     let results = ordered_results
                         .into_iter()

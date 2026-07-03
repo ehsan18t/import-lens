@@ -147,6 +147,18 @@ impl RegistryHintService {
         }
     }
 
+    /// Persists any registry metadata fetched since the last flush. Called at the
+    /// end of a package.json analysis or a registry-hint refresh so per-package
+    /// writes collapse into one snapshot rewrite.
+    pub fn flush(&self) {
+        if let Err(error) = self.cache.flush() {
+            logging::log_warn(
+                "registry",
+                format!("failed to persist registry metadata: {error}"),
+            );
+        }
+    }
+
     pub fn hint_for(
         &self,
         package_name: &str,

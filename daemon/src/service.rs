@@ -194,6 +194,10 @@ impl ImportLensService {
         self.registry_executor.spawn(job);
     }
 
+    pub fn flush_registry_hints(&self) {
+        self.registry_hints.flush();
+    }
+
     pub fn build_workspace_report(
         &self,
         request: WorkspaceReportRequest,
@@ -651,6 +655,8 @@ impl ImportLensService {
                 }
             }
         }
+        // Persist any registry metadata fetched above in one snapshot write.
+        self.registry_hints.flush();
 
         if let Some(emit_partial) = emit_partial.as_ref()
             && !states.is_empty()

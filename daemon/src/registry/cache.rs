@@ -6,14 +6,23 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+
+// Persist the full snapshot at most every N writes rather than on every write,
+// so refreshing M packages does not rewrite the whole file M times (O(M^2)
+// bytes). A trailing flush (per request / on Drop) persists the remainder.
+const REGISTRY_PERSIST_BATCH: usize = 16;
 
 #[derive(Debug)]
 pub struct RegistryMetadataCache {
     path: PathBuf,
     entries: Mutex<HashMap<String, RegistryPackageMetadataEntry>>,
     persist_lock: Mutex<()>,
+    unpersisted_writes: AtomicUsize,
 }
 
 impl RegistryMetadataCache {
@@ -24,6 +33,7 @@ impl RegistryMetadataCache {
             path,
             entries: Mutex::new(entries),
             persist_lock: Mutex::new(()),
+            unpersisted_writes: AtomicUsize::new(0),
         }
     }
 
@@ -32,6 +42,7 @@ impl RegistryMetadataCache {
             path: PathBuf::new(),
             entries: Mutex::new(HashMap::new()),
             persist_lock: Mutex::new(()),
+            unpersisted_writes: AtomicUsize::new(0),
         }
     }
 
@@ -55,7 +66,26 @@ impl RegistryMetadataCache {
             };
             entries.insert(cache_key(package_name), entry);
         }
-        self.persist_latest_snapshot()
+        // The in-memory map is the source of truth (get reads it), so defer the
+        // full-file persist; flush at a write threshold, per request, and on Drop.
+        if self.unpersisted_writes.fetch_add(1, Ordering::AcqRel) + 1 >= REGISTRY_PERSIST_BATCH {
+            return self.flush();
+        }
+        Ok(())
+    }
+
+    /// Persists the current snapshot if there are unpersisted writes.
+    pub fn flush(&self) -> Result<(), String> {
+        let had = self.unpersisted_writes.swap(0, Ordering::AcqRel);
+        if had == 0 {
+            return Ok(());
+        }
+        if let Err(error) = self.persist_latest_snapshot() {
+            // Restore the dirty count so a later flush retries.
+            self.unpersisted_writes.fetch_add(had, Ordering::AcqRel);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn write_metadata(
@@ -96,6 +126,12 @@ impl RegistryMetadataCache {
         let temp_path = self.path.with_extension("json.tmp");
         fs::write(&temp_path, bytes).map_err(|error| error.to_string())?;
         fs::rename(&temp_path, &self.path).map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for RegistryMetadataCache {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 

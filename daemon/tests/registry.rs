@@ -502,3 +502,41 @@ fn registry_cache_persists_latest_snapshot_under_concurrent_writes() {
     fs::remove_dir_all(cache_path).expect("cache cleanup");
     assert_eq!(value.as_object().expect("cache object").len(), 16);
 }
+
+fn sample_metadata(latest: &str) -> RegistryPackageMetadata {
+    RegistryPackageMetadata {
+        latest_version: Some(latest.to_owned()),
+        latest_published_at: None,
+        deprecated_versions: Vec::new(),
+    }
+}
+
+#[test]
+fn registry_metadata_defers_persistence_until_flush() {
+    let cache_path = temp_cache_path("flush-debounce");
+    let file = cache_path.join("registry-metadata.json");
+    {
+        let cache = RegistryMetadataCache::new(cache_path.clone());
+        for i in 0..5u64 {
+            cache
+                .write_metadata(&format!("pkg{i}"), sample_metadata(&format!("1.0.{i}")), 1000 + i)
+                .expect("write");
+        }
+        // Below the persist threshold: nothing written to disk yet.
+        assert!(
+            !file.exists(),
+            "writes below the threshold should defer persistence"
+        );
+        cache.flush().expect("flush");
+        assert!(file.exists(), "flush should persist the snapshot");
+    }
+
+    let reloaded = RegistryMetadataCache::new(cache_path.clone());
+    for i in 0..5u64 {
+        assert!(
+            reloaded.get(&format!("pkg{i}")).is_some(),
+            "pkg{i} should reload after flush"
+        );
+    }
+    fs::remove_dir_all(cache_path).expect("cleanup");
+}
