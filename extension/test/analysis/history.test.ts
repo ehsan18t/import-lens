@@ -3,8 +3,11 @@ import test from "node:test";
 import {
   bundleImpactHistoryLabel,
   bundleImpactHistoryDeltaLabel,
+  importCostHistoryKey,
   recordBundleImpactHistory,
+  recordImportCostHistory,
   type BundleImpactHistoryItem,
+  type ImportCostHistoryItem,
 } from "../../src/analysis/history.js";
 
 class MemoryStore {
@@ -59,4 +62,52 @@ test("bundleImpactHistoryDeltaLabel formats import cost deltas", () => {
     bundleImpactHistoryDeltaLabel(item("/workspace/src/app.ts", 1200), item("/workspace/src/app.ts", 1500)),
     "-300 B br vs previous",
   );
+});
+
+const costItem = (identity: string, brotliBytes: number): ImportCostHistoryItem => ({
+  identity,
+  timestamp: 1_800_000,
+  specifier: identity,
+  importKind: "named",
+  named: [],
+  rawBytes: brotliBytes * 4,
+  minifiedBytes: brotliBytes * 2,
+  gzipBytes: brotliBytes,
+  brotliBytes,
+  zstdBytes: brotliBytes,
+});
+
+class SlowStore extends MemoryStore {
+  override async update(key: string, value: unknown): Promise<void> {
+    await Promise.resolve();
+    this.values.set(key, value);
+  }
+}
+
+test("concurrent import-cost history writes both persist", async () => {
+  const store = new SlowStore();
+
+  await Promise.all([
+    recordImportCostHistory(store, [costItem("react", 100)]),
+    recordImportCostHistory(store, [costItem("lodash-es", 200)]),
+  ]);
+
+  const identities = store
+    .get<ImportCostHistoryItem[]>(importCostHistoryKey, [])
+    .map((entry) => entry.identity);
+  assert.ok(identities.includes("react"), `react missing: ${identities.join(",")}`);
+  assert.ok(identities.includes("lodash-es"), `lodash-es missing: ${identities.join(",")}`);
+});
+
+test("recording a changed import cost keeps one row per identity", async () => {
+  const store = new MemoryStore();
+
+  await recordImportCostHistory(store, [costItem("react", 100)]);
+  await recordImportCostHistory(store, [costItem("react", 150)]);
+
+  const rows = store
+    .get<ImportCostHistoryItem[]>(importCostHistoryKey, [])
+    .filter((entry) => entry.identity === "react");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].brotliBytes, 150);
 });

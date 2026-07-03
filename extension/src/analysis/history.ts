@@ -107,22 +107,38 @@ export const importCostHistoryDeltaLabel = (
   return `${sign}${formatBytes(Math.abs(delta))}`;
 };
 
-export const recordImportCostHistory = async (
+let historyWriteChain: Promise<void> = Promise.resolve();
+
+export const recordImportCostHistory = (
   store: BundleImpactHistoryStore,
   items: readonly ImportCostHistoryItem[],
   limit = 200,
 ): Promise<void> => {
-  const existing = store.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
-  const changedItems = items.filter((item) => {
-    const previous = existing.find((entry) => entry.identity === item.identity);
-    return !previous || !sameImportCost(item, previous);
+  // Serialize writes so concurrent analyses (e.g. switching tabs while a
+  // previous file's analysis is still in flight) do not read-modify-write the
+  // same array and lose each other's entries.
+  const write = historyWriteChain.then(async () => {
+    const existing = store.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
+    const changedItems = items.filter((item) => {
+      const previous = existing.find((entry) => entry.identity === item.identity);
+      return !previous || !sameImportCost(item, previous);
+    });
+
+    if (changedItems.length === 0) {
+      return;
+    }
+
+    // Keep one row per identity: drop prior rows for the changed identities so a
+    // single frequently-edited import cannot fill the cap and evict every other
+    // import's history. previousImportCostFor reads newest-first, so the trend
+    // insight is unaffected.
+    const changedIdentities = new Set(changedItems.map((item) => item.identity));
+    const retained = existing.filter((entry) => !changedIdentities.has(entry.identity));
+    await store.update(importCostHistoryKey, [...changedItems, ...retained].slice(0, Math.max(1, limit)));
   });
 
-  if (changedItems.length === 0) {
-    return;
-  }
-
-  await store.update(importCostHistoryKey, [...changedItems, ...existing].slice(0, Math.max(1, limit)));
+  historyWriteChain = write.catch(() => {});
+  return write;
 };
 
 const sameImportCost = (left: ImportCostHistoryItem, right: ImportCostHistoryItem): boolean =>
