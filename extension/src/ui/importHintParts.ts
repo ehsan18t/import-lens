@@ -69,7 +69,7 @@ export const importHintParts = (
     ];
 
     return {
-      primary: formatImportSizePrimary(state.result, config, state.detected.runtime),
+      primary: formatImportSizePrimary(state.result, config),
       primaryTone: state.result.error ? "neutral" : importSizePrimaryTone(state.result.confidence),
       suffixes,
     };

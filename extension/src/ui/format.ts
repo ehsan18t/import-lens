@@ -42,30 +42,6 @@ export const formatBytes = (bytes: number): string => {
   return `${(bytes / 1000).toFixed(1)} kB`;
 };
 
-const formatWarningSuffix = (result: ImportResult, showWarnings: boolean, runtime: ImportRuntime): string => {
-  const runtimeSuffix = runtime === "server" ? " · server" : "";
-
-  if (isTypesOnlyResult(result)) {
-    return `${runtimeSuffix} · types only`;
-  }
-
-  if (!showWarnings) {
-    return runtimeSuffix;
-  }
-
-  const warningTags = [];
-
-  if (result.is_cjs) {
-    warningTags.push("CJS");
-  }
-
-  if (warningTags.length > 0) {
-    return `${runtimeSuffix} · ${warningTags.join(" · ")}`;
-  }
-
-  return runtimeSuffix;
-};
-
 const confidencePrefix = (result: ImportResult): string =>
   result.confidence === "low" ? "~" : "";
 
@@ -106,7 +82,6 @@ export const importHintTagLabels = (
 export const formatImportSizePrimary = (
   result: ImportResult,
   options: FormatOptions,
-  runtime: ImportRuntime = "component",
 ): string => {
   if (result.error) {
     return "Size unavailable";
@@ -125,16 +100,4 @@ export const formatImportSizePrimary = (
   }
 
   return `${confidencePrefix(result)}${compressed} ${label} · ${formatBytes(result.minified_bytes)} min`;
-};
-
-export const formatImportSize = (
-  result: ImportResult,
-  options: FormatOptions,
-  runtime: ImportRuntime = "component",
-): string => {
-  if (result.error) {
-    return "Size unavailable";
-  }
-
-  return `${formatImportSizePrimary(result, options, runtime)}${formatWarningSuffix(result, options.showWarnings, runtime)}`;
 };
