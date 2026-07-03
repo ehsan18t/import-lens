@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compareImportItemsForResponse } from "../../src/ui/compareImportItems.js";
-import type { BatchResponse, ImportResult } from "../../src/ipc/protocol.js";
+import { compareImportItemsForResults } from "../../src/ui/compareImportItems.js";
+import type { ImportResult } from "../../src/ipc/protocol.js";
 
 const result = (specifier: string, brotliBytes: number, error: string | null = null): ImportResult => ({
   specifier,
@@ -20,18 +20,12 @@ const result = (specifier: string, brotliBytes: number, error: string | null = n
   diagnostics: [],
 });
 
-const response = (imports: ImportResult[]): BatchResponse => ({
-  version: 4,
-  request_id: 1,
-  imports,
-});
-
-test("compareImportItemsForResponse sorts successful imports by Brotli size", () => {
+test("compareImportItemsForResults sorts successful imports by Brotli size", () => {
   assert.deepEqual(
-    compareImportItemsForResponse(response([
+    compareImportItemsForResults([
       result("large-lib", 1500),
       result("small-lib", 500),
-    ])),
+    ]),
     {
       items: [
         {
@@ -47,12 +41,12 @@ test("compareImportItemsForResponse sorts successful imports by Brotli size", ()
   );
 });
 
-test("compareImportItemsForResponse reports no daemon and all-error responses", () => {
-  assert.deepEqual(compareImportItemsForResponse(null), {
+test("compareImportItemsForResults reports no daemon and all-error results", () => {
+  assert.deepEqual(compareImportItemsForResults(null), {
     items: [],
     warning: "ImportLens daemon did not return comparison results.",
   });
-  assert.deepEqual(compareImportItemsForResponse(response([result("broken-lib", 0, "failed")])), {
+  assert.deepEqual(compareImportItemsForResults([result("broken-lib", 0, "failed")]), {
     items: [],
     warning: "ImportLens could not compute any comparison results.",
   });

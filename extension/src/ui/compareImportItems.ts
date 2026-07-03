@@ -1,4 +1,4 @@
-import type { BatchResponse, ImportResult } from "../ipc/protocol.js";
+import type { ImportResult } from "../ipc/protocol.js";
 import { formatBytes } from "./format.js";
 
 export interface CompareImportQuickPickItem {
@@ -10,19 +10,6 @@ export interface CompareImportItemsResult {
   items: CompareImportQuickPickItem[];
   warning?: string;
 }
-
-export const compareImportItemsForResponse = (
-  response: BatchResponse | null,
-): CompareImportItemsResult => {
-  if (!response) {
-    return {
-      items: [],
-      warning: "ImportLens daemon did not return comparison results.",
-    };
-  }
-
-  return compareImportItemsForResults(response.imports);
-};
 
 export const compareImportItemsForResults = (
   results: readonly ImportResult[] | null,
