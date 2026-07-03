@@ -8,7 +8,7 @@ use import_lens_daemon::{
             PROTOCOL_VERSION, RefreshRegistryHintsRequest, RefreshRegistryHintsResponse,
             RegistryHintMode, RegistryHintTarget, ShutdownMessage,
         },
-        server::{batch_response_from_join, handle_connection},
+        server::{handle_connection, response_from_join},
     },
     prefetch::{CancellationToken, Prefetcher},
     registry::{
@@ -16,7 +16,7 @@ use import_lens_daemon::{
         service::RegistryHintService,
         types::{HttpRegistryResponse, RegistryHttpClient},
     },
-    service::ImportLensService,
+    service::{ImportLensService, protocol_error_batch_response},
 };
 use std::{
     collections::VecDeque,
@@ -783,11 +783,12 @@ async fn unsupported_hello_version_closes_connection_without_accepting_requests(
 async fn spawn_blocking_join_error_returns_protocol_batch_error() {
     let workspace = temp_workspace();
     let request = cache_warmup_batch(&workspace, 4);
-    let response = batch_response_from_join(
+    let response = response_from_join(
         tokio::task::spawn_blocking(|| -> BatchResponse {
             panic!("analysis worker panic");
         }),
         &request,
+        protocol_error_batch_response,
     )
     .await;
 

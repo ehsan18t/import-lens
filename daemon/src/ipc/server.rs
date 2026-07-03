@@ -5,14 +5,13 @@ use crate::{
         protocol::{
             AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
             AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-            BatchRequest, BatchResponse, CacheCleanupRequest, CacheCleanupResponse,
-            CacheListRequest, CacheListResponse, CacheRemoveRequest, CacheRemoveResponse,
-            CacheRemoveScope, CacheStatusRequest, CacheStatusResponse, ClientMessage,
-            CompleteImportMembersRequest, CompleteImportMembersResponse, EnumerateExportsRequest,
-            EnumerateExportsResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
-            FileSizeRequest, FileSizeResponse, ImportDiagnostic, PROTOCOL_VERSION,
-            RefreshRegistryHintsResponse, RegistryHintResult, WorkspaceReportRequest,
-            WorkspaceReportResponse, WorkspaceReportSummary, is_supported_protocol_version,
+            CacheCleanupRequest, CacheCleanupResponse, CacheListRequest, CacheListResponse,
+            CacheRemoveRequest, CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest,
+            CacheStatusResponse, ClientMessage, CompleteImportMembersRequest,
+            CompleteImportMembersResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
+            ImportDiagnostic, PROTOCOL_VERSION, RefreshRegistryHintsResponse, RegistryHintResult,
+            WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
+            is_supported_protocol_version,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
@@ -305,15 +304,23 @@ where
                     while let Some(response) = partial_rx.recv().await {
                         send_message!(response);
                     }
-                    let response =
-                        batch_response_from_join(response_handle, &request_for_error).await;
+                    let response = response_from_join(
+                        response_handle,
+                        &request_for_error,
+                        protocol_error_batch_response,
+                    )
+                    .await;
                     send_message!(response);
                 } else {
                     let request_for_error = request.clone();
                     let response_handle =
                         tokio::task::spawn_blocking(move || svc.handle_batch(request));
-                    let response =
-                        batch_response_from_join(response_handle, &request_for_error).await;
+                    let response = response_from_join(
+                        response_handle,
+                        &request_for_error,
+                        protocol_error_batch_response,
+                    )
+                    .await;
                     send_message!(response);
                 }
 
@@ -345,8 +352,12 @@ where
                         &crate::document::IgnoreRuleResolver::default(),
                     )
                 });
-                let response =
-                    analyze_document_response_from_join(response_handle, &request_for_error).await;
+                let response = response_from_join(
+                    response_handle,
+                    &request_for_error,
+                    protocol_error_analyze_document_response,
+                )
+                .await;
                 send_message!(response);
             }
             ClientMessage::AnalyzeDocument(request) => {
@@ -371,9 +382,10 @@ where
                     while let Some(response) = partial_rx.recv().await {
                         send_message!(response);
                     }
-                    let response = analyze_package_json_response_from_join(
+                    let response = response_from_join(
                         response_handle,
                         &request_for_error,
+                        protocol_error_analyze_package_json_response,
                     )
                     .await;
                     send_message!(response);
@@ -382,9 +394,10 @@ where
                     let response_handle = tokio::task::spawn_blocking(move || {
                         svc.handle_analyze_package_json(request)
                     });
-                    let response = analyze_package_json_response_from_join(
+                    let response = response_from_join(
                         response_handle,
                         &request_for_error,
+                        protocol_error_analyze_package_json_response,
                     )
                     .await;
                     send_message!(response);
@@ -404,9 +417,12 @@ where
                 let request_for_error = request.clone();
                 let response_handle =
                     tokio::task::spawn_blocking(move || svc.handle_analyze_specifiers(request));
-                let response =
-                    analyze_specifiers_response_from_join(response_handle, &request_for_error)
-                        .await;
+                let response = response_from_join(
+                    response_handle,
+                    &request_for_error,
+                    protocol_error_analyze_specifiers_response,
+                )
+                .await;
                 send_message!(response);
             }
             ClientMessage::AnalyzeSpecifiers(request) => {
@@ -629,8 +645,12 @@ where
                 let request_for_error = request.clone();
                 let response_handle =
                     tokio::task::spawn_blocking(move || svc.enumerate_exports(request));
-                let response =
-                    exports_response_from_join(response_handle, &request_for_error).await;
+                let response = response_from_join(
+                    response_handle,
+                    &request_for_error,
+                    protocol_error_exports_response,
+                )
+                .await;
                 send_message!(response);
             }
             ClientMessage::EnumerateExports(request) => {
@@ -647,8 +667,12 @@ where
                 let request_for_error = request.clone();
                 let response_handle =
                     tokio::task::spawn_blocking(move || svc.handle_file_size(request));
-                let response =
-                    file_size_response_from_join(response_handle, &request_for_error).await;
+                let response = response_from_join(
+                    response_handle,
+                    &request_for_error,
+                    protocol_error_file_size_response,
+                )
+                .await;
                 send_message!(response);
             }
             ClientMessage::FileSize(request) => {
@@ -665,9 +689,12 @@ where
                 let request_for_error = request.clone();
                 let response_handle =
                     tokio::task::spawn_blocking(move || svc.handle_file_size_document(request));
-                let response =
-                    file_size_document_response_from_join(response_handle, &request_for_error)
-                        .await;
+                let response = response_from_join(
+                    response_handle,
+                    &request_for_error,
+                    protocol_error_file_size_document_response,
+                )
+                .await;
                 send_message!(response);
             }
             ClientMessage::FileSizeDocument(request) => {
@@ -684,9 +711,12 @@ where
                 let request_for_error = request.clone();
                 let response_handle =
                     tokio::task::spawn_blocking(move || svc.complete_import_members(request));
-                let response =
-                    complete_import_members_response_from_join(response_handle, &request_for_error)
-                        .await;
+                let response = response_from_join(
+                    response_handle,
+                    &request_for_error,
+                    protocol_error_complete_import_members_response,
+                )
+                .await;
                 send_message!(response);
             }
             ClientMessage::CompleteImportMembers(request) => {
@@ -711,91 +741,18 @@ where
     Ok(())
 }
 
-pub async fn batch_response_from_join(
-    response_handle: JoinHandle<BatchResponse>,
-    request: &BatchRequest,
-) -> BatchResponse {
+/// Awaits an analysis worker's join handle and, when the worker panics or is
+/// cancelled, produces the request-scoped protocol error via `on_error`. One
+/// generic replaces the per-request join wrappers each message type used to
+/// carry verbatim.
+pub async fn response_from_join<T, R>(
+    response_handle: JoinHandle<T>,
+    request: &R,
+    on_error: impl FnOnce(&R, String) -> T,
+) -> T {
     match response_handle.await {
         Ok(response) => response,
-        Err(error) => protocol_error_batch_response(request, join_error_message(error)),
-    }
-}
-
-async fn exports_response_from_join(
-    response_handle: JoinHandle<EnumerateExportsResponse>,
-    request: &EnumerateExportsRequest,
-) -> EnumerateExportsResponse {
-    match response_handle.await {
-        Ok(response) => response,
-        Err(error) => protocol_error_exports_response(request, join_error_message(error)),
-    }
-}
-
-async fn file_size_response_from_join(
-    response_handle: JoinHandle<FileSizeResponse>,
-    request: &FileSizeRequest,
-) -> FileSizeResponse {
-    match response_handle.await {
-        Ok(response) => response,
-        Err(error) => protocol_error_file_size_response(request, join_error_message(error)),
-    }
-}
-
-async fn analyze_document_response_from_join(
-    response_handle: JoinHandle<AnalyzeDocumentResponse>,
-    request: &AnalyzeDocumentRequest,
-) -> AnalyzeDocumentResponse {
-    match response_handle.await {
-        Ok(response) => response,
-        Err(error) => protocol_error_analyze_document_response(request, join_error_message(error)),
-    }
-}
-
-async fn analyze_package_json_response_from_join(
-    response_handle: JoinHandle<AnalyzePackageJsonResponse>,
-    request: &AnalyzePackageJsonRequest,
-) -> AnalyzePackageJsonResponse {
-    match response_handle.await {
-        Ok(response) => response,
-        Err(error) => {
-            protocol_error_analyze_package_json_response(request, join_error_message(error))
-        }
-    }
-}
-
-async fn analyze_specifiers_response_from_join(
-    response_handle: JoinHandle<AnalyzeSpecifiersResponse>,
-    request: &AnalyzeSpecifiersRequest,
-) -> AnalyzeSpecifiersResponse {
-    match response_handle.await {
-        Ok(response) => response,
-        Err(error) => {
-            protocol_error_analyze_specifiers_response(request, join_error_message(error))
-        }
-    }
-}
-
-async fn file_size_document_response_from_join(
-    response_handle: JoinHandle<FileSizeDocumentResponse>,
-    request: &FileSizeDocumentRequest,
-) -> FileSizeDocumentResponse {
-    match response_handle.await {
-        Ok(response) => response,
-        Err(error) => {
-            protocol_error_file_size_document_response(request, join_error_message(error))
-        }
-    }
-}
-
-async fn complete_import_members_response_from_join(
-    response_handle: JoinHandle<CompleteImportMembersResponse>,
-    request: &CompleteImportMembersRequest,
-) -> CompleteImportMembersResponse {
-    match response_handle.await {
-        Ok(response) => response,
-        Err(error) => {
-            protocol_error_complete_import_members_response(request, join_error_message(error))
-        }
+        Err(error) => on_error(request, join_error_message(error)),
     }
 }
 
