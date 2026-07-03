@@ -584,15 +584,18 @@ fn service_analyzes_document_source_in_daemon() {
     write_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let response = service.handle_analyze_document(AnalyzeDocumentRequest {
-        message_type: "analyze_document".to_owned(),
-        version: PROTOCOL_VERSION,
-        request_id: 31,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: active_document_path(&workspace),
-        source: "import { value } from 'tiny-lib';\nimport type { Type } from 'tiny-lib';"
-            .to_owned(),
-    });
+    let response = service.handle_analyze_document(
+        AnalyzeDocumentRequest {
+            message_type: "analyze_document".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 31,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            active_document_path: active_document_path(&workspace),
+            source: "import { value } from 'tiny-lib';\nimport type { Type } from 'tiny-lib';"
+                .to_owned(),
+        },
+        &import_lens_daemon::document::IgnoreRuleResolver::default(),
+    );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert_eq!(response.request_id, 31);

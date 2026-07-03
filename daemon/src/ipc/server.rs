@@ -339,8 +339,12 @@ where
                 lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
                 let request_for_error = request.clone();
-                let response_handle =
-                    tokio::task::spawn_blocking(move || svc.handle_analyze_document(request));
+                let response_handle = tokio::task::spawn_blocking(move || {
+                    svc.handle_analyze_document(
+                        request,
+                        &crate::document::IgnoreRuleResolver::default(),
+                    )
+                });
                 let response =
                     analyze_document_response_from_join(response_handle, &request_for_error).await;
                 send_message!(response);

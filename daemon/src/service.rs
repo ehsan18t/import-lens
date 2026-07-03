@@ -5,7 +5,7 @@ use crate::{
         project::ProjectCacheRegistry,
     },
     document::{
-        analyze_imports, get_package_name, is_runtime_package_specifier, load_import_lens_ignore,
+        IgnoreRuleResolver, analyze_imports, get_package_name, is_runtime_package_specifier,
         named_import_completion_context, package_json_dependency_entries,
         package_json_dependency_sections, should_ignore_import,
     },
@@ -233,6 +233,10 @@ impl ImportLensService {
     ) -> WorkspaceReportResponse {
         let workspace_root = PathBuf::from(&request.workspace_root);
         let files = crate::report::scanner::scan_workspace_sources(&workspace_root);
+        // One resolver per report run: files sharing a directory share a single
+        // .importlensignore ancestor walk, while edits between reports are
+        // re-read because each report constructs a fresh resolver.
+        let ignore_resolver = IgnoreRuleResolver::default();
         let items = files
             .par_iter()
             .flat_map(|source_path| {
@@ -240,7 +244,7 @@ impl ImportLensService {
                     Ok(source) => source,
                     Err(_) => return Vec::new(),
                 };
-                self.analyze_report_source(source_path, &request, source)
+                self.analyze_report_source(source_path, &request, source, &ignore_resolver)
             })
             .collect::<Vec<_>>();
         let row_set = crate::report::model::build_report_rows(&items, &request.budgets);
@@ -261,6 +265,7 @@ impl ImportLensService {
         source_path: &std::path::Path,
         request: &WorkspaceReportRequest,
         source: String,
+        ignore_resolver: &IgnoreRuleResolver,
     ) -> Vec<crate::report::model::WorkspaceReportItem> {
         let document_request = AnalyzeDocumentRequest {
             message_type: "analyze_document".to_owned(),
@@ -288,7 +293,7 @@ impl ImportLensService {
                 }
             }
 
-            self.handle_analyze_document(document_request)
+            self.handle_analyze_document(document_request, ignore_resolver)
         }));
 
         let response = match response {
@@ -441,6 +446,7 @@ impl ImportLensService {
     pub fn handle_analyze_document(
         &self,
         request: AnalyzeDocumentRequest,
+        ignore_resolver: &IgnoreRuleResolver,
     ) -> AnalyzeDocumentResponse {
         if !is_supported_protocol_version(request.version) {
             return AnalyzeDocumentResponse {
@@ -463,6 +469,7 @@ impl ImportLensService {
             &request.active_document_path,
             &request.source,
             true,
+            ignore_resolver,
         ) {
             Ok(imports) => imports,
             Err(error) => {
@@ -551,10 +558,12 @@ impl ImportLensService {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
+        let ignore_resolver = IgnoreRuleResolver::default();
         let detected = match detected_imports_for_document(
             &request.active_document_path,
             &request.source,
             true,
+            &ignore_resolver,
         ) {
             Ok(imports) => imports,
             Err(error) => {
@@ -1347,12 +1356,13 @@ fn detected_imports_for_document(
     active_document_path: &str,
     source: &str,
     apply_ignore_rules: bool,
+    ignore_resolver: &IgnoreRuleResolver,
 ) -> Result<Vec<DetectedImport>, String> {
     let mut imports = analyze_imports(active_document_path, source)?;
 
     if apply_ignore_rules {
         let active_path = Path::new(active_document_path);
-        let rules = load_import_lens_ignore(active_path);
+        let rules = ignore_resolver.rules_for(active_path);
         imports.retain(|detected| !should_ignore_import(detected, active_document_path, &rules));
     }
 
@@ -1362,6 +1372,7 @@ fn detected_imports_for_document(
 #[cfg(test)]
 mod report_panic_isolation_tests {
     use super::ImportLensService;
+    use crate::document::IgnoreRuleResolver;
     use crate::ipc::protocol::{PROTOCOL_VERSION, WorkspaceReportBudgets, WorkspaceReportRequest};
     use std::path::Path;
 
@@ -1387,6 +1398,7 @@ mod report_panic_isolation_tests {
             Path::new("bad.ts"),
             &request,
             "// __IMPORTLENS_FORCE_PANIC__\n".to_owned(),
+            &IgnoreRuleResolver::default(),
         );
 
         assert!(items.is_empty());
