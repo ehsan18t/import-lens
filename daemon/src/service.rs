@@ -240,29 +240,7 @@ impl ImportLensService {
                     Ok(source) => source,
                     Err(_) => return Vec::new(),
                 };
-                let document_request = AnalyzeDocumentRequest {
-                    message_type: "analyze_document".to_owned(),
-                    version: request.version,
-                    request_id: request.request_id,
-                    workspace_root: request.workspace_root.clone(),
-                    active_document_path: source_path.to_string_lossy().to_string(),
-                    source,
-                };
-                self.handle_analyze_document(document_request)
-                    .imports
-                    .into_iter()
-                    .map(|item| crate::report::model::WorkspaceReportItem {
-                        source_file: source_path.to_string_lossy().to_string(),
-                        workspace_root: request.workspace_root.clone(),
-                        warning: if item.result.is_some() {
-                            None
-                        } else {
-                            item.message.clone()
-                        },
-                        detected: item.detected,
-                        result: item.result,
-                    })
-                    .collect::<Vec<_>>()
+                self.analyze_report_source(source_path, &request, source)
             })
             .collect::<Vec<_>>();
         let row_set = crate::report::model::build_report_rows(&items, &request.budgets);
@@ -276,6 +254,72 @@ impl ImportLensService {
             error: None,
             diagnostics: Vec::new(),
         }
+    }
+
+    fn analyze_report_source(
+        &self,
+        source_path: &std::path::Path,
+        request: &WorkspaceReportRequest,
+        source: String,
+    ) -> Vec<crate::report::model::WorkspaceReportItem> {
+        let document_request = AnalyzeDocumentRequest {
+            message_type: "analyze_document".to_owned(),
+            version: request.version,
+            request_id: request.request_id,
+            workspace_root: request.workspace_root.clone(),
+            active_document_path: source_path.to_string_lossy().to_string(),
+            source,
+        };
+
+        // Isolate per-file analysis: a panic while analyzing one workspace file
+        // must degrade to a skipped file, not fail the entire report. The report
+        // runs on a fire-and-forget worker, so an uncaught panic here would tear
+        // down the whole scan (mirrors the registry worker's catch_unwind).
+        // AssertUnwindSafe is sound because a panic that poisons a cache mutex is
+        // already handled by the cache's poisoned-lock fallback.
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            {
+                if document_request
+                    .source
+                    .contains("__IMPORTLENS_FORCE_PANIC__")
+                {
+                    panic!("forced report analysis panic (test only)");
+                }
+            }
+
+            self.handle_analyze_document(document_request)
+        }));
+
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                crate::logging::log_warn(
+                    "report",
+                    format!(
+                        "analysis panicked for {}; skipping file in report",
+                        source_path.display()
+                    ),
+                );
+                return Vec::new();
+            }
+        };
+
+        response
+            .imports
+            .into_iter()
+            .map(|item| crate::report::model::WorkspaceReportItem {
+                source_file: source_path.to_string_lossy().to_string(),
+                workspace_root: request.workspace_root.clone(),
+                warning: if item.result.is_some() {
+                    None
+                } else {
+                    item.message.clone()
+                },
+                detected: item.detected,
+                result: item.result,
+            })
+            .collect()
     }
 
     pub fn spawn_workspace_report(
@@ -1303,6 +1347,40 @@ fn detected_imports_for_document(
     }
 
     Ok(imports)
+}
+
+#[cfg(test)]
+mod report_panic_isolation_tests {
+    use super::ImportLensService;
+    use crate::ipc::protocol::{PROTOCOL_VERSION, WorkspaceReportBudgets, WorkspaceReportRequest};
+    use std::path::Path;
+
+    #[test]
+    fn analyze_report_source_isolates_a_panicking_file() {
+        let service = ImportLensService::new(None, false);
+        let request = WorkspaceReportRequest {
+            message_type: "workspace_report".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 1,
+            workspace_root: "unused".to_owned(),
+            budgets: WorkspaceReportBudgets {
+                per_import_brotli_bytes: None,
+                per_file_brotli_bytes: None,
+            },
+        };
+
+        // The `__IMPORTLENS_FORCE_PANIC__` sentinel (compiled in only under
+        // cfg(test)) makes the per-file analysis panic. A single bad file must
+        // be isolated - skipped from the report - rather than failing the whole
+        // workspace scan.
+        let items = service.analyze_report_source(
+            Path::new("bad.ts"),
+            &request,
+            "// __IMPORTLENS_FORCE_PANIC__\n".to_owned(),
+        );
+
+        assert!(items.is_empty());
+    }
 }
 
 fn detected_import_for_specifier(specifier: &str) -> DetectedImport {
