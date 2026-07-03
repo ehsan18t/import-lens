@@ -29,8 +29,10 @@ pub fn should_ignore_import(
     rules: &[ImportLensIgnoreRule],
 ) -> bool {
     rules.iter().any(|rule| match rule.kind {
-        ImportLensIgnoreRuleKind::Package => glob_matches(&rule.pattern, &detected.package_name),
-        ImportLensIgnoreRuleKind::Import => glob_matches(&rule.pattern, &detected.specifier),
+        ImportLensIgnoreRuleKind::Package => {
+            glob_matches_exact(&rule.pattern, &detected.package_name)
+        }
+        ImportLensIgnoreRuleKind::Import => glob_matches_exact(&rule.pattern, &detected.specifier),
         ImportLensIgnoreRuleKind::Path => glob_matches_path(&rule.pattern, source_file),
     })
 }
@@ -89,10 +91,6 @@ fn parse_rule_line(line: &str) -> ImportLensIgnoreRule {
             pattern: line.to_owned(),
         },
     }
-}
-
-fn glob_matches(pattern: &str, value: &str) -> bool {
-    glob_matches_exact(pattern, value)
 }
 
 fn glob_matches_path(pattern: &str, file_path: &str) -> bool {

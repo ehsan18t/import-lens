@@ -25,7 +25,7 @@ fn literal_requires(source: &str, masked: &str, unsupported: &mut bool) -> Vec<S
 
     while let Some(start) = find_ascii_token(bytes, b"require", index) {
         let end = start + "require".len();
-        if !is_boundary(bytes, start, end) {
+        if !is_identifier_boundary(bytes, start, end) {
             index = end;
             continue;
         }
@@ -451,10 +451,6 @@ fn read_identifier(bytes: &[u8], start: usize) -> Option<(String, usize)> {
         end += 1;
     }
     Some((String::from_utf8_lossy(&bytes[start..end]).to_string(), end))
-}
-
-fn is_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
-    is_identifier_boundary(bytes, start, end)
 }
 
 fn is_identifier_boundary(bytes: &[u8], start: usize, end: usize) -> bool {

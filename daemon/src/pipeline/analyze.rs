@@ -155,12 +155,7 @@ fn analyze_import_inner_resolved(
         }
     }
 
-    if !is_cjs
-        && matches!(
-            request.import_kind,
-            ImportKind::Named | ImportKind::Default | ImportKind::Namespace | ImportKind::Dynamic
-        )
-    {
+    if !is_cjs {
         match analyze_with_oxc_pipeline(context, request, entry_path.clone(), &side_effects_mode) {
             Ok(result) => return Ok(result),
             Err(error) => fallback_diagnostics.push(oxc_fallback_diagnostic(error)),

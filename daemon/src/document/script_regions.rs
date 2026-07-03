@@ -63,27 +63,6 @@ pub(super) fn source_type_for_region(filename: &str) -> SourceType {
     source_type
 }
 
-fn language_from_filename(filename: &str) -> ScriptLanguage {
-    let lower_filename = filename.to_ascii_lowercase();
-
-    if lower_filename.ends_with(".tsx") {
-        return ScriptLanguage::Tsx;
-    }
-
-    if lower_filename.ends_with(".ts")
-        || lower_filename.ends_with(".mts")
-        || lower_filename.ends_with(".cts")
-    {
-        return ScriptLanguage::Ts;
-    }
-
-    if lower_filename.ends_with(".jsx") {
-        return ScriptLanguage::Jsx;
-    }
-
-    ScriptLanguage::Js
-}
-
 fn language_from_attributes(attributes: &str) -> ScriptLanguage {
     let lower_attributes = attributes.to_ascii_lowercase();
     let Some(lang_index) = lower_attributes.find("lang") else {
@@ -323,9 +302,4 @@ fn read_attribute_value_with_end(value: &str, offset: usize) -> Option<(String, 
         .find(|char: char| char.is_ascii_whitespace() || char == '>')
         .map_or(value.len(), |relative| offset + relative);
     Some((value[offset..end].to_owned(), end))
-}
-
-#[allow(dead_code)]
-fn _language_from_filename_for_tests(filename: &str) -> ScriptLanguage {
-    language_from_filename(filename)
 }

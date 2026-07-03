@@ -1,5 +1,5 @@
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{Expression, ModuleExportName, Program, Statement};
+use oxc_ast::ast::{ModuleExportName, Program, Statement};
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_minifier::{Minifier, MinifierOptions};
 use oxc_parser::Parser;
@@ -93,24 +93,6 @@ fn remove_import_lens_marker_statements(program: &mut Program<'_>) {
 }
 
 fn is_import_lens_marker_statement(statement: &Statement<'_>) -> bool {
-    if is_import_lens_marker_export_statement(statement) {
-        return true;
-    }
-
-    let Statement::ExpressionStatement(statement) = statement else {
-        return false;
-    };
-    let Expression::CallExpression(call) = &statement.expression else {
-        return false;
-    };
-    let Expression::Identifier(callee) = &call.callee else {
-        return false;
-    };
-
-    callee.name.as_str() == "__importLensUse"
-}
-
-fn is_import_lens_marker_export_statement(statement: &Statement<'_>) -> bool {
     let Statement::ExportNamedDeclaration(export) = statement else {
         return false;
     };
