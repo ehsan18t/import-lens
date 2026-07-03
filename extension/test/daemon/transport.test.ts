@@ -7,8 +7,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  BatchRequest,
-  BatchResponse,
   CacheCleanupRequest,
   CacheCleanupResponse,
   CacheListRequest,
@@ -23,8 +21,6 @@ import type {
   EnumerateExportsResponse,
   FileSizeDocumentRequest,
   FileSizeDocumentResponse,
-  FileSizeRequest,
-  FileSizeResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
   WorkspaceReportRequest,
@@ -71,15 +67,6 @@ class FakeTransport implements AnalysisTransport {
     return this.#state;
   }
 
-  async sendBatch(request: BatchRequest): Promise<BatchResponse> {
-    this.calls.push(`batch:${request.request_id}`);
-    return {
-      version: request.version,
-      request_id: request.request_id,
-      imports: [],
-    };
-  }
-
   async analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse> {
     this.calls.push(`document:${request.request_id}`);
     return {
@@ -121,22 +108,6 @@ class FakeTransport implements AnalysisTransport {
       request_id: request.request_id,
       specifier: request.specifier,
       exports: ["alpha"],
-      error: null,
-      diagnostics: [],
-    };
-  }
-
-  async requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse> {
-    this.calls.push(`fileSize:${request.request_id}`);
-    return {
-      version: request.version,
-      request_id: request.request_id,
-      raw_bytes: 10,
-      minified_bytes: 8,
-      gzip_bytes: 6,
-      brotli_bytes: 5,
-      zstd_bytes: 6,
-      imports: [],
       error: null,
       diagnostics: [],
     };
@@ -321,10 +292,6 @@ class SlowReadyTransport implements AnalysisTransport {
     this.#releaseStart?.();
   }
 
-  async sendBatch(): Promise<BatchResponse | null> {
-    return null;
-  }
-
   async analyzeDocument(): Promise<AnalyzeDocumentResponse | null> {
     return null;
   }
@@ -338,10 +305,6 @@ class SlowReadyTransport implements AnalysisTransport {
   }
 
   async enumerateExports(): Promise<EnumerateExportsResponse | null> {
-    return null;
-  }
-
-  async requestFileSize(): Promise<FileSizeResponse | null> {
     return null;
   }
 
@@ -408,9 +371,7 @@ test("TransportCoordinator selects the first ready transport and delegates reque
   const coordinator = new TransportCoordinator([unavailable, ready]);
 
   assert.equal(await coordinator.start(), "ready");
-  await coordinator.sendBatch(batch(7));
   await coordinator.enumerateExports(exportsRequest(8));
-  await coordinator.requestFileSize(fileSizeRequest(9));
   await coordinator.cacheStatus(cacheStatusRequest(10));
   await coordinator.cleanupCache(cacheCleanupRequest(11));
   await coordinator.listCache(cacheListRequest(12));
@@ -421,9 +382,7 @@ test("TransportCoordinator selects the first ready transport and delegates reque
   assert.deepEqual(unavailable.calls, ["start"]);
   assert.deepEqual(ready.calls, [
     "start",
-    "batch:7",
     "exports:8:tiny-lib",
-    "fileSize:9",
     "cacheStatus:10",
     "cleanupCache:11",
     "listCache:12",
@@ -437,7 +396,7 @@ test("TransportCoordinator returns null when no transport is ready", async () =>
   const coordinator = new TransportCoordinator([new FakeTransport("unavailable")]);
 
   assert.equal(await coordinator.start(), "unavailable");
-  assert.equal(await coordinator.sendBatch(batch(1)), null);
+  assert.equal(await coordinator.enumerateExports(exportsRequest(1)), null);
 });
 
 test("TransportCoordinator passes analysis root to transport startup", async () => {
@@ -508,14 +467,6 @@ test("TransportCoordinator forwards registry refresh partial callbacks", async (
   assert.equal(response?.results[0]?.hint?.latestVersion, "19.0.0");
 });
 
-const batch = (requestId: number): BatchRequest => ({
-  version: 1,
-  request_id: requestId,
-  workspace_root: "/workspace",
-  active_document_path: "/workspace/src/app.ts",
-  imports: [],
-});
-
 const exportsRequest = (requestId: number): EnumerateExportsRequest => ({
   type: "enumerate_exports",
   version: 2,
@@ -525,15 +476,6 @@ const exportsRequest = (requestId: number): EnumerateExportsRequest => ({
   specifier: "tiny-lib",
   package: "tiny-lib",
   package_version: "1.0.0",
-});
-
-const fileSizeRequest = (requestId: number): FileSizeRequest => ({
-  type: "file_size",
-  version: 2,
-  request_id: requestId,
-  workspace_root: "/workspace",
-  active_document_path: "/workspace/src/app.ts",
-  imports: [],
 });
 
 const cacheStatusRequest = (requestId: number): CacheStatusRequest => ({

@@ -42,15 +42,6 @@ export interface ImportRequest {
   runtime: ImportRuntime;
 }
 
-export interface BatchRequest {
-  version: number;
-  request_id: number;
-  workspace_root: string;
-  active_document_path: string;
-  imports: ImportRequest[];
-  streaming?: boolean;
-}
-
 export interface ImportResult {
   specifier: string;
   raw_bytes: number;
@@ -79,13 +70,6 @@ export interface ImportDiagnostic {
 export interface ModuleContribution {
   path: string;
   bytes: number;
-}
-
-export interface BatchResponse {
-  version: number;
-  request_id: number;
-  imports: ImportResult[];
-  indexes?: number[];
 }
 
 export type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
@@ -517,7 +501,6 @@ export type ClientMessage =
   | AnalyzePackageJsonRequest
   | RefreshRegistryHintsRequest
   | AnalyzeSpecifiersRequest
-  | BatchRequest
   | CacheInvalidateMessage
   | CacheInvalidateAllMessage
   | PrewarmPackageJsonMessage

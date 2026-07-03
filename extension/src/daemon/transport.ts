@@ -5,8 +5,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  BatchRequest,
-  BatchResponse,
   CacheCleanupRequest,
   CacheCleanupResponse,
   CacheListRequest,
@@ -21,8 +19,6 @@ import type {
   EnumerateExportsResponse,
   FileSizeDocumentRequest,
   FileSizeDocumentResponse,
-  FileSizeRequest,
-  FileSizeResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
   WorkspaceReportRequest,
@@ -38,7 +34,6 @@ export interface AnalysisTransport {
   readonly state: DaemonState;
   readonly onDidChangeState?: DaemonStateEvent;
   start(analysisRoot?: string): Promise<DaemonState>;
-  sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null>;
   analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null>;
   analyzePackageJson(
     request: AnalyzePackageJsonRequest,
@@ -46,7 +41,6 @@ export interface AnalysisTransport {
   ): Promise<AnalyzePackageJsonResponse | null>;
   analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null>;
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null>;
-  requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null>;
   requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null>;
   completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null>;
   cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null>;
@@ -132,10 +126,6 @@ export class TransportCoordinator implements AnalysisTransport {
     return this.#state;
   }
 
-  sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null> {
-    return this.#activeTransport?.sendBatch(request, onPartial) ?? Promise.resolve(null);
-  }
-
   analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null> {
     return this.#activeTransport?.analyzeDocument(request) ?? Promise.resolve(null);
   }
@@ -153,10 +143,6 @@ export class TransportCoordinator implements AnalysisTransport {
 
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
     return this.#activeTransport?.enumerateExports(request) ?? Promise.resolve(null);
-  }
-
-  requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null> {
-    return this.#activeTransport?.requestFileSize(request) ?? Promise.resolve(null);
   }
 
   requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {

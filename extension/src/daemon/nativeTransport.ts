@@ -12,8 +12,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  BatchRequest,
-  BatchResponse,
   CacheCleanupRequest,
   CacheCleanupResponse,
   CacheListRequest,
@@ -28,8 +26,6 @@ import type {
   EnumerateExportsResponse,
   FileSizeDocumentRequest,
   FileSizeDocumentResponse,
-  FileSizeRequest,
-  FileSizeResponse,
   HelloMessage,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
@@ -366,16 +362,6 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }, CLEAN_RECYCLE_SESSION_MS);
   }
 
-  async sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null> {
-    if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Batch request ${request.request_id} skipped because daemon is ${this.#state}.`);
-      return null;
-    }
-
-    this.#logger.debug(`Sending batch request ${request.request_id} with ${request.imports.length} import(s).`);
-    return this.#client.requestBatch(request, 10000, onPartial);
-  }
-
   async analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null> {
     if (!this.#client || this.#state !== "ready") {
       this.#logger.warn(`Document analysis ${request.request_id} skipped because daemon is ${this.#state}.`);
@@ -417,16 +403,6 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     this.#logger.debug(`Requesting export enumeration ${request.request_id} for ${request.specifier}.`);
     return this.#client.requestExports(request);
-  }
-
-  async requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null> {
-    if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Current-file size request ${request.request_id} skipped because daemon is ${this.#state}.`);
-      return null;
-    }
-
-    this.#logger.debug(`Requesting current-file size ${request.request_id} for ${request.imports.length} import(s).`);
-    return this.#client.requestFileSize(request);
   }
 
   async requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {

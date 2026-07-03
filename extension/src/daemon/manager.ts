@@ -6,8 +6,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  BatchRequest,
-  BatchResponse,
   CacheCleanupRequest,
   CacheCleanupResponse,
   CacheListRequest,
@@ -22,8 +20,6 @@ import type {
   EnumerateExportsResponse,
   FileSizeDocumentRequest,
   FileSizeDocumentResponse,
-  FileSizeRequest,
-  FileSizeResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
   WorkspaceReportRequest,
@@ -64,10 +60,6 @@ export class DaemonManager implements vscode.Disposable {
     return this.#transport.start(analysisRoot);
   }
 
-  sendBatch(request: BatchRequest, onPartial?: (response: BatchResponse) => void): Promise<BatchResponse | null> {
-    return this.#transport.sendBatch(request, onPartial);
-  }
-
   analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null> {
     return this.#transport.analyzeDocument(request);
   }
@@ -85,10 +77,6 @@ export class DaemonManager implements vscode.Disposable {
 
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
     return this.#transport.enumerateExports(request);
-  }
-
-  requestFileSize(request: FileSizeRequest): Promise<FileSizeResponse | null> {
-    return this.#transport.requestFileSize(request);
   }
 
   requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {

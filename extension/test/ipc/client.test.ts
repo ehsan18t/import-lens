@@ -9,8 +9,6 @@ import { FrameDecoder, encodeFrame } from "../../src/ipc/codec.js";
 import type {
   AnalyzePackageJsonRequest,
   AnalyzePackageJsonResponse,
-  BatchRequest,
-  BatchResponse,
   CacheCleanupRequest,
   CacheCleanupResponse,
   CacheListRequest,
@@ -21,8 +19,6 @@ import type {
   CacheStatusResponse,
   EnumerateExportsRequest,
   EnumerateExportsResponse,
-  FileSizeRequest,
-  FileSizeResponse,
   ImportResult,
   PackageJsonDependencyAnalysisItem,
   PackageJsonDependencyEntry,
@@ -91,15 +87,6 @@ const emptyResult = (specifier: string): ImportResult => ({
   diagnostics: [],
 });
 
-const batchRequest = (requestId: number): BatchRequest => ({
-  version: 2,
-  request_id: requestId,
-  workspace_root: "/workspace",
-  active_document_path: "/workspace/src/app.ts",
-  imports: [],
-  streaming: true,
-});
-
 const exportsRequest = (requestId: number): EnumerateExportsRequest => ({
   type: "enumerate_exports",
   version: 2,
@@ -109,15 +96,6 @@ const exportsRequest = (requestId: number): EnumerateExportsRequest => ({
   specifier: "tiny-lib",
   package: "tiny-lib",
   package_version: "1.0.0",
-});
-
-const fileSizeRequest = (requestId: number): FileSizeRequest => ({
-  type: "file_size",
-  version: 2,
-  request_id: requestId,
-  workspace_root: "/workspace",
-  active_document_path: "/workspace/src/app.ts",
-  imports: [],
 });
 
 const cacheStatusRequest = (requestId: number): CacheStatusRequest => ({
@@ -254,95 +232,6 @@ test("IpcClient emits one disconnect for external socket closure", async () => {
     await delay(20);
 
     assert.equal(disconnects, 1);
-    client.dispose();
-  } finally {
-    destroySockets(sockets);
-    await closeServer(server);
-  }
-});
-
-test("IpcClient emits streaming partials and resolves final batch response", async () => {
-  const pipeName = testPipeName();
-  const sockets = new Set<net.Socket>();
-  const partial: BatchResponse = {
-    version: 2,
-    request_id: 99,
-    imports: [emptyResult("react")],
-    indexes: [0],
-  };
-  const final: BatchResponse = {
-    version: 2,
-    request_id: 99,
-    imports: [emptyResult("react")],
-  };
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-    socket.resume();
-    setTimeout(() => {
-      socket.write(encodeFrame(partial));
-      socket.write(encodeFrame(final));
-    }, 10);
-  });
-  await listen(server, pipeName);
-
-  try {
-    const client = await IpcClient.connect(pipeName);
-    const partials: BatchResponse[] = [];
-    client.on("batchPartial", (response: BatchResponse) => {
-      partials.push(response);
-    });
-
-    const response = await client.requestBatch(batchRequest(99));
-
-    assert.equal(response.indexes, undefined);
-    assert.equal(response.imports.length, 1);
-    assert.equal(partials.length, 1);
-    assert.deepEqual(partials[0]?.indexes, [0]);
-    client.dispose();
-  } finally {
-    destroySockets(sockets);
-    await closeServer(server);
-  }
-});
-
-test("IpcClient ignores stale streaming partials for other request IDs", async () => {
-  const pipeName = testPipeName();
-  const sockets = new Set<net.Socket>();
-  const stalePartial: BatchResponse = {
-    version: 2,
-    request_id: 98,
-    imports: [emptyResult("stale-lib")],
-    indexes: [0],
-  };
-  const final: BatchResponse = {
-    version: 2,
-    request_id: 99,
-    imports: [emptyResult("react")],
-  };
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-    socket.resume();
-    setTimeout(() => {
-      socket.write(encodeFrame(stalePartial));
-      socket.write(encodeFrame(final));
-    }, 10);
-  });
-  await listen(server, pipeName);
-
-  try {
-    const client = await IpcClient.connect(pipeName);
-    const partials: BatchResponse[] = [];
-    client.on("batchPartial", (response: BatchResponse) => {
-      partials.push(response);
-    });
-
-    const response = await client.requestBatch(batchRequest(99));
-
-    assert.equal(response.request_id, 99);
-    assert.equal(response.imports.length, 1);
-    assert.equal(partials.length, 0);
     client.dispose();
   } finally {
     destroySockets(sockets);
@@ -540,7 +429,7 @@ test("IpcClient delivers registry hint refresh partials before final response", 
   }
 });
 
-test("IpcClient resolves export enumeration responses independently from batches", async () => {
+test("IpcClient resolves export enumeration responses by request id", async () => {
   const pipeName = testPipeName();
   const sockets = new Set<net.Socket>();
   const exportsResponse: EnumerateExportsResponse = {
@@ -567,44 +456,6 @@ test("IpcClient resolves export enumeration responses independently from batches
 
     assert.deepEqual(response.exports, ["alpha", "beta"]);
     assert.equal(response.request_id, 101);
-    client.dispose();
-  } finally {
-    destroySockets(sockets);
-    await closeServer(server);
-  }
-});
-
-test("IpcClient resolves file size responses independently from batches", async () => {
-  const pipeName = testPipeName();
-  const sockets = new Set<net.Socket>();
-  const fileSizeResponse: FileSizeResponse = {
-    version: 2,
-    request_id: 102,
-    raw_bytes: 100,
-    minified_bytes: 80,
-    gzip_bytes: 50,
-    brotli_bytes: 40,
-    zstd_bytes: 45,
-    imports: [],
-    error: null,
-    diagnostics: [],
-  };
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-    socket.resume();
-    setTimeout(() => {
-      socket.write(encodeFrame(fileSizeResponse));
-    }, 10);
-  });
-  await listen(server, pipeName);
-
-  try {
-    const client = await IpcClient.connect(pipeName);
-    const response = await client.requestFileSize(fileSizeRequest(102));
-
-    assert.equal(response.brotli_bytes, 40);
-    assert.equal(response.request_id, 102);
     client.dispose();
   } finally {
     destroySockets(sockets);
