@@ -64,28 +64,50 @@ pub(super) fn source_type_for_region(filename: &str) -> SourceType {
 }
 
 fn language_from_attributes(attributes: &str) -> ScriptLanguage {
-    let lower_attributes = attributes.to_ascii_lowercase();
-    let Some(lang_index) = lower_attributes.find("lang") else {
-        return ScriptLanguage::Js;
-    };
-    let mut current = lang_index + "lang".len();
-    current = skip_ascii_whitespace(&lower_attributes, current);
+    // Walk the attributes as `name[=value]` tokens and match the attribute
+    // named exactly `lang`. A substring search would mis-fire on an earlier
+    // attribute that merely contains "lang" (e.g. `data-slang="x"`).
+    let lower = attributes.to_ascii_lowercase();
+    let mut offset = skip_ascii_whitespace(&lower, 0);
 
-    if lower_attributes.as_bytes().get(current) != Some(&b'=') {
-        return ScriptLanguage::Js;
+    while offset < lower.len() {
+        let name_end = lower[offset..]
+            .find(|char: char| {
+                char.is_ascii_whitespace() || char == '=' || char == '/' || char == '>'
+            })
+            .map_or(lower.len(), |relative| offset + relative);
+
+        if name_end == offset {
+            // Not an attribute-name character (e.g. a stray `/`); skip it.
+            offset = skip_ascii_whitespace(&lower, offset + 1);
+            continue;
+        }
+
+        let name = &lower[offset..name_end];
+        let after_name = skip_ascii_whitespace(&lower, name_end);
+
+        if lower.as_bytes().get(after_name) == Some(&b'=') {
+            let value_start = skip_ascii_whitespace(&lower, after_name + 1);
+            let (value, value_end) = read_attribute_value_with_end(&lower, value_start)
+                .unwrap_or((String::new(), value_start + 1));
+
+            if name == "lang" {
+                return match value.as_str() {
+                    "ts" | "typescript" => ScriptLanguage::Ts,
+                    "tsx" => ScriptLanguage::Tsx,
+                    "jsx" => ScriptLanguage::Jsx,
+                    _ => ScriptLanguage::Js,
+                };
+            }
+
+            offset = skip_ascii_whitespace(&lower, value_end);
+        } else {
+            // A valueless attribute (`setup`, or `lang` with no value → JS).
+            offset = after_name;
+        }
     }
 
-    current = skip_ascii_whitespace(&lower_attributes, current + 1);
-    let Some(value) = read_attribute_value(&lower_attributes, current) else {
-        return ScriptLanguage::Js;
-    };
-
-    match value.as_str() {
-        "ts" | "typescript" => ScriptLanguage::Ts,
-        "tsx" => ScriptLanguage::Tsx,
-        "jsx" => ScriptLanguage::Jsx,
-        _ => ScriptLanguage::Js,
-    }
+    ScriptLanguage::Js
 }
 
 fn component_script_regions<'a>(filename: &str, source: &'a str) -> Vec<ScriptRegion<'a>> {
@@ -161,17 +183,24 @@ fn script_blocks(source: &str) -> Vec<ScriptBlock<'_>> {
         };
         let tag_end = tag_start + relative_tag_end;
         let content_start = tag_end + 1;
-        let Some(relative_end) = lower_source[content_start..].find("</script>") else {
+        // Match the closing tag as `</script` followed by optional whitespace
+        // and `>`, so a legal `</script >` is not missed (which would drop this
+        // block and every later block).
+        let Some(relative_close) = lower_source[content_start..].find("</script") else {
             break;
         };
-        let content_end = content_start + relative_end;
+        let content_end = content_start + relative_close;
+        let Some(relative_gt) = lower_source[content_end..].find('>') else {
+            break;
+        };
+        let close_end = content_end + relative_gt + 1;
 
         blocks.push(ScriptBlock {
             attributes: &source[after_name..tag_end],
             source: &source[content_start..content_end],
             content_start,
         });
-        search_offset = content_end + "</script>".len();
+        search_offset = close_end;
     }
 
     blocks
@@ -287,10 +316,6 @@ fn skip_ascii_whitespace(value: &str, mut offset: usize) -> usize {
     offset
 }
 
-fn read_attribute_value(value: &str, offset: usize) -> Option<String> {
-    read_attribute_value_with_end(value, offset).map(|(value, _)| value)
-}
-
 fn read_attribute_value_with_end(value: &str, offset: usize) -> Option<(String, usize)> {
     let byte = *value.as_bytes().get(offset)?;
     if byte == b'"' || byte == b'\'' {
@@ -305,4 +330,34 @@ fn read_attribute_value_with_end(value: &str, offset: usize) -> Option<(String, 
         .find(|char: char| char.is_ascii_whitespace() || char == '>')
         .map_or(value.len(), |relative| offset + relative);
     Some((value[offset..end].to_owned(), end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_from_attributes_ignores_substring_matches_before_lang() {
+        assert!(matches!(
+            language_from_attributes("data-slang=\"x\" lang=\"ts\""),
+            ScriptLanguage::Ts
+        ));
+    }
+
+    #[test]
+    fn language_from_attributes_reads_setup_and_lang() {
+        assert!(matches!(
+            language_from_attributes("setup lang=\"tsx\""),
+            ScriptLanguage::Tsx
+        ));
+    }
+
+    #[test]
+    fn language_from_attributes_defaults_to_js() {
+        assert!(matches!(language_from_attributes(""), ScriptLanguage::Js));
+        assert!(matches!(
+            language_from_attributes("setup"),
+            ScriptLanguage::Js
+        ));
+    }
 }

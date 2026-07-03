@@ -111,6 +111,14 @@ fn analyze_imports_handles_empty_astro_frontmatter_without_panicking() {
 }
 
 #[test]
+fn analyze_imports_handles_script_end_tag_with_trailing_whitespace() {
+    let svelte = "<script lang=\"ts\">\nimport { writable } from \"svelte/store\";\n</script >\n";
+    let imports = analyze_imports("Component.svelte", svelte).expect("svelte should parse");
+    assert_eq!(imports.len(), 1);
+    assert_eq!(imports[0].specifier, "svelte/store");
+}
+
+#[test]
 fn package_json_dependency_ranges_and_sections_are_extracted_in_rust() {
     let source = r#"{
   "dependencies": {
