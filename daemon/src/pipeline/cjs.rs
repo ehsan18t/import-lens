@@ -39,7 +39,6 @@ pub fn analyze_cjs_graph_with_runtime(
     let resolver = create_resolver(runtime);
 
     while let Some(path) = queue.pop_front() {
-        let path = normalize_existing_path(&path)?;
         if !seen.insert(path.clone()) {
             continue;
         }

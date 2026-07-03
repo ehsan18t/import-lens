@@ -336,8 +336,10 @@ impl ModuleGraphBuilder {
             if self.loading_paths.contains(&path)
                 && let Some(importer) = importer
             {
-                let importer = normalize_existing_path(importer)?;
-                if self.circular_edges.insert((importer.clone(), path.clone())) {
+                if self
+                    .circular_edges
+                    .insert((importer.to_path_buf(), path.clone()))
+                {
                     self.graph.diagnostics.push(GraphDiagnostic {
                         stage: "circular_dependency".to_owned(),
                         message: "circular module dependency detected".to_owned(),

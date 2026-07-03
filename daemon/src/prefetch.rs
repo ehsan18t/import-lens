@@ -250,8 +250,15 @@ fn run_recent_prewarm_job(
         .into_iter()
         .filter_map(|key| {
             let identity = decode_cache_identity(&key)?;
-            let request = cached_import_request_from_key(&key)?;
             let resolved = resolved_from_cache_identity(&identity)?;
+            let request = ImportRequest {
+                specifier: identity.specifier,
+                package_name: identity.package_name,
+                version: identity.package_version,
+                named: identity.named_exports,
+                import_kind: identity.import_kind,
+                runtime: identity.runtime,
+            };
             Some(PrewarmJob { request, resolved })
         })
         .collect::<Vec<_>>();
