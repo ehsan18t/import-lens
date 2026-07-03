@@ -66,6 +66,29 @@ const readyState = (
   result: result(resultOverrides),
 });
 
+test("re-applying insights replaces rather than accumulates", () => {
+  const base = readyState({}, { brotli_bytes: 50_000 });
+  const options = { importCostHistory: [], budgets: { perImportBrotliBytes: 10_000 } };
+
+  const once = applyImportAnalysisInsights([base], options);
+  const twice = applyImportAnalysisInsights(once, options);
+
+  const overBudget = (twice[0].insights ?? []).filter((insight) => insight.label === "over budget");
+  assert.equal(overBudget.length, 1);
+});
+
+test("re-applying insights clears entries whose inputs no longer produce them", () => {
+  const base = readyState({}, { brotli_bytes: 50_000 });
+  const over = applyImportAnalysisInsights([base], {
+    importCostHistory: [],
+    budgets: { perImportBrotliBytes: 10_000 },
+  });
+  assert.ok((over[0].insights ?? []).some((insight) => insight.label === "over budget"));
+
+  const relaxed = applyImportAnalysisInsights(over, { importCostHistory: [] });
+  assert.equal((relaxed[0].insights ?? []).length, 0);
+});
+
 test("applyImportAnalysisInsights adds working-tree import cost deltas", () => {
   const [state] = applyImportAnalysisInsights([readyState()], {
     changedLines: new Set([4]),

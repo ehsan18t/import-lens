@@ -35,14 +35,19 @@ export const applyImportAnalysisInsights = (
       historyTrendInsight(state, options.importCostHistory, options.now),
     ].filter((insight): insight is ImportAnalysisInsight => Boolean(insight));
 
+    // Insights are derived entirely from the current state and options, so
+    // recompute and replace rather than append: reapplying (e.g. on a UI-only
+    // config change over already-insighted stored states) must not accumulate
+    // duplicate tags, and must clear insights whose inputs no longer produce
+    // them (e.g. an "over budget" tag after the budget is raised).
     if (insights.length === 0) {
-      return state;
+      if (!state.insights || state.insights.length === 0) {
+        return state;
+      }
+      return { ...state, insights: undefined };
     }
 
-    return {
-      ...state,
-      insights: [...(state.insights ?? []), ...insights],
-    };
+    return { ...state, insights };
   });
 };
 
