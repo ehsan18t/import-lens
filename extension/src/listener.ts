@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { DebouncedDocumentScheduler } from "./analysis/debouncedDocumentScheduler.js";
 import { AnalysisFreshnessTracker } from "./analysis/freshness.js";
 import { changedLinesForFile } from "./analysis/gitDiff.js";
 import {
@@ -28,7 +29,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
   readonly #historyStore: BundleImpactHistoryStore;
   readonly #logger: ImportLensLogger;
   readonly #statusBar: StatusBarController;
-  readonly #timers = new Map<string, NodeJS.Timeout>();
+  readonly #scheduler = new DebouncedDocumentScheduler();
   readonly #freshness = new AnalysisFreshnessTracker();
 
   constructor(
@@ -61,15 +62,11 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
 
-    const config = getImportLensConfig();
-    const key = document.uri.toString();
-    const existing = this.#timers.get(key);
-
-    if (existing) {
-      clearTimeout(existing);
-    }
-
-    this.#timers.set(key, setTimeout(() => void this.analyze(document), config.debounceMs));
+    this.#scheduler.schedule(
+      document.uri.toString(),
+      getImportLensConfig().debounceMs,
+      () => void this.analyze(document),
+    );
   }
 
   async analyze(document: vscode.TextDocument): Promise<void> {
@@ -165,23 +162,13 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
   private disposeDocument(document: vscode.TextDocument): void {
     const key = document.uri.toString();
-    const timer = this.#timers.get(key);
-
-    if (timer) {
-      clearTimeout(timer);
-      this.#timers.delete(key);
-    }
-
+    this.#scheduler.cancel(key);
     this.#freshness.forget(key);
     this.#store.clear(document.uri);
   }
 
   dispose(): void {
-    for (const timer of this.#timers.values()) {
-      clearTimeout(timer);
-    }
-
-    this.#timers.clear();
+    this.#scheduler.dispose();
     this.#freshness.clear();
   }
 }

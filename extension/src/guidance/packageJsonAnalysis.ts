@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { DebouncedDocumentScheduler } from "../analysis/debouncedDocumentScheduler.js";
 import { AnalysisFreshnessTracker } from "../analysis/freshness.js";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
@@ -26,7 +27,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   readonly #context: vscode.ExtensionContext;
   readonly #daemon: DaemonManager;
   readonly #logger: ImportLensLogger;
-  readonly #timers = new Map<string, NodeJS.Timeout>();
+  readonly #scheduler = new DebouncedDocumentScheduler();
   readonly #freshness = new AnalysisFreshnessTracker();
   readonly #states = new Map<string, PackageJsonDependencyAnalysisState[]>();
   readonly #sections = new Map<string, PackageJsonDependencySection[]>();
@@ -82,15 +83,11 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       return;
     }
 
-    const config = getImportLensConfig();
-    const key = document.uri.toString();
-    const existing = this.#timers.get(key);
-
-    if (existing) {
-      clearTimeout(existing);
-    }
-
-    this.#timers.set(key, setTimeout(() => void this.analyze(document), config.debounceMs));
+    this.#scheduler.schedule(
+      document.uri.toString(),
+      getImportLensConfig().debounceMs,
+      () => void this.analyze(document),
+    );
   }
 
   async analyze(document: vscode.TextDocument): Promise<void> {
@@ -283,23 +280,12 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   }
 
   private disposeDocument(document: vscode.TextDocument): void {
-    const key = document.uri.toString();
-    const timer = this.#timers.get(key);
-
-    if (timer) {
-      clearTimeout(timer);
-      this.#timers.delete(key);
-    }
-
+    this.#scheduler.cancel(document.uri.toString());
     this.clear(document.uri);
   }
 
   dispose(): void {
-    for (const timer of this.#timers.values()) {
-      clearTimeout(timer);
-    }
-
-    this.#timers.clear();
+    this.#scheduler.dispose();
     this.#freshness.clear();
     this.#onDidChange.dispose();
   }
