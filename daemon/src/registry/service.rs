@@ -479,9 +479,12 @@ fn package_metadata_from_response(
         .and_then(|tags| tags.get("latest"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let latest_published_at = latest_version
-        .as_ref()
-        .and_then(|version| document.get("time").and_then(|time| time.get(version)))
+    // The abbreviated ("corgi") packument the client requests omits the
+    // per-version `time` map but includes a top-level `modified` timestamp,
+    // which reflects the latest publish in the common case. Sourcing from
+    // `modified` keeps this field populated without fetching the full packument.
+    let latest_published_at = document
+        .get("modified")
         .and_then(Value::as_str)
         .map(str::to_owned);
     let mut deprecated_versions = document

@@ -101,7 +101,7 @@ fn registry_service_builds_hint_from_metadata() {
         body: r#"{
           "dist-tags":{"latest":"19.0.0"},
           "versions":{"18.2.0":{}},
-          "time":{"19.0.0":"2026-06-25T00:00:00.000Z"}
+          "modified":"2026-06-25T00:00:00.000Z"
         }"#
         .to_owned(),
     });
@@ -124,6 +124,36 @@ fn registry_service_builds_hint_from_metadata() {
             deprecated: Some(false),
             fetched_at: Some(100),
         })
+    );
+}
+
+#[test]
+fn registry_hint_sources_published_at_from_abbreviated_modified_field() {
+    let cache_path = temp_cache_path("abbreviated");
+    // Genuine abbreviated ("corgi") metadata: dist-tags + versions + a top-level
+    // `modified` timestamp, and no per-version `time` map (which the abbreviated
+    // format the client requests does not include).
+    let client = FakeRegistryHttpClient::with_response(HttpRegistryResponse {
+        status: 200,
+        retry_after_ms: None,
+        body: r#"{
+          "dist-tags":{"latest":"19.0.0"},
+          "versions":{"18.2.0":{}},
+          "modified":"2026-06-25T00:00:00.000Z"
+        }"#
+        .to_owned(),
+    });
+    let service = RegistryHintService::new(
+        RegistryMetadataCache::new(cache_path.clone()),
+        Box::new(client.clone()),
+    );
+
+    let lookup = service.hint_for("react", Some("18.2.0"), RegistryHintMode::RefreshStale, 100);
+
+    fs::remove_dir_all(cache_path).expect("cache cleanup");
+    assert_eq!(
+        lookup.hint.and_then(|hint| hint.latest_published_at),
+        Some("2026-06-25T00:00:00.000Z".to_owned())
     );
 }
 
