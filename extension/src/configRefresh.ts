@@ -1,4 +1,5 @@
 import type { ImportLensConfig } from "./config.js";
+import type { DaemonState } from "./daemon/transport.js";
 import { supportedLanguageIds } from "./languages.js";
 
 export interface RefreshableDocument {
@@ -49,4 +50,30 @@ export const refreshVisibleImportLensDocuments = <TDocument extends RefreshableD
   actions.refreshInlayHints();
   actions.refreshCodeLens();
   actions.refreshPackageJsonHints();
+};
+
+export interface DaemonStateTransitionActions {
+  setStatus(state: DaemonState): void;
+  prewarmPackageJson(): void;
+  refreshPackageJsonHints(): void;
+  refreshPackageJsonDecorations(): void;
+  reanalyzeDocuments(): void;
+}
+
+export const applyDaemonStateTransition = (
+  state: DaemonState,
+  actions: DaemonStateTransitionActions,
+): void => {
+  actions.setStatus(state);
+
+  if (state !== "ready") {
+    return;
+  }
+
+  actions.prewarmPackageJson();
+  actions.refreshPackageJsonHints();
+  actions.refreshPackageJsonDecorations();
+  // On automatic recovery the daemon-cleared document sizes must be recomputed;
+  // the package.json refreshes above do not cover open source documents.
+  actions.reanalyzeDocuments();
 };

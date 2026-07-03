@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { refreshVisibleImportLensDocuments } from "../src/configRefresh.js";
+import { applyDaemonStateTransition, refreshVisibleImportLensDocuments } from "../src/configRefresh.js";
 import type { ImportLensConfig } from "../src/config.js";
 
 const config = (enabled: boolean): ImportLensConfig => ({
@@ -25,6 +25,31 @@ const document = (languageId: string, scheme = "file") => ({
     scheme,
     toString: () => `${scheme}:///app/src/file.${languageId}`,
   },
+});
+
+const daemonTransitionActions = (calls: string[]) => ({
+  setStatus: (state: "ready" | "unavailable") => calls.push(`status:${state}`),
+  prewarmPackageJson: () => calls.push("prewarm"),
+  refreshPackageJsonHints: () => calls.push("pkgHints"),
+  refreshPackageJsonDecorations: () => calls.push("pkgDecorations"),
+  reanalyzeDocuments: () => calls.push("reanalyze"),
+});
+
+test("daemon ready transition reanalyzes open documents", () => {
+  const calls: string[] = [];
+  applyDaemonStateTransition("ready", daemonTransitionActions(calls));
+
+  assert.ok(
+    calls.includes("reanalyze"),
+    `ready transition must reanalyze documents; got ${calls.join(",")}`,
+  );
+});
+
+test("daemon unavailable transition only updates status", () => {
+  const calls: string[] = [];
+  applyDaemonStateTransition("unavailable", daemonTransitionActions(calls));
+
+  assert.deepEqual(calls, ["status:unavailable"]);
 });
 
 test("refreshVisibleImportLensDocuments uiOnly refresh does not schedule re-analysis", () => {

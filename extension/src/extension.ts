@@ -3,7 +3,7 @@ import { applyImportAnalysisInsights } from "./analysis/insights.js";
 import { importCostHistoryKey, type ImportCostHistoryItem } from "./analysis/history.js";
 import { AnalysisStore } from "./analysis/state.js";
 import { classifyImportLensConfigChange } from "./configChange.js";
-import { refreshVisibleImportLensDocuments, type ConfigRefreshMode } from "./configRefresh.js";
+import { applyDaemonStateTransition, refreshVisibleImportLensDocuments, type ConfigRefreshMode } from "./configRefresh.js";
 import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
 import { PackageJsonAnalysisController } from "./guidance/packageJsonAnalysis.js";
@@ -296,19 +296,18 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   );
   registerPackageJsonPrewarm(context, daemon, logger.child({ component: "prewarm" }));
   context.subscriptions.push(daemon.onDidChangeState((nextState) => {
-    statusBar.setStatus(nextState === "ready" ? "ready" : "unavailable");
-
-    if (nextState !== "ready") {
-      return;
-    }
-
-    const prewarmCount = prewarmPackageJsonDocuments(vscode.workspace.textDocuments, daemon!);
-    if (prewarmCount > 0) {
-      logger.debug(`Replayed package.json prewarm for ${prewarmCount} open document(s).`);
-    }
-
-    packageJsonAnalysis.refreshVisibleDocuments();
-    packageJsonDecorations.refreshVisibleEditors();
+    applyDaemonStateTransition(nextState, {
+      setStatus: (state) => statusBar.setStatus(state),
+      prewarmPackageJson: () => {
+        const prewarmCount = prewarmPackageJsonDocuments(vscode.workspace.textDocuments, daemon!);
+        if (prewarmCount > 0) {
+          logger.debug(`Replayed package.json prewarm for ${prewarmCount} open document(s).`);
+        }
+      },
+      refreshPackageJsonHints: () => packageJsonAnalysis.refreshVisibleDocuments(),
+      refreshPackageJsonDecorations: () => packageJsonDecorations.refreshVisibleEditors(),
+      reanalyzeDocuments: () => refreshVisibleDocuments(getImportLensConfig(), "reanalyze"),
+    });
   }));
   const state = await daemon.start();
   logger.info(`ImportLens daemon startup completed with state: ${state}.`);
