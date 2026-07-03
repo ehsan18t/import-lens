@@ -3,32 +3,31 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct UreqRegistryHttpClient {
-    timeout_ms: u64,
+    agent: ureq::Agent,
 }
 
 impl Default for UreqRegistryHttpClient {
     fn default() -> Self {
-        Self {
-            timeout_ms: DEFAULT_TIMEOUT_MS,
-        }
+        Self::new(DEFAULT_TIMEOUT_MS)
     }
 }
 
 impl UreqRegistryHttpClient {
     pub fn new(timeout_ms: u64) -> Self {
-        Self { timeout_ms }
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_millis(timeout_ms)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        Self { agent }
     }
 }
 
 impl super::types::RegistryHttpClient for UreqRegistryHttpClient {
     fn get_package_metadata(&self, package_name: &str) -> Result<HttpRegistryResponse, String> {
         let url = registry_url(package_name);
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_millis(self.timeout_ms)))
-            .http_status_as_error(false)
-            .build()
-            .into();
-        let mut response = agent
+        let mut response = self
+            .agent
             .get(&url)
             .header(
                 "accept",
