@@ -403,6 +403,25 @@ fn disk_cache_tracks_recent_entries_for_startup_prewarm() {
 }
 
 #[test]
+fn flush_to_disk_succeeds_with_nothing_dirty() {
+    // Disk-enabled cache: insert already persisted synchronously, so a flush
+    // has nothing to replay and must still succeed (and keep the entry).
+    let storage_path = temp_storage();
+    let cache = ImportCache::new(Some(storage_path.clone()), true);
+    cache.insert("react@18.3.1::default".to_owned(), result("react"));
+
+    cache.flush_to_disk().expect("flush should succeed");
+    assert!(cache.get("react@18.3.1::default").is_some());
+
+    // Disk-disabled cache: inserts never fail, so nothing is ever dirty.
+    let memory_only = ImportCache::new(None, false);
+    memory_only.insert("vue@3.4.0::default".to_owned(), result("vue"));
+    memory_only.flush_to_disk().expect("flush should succeed");
+
+    fs::remove_dir_all(storage_path).expect("temp storage should be removed");
+}
+
+#[test]
 fn flush_to_disk_persists_memory_entries_for_reload() {
     let storage_path = temp_storage();
     let key = "react@18.3.1::default".to_owned();

@@ -6,7 +6,7 @@ use crate::{
     ipc::protocol::ImportResult,
 };
 use papaya::HashMap;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf, sync::Mutex};
 
 pub const RECENT_PRELOAD_LIMIT: usize = 20;
 
@@ -20,6 +20,8 @@ pub struct CachedImport {
 pub struct ImportCache {
     memory: HashMap<String, CachedImport>,
     disk: DiskCache,
+    // Keys whose synchronous disk insert failed; flush_to_disk replays these.
+    dirty: Mutex<HashSet<String>>,
 }
 
 impl Default for ImportCache {
@@ -27,6 +29,7 @@ impl Default for ImportCache {
         Self {
             memory: HashMap::new(),
             disk: DiskCache::default(),
+            dirty: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -51,7 +54,11 @@ impl ImportCache {
             }
         }
 
-        Self { memory, disk }
+        Self {
+            memory,
+            disk,
+            dirty: Mutex::new(HashSet::new()),
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<ImportResult> {
@@ -95,6 +102,9 @@ impl ImportCache {
 
         if let Err(error) = self.disk.insert(&key, &cached) {
             crate::logging::log_warn("cache", format!("skipping disk insert for {key}: {error}"));
+            if let Ok(mut dirty) = self.dirty.lock() {
+                dirty.insert(key.clone());
+            }
         }
 
         self.memory.pin().insert(key, cached);
@@ -118,6 +128,9 @@ impl ImportCache {
     pub fn clear(&self) {
         self.disk.clear();
         self.memory.pin().clear();
+        if let Ok(mut dirty) = self.dirty.lock() {
+            dirty.clear();
+        }
     }
 
     pub fn memory_len(&self) -> usize {
@@ -136,17 +149,30 @@ impl ImportCache {
         self.disk.flush_pending_touches();
     }
 
+    // Inserts persist synchronously, so only entries whose disk insert failed
+    // need replaying; rewriting the whole map issued one committed transaction
+    // per entry on every recycle.
     pub fn flush_to_disk(&self) -> Result<(), String> {
+        let dirty_keys = match self.dirty.lock() {
+            Ok(mut dirty) => std::mem::take(&mut *dirty),
+            Err(_) => return Err("cache dirty-set lock poisoned".to_owned()),
+        };
+
         let entries = {
             let memory = self.memory.pin();
-            memory
+            dirty_keys
                 .iter()
-                .map(|(key, cached)| (key.clone(), cached.clone()))
+                .filter_map(|key| memory.get(key).map(|cached| (key.clone(), cached.clone())))
                 .collect::<Vec<_>>()
         };
 
         for (key, cached) in entries {
-            self.disk.insert(&key, &cached)?;
+            if let Err(error) = self.disk.insert(&key, &cached) {
+                if let Ok(mut dirty) = self.dirty.lock() {
+                    dirty.extend(dirty_keys);
+                }
+                return Err(error);
+            }
         }
 
         self.disk.flush_pending_touches();
