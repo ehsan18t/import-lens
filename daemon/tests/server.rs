@@ -471,6 +471,58 @@ async fn server_responds_to_cache_status_request() {
 }
 
 #[tokio::test]
+async fn server_ignores_an_undecodable_frame_and_keeps_serving() {
+    let workspace = temp_workspace();
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new(None, false)),
+            Prefetcher::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = CacheStatusResponseReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+    // A well-framed but undecodable payload (a corrupt frame, or an unknown
+    // message type from a newer client) must be skipped, not tear down the
+    // connection and discard warm cache + in-flight work.
+    client_stream
+        .write_all(&encode_frame(&0xDEAD_BEEF_u64).expect("garbage frame should encode"))
+        .await
+        .expect("garbage frame should be written");
+    client_stream
+        .write_all(&encode_frame(&cache_status(&workspace, 12)).expect("status should encode"))
+        .await
+        .expect("status should be written");
+
+    let response = reader.read_response(&mut client_stream).await;
+    assert_eq!(response.request_id, 12);
+    assert_eq!(response.error, None);
+
+    client_stream
+        .write_all(
+            &encode_frame(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("shutdown should encode"),
+        )
+        .await
+        .expect("shutdown should be written");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should exit cleanly");
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[tokio::test]
 async fn server_cancels_prewarm_before_file_size_requests() {
     let workspace = temp_workspace();
     write_tiny_package(&workspace);

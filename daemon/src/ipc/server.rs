@@ -174,7 +174,18 @@ where
             break;
         };
 
-        let message = decode_payload::<ClientMessage>(&payload)?;
+        let message = match decode_payload::<ClientMessage>(&payload) {
+            Ok(message) => message,
+            Err(error) => {
+                // A single undecodable frame (a corrupt payload, or an unknown
+                // message type from a newer client) must not tear down the
+                // connection and discard the warm cache and in-flight work.
+                // Framing-level errors (oversized frames, io failures) still
+                // propagate below and remain fatal.
+                logging::log_warn("ipc", format!("ignoring undecodable client frame: {error}"));
+                continue;
+            }
+        };
 
         match message {
             ClientMessage::Hello(hello) => {
