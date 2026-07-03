@@ -539,6 +539,8 @@ fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
             return Some(CachedImport {
                 result,
                 dependency_fingerprints: envelope.dependency_fingerprints,
+                verified_generation: 0,
+                verified_at_millis: 0,
             });
         }
         return None;
@@ -549,6 +551,8 @@ fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
         .map(|result| CachedImport {
             result,
             dependency_fingerprints: Vec::new(),
+            verified_generation: 0,
+            verified_at_millis: 0,
         })
 }
 

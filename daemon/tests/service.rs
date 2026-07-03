@@ -1055,6 +1055,10 @@ fn service_revalidates_cache_when_relative_dependency_changes() {
         "export const helper = 'changed dependency payload';",
     )
     .expect("helper should be updated");
+    // A node_modules change bumps the cache generation in production (the
+    // extension sends node_modules_changed); that forces the fingerprint
+    // re-verification which detects the changed dependency.
+    import_lens_daemon::cache::memory::bump_cache_generation();
     let second = service.handle_batch(package_batch(&workspace, 2, "dependent-lib", "value"));
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
@@ -1078,6 +1082,10 @@ fn service_revalidates_cache_when_transitive_package_dependency_changes() {
         "export const dep = 'changed transitive dependency payload';",
     )
     .expect("dependency should be updated");
+    // A node_modules change bumps the cache generation in production (the
+    // extension sends node_modules_changed); that forces the fingerprint
+    // re-verification which detects the changed transitive dependency.
+    import_lens_daemon::cache::memory::bump_cache_generation();
     let second = service.handle_batch(package_batch(&workspace, 2, "parent-lib", "value"));
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");

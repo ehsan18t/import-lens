@@ -6,14 +6,42 @@ use crate::{
     ipc::protocol::ImportResult,
 };
 use papaya::HashMap;
-use std::{collections::HashSet, path::PathBuf, sync::Mutex};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 pub const RECENT_PRELOAD_LIMIT: usize = 20;
+
+// Dependency fingerprints only change when node_modules changes, which the
+// extension signals via cache invalidation. Between invalidations, re-stat'ing
+// every dependency file on each cache hit is pure waste, so a cached entry
+// verified at the current generation skips the re-stat. The TTL backstops the
+// case where node_modules changes with no invalidation event (e.g. a
+// watcher-excluded folder): after it elapses, the entry re-verifies anyway.
+static CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
+const REVERIFY_TTL_MS: u64 = 30_000;
+
+pub fn bump_cache_generation() {
+    CACHE_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+fn current_cache_generation() -> u64 {
+    CACHE_GENERATION.load(Ordering::Acquire)
+}
 
 #[derive(Debug, Clone)]
 pub struct CachedImport {
     pub result: ImportResult,
     pub dependency_fingerprints: Vec<FileFingerprint>,
+    // Runtime verification state (not persisted): the generation and wall-clock
+    // at which this entry's fingerprints were last confirmed current.
+    pub verified_generation: u64,
+    pub verified_at_millis: u64,
 }
 
 #[derive(Debug)]
@@ -64,18 +92,35 @@ impl ImportCache {
     pub fn get(&self, key: &str) -> Option<ImportResult> {
         let memory = self.memory.pin();
         if let Some(cached) = memory.get(key) {
-            if !fingerprints_are_current(&cached.dependency_fingerprints) {
-                memory.remove(key);
-                self.disk.remove(key);
-                return None;
+            let generation = current_cache_generation();
+            let now = crate::time::unix_millis_now();
+            let fresh_without_restat = cached.verified_generation == generation
+                && now.saturating_sub(cached.verified_at_millis) <= REVERIFY_TTL_MS;
+
+            if !fresh_without_restat {
+                if !fingerprints_are_current(&cached.dependency_fingerprints) {
+                    memory.remove(key);
+                    self.disk.remove(key);
+                    return None;
+                }
+                // Re-verified: restamp so subsequent hits can skip the re-stat.
+                let mut restamped = cached.clone();
+                restamped.verified_generation = generation;
+                restamped.verified_at_millis = now;
+                memory.insert(key.to_owned(), restamped);
             }
-            let mut result = cached.result.clone();
+
+            let mut result = memory.get(key)?.result.clone();
             result.cache_hit = true;
             self.disk.touch(key);
             return Some(result);
         }
 
-        if let Some(cached) = self.disk.get(key) {
+        if let Some(mut cached) = self.disk.get(key) {
+            // DiskCache::get already verified fingerprints against the file, so
+            // stamp the entry current to avoid a redundant re-stat on next hit.
+            cached.verified_generation = current_cache_generation();
+            cached.verified_at_millis = crate::time::unix_millis_now();
             let mut result = cached.result.clone();
             memory.insert(key.to_owned(), cached);
             result.cache_hit = true;
@@ -98,6 +143,8 @@ impl ImportCache {
         let cached = CachedImport {
             result,
             dependency_fingerprints,
+            verified_generation: current_cache_generation(),
+            verified_at_millis: crate::time::unix_millis_now(),
         };
 
         if let Err(error) = self.disk.insert(&key, &cached) {

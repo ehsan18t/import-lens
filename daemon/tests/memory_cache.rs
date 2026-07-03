@@ -92,3 +92,40 @@ fn import_cache_invalidates_subpath_entries() {
     assert!(cache.get("svelte/store@5.0.0::writable").is_none());
     assert!(cache.get("lodash-es@4.17.21::debounce").is_some());
 }
+
+#[test]
+fn cache_hit_skips_fingerprint_restat_until_generation_bumps() {
+    use import_lens_daemon::cache::key::fingerprints_for_paths;
+    use import_lens_daemon::cache::memory::bump_cache_generation;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("il-memgen-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dep = dir.join("dep.js");
+    std::fs::write(&dep, "export const x = 1;").expect("dep file");
+    let fp = fingerprints_for_paths(vec![dep.clone()]);
+
+    let cache = ImportCache::new(None, false);
+    cache.insert_with_fingerprints("v3:aa".to_owned(), result("dep", false), fp);
+
+    // Delete the dependency out of band. Within the same generation and TTL the
+    // re-stat is skipped, so the (now stale) entry still serves.
+    std::fs::remove_file(&dep).expect("delete dep");
+    assert!(
+        cache.get("v3:aa").is_some(),
+        "should serve without re-stat inside the same generation"
+    );
+
+    // A generation bump forces a re-verify, which observes the missing file.
+    bump_cache_generation();
+    assert!(
+        cache.get("v3:aa").is_none(),
+        "generation bump should force re-verify and evict the stale entry"
+    );
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
