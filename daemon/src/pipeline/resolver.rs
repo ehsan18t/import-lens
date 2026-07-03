@@ -149,7 +149,11 @@ fn resolve_with_oxc(
         .ok_or_else(|| "active document path has no parent directory".to_owned())?;
 
     let resolvers = shared_resolvers();
-    let resolved = resolve_module_path(resolvers.resolver(request.runtime), directory, &request.specifier)?;
+    let resolved = resolve_module_path(
+        resolvers.resolver(request.runtime),
+        directory,
+        &request.specifier,
+    )?;
 
     Ok(ResolvedEntry {
         entry_path: resolved.path,

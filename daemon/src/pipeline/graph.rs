@@ -1589,7 +1589,10 @@ impl<'a> Visit<'a> for ShorthandIdentifierCollector {
     }
 }
 
-fn collect_binding_pattern_spans(pattern: &BindingPattern<'_>, spans: &mut HashSet<(usize, usize)>) {
+fn collect_binding_pattern_spans(
+    pattern: &BindingPattern<'_>,
+    spans: &mut HashSet<(usize, usize)>,
+) {
     match pattern {
         BindingPattern::BindingIdentifier(identifier) => {
             spans.insert(span_bounds(identifier.span));

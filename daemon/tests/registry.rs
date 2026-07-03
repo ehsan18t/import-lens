@@ -519,7 +519,11 @@ fn registry_metadata_defers_persistence_until_flush() {
         let cache = RegistryMetadataCache::new(cache_path.clone());
         for i in 0..5u64 {
             cache
-                .write_metadata(&format!("pkg{i}"), sample_metadata(&format!("1.0.{i}")), 1000 + i)
+                .write_metadata(
+                    &format!("pkg{i}"),
+                    sample_metadata(&format!("1.0.{i}")),
+                    1000 + i,
+                )
                 .expect("write");
         }
         // Below the persist threshold: nothing written to disk yet.

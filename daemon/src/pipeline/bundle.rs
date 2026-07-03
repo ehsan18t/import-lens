@@ -597,8 +597,7 @@ fn semantic_rename_replacements(
     // Spans were recorded once at graph build (module.root_symbol_spans /
     // module.shorthand_spans); reuse them instead of re-parsing and re-running
     // semantic analysis on every bundle request.
-    let shorthand_spans: HashSet<(usize, usize)> =
-        module.shorthand_spans.iter().copied().collect();
+    let shorthand_spans: HashSet<(usize, usize)> = module.shorthand_spans.iter().copied().collect();
     let mut replacements = Vec::new();
     let mut seen_spans = HashSet::new();
 

@@ -244,8 +244,16 @@ fn shared_resolver_reflects_node_modules_change_only_after_invalidation() {
         "node_modules/swap-lib/package.json",
         r#"{"version":"1.0.0","module":"a.js"}"#,
     );
-    write_source(&root, "node_modules/swap-lib/a.js", "export const value = 'a';");
-    write_source(&root, "node_modules/swap-lib/b.js", "export const value = 'b';");
+    write_source(
+        &root,
+        "node_modules/swap-lib/a.js",
+        "export const value = 'a';",
+    );
+    write_source(
+        &root,
+        "node_modules/swap-lib/b.js",
+        "export const value = 'b';",
+    );
     let document = root.join("src").join("app.ts");
 
     let first = resolve_package_entry(&document, &request("swap-lib", ImportRuntime::Component))
@@ -289,5 +297,8 @@ fn find_package_root_error_lists_probed_paths() {
 
     fs::remove_dir_all(root).expect("cleanup");
     assert!(error.contains("nope-lib"), "{error}");
-    assert!(error.contains("checked:"), "error should list probed paths: {error}");
+    assert!(
+        error.contains("checked:"),
+        "error should list probed paths: {error}"
+    );
 }
