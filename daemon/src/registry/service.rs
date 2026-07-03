@@ -59,25 +59,24 @@ struct InflightFetchGuard<'a> {
 
 impl Drop for InflightFetchGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut result) = self.flight.result.lock() {
-            if result.is_none() {
-                *result = Some(RegistryPackageMetadataEntry {
-                    metadata: None,
-                    updated_at: 0,
-                    retry_after: None,
-                    error: Some("registry fetch panicked".to_owned()),
-                    not_found: false,
-                });
-            }
+        if let Ok(mut result) = self.flight.result.lock()
+            && result.is_none()
+        {
+            *result = Some(RegistryPackageMetadataEntry {
+                metadata: None,
+                updated_at: 0,
+                retry_after: None,
+                error: Some("registry fetch panicked".to_owned()),
+                not_found: false,
+            });
         }
         self.flight.ready.notify_all();
-        if let Ok(mut in_flight) = self.service.in_flight.lock() {
-            if in_flight
+        if let Ok(mut in_flight) = self.service.in_flight.lock()
+            && in_flight
                 .get(&self.key)
                 .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
-            {
-                in_flight.remove(&self.key);
-            }
+        {
+            in_flight.remove(&self.key);
         }
     }
 }
@@ -172,18 +171,17 @@ impl RegistryHintService {
                     error: None,
                 });
         }
-        if mode != RegistryHintMode::ForceRefresh {
-            if let Some(entry) = cached.as_ref() {
-                if mode == RegistryHintMode::RefreshStale && is_usable_without_fetch(entry, now_ms)
-                {
-                    return lookup_from_entry(entry, installed_version);
-                }
-                if entry
-                    .retry_after
-                    .is_some_and(|retry_after| retry_after > now_ms)
-                {
-                    return lookup_from_entry(entry, installed_version);
-                }
+        if mode != RegistryHintMode::ForceRefresh
+            && let Some(entry) = cached.as_ref()
+        {
+            if mode == RegistryHintMode::RefreshStale && is_usable_without_fetch(entry, now_ms) {
+                return lookup_from_entry(entry, installed_version);
+            }
+            if entry
+                .retry_after
+                .is_some_and(|retry_after| retry_after > now_ms)
+            {
+                return lookup_from_entry(entry, installed_version);
             }
         }
 

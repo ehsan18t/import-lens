@@ -407,7 +407,9 @@ fn create_detected_import(
     let statement_end = region.offset + span_end(parts.statement_span);
     let specifier_start = region.offset + span_start(parts.module_request_span);
     let quote_end = region.offset + span_end(parts.module_request_span);
-    let line = line_index.position_at(document_source, statement_start).line;
+    let line = line_index
+        .position_at(document_source, statement_start)
+        .line;
 
     DetectedImport {
         specifier: parts.specifier.to_owned(),
@@ -418,11 +420,7 @@ fn create_detected_import(
         runtime: region.runtime,
         line,
         quote_end: line_index.position_at(document_source, quote_end),
-        specifier_range: line_index.range_from_offsets(
-            document_source,
-            specifier_start,
-            quote_end,
-        ),
+        specifier_range: line_index.range_from_offsets(document_source, specifier_start, quote_end),
         statement_range: line_index.range_from_offsets(
             document_source,
             statement_start,

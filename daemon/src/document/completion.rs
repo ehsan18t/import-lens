@@ -121,6 +121,19 @@ struct OffsetRange {
     end: usize,
 }
 
+fn named_import_member_range(source: &str, statement_span: Span) -> Option<OffsetRange> {
+    let statement_start = statement_span.start as usize;
+    let statement_end = statement_span.end as usize;
+    let statement = source.get(statement_start..statement_end)?;
+    let open_brace = statement.find('{')?;
+    let close_brace = statement[open_brace + 1..].find('}')? + open_brace + 1;
+
+    Some(OffsetRange {
+        start: statement_start + open_brace + 1,
+        end: statement_start + close_brace,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::named_import_completion_context;
@@ -172,17 +185,4 @@ mod tests {
 
         assert_eq!(context.specifier, "lodash");
     }
-}
-
-fn named_import_member_range(source: &str, statement_span: Span) -> Option<OffsetRange> {
-    let statement_start = statement_span.start as usize;
-    let statement_end = statement_span.end as usize;
-    let statement = source.get(statement_start..statement_end)?;
-    let open_brace = statement.find('{')?;
-    let close_brace = statement[open_brace + 1..].find('}')? + open_brace + 1;
-
-    Some(OffsetRange {
-        start: statement_start + open_brace + 1,
-        end: statement_start + close_brace,
-    })
 }

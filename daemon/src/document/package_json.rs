@@ -64,7 +64,11 @@ pub fn package_json_dependency_entries(source: &str) -> Vec<PackageJsonDependenc
             continue;
         }
 
-        entries.extend(dependency_entries_for_section(source, &line_index, &section));
+        entries.extend(dependency_entries_for_section(
+            source,
+            &line_index,
+            &section,
+        ));
     }
 
     entries.sort_by(|left, right| {

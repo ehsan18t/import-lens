@@ -364,20 +364,18 @@ impl ModuleGraphBuilder {
         if let Some(existing) = self.graph.path_to_id.get(&path) {
             if self.loading_paths.contains(&path)
                 && let Some(importer) = importer
-            {
-                if self
+                && self
                     .circular_edges
                     .insert((importer.to_path_buf(), path.clone()))
-                {
-                    self.graph.diagnostics.push(GraphDiagnostic {
-                        stage: "circular_dependency".to_owned(),
-                        message: "circular module dependency detected".to_owned(),
-                        details: vec![
-                            format!("from_path: {}", importer.display()),
-                            format!("to_path: {}", path.display()),
-                        ],
-                    });
-                }
+            {
+                self.graph.diagnostics.push(GraphDiagnostic {
+                    stage: "circular_dependency".to_owned(),
+                    message: "circular module dependency detected".to_owned(),
+                    details: vec![
+                        format!("from_path: {}", importer.display()),
+                        format!("to_path: {}", path.display()),
+                    ],
+                });
             }
             return Ok(*existing);
         }

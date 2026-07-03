@@ -213,7 +213,10 @@ impl ImportLensService {
                 rows: Vec::new(),
                 summary: WorkspaceReportSummary::default(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -397,7 +400,10 @@ impl ImportLensService {
                 request_id: request.request_id,
                 imports: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -442,7 +448,10 @@ impl ImportLensService {
                 request_id: request.request_id,
                 imports: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -483,7 +492,10 @@ impl ImportLensService {
                 imports: Vec::new(),
                 states: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -574,7 +586,10 @@ impl ImportLensService {
                 states: Vec::new(),
                 indexes: None,
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -706,7 +721,10 @@ impl ImportLensService {
                 exports: Vec::new(),
                 imported_names: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -862,7 +880,10 @@ impl ImportLensService {
                 last_cleanup_millis: None,
                 current_project: None,
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -892,7 +913,10 @@ impl ImportLensService {
                 removed: Vec::new(),
                 failed: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -920,7 +944,10 @@ impl ImportLensService {
                 request_id: request.request_id,
                 shards: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -941,7 +968,10 @@ impl ImportLensService {
                 removed: Vec::new(),
                 failed: Vec::new(),
                 error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage("protocol", "unsupported protocol version")],
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "protocol",
+                    "unsupported protocol version",
+                )],
             };
         }
 
@@ -1045,7 +1075,14 @@ impl ImportLensService {
             return;
         }
 
-        let _ = self.analyze_and_cache(cache.as_ref(), context, request, key, resolved, should_continue);
+        let _ = self.analyze_and_cache(
+            cache.as_ref(),
+            context,
+            request,
+            key,
+            resolved,
+            should_continue,
+        );
     }
 
     pub fn invalidate_package_json_paths(&self, package_json_paths: &[String]) -> bool {

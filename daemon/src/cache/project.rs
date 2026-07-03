@@ -591,4 +591,3 @@ fn directory_size(path: &Path) -> u64 {
         .map(|entry| directory_size(&entry.path()))
         .sum()
 }
-

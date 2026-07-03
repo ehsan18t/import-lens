@@ -141,8 +141,11 @@ pub fn bundle_reachable_modules_with_metadata(
                 .map(|name| format!("{name} as {}", external_binding_name(index, name)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            writeln!(synthetic_imports, "import {{ {named} }} from '{specifier}';")
-                .expect("writing to String should not fail");
+            writeln!(
+                synthetic_imports,
+                "import {{ {named} }} from '{specifier}';"
+            )
+            .expect("writing to String should not fail");
         }
 
         if !has_bindings {

@@ -260,8 +260,16 @@ fn bundle_renames_colliding_external_import_locals() {
     let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
         .expect("reachable modules should bundle");
 
-    assert!(bundled.source.contains("from 'ext-one'"), "{}", bundled.source);
-    assert!(bundled.source.contains("from 'ext-two'"), "{}", bundled.source);
+    assert!(
+        bundled.source.contains("from 'ext-one'"),
+        "{}",
+        bundled.source
+    );
+    assert!(
+        bundled.source.contains("from 'ext-two'"),
+        "{}",
+        bundled.source
+    );
     assert_semantic_valid(&bundled.source);
     let minified = minify_source_with_markers(&bundled.minifier_source, false)
         .expect("bundle with colliding external locals should minify");
@@ -459,7 +467,11 @@ fn bundle_survives_star_export_cycles_without_stack_overflow() {
         .expect("cyclic star exports should still bundle");
 
     fs::remove_dir_all(root).expect("temp bundle workspace should be removed");
-    assert!(bundled.source.contains("__il_m0_value"), "{}", bundled.source);
+    assert!(
+        bundled.source.contains("__il_m0_value"),
+        "{}",
+        bundled.source
+    );
 }
 
 #[test]

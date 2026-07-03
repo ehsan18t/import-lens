@@ -236,10 +236,10 @@ where
                     ))
                 };
                 hello_received = true;
-                if let Some(storage_path) = lifecycle_storage_path.as_deref() {
-                    if let Some(result) = remove_legacy_central_cache(storage_path) {
-                        log_legacy_cache_removal(&result);
-                    }
+                if let Some(storage_path) = lifecycle_storage_path.as_deref()
+                    && let Some(result) = remove_legacy_central_cache(storage_path)
+                {
+                    log_legacy_cache_removal(&result);
                 }
                 let cleanup = service.cleanup_cache(CacheCleanupRequest {
                     message_type: "cache_cleanup".to_owned(),
@@ -447,16 +447,15 @@ where
                 prefetcher.cancel();
                 let remove_legacy_cache = matches!(request.scope, CacheRemoveScope::All);
                 let mut response = service.remove_cache(request);
-                if remove_legacy_cache {
-                    if let Some(storage_path) = lifecycle_storage_path.as_deref() {
-                        if let Some(result) = remove_legacy_central_cache(storage_path) {
-                            log_legacy_cache_removal(&result);
-                            if result.removed {
-                                response.removed.push(result);
-                            } else {
-                                response.failed.push(result);
-                            }
-                        }
+                if remove_legacy_cache
+                    && let Some(storage_path) = lifecycle_storage_path.as_deref()
+                    && let Some(result) = remove_legacy_central_cache(storage_path)
+                {
+                    log_legacy_cache_removal(&result);
+                    if result.removed {
+                        response.removed.push(result);
+                    } else {
+                        response.failed.push(result);
                     }
                 }
                 send_message!(response);

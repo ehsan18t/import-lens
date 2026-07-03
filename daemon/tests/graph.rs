@@ -1,8 +1,7 @@
 use import_lens_daemon::pipeline::{
     graph::{
-        GraphLimits, MAX_CACHED_GRAPHS, ModuleGraph, build_module_graph,
-        build_module_graph_cached, build_module_graph_with_limits, clear_module_graph_cache,
-        module_graph_cache_len,
+        GraphLimits, MAX_CACHED_GRAPHS, ModuleGraph, build_module_graph, build_module_graph_cached,
+        build_module_graph_with_limits, clear_module_graph_cache, module_graph_cache_len,
     },
     reachability::reachable_exports,
 };

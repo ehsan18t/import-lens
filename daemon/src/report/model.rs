@@ -351,11 +351,9 @@ fn build_treemap(
             specifier: row.specifier.clone(),
             source_file: row.source_file.clone(),
             brotli_bytes: row.brotli_bytes,
-            percentage: if total_brotli_bytes > 0 {
-                ((row.brotli_bytes * 100) + (total_brotli_bytes / 2)) / total_brotli_bytes
-            } else {
-                0
-            },
+            percentage: ((row.brotli_bytes * 100) + (total_brotli_bytes / 2))
+                .checked_div(total_brotli_bytes)
+                .unwrap_or(0),
             confidence: row.confidence.clone(),
         })
         .collect()
