@@ -40,8 +40,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const NODE_MODULES_BULK_INVALIDATION_LIMIT: usize = 20;
-
 // `RegistryHintService` and `RegistryRefreshExecutor` hold trait objects and a
 // thread pool respectively, so `ImportLensService` no longer derives `Debug`.
 pub struct ImportLensService {
@@ -1159,14 +1157,11 @@ impl ImportLensService {
     }
 
     pub fn invalidate_package_json_paths(&self, package_json_paths: &[String]) -> bool {
-        if package_json_paths.len() > NODE_MODULES_BULK_INVALIDATION_LIMIT {
-            self.invalidate_all();
-            return true;
-        }
-
         let mut package_names = Vec::with_capacity(package_json_paths.len());
         for package_json_path in package_json_paths {
             let Some(package_name) = package_name_from_package_json_path(package_json_path) else {
+                // A path we can't map to a package name is opaque, so fall back
+                // to a full invalidation -- the only safe option.
                 self.invalidate_all();
                 return true;
             };
@@ -1177,9 +1172,11 @@ impl ImportLensService {
             return false;
         }
 
-        // Batch the cache eviction into a single shard-scan/open pass, and run
-        // the global graph/resolver/generation invalidations once for the whole
-        // burst instead of once per package.
+        // Even for a large burst, invalidate only the affected packages (a single
+        // decode pass via `invalidate_packages`) rather than nuking every project
+        // shard under this workspace's cache base -- a full clear would evict
+        // unrelated sibling projects in a multi-root / monorepo window. The
+        // graph/resolver/generation invalidations run once for the whole burst.
         self.cache_registry.invalidate_packages(&package_names);
         for package_name in &package_names {
             invalidate_module_graph_cache_for_package(package_name);

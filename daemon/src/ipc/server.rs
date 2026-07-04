@@ -730,6 +730,15 @@ where
             }
             ClientMessage::Shutdown(_) => {
                 prefetcher.cancel();
+                // Drain pending disk inserts (not just recency touches) so a
+                // clean shutdown never relies on Drop running before the process
+                // exits, mirroring the recycle path.
+                if let Err(error) = service.flush_cache() {
+                    logging::log_warn(
+                        "lifecycle",
+                        format!("failed to flush cache on shutdown: {error}"),
+                    );
+                }
                 service.flush_cache_recency_touches();
                 return Ok(());
             }

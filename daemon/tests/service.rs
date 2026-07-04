@@ -881,7 +881,7 @@ fn service_invalidates_packages_from_node_modules_package_json_paths() {
 }
 
 #[test]
-fn service_bulk_invalidates_all_from_large_node_modules_package_json_bursts() {
+fn service_bulk_invalidation_is_scoped_to_changed_packages() {
     let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
@@ -890,7 +890,10 @@ fn service_bulk_invalidates_all_from_large_node_modules_package_json_bursts() {
     let service = ImportLensService::new(None, false);
 
     let _ = service.handle_batch(batch(&workspace, 1));
-    let package_json_paths = (0..21)
+
+    // A large burst of UNRELATED package.json changes must not evict tiny-lib:
+    // bulk invalidation is scoped to the named packages, never a workspace nuke.
+    let unrelated_paths = (0..21)
         .map(|index| {
             workspace
                 .join("node_modules")
@@ -900,12 +903,30 @@ fn service_bulk_invalidates_all_from_large_node_modules_package_json_bursts() {
                 .to_string()
         })
         .collect::<Vec<_>>();
-    let invalidated = service.invalidate_package_json_paths(&package_json_paths);
-    let after_invalidate = service.handle_batch(batch(&workspace, 2));
+    let invalidated_unrelated = service.invalidate_package_json_paths(&unrelated_paths);
+    let after_unrelated = service.handle_batch(batch(&workspace, 2));
+
+    // Invalidating tiny-lib itself does evict it.
+    let tiny_lib_path = workspace
+        .join("node_modules")
+        .join("tiny-lib")
+        .join("package.json")
+        .to_string_lossy()
+        .to_string();
+    let invalidated_tiny = service.invalidate_package_json_paths(&[tiny_lib_path]);
+    let after_tiny = service.handle_batch(batch(&workspace, 3));
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert!(invalidated);
-    assert!(!after_invalidate.imports[0].cache_hit);
+    assert!(invalidated_unrelated);
+    assert!(
+        after_unrelated.imports[0].cache_hit,
+        "unrelated bulk invalidation must leave tiny-lib cached"
+    );
+    assert!(invalidated_tiny);
+    assert!(
+        !after_tiny.imports[0].cache_hit,
+        "invalidating tiny-lib itself must evict it"
+    );
 }
 
 #[test]
