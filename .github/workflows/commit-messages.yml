@@ -1,0 +1,44 @@
+name: Commit Messages
+
+# Validates every commit on a pull request against the project's
+# conventional-commit rules (the same scripts/check-commit-msg.mjs the local
+# lefthook commit-msg hook runs). Deliberately PR-only: direct pushes to main
+# are already validated at commit time by the local hook, and re-running here on
+# push would only ever surface as a skipped check.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commit-messages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commit-messages:
+    name: Commit messages
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Install Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+      - name: Validate PR commit messages
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          fail=0
+          for sha in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
+            git log -1 --format=%B "$sha" > /tmp/msg
+            if ! node scripts/check-commit-msg.mjs /tmp/msg; then
+              echo "  ^ commit $sha"
+              fail=1
+            fi
+          done
+          exit $fail
