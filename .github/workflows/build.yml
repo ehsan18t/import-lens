@@ -17,79 +17,24 @@ on:
 permissions:
   contents: read
 
+# One Build at a time: starting a new run cancels the one in progress. Any
+# targets the cancelled run already cached are reused by the new run.
 concurrency:
-  group: build-${{ inputs.version }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
 
 env:
   PNPM_VERSION: 11.9.0
-  RUST_VERSION: 1.89.0
 
 jobs:
+  # Resolve the version once and run the full release-gate validation (perf +
+  # coverage on top of the shared checks). Its output feeds every package job.
   validate:
-    name: Validate
-    runs-on: ubuntu-24.04
-    outputs:
-      version: ${{ steps.resolve.outputs.version }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.0
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6.0.9
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
-      - name: Install Node.js
-        uses: actions/setup-node@v6.4.0
-        with:
-          node-version: 24
-          cache: pnpm
-
-      # Resolve the version once, here, so every matrix package job below agrees
-      # on it. A blank input falls back to package.json; a value overrides it.
-      - name: Resolve version
-        id: resolve
-        env:
-          REQUESTED_VERSION: ${{ inputs.version }}
-        run: |
-          version="$(node scripts/resolve-version.mjs "$REQUESTED_VERSION")"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Resolved release version: $version"
-
-      - name: Install Rust
-        run: |
-          rustup toolchain install "${RUST_VERSION}" --profile minimal
-          rustup default "${RUST_VERSION}"
-          rustup component add llvm-tools-preview
-
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
-
-      - name: Verify release icon
-        run: |
-          node -e "const fs = require('node:fs'); const pkg = require('./package.json'); if (pkg.icon && !fs.existsSync(pkg.icon)) { console.error(\`release icon is declared at \${pkg.icon}, but the file does not exist\`); process.exit(1); }"
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Check TypeScript
-        run: pnpm check
-
-      - name: Check Rust formatting
-        run: cargo fmt --check
-
-      - name: Run tests
-        run: pnpm test
-
-      - name: Run performance smoke test
-        env:
-          IMPORT_LENS_PERF_MULTIPLIER: 8
-        run: pnpm test:performance
-
-      - name: Check Rust coverage
-        run: pnpm coverage:rust
+    uses: ./.github/workflows/validate.yml
+    with:
+      requested_version: ${{ inputs.version }}
+      run_performance: true
+      run_coverage: true
 
   package:
     name: Package ${{ matrix.target }}
@@ -153,9 +98,17 @@ jobs:
       - name: Install Rust
         if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
         run: |
-          rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
-          rustup default ${{ env.RUST_VERSION }}
+          rustup toolchain install stable --profile minimal
+          rustup default stable
           rustup target add ${{ matrix.rust-target }}
+
+      # Cache the release compile per target, so a first build, a forced rebuild,
+      # or re-running to fill a failed platform doesn't recompile oxc from cold.
+      - name: Cache Rust build
+        if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: ${{ matrix.rust-target }}
 
       - name: Install dependencies
         if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}

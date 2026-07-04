@@ -38,7 +38,9 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
 
 test("dependency policy pins build tooling and removes stale extension-host queue deps", () => {
   const manifest = JSON.parse(repoFile("package.json"));
-  const ciWorkflow = repoFile(".github/workflows/ci.yml");
+  // CI delegates its toolchain pins to the reusable validate workflow.
+  const validateWorkflow = repoFile(".github/workflows/validate.yml");
+  const buildWorkflow = repoFile(".github/workflows/build.yml");
   const releaseWorkflow = repoFile(".github/workflows/release.yml");
   const dockerfile = repoFile("Dockerfile.build");
   const tsdownConfig = repoFile("tsdown.config.ts");
@@ -48,11 +50,13 @@ test("dependency policy pins build tooling and removes stale extension-host queu
   assert.equal(manifest.devDependencies.tsdown, "0.22.3");
   assert.equal(manifest.devDependencies["@vscode/vsce"], "3.9.2");
 
-  assert.match(ciWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
+  // PNPM_VERSION lives in every workflow that installs pnpm; keep them in lockstep.
+  assert.match(validateWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
+  assert.match(buildWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
   assert.match(releaseWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
-  assert.match(ciWorkflow, /node-version: 24/u);
+  assert.match(validateWorkflow, /node-version: 24/u);
   assert.match(releaseWorkflow, /node-version: 24/u);
-  assert.doesNotMatch(ciWorkflow, new RegExp(`node-version: ${22}`, "u"));
+  assert.doesNotMatch(validateWorkflow, new RegExp(`node-version: ${22}`, "u"));
   assert.doesNotMatch(releaseWorkflow, new RegExp(`node-version: ${22}`, "u"));
 
   assert.match(dockerfile, /^FROM node:24-bookworm$/mu);

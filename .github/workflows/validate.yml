@@ -1,0 +1,118 @@
+name: Validate
+
+# Shared validation used by both CI (on push / PR) and Build (as a release gate).
+# The heavier gates are opt-in so each caller runs only what it needs.
+on:
+  workflow_call:
+    inputs:
+      requested_version:
+        description: "Version to resolve (blank falls back to package.json)."
+        required: false
+        default: ""
+        type: string
+      run_accuracy:
+        description: "Run the accuracy comparison suite."
+        required: false
+        default: false
+        type: boolean
+      run_performance:
+        description: "Run the performance smoke test."
+        required: false
+        default: false
+        type: boolean
+      run_coverage:
+        description: "Run the Rust coverage gate (installs cargo-llvm-cov)."
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      version:
+        description: "The resolved version (requested input, or package.json)."
+        value: ${{ jobs.validate.outputs.version }}
+
+permissions:
+  contents: read
+
+env:
+  PNPM_VERSION: 11.9.0
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6.0.9
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Resolve version
+        id: resolve
+        env:
+          REQUESTED_VERSION: ${{ inputs.requested_version }}
+        run: |
+          version="$(node scripts/resolve-version.mjs "$REQUESTED_VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version"
+
+      # Always the latest stable toolchain (rust-toolchain.toml pins the channel
+      # and supplies rustfmt); no fixed version to fall behind.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Add coverage tooling
+        if: ${{ inputs.run_coverage }}
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        if: ${{ inputs.run_coverage }}
+        uses: taiki-e/install-action@v2.82.7
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Verify release icon
+        run: |
+          node -e "const fs = require('node:fs'); const pkg = require('./package.json'); if (pkg.icon && !fs.existsSync(pkg.icon)) { console.error(\`release icon is declared at \${pkg.icon}, but the file does not exist\`); process.exit(1); }"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check TypeScript
+        run: pnpm check
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Run performance smoke test
+        if: ${{ inputs.run_performance }}
+        env:
+          IMPORT_LENS_PERF_MULTIPLIER: 8
+        run: pnpm test:performance
+
+      - name: Run accuracy tests
+        if: ${{ inputs.run_accuracy }}
+        run: pnpm test:accuracy
+
+      - name: Check Rust coverage
+        if: ${{ inputs.run_coverage }}
+        run: pnpm coverage:rust

@@ -47,18 +47,36 @@ test("build workflow caches each VSIX per target and resolved version and suppor
   assert.match(source, /if-no-files-found: error/u);
 });
 
-test("build workflow resolves the version once and overrides package.json before packaging", () => {
+test("build workflow validates via the reusable workflow and overrides package.json before packaging", () => {
   const source = workflow();
 
-  // The optional input falls back to package.json via a single resolve step
-  // whose output feeds the matrix.
+  // Validation (including resolving the version) is delegated to the reusable
+  // workflow, which feeds its resolved version back into the matrix.
+  assert.match(source, /uses: \.\/\.github\/workflows\/validate\.yml/u);
+  assert.match(source, /requested_version: \$\{\{ inputs\.version \}\}/u);
+  assert.match(source, /needs\.validate\.outputs\.version/u);
+
+  // The optional input still overrides package.json at package time.
   assert.match(source, /required: false/u);
-  assert.match(source, /resolve-version\.mjs/u);
-  assert.match(source, /version: \$\{\{ steps\.resolve\.outputs\.version \}\}/u);
   assert.match(source, /set-version\.mjs/u);
 
   // The old hard equality guard against package.json is gone.
   assert.doesNotMatch(source, /does not match build input/u);
+});
+
+test("build workflow caches the Rust compile per target and tracks latest stable", () => {
+  const source = workflow();
+
+  assert.match(source, /Swatinem\/rust-cache@v2\.9\.1/u);
+  assert.match(source, /rustup toolchain install stable/u);
+  assert.doesNotMatch(source, /RUST_VERSION/u);
+});
+
+test("build workflow cancels an in-progress run when a new one starts", () => {
+  const source = workflow();
+
+  assert.match(source, /group: \$\{\{ github\.workflow \}\}/u);
+  assert.match(source, /cancel-in-progress: true/u);
 });
 
 test("build workflow pins current action versions exactly", () => {

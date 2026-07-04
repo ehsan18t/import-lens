@@ -115,9 +115,11 @@ jobs:
         id: buildrun
         run: |
           artifact="import-lens-win32-x64-${RELEASE_VERSION}"
-          run_id=$(gh api --paginate \
+          # --slurp collects every page into one array before the jq filter, so
+          # max is taken across all pages (not per page) and stays a single line.
+          run_id=$(gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact}" \
-            --jq '[.artifacts[].workflow_run.id] | max // empty')
+            --jq '[.[].artifacts[].workflow_run.id] | max // empty')
           if [ -z "$run_id" ]; then
             echo "::error::No Build artifact ${artifact} found. Run the Build workflow for ${RELEASE_VERSION} first."
             exit 1
