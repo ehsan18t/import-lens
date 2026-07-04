@@ -64,9 +64,9 @@ test("dependency policy pins build tooling and removes stale extension-host queu
   assert.equal(manifest.devDependencies["@vscode/vsce"], "3.9.2");
 
   // PNPM_VERSION lives in every workflow that installs pnpm; keep them in lockstep.
-  assert.match(validateWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
-  assert.match(buildWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
-  assert.match(releaseWorkflow, /^  PNPM_VERSION: 11[.]9[.]0$/mu);
+  assert.match(validateWorkflow, /^ {2}PNPM_VERSION: 11[.]9[.]0$/mu);
+  assert.match(buildWorkflow, /^ {2}PNPM_VERSION: 11[.]9[.]0$/mu);
+  assert.match(releaseWorkflow, /^ {2}PNPM_VERSION: 11[.]9[.]0$/mu);
   assert.match(validateWorkflow, /node-version: 24/u);
   assert.match(releaseWorkflow, /node-version: 24/u);
   assert.doesNotMatch(validateWorkflow, new RegExp(`node-version: ${22}`, "u"));

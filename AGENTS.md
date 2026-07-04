@@ -50,6 +50,8 @@ pnpm package:win32-x64
 ## Git Expectations
 
 - Keep commits focused by task or feature.
-- Use professional commit messages with enough body detail to explain the user-visible change and important technical rationale.
+- Follow Conventional Commits: `type(scope)!: subject` (<=72 chars, no trailing period). Types: `feat fix perf docs refactor style test chore ci build` (kept in sync with `cliff.toml`).
+- A commit body (description) is REQUIRED and must explain the user-visible change and important technical rationale — it feeds the AI changelog. The `commit-msg` hook enforces this locally; CI enforces it on pull requests.
 - Do not revert user changes unless explicitly asked.
 - Before committing, check `git status --short` and review the staged diff.
+- Hooks are lefthook-managed and installed by `pnpm install`. pre-commit runs Biome (auto-format + re-stage) and TypeScript check, plus clippy and cargo-deny for Rust changes; pre-push runs `pnpm test`. Bypass only in a genuine emergency with `--no-verify` (CI still enforces).

@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import {
-  emptyInlineHintDecorationLayerBuckets,
   INLINE_HINT_DECORATION_SLOTS,
   inlineHintDecorationLayerBuckets,
   type InlineHintDecorationSlot,

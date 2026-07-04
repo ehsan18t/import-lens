@@ -11,6 +11,20 @@
     ]
   },
   "formatter": { "enabled": true, "useEditorconfig": true, "lineWidth": 100 },
-  "linter": { "enabled": true },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "style": {
+        "noNonNullAssertion": "off"
+      }
+    }
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "off"
+      }
+    }
+  },
   "javascript": { "formatter": { "quoteStyle": "double" } }
 }

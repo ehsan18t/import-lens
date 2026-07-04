@@ -1,0 +1,7 @@
+# <type>(<scope>): <subject>   (<=72 chars, no trailing period)
+#
+# <body: required — explain WHAT changed and WHY, wrapped ~72 cols.
+#  This becomes AI changelog input, so be specific and user-facing.>
+#
+# Types: feat fix perf docs refactor style test chore ci build
+# Add ! after type/scope for a breaking change, e.g. feat(api)!: ...

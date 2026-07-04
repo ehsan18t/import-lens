@@ -26,7 +26,6 @@ import type {
   WorkspaceReportResponse,
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
-import type { Logger } from "../logging/types.js";
 import { getImportLensConfig } from "../config.js";
 import { NativeDaemonTransport } from "./nativeTransport.js";
 import { TransportCoordinator, type DaemonState, type DaemonStateEvent } from "./transport.js";

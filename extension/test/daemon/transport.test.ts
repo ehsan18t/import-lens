@@ -352,29 +352,19 @@ class SlowReadyTransport implements AnalysisTransport {
     return null;
   }
 
-  invalidatePackage(): void {
-    return undefined;
-  }
+  invalidatePackage(): void {}
 
-  invalidateAll(): void {
-    return undefined;
-  }
+  invalidateAll(): void {}
 
-  nodeModulesChanged(): void {
-    return undefined;
-  }
+  nodeModulesChanged(): void {}
 
-  prewarmPackageJson(): void {
-    return undefined;
-  }
+  prewarmPackageJson(): void {}
 
   async shutdown(): Promise<void> {
     this.#state = "unavailable";
   }
 
-  dispose(): void {
-    return undefined;
-  }
+  dispose(): void {}
 }
 
 test("TransportCoordinator selects the first ready transport and delegates requests", async () => {

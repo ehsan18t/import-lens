@@ -27,7 +27,6 @@ export interface PackageJsonDependencyAnalysisState extends PackageJsonDependenc
 }
 
 export class PackageJsonAnalysisController implements vscode.Disposable {
-  readonly #context: vscode.ExtensionContext;
   readonly #daemon: DaemonManager;
   readonly #logger: ImportLensLogger;
   readonly #scheduler = new DebouncedDocumentScheduler();
@@ -43,7 +42,6 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   readonly onDidChange: vscode.Event<vscode.Uri> = this.#onDidChange.event;
 
   constructor(context: vscode.ExtensionContext, daemon: DaemonManager, logger: ImportLensLogger) {
-    this.#context = context;
     this.#daemon = daemon;
     this.#logger = logger;
     this.#registryRefresher = new RegistryHintRefresher(

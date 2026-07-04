@@ -68,11 +68,13 @@ jobs:
           echo "Resolved version: $version"
 
       # Always the latest stable toolchain (rust-toolchain.toml pins the channel
-      # and supplies rustfmt); no fixed version to fall behind.
+      # and supplies rustfmt); no fixed version to fall behind. clippy is added
+      # explicitly for the lint gate below.
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+          rustup component add clippy
 
       - name: Add coverage tooling
         if: ${{ inputs.run_coverage }}
@@ -99,6 +101,15 @@ jobs:
 
       - name: Check Rust formatting
         run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2.0.20
+
+      - name: Biome CI
+        run: pnpm exec biome ci .
 
       - name: Run tests
         run: pnpm test

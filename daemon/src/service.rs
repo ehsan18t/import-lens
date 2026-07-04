@@ -1369,42 +1369,6 @@ fn detected_imports_for_document(
     Ok(imports)
 }
 
-#[cfg(test)]
-mod report_panic_isolation_tests {
-    use super::ImportLensService;
-    use crate::document::IgnoreRuleResolver;
-    use crate::ipc::protocol::{PROTOCOL_VERSION, WorkspaceReportBudgets, WorkspaceReportRequest};
-    use std::path::Path;
-
-    #[test]
-    fn analyze_report_source_isolates_a_panicking_file() {
-        let service = ImportLensService::new(None, false);
-        let request = WorkspaceReportRequest {
-            message_type: "workspace_report".to_owned(),
-            version: PROTOCOL_VERSION,
-            request_id: 1,
-            workspace_root: "unused".to_owned(),
-            budgets: WorkspaceReportBudgets {
-                per_import_brotli_bytes: None,
-                per_file_brotli_bytes: None,
-            },
-        };
-
-        // The `__IMPORTLENS_FORCE_PANIC__` sentinel (compiled in only under
-        // cfg(test)) makes the per-file analysis panic. A single bad file must
-        // be isolated - skipped from the report - rather than failing the whole
-        // workspace scan.
-        let items = service.analyze_report_source(
-            Path::new("bad.ts"),
-            &request,
-            "// __IMPORTLENS_FORCE_PANIC__\n".to_owned(),
-            &IgnoreRuleResolver::default(),
-        );
-
-        assert!(items.is_empty());
-    }
-}
-
 fn detected_import_for_specifier(specifier: &str) -> DetectedImport {
     DetectedImport {
         specifier: specifier.to_owned(),
@@ -1626,5 +1590,41 @@ fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
         module_breakdown: None,
         shared_bytes: None,
         internal_contributions: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod report_panic_isolation_tests {
+    use super::ImportLensService;
+    use crate::document::IgnoreRuleResolver;
+    use crate::ipc::protocol::{PROTOCOL_VERSION, WorkspaceReportBudgets, WorkspaceReportRequest};
+    use std::path::Path;
+
+    #[test]
+    fn analyze_report_source_isolates_a_panicking_file() {
+        let service = ImportLensService::new(None, false);
+        let request = WorkspaceReportRequest {
+            message_type: "workspace_report".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 1,
+            workspace_root: "unused".to_owned(),
+            budgets: WorkspaceReportBudgets {
+                per_import_brotli_bytes: None,
+                per_file_brotli_bytes: None,
+            },
+        };
+
+        // The `__IMPORTLENS_FORCE_PANIC__` sentinel (compiled in only under
+        // cfg(test)) makes the per-file analysis panic. A single bad file must
+        // be isolated - skipped from the report - rather than failing the whole
+        // workspace scan.
+        let items = service.analyze_report_source(
+            Path::new("bad.ts"),
+            &request,
+            "// __IMPORTLENS_FORCE_PANIC__\n".to_owned(),
+            &IgnoreRuleResolver::default(),
+        );
+
+        assert!(items.is_empty());
     }
 }

@@ -203,6 +203,7 @@
   ],
   "scripts": {
     "build": "tsdown",
+    "prepare": "lefthook install && git config commit.template .gitmessage",
     "check": "tsc --noEmit -p tsconfig.json",
     "lint": "biome check",
     "lint:fix": "biome check --write",
@@ -256,6 +257,7 @@
     "@types/vscode": "1.90.0",
     "@vscode/vsce": "3.9.2",
     "esbuild": "0.28.1",
+    "lefthook": "^2.1.9",
     "ovsx": "1.0.2",
     "tsdown": "0.22.3",
     "typescript": "6.0.3"

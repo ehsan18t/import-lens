@@ -1,0 +1,33 @@
+# Local quality gates. Bypass in a genuine emergency with --no-verify (CI still enforces).
+# Rust jobs are glob-scoped so a TypeScript-only commit never compiles Rust, and vice versa.
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: rust-fmt
+      glob: "*.rs"
+      run: cargo fmt
+      stage_fixed: true
+    - name: rust-clippy
+      glob: ["*.rs", "Cargo.toml", "Cargo.lock", "clippy.toml"]
+      run: cargo clippy --workspace --all-targets
+    - name: rust-deny
+      glob: ["Cargo.toml", "Cargo.lock", "deny.toml"]
+      run: cargo deny check
+    - name: ts-biome
+      glob: ["*.ts", "*.mts", "*.mjs", "*.json"]
+      run: pnpm exec biome check --write --no-errors-on-unmatched --files-ignore-unknown=true {staged_files}
+      stage_fixed: true
+    - name: ts-typecheck
+      glob: ["*.ts", "*.mts", "tsconfig*.json"]
+      run: pnpm check
+
+commit-msg:
+  jobs:
+    - name: commit-convention
+      run: node scripts/check-commit-msg.mjs {1}
+
+pre-push:
+  jobs:
+    - name: build-and-test
+      run: pnpm test

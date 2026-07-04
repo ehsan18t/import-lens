@@ -17,14 +17,30 @@ test("resolveRange diffs from the previous tag, or full history when there is no
 });
 
 test("buildUserPrompt lists the version and every commit subject as a bullet", () => {
-  const prompt = buildUserPrompt("0.2.0", ["feat: a", "fix: b"]);
+  const prompt = buildUserPrompt("0.2.0", [
+    { subject: "feat: a", body: "" },
+    { subject: "fix: b", body: "" },
+  ]);
   assert.match(prompt, /Release version: 0\.2\.0/);
   assert.match(prompt, /^- feat: a$/mu);
   assert.match(prompt, /^- fix: b$/mu);
 });
 
+test("buildUserPrompt includes truncated commit bodies indented under the subject", () => {
+  const prompt = buildUserPrompt("1.0.0", [
+    { subject: "feat(x): add thing", body: "Adds the thing so users can do Y." },
+  ]);
+  assert.match(prompt, /- feat\(x\): add thing/);
+  assert.match(prompt, /^ {2}Adds the thing so users can do Y\.$/mu);
+
+  const longBody = "z".repeat(900);
+  const capped = buildUserPrompt("1.0.0", [{ subject: "fix: y", body: longBody }]);
+  assert.ok(capped.includes("z".repeat(600)));
+  assert.ok(!capped.includes("z".repeat(601)));
+});
+
 test("buildRequestBody produces a low-temperature OpenAI-compatible payload", () => {
-  const body = buildRequestBody("some-model", "0.2.0", ["feat: a"]);
+  const body = buildRequestBody("some-model", "0.2.0", [{ subject: "feat: a", body: "" }]);
   assert.equal(body.model, "some-model");
   assert.equal(body.temperature, 0.2);
   assert.equal(body.messages[0].role, "system");

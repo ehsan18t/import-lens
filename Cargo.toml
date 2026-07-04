@@ -4,6 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
+license = "MIT"
 
 [profile.release]
 opt-level = "z"
@@ -11,3 +12,12 @@ codegen-units = 1
 lto = true
 panic = "abort"
 strip = true
+
+# The high-value groups (correctness/suspicious/style/complexity/perf, plus the
+# disallowed-macros ban in clippy.toml) are hard errors. The two threshold-based
+# lints below are pedantic/nursery: kept as non-blocking warnings so they flag
+# future bloat without forcing a refactor of existing long functions here.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+too_many_lines = "warn"
+cognitive_complexity = "warn"

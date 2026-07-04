@@ -1,12 +1,7 @@
 import type { ImportLensConfig } from "../config.js";
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 import type { PackageJsonDependencySectionName } from "../ipc/protocol.js";
-import {
-  bytesForCompression,
-  formatBytes,
-  labelForCompression,
-  type CompressionFormat,
-} from "./format.js";
+import { bytesForCompression, formatBytes, labelForCompression } from "./format.js";
 import type { PackageJsonPrimaryTone, PackageJsonSuffixTone } from "./packageJsonHintVisuals.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 

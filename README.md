@@ -169,5 +169,15 @@ ImportLens never rewrites your source files. Actions that suggest named imports 
 - VS Code **1.90.0** or higher.
 - A local workspace or loose file whose parent tree contains a populated `node_modules` directory.
 
+## Contributing
+
+Git hooks are managed by [lefthook](https://lefthook.dev/) and installed automatically by `pnpm install` (via the `prepare` script), which also sets the conventional-commit message template.
+
+- **pre-commit** — Biome formats and lints staged TypeScript/JS (auto-fixing and re-staging), TypeScript type-checks; for staged Rust it runs `cargo clippy` and `cargo deny check`.
+- **commit-msg** — enforces Conventional Commits with a mandatory body. Format: `type(scope)!: subject` then a blank line then a body explaining what and why. Types: `feat fix perf docs refactor style test chore ci build`.
+- **pre-push** — runs the full suite (`pnpm test`: build + TypeScript, script, and Rust tests).
+
+Run gates manually with `pnpm lint`, `pnpm format`, `cargo clippy --workspace --all-targets`, `cargo deny check`, and `pnpm test`. Bypass hooks only in a genuine emergency with `--no-verify`; CI enforces the same gates regardless.
+
 ---
 *Built with [OXC](https://oxc.rs/) for maximum performance.*
