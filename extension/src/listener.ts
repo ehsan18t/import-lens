@@ -16,10 +16,15 @@ import { ImportResultLogTracker } from "./analysis/resultLogging.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
-import { type ImportAnalysisItem, protocolVersion } from "./ipc/protocol.js";
+import {
+  type FileSizeDocumentResponse,
+  type ImportAnalysisItem,
+  protocolVersion,
+} from "./ipc/protocol.js";
 import { nextIpcRequestId } from "./ipc/requestIds.js";
 import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
+import { bytesForCompression, formatBytes, labelForCompression } from "./ui/format.js";
 import type { StatusBarController } from "./ui/statusbar.js";
 import { analysisRootForFile } from "./workspaceContext.js";
 
@@ -50,8 +55,14 @@ export class DocumentAnalysisController implements vscode.Disposable {
       vscode.workspace.onDidOpenTextDocument((document) => this.schedule(document)),
       vscode.workspace.onDidCloseTextDocument((document) => this.disposeDocument(document)),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
-        if (editor) {
+        if (
+          editor &&
+          supportedLanguageIds.has(editor.document.languageId) &&
+          editor.document.uri.scheme === "file"
+        ) {
           this.schedule(editor.document);
+        } else {
+          this.#statusBar.setState({ kind: "ready" });
         }
       }),
     );
@@ -85,11 +96,11 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
     if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
       this.#store.clear(document.uri);
-      this.#statusBar.setStatus("unavailable");
+      this.#statusBar.setState({ kind: "unavailable" });
       return;
     }
 
-    this.#statusBar.setStatus("computing");
+    this.#statusBar.setState({ kind: "computing" });
     this.#logger.debug(`Starting document analysis request ${requestId}.`);
 
     try {
@@ -108,7 +119,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
       if (!response) {
         this.#store.clear(document.uri);
-        this.#statusBar.setStatus("unavailable");
+        this.#statusBar.setState({ kind: "unavailable" });
         return;
       }
 
@@ -119,13 +130,13 @@ export class DocumentAnalysisController implements vscode.Disposable {
       if (response.error) {
         this.#logger.warn(`Document analysis failed: ${response.error}`);
         this.#store.clear(document.uri);
-        this.#statusBar.setStatus("unavailable");
+        this.#statusBar.setState({ kind: "unavailable" });
         return;
       }
 
       if (response.imports.length === 0) {
         this.#store.clear(document.uri);
-        this.#statusBar.setStatus("ready");
+        this.#statusBar.setState({ kind: "ready" });
         return;
       }
 
@@ -159,15 +170,54 @@ export class DocumentAnalysisController implements vscode.Disposable {
           `Import history update failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      this.#statusBar.setStatus("ready");
+      await this.updateFileSize(document, workspaceRoot, requestId);
       this.#logger.debug(`Completed document analysis request ${requestId}.`);
     } catch (error) {
       this.#logger.warn(
         `Analysis request failed: ${error instanceof Error ? error.message : String(error)}`,
       );
       this.#store.clear(document.uri);
-      this.#statusBar.setStatus("unavailable");
+      this.#statusBar.setState({ kind: "unavailable" });
     }
+  }
+
+  private async updateFileSize(
+    document: vscode.TextDocument,
+    workspaceRoot: string,
+    analysisRequestId: number,
+  ): Promise<void> {
+    const documentKey = document.uri.toString();
+    const config = getImportLensConfig();
+    let response: FileSizeDocumentResponse | null = null;
+    try {
+      response = await this.#daemon.requestFileSizeDocument({
+        type: "file_size_document",
+        version: protocolVersion,
+        request_id: nextIpcRequestId(),
+        workspace_root: workspaceRoot,
+        active_document_path: document.fileName,
+        source: document.getText(),
+      });
+    } catch (error) {
+      this.#logger.warn(
+        `File-size status request failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    // A newer analysis for this document supersedes this size result.
+    if (!this.#freshness.isCurrent(documentKey, analysisRequestId)) {
+      return;
+    }
+    if (!response || response.error) {
+      this.#statusBar.setState({ kind: "unavailable" });
+      return;
+    }
+    if (response.imports.length === 0) {
+      this.#statusBar.setState({ kind: "ready" });
+      return;
+    }
+    const label = `${formatBytes(bytesForCompression(response, config.compression))} ${labelForCompression(config.compression)}`;
+    this.#statusBar.setState({ kind: "size", label });
   }
 
   private disposeDocument(document: vscode.TextDocument): void {

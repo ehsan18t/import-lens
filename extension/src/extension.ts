@@ -212,7 +212,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     }
 
     const state = await daemon.restart();
-    statusBar.setStatus(state === "ready" ? "ready" : "unavailable");
+    statusBar.setState({ kind: state === "ready" ? "ready" : "unavailable" });
     refreshVisibleDocuments(getImportLensConfig(), "reanalyze");
   };
 
@@ -355,7 +355,8 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     daemon.onDidChangeState((nextState) => {
       applyDaemonStateTransition(nextState, {
-        setStatus: (state) => statusBar.setStatus(state),
+        setStatus: (state) =>
+          statusBar.setState({ kind: state === "ready" ? "ready" : "unavailable" }),
         prewarmPackageJson: () => {
           const prewarmCount = prewarmPackageJsonDocuments(
             vscode.workspace.textDocuments,
@@ -373,7 +374,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   );
   const state = await daemon.start();
   logger.info(`ImportLens daemon startup completed with state: ${state}.`);
-  statusBar.setStatus(state === "ready" ? "ready" : "unavailable");
+  statusBar.setState({ kind: state === "ready" ? "ready" : "unavailable" });
 
   if (vscode.window.activeTextEditor) {
     analysis.schedule(vscode.window.activeTextEditor.document);
