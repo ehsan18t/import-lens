@@ -69,6 +69,53 @@ fn import_cache_invalidates_package_prefixes() {
 }
 
 #[test]
+fn import_cache_purge_orphan_entries_removes_uninstalled_package_entries() {
+    use import_lens_daemon::cache::key::{ANALYZER_VERSION, cache_key_for_resolved_import};
+    use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
+    use import_lens_daemon::pipeline::resolver::resolve_package_entry;
+    use std::fs;
+
+    let workspace = std::env::temp_dir().join(format!("il-purge-orphan-{}", std::process::id()));
+    let package_root = workspace.join("node_modules").join("purge-lib");
+    fs::create_dir_all(&package_root).expect("package root");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+    )
+    .expect("manifest");
+    fs::write(package_root.join("index.js"), "export const value = 1;").expect("entry");
+
+    let document = workspace.join("src").join("index.ts");
+    let request = ImportRequest {
+        specifier: "purge-lib".to_owned(),
+        package_name: "purge-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: Vec::new(),
+        import_kind: ImportKind::Namespace,
+        runtime: ImportRuntime::Component,
+    };
+    let resolved = resolve_package_entry(&document, &request).expect("package should resolve");
+    let key = cache_key_for_resolved_import(&request, &resolved);
+
+    let cache = ImportCache::new(None, false);
+    cache.insert(key.clone(), result("purge-lib", false));
+
+    // Paths still exist -> not an orphan -> survives the purge.
+    cache.purge_orphan_entries(ANALYZER_VERSION);
+    assert!(cache.get(&key).is_some());
+
+    // Uninstall the package -> its resolved paths are gone -> orphan -> purged.
+    fs::remove_dir_all(&package_root).expect("uninstall package");
+    cache.purge_orphan_entries(ANALYZER_VERSION);
+    assert!(
+        cache.get(&key).is_none(),
+        "orphan entry for an uninstalled package should be purged"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
 fn import_cache_bounds_memory_entries_with_lru_eviction() {
     use import_lens_daemon::cache::memory::MAX_MEMORY_ENTRIES;
     let cache = ImportCache::new(None, false);

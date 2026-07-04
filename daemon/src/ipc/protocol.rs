@@ -691,6 +691,7 @@ pub enum CacheRemoveScope {
     CurrentProject,
     Selected,
     All,
+    Orphans,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

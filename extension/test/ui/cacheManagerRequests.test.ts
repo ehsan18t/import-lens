@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   cacheCleanupRequest,
   cacheListRequest,
+  cachePurgeOrphansRequest,
   cacheRemoveAllRequest,
   cacheRemoveCurrentProjectRequest,
   cacheRemoveSelectedRequest,
@@ -45,5 +46,11 @@ test("cache manager request builders use protocol version 7", () => {
     version: 7,
     request_id: 6,
     scope: "all",
+  });
+  assert.deepEqual(cachePurgeOrphansRequest(7), {
+    type: "cache_remove",
+    version: 7,
+    request_id: 7,
+    scope: "orphans",
   });
 });

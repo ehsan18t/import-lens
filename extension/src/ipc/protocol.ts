@@ -395,7 +395,7 @@ export interface CacheListResponse {
   diagnostics: ImportDiagnostic[];
 }
 
-export type CacheRemoveScope = "current_project" | "selected" | "all";
+export type CacheRemoveScope = "current_project" | "selected" | "all" | "orphans";
 
 export interface CacheRemoveRequest {
   type: "cache_remove";

@@ -1,6 +1,12 @@
 import type { CacheListResponse, CacheShardInfo, CacheStatusResponse } from "../ipc/protocol.js";
 
-export type CacheManagerAction = "summary" | "cleanup" | "clearCurrent" | "clearAll" | "inspect";
+export type CacheManagerAction =
+  | "summary"
+  | "cleanup"
+  | "clearCurrent"
+  | "clearAll"
+  | "purgeOrphans"
+  | "inspect";
 
 export interface CacheManagerActionItem {
   label: string;
@@ -61,6 +67,12 @@ export const cacheManagerActionItems = (status: CacheStatusResponse): CacheManag
     label: "$(trash) Clear All ImportLens Cache",
     description: formatCacheBytes(status.total_size_bytes),
     action: "clearAll",
+  },
+  {
+    label: "$(clear-all) Purge Orphan Cache",
+    description: "Remove caches for deleted projects and uninstalled packages",
+    detail: "Keeps caches whose files still exist; drops only genuinely orphaned entries.",
+    action: "purgeOrphans",
   },
   {
     label: "$(folder-opened) Inspect Project Caches",

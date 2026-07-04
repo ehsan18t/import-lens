@@ -56,3 +56,10 @@ export const cacheRemoveAllRequest = (requestId: number): CacheRemoveRequest => 
   request_id: requestId,
   scope: "all",
 });
+
+export const cachePurgeOrphansRequest = (requestId: number): CacheRemoveRequest => ({
+  type: "cache_remove",
+  version: protocolVersion,
+  request_id: requestId,
+  scope: "orphans",
+});

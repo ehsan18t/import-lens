@@ -87,6 +87,32 @@ pub fn cache_key_matches_package(key: &str, package_name: &str) -> bool {
     key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix)
 }
 
+/// Whether a cache entry is an orphan the user's purge action should drop:
+/// built by a different analyzer version (release-stale), or resolved from a
+/// package whose entry/root no longer exists on disk (uninstalled). A *changed*
+/// file is NOT an orphan (it recomputes on access); only a *missing* one is, so
+/// this checks path existence, not fingerprint currency. Undecodable keys are
+/// left alone.
+pub fn cache_key_is_orphan(key: &str, current_analyzer_version: &str) -> bool {
+    let Some(identity) = decode_cache_identity(key) else {
+        return false;
+    };
+    if identity.analyzer_version != current_analyzer_version {
+        return true;
+    }
+    if identity
+        .entry_path
+        .as_deref()
+        .is_some_and(|path| !Path::new(path).exists())
+    {
+        return true;
+    }
+    identity
+        .package_root
+        .as_deref()
+        .is_some_and(|path| !Path::new(path).exists())
+}
+
 /// Whether `key` belongs to any package in `package_names`. Decodes the key's
 /// identity exactly once and tests set membership, so invalidating a burst of
 /// packages is a single O(keys) pass instead of O(keys * packages) with a full

@@ -1,7 +1,7 @@
 use crate::{
     cache::key::{
-        ANALYZER_VERSION, CacheIdentityV3, FileFingerprint, cache_key_matches_any_package,
-        decode_cache_identity, fingerprints_are_current,
+        ANALYZER_VERSION, CacheIdentityV3, FileFingerprint, cache_key_is_orphan,
+        cache_key_matches_any_package, decode_cache_identity, fingerprints_are_current,
     },
     cache::memory::CachedImport,
     ipc::protocol::{ImportResult, ModuleContribution},
@@ -359,6 +359,54 @@ impl DiskCache {
                 self.remove_pending_touch(&key);
             }
         }
+    }
+
+    /// Drops orphaned entries (release-stale analyzer version, or a resolved
+    /// package/entry path that no longer exists). Scans once under a read txn,
+    /// then removes under a short write txn. Returns the number removed.
+    pub fn purge_orphan_entries(&self, current_analyzer_version: &str) -> usize {
+        let db = match self.db.as_ref() {
+            Some(db) => db,
+            None => return 0,
+        };
+
+        let mut orphan_keys = Vec::new();
+        if let Ok(read_txn) = db.begin_read()
+            && let Ok(table) = read_txn.open_table(CACHE_TABLE)
+            && let Ok(iter) = table.iter()
+        {
+            for result in iter {
+                if let Ok((key, _)) = result
+                    && cache_key_is_orphan(key.value(), current_analyzer_version)
+                {
+                    orphan_keys.push(key.value().to_owned());
+                }
+            }
+        }
+
+        if orphan_keys.is_empty() {
+            return 0;
+        }
+
+        if let Ok(write_txn) = db.begin_write() {
+            if let Ok(mut table) = write_txn.open_table(CACHE_TABLE) {
+                for key in &orphan_keys {
+                    let _ = table.remove(key.as_str());
+                }
+            }
+            if let Ok(mut recents) = write_txn.open_table(RECENTS_TABLE) {
+                for key in &orphan_keys {
+                    let _ = recents.remove(key.as_str());
+                }
+            }
+            let _ = write_txn.commit();
+        }
+
+        if let Ok(mut pending) = self.pending_inserts.lock() {
+            pending.retain(|key, _| !cache_key_is_orphan(key, current_analyzer_version));
+        }
+
+        orphan_keys.len()
     }
 
     pub fn clear(&self) {

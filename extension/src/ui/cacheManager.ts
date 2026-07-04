@@ -8,6 +8,7 @@ import { cacheManagerActionItems, cacheShardPickItems } from "./cacheManagerItem
 import {
   cacheCleanupRequest,
   cacheListRequest,
+  cachePurgeOrphansRequest,
   cacheRemoveAllRequest,
   cacheRemoveCurrentProjectRequest,
   cacheRemoveSelectedRequest,
@@ -72,7 +73,45 @@ export const showCacheManager = async (
     return;
   }
 
+  if (selected.action === "purgeOrphans") {
+    await purgeOrphanCaches(daemon, logger, afterMutation);
+    return;
+  }
+
   await inspectProjectCaches(daemon, logger, afterMutation);
+};
+
+export const purgeOrphanCaches = async (
+  daemon: DaemonManager,
+  logger: Pick<Logger, "info" | "warn">,
+  afterMutation?: () => void,
+): Promise<void> => {
+  const workspaceRoot = await requireWorkspaceRoot();
+
+  if (!workspaceRoot || !(await ensureDaemonReady(daemon, workspaceRoot))) {
+    return;
+  }
+
+  const confirmed = await vscode.window.showWarningMessage(
+    "Purge orphan ImportLens caches for deleted projects and uninstalled packages?",
+    { modal: true },
+    "Purge Orphans",
+  );
+
+  if (confirmed !== "Purge Orphans") {
+    return;
+  }
+
+  const response = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "ImportLens: Purging orphan caches",
+    },
+    () => daemon.removeCache(cachePurgeOrphansRequest(nextIpcRequestId())),
+  );
+
+  await reportRemoveResponse(logger, "orphan", response);
+  notifyAfterMutation(response, afterMutation);
 };
 
 export const clearCurrentProjectCache = async (

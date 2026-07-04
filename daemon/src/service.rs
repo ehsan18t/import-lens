@@ -1108,6 +1108,7 @@ impl ImportLensService {
                 .cache_registry
                 .remove_selected(request.shard_ids.as_deref().unwrap_or(&[])),
             CacheRemoveScope::All => self.cache_registry.remove_all(),
+            CacheRemoveScope::Orphans => self.cache_registry.purge_orphans(),
         };
         let (removed, failed): (Vec<_>, Vec<_>) =
             results.into_iter().partition(|result| result.removed);

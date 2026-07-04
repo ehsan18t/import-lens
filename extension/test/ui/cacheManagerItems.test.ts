@@ -10,7 +10,7 @@ test("cacheManagerActionItems presents summary and maintenance actions", () => {
   assert.equal(items[0]?.description, "142 MB across 3 projects - limit 512 MB - 30 days");
   assert.deepEqual(
     items.slice(1).map((item) => item.action),
-    ["cleanup", "clearCurrent", "clearAll", "inspect"],
+    ["cleanup", "clearCurrent", "clearAll", "purgeOrphans", "inspect"],
   );
 });
 

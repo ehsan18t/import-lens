@@ -1,7 +1,10 @@
 use crate::{
     cache::{
         disk::DiskCache,
-        key::{FileFingerprint, cache_key_matches_any_package, fingerprints_are_current},
+        key::{
+            FileFingerprint, cache_key_is_orphan, cache_key_matches_any_package,
+            fingerprints_are_current,
+        },
     },
     ipc::protocol::ImportResult,
 };
@@ -233,6 +236,25 @@ impl ImportCache {
         for key in keys {
             memory.remove(&key);
         }
+    }
+
+    /// Drops orphaned entries (release-stale analyzer version, or a resolved
+    /// package/entry path that no longer exists) from both layers. Returns the
+    /// number removed from disk.
+    pub fn purge_orphan_entries(&self, current_analyzer_version: &str) -> usize {
+        let removed = self.disk.purge_orphan_entries(current_analyzer_version);
+
+        let memory = self.memory.pin();
+        let keys = memory
+            .iter()
+            .filter(|(key, _)| cache_key_is_orphan(key, current_analyzer_version))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            memory.remove(&key);
+        }
+
+        removed
     }
 
     pub fn clear(&self) {

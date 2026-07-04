@@ -239,6 +239,51 @@ impl ProjectCacheRegistry {
             .collect()
     }
 
+    /// User-triggered orphan purge. Removes shards whose project root no longer
+    /// exists on disk, and drops stale/uninstalled entries from surviving shards.
+    /// Stat-only (no project-tree scan): each check is one `Path::exists`. Returns
+    /// the removed-shard results (entry-level drops are not surfaced per entry).
+    pub fn purge_orphans(&self) -> Vec<CacheOperationResult> {
+        let analyzer_version = crate::cache::key::ANALYZER_VERSION;
+        let loaded_ids = self
+            .loaded
+            .lock()
+            .map(|loaded| loaded.keys().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+
+        let mut removed = Vec::new();
+        for shard in self.list_shards() {
+            let root_missing =
+                !shard.project_root.is_empty() && !Path::new(&shard.project_root).exists();
+            if root_missing {
+                removed.push(self.remove_shard_by_id(&shard.shard_id));
+                continue;
+            }
+
+            if loaded_ids.contains(&shard.shard_id) {
+                // Clone the Arc out and release the lock before the scan+write, so
+                // the purge doesn't block peers needing the loaded map.
+                let cache = self.loaded.lock().ok().and_then(|loaded| {
+                    loaded
+                        .get(&shard.shard_id)
+                        .map(|entry| Arc::clone(&entry.cache))
+                });
+                if let Some(cache) = cache {
+                    cache.purge_orphan_entries(analyzer_version);
+                }
+            } else if !shard.cache_path.is_empty() {
+                let cache = ImportCache::new_with_recent_preload_limit(
+                    Some(PathBuf::from(&shard.cache_path)),
+                    self.enable_disk_cache,
+                    0,
+                );
+                cache.purge_orphan_entries(analyzer_version);
+            }
+        }
+
+        removed
+    }
+
     pub fn invalidate_package(&self, package_name: &str) {
         self.invalidate_packages(&[package_name.to_owned()]);
     }
