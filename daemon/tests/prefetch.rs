@@ -1,6 +1,7 @@
 use import_lens_daemon::{
     cache::key::cache_key_for_resolved_import,
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
+    pipeline::graph::build_module_graph_cached_with_runtime,
     pipeline::resolver::resolve_package_entry,
     prefetch::{
         CancellationToken, Prefetcher, cached_import_request_from_key,
@@ -130,6 +131,16 @@ fn package_json_prewarm_requests_skip_default_for_packages_without_default_expor
         r#"{"dependencies":{"named-lib":"^1.0.0"}}"#,
     )
     .expect("workspace package json should be written");
+
+    // Warm the module graph so the (already-cached-only) default-export check can
+    // suppress the uncacheable Default variant. On a cold cache the Default job is
+    // enqueued and only later prewarms suppress it.
+    let entry = workspace
+        .join("node_modules")
+        .join("named-lib")
+        .join("index.js");
+    build_module_graph_cached_with_runtime(&entry, ImportRuntime::Component)
+        .expect("named-lib graph should build");
 
     let requests = package_json_prewarm_requests(&package_json_path, &active_document_path)
         .expect("prewarm requests should be created");

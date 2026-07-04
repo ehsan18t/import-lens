@@ -279,6 +279,27 @@ pub fn build_module_graph_cached_with_runtime(
     Ok(graph)
 }
 
+/// Returns the module graph for `entry_path` only if it is already cached and
+/// still current; never builds one. Used where building would be wasteful, e.g.
+/// a prewarm enumeration over a large manifest that would otherwise serialize
+/// graph builds and thrash the bounded cache.
+pub fn cached_module_graph_with_runtime(
+    entry_path: &Path,
+    runtime: ImportRuntime,
+) -> Option<Arc<ModuleGraph>> {
+    let entry_path = normalize_existing_path(entry_path).ok()?;
+    let cache = GRAPH_CACHE.get()?;
+    let pinned = cache.pin();
+    let cached = pinned.get(&(entry_path, runtime))?;
+    if fingerprints_are_current(&cached.fingerprints) {
+        cached
+            .last_used_millis
+            .store(crate::time::unix_millis_now(), Ordering::Relaxed);
+        return Some(Arc::clone(&cached.graph));
+    }
+    None
+}
+
 pub fn module_graph_cache_len() -> usize {
     GRAPH_CACHE
         .get()

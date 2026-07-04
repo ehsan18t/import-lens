@@ -3,7 +3,7 @@ use crate::{
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
-        graph::{build_module_graph_cached_with_runtime, module_provides_export},
+        graph::{cached_module_graph_with_runtime, module_provides_export},
         resolver::{ResolvedPackage, resolve_package_entry, resolved_from_cache_identity},
     },
     service::ImportLensService,
@@ -196,19 +196,23 @@ fn package_json_prewarm_jobs(
 
 // A `Default` prewarm job for a package with no `default` export emits an
 // "exports" diagnostic, so `should_cache_result` refuses to cache the result and
-// every prewarm trigger re-runs bundle+minify+compress for nothing. Only enqueue
-// the Default variant when the entry actually exposes a default export. The graph
-// is GRAPH_CACHE-shared with the Namespace job, so this adds no net graph builds;
-// on a warm cache (the repeated-trigger case this targets) it is a cheap lookup.
+// every prewarm trigger re-runs bundle+minify+compress for nothing. Suppress the
+// Default variant when the entry exposes no default export -- but only when the
+// module graph is ALREADY cached: building one here would serialize graph builds
+// during enumeration and thrash the bounded GRAPH_CACHE on large manifests. On a
+// cold cache this returns true (the Default job runs once, as before); a later
+// prewarm, after the Namespace job has warmed the graph, then suppresses it.
 fn exposes_default_export(resolved: &ResolvedPackage) -> bool {
     // CommonJS default interop always yields a usable default binding.
     if resolved.is_cjs {
         return true;
     }
-    match build_module_graph_cached_with_runtime(&resolved.entry_path, ImportRuntime::Component) {
-        Ok(graph) => module_provides_export(&graph, graph.entry_id, "default", &mut HashSet::new()),
-        // If the graph can't be built here, don't suppress the Default variant.
-        Err(_) => true,
+    match cached_module_graph_with_runtime(&resolved.entry_path, ImportRuntime::Component) {
+        Some(graph) => {
+            module_provides_export(&graph, graph.entry_id, "default", &mut HashSet::new())
+        }
+        // Not cached yet -> don't suppress; the Default job runs this round.
+        None => true,
     }
 }
 

@@ -25,7 +25,7 @@ import { nextIpcRequestId } from "./ipc/requestIds.js";
 import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import { bytesForCompression, formatBytes, labelForCompression } from "./ui/format.js";
-import type { StatusBarController } from "./ui/statusbar.js";
+import type { StatusBarController, StatusBarState } from "./ui/statusbar.js";
 import { analysisRootForFile } from "./workspaceContext.js";
 
 export class DocumentAnalysisController implements vscode.Disposable {
@@ -96,11 +96,11 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
     if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
       this.#store.clear(document.uri);
-      this.#statusBar.setState({ kind: "unavailable" });
+      this.setStatusForActive(document, { kind: "unavailable" });
       return;
     }
 
-    this.#statusBar.setState({ kind: "computing" });
+    this.setStatusForActive(document, { kind: "computing" });
     this.#logger.debug(`Starting document analysis request ${requestId}.`);
 
     try {
@@ -119,7 +119,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
       if (!response) {
         this.#store.clear(document.uri);
-        this.#statusBar.setState({ kind: "unavailable" });
+        this.setStatusForActive(document, { kind: "unavailable" });
         return;
       }
 
@@ -130,13 +130,13 @@ export class DocumentAnalysisController implements vscode.Disposable {
       if (response.error) {
         this.#logger.warn(`Document analysis failed: ${response.error}`);
         this.#store.clear(document.uri);
-        this.#statusBar.setState({ kind: "unavailable" });
+        this.setStatusForActive(document, { kind: "unavailable" });
         return;
       }
 
       if (response.imports.length === 0) {
         this.#store.clear(document.uri);
-        this.#statusBar.setState({ kind: "ready" });
+        this.setStatusForActive(document, { kind: "ready" });
         return;
       }
 
@@ -177,7 +177,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
         `Analysis request failed: ${error instanceof Error ? error.message : String(error)}`,
       );
       this.#store.clear(document.uri);
-      this.#statusBar.setState({ kind: "unavailable" });
+      this.setStatusForActive(document, { kind: "unavailable" });
     }
   }
 
@@ -209,15 +209,25 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
     if (!response || response.error) {
-      this.#statusBar.setState({ kind: "unavailable" });
+      // Analysis itself succeeded (decorations are shown); a failed size
+      // round-trip should not read as "Unavailable".
+      this.setStatusForActive(document, { kind: "ready" });
       return;
     }
     if (response.imports.length === 0) {
-      this.#statusBar.setState({ kind: "ready" });
+      this.setStatusForActive(document, { kind: "ready" });
       return;
     }
     const label = `${formatBytes(bytesForCompression(response, config.compression))} ${labelForCompression(config.compression)}`;
-    this.#statusBar.setState({ kind: "size", label });
+    this.setStatusForActive(document, { kind: "size", label });
+  }
+
+  private setStatusForActive(document: vscode.TextDocument, state: StatusBarState): void {
+    // The status bar reflects the active editor, so a late-completing analysis
+    // for a now-inactive document must not overwrite the active file's status.
+    if (vscode.window.activeTextEditor?.document.uri.toString() === document.uri.toString()) {
+      this.#statusBar.setState(state);
+    }
   }
 
   private disposeDocument(document: vscode.TextDocument): void {
