@@ -9,27 +9,32 @@ ImportLens is a VS Code extension that shows real-time bundle-size analysis for 
 1. **TypeScript extension host** — parses imports, resolves versions, renders UI, communicates over IPC.
 2. **Rust daemon** — performs tree-shaking, minification, multi-format compression, and caching via IPC.
 
-## Critical Version Pins
+## Reference Versions & Pinning Policy
 
-Before writing ANY code, verify these versions. They are the most common source of agent errors:
+These are current reference versions, **not** a mandate to pin everything. The project follows a tiered dependency-version policy (SRS §9) — stay current automatically wherever it is safe, chosen by the blast radius of an automatic upgrade:
 
-| Dependency            | Pinned Version | Notes                                  |
-| --------------------- | -------------- | -------------------------------------- |
-| `oxc-parser` (npm)    | `0.133.0`      | NOT 0.123.0. Must match Rust crate.    |
-| `oxc_parser` (Rust)   | `~0.133`       | All OXC crates same version.           |
-| `oxc_resolver` (Rust) | `~11.19`       | Independent repo, independent version. |
-| `redb` (Rust)         | `^4`           | NOT v3. v4.0.0 minimum.                |
-| `papaya` (Rust)       | `~0.2`         | Lock-free, requires pin API.           |
-| Node.js (build)       | `24 LTS`       | Build/test/package only.               |
-| `pnpm`                | `11.9.0`       | Pinned through Corepack and CI.         |
-| `@types/vscode`       | `1.90.0`       | Matches `engines.vscode`.              |
-| `typescript`          | `6.0.3`        | TS 6.x, NOT 5.x.                       |
-| `tsdown`              | `0.22.3`       | Rolldown-powered bundler.              |
-| `@vscode/vsce`        | `3.9.2`        | VSIX package/publish tooling.          |
+- **Tier 1 — track minor+patch (caret `^`)** where no in-major upgrade can break us (e.g. `redb ^4`, most well-behaved libs, dev tooling like Biome/lefthook).
+- **Tier 2 — patch-only (tilde `~`)** where a minor could break: the coordinated OXC stack (`oxc_parser ~0.138.0`, all monorepo crates on ONE version) and `oxc_resolver ~11.22.0`, plus `papaya ~0.2`.
+- **Tier 3 — exact (`=`)** only when even a patch can break (e.g. GitHub Action pins, for supply-chain safety).
+
+A caret/tilde range is the intended policy — **do not flag it as an error**.
+
+| Dependency            | Version    | Tier / Notes                                    |
+| --------------------- | ---------- | ----------------------------------------------- |
+| `oxc_parser` (Rust)   | `~0.138.0` | Patch-pin; all OXC monorepo crates one version. |
+| `oxc_resolver` (Rust) | `~11.22.0` | Patch-pin; independent repo/version.            |
+| `redb` (Rust)         | `^4`       | Track minor+patch. v4.0.0 minimum (NOT v3).     |
+| `papaya` (Rust)       | `~0.2`     | Patch-pin; lock-free, requires pin API.         |
+| Node.js (build)       | `24 LTS`   | Build/test/package only.                        |
+| `pnpm`                | `11.9.0`   | Pinned through Corepack and CI.                 |
+| `@types/vscode`       | `1.90.0`   | Matches `engines.vscode` baseline.              |
+| `typescript`          | `6.0.3`    | TS 6.x, NOT 5.x.                                |
+| `tsdown`              | `0.22.3`   | Rolldown-powered bundler.                       |
+| `@vscode/vsce`        | `3.9.2`    | VSIX package/publish tooling.                   |
 
 ## Banned Packages — DO NOT USE
 
-- `@oxc-parser/wasm` → use `oxc-parser` (NAPI)
+- `@oxc-parser/wasm` and `oxc-parser` (npm) → parse in the Rust daemon (`oxc_parser` crate); the extension host does not parse
 - `sled` → use `redb` v4
 - `dashmap` → use `papaya`
 - `num_cpus` → use `std::thread::available_parallelism()`
@@ -43,7 +48,7 @@ Before writing ANY code, verify these versions. They are the most common source 
 3. **Socket path**: Must include window-unique identifier (NFR-014b).
 4. **Length-prefix framing**: Every IPC message needs a 4-byte big-endian length header.
 5. **Shutdown sequence**: 3 steps — Shutdown IPC → 5s → SIGTERM → 2s → SIGKILL (Unix).
-6. **oxc-parser version**: 0.133.0, not 0.123.0.
+6. **OXC crate versions**: all monorepo crates share one coordinated version (currently `0.138.0`, patch-pinned `~`); `oxc_resolver` is separate (`~11.22.0`).
 7. **redb version**: v4.x, not v3.x. Must have schema versioning (FR-026a).
 8. **File watcher glob**: `**/node_modules/*/package.json` (single star), not double star.
 9. **sideEffects array**: Treat `["*.css"]` conservatively as `true` in v1.0.
@@ -52,9 +57,9 @@ Before writing ANY code, verify these versions. They are the most common source 
 ## Architecture Quick Reference
 
 ```
-User types → 300ms debounce → oxc-parser (NAPI) → filter imports
-→ resolve versions from node_modules → BatchRequest (MessagePack + length-prefix)
+User types → 300ms debounce → BatchRequest with document source (MessagePack + length-prefix)
 → Unix socket / Named pipe → Rust daemon
+→ oxc_parser extracts imports → resolve installed versions from node_modules
 → papaya cache check → [miss: oxc_resolver → module graph → tree-shake
 → oxc_minifier → nested rayon::join(gzip, (brotli, zstd))]
 → BatchResponse → decorations / inlay hints
@@ -70,7 +75,6 @@ When implementing a specific area, load the relevant skill:
 | IPC wire protocol, message types    | `ipc-message-protocol`       |
 | TypeScript IPC client               | `ts-ipc-client`              |
 | Rust IPC server                     | `rust-tokio-ipc-server`      |
-| Import parsing (extension host)     | `ts-oxc-parser-napi`         |
 | Package version resolution          | `ts-package-resolver`        |
 | Document listener, debounce         | `ts-debounce-listener`       |
 | Module resolution (daemon)          | `rust-oxc-resolver`          |

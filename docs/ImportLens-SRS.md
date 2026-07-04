@@ -656,6 +656,16 @@ The following criteria constitute the definition of done for the v1.0 release. A
 
 ## 9. Technical Stack
 
+### 9.0 Dependency Version Policy
+
+ImportLens deliberately tracks recent dependency versions and stays current automatically wherever it is safe. Every dependency's version constraint — new or existing — is chosen by the **blast radius of an automatic upgrade**, tightening only as far as the real risk demands. New dependencies are added at their latest stable release resolved at implementation time. A caret or tilde range is the intended policy, not a defect to be "fixed" to an exact pin.
+
+- **Tier 1 — track minor + patch (caret `^`):** no in-major upgrade can break the project. Applies to most well-behaved libraries and dev tooling (e.g. Biome, lefthook), and to `redb ^4`.
+- **Tier 2 — patch-only (tilde `~`):** a minor bump could break, so only patches flow automatically. Applies to the coordinated OXC stack (`~0.138.0`, all monorepo crates on one version) and `oxc_resolver` (`~11.22.0`), and to `papaya ~0.2`. See §9.3 and constraint C-001.
+- **Tier 3 — exact (`=`):** reserved for the rare case where even a patch can break, or where mutability is a supply-chain risk (e.g. pinning GitHub Actions to an exact release).
+
+The specific per-dependency policy for each crate and package is recorded in the manifest tables in §9.4.1–§9.4.3.
+
 ### 9.1 Extension Host (TypeScript)
 
 | Component     | Technology                                        | Rationale                                                                                                                                                                                                                                     |

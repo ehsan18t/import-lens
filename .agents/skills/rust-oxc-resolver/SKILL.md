@@ -1,6 +1,6 @@
 ---
 name: rust-oxc-resolver
-description: "Resolving module entry paths from the active document path using oxc_resolver (v11.19.x, separate repo from OXC monorepo). Use when implementing daemon/src/pipeline/resolve.rs (FR-008, FR-017)."
+description: "Resolving module entry paths from the active document path using oxc_resolver (v11.22.x, separate repo from OXC monorepo). Use when implementing daemon/src/pipeline/resolve.rs (FR-008, FR-017)."
 ---
 
 # Instructions
@@ -33,5 +33,5 @@ if let Ok(res) = resolution {
 
 ## Rules
 
-- Note that `oxc_resolver` lives in a separate repository (`oxc-project/oxc-resolver`) and is versioned independently from the main OXC suite. Use `~11.19`.
+- Note that `oxc_resolver` lives in a separate repository (`oxc-project/oxc-resolver`) and is versioned independently from the main OXC suite. Patch-pin it as `~11.22.0`.
 - Cache resolver instances rather than recreating them on every request, as instances load and parse package.json files natively.

@@ -22,7 +22,7 @@ import-lens/
 │   ├── src/
 │   │   ├── extension.ts               # activate() / deactivate()
 │   │   ├── listener.ts                # onDidChangeTextDocument, debounce
-│   │   ├── parser.ts                  # oxc-parser NAPI import extraction
+│   │   ├── parser.ts                  # import range detection (source forwarded to daemon)
 │   │   ├── resolver.ts                # package.json version resolution
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
@@ -54,7 +54,7 @@ import-lens/
 │       │   ├── graph.rs               # Module graph walker
 │       │   ├── treeshake.rs           # Reachability analysis
 │       │   ├── transform.rs           # oxc_transformer (TS/JSX stripping)
-│       │   ├── minify.rs              # oxc_minifier + oxc_mangler
+│       │   ├── minify.rs              # oxc_minifier (mangling via minifier options)
 │       │   ├── codegen.rs             # oxc_codegen AST-to-string
 │       │   └── compress.rs            # flate2 + brotli + zstd (nested rayon::join)
 │       ├── cache/
@@ -91,31 +91,28 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.89.0"
 ```
 
 ## 3. Daemon Cargo.toml — Pinned Versions
 
-All OXC crates MUST be pinned to `~0.133`. `oxc_resolver` is independent at `~11.19`.
+All OXC monorepo crates MUST be patch-pinned (`~`) to `~0.138.0` (coordinated — all monorepo crates share the same version). `oxc_resolver` is versioned independently and is patch-pinned to `~11.22.0`.
 
 ```toml
 [package]
 name = "import-lens-daemon"
 version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 # OXC suite — ALL must be same version
-oxc_parser = "~0.133"
-oxc_resolver = "~11.19"
-oxc_semantic = "~0.133"
-oxc_transformer = "~0.133"
-oxc_minifier = "~0.133"
-oxc_mangler = "~0.133"
-oxc_codegen = "~0.133"
-oxc_allocator = "~0.133"
-oxc_span = "~0.133"
+oxc_parser = "~0.138.0"
+oxc_resolver = "~11.22.0"
+oxc_semantic = "~0.138.0"
+oxc_transformer = "~0.138.0"
+oxc_minifier = "~0.138.0"
+oxc_codegen = "~0.138.0"
+oxc_allocator = "~0.138.0"
+oxc_span = "~0.138.0"
 
 # Caching
 papaya = "~0.2"
@@ -161,7 +158,6 @@ strip = true
     "onLanguage:javascriptreact"
   ],
   "dependencies": {
-    "oxc-parser": "0.133.0",
     "@msgpack/msgpack": "3.1.3"
   },
   "devDependencies": {
@@ -175,7 +171,6 @@ strip = true
 
 > [!IMPORTANT]
 >
-> - `oxc-parser` is v0.133.0, NOT v0.123.0. The npm package MUST match the Rust crate version.
 > - `@types/vscode` MUST be 1.100.0, matching the minimum `engines.vscode`.
 > - `@vscode/vsce` MUST be 3.9.1. Use `--no-dependencies` when building VSIX.
 > - Do NOT use `@oxc-parser/wasm`, `dashmap`, `sled`, or `num_cpus` anywhere.
@@ -184,7 +179,7 @@ strip = true
 
 These must NEVER appear in `Cargo.toml` or `package.json`:
 
-- `@oxc-parser/wasm` (npm) → use `oxc-parser` NAPI
+- `@oxc-parser/wasm` and `oxc-parser` (npm) → parse in the Rust daemon (`oxc_parser` crate)
 - `sled` (Rust) → use `redb` v4
 - `dashmap` (Rust) → use `papaya`
 - `num_cpus` (Rust) → use `std::thread::available_parallelism()`
@@ -192,5 +187,5 @@ These must NEVER appear in `Cargo.toml` or `package.json`:
 ## Rules
 
 - The `dist/bin/` directory is gitignored and CI-populated.
-- The extension must be bundled to a single file by `tsdown`. Only `oxc-parser` (NAPI) and `@msgpack/msgpack` are runtime dependencies.
+- The extension must be bundled to a single file by `tsdown`. Only `@msgpack/msgpack` is a runtime dependency (all parsing is daemon-side).
 - The `vscode` module must always be marked as `external` in tsdown config.
