@@ -666,55 +666,90 @@ impl ImportLensService {
         // package.json read) in parallel; into_par_iter preserves order, so the
         // resulting states and import_requests still line up with streaming
         // indexes exactly as the sequential loop did.
-        let resolved: Vec<(PackageJsonDependencyAnalysisItem, Option<ImportRequest>)> =
-            package_json_dependency_entries(&request.source)
-                .into_par_iter()
-                .map(|entry| {
-                    match resolve_installed_package_version(
-                        &context.active_document_path,
-                        &entry.name,
-                    ) {
-                        Ok(version) => {
-                            let import_request = ImportRequest {
-                                specifier: entry.name.clone(),
-                                package_name: entry.name.clone(),
-                                version: version.clone(),
-                                named: Vec::new(),
-                                import_kind: ImportKind::Namespace,
-                                runtime: ImportRuntime::Component,
-                            };
-                            let registry_hint = self
-                                .registry_hints
-                                .hint_for(&entry.name, Some(&version), registry_hint_mode, now_ms)
-                                .hint;
-                            let state = PackageJsonDependencyAnalysisItem {
-                                name: entry.name.clone(),
-                                section: entry.section.clone(),
-                                entry,
-                                status: ImportAnalysisStatus::Loading,
-                                installed_version: Some(version),
-                                registry_hint,
-                                message: None,
-                                result: None,
-                            };
-                            (state, Some(import_request))
+        type PreparedDependency = (ImportRequest, Option<ResolvedPackage>);
+        let resolved: Vec<(
+            PackageJsonDependencyAnalysisItem,
+            Option<PreparedDependency>,
+        )> = package_json_dependency_entries(&request.source)
+            .into_par_iter()
+            .map(|entry| {
+                // Resolve the package once here and carry the ResolvedPackage
+                // to the analysis pass below, so the manifest is read once
+                // instead of resolve_installed_package_version + a second
+                // resolve_package_entry per dependency. Entry resolution can
+                // fail for an installed-but-unresolvable package (e.g. types
+                // -only); fall back to the lightweight version read so the
+                // analysis pass still applies its declaration-only handling.
+                let probe = ImportRequest {
+                    specifier: entry.name.clone(),
+                    package_name: entry.name.clone(),
+                    version: String::new(),
+                    named: Vec::new(),
+                    import_kind: ImportKind::Namespace,
+                    runtime: ImportRuntime::Component,
+                };
+                let (version, resolved) =
+                    match resolve_package_entry(&context.active_document_path, &probe) {
+                        Ok(resolved) => {
+                            let version = resolved
+                                .package_json
+                                .get("version")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_owned();
+                            (Ok(version), Some(resolved))
                         }
-                        Err(message) => {
-                            let state = PackageJsonDependencyAnalysisItem {
-                                name: entry.name.clone(),
-                                section: entry.section.clone(),
-                                entry,
-                                status: ImportAnalysisStatus::Missing,
-                                installed_version: None,
-                                registry_hint: None,
-                                message: Some(message),
-                                result: None,
-                            };
-                            (state, None)
-                        }
+                        Err(_) => (
+                            resolve_installed_package_version(
+                                &context.active_document_path,
+                                &entry.name,
+                            ),
+                            None,
+                        ),
+                    };
+
+                match version {
+                    Ok(version) => {
+                        let import_request = ImportRequest {
+                            specifier: entry.name.clone(),
+                            package_name: entry.name.clone(),
+                            version: version.clone(),
+                            named: Vec::new(),
+                            import_kind: ImportKind::Namespace,
+                            runtime: ImportRuntime::Component,
+                        };
+                        let registry_hint = self
+                            .registry_hints
+                            .hint_for(&entry.name, Some(&version), registry_hint_mode, now_ms)
+                            .hint;
+                        let state = PackageJsonDependencyAnalysisItem {
+                            name: entry.name.clone(),
+                            section: entry.section.clone(),
+                            entry,
+                            status: ImportAnalysisStatus::Loading,
+                            installed_version: Some(version),
+                            registry_hint,
+                            message: None,
+                            result: None,
+                        };
+                        (state, Some((import_request, resolved)))
                     }
-                })
-                .collect();
+                    Err(message) => {
+                        let state = PackageJsonDependencyAnalysisItem {
+                            name: entry.name.clone(),
+                            section: entry.section.clone(),
+                            entry,
+                            status: ImportAnalysisStatus::Missing,
+                            installed_version: None,
+                            registry_hint: None,
+                            message: Some(message),
+                            result: None,
+                        };
+                        (state, None)
+                    }
+                }
+            })
+            .collect();
         let (mut states, import_requests): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
         // Persist any registry metadata fetched above in one snapshot write.
         self.registry_hints.flush();
@@ -736,9 +771,14 @@ impl ImportLensService {
         let indexed_results = import_requests
             .par_iter()
             .enumerate()
-            .filter_map(|(index, import_request)| import_request.as_ref().map(|item| (index, item)))
-            .map(|(index, import_request)| {
-                let result = self.analyze_with_cache(&context, import_request);
+            .filter_map(|(index, prepared)| prepared.as_ref().map(|item| (index, item)))
+            .map(|(index, (import_request, resolved))| {
+                let result = match resolved {
+                    Some(resolved) => {
+                        self.analyze_resolved_with_cache(&context, import_request, resolved.clone())
+                    }
+                    None => self.analyze_with_cache(&context, import_request),
+                };
 
                 if let Some(emit_partial) = emit_partial.as_ref() {
                     let mut state = states[index].clone();
@@ -1257,10 +1297,21 @@ impl ImportLensService {
         context: &AnalysisContext,
         request: &ImportRequest,
     ) -> ImportResult {
-        let resolved = match resolve_package_entry(&context.active_document_path, request) {
-            Ok(resolved) => resolved,
-            Err(_) => return analyze_import(context, request),
-        };
+        match resolve_package_entry(&context.active_document_path, request) {
+            Ok(resolved) => self.analyze_resolved_with_cache(context, request, resolved),
+            Err(_) => analyze_import(context, request),
+        }
+    }
+
+    // Cache lookup + analysis for an already-resolved package. The package.json
+    // analysis path resolves each dependency once and reuses the ResolvedPackage
+    // here, avoiding a second resolve_package_entry (and its manifest read).
+    fn analyze_resolved_with_cache(
+        &self,
+        context: &AnalysisContext,
+        request: &ImportRequest,
+        resolved: ResolvedPackage,
+    ) -> ImportResult {
         let key = cache_key_for_resolved_import(request, &resolved);
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
