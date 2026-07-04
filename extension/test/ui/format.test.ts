@@ -21,16 +21,61 @@ const result: ImportResult = {
 };
 
 test("formatImportSizePrimary supports minimal, standard, and verbose display modes", () => {
-  assert.equal(formatImportSizePrimary(result, { display: "minimal", compression: "brotli", showWarnings: true }), "1.5 kB br");
-  assert.equal(formatImportSizePrimary(result, { display: "standard", compression: "brotli", showWarnings: true }), "1.5 kB br · 5.3 kB min");
-  assert.equal(formatImportSizePrimary(result, { display: "verbose", compression: "brotli", showWarnings: true }), "1.5 kB br · 1.8 kB gz · 1.6 kB zstd · 5.3 kB min");
+  assert.equal(
+    formatImportSizePrimary(result, {
+      display: "minimal",
+      compression: "brotli",
+      showWarnings: true,
+    }),
+    "1.5 kB br",
+  );
+  assert.equal(
+    formatImportSizePrimary(result, {
+      display: "standard",
+      compression: "brotli",
+      showWarnings: true,
+    }),
+    "1.5 kB br · 5.3 kB min",
+  );
+  assert.equal(
+    formatImportSizePrimary(result, {
+      display: "verbose",
+      compression: "brotli",
+      showWarnings: true,
+    }),
+    "1.5 kB br · 1.8 kB gz · 1.6 kB zstd · 5.3 kB min",
+  );
 });
 
 test("formatImportSizePrimary shows unavailable and applies compression and confidence", () => {
-  assert.equal(formatImportSizePrimary({ ...result, error: "parse failed" }, { display: "standard", compression: "brotli", showWarnings: true }), "Size unavailable");
-  assert.equal(formatImportSizePrimary({ ...result, side_effects: true }, { display: "minimal", compression: "gzip", showWarnings: true }), "1.8 kB gz");
-  assert.equal(formatImportSizePrimary({ ...result, is_cjs: true, confidence: "low" }, { display: "minimal", compression: "zstd", showWarnings: true }), "~1.6 kB zstd");
-  assert.equal(formatImportSizePrimary({ ...result, confidence: "low" }, { display: "standard", compression: "brotli", showWarnings: true }), "~1.5 kB br · 5.3 kB min");
+  assert.equal(
+    formatImportSizePrimary(
+      { ...result, error: "parse failed" },
+      { display: "standard", compression: "brotli", showWarnings: true },
+    ),
+    "Size unavailable",
+  );
+  assert.equal(
+    formatImportSizePrimary(
+      { ...result, side_effects: true },
+      { display: "minimal", compression: "gzip", showWarnings: true },
+    ),
+    "1.8 kB gz",
+  );
+  assert.equal(
+    formatImportSizePrimary(
+      { ...result, is_cjs: true, confidence: "low" },
+      { display: "minimal", compression: "zstd", showWarnings: true },
+    ),
+    "~1.6 kB zstd",
+  );
+  assert.equal(
+    formatImportSizePrimary(
+      { ...result, confidence: "low" },
+      { display: "standard", compression: "brotli", showWarnings: true },
+    ),
+    "~1.5 kB br · 5.3 kB min",
+  );
 });
 
 test("importHintTagLabels reports server, CJS, and warning-visibility tags", () => {
@@ -38,7 +83,10 @@ test("importHintTagLabels reports server, CJS, and warning-visibility tags", () 
   assert.deepEqual(importHintTagLabels(result, true, "server"), ["server"]);
   assert.deepEqual(importHintTagLabels({ ...result, is_cjs: true }, true, "component"), ["CJS"]);
   assert.deepEqual(importHintTagLabels({ ...result, is_cjs: true }, false, "component"), []);
-  assert.deepEqual(importHintTagLabels({ ...result, is_cjs: true }, true, "server"), ["server", "CJS"]);
+  assert.deepEqual(importHintTagLabels({ ...result, is_cjs: true }, true, "server"), [
+    "server",
+    "CJS",
+  ]);
 });
 
 test("declaration-only packages report zero primary bytes and a types-only tag", () => {
@@ -58,6 +106,13 @@ test("declaration-only packages report zero primary bytes and a types-only tag",
     ],
   };
 
-  assert.equal(formatImportSizePrimary(typesOnly, { display: "minimal", compression: "brotli", showWarnings: true }), "0 B br");
+  assert.equal(
+    formatImportSizePrimary(typesOnly, {
+      display: "minimal",
+      compression: "brotli",
+      showWarnings: true,
+    }),
+    "0 B br",
+  );
   assert.deepEqual(importHintTagLabels(typesOnly, true, "component"), ["types only"]);
 });

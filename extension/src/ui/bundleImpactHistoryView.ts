@@ -1,4 +1,7 @@
-import { bundleImpactHistoryDeltaLabel, type BundleImpactHistoryItem } from "../analysis/history.js";
+import {
+  bundleImpactHistoryDeltaLabel,
+  type BundleImpactHistoryItem,
+} from "../analysis/history.js";
 import { formatBytes } from "./format.js";
 
 export const bundleImpactHistoryHtml = (history: readonly BundleImpactHistoryItem[]): string => {
@@ -108,9 +111,12 @@ ${historyChartSvg(oldestFirst, maxBrotli)}
 const historySummaryHtml = (history: readonly BundleImpactHistoryItem[]): string => {
   const latest = history[0];
   const previous = latest
-    ? history.find((item) => item.fileName === latest.fileName && item.timestamp !== latest.timestamp)
+    ? history.find(
+        (item) => item.fileName === latest.fileName && item.timestamp !== latest.timestamp,
+      )
     : undefined;
-  const delta = latest && previous ? bundleImpactHistoryDeltaLabel(latest, previous) : "No previous match";
+  const delta =
+    latest && previous ? bundleImpactHistoryDeltaLabel(latest, previous) : "No previous match";
 
   return `<section class="summary" aria-label="Bundle impact summary">
 <div class="metric">Latest Brotli<strong>${latest ? formatBytes(latest.brotliBytes) : "0 B"}</strong></div>
@@ -139,15 +145,21 @@ const historyChartSvg = (
   const chartWidth = width - padding * 2;
   const chartHeight = height - padding * 2;
   const points = history.map((item, index) => {
-    const x = padding + (history.length === 1 ? chartWidth / 2 : (index / (history.length - 1)) * chartWidth);
+    const x =
+      padding +
+      (history.length === 1 ? chartWidth / 2 : (index / (history.length - 1)) * chartWidth);
     const y = padding + chartHeight - (item.brotliBytes / maxBrotli) * chartHeight;
     return { item, x, y };
   });
   const polyline = points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
-  const circles = points.map((point) => `
+  const circles = points
+    .map(
+      (point) => `
 <circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="4">
 <title>${escapeHtml(`${formatBytes(point.item.brotliBytes)} br - ${point.item.fileName}`)}</title>
-</circle>`).join("");
+</circle>`,
+    )
+    .join("");
 
   return `<svg role="img" aria-label="Brotli size trend" viewBox="0 0 ${width} ${height}">
 <line x1="${padding}" y1="${height - padding}" x2="${width - padding}" y2="${height - padding}" stroke="var(--vscode-panel-border)" />

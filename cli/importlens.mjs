@@ -12,7 +12,19 @@ import { decode, encode } from "@msgpack/msgpack";
 
 const execFile = promisify(execFileCallback);
 const protocolVersion = 6;
-const supportedExtensions = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts", ".svelte", ".vue", ".astro"]);
+const supportedExtensions = new Set([
+  ".js",
+  ".jsx",
+  ".ts",
+  ".tsx",
+  ".mjs",
+  ".mts",
+  ".cjs",
+  ".cts",
+  ".svelte",
+  ".vue",
+  ".astro",
+]);
 const defaultIpcTimeoutMs = 10000;
 
 export const parseCliArgs = (argv) => {
@@ -58,7 +70,9 @@ export const loadBudgetConfig = async ({
   try {
     parsed = JSON.parse(source.text);
   } catch (error) {
-    throw new Error(`failed to parse ${source.path}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `failed to parse ${source.path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 
   return sanitizeBudgets(parsed.budgets ?? parsed.importLens?.budgets ?? {});
@@ -86,13 +100,23 @@ export const runImportLensCheck = async ({
     const result = await analyzeFile(path.resolve(resolveRoot, filePath));
     const relative = path.relative(cwd, result.filePath).split(path.sep).join("/");
 
-    if (budgets.perFileBrotliBytes !== undefined && result.brotliBytes > budgets.perFileBrotliBytes) {
-      violations.push(`${relative}: file Brotli budget exceeded: ${formatBytes(result.brotliBytes)} > ${formatBytes(budgets.perFileBrotliBytes)}`);
+    if (
+      budgets.perFileBrotliBytes !== undefined &&
+      result.brotliBytes > budgets.perFileBrotliBytes
+    ) {
+      violations.push(
+        `${relative}: file Brotli budget exceeded: ${formatBytes(result.brotliBytes)} > ${formatBytes(budgets.perFileBrotliBytes)}`,
+      );
     }
 
     for (const item of result.imports) {
-      if (budgets.perImportBrotliBytes !== undefined && item.brotliBytes > budgets.perImportBrotliBytes) {
-        violations.push(`${relative}: ${item.specifier} Brotli budget exceeded: ${formatBytes(item.brotliBytes)} > ${formatBytes(budgets.perImportBrotliBytes)}`);
+      if (
+        budgets.perImportBrotliBytes !== undefined &&
+        item.brotliBytes > budgets.perImportBrotliBytes
+      ) {
+        violations.push(
+          `${relative}: ${item.specifier} Brotli budget exceeded: ${formatBytes(item.brotliBytes)} > ${formatBytes(budgets.perImportBrotliBytes)}`,
+        );
       }
     }
   }
@@ -104,7 +128,9 @@ export const runImportLensCheck = async ({
     return 1;
   }
 
-  writeLine(`ImportLens budgets passed for ${files.length} changed ${files.length === 1 ? "file" : "files"}.`);
+  writeLine(
+    `ImportLens budgets passed for ${files.length} changed ${files.length === 1 ? "file" : "files"}.`,
+  );
   return 0;
 };
 
@@ -115,7 +141,9 @@ const main = async () => {
   const { topLevel, files } = hasBudgets(budgets)
     ? await changedFiles(cwd)
     : { topLevel: cwd, files: [] };
-  const supportedFiles = files.filter((filePath) => supportedExtensions.has(path.extname(filePath)));
+  const supportedFiles = files.filter((filePath) =>
+    supportedExtensions.has(path.extname(filePath)),
+  );
   let daemon;
 
   try {
@@ -210,17 +238,15 @@ const startDaemon = async (workspaceRoot) => {
   const { cachePath, lifecyclePath } = resolveCliStoragePaths();
   await mkdir(cachePath, { recursive: true });
   await mkdir(lifecyclePath, { recursive: true });
-  const pipeName = process.platform === "win32"
-    ? `\\\\.\\pipe\\import-lens-cli-${process.pid}-${randomUUID()}`
-    : path.join(lifecyclePath, `import-lens-cli-${process.pid}-${randomUUID()}.sock`);
-  const child = spawn(binary, [
-    "--pipe",
-    pipeName,
-    "--workspace",
-    workspaceRoot,
-    "--storage",
-    lifecyclePath,
-  ], { stdio: ["ignore", "ignore", "inherit"] });
+  const pipeName =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\import-lens-cli-${process.pid}-${randomUUID()}`
+      : path.join(lifecyclePath, `import-lens-cli-${process.pid}-${randomUUID()}.sock`);
+  const child = spawn(
+    binary,
+    ["--pipe", pipeName, "--workspace", workspaceRoot, "--storage", lifecyclePath],
+    { stdio: ["ignore", "ignore", "inherit"] },
+  );
   let socket;
   let client;
 
@@ -268,11 +294,12 @@ export const resolveCliStoragePaths = ({
   platform = process.platform,
   homeDir = os.homedir(),
 } = {}) => {
-  const basePath = platform === "win32"
-    ? path.join(env.LOCALAPPDATA ?? path.join(homeDir, "AppData", "Local"), "ImportLens")
-    : platform === "darwin"
-      ? path.join(homeDir, "Library", "Caches", "ImportLens")
-      : path.join(env.XDG_CACHE_HOME ?? path.join(homeDir, ".cache"), "import-lens");
+  const basePath =
+    platform === "win32"
+      ? path.join(env.LOCALAPPDATA ?? path.join(homeDir, "AppData", "Local"), "ImportLens")
+      : platform === "darwin"
+        ? path.join(homeDir, "Library", "Caches", "ImportLens")
+        : path.join(env.XDG_CACHE_HOME ?? path.join(homeDir, ".cache"), "import-lens");
 
   return {
     cachePath: path.join(basePath, "daemon-cache"),
@@ -431,10 +458,18 @@ const sanitizeBudgets = (value) => {
   }
 
   const budgets = {};
-  if (typeof value.perImportBrotliBytes === "number" && Number.isFinite(value.perImportBrotliBytes) && value.perImportBrotliBytes > 0) {
+  if (
+    typeof value.perImportBrotliBytes === "number" &&
+    Number.isFinite(value.perImportBrotliBytes) &&
+    value.perImportBrotliBytes > 0
+  ) {
     budgets.perImportBrotliBytes = Math.floor(value.perImportBrotliBytes);
   }
-  if (typeof value.perFileBrotliBytes === "number" && Number.isFinite(value.perFileBrotliBytes) && value.perFileBrotliBytes > 0) {
+  if (
+    typeof value.perFileBrotliBytes === "number" &&
+    Number.isFinite(value.perFileBrotliBytes) &&
+    value.perFileBrotliBytes > 0
+  ) {
     budgets.perFileBrotliBytes = Math.floor(value.perFileBrotliBytes);
   }
   return budgets;

@@ -8,5 +8,8 @@ const event = (changed: string) => ({
 
 test("cache storage policy settings restart the daemon", () => {
   assert.equal(classifyImportLensConfigChange(event("importLens.cacheMaxSizeMB")), "daemonRestart");
-  assert.equal(classifyImportLensConfigChange(event("importLens.cacheMaxAgeDays")), "daemonRestart");
+  assert.equal(
+    classifyImportLensConfigChange(event("importLens.cacheMaxAgeDays")),
+    "daemonRestart",
+  );
 });

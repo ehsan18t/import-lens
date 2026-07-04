@@ -29,11 +29,7 @@ export const changedLinesBetween = (base: string, current: string): Set<number> 
 
   let endBefore = before.length;
   let endAfter = after.length;
-  while (
-    endBefore > start
-    && endAfter > start
-    && before[endBefore - 1] === after[endAfter - 1]
-  ) {
+  while (endBefore > start && endAfter > start && before[endBefore - 1] === after[endAfter - 1]) {
     endBefore -= 1;
     endAfter -= 1;
   }
@@ -58,9 +54,10 @@ export const changedLinesBetween = (base: string, current: string): Set<number> 
   const dp: Int32Array[] = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
   for (let i = n - 1; i >= 0; i -= 1) {
     for (let j = m - 1; j >= 0; j -= 1) {
-      dp[i][j] = before[start + i] === after[start + j]
-        ? dp[i + 1][j + 1] + 1
-        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      dp[i][j] =
+        before[start + i] === after[start + j]
+          ? dp[i + 1][j + 1] + 1
+          : Math.max(dp[i + 1][j], dp[i][j + 1]);
     }
   }
 
@@ -106,10 +103,7 @@ export const changedLinesForFile = async (
       ["-C", directory, "rev-parse", "--show-toplevel"],
       { encoding: "utf8", timeout: 500 },
     );
-    const relativePath = path
-      .relative(topLevel.trim(), fileName)
-      .split(path.sep)
-      .join("/");
+    const relativePath = path.relative(topLevel.trim(), fileName).split(path.sep).join("/");
     const { stdout: baseText } = await execFileAsync(
       "git",
       ["-C", directory, "show", `HEAD:${relativePath}`],

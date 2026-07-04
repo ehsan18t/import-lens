@@ -42,9 +42,7 @@ const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
   ...overrides,
 });
 
-const readyState = (
-  overrides: Partial<ImportAnalysisState> = {},
-): ImportAnalysisState => ({
+const readyState = (overrides: Partial<ImportAnalysisState> = {}): ImportAnalysisState => ({
   detected: detectedImport({
     specifier: "lodash-es",
     specifierRange: sourceRange(0, 8, 20),
@@ -79,11 +77,14 @@ test("importHintParts returns neutral loading and missing states", () => {
     primaryTone: "neutral",
     suffixes: [],
   });
-  assert.deepEqual(importHintParts({ ...readyState(), status: "missing", message: "Missing pkg" }, config()), {
-    primary: "Missing pkg",
-    primaryTone: "neutral",
-    suffixes: [],
-  });
+  assert.deepEqual(
+    importHintParts({ ...readyState(), status: "missing", message: "Missing pkg" }, config()),
+    {
+      primary: "Missing pkg",
+      primaryTone: "neutral",
+      suffixes: [],
+    },
+  );
   assert.equal(importHintParts({ ...readyState(), status: "unavailable" }, config()), null);
 });
 

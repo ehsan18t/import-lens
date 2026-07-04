@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  cacheManagerActionItems,
-  cacheShardPickItems,
-} from "../../src/ui/cacheManagerItems.js";
+import { cacheManagerActionItems, cacheShardPickItems } from "../../src/ui/cacheManagerItems.js";
 import type { CacheListResponse, CacheStatusResponse } from "../../src/ipc/protocol.js";
 
 test("cacheManagerActionItems presents summary and maintenance actions", () => {
@@ -11,12 +8,10 @@ test("cacheManagerActionItems presents summary and maintenance actions", () => {
 
   assert.equal(items[0]?.label, "ImportLens cache");
   assert.equal(items[0]?.description, "142 MB across 3 projects - limit 512 MB - 30 days");
-  assert.deepEqual(items.slice(1).map((item) => item.action), [
-    "cleanup",
-    "clearCurrent",
-    "clearAll",
-    "inspect",
-  ]);
+  assert.deepEqual(
+    items.slice(1).map((item) => item.action),
+    ["cleanup", "clearCurrent", "clearAll", "inspect"],
+  );
 });
 
 test("cacheShardPickItems maps project shards to readable items", () => {

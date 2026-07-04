@@ -10,17 +10,14 @@ export const shouldShowColoredSourceHovers = (config: ImportLensConfig): boolean
   shouldShowInlayHints(config) && config.inlineRenderer === "colored";
 
 export const shouldShowDecorations = (config: ImportLensConfig): boolean =>
-  config.enabled
-  && (
-    shouldShowColoredSourceHovers(config)
-    || (config.display !== "inlayHint" && !config.useCodeLens)
-  );
+  config.enabled &&
+  (shouldShowColoredSourceHovers(config) ||
+    (config.display !== "inlayHint" && !config.useCodeLens));
 
 export const shouldShowCodeLens = (config: ImportLensConfig): boolean =>
   config.enabled && config.display !== "inlayHint" && config.useCodeLens;
 
-export const shouldOfferImportCompletions = (config: ImportLensConfig): boolean =>
-  config.enabled;
+export const shouldOfferImportCompletions = (config: ImportLensConfig): boolean => config.enabled;
 
 export const shouldShowPackageJsonDecorations = (config: ImportLensConfig): boolean =>
   config.enabled;

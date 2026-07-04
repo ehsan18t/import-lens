@@ -236,10 +236,7 @@ export class IpcClient extends EventEmitter {
     return this.#requestWithPending(this.#completionPending, request, timeoutMs);
   }
 
-  requestCacheStatus(
-    request: CacheStatusRequest,
-    timeoutMs = 10000,
-  ): Promise<CacheStatusResponse> {
+  requestCacheStatus(request: CacheStatusRequest, timeoutMs = 10000): Promise<CacheStatusResponse> {
     return this.#requestWithPending(this.#cacheStatusPending, request, timeoutMs);
   }
 
@@ -250,17 +247,11 @@ export class IpcClient extends EventEmitter {
     return this.#requestWithPending(this.#cacheCleanupPending, request, timeoutMs);
   }
 
-  requestCacheList(
-    request: CacheListRequest,
-    timeoutMs = 10000,
-  ): Promise<CacheListResponse> {
+  requestCacheList(request: CacheListRequest, timeoutMs = 10000): Promise<CacheListResponse> {
     return this.#requestWithPending(this.#cacheListPending, request, timeoutMs);
   }
 
-  requestCacheRemove(
-    request: CacheRemoveRequest,
-    timeoutMs = 30000,
-  ): Promise<CacheRemoveResponse> {
+  requestCacheRemove(request: CacheRemoveRequest, timeoutMs = 30000): Promise<CacheRemoveResponse> {
     return this.#requestWithPending(this.#cacheRemovePending, request, timeoutMs);
   }
 
@@ -514,13 +505,16 @@ const isRefreshRegistryHintsResponse = (value: unknown): value is RefreshRegistr
     typeof candidate.version === "number" &&
     typeof candidate.request_id === "number" &&
     Array.isArray(candidate.results) &&
-    candidate.results.every((result) =>
-      !!result &&
-      typeof result === "object" &&
-      !!(result as { target?: unknown }).target &&
-      typeof ((result as { target: { name?: unknown } }).target.name) === "string") &&
+    candidate.results.every(
+      (result) =>
+        !!result &&
+        typeof result === "object" &&
+        !!(result as { target?: unknown }).target &&
+        typeof (result as { target: { name?: unknown } }).target.name === "string",
+    ) &&
     (candidate.indexes === undefined ||
-      (Array.isArray(candidate.indexes) && candidate.indexes.every((index) => typeof index === "number"))) &&
+      (Array.isArray(candidate.indexes) &&
+        candidate.indexes.every((index) => typeof index === "number"))) &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics)
   );
@@ -561,11 +555,13 @@ const isAnalyzeDocumentResponse = (value: unknown): value is AnalyzeDocumentResp
     Array.isArray(candidate.imports) &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics) &&
-    candidate.imports.every((item) =>
-      !!item &&
-      typeof item === "object" &&
-      "detected" in item &&
-      typeof (item as { status?: unknown }).status === "string")
+    candidate.imports.every(
+      (item) =>
+        !!item &&
+        typeof item === "object" &&
+        "detected" in item &&
+        typeof (item as { status?: unknown }).status === "string",
+    )
   );
 };
 
@@ -580,7 +576,8 @@ const isAnalyzePackageJsonResponse = (value: unknown): value is AnalyzePackageJs
     typeof candidate.request_id === "number" &&
     Array.isArray(candidate.sections) &&
     Array.isArray(candidate.states) &&
-    (candidate.indexes === undefined || candidate.indexes.every((index) => typeof index === "number")) &&
+    (candidate.indexes === undefined ||
+      candidate.indexes.every((index) => typeof index === "number")) &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics)
   );
@@ -631,7 +628,9 @@ const isFileSizeResponse = (value: unknown): value is FileSizeResponse => {
   );
 };
 
-const isCompleteImportMembersResponse = (value: unknown): value is CompleteImportMembersResponse => {
+const isCompleteImportMembersResponse = (
+  value: unknown,
+): value is CompleteImportMembersResponse => {
   if (!value || typeof value !== "object") {
     return false;
   }
@@ -682,7 +681,9 @@ const isCacheOperationResult = (value: unknown): boolean => {
   );
 };
 
-const hasCacheResponseBase = (value: unknown): value is {
+const hasCacheResponseBase = (
+  value: unknown,
+): value is {
   version: number;
   request_id: number;
   error: string | null;

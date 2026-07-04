@@ -106,10 +106,11 @@ test("packageJsonDependencyTooltipMarkdown includes fetched time and single-pack
 
   assert.match(markdown, /Registry info fetched: time:1000/u);
   assert.match(markdown, /\$\(sync\) Refresh npm registry info/u);
-  assert.deepEqual(
-    commandArgs(markdown, refreshPackageJsonRegistryHintCommand),
-    ["file:///workspace/package.json", "react", "18.2.0"],
-  );
+  assert.deepEqual(commandArgs(markdown, refreshPackageJsonRegistryHintCommand), [
+    "file:///workspace/package.json",
+    "react",
+    "18.2.0",
+  ]);
 });
 
 test("packageJsonDependencyTooltipTrustedCommands keeps refresh and diagnostics permissions narrow", () => {
@@ -119,7 +120,9 @@ test("packageJsonDependencyTooltipTrustedCommands keeps refresh and diagnostics 
         name: "react",
         section: "dependencies",
         status: "ready",
-        result: result({ diagnostics: [{ stage: "resolve", message: "Missing peer.", details: [] }] }),
+        result: result({
+          diagnostics: [{ stage: "resolve", message: "Missing peer.", details: [] }],
+        }),
       },
       config(),
       { packageJsonUri: "file:///workspace/package.json" },
@@ -170,10 +173,10 @@ test("packageJsonSectionSummaryTooltipMarkdown uses oldest fetched time and summ
 
   assert.match(markdown, /All registry info fetched since: time:3000/u);
   assert.match(markdown, /\$\(sync\) Refresh all npm registry info/u);
-  assert.deepEqual(
-    commandArgs(markdown, refreshPackageJsonRegistryHintsCommand),
-    ["file:///workspace/package.json", "dependencies"],
-  );
+  assert.deepEqual(commandArgs(markdown, refreshPackageJsonRegistryHintsCommand), [
+    "file:///workspace/package.json",
+    "dependencies",
+  ]);
 });
 
 test("packageJsonSectionSummaryTooltipMarkdown reports missing fetched times", () => {
@@ -207,10 +210,9 @@ test("packageJsonSectionSummaryTooltipMarkdown reports missing fetched times", (
 
 test("packageJsonSectionSummaryTooltipTrustedCommands trusts only summary refresh", () => {
   assert.deepEqual(
-    packageJsonSectionSummaryTooltipTrustedCommands(
-      config(),
-      { packageJsonUri: "file:///workspace/package.json" },
-    ),
+    packageJsonSectionSummaryTooltipTrustedCommands(config(), {
+      packageJsonUri: "file:///workspace/package.json",
+    }),
     [refreshPackageJsonRegistryHintsCommand],
   );
 });

@@ -1,7 +1,12 @@
 import type { ImportLensConfig } from "../config.js";
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 import type { PackageJsonDependencySectionName } from "../ipc/protocol.js";
-import { bytesForCompression, formatBytes, labelForCompression, type CompressionFormat } from "./format.js";
+import {
+  bytesForCompression,
+  formatBytes,
+  labelForCompression,
+  type CompressionFormat,
+} from "./format.js";
 import type { PackageJsonPrimaryTone, PackageJsonSuffixTone } from "./packageJsonHintVisuals.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
@@ -26,9 +31,9 @@ export const isFreshLatestRelease = (
 
   const publishedAt = Date.parse(registryHint.latestPublishedAt);
 
-  return Number.isFinite(publishedAt)
-    && publishedAt <= now
-    && now - publishedAt < freshReleaseWindowMs;
+  return (
+    Number.isFinite(publishedAt) && publishedAt <= now && now - publishedAt < freshReleaseWindowMs
+  );
 };
 
 export const packageJsonDependencyVersionStatusSuffix = (
@@ -76,7 +81,11 @@ export const packageJsonDependencyVersionStatusLabel = (
     return null;
   }
 
-  if (state.status === "missing" || !state.registryHint || !isFreshLatestRelease(state.registryHint, now)) {
+  if (
+    state.status === "missing" ||
+    !state.registryHint ||
+    !isFreshLatestRelease(state.registryHint, now)
+  ) {
     return suffix;
   }
 
@@ -150,18 +159,26 @@ export const packageJsonSectionSummaryLabel = (
     return null;
   }
 
-  const measuredStates = sectionStates.filter((state) =>
-    state.status === "ready" && state.result && !state.result.error);
+  const measuredStates = sectionStates.filter(
+    (state) => state.status === "ready" && state.result && !state.result.error,
+  );
   const totalBytes = measuredStates.reduce(
     (sum, state) => sum + bytesForCompression(state.result!, config.compression),
     0,
   );
   const missingCount = sectionStates.filter((state) => state.status === "missing").length;
-  const unavailableCount = sectionStates.filter((state) =>
-    state.status === "unavailable" || (state.status === "ready" && Boolean(state.result?.error))).length;
+  const unavailableCount = sectionStates.filter(
+    (state) =>
+      state.status === "unavailable" || (state.status === "ready" && Boolean(state.result?.error)),
+  ).length;
   const loadingCount = sectionStates.filter((state) => state.status === "loading").length;
 
-  if (measuredStates.length === 0 && missingCount === 0 && unavailableCount === 0 && loadingCount > 0) {
+  if (
+    measuredStates.length === 0 &&
+    missingCount === 0 &&
+    unavailableCount === 0 &&
+    loadingCount > 0
+  ) {
     return `${loadingCount} checking...`;
   }
 

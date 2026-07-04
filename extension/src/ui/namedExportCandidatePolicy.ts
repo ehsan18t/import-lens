@@ -7,6 +7,5 @@ export const shouldOfferNamedExportCandidates = (state: ImportAnalysisState): bo
     return false;
   }
 
-  return state.detected.importKind === "namespace" &&
-    !result.truly_treeshakeable;
+  return state.detected.importKind === "namespace" && !result.truly_treeshakeable;
 };

@@ -14,7 +14,10 @@ import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { ImportLensLogger } from "../logger.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
 import { analysisRootForFile } from "../workspaceContext.js";
-import { markPackageJsonLoadingUnavailable, mergePackageJsonAnalysisPartial } from "./packageJsonPartial.js";
+import {
+  markPackageJsonLoadingUnavailable,
+  mergePackageJsonAnalysisPartial,
+} from "./packageJsonPartial.js";
 import type { PackageJsonDependencyHintState } from "./packageJsonState.js";
 import { RegistryHintRefresher, registryTargetsForStates } from "./registryRefresh.js";
 
@@ -32,15 +35,14 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   readonly #states = new Map<string, PackageJsonDependencyAnalysisState[]>();
   readonly #sections = new Map<string, PackageJsonDependencySection[]>();
   readonly #onDidChange = new vscode.EventEmitter<vscode.Uri>();
-  readonly #registryRefresher: RegistryHintRefresher<vscode.Uri, PackageJsonDependencyAnalysisState>;
+  readonly #registryRefresher: RegistryHintRefresher<
+    vscode.Uri,
+    PackageJsonDependencyAnalysisState
+  >;
 
   readonly onDidChange: vscode.Event<vscode.Uri> = this.#onDidChange.event;
 
-  constructor(
-    context: vscode.ExtensionContext,
-    daemon: DaemonManager,
-    logger: ImportLensLogger,
-  ) {
+  constructor(context: vscode.ExtensionContext, daemon: DaemonManager, logger: ImportLensLogger) {
     this.#context = context;
     this.#daemon = daemon;
     this.#logger = logger;
@@ -107,23 +109,26 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       return;
     }
 
-    if (this.#daemon.state !== "ready" && await this.#daemon.start(workspaceRoot) !== "ready") {
+    if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
       this.clear(document.uri);
       return;
     }
 
     try {
-      const response = await this.#daemon.analyzePackageJson({
-        type: "analyze_package_json",
-        version: protocolVersion,
-        request_id: requestId,
-        workspace_root: workspaceRoot,
-        active_document_path: document.fileName,
-        source: document.getText(),
-        streaming: true,
-        include_registry_hints: config.enableRegistryHints,
-        registry_hint_mode: config.enableRegistryHints ? "cached" : "off",
-      }, (partial) => this.handlePackageJsonPartial(document.uri, key, partial));
+      const response = await this.#daemon.analyzePackageJson(
+        {
+          type: "analyze_package_json",
+          version: protocolVersion,
+          request_id: requestId,
+          workspace_root: workspaceRoot,
+          active_document_path: document.fileName,
+          source: document.getText(),
+          streaming: true,
+          include_registry_hints: config.enableRegistryHints,
+          registry_hint_mode: config.enableRegistryHints ? "cached" : "off",
+        },
+        (partial) => this.handlePackageJsonPartial(document.uri, key, partial),
+      );
 
       if (!response) {
         if (!this.#freshness.isCurrent(key, requestId)) {
@@ -147,7 +152,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       this.setStates(document.uri, states);
       this.queueRegistryRefreshes(document.uri, states);
     } catch (error) {
-      this.#logger.warn(`Package.json dependency analysis failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#logger.warn(
+        `Package.json dependency analysis failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       if (!this.#freshness.isCurrent(key, requestId)) {
         return;
       }
@@ -213,20 +220,19 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     } = {},
   ): Promise<void> {
     const states = this.#states.get(uri.toString()) ?? [];
-    const targets = states.filter((state) =>
-      (!options.section || state.section === options.section) &&
-      (!options.packageName ||
-        (state.name === options.packageName && state.installedVersion === options.installedVersion)));
+    const targets = states.filter(
+      (state) =>
+        (!options.section || state.section === options.section) &&
+        (!options.packageName ||
+          (state.name === options.packageName &&
+            state.installedVersion === options.installedVersion)),
+    );
 
     if (targets.length === 0) {
       return;
     }
 
-    await this.#registryRefresher.refresh(
-      uri,
-      registryTargetsForStates(targets),
-      "force_refresh",
-    );
+    await this.#registryRefresher.refresh(uri, registryTargetsForStates(targets), "force_refresh");
   }
 
   private handlePackageJsonPartial(
@@ -257,7 +263,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     }
 
     const selectedStates = indexes
-      ? indexes.map((index) => states[index]).filter((state): state is PackageJsonDependencyAnalysisState => !!state)
+      ? indexes
+          .map((index) => states[index])
+          .filter((state): state is PackageJsonDependencyAnalysisState => !!state)
       : states;
     const targets = registryTargetsForStates(selectedStates);
 

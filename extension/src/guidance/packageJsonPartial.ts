@@ -54,11 +54,12 @@ export const markPackageJsonLoadingUnavailable = (
   states.map((state) =>
     state.status === "loading"
       ? {
-        ...state,
-        status: "unavailable",
-        message,
-      }
-      : state);
+          ...state,
+          status: "unavailable",
+          message,
+        }
+      : state,
+  );
 
 const mergePackageJsonState = (
   current: PackageJsonMergeState | undefined,

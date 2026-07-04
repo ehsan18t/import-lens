@@ -27,7 +27,11 @@ import type {
   WorkspaceReportResponse,
 } from "../../src/ipc/protocol.js";
 import { protocolVersion } from "../../src/ipc/protocol.js";
-import { TransportCoordinator, type AnalysisTransport, type DaemonState } from "../../src/daemon/transport.js";
+import {
+  TransportCoordinator,
+  type AnalysisTransport,
+  type DaemonState,
+} from "../../src/daemon/transport.js";
 
 class FakeTransport implements AnalysisTransport {
   readonly #startState: DaemonState;
@@ -78,7 +82,9 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
-  async analyzePackageJson(request: AnalyzePackageJsonRequest): Promise<AnalyzePackageJsonResponse> {
+  async analyzePackageJson(
+    request: AnalyzePackageJsonRequest,
+  ): Promise<AnalyzePackageJsonResponse> {
     this.calls.push(`packageJson:${request.request_id}`);
     return {
       version: request.version,
@@ -113,7 +119,9 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
-  async requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse> {
+  async requestFileSizeDocument(
+    request: FileSizeDocumentRequest,
+  ): Promise<FileSizeDocumentResponse> {
     this.calls.push(`fileSizeDocument:${request.request_id}`);
     return {
       version: request.version,
@@ -130,7 +138,9 @@ class FakeTransport implements AnalysisTransport {
     };
   }
 
-  async completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse> {
+  async completeImportMembers(
+    request: CompleteImportMembersRequest,
+  ): Promise<CompleteImportMembersResponse> {
     this.calls.push(`completion:${request.request_id}`);
     return {
       version: request.version,
@@ -204,11 +214,13 @@ class FakeTransport implements AnalysisTransport {
       version: request.version,
       request_id: request.request_id,
       indexes: [0],
-      results: [{
-        target: request.targets[0]!,
-        hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
-        error: null,
-      }],
+      results: [
+        {
+          target: request.targets[0]!,
+          hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+          error: null,
+        },
+      ],
       error: null,
       diagnostics: [],
     };
@@ -454,13 +466,16 @@ test("TransportCoordinator forwards registry refresh partial callbacks", async (
   const partials: RefreshRegistryHintsResponse[] = [];
 
   await coordinator.start("/workspace");
-  const response = await coordinator.refreshRegistryHints({
-    type: "refresh_registry_hints",
-    version: protocolVersion,
-    request_id: 88,
-    targets: [{ name: "react", installedVersion: "18.2.0" }],
-    mode: "refresh_stale",
-  }, (partial) => partials.push(partial));
+  const response = await coordinator.refreshRegistryHints(
+    {
+      type: "refresh_registry_hints",
+      version: protocolVersion,
+      request_id: 88,
+      targets: [{ name: "react", installedVersion: "18.2.0" }],
+      mode: "refresh_stale",
+    },
+    (partial) => partials.push(partial),
+  );
 
   assert.deepEqual(transport.calls, ["start:/workspace", "registryHints:88"]);
   assert.equal(partials.length, 1);

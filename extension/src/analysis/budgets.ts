@@ -41,7 +41,13 @@ export const budgetInsightForState = (
   const limit = budgets.perImportBrotliBytes;
   const result = state.result;
 
-  if (limit === undefined || state.status !== "ready" || !result || result.error || result.brotli_bytes <= limit) {
+  if (
+    limit === undefined ||
+    state.status !== "ready" ||
+    !result ||
+    result.error ||
+    result.brotli_bytes <= limit
+  ) {
     return null;
   }
 
@@ -95,10 +101,7 @@ export const budgetViolationsForStates = (
   return violations;
 };
 
-const positiveIntegerBudget = (
-  value: unknown,
-  key: keyof ImportLensBudgets,
-): ImportLensBudgets => {
+const positiveIntegerBudget = (value: unknown, key: keyof ImportLensBudgets): ImportLensBudgets => {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     return {};
   }

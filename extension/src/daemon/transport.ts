@@ -41,8 +41,12 @@ export interface AnalysisTransport {
   ): Promise<AnalyzePackageJsonResponse | null>;
   analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null>;
   enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null>;
-  requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null>;
-  completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null>;
+  requestFileSizeDocument(
+    request: FileSizeDocumentRequest,
+  ): Promise<FileSizeDocumentResponse | null>;
+  completeImportMembers(
+    request: CompleteImportMembersRequest,
+  ): Promise<CompleteImportMembersResponse | null>;
   cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null>;
   cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null>;
   listCache(request: CacheListRequest): Promise<CacheListResponse | null>;
@@ -145,11 +149,15 @@ export class TransportCoordinator implements AnalysisTransport {
     return this.#activeTransport?.enumerateExports(request) ?? Promise.resolve(null);
   }
 
-  requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {
+  requestFileSizeDocument(
+    request: FileSizeDocumentRequest,
+  ): Promise<FileSizeDocumentResponse | null> {
     return this.#activeTransport?.requestFileSizeDocument(request) ?? Promise.resolve(null);
   }
 
-  completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null> {
+  completeImportMembers(
+    request: CompleteImportMembersRequest,
+  ): Promise<CompleteImportMembersResponse | null> {
     return this.#activeTransport?.completeImportMembers(request) ?? Promise.resolve(null);
   }
 
@@ -208,7 +216,10 @@ export class TransportCoordinator implements AnalysisTransport {
   }
 
   #handleTransportState(transport: AnalysisTransport, state: DaemonState): void {
-    if (transport !== this.#activeTransport && !(state === "ready" && this.#activeTransport === null)) {
+    if (
+      transport !== this.#activeTransport &&
+      !(state === "ready" && this.#activeTransport === null)
+    ) {
       return;
     }
 

@@ -7,10 +7,18 @@ import { oxcStackConfig } from "../oxc-stack.config.mjs";
 import { replaceKnownVersions } from "../oxc-stack-helpers.mjs";
 import { parseUpdateArgs, updateOxcStack } from "../update-oxc-stack.mjs";
 
-const tempRepo = async ({ cargoToml = cargoTomlFixture(), manifest = manifestFixture(), srs = srsFixture() } = {}) => {
+const tempRepo = async ({
+  cargoToml = cargoTomlFixture(),
+  manifest = manifestFixture(),
+  srs = srsFixture(),
+} = {}) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "importlens-oxc-update-"));
   await writeFile(path.join(root, "daemon-Cargo.toml"), cargoToml, "utf8");
-  await writeFile(path.join(root, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  await writeFile(
+    path.join(root, "package.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    "utf8",
+  );
   await writeFile(path.join(root, "dependency-policy.test.mjs"), dependencyPolicyFixture(), "utf8");
   await writeFile(path.join(root, "package-vsix-manifest.test.mjs"), packageVsixFixture(), "utf8");
   await writeFile(path.join(root, "ImportLens-SRS.md"), srs, "utf8");
@@ -80,15 +88,16 @@ test("updateOxcStack dry-run reports planned edits without writing files or lock
 
   assert.equal(result.oxcVersion, "0.139.0");
   assert.equal(result.resolverVersion, "11.22.0");
-  assert.deepEqual(result.changedFiles.sort(), [
-    repo.paths.cargoToml,
-    repo.paths.config,
-    repo.paths.manifest,
-    repo.paths.srs,
-  ].sort());
+  assert.deepEqual(
+    result.changedFiles.sort(),
+    [repo.paths.cargoToml, repo.paths.config, repo.paths.manifest, repo.paths.srs].sort(),
+  );
   assert.deepEqual(writes, []);
   assert.deepEqual(execs, []);
-  assert.match(await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8"), /oxc_parser = "=0\.138\.0"/);
+  assert.match(
+    await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8"),
+    /oxc_parser = "=0\.138\.0"/,
+  );
 });
 
 test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () => {
@@ -107,7 +116,10 @@ test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () =>
 
   const cargoToml = await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8");
   const manifest = JSON.parse(await readFile(path.join(repo.root, repo.paths.manifest), "utf8"));
-  const packageVsix = await readFile(path.join(repo.root, repo.paths.packageVsixManifestTest), "utf8");
+  const packageVsix = await readFile(
+    path.join(repo.root, repo.paths.packageVsixManifestTest),
+    "utf8",
+  );
   const srs = await readFile(path.join(repo.root, repo.paths.srs), "utf8");
   const config = await readFile(path.join(repo.root, repo.paths.config), "utf8");
 
@@ -268,10 +280,16 @@ const availableVersions = () => async (url) => availableVersionPayload(url);
 
 const availableVersionPayload = (url) => {
   if (url.endsWith("/oxc_parser")) {
-    return { crate: { max_stable_version: "0.139.0" }, versions: [{ num: "0.139.0" }, { num: "0.136.0" }] };
+    return {
+      crate: { max_stable_version: "0.139.0" },
+      versions: [{ num: "0.139.0" }, { num: "0.136.0" }],
+    };
   }
   if (url.endsWith("/oxc_resolver")) {
-    return { crate: { max_stable_version: "11.22.0" }, versions: [{ num: "11.22.0" }, { num: "11.23.0" }] };
+    return {
+      crate: { max_stable_version: "11.22.0" },
+      versions: [{ num: "11.22.0" }, { num: "11.23.0" }],
+    };
   }
   if (url.endsWith("/oxc_resolver/11.22.0")) {
     return { version: { num: "11.22.0" } };
@@ -279,7 +297,9 @@ const availableVersionPayload = (url) => {
   if (url.endsWith("/oxc_resolver/11.23.0")) {
     return { version: { num: "11.23.0" } };
   }
-  const crate = oxcStackConfig.oxcCrates.find((crate) => url.endsWith(`/${crate}/0.139.0`) || url.endsWith(`/${crate}/0.136.0`));
+  const crate = oxcStackConfig.oxcCrates.find(
+    (crate) => url.endsWith(`/${crate}/0.139.0`) || url.endsWith(`/${crate}/0.136.0`),
+  );
   if (crate) {
     return { version: { num: url.endsWith("0.136.0") ? "0.136.0" : "0.139.0" } };
   }
@@ -307,7 +327,8 @@ assert.match(cargoToml, /^oxc_resolver = "=11\\.22\\.0"$/mu);
 assert.equal(manifest.dependencies["oxc-parser"], undefined);
 `;
 
-const packageVsixFixture = () => `const manifest = { dependencies: { "@msgpack/msgpack": "3.1.3" } };
+const packageVsixFixture =
+  () => `const manifest = { dependencies: { "@msgpack/msgpack": "3.1.3" } };
 assert.deepEqual(staged.dependencies, { "@msgpack/msgpack": "3.1.3" });
 `;
 

@@ -36,7 +36,11 @@ import { protocolVersion } from "../ipc/protocol.js";
 import type { Logger } from "../logging/types.js";
 import { currentPlatformTarget, daemonRelativePath } from "./platform.js";
 import { knownDaemonHashes } from "./knownHashes.generated.js";
-import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs, terminateProcess } from "./processLifecycle.js";
+import {
+  cleanupFailedDaemonStartup,
+  pipeDaemonProcessLogs,
+  terminateProcess,
+} from "./processLifecycle.js";
 import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 import { resolveDaemonStartRoot } from "./startRoot.js";
@@ -140,7 +144,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
     const target = currentPlatformTarget();
 
     if (!target) {
-      this.#logger.warn(`Unsupported platform ${process.platform}-${process.arch}; daemon unavailable.`);
+      this.#logger.warn(
+        `Unsupported platform ${process.platform}-${process.arch}; daemon unavailable.`,
+      );
       this.#setState("unavailable");
       return this.#state;
     }
@@ -158,9 +164,10 @@ export class NativeDaemonTransport implements AnalysisTransport {
     await mkdir(storagePaths.lifecycleStoragePath, { recursive: true });
     await mkdir(storagePaths.cacheBasePath, { recursive: true });
 
-    const pipeName = process.platform === "win32"
-      ? `\\\\.\\pipe\\import-lens-${process.pid}-${randomUUID()}`
-      : path.join(tmpdir(), `import-lens-${process.pid}-${randomUUID()}.sock`);
+    const pipeName =
+      process.platform === "win32"
+        ? `\\\\.\\pipe\\import-lens-${process.pid}-${randomUUID()}`
+        : path.join(tmpdir(), `import-lens-${process.pid}-${randomUUID()}.sock`);
 
     const childProcess = spawn(binaryPath, [
       "--pipe",
@@ -186,7 +193,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
     let client: IpcClient;
 
     try {
-      client = await IpcClient.connect(pipeName, { logger: this.#logger.child({ component: "ipc" }) });
+      client = await IpcClient.connect(pipeName, {
+        logger: this.#logger.child({ component: "ipc" }),
+      });
       if (childProcess !== this.#process) {
         client.dispose();
         return this.#state;
@@ -195,7 +204,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#client = client;
       this.#logger.info("Connected to ImportLens daemon IPC.");
     } catch (error) {
-      this.#logger.warn(`Failed to connect to daemon: ${error instanceof Error ? error.message : String(error)}`);
+      this.#logger.warn(
+        `Failed to connect to daemon: ${error instanceof Error ? error.message : String(error)}`,
+      );
       cleanupFailedDaemonStartup(null, childProcess);
       if (childProcess === this.#process) {
         this.#client = null;
@@ -218,7 +229,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#client.send(this.#hello(workspaceRoot));
       this.#logger.info(`Sent daemon hello using protocol v${protocolVersion}.`);
     } catch (error) {
-      this.#logger.warn(`Failed to send daemon hello: ${error instanceof Error ? error.message : String(error)}`);
+      this.#logger.warn(
+        `Failed to send daemon hello: ${error instanceof Error ? error.message : String(error)}`,
+      );
       cleanupFailedDaemonStartup(client, childProcess);
       if (childProcess === this.#process && client === this.#client) {
         this.#client = null;
@@ -259,7 +272,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
     try {
       await this.#recycleGuard.recordRecycle();
     } catch (error) {
-      this.#logger.warn(`Failed to record daemon recycle: ${error instanceof Error ? error.message : String(error)}`);
+      this.#logger.warn(
+        `Failed to record daemon recycle: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -281,14 +296,19 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#crashTimes = recentCrashTimes([...this.#crashTimes, now], now);
 
     if (shouldEnterCrashDegradedMode(this.#crashTimes, now)) {
-      this.#logger.error("Daemon crashed three times within 60 seconds. ImportLens is entering unavailable mode.");
+      this.#logger.error(
+        "Daemon crashed three times within 60 seconds. ImportLens is entering unavailable mode.",
+      );
       this.#setState("unavailable");
       return;
     }
 
     this.#restartAttempt++;
     const delay = restartDelayMs(this.#restartAttempt);
-    this.#scheduleRestart(delay, `Restarting daemon in ${delay}ms (attempt ${this.#restartAttempt})...`);
+    this.#scheduleRestart(
+      delay,
+      `Restarting daemon in ${delay}ms (attempt ${this.#restartAttempt})...`,
+    );
   }
 
   #scheduleRestart(delay: number, message: string, level: "info" | "warn" = "warn"): void {
@@ -364,7 +384,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Document analysis ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Document analysis ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
@@ -377,7 +399,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
     onPartial?: (response: AnalyzePackageJsonResponse) => void,
   ): Promise<AnalyzePackageJsonResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`package.json analysis ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `package.json analysis ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
@@ -385,29 +409,45 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#client.requestAnalyzePackageJson(request, 30000, onPartial);
   }
 
-  async analyzeSpecifiers(request: AnalyzeSpecifiersRequest): Promise<AnalyzeSpecifiersResponse | null> {
+  async analyzeSpecifiers(
+    request: AnalyzeSpecifiersRequest,
+  ): Promise<AnalyzeSpecifiersResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Specifier analysis ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Specifier analysis ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
-    this.#logger.debug(`Requesting specifier analysis ${request.request_id} for ${request.specifiers.length} import(s).`);
+    this.#logger.debug(
+      `Requesting specifier analysis ${request.request_id} for ${request.specifiers.length} import(s).`,
+    );
     return this.#client.requestAnalyzeSpecifiers(request);
   }
 
-  async enumerateExports(request: EnumerateExportsRequest): Promise<EnumerateExportsResponse | null> {
+  async enumerateExports(
+    request: EnumerateExportsRequest,
+  ): Promise<EnumerateExportsResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Export enumeration ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Export enumeration ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
-    this.#logger.debug(`Requesting export enumeration ${request.request_id} for ${request.specifier}.`);
+    this.#logger.debug(
+      `Requesting export enumeration ${request.request_id} for ${request.specifier}.`,
+    );
     return this.#client.requestExports(request);
   }
 
-  async requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {
+  async requestFileSizeDocument(
+    request: FileSizeDocumentRequest,
+  ): Promise<FileSizeDocumentResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Current-file size request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Current-file size request ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
@@ -415,9 +455,13 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#client.requestFileSizeDocument(request);
   }
 
-  async completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null> {
+  async completeImportMembers(
+    request: CompleteImportMembersRequest,
+  ): Promise<CompleteImportMembersResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Import member completion ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Import member completion ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
@@ -427,7 +471,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Cache status request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Cache status request ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
@@ -437,7 +483,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Cache cleanup request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Cache cleanup request ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
@@ -447,7 +495,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async listCache(request: CacheListRequest): Promise<CacheListResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Cache list request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Cache list request ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
@@ -457,11 +507,15 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async removeCache(request: CacheRemoveRequest): Promise<CacheRemoveResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Cache remove request ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Cache remove request ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
-    this.#logger.info(`Requesting cache removal ${request.request_id} with scope ${request.scope}.`);
+    this.#logger.info(
+      `Requesting cache removal ${request.request_id} with scope ${request.scope}.`,
+    );
     return this.#client.requestCacheRemove(request);
   }
 
@@ -470,21 +524,31 @@ export class NativeDaemonTransport implements AnalysisTransport {
     onPartial?: (response: RefreshRegistryHintsResponse) => void,
   ): Promise<RefreshRegistryHintsResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Registry hint refresh ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Registry hint refresh ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
-    this.#logger.debug(`Requesting registry hint refresh ${request.request_id} for ${request.targets.length} package(s).`);
+    this.#logger.debug(
+      `Requesting registry hint refresh ${request.request_id} for ${request.targets.length} package(s).`,
+    );
     return this.#client.requestRefreshRegistryHints(request, 30000, onPartial);
   }
 
-  async requestWorkspaceReport(request: WorkspaceReportRequest): Promise<WorkspaceReportResponse | null> {
+  async requestWorkspaceReport(
+    request: WorkspaceReportRequest,
+  ): Promise<WorkspaceReportResponse | null> {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(`Workspace report ${request.request_id} skipped because daemon is ${this.#state}.`);
+      this.#logger.warn(
+        `Workspace report ${request.request_id} skipped because daemon is ${this.#state}.`,
+      );
       return null;
     }
 
-    this.#logger.debug(`Requesting workspace report ${request.request_id} for ${request.workspace_root}.`);
+    this.#logger.debug(
+      `Requesting workspace report ${request.request_id} for ${request.workspace_root}.`,
+    );
     return this.#client.requestWorkspaceReport(request, WORKSPACE_REPORT_TIMEOUT_MS);
   }
 
@@ -504,7 +568,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
       return;
     }
 
-    this.#logger.info(`Sending ${packageJsonPaths.length} node_modules package.json invalidation(s).`);
+    this.#logger.info(
+      `Sending ${packageJsonPaths.length} node_modules package.json invalidation(s).`,
+    );
     this.#client.send({
       type: "node_modules_changed",
       package_json_paths: [...packageJsonPaths],
@@ -513,7 +579,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {
     if (!this.#client || this.#state !== "ready") {
-      this.#logger.debug(`Skipping package.json prewarm because daemon is ${this.#state}: ${packageJsonPath}.`);
+      this.#logger.debug(
+        `Skipping package.json prewarm because daemon is ${this.#state}: ${packageJsonPath}.`,
+      );
       return;
     }
 
@@ -542,7 +610,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
     try {
       client?.send({ type: "shutdown" });
     } catch (error) {
-      this.#logger.warn(`Failed to send daemon shutdown: ${error instanceof Error ? error.message : String(error)}`);
+      this.#logger.warn(
+        `Failed to send daemon shutdown: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
 
     if (childProcess) {
@@ -572,12 +642,16 @@ export class NativeDaemonTransport implements AnalysisTransport {
     const expectedHash = knownDaemonHashes[relativePath];
 
     if (!expectedHash) {
-      this.#logger.warn(`No trusted hash is available for ${relativePath}. Build the daemon and run pnpm hash:daemon.`);
+      this.#logger.warn(
+        `No trusted hash is available for ${relativePath}. Build the daemon and run pnpm hash:daemon.`,
+      );
       return false;
     }
 
     try {
-      const actualHash = createHash("sha256").update(await readFile(binaryPath)).digest("hex");
+      const actualHash = createHash("sha256")
+        .update(await readFile(binaryPath))
+        .digest("hex");
 
       if (actualHash !== expectedHash) {
         this.#logger.error(`Daemon hash mismatch for ${relativePath}.`);
@@ -586,7 +660,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
       return true;
     } catch (error) {
-      this.#logger.warn(`Daemon binary is unavailable at ${binaryPath}: ${error instanceof Error ? error.message : String(error)}`);
+      this.#logger.warn(
+        `Daemon binary is unavailable at ${binaryPath}: ${error instanceof Error ? error.message : String(error)}`,
+      );
       return false;
     }
   }

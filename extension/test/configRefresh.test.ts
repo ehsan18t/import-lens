@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyDaemonStateTransition, refreshVisibleImportLensDocuments } from "../src/configRefresh.js";
+import {
+  applyDaemonStateTransition,
+  refreshVisibleImportLensDocuments,
+} from "../src/configRefresh.js";
 import type { ImportLensConfig } from "../src/config.js";
 
 const config = (enabled: boolean): ImportLensConfig => ({

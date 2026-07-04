@@ -19,7 +19,11 @@ const fail = (message) => {
 const run = (command, commandArgs) => {
   const needsShell = process.platform === "win32" && command === "pnpm";
   const result = needsShell
-    ? spawnSync(`${command} ${commandArgs.join(" ")}`, { cwd: repoRoot, shell: true, stdio: "inherit" })
+    ? spawnSync(`${command} ${commandArgs.join(" ")}`, {
+        cwd: repoRoot,
+        shell: true,
+        stdio: "inherit",
+      })
     : spawnSync(command, commandArgs, { cwd: repoRoot, stdio: "inherit" });
 
   if (result.error) {
@@ -44,11 +48,7 @@ if (manifest.icon && !existsSync(path.join(repoRoot, manifest.icon))) {
   fail(`Extension icon is declared at ${manifest.icon}, but the file does not exist.`);
 }
 
-run(process.execPath, [
-  "scripts/build-daemon.mjs",
-  target,
-  ...(useZigbuild ? ["--zigbuild"] : []),
-]);
+run(process.execPath, ["scripts/build-daemon.mjs", target, ...(useZigbuild ? ["--zigbuild"] : [])]);
 run(process.execPath, ["scripts/copy-daemon.mjs", target]);
 run(process.execPath, ["scripts/generate-daemon-hashes.mjs", target]);
 run("pnpm", ["build"]);

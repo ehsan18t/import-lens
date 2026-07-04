@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  applyImportAnalysisInsights,
-  insightLabelSuffix,
-} from "../../src/analysis/insights.js";
+import { applyImportAnalysisInsights, insightLabelSuffix } from "../../src/analysis/insights.js";
 import {
   importCostHistoryItem,
   importCostHistoryKey,
@@ -27,17 +24,18 @@ class MemoryStore {
   }
 }
 
-const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport => detectedImport({
-  specifier: "lodash-es",
-  packageName: "lodash-es",
-  named: ["debounce"],
-  importKind: "named",
-  line: 4,
-  quoteEnd: { line: 4, character: 32 },
-  specifierRange: sourceRange(4, 8, 31),
-  statementRange: sourceRange(4, 0, 36),
-  ...overrides,
-});
+const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport =>
+  detectedImport({
+    specifier: "lodash-es",
+    packageName: "lodash-es",
+    named: ["debounce"],
+    importKind: "named",
+    line: 4,
+    quoteEnd: { line: 4, character: 32 },
+    specifierRange: sourceRange(4, 8, 31),
+    statementRange: sourceRange(4, 0, 36),
+    ...overrides,
+  });
 
 const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
   specifier: "lodash-es",
@@ -102,15 +100,21 @@ test("applyImportAnalysisInsights adds working-tree import cost deltas", () => {
 test("applyImportAnalysisInsights explains shared dependency modules", () => {
   const states = applyImportAnalysisInsights(
     [
-      readyState({}, {
-        shared_bytes: 300,
-        module_breakdown: [{ path: "/workspace/node_modules/lodash-es/debounce.js", bytes: 300 }],
-      }),
-      readyState({ specifier: "my-ui-lib", packageName: "my-ui-lib", named: [], importKind: "default" }, {
-        specifier: "my-ui-lib",
-        shared_bytes: 300,
-        module_breakdown: [{ path: "/workspace/node_modules/lodash-es/debounce.js", bytes: 300 }],
-      }),
+      readyState(
+        {},
+        {
+          shared_bytes: 300,
+          module_breakdown: [{ path: "/workspace/node_modules/lodash-es/debounce.js", bytes: 300 }],
+        },
+      ),
+      readyState(
+        { specifier: "my-ui-lib", packageName: "my-ui-lib", named: [], importKind: "default" },
+        {
+          specifier: "my-ui-lib",
+          shared_bytes: 300,
+          module_breakdown: [{ path: "/workspace/node_modules/lodash-es/debounce.js", bytes: 300 }],
+        },
+      ),
     ],
     { importCostHistory: [] },
   );

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { importHintAnchorPosition, type ImportHintAnchorDocument } from "../../src/ui/importHintAnchor.js";
+import {
+  importHintAnchorPosition,
+  type ImportHintAnchorDocument,
+} from "../../src/ui/importHintAnchor.js";
 import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
 test("importHintAnchorPosition anchors at the end of the import statement", () => {

@@ -61,7 +61,6 @@ export const inlineHintSegmentsFromParts = (
 };
 
 export const inlineHintDisplayText = (parts: InlineHintParts): string =>
-  [
-    parts.primary,
-    ...parts.suffixes.map((suffix) => suffix.text),
-  ].filter((part) => part.length > 0).join(" · ");
+  [parts.primary, ...parts.suffixes.map((suffix) => suffix.text)]
+    .filter((part) => part.length > 0)
+    .join(" · ");

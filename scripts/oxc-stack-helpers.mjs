@@ -16,7 +16,9 @@ export const validateCurrentStack = (cargoToml, _manifest) => {
   });
   const uniqueCrateVersions = new Set(crateVersions);
   if (uniqueCrateVersions.size !== 1) {
-    throw new Error(`Current OXC crate versions are not coordinated: ${[...uniqueCrateVersions].join(", ")}`);
+    throw new Error(
+      `Current OXC crate versions are not coordinated: ${[...uniqueCrateVersions].join(", ")}`,
+    );
   }
 
   if (!/^oxc_resolver\s*=\s*"=[^"]+"$/mu.test(cargoToml)) {
@@ -56,7 +58,10 @@ export const latestCrateVersion = async (fetchJson, crate) => {
 export const updateCargoToml = (cargoToml, oxcVersion, resolverVersion) => {
   let next = cargoToml;
   for (const crate of oxcStackConfig.oxcCrates) {
-    next = next.replace(new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"), `${crate} = "=${oxcVersion}"`);
+    next = next.replace(
+      new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"),
+      `${crate} = "=${oxcVersion}"`,
+    );
   }
   return next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "=${resolverVersion}"`);
 };
@@ -97,18 +102,13 @@ export const replaceKnownVersions = (content, oxcVersion, resolverVersion) => {
 
 export const updateConfig = (content, oxcVersion, resolverVersion) =>
   content
-    .replace(
-      /currentOxcVersion:\s*"[^"]+"/u,
-      `currentOxcVersion: "${oxcVersion}"`,
-    )
-    .replace(
-      /currentResolverVersion:\s*"[^"]+"/u,
-      `currentResolverVersion: "${resolverVersion}"`,
-    );
+    .replace(/currentOxcVersion:\s*"[^"]+"/u, `currentOxcVersion: "${oxcVersion}"`)
+    .replace(/currentResolverVersion:\s*"[^"]+"/u, `currentResolverVersion: "${resolverVersion}"`);
 
 export const formatOxcUpdateResult = ({ dryRun, oxcVersion, resolverVersion, changedFiles }) => {
   const mode = dryRun ? "Dry run" : "Updated";
-  const files = changedFiles.length === 0 ? "No file edits needed." : `Files: ${changedFiles.join(", ")}`;
+  const files =
+    changedFiles.length === 0 ? "No file edits needed." : `Files: ${changedFiles.join(", ")}`;
   return `${mode}: OXC ${oxcVersion}, oxc_resolver ${resolverVersion}\n${files}\n`;
 };
 

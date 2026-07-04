@@ -51,7 +51,14 @@ test("recycle guard records clean daemon recycle events", async () => {
     await guard.recordRecycle(now - 40);
 
     assert.equal(await guard.shouldEnterDegradedMode(now), true);
-    assert.deepEqual(await guard.readRecycleTimes(), [now - 90, now - 80, now - 70, now - 60, now - 50, now - 40]);
+    assert.deepEqual(await guard.readRecycleTimes(), [
+      now - 90,
+      now - 80,
+      now - 70,
+      now - 60,
+      now - 50,
+      now - 40,
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -73,7 +80,14 @@ test("recycle guard preserves concurrent recycle records", async () => {
       guard.recordRecycle(now - 50),
     ]);
 
-    assert.deepEqual(await guard.readRecycleTimes(), [now - 100, now - 90, now - 80, now - 70, now - 60, now - 50]);
+    assert.deepEqual(await guard.readRecycleTimes(), [
+      now - 100,
+      now - 90,
+      now - 80,
+      now - 70,
+      now - 60,
+      now - 50,
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -10,13 +10,14 @@ import { daemonRoot, platformTargets, relativeDaemonPath } from "../targets.mjs"
 // daemon root; these tests keep them in lockstep, so moving the binaries is a
 // one-line change per boundary that fails loudly here when half-done.
 
-const repoFile = (relativePath) => readFileSync(new URL(`../../${relativePath}`, import.meta.url), "utf8");
+const repoFile = (relativePath) =>
+  readFileSync(new URL(`../../${relativePath}`, import.meta.url), "utf8");
 
 test("extension platform.ts mirrors the scripts' daemon root", () => {
   const source = repoFile("extension/src/daemon/platform.ts");
   const match = /export const daemonRoot = "([^"]+)";/u.exec(source);
 
-  assert.ok(match, "platform.ts must declare `export const daemonRoot = \"...\";`");
+  assert.ok(match, 'platform.ts must declare `export const daemonRoot = "...";`');
   assert.equal(match[1], daemonRoot);
 });
 
@@ -24,7 +25,7 @@ test("CLI importlens.mjs mirrors the scripts' daemon root", () => {
   const source = repoFile("cli/importlens.mjs");
   const match = /const DAEMON_ROOT = "([^"]+)";/u.exec(source);
 
-  assert.ok(match, "importlens.mjs must declare `const DAEMON_ROOT = \"...\";`");
+  assert.ok(match, 'importlens.mjs must declare `const DAEMON_ROOT = "...";`');
   assert.equal(match[1], daemonRoot);
 });
 
@@ -44,6 +45,9 @@ test("every committed daemon hash key is a canonical daemon path", () => {
 
   assert.ok(keys.length > 0, "knownHashes.generated.ts must contain at least one entry");
   for (const key of keys) {
-    assert.ok(canonical.has(key), `stale daemon hash key ${key}; rename it to match relativeDaemonPath()`);
+    assert.ok(
+      canonical.has(key),
+      `stale daemon hash key ${key}; rename it to match relativeDaemonPath()`,
+    );
   }
 });

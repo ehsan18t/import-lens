@@ -6,7 +6,13 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStagedManifest } from "./package-vsix-manifest.mjs";
-import { daemonRoot, extensionBundle, stagingDir, targetInfo, vsixNameForTarget } from "./targets.mjs";
+import {
+  daemonRoot,
+  extensionBundle,
+  stagingDir,
+  targetInfo,
+  vsixNameForTarget,
+} from "./targets.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -79,7 +85,11 @@ writeFileSync(
 );
 
 console.log("Installing production dependencies inside staging directory...");
-run("pnpm", ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoisted", "--ignore-workspace"], stagingRoot);
+run(
+  "pnpm",
+  ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoisted", "--ignore-workspace"],
+  stagingRoot,
+);
 
 copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));
 copyPath(path.join(repoRoot, "LICENSE"), path.join(stagingRoot, "LICENSE"));
@@ -96,7 +106,6 @@ if (manifest.icon) {
 
   copyPath(iconPath, path.join(stagingRoot, manifest.icon));
 }
-
 
 const result = spawnSync(
   process.execPath,

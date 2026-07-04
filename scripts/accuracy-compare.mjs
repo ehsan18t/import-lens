@@ -48,21 +48,28 @@ const main = async () => {
       const delta = Math.abs(importLens.brotliBytes - esbuildSize.brotliBytes);
       const relativeDelta = delta / Math.max(esbuildSize.brotliBytes, 1);
 
-      process.stdout.write([
-        `${benchmark.label}:`,
-        `  ImportLens named import: ${importLens.brotliBytes} B br (${importLens.minifiedBytes} B minified)`,
-        `  esbuild named import: ${esbuildSize.brotliBytes} B br (${esbuildSize.minifiedBytes} B minified)`,
-        `  relative delta: ${(relativeDelta * 100).toFixed(1)}%`,
-      ].join("\n"));
+      process.stdout.write(
+        [
+          `${benchmark.label}:`,
+          `  ImportLens named import: ${importLens.brotliBytes} B br (${importLens.minifiedBytes} B minified)`,
+          `  esbuild named import: ${esbuildSize.brotliBytes} B br (${esbuildSize.minifiedBytes} B minified)`,
+          `  relative delta: ${(relativeDelta * 100).toFixed(1)}%`,
+        ].join("\n"),
+      );
       process.stdout.write("\n");
 
       if (relativeDelta > tolerance) {
-        throw new Error(`${benchmark.label} accuracy delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(tolerance * 100).toFixed(1)}% tolerance`);
+        throw new Error(
+          `${benchmark.label} accuracy delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(tolerance * 100).toFixed(1)}% tolerance`,
+        );
       }
 
-      if (benchmark.excludedModule && importLens.moduleBreakdown.some((module) =>
-        module.path.replaceAll("\\", "/").endsWith(benchmark.excludedModule)
-      )) {
+      if (
+        benchmark.excludedModule &&
+        importLens.moduleBreakdown.some((module) =>
+          module.path.replaceAll("\\", "/").endsWith(benchmark.excludedModule),
+        )
+      ) {
         throw new Error(`${benchmark.label} unexpectedly included ${benchmark.excludedModule}`);
       }
     }
@@ -80,13 +87,17 @@ const writeFixture = async (workspace) => {
 
   await writeFile(
     path.join(packageRoot, "package.json"),
-    JSON.stringify({
-      name: packageName,
-      version: "1.0.0",
-      type: "module",
-      module: "index.js",
-      sideEffects: false,
-    }, null, 2),
+    JSON.stringify(
+      {
+        name: packageName,
+        version: "1.0.0",
+        type: "module",
+        module: "index.js",
+        sideEffects: false,
+      },
+      null,
+      2,
+    ),
     "utf8",
   );
   await writeFile(
@@ -125,14 +136,16 @@ const importLensNamedSize = async (daemon, workspace, activeDocumentPath, named,
     request_id: requestId,
     workspace_root: workspace,
     active_document_path: activeDocumentPath,
-    imports: [{
-      specifier: packageName,
-      package: packageName,
-      version: "1.0.0",
-      named: [named],
-      import_kind: "named",
-      runtime: "component",
-    }],
+    imports: [
+      {
+        specifier: packageName,
+        package: packageName,
+        version: "1.0.0",
+        named: [named],
+        import_kind: "named",
+        runtime: "component",
+      },
+    ],
   });
   const result = response.imports?.[0];
 
@@ -174,25 +187,30 @@ const esbuildNamedSize = async (workspace, activeDocumentPath) => {
 const startDaemon = async (workspace) => {
   const storagePath = path.join(workspace, ".importlens-cache");
   await mkdir(storagePath, { recursive: true });
-  const pipeName = process.platform === "win32"
-    ? `\\\\.\\pipe\\import-lens-accuracy-${process.pid}-${randomUUID()}`
-    : path.join(os.tmpdir(), `import-lens-accuracy-${process.pid}-${randomUUID()}.sock`);
-  const child = spawn("cargo", [
-    "run",
-    "--quiet",
-    "--bin",
-    "import-lens-daemon",
-    "--",
-    "--pipe",
-    pipeName,
-    "--workspace",
-    workspace,
-    "--storage",
-    storagePath,
-  ], {
-    cwd: fileURLToPath(new URL("..", import.meta.url)),
-    stdio: ["ignore", "ignore", "pipe"],
-  });
+  const pipeName =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\import-lens-accuracy-${process.pid}-${randomUUID()}`
+      : path.join(os.tmpdir(), `import-lens-accuracy-${process.pid}-${randomUUID()}.sock`);
+  const child = spawn(
+    "cargo",
+    [
+      "run",
+      "--quiet",
+      "--bin",
+      "import-lens-daemon",
+      "--",
+      "--pipe",
+      pipeName,
+      "--workspace",
+      workspace,
+      "--storage",
+      storagePath,
+    ],
+    {
+      cwd: fileURLToPath(new URL("..", import.meta.url)),
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
   const stderr = [];
   child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
 
@@ -255,7 +273,9 @@ const connectWithRetry = async (pipeName, timeoutMs, child, stderr) => {
 
   const stderrText = stderr.join("").trim();
   const suffix = stderrText ? `; daemon stderr: ${stderrText}` : "";
-  throw new Error(`failed to connect to ImportLens daemon: ${lastError?.message ?? "timeout"}${suffix}`);
+  throw new Error(
+    `failed to connect to ImportLens daemon: ${lastError?.message ?? "timeout"}${suffix}`,
+  );
 };
 
 const daemonClient = (socket, { requestTimeoutMs = 60000 } = {}) => {
@@ -327,15 +347,19 @@ const daemonClient = (socket, { requestTimeoutMs = 60000 } = {}) => {
 
   return {
     send,
-    request: (message) => new Promise((resolve, reject) => {
-      const item = { resolve, reject, settled: false, timer: null };
-      item.timer = setTimeout(
-        () => settle(item, () => reject(new Error(`ImportLens daemon request timed out after ${requestTimeoutMs}ms`))),
-        requestTimeoutMs,
-      );
-      pending.push(item);
-      send(message);
-    }),
+    request: (message) =>
+      new Promise((resolve, reject) => {
+        const item = { resolve, reject, settled: false, timer: null };
+        item.timer = setTimeout(
+          () =>
+            settle(item, () =>
+              reject(new Error(`ImportLens daemon request timed out after ${requestTimeoutMs}ms`)),
+            ),
+          requestTimeoutMs,
+        );
+        pending.push(item);
+        send(message);
+      }),
   };
 };
 

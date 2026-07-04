@@ -7,8 +7,5 @@
     "declaration": false,
     "isolatedDeclarations": false
   },
-  "include": [
-    "extension/src/**/*",
-    "extension/test/**/*"
-  ]
+  "include": ["extension/src/**/*", "extension/test/**/*"]
 }

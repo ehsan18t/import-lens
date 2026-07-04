@@ -36,5 +36,8 @@ test("createStagedManifest keeps production dependencies and strips development-
 });
 
 test("package-vsix copies every non-generated manifest directory", () => {
-  assert.match(packageVsixScript, /copyPath\(path\.join\(repoRoot, "cli"\), path\.join\(stagingRoot, "cli"\)\)/);
+  assert.match(
+    packageVsixScript,
+    /copyPath\(path\.join\(repoRoot, "cli"\), path\.join\(stagingRoot, "cli"\)\)/,
+  );
 });

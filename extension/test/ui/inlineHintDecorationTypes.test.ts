@@ -40,5 +40,11 @@ test("inlineHintDecorationLayerBuckets preserves segment order in slots", () => 
 });
 
 test("INLINE_HINT_DECORATION_SLOTS applies primary before suffix layers", () => {
-  assert.deepEqual(INLINE_HINT_DECORATION_SLOTS, ["primary", "suffix0", "suffix1", "suffix2", "suffix3"]);
+  assert.deepEqual(INLINE_HINT_DECORATION_SLOTS, [
+    "primary",
+    "suffix0",
+    "suffix1",
+    "suffix2",
+    "suffix3",
+  ]);
 });

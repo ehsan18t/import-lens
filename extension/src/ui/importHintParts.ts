@@ -1,10 +1,6 @@
 import type { ImportAnalysisInsight, ImportAnalysisState } from "../analysis/state.js";
 import type { ImportLensConfig } from "../config.js";
-import {
-  formatImportSizePrimary,
-  importHintTagLabels,
-  importSizePrimaryTone,
-} from "./format.js";
+import { formatImportSizePrimary, importHintTagLabels, importSizePrimaryTone } from "./format.js";
 import type { InlineHintParts, InlineHintSuffixPart } from "./inlineHintSegments.js";
 import type { InlineHintTone } from "./inlineHintVisuals.js";
 
@@ -61,10 +57,12 @@ export const importHintParts = (
 
   if (state.status === "ready" && state.result) {
     const suffixes: InlineHintSuffixPart[] = [
-      ...importHintTagLabels(state.result, config.showWarnings, state.detected.runtime).map((text) => ({
-        text,
-        tone: "tag" as const,
-      })),
+      ...importHintTagLabels(state.result, config.showWarnings, state.detected.runtime).map(
+        (text) => ({
+          text,
+          tone: "tag" as const,
+        }),
+      ),
       ...insightSuffixes(state.insights),
     ];
 

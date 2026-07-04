@@ -40,4 +40,5 @@ export const formatLogLine = (
   message: string,
   context: LogContext = {},
   date: Date = new Date(),
-): string => `${date.toISOString()} [${level.toUpperCase()}] ${formatContextPrefix(context)}${message}`;
+): string =>
+  `${date.toISOString()} [${level.toUpperCase()}] ${formatContextPrefix(context)}${message}`;

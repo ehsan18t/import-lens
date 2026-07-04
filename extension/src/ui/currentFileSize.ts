@@ -30,7 +30,9 @@ export const showCurrentFileSize = async (
 
   const { document } = editor;
   if (document.uri.scheme !== "file" || !supportedLanguageIds.has(document.languageId)) {
-    await vscode.window.showWarningMessage("ImportLens current-file sizing supports local JavaScript and TypeScript files.");
+    await vscode.window.showWarningMessage(
+      "ImportLens current-file sizing supports local JavaScript and TypeScript files.",
+    );
     return;
   }
 
@@ -38,7 +40,7 @@ export const showCurrentFileSize = async (
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
   const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
 
-  if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
+  if (daemon.state !== "ready" && (await daemon.start(workspaceRoot)) !== "ready") {
     await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
     return;
   }
@@ -49,23 +51,28 @@ export const showCurrentFileSize = async (
         location: vscode.ProgressLocation.Notification,
         title: "ImportLens: Calculating current file size",
       },
-      () => daemon.requestFileSizeDocument({
-        type: "file_size_document",
-        version: protocolVersion,
-        request_id: nextIpcRequestId(),
-        workspace_root: workspaceRoot,
-        active_document_path: document.fileName,
-        source: document.getText(),
-      }),
+      () =>
+        daemon.requestFileSizeDocument({
+          type: "file_size_document",
+          version: protocolVersion,
+          request_id: nextIpcRequestId(),
+          workspace_root: workspaceRoot,
+          active_document_path: document.fileName,
+          source: document.getText(),
+        }),
     );
 
     if (!response) {
-      await vscode.window.showWarningMessage("ImportLens daemon did not return a current-file size.");
+      await vscode.window.showWarningMessage(
+        "ImportLens daemon did not return a current-file size.",
+      );
       return;
     }
 
     if (response.error) {
-      await vscode.window.showWarningMessage(`ImportLens current-file size unavailable: ${response.error}`);
+      await vscode.window.showWarningMessage(
+        `ImportLens current-file size unavailable: ${response.error}`,
+      );
       return;
     }
 
@@ -75,7 +82,9 @@ export const showCurrentFileSize = async (
     }
 
     if (response.imports.length === 0) {
-      await vscode.window.showWarningMessage("ImportLens could not resolve any runtime package imports in the current file.");
+      await vscode.window.showWarningMessage(
+        "ImportLens could not resolve any runtime package imports in the current file.",
+      );
       return;
     }
 
@@ -97,17 +106,21 @@ export const showCurrentFileSize = async (
 
     const skipped = response.states.length - response.imports.length;
     const skippedSuffix = skipped > 0 ? ` · ${skipped} skipped` : "";
-    const diffSuffix = previous ? ` · ${bundleImpactHistoryDeltaLabel(currentHistoryItem, previous)}` : "";
-    await vscode.window.showInformationMessage(`${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}${diffSuffix}`);
+    const diffSuffix = previous
+      ? ` · ${bundleImpactHistoryDeltaLabel(currentHistoryItem, previous)}`
+      : "";
+    await vscode.window.showInformationMessage(
+      `${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}${diffSuffix}`,
+    );
   } catch (error) {
-    logger.warn(`Current-file size request failed: ${error instanceof Error ? error.message : String(error)}`);
+    logger.warn(
+      `Current-file size request failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
     await vscode.window.showWarningMessage("ImportLens current-file size request failed.");
   }
 };
 
-export const showBundleImpactHistory = async (
-  context: vscode.ExtensionContext,
-): Promise<void> => {
+export const showBundleImpactHistory = async (context: vscode.ExtensionContext): Promise<void> => {
   const history = context.globalState.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []);
 
   if (history.length === 0) {

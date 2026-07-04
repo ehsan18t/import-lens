@@ -1,4 +1,9 @@
-import { bytesForCompression, formatBytes, labelForCompression, type CompressionFormat } from "../ui/format.js";
+import {
+  bytesForCompression,
+  formatBytes,
+  labelForCompression,
+  type CompressionFormat,
+} from "../ui/format.js";
 import type { FileSizeResponse } from "../ipc/protocol.js";
 
 export const formatCurrentFileSizeSummary = (

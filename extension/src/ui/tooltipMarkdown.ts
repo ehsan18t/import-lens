@@ -4,7 +4,12 @@ import type { ImportResult } from "../ipc/protocol.js";
 import type { ImportRuntime } from "../ipc/protocol.js";
 import { confidenceVisualFor } from "./confidenceVisuals.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
-import { bytesForCompression, formatBytes, labelForCompression, type CompressionFormat } from "./format.js";
+import {
+  bytesForCompression,
+  formatBytes,
+  labelForCompression,
+  type CompressionFormat,
+} from "./format.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
 export const isConservativeEstimate = (result: ImportResult): boolean =>
@@ -90,13 +95,15 @@ export const tooltipForResultMarkdown = (
     parts.push(result.confidence_reasons.map((reason) => `- ${reason}`).join("\n"));
   }
 
-  parts.push([
-    "**Status**",
-    `- Runtime: ${runtime}`,
-    `- Side effects: ${result.side_effects ? "yes" : "no"}`,
-    `- CommonJS: ${result.is_cjs ? "yes" : "no"}`,
-    `- Tree-shakeable: ${result.truly_treeshakeable ? "yes" : "no"}`,
-  ].join("\n"));
+  parts.push(
+    [
+      "**Status**",
+      `- Runtime: ${runtime}`,
+      `- Side effects: ${result.side_effects ? "yes" : "no"}`,
+      `- CommonJS: ${result.is_cjs ? "yes" : "no"}`,
+      `- Tree-shakeable: ${result.truly_treeshakeable ? "yes" : "no"}`,
+    ].join("\n"),
+  );
 
   const conservativeSizing = conservativeSizingMarkdown(result);
 
@@ -105,10 +112,7 @@ export const tooltipForResultMarkdown = (
   }
 
   if (insights.length > 0) {
-    parts.push([
-      "**Insights**",
-      ...insights.map((insight) => `- ${insight.tooltip}`),
-    ].join("\n"));
+    parts.push(["**Insights**", ...insights.map((insight) => `- ${insight.tooltip}`)].join("\n"));
   }
 
   if (result.diagnostics.length > 0) {

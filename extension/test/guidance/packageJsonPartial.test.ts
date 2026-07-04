@@ -106,20 +106,24 @@ test("mergePackageJsonAnalysisPartial ignores stale indexes and mismatched packa
 });
 
 test("mergePackageJsonAnalysisPartial preserves stale registry refresh status", () => {
-  const current = [{
-    ...stateFor("react", "ready"),
-    registryHint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
-    registryHintRefreshStatus: "stale" as const,
-    registryHintRefreshError: "temporary registry failure",
-  }];
+  const current = [
+    {
+      ...stateFor("react", "ready"),
+      registryHint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+      registryHintRefreshStatus: "stale" as const,
+      registryHintRefreshError: "temporary registry failure",
+    },
+  ];
   const partial: AnalyzePackageJsonResponse = {
     version: 7,
     request_id: 9,
     sections: [],
-    states: [{
-      ...stateFor("react", "ready"),
-      result: resultFor("react"),
-    }],
+    states: [
+      {
+        ...stateFor("react", "ready"),
+        result: resultFor("react"),
+      },
+    ],
     error: null,
     diagnostics: [],
   };

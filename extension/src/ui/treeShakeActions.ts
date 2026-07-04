@@ -14,10 +14,7 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
     this.#store = store;
   }
 
-  provideCodeActions(
-    document: vscode.TextDocument,
-    range: vscode.Range,
-  ): vscode.CodeAction[] {
+  provideCodeActions(document: vscode.TextDocument, range: vscode.Range): vscode.CodeAction[] {
     if (!getImportLensConfig().enabled) {
       return [];
     }
@@ -28,7 +25,10 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
       .flatMap((state) => this.actionsForState(document, state));
   }
 
-  private actionsForState(document: vscode.TextDocument, state: ImportAnalysisState): vscode.CodeAction[] {
+  private actionsForState(
+    document: vscode.TextDocument,
+    state: ImportAnalysisState,
+  ): vscode.CodeAction[] {
     if (state.status !== "ready" || !state.result) {
       return [];
     }
@@ -73,7 +73,10 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
       actions.push(namedExports);
     }
 
-    for (const suggestion of substitutionSuggestionsFor(state.detected.specifier, state.detected.packageName)) {
+    for (const suggestion of substitutionSuggestionsFor(
+      state.detected.specifier,
+      state.detected.packageName,
+    )) {
       const action = new vscode.CodeAction(
         `Copy ImportLens alternative: ${suggestion.packageName}`,
         vscode.CodeActionKind.Refactor,

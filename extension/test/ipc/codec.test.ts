@@ -20,16 +20,13 @@ test("FrameDecoder returns complete messages and buffers partial frames", () => 
 
   const decoded = decoder.push(Buffer.concat([first.subarray(splitPoint), second]));
 
-  assert.deepEqual(decoded, [
-    { type: "cache_invalidate", package: "react" },
-    { type: "shutdown" },
-  ]);
+  assert.deepEqual(decoded, [{ type: "cache_invalidate", package: "react" }, { type: "shutdown" }]);
 });
 
 test("FrameDecoder rejects oversized frames before buffering payload", () => {
   const decoder = new FrameDecoder();
   const header = Buffer.alloc(4);
-  header.writeUInt32BE((32 * 1024 * 1024) + 1, 0);
+  header.writeUInt32BE(32 * 1024 * 1024 + 1, 0);
 
   assert.throws(() => decoder.push(header), /too large/u);
 });

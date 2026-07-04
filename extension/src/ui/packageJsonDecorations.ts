@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
-import type { PackageJsonAnalysisController, PackageJsonDependencyAnalysisState } from "../guidance/packageJsonAnalysis.js";
+import type {
+  PackageJsonAnalysisController,
+  PackageJsonDependencyAnalysisState,
+} from "../guidance/packageJsonAnalysis.js";
 import type { PackageJsonDependencySection } from "../ipc/protocol.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
 import { getImportLensConfig } from "../config.js";
@@ -21,7 +24,10 @@ import {
   mergeInlineHintDecorationLayers,
 } from "./inlineHintDecorationTypes.js";
 import { InlineHintDecorationController } from "./inlineHintDecorationController.js";
-import { packageJsonHintSegments, packageJsonSectionSummarySegment } from "./packageJsonHintSegments.js";
+import {
+  packageJsonHintSegments,
+  packageJsonSectionSummarySegment,
+} from "./packageJsonHintSegments.js";
 
 export class PackageJsonDecorationController extends InlineHintDecorationController {
   readonly #analysis: PackageJsonAnalysisController;
@@ -35,9 +41,9 @@ export class PackageJsonDecorationController extends InlineHintDecorationControl
     const config = getImportLensConfig();
 
     if (
-      !shouldShowPackageJsonDecorations(config)
-      || editor.document.uri.scheme !== "file"
-      || !isPackageJsonPath(editor.document.fileName)
+      !shouldShowPackageJsonDecorations(config) ||
+      editor.document.uri.scheme !== "file" ||
+      !isPackageJsonPath(editor.document.fileName)
     ) {
       this.decorationPool.clearEditor(editor);
       return;
@@ -48,7 +54,12 @@ export class PackageJsonDecorationController extends InlineHintDecorationControl
     const layers = emptyInlineHintDecorationLayers();
 
     for (const section of sections) {
-      const sectionLayers = this.decorationLayersForSection(editor.document, section, states, config);
+      const sectionLayers = this.decorationLayersForSection(
+        editor.document,
+        section,
+        states,
+        config,
+      );
 
       if (sectionLayers) {
         mergeInlineHintDecorationLayers(layers, sectionLayers);
@@ -56,7 +67,10 @@ export class PackageJsonDecorationController extends InlineHintDecorationControl
     }
 
     for (const state of states) {
-      mergeInlineHintDecorationLayers(layers, this.decorationLayersForState(editor.document, state, config));
+      mergeInlineHintDecorationLayers(
+        layers,
+        this.decorationLayersForState(editor.document, state, config),
+      );
     }
 
     this.decorationPool.applyToEditor(editor, layers);
@@ -75,11 +89,7 @@ export class PackageJsonDecorationController extends InlineHintDecorationControl
     const parts = packageJsonDependencyHintParts(state, config);
     const tooltip = tooltipForPackageJsonState(state, config, document.uri.toString());
 
-    return inlineHintDecorationLayers(
-      packageJsonHintSegments(parts, config),
-      anchor,
-      tooltip,
-    );
+    return inlineHintDecorationLayers(packageJsonHintSegments(parts, config), anchor, tooltip);
   }
 
   private decorationLayersForSection(
@@ -125,11 +135,9 @@ const tooltipForPackageJsonState = (
     packageJsonDependencyTooltipMarkdown(state, config, { packageJsonUri }),
     true,
   );
-  const trustedCommands = packageJsonDependencyTooltipTrustedCommands(
-    state,
-    config,
-    { packageJsonUri },
-  );
+  const trustedCommands = packageJsonDependencyTooltipTrustedCommands(state, config, {
+    packageJsonUri,
+  });
 
   if (trustedCommands.length > 0) {
     tooltip.isTrusted = { enabledCommands: trustedCommands };

@@ -4,10 +4,7 @@ import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { CacheCleanupResponse, CacheRemoveResponse } from "../ipc/protocol.js";
 import type { Logger } from "../logging/types.js";
 import { analysisRootForFile } from "../workspaceContext.js";
-import {
-  cacheManagerActionItems,
-  cacheShardPickItems,
-} from "./cacheManagerItems.js";
+import { cacheManagerActionItems, cacheShardPickItems } from "./cacheManagerItems.js";
 import {
   cacheCleanupRequest,
   cacheListRequest,
@@ -229,10 +226,13 @@ const inspectProjectCaches = async (
       location: vscode.ProgressLocation.Notification,
       title: "ImportLens: Removing selected project caches",
     },
-    () => daemon.removeCache(cacheRemoveSelectedRequest(
-      nextIpcRequestId(),
-      selected.map((item) => item.shardId),
-    )),
+    () =>
+      daemon.removeCache(
+        cacheRemoveSelectedRequest(
+          nextIpcRequestId(),
+          selected.map((item) => item.shardId),
+        ),
+      ),
   );
 
   await reportRemoveResponse(logger, "selected projects", removeResponse);
@@ -243,7 +243,9 @@ const requireWorkspaceRoot = async (): Promise<string | null> => {
   const workspaceRoot = await currentWorkspaceRoot();
 
   if (!workspaceRoot) {
-    await vscode.window.showWarningMessage("Open a workspace or local file before managing ImportLens cache.");
+    await vscode.window.showWarningMessage(
+      "Open a workspace or local file before managing ImportLens cache.",
+    );
   }
 
   return workspaceRoot;
@@ -260,8 +262,11 @@ const currentWorkspaceRoot = async (): Promise<string | null> => {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
 };
 
-const ensureDaemonReady = async (daemon: DaemonManager, workspaceRoot: string): Promise<boolean> => {
-  if (daemon.state === "ready" || await daemon.start(workspaceRoot) === "ready") {
+const ensureDaemonReady = async (
+  daemon: DaemonManager,
+  workspaceRoot: string,
+): Promise<boolean> => {
+  if (daemon.state === "ready" || (await daemon.start(workspaceRoot)) === "ready") {
     return true;
   }
 
@@ -285,7 +290,9 @@ const reportCleanupResponse = async (
   }
 
   if (response.failed.length > 0) {
-    logger.warn(`Cache cleanup removed ${response.removed.length} cache(s), failed ${response.failed.length}.`);
+    logger.warn(
+      `Cache cleanup removed ${response.removed.length} cache(s), failed ${response.failed.length}.`,
+    );
     await vscode.window.showWarningMessage(
       `ImportLens cache cleanup removed ${response.removed.length} cache(s), failed ${response.failed.length}.`,
     );
@@ -315,7 +322,9 @@ const reportRemoveResponse = async (
   }
 
   if (response.failed.length > 0) {
-    logger.warn(`Cache removal for ${scopeLabel} removed ${response.removed.length} cache(s), failed ${response.failed.length}.`);
+    logger.warn(
+      `Cache removal for ${scopeLabel} removed ${response.removed.length} cache(s), failed ${response.failed.length}.`,
+    );
     await vscode.window.showWarningMessage(
       `ImportLens removed ${response.removed.length} cache(s), failed ${response.failed.length}.`,
     );

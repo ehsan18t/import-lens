@@ -2,12 +2,7 @@ import type { InlineHintSegment } from "./inlineHintSegments.js";
 
 export const INLINE_HINT_SUFFIX_SLOT_COUNT = 4;
 
-export type InlineHintDecorationSlot =
-  | "primary"
-  | "suffix0"
-  | "suffix1"
-  | "suffix2"
-  | "suffix3";
+export type InlineHintDecorationSlot = "primary" | "suffix0" | "suffix1" | "suffix2" | "suffix3";
 
 export const INLINE_HINT_DECORATION_SLOTS: readonly InlineHintDecorationSlot[] = [
   "primary",
@@ -17,7 +12,10 @@ export const INLINE_HINT_DECORATION_SLOTS: readonly InlineHintDecorationSlot[] =
   "suffix3",
 ];
 
-export type InlineHintDecorationLayerBuckets = Record<InlineHintDecorationSlot, InlineHintSegment[]>;
+export type InlineHintDecorationLayerBuckets = Record<
+  InlineHintDecorationSlot,
+  InlineHintSegment[]
+>;
 
 export const emptyInlineHintDecorationLayerBuckets = (): InlineHintDecorationLayerBuckets => ({
   primary: [],

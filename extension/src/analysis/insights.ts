@@ -51,7 +51,9 @@ export const applyImportAnalysisInsights = (
   });
 };
 
-export const insightLabelSuffix = (insights: readonly ImportAnalysisInsight[] | undefined): string => {
+export const insightLabelSuffix = (
+  insights: readonly ImportAnalysisInsight[] | undefined,
+): string => {
   const labels = (insights ?? [])
     .map((insight) => insight.label)
     .filter((label): label is string => Boolean(label));
@@ -64,8 +66,12 @@ export const importCostHistoryItemsForStates = (
   now: number = Date.now(),
 ): ImportCostHistoryItem[] =>
   states
-    .filter((state): state is ImportAnalysisState & { result: NonNullable<ImportAnalysisState["result"]> } =>
-      state.status === "ready" && Boolean(state.result) && !state.result?.error)
+    .filter(
+      (
+        state,
+      ): state is ImportAnalysisState & { result: NonNullable<ImportAnalysisState["result"]> } =>
+        state.status === "ready" && Boolean(state.result) && !state.result?.error,
+    )
     .map((state) => importCostHistoryItem(state.detected, state.result, now));
 
 const gitDeltaInsight = (
@@ -76,7 +82,11 @@ const gitDeltaInsight = (
     return null;
   }
 
-  for (let line = state.detected.statementRange.start.line; line <= state.detected.statementRange.end.line; line += 1) {
+  for (
+    let line = state.detected.statementRange.start.line;
+    line <= state.detected.statementRange.end.line;
+    line += 1
+  ) {
     if (changedLines.has(line)) {
       return {
         label: `+${formatBytes(state.result.brotli_bytes)} br`,

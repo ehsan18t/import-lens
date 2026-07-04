@@ -56,10 +56,8 @@ test("cache management requests are client messages", () => {
   };
   const messages = [status, cleanup, list, remove] satisfies ClientMessage[];
 
-  assert.deepEqual(messages.map((message) => message.type), [
-    "cache_status",
-    "cache_cleanup",
-    "cache_list",
-    "cache_remove",
-  ]);
+  assert.deepEqual(
+    messages.map((message) => message.type),
+    ["cache_status", "cache_cleanup", "cache_list", "cache_remove"],
+  );
 });

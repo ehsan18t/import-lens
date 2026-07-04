@@ -55,7 +55,8 @@ export const createNodeModulesInvalidationBuffer = (
   const pending = new Set<string>();
   const delayMs = options.delayMs ?? defaultNodeModulesInvalidationDelayMs;
   const setTimeoutFn = options.setTimeoutFn ?? setTimeout;
-  const clearTimeoutFn = options.clearTimeoutFn ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+  const clearTimeoutFn =
+    options.clearTimeoutFn ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
   let timer: unknown;
   let disposed = false;
 

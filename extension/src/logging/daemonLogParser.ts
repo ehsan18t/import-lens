@@ -12,7 +12,12 @@ const structuredDaemonLogPattern =
 const levelFromToken = (token: string): LogLevel | null => {
   const normalized = token.toLowerCase();
 
-  if (normalized === "error" || normalized === "warn" || normalized === "info" || normalized === "debug") {
+  if (
+    normalized === "error" ||
+    normalized === "warn" ||
+    normalized === "info" ||
+    normalized === "debug"
+  ) {
     return normalized;
   }
 

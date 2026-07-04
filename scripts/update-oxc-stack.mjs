@@ -86,7 +86,8 @@ export const updateOxcStack = async ({
   validateCurrentStack(files.cargoToml, files.manifestJson);
 
   const targetOxcVersion = oxcVersion ?? (await latestCrateVersion(fetchJson, "oxc_parser"));
-  const targetResolverVersion = resolverVersion ?? (await latestCrateVersion(fetchJson, "oxc_resolver"));
+  const targetResolverVersion =
+    resolverVersion ?? (await latestCrateVersion(fetchJson, "oxc_resolver"));
 
   validateVersion("OXC", targetOxcVersion);
   validateVersion("oxc_resolver", targetResolverVersion);
@@ -95,8 +96,16 @@ export const updateOxcStack = async ({
   const nextFiles = {
     cargoToml: updateCargoToml(files.cargoToml, targetOxcVersion, targetResolverVersion),
     manifest: updateManifest(files.manifestJson, targetOxcVersion),
-    dependencyPolicyTest: replaceKnownVersions(files.dependencyPolicyTest, targetOxcVersion, targetResolverVersion),
-    packageVsixManifestTest: replaceKnownVersions(files.packageVsixManifestTest, targetOxcVersion, targetResolverVersion),
+    dependencyPolicyTest: replaceKnownVersions(
+      files.dependencyPolicyTest,
+      targetOxcVersion,
+      targetResolverVersion,
+    ),
+    packageVsixManifestTest: replaceKnownVersions(
+      files.packageVsixManifestTest,
+      targetOxcVersion,
+      targetResolverVersion,
+    ),
     srs: replaceKnownVersions(files.srs, targetOxcVersion, targetResolverVersion),
     config: updateConfig(files.config, targetOxcVersion, targetResolverVersion),
   };
@@ -151,7 +160,12 @@ const valueAfter = (argv, index, option) => {
   return value;
 };
 
-const updateLockfiles = async (execFile, oxcVersion, resolverVersion, platform = process.platform) => {
+const updateLockfiles = async (
+  execFile,
+  oxcVersion,
+  resolverVersion,
+  platform = process.platform,
+) => {
   // On Windows `pnpm` resolves to `pnpm.CMD`, which execFile (CreateProcess)
   // cannot launch directly; run it through the shell, mirroring the packaging
   // scripts. cargo is a real executable and stays on execFile.

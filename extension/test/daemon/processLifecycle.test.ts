@@ -99,10 +99,7 @@ test("routeDaemonLogLine falls back to stream defaults for unstructured lines", 
   routeDaemonLogLine("startup ready", logger, "stdout");
   routeDaemonLogLine("resolver failed", logger, "stderr");
 
-  assert.deepEqual(messages, [
-    "info:startup ready",
-    "warn:resolver failed",
-  ]);
+  assert.deepEqual(messages, ["info:startup ready", "warn:resolver failed"]);
 });
 
 test("pipeDaemonProcessLogs forwards daemon streams through routeDaemonLogLine", async () => {
@@ -124,8 +121,5 @@ test("pipeDaemonProcessLogs forwards daemon streams through routeDaemonLogLine",
   stderr.write("[import-lens-daemon] 2026-06-15T12:00:00.000Z [WARN] [ipc] resolver failed\n");
   await delay(0);
 
-  assert.deepEqual(messages, [
-    "info:daemon ready",
-    "warn:[ipc] resolver failed",
-  ]);
+  assert.deepEqual(messages, ["info:daemon ready", "warn:[ipc] resolver failed"]);
 });

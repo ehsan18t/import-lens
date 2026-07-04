@@ -4,7 +4,9 @@ import { parseDaemonLogLine } from "../../src/logging/daemonLogParser.js";
 
 test("parseDaemonLogLine parses structured daemon output", () => {
   assert.deepEqual(
-    parseDaemonLogLine("[import-lens-daemon] 2026-06-15T12:00:00.000Z [WARN] [cache] failed to flush"),
+    parseDaemonLogLine(
+      "[import-lens-daemon] 2026-06-15T12:00:00.000Z [WARN] [cache] failed to flush",
+    ),
     {
       level: "warn",
       component: "cache",

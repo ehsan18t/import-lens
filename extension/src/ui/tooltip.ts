@@ -17,7 +17,9 @@ export const tooltipForResult = (
     tooltip.isTrusted = { enabledCommands: [copyImportDiagnosticsCommand] };
   }
 
-  tooltip.appendMarkdown(tooltipForResultMarkdown(result, getImportLensConfig(), runtime, insights));
+  tooltip.appendMarkdown(
+    tooltipForResultMarkdown(result, getImportLensConfig(), runtime, insights),
+  );
   return tooltip;
 };
 
@@ -28,7 +30,9 @@ export const tooltipForMessage = (title: string, message: string): vscode.Markdo
   return tooltip;
 };
 
-export const tooltipForAnalysisState = (state: ImportAnalysisState): vscode.MarkdownString | undefined => {
+export const tooltipForAnalysisState = (
+  state: ImportAnalysisState,
+): vscode.MarkdownString | undefined => {
   if (state.status === "missing") {
     return tooltipForMessage("ImportLens", state.message ?? "Package not found");
   }

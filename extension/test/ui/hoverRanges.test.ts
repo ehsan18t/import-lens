@@ -25,33 +25,51 @@ const state = (
 });
 
 test("stateForHoverPosition returns the import whose specifier range contains the hover", () => {
-  const first = state("react", {
-    start: { line: 2, character: 0 },
-    end: { line: 2, character: 26 },
-  }, {
-    start: { line: 2, character: 8 },
-    end: { line: 2, character: 13 },
-  });
-  const second = state("date-fns", {
-    start: { line: 5, character: 0 },
-    end: { line: 7, character: 18 },
-  }, {
-    start: { line: 6, character: 2 },
-    end: { line: 6, character: 10 },
-  });
+  const first = state(
+    "react",
+    {
+      start: { line: 2, character: 0 },
+      end: { line: 2, character: 26 },
+    },
+    {
+      start: { line: 2, character: 8 },
+      end: { line: 2, character: 13 },
+    },
+  );
+  const second = state(
+    "date-fns",
+    {
+      start: { line: 5, character: 0 },
+      end: { line: 7, character: 18 },
+    },
+    {
+      start: { line: 6, character: 2 },
+      end: { line: 6, character: 10 },
+    },
+  );
 
-  assert.equal(stateForHoverPosition([first, second], { line: 2, character: 8 })?.detected.specifier, "react");
-  assert.equal(stateForHoverPosition([first, second], { line: 6, character: 4 })?.detected.specifier, "date-fns");
+  assert.equal(
+    stateForHoverPosition([first, second], { line: 2, character: 8 })?.detected.specifier,
+    "react",
+  );
+  assert.equal(
+    stateForHoverPosition([first, second], { line: 6, character: 4 })?.detected.specifier,
+    "date-fns",
+  );
 });
 
 test("stateForHoverPosition ignores positions outside tracked import specifier ranges", () => {
-  const tracked = state("lodash-es", {
-    start: { line: 3, character: 4 },
-    end: { line: 3, character: 32 },
-  }, {
-    start: { line: 3, character: 12 },
-    end: { line: 3, character: 21 },
-  });
+  const tracked = state(
+    "lodash-es",
+    {
+      start: { line: 3, character: 4 },
+      end: { line: 3, character: 32 },
+    },
+    {
+      start: { line: 3, character: 12 },
+      end: { line: 3, character: 21 },
+    },
+  );
 
   assert.equal(stateForHoverPosition([tracked], { line: 3, character: 3 }), undefined);
   assert.equal(stateForHoverPosition([tracked], { line: 3, character: 32 }), undefined);

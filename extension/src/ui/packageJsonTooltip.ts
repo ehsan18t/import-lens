@@ -34,11 +34,9 @@ export interface PackageJsonSectionSummaryTooltipOptions extends PackageJsonTool
   section?: PackageJsonDependencySectionName;
 }
 
-const defaultFormatFetchedAt = (timestamp: number): string =>
-  new Date(timestamp).toLocaleString();
+const defaultFormatFetchedAt = (timestamp: number): string => new Date(timestamp).toLocaleString();
 
-const commandArgs = (args: readonly unknown[]): string =>
-  encodeURIComponent(JSON.stringify(args));
+const commandArgs = (args: readonly unknown[]): string => encodeURIComponent(JSON.stringify(args));
 
 const refreshPackageRegistryHintMarkdown = (
   state: PackageJsonDependencyTooltipState,
@@ -134,10 +132,9 @@ export const packageJsonDependencyTooltipMarkdown = (
   const registryDetails = registryDetailsMarkdown(state, options);
 
   if (registryDetails.length > 0) {
-    parts.push([
-      "**Package version**",
-      ...registryDetails.map((detail) => `- ${detail}`),
-    ].join("\n"));
+    parts.push(
+      ["**Package version**", ...registryDetails.map((detail) => `- ${detail}`)].join("\n"),
+    );
   }
 
   const refreshAction = config.enableRegistryHints
@@ -178,9 +175,8 @@ const sectionFetchedAtMarkdown = (
   options: PackageJsonSectionSummaryTooltipOptions,
 ): string => {
   const fetchedTimes = states.flatMap((state) =>
-    typeof state.registryHint?.fetchedAt === "number"
-      ? [state.registryHint.fetchedAt]
-      : []);
+    typeof state.registryHint?.fetchedAt === "number" ? [state.registryHint.fetchedAt] : [],
+  );
 
   if (states.length === 0 || fetchedTimes.length !== states.length) {
     return "Some registry info has not been fetched yet";
@@ -197,10 +193,7 @@ export const packageJsonSectionSummaryTooltipMarkdown = (
   config: PackageJsonRegistryTooltipConfig,
   options: PackageJsonSectionSummaryTooltipOptions = {},
 ): string => {
-  const parts = [
-    "**ImportLens dependency summary**",
-    label,
-  ];
+  const parts = ["**ImportLens dependency summary**", label];
 
   if (config.enableRegistryHints) {
     parts.push(sectionFetchedAtMarkdown(states, options));

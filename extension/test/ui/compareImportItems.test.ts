@@ -3,7 +3,11 @@ import test from "node:test";
 import { compareImportItemsForResults } from "../../src/ui/compareImportItems.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
 
-const result = (specifier: string, brotliBytes: number, error: string | null = null): ImportResult => ({
+const result = (
+  specifier: string,
+  brotliBytes: number,
+  error: string | null = null,
+): ImportResult => ({
   specifier,
   raw_bytes: brotliBytes + 20,
   minified_bytes: brotliBytes + 10,
@@ -22,10 +26,7 @@ const result = (specifier: string, brotliBytes: number, error: string | null = n
 
 test("compareImportItemsForResults sorts successful imports by Brotli size", () => {
   assert.deepEqual(
-    compareImportItemsForResults([
-      result("large-lib", 1500),
-      result("small-lib", 500),
-    ]),
+    compareImportItemsForResults([result("large-lib", 1500), result("small-lib", 500)]),
     {
       items: [
         {

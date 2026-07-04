@@ -62,7 +62,8 @@ export const inlineHintDecorationLayers = (
           segment,
           anchor,
           slot === "primary" && index === 0 ? hoverMessage : undefined,
-        )),
+        ),
+      ),
     );
   }
 

@@ -36,9 +36,12 @@ export const compareImports = async (
   }
 
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
-  const workspaceRoot = await analysisRootForFile(editor.document.fileName, workspaceFolder?.uri.fsPath);
+  const workspaceRoot = await analysisRootForFile(
+    editor.document.fileName,
+    workspaceFolder?.uri.fsPath,
+  );
 
-  if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
+  if (daemon.state !== "ready" && (await daemon.start(workspaceRoot)) !== "ready") {
     await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
     return;
   }
@@ -57,12 +60,16 @@ export const compareImports = async (
       specifiers,
     });
   } catch (error) {
-    logger.warn(`Import comparison failed: ${error instanceof Error ? error.message : String(error)}`);
+    logger.warn(
+      `Import comparison failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
     await vscode.window.showWarningMessage("ImportLens import comparison failed.");
     return;
   }
 
-  const { items, warning } = compareImportItemsForResults(response?.imports.flatMap((item) => item.result ? [item.result] : []) ?? null);
+  const { items, warning } = compareImportItemsForResults(
+    response?.imports.flatMap((item) => (item.result ? [item.result] : [])) ?? null,
+  );
 
   if (warning) {
     await vscode.window.showWarningMessage(warning);

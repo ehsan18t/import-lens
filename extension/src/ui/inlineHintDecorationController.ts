@@ -11,7 +11,8 @@ export interface DecorationRefreshSource {
  * visible editors. Subclasses only implement {@link refreshEditor}.
  */
 export abstract class InlineHintDecorationController implements vscode.Disposable {
-  protected readonly decorationPool: InlineHintSlotDecorationPool = new InlineHintSlotDecorationPool();
+  protected readonly decorationPool: InlineHintSlotDecorationPool =
+    new InlineHintSlotDecorationPool();
   readonly #subscription: vscode.Disposable;
 
   constructor(source: DecorationRefreshSource) {

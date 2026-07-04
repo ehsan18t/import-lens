@@ -9,9 +9,7 @@ export const sourceRange = (
   end: { line, character: endCharacter },
 });
 
-export const detectedImport = (
-  overrides: Partial<DetectedImport> = {},
-): DetectedImport => {
+export const detectedImport = (overrides: Partial<DetectedImport> = {}): DetectedImport => {
   const line = overrides.line ?? 0;
   const statementRange = overrides.statementRange ?? sourceRange(line, 0, 24);
   const specifierRange = overrides.specifierRange ?? sourceRange(line, 8, 18);

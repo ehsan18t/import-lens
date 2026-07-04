@@ -81,8 +81,8 @@ test("knownHashesSource emits deterministic sorted TypeScript", () => {
     }),
     [
       "export const knownDaemonHashes: Readonly<Record<string, string>> = {",
-      "  \"dist/bin/darwin-arm64/import-lens-daemon\": \"darwin\",",
-      "  \"dist/bin/win32-x64/import-lens-daemon.exe\": \"win\"",
+      '  "dist/bin/darwin-arm64/import-lens-daemon": "darwin",',
+      '  "dist/bin/win32-x64/import-lens-daemon.exe": "win"',
       "};",
       "",
     ].join("\n"),

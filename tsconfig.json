@@ -3,10 +3,7 @@
     "target": "es2025",
     "module": "esnext",
     "moduleResolution": "bundler",
-    "types": [
-      "node",
-      "vscode"
-    ],
+    "types": ["node", "vscode"],
     "strict": true,
     "declaration": true,
     "isolatedDeclarations": true,
@@ -15,7 +12,5 @@
     "outDir": "./dist/extension",
     "rootDir": "./extension/src"
   },
-  "include": [
-    "extension/src/**/*"
-  ]
+  "include": ["extension/src/**/*"]
 }

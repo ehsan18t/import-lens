@@ -9,14 +9,15 @@ import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
 import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
-const detected = (specifier: string, line: number) => detectedImport({
-  specifier,
-  packageName: specifier,
-  line,
-  quoteEnd: { line, character: 20 },
-  specifierRange: sourceRange(line, 8, 18),
-  statementRange: sourceRange(line, 0, 24),
-});
+const detected = (specifier: string, line: number) =>
+  detectedImport({
+    specifier,
+    packageName: specifier,
+    line,
+    quoteEnd: { line, character: 20 },
+    specifierRange: sourceRange(line, 8, 18),
+    statementRange: sourceRange(line, 0, 24),
+  });
 
 const result = (specifier: string, brotliBytes: number): ImportResult => ({
   specifier,
@@ -91,5 +92,8 @@ test("budgetInsightForState adds distinct inline and hover text for import budge
       tooltip: "Budget: large-lib is 2.6 kB br, over the per-import budget of 2.0 kB br.",
     },
   );
-  assert.equal(budgetInsightForState(ready("small-lib", 900), { perImportBrotliBytes: 2000 }), null);
+  assert.equal(
+    budgetInsightForState(ready("small-lib", 900), { perImportBrotliBytes: 2000 }),
+    null,
+  );
 });

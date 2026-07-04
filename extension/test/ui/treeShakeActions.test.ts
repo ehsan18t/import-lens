@@ -28,7 +28,10 @@ const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
 test("treeShakeActionReason explains non tree-shakeable import results", () => {
   assert.match(treeShakeActionReason(result({ is_cjs: true })) ?? "", /CommonJS/u);
   assert.match(treeShakeActionReason(result({ side_effects: true })) ?? "", /side effects/u);
-  assert.match(treeShakeActionReason(result({ truly_treeshakeable: false })) ?? "", /not tree-shakeable/u);
+  assert.match(
+    treeShakeActionReason(result({ truly_treeshakeable: false })) ?? "",
+    /not tree-shakeable/u,
+  );
 });
 
 test("treeShakeActionReason ignores already tree-shakeable and errored imports", () => {
@@ -36,14 +39,15 @@ test("treeShakeActionReason ignores already tree-shakeable and errored imports",
   assert.equal(treeShakeActionReason(result({ error: "failed" })), null);
 });
 
-const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport => detectedImport({
-  specifier: "date-fns",
-  packageName: "date-fns",
-  quoteEnd: { line: 0, character: 31 },
-  specifierRange: sourceRange(0, 8, 30),
-  statementRange: sourceRange(0, 0, 33),
-  ...overrides,
-});
+const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport =>
+  detectedImport({
+    specifier: "date-fns",
+    packageName: "date-fns",
+    quoteEnd: { line: 0, character: 31 },
+    specifierRange: sourceRange(0, 8, 30),
+    statementRange: sourceRange(0, 0, 33),
+    ...overrides,
+  });
 
 const state = (
   detectedOverrides: Partial<DetectedImport> = {},
@@ -56,7 +60,10 @@ const state = (
 
 test("shouldOfferNamedExportCandidates targets namespace imports that do not tree-shake", () => {
   assert.equal(shouldOfferNamedExportCandidates(state()), true);
-  assert.equal(shouldOfferNamedExportCandidates(state({ importKind: "named", named: ["format"] })), false);
+  assert.equal(
+    shouldOfferNamedExportCandidates(state({ importKind: "named", named: ["format"] })),
+    false,
+  );
   assert.equal(shouldOfferNamedExportCandidates(state({}, { truly_treeshakeable: true })), false);
   assert.equal(shouldOfferNamedExportCandidates(state({}, { error: "failed" })), false);
 });

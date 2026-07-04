@@ -10,7 +10,10 @@ import type { InlineHintSegment } from "./inlineHintSegments.js";
 export const packageJsonHintDisplayText = (
   parts: PackageJsonHintParts,
   config: ImportLensConfig,
-): string => packageJsonHintSegments(parts, config).map((segment) => segment.contentText).join("");
+): string =>
+  packageJsonHintSegments(parts, config)
+    .map((segment) => segment.contentText)
+    .join("");
 
 export type PackageJsonHintSegment = InlineHintSegment;
 
@@ -56,9 +59,7 @@ export const packageJsonHintSegments = (
   return segments;
 };
 
-export const packageJsonSectionSummarySegment = (
-  label: string,
-): PackageJsonHintSegment => ({
+export const packageJsonSectionSummarySegment = (label: string): PackageJsonHintSegment => ({
   contentText: ` ${label}`,
   tone: "neutral",
   themeColorId: "descriptionForeground",

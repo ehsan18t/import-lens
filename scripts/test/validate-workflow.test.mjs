@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-const workflow = () => readFileSync(new URL("../../.github/workflows/validate.yml", import.meta.url), "utf8");
+const workflow = () =>
+  readFileSync(new URL("../../.github/workflows/validate.yml", import.meta.url), "utf8");
 
-const actionUses = (source) =>
-  source.match(/uses:\s+[\w-]+\/[\w-]+(?:\/[\w-]+)?@v[^\s]+/gu) ?? [];
+const actionUses = (source) => source.match(/uses:\s+[\w-]+\/[\w-]+(?:\/[\w-]+)?@v[^\s]+/gu) ?? [];
 
 test("validate is a reusable workflow with opt-in heavy gates", () => {
   const source = workflow();
@@ -41,7 +41,10 @@ test("validate caches Rust builds and installs cargo-llvm-cov from a prebuilt bi
   const source = workflow();
 
   assert.match(source, /Swatinem\/rust-cache@v2\.9\.1/u);
-  assert.match(source, /taiki-e\/install-action@v[\d.]+\n\s+with:\n\s+tool: cargo-llvm-cov@0\.8\.7/u);
+  assert.match(
+    source,
+    /taiki-e\/install-action@v[\d.]+\n\s+with:\n\s+tool: cargo-llvm-cov@0\.8\.7/u,
+  );
 
   // The from-source compile is gone.
   assert.doesNotMatch(source, /cargo install cargo-llvm-cov/u);

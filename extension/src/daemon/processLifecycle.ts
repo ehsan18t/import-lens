@@ -110,10 +110,7 @@ const waitForExit = (
   });
 };
 
-const pipeStreamLines = (
-  stream: Readable,
-  writeLine: (line: string) => void,
-): void => {
+const pipeStreamLines = (stream: Readable, writeLine: (line: string) => void): void => {
   let pending = "";
 
   stream.setEncoding("utf8");

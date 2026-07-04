@@ -6,8 +6,5 @@ test("createIpcRequestIdGenerator returns strictly increasing ids", () => {
   const ids = [100, 100, 99, 150];
   const nextId = createIpcRequestIdGenerator(() => ids.shift() ?? 150);
 
-  assert.deepEqual(
-    [nextId(), nextId(), nextId(), nextId()],
-    [101, 102, 150, 151],
-  );
+  assert.deepEqual([nextId(), nextId(), nextId(), nextId()], [101, 102, 150, 151]);
 });

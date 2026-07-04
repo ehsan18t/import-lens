@@ -6,7 +6,10 @@ import {
   packageJsonDependencyHintParts,
   type PackageJsonDependencyHintState,
 } from "../../src/ui/packageJsonLabels.js";
-import { packageJsonHintDisplayText, packageJsonHintSegments } from "../../src/ui/packageJsonHintSegments.js";
+import {
+  packageJsonHintDisplayText,
+  packageJsonHintSegments,
+} from "../../src/ui/packageJsonHintSegments.js";
 
 const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => ({
   enabled: true,

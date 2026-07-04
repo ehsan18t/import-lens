@@ -1,8 +1,4 @@
-import type {
-  CacheListResponse,
-  CacheShardInfo,
-  CacheStatusResponse,
-} from "../ipc/protocol.js";
+import type { CacheListResponse, CacheShardInfo, CacheStatusResponse } from "../ipc/protocol.js";
 
 export type CacheManagerAction = "summary" | "cleanup" | "clearCurrent" | "clearAll" | "inspect";
 

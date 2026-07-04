@@ -83,7 +83,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
     const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
 
-    if (this.#daemon.state !== "ready" && await this.#daemon.start(workspaceRoot) !== "ready") {
+    if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
       this.#store.clear(document.uri);
       this.#statusBar.setStatus("unavailable");
       return;
@@ -130,7 +130,10 @@ export class DocumentAnalysisController implements vscode.Disposable {
       }
 
       const responseStates = response.imports.map((item) =>
-        importAnalysisStateFromDaemon(item, (specifier, reason) => resultLogger.logMissingResult(specifier, reason)));
+        importAnalysisStateFromDaemon(item, (specifier, reason) =>
+          resultLogger.logMissingResult(specifier, reason),
+        ),
+      );
 
       for (const state of responseStates) {
         if (state.status === "ready" && state.result) {
@@ -147,14 +150,21 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
       this.#store.set(document.uri, nextStates);
       try {
-        await recordImportCostHistory(this.#historyStore, importCostHistoryItemsForStates(responseStates));
+        await recordImportCostHistory(
+          this.#historyStore,
+          importCostHistoryItemsForStates(responseStates),
+        );
       } catch (error) {
-        this.#logger.warn(`Import history update failed: ${error instanceof Error ? error.message : String(error)}`);
+        this.#logger.warn(
+          `Import history update failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
       this.#statusBar.setStatus("ready");
       this.#logger.debug(`Completed document analysis request ${requestId}.`);
     } catch (error) {
-      this.#logger.warn(`Analysis request failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#logger.warn(
+        `Analysis request failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       this.#store.clear(document.uri);
       this.#statusBar.setStatus("unavailable");
     }

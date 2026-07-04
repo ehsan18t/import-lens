@@ -41,7 +41,9 @@ test("recordBundleImpactHistory keeps newest entries first under the limit", asy
   await recordBundleImpactHistory(store, item("/workspace/src/c.ts", 900), 2);
 
   assert.deepEqual(
-    store.get<BundleImpactHistoryItem[]>("importLens.bundleImpactHistory", []).map((entry) => entry.fileName),
+    store
+      .get<BundleImpactHistoryItem[]>("importLens.bundleImpactHistory", [])
+      .map((entry) => entry.fileName),
     ["/workspace/src/c.ts", "/workspace/src/b.ts"],
   );
 });
@@ -55,11 +57,17 @@ test("bundleImpactHistoryLabel formats bundle history entries", () => {
 
 test("bundleImpactHistoryDeltaLabel formats import cost deltas", () => {
   assert.equal(
-    bundleImpactHistoryDeltaLabel(item("/workspace/src/app.ts", 1800), item("/workspace/src/app.ts", 1500)),
+    bundleImpactHistoryDeltaLabel(
+      item("/workspace/src/app.ts", 1800),
+      item("/workspace/src/app.ts", 1500),
+    ),
     "+300 B br vs previous",
   );
   assert.equal(
-    bundleImpactHistoryDeltaLabel(item("/workspace/src/app.ts", 1200), item("/workspace/src/app.ts", 1500)),
+    bundleImpactHistoryDeltaLabel(
+      item("/workspace/src/app.ts", 1200),
+      item("/workspace/src/app.ts", 1500),
+    ),
     "-300 B br vs previous",
   );
 });

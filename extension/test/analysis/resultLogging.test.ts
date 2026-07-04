@@ -26,42 +26,48 @@ const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
 
 test("warningMessageForImportResult stays quiet for usable low-confidence fallbacks", () => {
   assert.equal(
-    warningMessageForImportResult(result({
-      confidence: "low",
-      confidence_reasons: ["Static entry sizing is a fallback."],
-      diagnostics: [
-        {
-          stage: "oxc_fallback",
-          message: "OXC pipeline failed; using static entry sizing.",
-          details: ["failed_stage: minify"],
-        },
-      ],
-    })),
+    warningMessageForImportResult(
+      result({
+        confidence: "low",
+        confidence_reasons: ["Static entry sizing is a fallback."],
+        diagnostics: [
+          {
+            stage: "oxc_fallback",
+            message: "OXC pipeline failed; using static entry sizing.",
+            details: ["failed_stage: minify"],
+          },
+        ],
+      }),
+    ),
     null,
   );
 });
 
 test("warningMessageForImportResult stays quiet for measured results that carry fallback error details", () => {
   assert.equal(
-    warningMessageForImportResult(result({
-      confidence: "low",
-      error: "failed to minify bundled modules; using static entry sizing",
-    })),
+    warningMessageForImportResult(
+      result({
+        confidence: "low",
+        error: "failed to minify bundled modules; using static entry sizing",
+      }),
+    ),
     null,
   );
 });
 
 test("warningMessageForImportResult warns when no usable size was produced", () => {
   assert.equal(
-    warningMessageForImportResult(result({
-      raw_bytes: 0,
-      minified_bytes: 0,
-      gzip_bytes: 0,
-      brotli_bytes: 0,
-      zstd_bytes: 0,
-      confidence: "low",
-      error: "failed to resolve package entry",
-    })),
+    warningMessageForImportResult(
+      result({
+        raw_bytes: 0,
+        minified_bytes: 0,
+        gzip_bytes: 0,
+        brotli_bytes: 0,
+        zstd_bytes: 0,
+        confidence: "low",
+        error: "failed to resolve package entry",
+      }),
+    ),
     "sonner: failed to resolve package entry",
   );
 });

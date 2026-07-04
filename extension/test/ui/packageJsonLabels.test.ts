@@ -174,7 +174,10 @@ test("packageJsonDependencyHintParts assigns independent primary and suffix tone
 
 test("packageJsonDependencyHintLabel formats unresolved states without daemon wording", () => {
   assert.equal(
-    packageJsonDependencyHintLabel({ name: "react", section: "dependencies", status: "loading" }, config()),
+    packageJsonDependencyHintLabel(
+      { name: "react", section: "dependencies", status: "loading" },
+      config(),
+    ),
     "checking...",
   );
   assert.equal(
@@ -202,7 +205,10 @@ test("packageJsonDependencyHintLabel formats unresolved states without daemon wo
     "unavailable · latest",
   );
   assert.equal(
-    packageJsonDependencyHintLabel({ name: "react", section: "dependencies", status: "unavailable" }, config()),
+    packageJsonDependencyHintLabel(
+      { name: "react", section: "dependencies", status: "unavailable" },
+      config(),
+    ),
     "unavailable",
   );
 });
@@ -210,9 +216,19 @@ test("packageJsonDependencyHintLabel formats unresolved states without daemon wo
 test("packageJsonSectionSummaryLabel totals measured dependencies and problem counts", () => {
   const states: PackageJsonDependencyHintState[] = [
     { name: "react", section: "dependencies", status: "ready", result: result() },
-    { name: "lodash-es", section: "dependencies", status: "ready", result: result({ brotli_bytes: 500 }) },
+    {
+      name: "lodash-es",
+      section: "dependencies",
+      status: "ready",
+      result: result({ brotli_bytes: 500 }),
+    },
     { name: "missing", section: "dependencies", status: "missing" },
-    { name: "vitest", section: "devDependencies", status: "ready", result: result({ brotli_bytes: 900 }) },
+    {
+      name: "vitest",
+      section: "devDependencies",
+      status: "ready",
+      result: result({ brotli_bytes: 900 }),
+    },
   ];
 
   assert.equal(
@@ -241,8 +257,5 @@ test("packageJsonSectionSummaryLabel shows checking state before measurements ar
     { name: "lodash-es", section: "dependencies", status: "loading" },
   ];
 
-  assert.equal(
-    packageJsonSectionSummaryLabel("dependencies", states, config()),
-    "2 checking...",
-  );
+  assert.equal(packageJsonSectionSummaryLabel("dependencies", states, config()), "2 checking...");
 });

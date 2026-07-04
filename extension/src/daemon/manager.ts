@@ -79,11 +79,15 @@ export class DaemonManager implements vscode.Disposable {
     return this.#transport.enumerateExports(request);
   }
 
-  requestFileSizeDocument(request: FileSizeDocumentRequest): Promise<FileSizeDocumentResponse | null> {
+  requestFileSizeDocument(
+    request: FileSizeDocumentRequest,
+  ): Promise<FileSizeDocumentResponse | null> {
     return this.#transport.requestFileSizeDocument(request);
   }
 
-  completeImportMembers(request: CompleteImportMembersRequest): Promise<CompleteImportMembersResponse | null> {
+  completeImportMembers(
+    request: CompleteImportMembersRequest,
+  ): Promise<CompleteImportMembersResponse | null> {
     return this.#transport.completeImportMembers(request);
   }
 

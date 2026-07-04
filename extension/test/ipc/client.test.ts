@@ -131,7 +131,7 @@ const packageJsonRequest = (requestId: number): AnalyzePackageJsonRequest => ({
   request_id: requestId,
   workspace_root: "/workspace",
   active_document_path: "/workspace/package.json",
-  source: "{\"dependencies\":{\"react\":\"^19.0.0\"}}",
+  source: '{"dependencies":{"react":"^19.0.0"}}',
   include_registry_hints: false,
   streaming: true,
 });
@@ -346,11 +346,13 @@ test("IpcClient routes registry hint refresh responses by request id", async () 
   const final: RefreshRegistryHintsResponse = {
     version: protocolVersion,
     request_id: 45,
-    results: [{
-      target: { name: "react", installedVersion: "18.2.0" },
-      hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
-      error: null,
-    }],
+    results: [
+      {
+        target: { name: "react", installedVersion: "18.2.0" },
+        hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+        error: null,
+      },
+    ],
     error: null,
     diagnostics: [],
   };
@@ -380,11 +382,13 @@ test("IpcClient delivers registry hint refresh partials before final response", 
   const partial: RefreshRegistryHintsResponse = {
     version: protocolVersion,
     request_id: 46,
-    results: [{
-      target: { name: "react", installedVersion: "18.2.0" },
-      hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
-      error: null,
-    }],
+    results: [
+      {
+        target: { name: "react", installedVersion: "18.2.0" },
+        hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+        error: null,
+      },
+    ],
     indexes: [0],
     error: null,
     diagnostics: [],
@@ -392,11 +396,13 @@ test("IpcClient delivers registry hint refresh partials before final response", 
   const final: RefreshRegistryHintsResponse = {
     version: protocolVersion,
     request_id: 46,
-    results: [{
-      target: { name: "react", installedVersion: "18.2.0" },
-      hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
-      error: null,
-    }],
+    results: [
+      {
+        target: { name: "react", installedVersion: "18.2.0" },
+        hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
+        error: null,
+      },
+    ],
     error: null,
     diagnostics: [],
   };

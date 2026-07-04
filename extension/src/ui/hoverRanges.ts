@@ -13,8 +13,8 @@ export const sourceRangeContainsPosition = (
   range: SourceRange,
   position: SourcePosition,
 ): boolean =>
-  compareSourcePositions(position, range.start) >= 0
-  && compareSourcePositions(position, range.end) < 0;
+  compareSourcePositions(position, range.start) >= 0 &&
+  compareSourcePositions(position, range.end) < 0;
 
 export const stateForHoverPosition = (
   states: readonly ImportAnalysisState[],

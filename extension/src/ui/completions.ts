@@ -29,7 +29,7 @@ export class ImportMemberCompletionProvider implements vscode.CompletionItemProv
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
     const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
 
-    if (this.#daemon.state !== "ready" && await this.#daemon.start(workspaceRoot) !== "ready") {
+    if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
       return undefined;
     }
 

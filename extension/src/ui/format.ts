@@ -25,7 +25,10 @@ export interface CompressionByteSizes {
   zstd_bytes: number;
 }
 
-export const bytesForCompression = (sizes: CompressionByteSizes, compression: CompressionFormat): number => {
+export const bytesForCompression = (
+  sizes: CompressionByteSizes,
+  compression: CompressionFormat,
+): number => {
   if (compression === "gzip") {
     return sizes.gzip_bytes;
   }
@@ -48,8 +51,7 @@ export const formatBytes = (bytes: number): string => {
   return `${(bytes / 1000).toFixed(1)} kB`;
 };
 
-const confidencePrefix = (result: ImportResult): string =>
-  result.confidence === "low" ? "~" : "";
+const confidencePrefix = (result: ImportResult): string => (result.confidence === "low" ? "~" : "");
 
 export const importSizePrimaryTone = (confidence: ConfidenceLevel): InlineHintTone => {
   if (confidence === "medium") {
@@ -85,10 +87,7 @@ export const importHintTagLabels = (
   return tags;
 };
 
-export const formatImportSizePrimary = (
-  result: ImportResult,
-  options: FormatOptions,
-): string => {
+export const formatImportSizePrimary = (result: ImportResult, options: FormatOptions): string => {
   if (result.error) {
     return "Size unavailable";
   }

@@ -11,9 +11,7 @@ test("CJS bundle must not externalize bundled runtime dependencies", () => {
   try {
     bundle = readFileSync(bundlePath, "utf8");
   } catch {
-    assert.fail(
-      `Bundle not found at ${bundlePath.pathname}. Run "pnpm build" first.`,
-    );
+    assert.fail(`Bundle not found at ${bundlePath.pathname}. Run "pnpm build" first.`);
   }
 
   for (const dep of BUNDLED_RUNTIME_DEPS) {

@@ -1,4 +1,10 @@
-import { protocolVersion, type CacheCleanupRequest, type CacheListRequest, type CacheRemoveRequest, type CacheStatusRequest } from "../ipc/protocol.js";
+import {
+  protocolVersion,
+  type CacheCleanupRequest,
+  type CacheListRequest,
+  type CacheRemoveRequest,
+  type CacheStatusRequest,
+} from "../ipc/protocol.js";
 
 export const cacheStatusRequest = (
   requestId: number,

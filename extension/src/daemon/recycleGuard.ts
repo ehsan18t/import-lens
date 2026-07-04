@@ -34,7 +34,9 @@ export class RecycleGuard {
 
   async resetAfterCleanSession(now: number = Date.now()): Promise<void> {
     await this.#mutateRecycleTimes((recycleTimes) => {
-      const hasRecentRecycle = recycleTimes.some((timestamp) => now - timestamp <= CLEAN_SESSION_MS);
+      const hasRecentRecycle = recycleTimes.some(
+        (timestamp) => now - timestamp <= CLEAN_SESSION_MS,
+      );
 
       return hasRecentRecycle ? recycleTimes : [];
     });
@@ -93,7 +95,9 @@ export class RecycleGuard {
     await mutation;
   }
 
-  async #mutateRecycleTimes(updater: (recycleTimes: readonly number[]) => readonly number[]): Promise<void> {
+  async #mutateRecycleTimes(
+    updater: (recycleTimes: readonly number[]) => readonly number[],
+  ): Promise<void> {
     const mutation = this.#pendingMutation.then(async () => {
       const current = await this.#loadRecycleTimes();
       const next = this.#sortedRecycleTimes(updater(current));
@@ -108,11 +112,7 @@ export class RecycleGuard {
     await mkdir(this.#storagePath, { recursive: true });
     const sorted = this.#sortedRecycleTimes(recycleTimes);
 
-    await writeFile(
-      this.#filePath(),
-      JSON.stringify({ recycles: sorted }),
-      "utf8",
-    );
+    await writeFile(this.#filePath(), JSON.stringify({ recycles: sorted }), "utf8");
 
     this.#cachedRecycleTimes = sorted;
   }

@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { oxcStackConfig } from "../oxc-stack.config.mjs";
 
-const repoFile = (relativePath) => readFileSync(new URL(`../../${relativePath}`, import.meta.url), "utf8");
+const repoFile = (relativePath) =>
+  readFileSync(new URL(`../../${relativePath}`, import.meta.url), "utf8");
 const REMOVED_EXTENSION_DEPS = ["p-" + "queue", "p-" + "timeout", "eventemitter" + "3"];
 
 test("dependency policy pins the oxc analysis stack as one coordinated version", () => {
@@ -12,11 +13,20 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   const dockerfile = repoFile("Dockerfile.build");
   const rustToolchain = repoFile("rust-toolchain.toml");
   for (const crate of oxcStackConfig.oxcCrates) {
-    assert.match(cargoToml, new RegExp(`^${crate} = "=${escapedVersion(oxcStackConfig.currentOxcVersion)}"$`, "mu"));
+    assert.match(
+      cargoToml,
+      new RegExp(`^${crate} = "=${escapedVersion(oxcStackConfig.currentOxcVersion)}"$`, "mu"),
+    );
   }
 
   assert.doesNotMatch(cargoToml, /^oxc_mangler = /mu);
-  assert.match(cargoToml, new RegExp(`^oxc_resolver = "=${escapedVersion(oxcStackConfig.currentResolverVersion)}"$`, "mu"));
+  assert.match(
+    cargoToml,
+    new RegExp(
+      `^oxc_resolver = "=${escapedVersion(oxcStackConfig.currentResolverVersion)}"$`,
+      "mu",
+    ),
+  );
   assert.doesNotMatch(workspaceCargoToml, /^rust-version = /mu);
   assert.doesNotMatch(cargoToml, /^rust-version\.workspace = /mu);
   assert.match(dockerfile, /^ARG RUST_VERSION=stable$/mu);
@@ -25,7 +35,10 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   assert.match(dockerfile, /https:\/\/ziglang\.org\/download\/index\.json/);
   assert.match(dockerfile, /ln -sf \/opt\/zig\/zig \/usr\/local\/bin\/zig/);
   assert.match(dockerfile, /cargo install cargo-zigbuild --locked/);
-  assert.match(dockerfile, /cargo install cargo-zigbuild --version "\$\{CARGO_ZIGBUILD_VERSION\}" --locked/);
+  assert.match(
+    dockerfile,
+    /cargo install cargo-zigbuild --version "\$\{CARGO_ZIGBUILD_VERSION\}" --locked/,
+  );
   assert.doesNotMatch(dockerfile, /ZIG_VERSION=0\./);
   assert.doesNotMatch(dockerfile, /CARGO_ZIGBUILD_VERSION=0\./);
   assert.match(rustToolchain, /^channel = "stable"$/mu);

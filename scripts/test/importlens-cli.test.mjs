@@ -39,11 +39,12 @@ test("parseCliArgs supports importlens check and optional config", () => {
 
 test("loadBudgetConfig rejects malformed budget config", async () => {
   await assert.rejects(
-    () => loadBudgetConfig({
-      configPath: ".importlensrc.json",
-      readText: async () => "{ invalid json",
-      findDefaultConfig: async () => null,
-    }),
+    () =>
+      loadBudgetConfig({
+        configPath: ".importlensrc.json",
+        readText: async () => "{ invalid json",
+        findDefaultConfig: async () => null,
+      }),
     /failed to parse/u,
   );
 });

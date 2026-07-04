@@ -11,4 +11,3 @@ test("platformTargetFrom returns null for unsupported runtime pairs", () => {
   assert.equal(platformTargetFrom("aix", "x64"), null);
   assert.equal(platformTargetFrom("win32", "ia32"), null);
 });
-

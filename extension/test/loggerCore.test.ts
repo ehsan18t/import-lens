@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { defaultLogLevel, formatContextPrefix, formatLogLine, shouldWriteLog } from "../src/loggerCore.js";
+import {
+  defaultLogLevel,
+  formatContextPrefix,
+  formatLogLine,
+  shouldWriteLog,
+} from "../src/loggerCore.js";
 
 test("defaultLogLevel keeps the output channel useful without extra configuration", () => {
   assert.equal(defaultLogLevel, "info");

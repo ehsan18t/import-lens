@@ -20,7 +20,7 @@ export const showReport = async (
     return;
   }
 
-  if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
+  if (daemon.state !== "ready" && (await daemon.start(workspaceRoot)) !== "ready") {
     await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
     return;
   }
@@ -32,26 +32,34 @@ export const showReport = async (
         location: vscode.ProgressLocation.Notification,
         title: "ImportLens: Building workspace report",
       },
-      () => daemon.requestWorkspaceReport({
-        type: "workspace_report",
-        version: protocolVersion,
-        request_id: nextIpcRequestId(),
-        workspace_root: workspaceRoot,
-        budgets: config.budgets,
-      }),
+      () =>
+        daemon.requestWorkspaceReport({
+          type: "workspace_report",
+          version: protocolVersion,
+          request_id: nextIpcRequestId(),
+          workspace_root: workspaceRoot,
+          budgets: config.budgets,
+        }),
     );
 
     if (!response || response.error) {
-      await vscode.window.showWarningMessage(`ImportLens report unavailable${response?.error ? `: ${response.error}` : "."}`);
+      await vscode.window.showWarningMessage(
+        `ImportLens report unavailable${response?.error ? `: ${response.error}` : "."}`,
+      );
       return;
     }
 
     logger.info(`Workspace report built with ${response.rows.length} import item(s).`);
     const reportRows = response.rows;
     const summary = response.summary;
-    const panel = vscode.window.createWebviewPanel("importLensReport", "ImportLens Report", vscode.ViewColumn.Beside, {
-      enableScripts: false,
-    });
+    const panel = vscode.window.createWebviewPanel(
+      "importLensReport",
+      "ImportLens Report",
+      vscode.ViewColumn.Beside,
+      {
+        enableScripts: false,
+      },
+    );
     const treemap = svgTreemap(summary.treemap);
     const confidenceLegend = (["high", "medium", "low"] as const)
       .map((confidence) => {
@@ -60,13 +68,20 @@ export const showReport = async (
       })
       .join("");
     const duplicateImports = summary.duplicateImports
-      .map((item) => `<tr><td>${escapeHtml(item.specifier)}</td><td>${item.count}</td><td>${formatBytes(item.totalBrotliBytes)}</td><td>${escapeHtml(item.sourceFiles.join(", "))}</td></tr>`)
+      .map(
+        (item) =>
+          `<tr><td>${escapeHtml(item.specifier)}</td><td>${item.count}</td><td>${formatBytes(item.totalBrotliBytes)}</td><td>${escapeHtml(item.sourceFiles.join(", "))}</td></tr>`,
+      )
       .join("");
     const sharedModules = summary.sharedModules
-      .map((item) => `<tr><td>${escapeHtml(item.basename)}</td><td>${item.count}</td><td>${formatBytes(item.totalBytes)}</td><td>${escapeHtml(item.specifiers.join(", "))}</td><td>${item.vendored ? "yes" : "no"}</td><td>${escapeHtml(item.modulePath)}</td></tr>`)
+      .map(
+        (item) =>
+          `<tr><td>${escapeHtml(item.basename)}</td><td>${item.count}</td><td>${formatBytes(item.totalBytes)}</td><td>${escapeHtml(item.specifiers.join(", "))}</td><td>${item.vendored ? "yes" : "no"}</td><td>${escapeHtml(item.modulePath)}</td></tr>`,
+      )
       .join("");
     const rows = reportRows
-      .map((row) => `<tr>
+      .map(
+        (row) => `<tr>
 <td>${escapeHtml(row.packageName)}</td>
 <td>${escapeHtml(row.specifier)}</td>
 <td>${escapeHtml(row.sourceFile)}</td>
@@ -81,7 +96,8 @@ export const showReport = async (
 <td>${escapeHtml(row.confidenceReasons)}</td>
 <td>${escapeHtml(row.topModules)}</td>
 <td>${escapeHtml(row.warning)}</td>
-</tr>`)
+</tr>`,
+      )
       .join("");
 
     panel.webview.html = `<!doctype html>
@@ -145,8 +161,12 @@ th{font-weight:600}
 </html>`;
     context.subscriptions.push(panel);
   } catch (error) {
-    logger.warn(`Workspace report request failed: ${error instanceof Error ? error.message : String(error)}`);
-    await vscode.window.showWarningMessage(`ImportLens report request failed: ${error instanceof Error ? error.message : String(error)}`);
+    logger.warn(
+      `Workspace report request failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    await vscode.window.showWarningMessage(
+      `ImportLens report request failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 };
 
@@ -157,9 +177,7 @@ const escapeHtml = (value: string): string =>
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
 
-const svgTreemap = (
-  items: WorkspaceReportSummary["treemap"],
-): string => {
+const svgTreemap = (items: WorkspaceReportSummary["treemap"]): string => {
   if (items.length === 0) {
     return "";
   }
@@ -167,15 +185,20 @@ const svgTreemap = (
   const width = 1000;
   const rowHeight = 28;
   const height = items.length * rowHeight;
-  const rows = items.map((item, index) => {
-    const y = index * rowHeight;
-    const fillClass = confidenceVisualFor(item.confidence).cssClass.replace("confidence-", "confidence-fill-");
-    const barWidth = Math.max(1, Math.round((item.percentage / 100) * width));
-    return `<g>
+  const rows = items
+    .map((item, index) => {
+      const y = index * rowHeight;
+      const fillClass = confidenceVisualFor(item.confidence).cssClass.replace(
+        "confidence-",
+        "confidence-fill-",
+      );
+      const barWidth = Math.max(1, Math.round((item.percentage / 100) * width));
+      return `<g>
 <rect class="${fillClass}" x="0" y="${y}" width="${barWidth}" height="24"></rect>
 <text x="8" y="${y + 17}">${escapeHtml(item.specifier)} · ${formatBytes(item.brotliBytes)} br · ${item.percentage}%</text>
 </g>`;
-  }).join("");
+    })
+    .join("");
 
   return `<svg class="treemap" viewBox="0 0 ${width} ${height}" role="img" aria-label="Brotli size treemap">${rows}</svg>`;
 };

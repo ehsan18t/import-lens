@@ -21,7 +21,7 @@ export const showNamedExportCandidates = async (
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
   const workspaceRoot = await analysisRootForFile(uri.fsPath, workspaceFolder?.uri.fsPath);
 
-  if (daemon.state !== "ready" && await daemon.start(workspaceRoot) !== "ready") {
+  if (daemon.state !== "ready" && (await daemon.start(workspaceRoot)) !== "ready") {
     await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
     return;
   }
@@ -34,7 +34,9 @@ export const showNamedExportCandidates = async (
     active_document_path: uri.fsPath,
     specifiers: [detected.specifier],
   });
-  const request = analysis?.imports.find((item) => item.detected.specifier === detected.specifier)?.request;
+  const request = analysis?.imports.find(
+    (item) => item.detected.specifier === detected.specifier,
+  )?.request;
 
   if (!request) {
     await vscode.window.showWarningMessage(`ImportLens could not resolve ${detected.specifier}.`);
@@ -53,8 +55,12 @@ export const showNamedExportCandidates = async (
   });
 
   if (!response || response.error) {
-    logger.warn(`Named export candidates unavailable for ${detected.specifier}: ${response?.error ?? "no daemon response"}`);
-    await vscode.window.showWarningMessage(`ImportLens could not enumerate exports for ${detected.specifier}.`);
+    logger.warn(
+      `Named export candidates unavailable for ${detected.specifier}: ${response?.error ?? "no daemon response"}`,
+    );
+    await vscode.window.showWarningMessage(
+      `ImportLens could not enumerate exports for ${detected.specifier}.`,
+    );
     return;
   }
 
@@ -63,7 +69,9 @@ export const showNamedExportCandidates = async (
     .sort((left, right) => left.localeCompare(right));
 
   if (exports.length === 0) {
-    await vscode.window.showInformationMessage(`ImportLens found no named exports for ${detected.specifier}.`);
+    await vscode.window.showInformationMessage(
+      `ImportLens found no named exports for ${detected.specifier}.`,
+    );
     return;
   }
 
@@ -81,6 +89,8 @@ export const showNamedExportCandidates = async (
   }
 
   const names = selected.map((item) => item.label).sort((left, right) => left.localeCompare(right));
-  await vscode.env.clipboard.writeText(`import { ${names.join(", ")} } from '${detected.specifier}';`);
+  await vscode.env.clipboard.writeText(
+    `import { ${names.join(", ")} } from '${detected.specifier}';`,
+  );
   await vscode.window.showInformationMessage(`Copied named import for ${detected.specifier}.`);
 };

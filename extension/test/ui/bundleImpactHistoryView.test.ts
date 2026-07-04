@@ -3,7 +3,9 @@ import test from "node:test";
 import { bundleImpactHistoryHtml } from "../../src/ui/bundleImpactHistoryView.js";
 import type { BundleImpactHistoryItem } from "../../src/analysis/history.js";
 
-const historyItem = (overrides: Partial<BundleImpactHistoryItem> = {}): BundleImpactHistoryItem => ({
+const historyItem = (
+  overrides: Partial<BundleImpactHistoryItem> = {},
+): BundleImpactHistoryItem => ({
   timestamp: Date.UTC(2026, 0, 2, 3, 4, 5),
   fileName: "src/app.ts",
   rawBytes: 9000,

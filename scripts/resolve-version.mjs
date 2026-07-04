@@ -18,7 +18,9 @@ const main = () => {
   const version = resolveVersion(process.argv[2], manifest.version);
 
   if (!version) {
-    console.error("Could not resolve a version: no input was given and package.json has no version.");
+    console.error(
+      "Could not resolve a version: no input was given and package.json has no version.",
+    );
     process.exit(1);
   }
 

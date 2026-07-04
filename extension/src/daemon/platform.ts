@@ -6,7 +6,10 @@ export type PlatformTarget =
   | "darwin-x64"
   | "darwin-arm64";
 
-export const platformTargetFrom = (platform: NodeJS.Platform, arch: NodeJS.Architecture): PlatformTarget | null => {
+export const platformTargetFrom = (
+  platform: NodeJS.Platform,
+  arch: NodeJS.Architecture,
+): PlatformTarget | null => {
   if (platform === "win32" && arch === "x64") {
     return "win32-x64";
   }
@@ -34,9 +37,11 @@ export const platformTargetFrom = (platform: NodeJS.Platform, arch: NodeJS.Archi
   return null;
 };
 
-export const currentPlatformTarget = (): PlatformTarget | null => platformTargetFrom(process.platform, process.arch);
+export const currentPlatformTarget = (): PlatformTarget | null =>
+  platformTargetFrom(process.platform, process.arch);
 
-export const daemonBinaryName = (target: PlatformTarget): string => target.startsWith("win32") ? "import-lens-daemon.exe" : "import-lens-daemon";
+export const daemonBinaryName = (target: PlatformTarget): string =>
+  target.startsWith("win32") ? "import-lens-daemon.exe" : "import-lens-daemon";
 
 // Where the daemon binaries live, relative to the extension root — identical in
 // the repo (dev resolves against the repo root) and inside the packaged VSIX.
@@ -46,4 +51,3 @@ export const daemonRoot = "dist/bin";
 
 export const daemonRelativePath = (target: PlatformTarget): string =>
   `${daemonRoot}/${target}/${daemonBinaryName(target)}`;
-

@@ -5,9 +5,11 @@ import { NativeDaemonTransport } from "../../src/daemon/nativeTransport.js";
 import type { Logger } from "../../src/logging/types.js";
 
 const capturingLogger = (lines: string[]): Logger => {
-  const record = (level: string) => (message: string): void => {
-    lines.push(`${level}: ${message}`);
-  };
+  const record =
+    (level: string) =>
+    (message: string): void => {
+      lines.push(`${level}: ${message}`);
+    };
   const logger: Logger = {
     error: record("error"),
     warn: record("warn"),

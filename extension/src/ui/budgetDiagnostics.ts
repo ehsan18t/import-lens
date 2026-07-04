@@ -29,8 +29,8 @@ export class BudgetDiagnosticsController implements vscode.Disposable {
       return;
     }
 
-    const diagnostics = budgetViolationsForStates(this.#store.get(uri), config.budgets)
-      .map((violation) => {
+    const diagnostics = budgetViolationsForStates(this.#store.get(uri), config.budgets).map(
+      (violation) => {
         const diagnostic = new vscode.Diagnostic(
           rangeFromSourceRange(violation.range),
           violation.message,
@@ -39,7 +39,8 @@ export class BudgetDiagnosticsController implements vscode.Disposable {
         diagnostic.source = "ImportLens";
         diagnostic.code = violation.kind === "file" ? "file-budget" : "import-budget";
         return diagnostic;
-      });
+      },
+    );
 
     this.#collection.set(uri, diagnostics);
   }

@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-const workflow = () => readFileSync(new URL("../../.github/workflows/build.yml", import.meta.url), "utf8");
+const workflow = () =>
+  readFileSync(new URL("../../.github/workflows/build.yml", import.meta.url), "utf8");
 
-const actionUses = (source) =>
-  source.match(/uses:\s+[\w-]+\/[\w-]+(?:\/[\w-]+)?@v[^\s]+/gu) ?? [];
+const actionUses = (source) => source.match(/uses:\s+[\w-]+\/[\w-]+(?:\/[\w-]+)?@v[^\s]+/gu) ?? [];
 
 test("build workflow packages every native VSIX target", () => {
   const source = workflow();
@@ -43,7 +43,10 @@ test("build workflow caches each VSIX per target and resolved version and suppor
 
   // vsix-v2: the namespace was bumped when the VSIX path moved to dist/vsix,
   // so stale caches created under builds/ can never be restored.
-  assert.match(source, /key: vsix-v2-\$\{\{ matrix\.target \}\}-\$\{\{ needs\.validate\.outputs\.version \}\}/u);
+  assert.match(
+    source,
+    /key: vsix-v2-\$\{\{ matrix\.target \}\}-\$\{\{ needs\.validate\.outputs\.version \}\}/u,
+  );
   assert.match(source, /VSIX_PATH: dist\/vsix\/import-lens-/u);
   assert.match(source, /inputs\.force/u);
   assert.match(source, /retention-days: 1/u);

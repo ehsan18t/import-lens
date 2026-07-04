@@ -69,7 +69,8 @@ const runtimeTargets = new Map([
   ["darwin:arm64", "darwin-arm64"],
 ]);
 
-export const currentPlatformTarget = () => runtimeTargets.get(`${process.platform}:${process.arch}`) ?? null;
+export const currentPlatformTarget = () =>
+  runtimeTargets.get(`${process.platform}:${process.arch}`) ?? null;
 
 export const targetInfo = (platformTarget) => {
   const info = targets.get(platformTarget);
@@ -89,27 +90,13 @@ export const artifactPathForTarget = (repoRoot, platformTarget) => {
 export const cargoBuildArgsForTarget = (platformTarget) => {
   const info = targetInfo(platformTarget);
 
-  return [
-    "build",
-    "-p",
-    "import-lens-daemon",
-    "--release",
-    "--target",
-    info.rustTarget,
-  ];
+  return ["build", "-p", "import-lens-daemon", "--release", "--target", info.rustTarget];
 };
 
 export const cargoZigbuildArgsForTarget = (platformTarget) => {
   const info = targetInfo(platformTarget);
 
-  return [
-    "zigbuild",
-    "-p",
-    "import-lens-daemon",
-    "--release",
-    "--target",
-    info.rustTarget,
-  ];
+  return ["zigbuild", "-p", "import-lens-daemon", "--release", "--target", info.rustTarget];
 };
 
 // All build artifacts live under dist/ (target/ is the one Rust-convention

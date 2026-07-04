@@ -6,7 +6,10 @@ const manifest = JSON.parse(readFileSync(new URL("../../package.json", import.me
 const tsconfig = JSON.parse(readFileSync(new URL("../../tsconfig.json", import.meta.url), "utf8"));
 
 test("ImportLens log level defaults to info for visible output-channel diagnostics", () => {
-  assert.equal(manifest.contributes.configuration.properties["importLens.logLevel"].default, "info");
+  assert.equal(
+    manifest.contributes.configuration.properties["importLens.logLevel"].default,
+    "info",
+  );
 });
 
 test("ImportLens colored inline renderer is the default with native available", () => {
@@ -34,7 +37,10 @@ test("ImportLens budgets expose per-import and per-file Brotli thresholds", () =
 });
 
 test("ImportLens registry hints default on", () => {
-  assert.equal(manifest.contributes.configuration.properties["importLens.enableRegistryHints"].default, true);
+  assert.equal(
+    manifest.contributes.configuration.properties["importLens.enableRegistryHints"].default,
+    true,
+  );
 });
 
 test("ImportLens exposes cache retention policy settings", () => {
@@ -50,11 +56,17 @@ test("ImportLens exposes cache retention policy settings", () => {
 test("ImportLens compare workflow is contributed and package.json can activate the extension", () => {
   assert.ok(manifest.activationEvents.includes("onLanguage:json"));
   assert.ok(manifest.activationEvents.includes("onLanguage:jsonc"));
-  assert.ok(manifest.contributes.commands.some((command) => command.command === "importLens.compareImports"));
+  assert.ok(
+    manifest.contributes.commands.some(
+      (command) => command.command === "importLens.compareImports",
+    ),
+  );
 });
 
 test("ImportLens contributes cache management commands", () => {
-  const commands = new Map(manifest.contributes.commands.map((command) => [command.command, command.title]));
+  const commands = new Map(
+    manifest.contributes.commands.map((command) => [command.command, command.title]),
+  );
 
   assert.equal(commands.get("importLens.manageCache"), "ImportLens: Manage Cache");
   assert.equal(commands.get("importLens.clearCache"), "ImportLens: Clear Current Project Cache");

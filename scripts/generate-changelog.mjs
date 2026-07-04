@@ -89,8 +89,7 @@ export const renderPlainChangelog = (subjects) => {
   return sections.join("\n").trim() || "- No notable changes.";
 };
 
-const runCapture = (command, args) =>
-  spawnSync(command, args, { cwd: repoRoot, encoding: "utf8" });
+const runCapture = (command, args) => spawnSync(command, args, { cwd: repoRoot, encoding: "utf8" });
 
 /** Nearest reachable `v*` tag before HEAD, or null on the first-ever release. */
 const getPrevTag = () => {
