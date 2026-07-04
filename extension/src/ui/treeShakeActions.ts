@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
-import { getImportLensConfig } from "../config.js";
 import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
+import { getImportLensConfig } from "../config.js";
 import { substitutionSuggestionsFor } from "../guidance/substitutions.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import { shouldOfferNamedExportCandidates } from "./namedExportCandidatePolicy.js";

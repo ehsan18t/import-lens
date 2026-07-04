@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { FrameDecoder, encodeFrame } from "../../src/ipc/codec.js";
+import { encodeFrame, FrameDecoder } from "../../src/ipc/codec.js";
 
 test("encodeFrame prefixes MessagePack payloads with a big-endian length", () => {
   const frame = encodeFrame({ type: "shutdown" });

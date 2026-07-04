@@ -10,21 +10,62 @@
       "!**/*.generated.*"
     ]
   },
-  "formatter": { "enabled": true, "useEditorconfig": true, "lineWidth": 100 },
+  "formatter": {
+    "enabled": true,
+    "useEditorconfig": true,
+    "lineWidth": 100,
+    "lineEnding": "lf"
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "all",
+      "arrowParentheses": "always",
+      "bracketSpacing": true
+    }
+  },
   "linter": {
     "enabled": true,
     "rules": {
       "style": {
-        "noNonNullAssertion": "off"
+        "useConsistentArrayType": { "level": "error", "options": { "syntax": "shorthand" } },
+        "useShorthandFunctionType": "error",
+        "useForOf": "error",
+        "useCollapsedElseIf": "error",
+        "useThrowNewError": "error",
+        "useThrowOnlyError": "error",
+        "noYodaExpression": "error",
+        "noInferrableTypes": "error",
+        "useNumberNamespace": "error"
+      },
+      "suspicious": {
+        "noEvolvingTypes": "error"
+      },
+      "complexity": {
+        "useDateNow": "error",
+        "noExcessiveCognitiveComplexity": {
+          "level": "warn",
+          "options": { "maxAllowedComplexity": 25 }
+        }
       }
     }
   },
   "assist": {
     "actions": {
       "source": {
-        "organizeImports": "off"
+        "organizeImports": "on"
       }
     }
   },
-  "javascript": { "formatter": { "quoteStyle": "double" } }
+  "overrides": [
+    {
+      "includes": ["scripts/**", "cli/**"],
+      "linter": { "rules": { "suspicious": { "noConsole": "off" } } }
+    },
+    {
+      "includes": ["extension/src/**"],
+      "linter": { "rules": { "suspicious": { "noConsole": "error" } } }
+    }
+  ]
 }

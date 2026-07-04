@@ -1,8 +1,8 @@
 import * as vscode from "vscode";
-import { sanitizeBudgets, type ImportLensBudgets } from "./analysis/budgets.js";
-import type { CompressionFormat, DisplayMode } from "./ui/format.js";
+import { type ImportLensBudgets, sanitizeBudgets } from "./analysis/budgets.js";
 import type { LogLevel } from "./ipc/protocol.js";
 import { defaultLogLevel } from "./loggerCore.js";
+import type { CompressionFormat, DisplayMode } from "./ui/format.js";
 
 export type InlineRenderer = "colored" | "native";
 

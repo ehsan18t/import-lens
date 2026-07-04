@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import path from "node:path";
-import { encode } from "@msgpack/msgpack";
 import test from "node:test";
+import { encode } from "@msgpack/msgpack";
 import {
   createDaemonClient,
   daemonBinaryPath,

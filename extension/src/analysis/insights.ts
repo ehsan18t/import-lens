@@ -1,13 +1,13 @@
 import path from "node:path";
+import { formatBytes } from "../ui/format.js";
+import { budgetInsightForState, type ImportLensBudgets } from "./budgets.js";
 import {
+  type ImportCostHistoryItem,
   importCostHistoryDeltaLabel,
   importCostHistoryItem,
   previousImportCostFor,
-  type ImportCostHistoryItem,
 } from "./history.js";
-import { budgetInsightForState, type ImportLensBudgets } from "./budgets.js";
 import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
-import { formatBytes } from "../ui/format.js";
 
 export interface ImportAnalysisInsightOptions {
   changedLines?: ReadonlySet<number>;

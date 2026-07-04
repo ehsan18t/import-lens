@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { inlineHintDecorationLayerBuckets } from "../../src/ui/inlineHintDecorationLayerBuilder.js";
 import {
   inlineHintDisplayText,
   inlineHintSegmentsFromParts,
 } from "../../src/ui/inlineHintSegments.js";
-import { inlineHintDecorationLayerBuckets } from "../../src/ui/inlineHintDecorationLayerBuilder.js";
 
 test("inlineHintSegmentsFromParts builds primary and suffix segments", () => {
   assert.deepEqual(

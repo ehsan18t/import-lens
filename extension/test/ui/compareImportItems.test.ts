@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compareImportItemsForResults } from "../../src/ui/compareImportItems.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
+import { compareImportItemsForResults } from "../../src/ui/compareImportItems.js";
 
 const result = (
   specifier: string,

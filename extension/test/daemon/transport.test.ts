@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  type AnalysisTransport,
+  type DaemonState,
+  TransportCoordinator,
+} from "../../src/daemon/transport.js";
 import type {
   AnalyzeDocumentRequest,
   AnalyzeDocumentResponse,
@@ -27,11 +32,6 @@ import type {
   WorkspaceReportResponse,
 } from "../../src/ipc/protocol.js";
 import { protocolVersion } from "../../src/ipc/protocol.js";
-import {
-  TransportCoordinator,
-  type AnalysisTransport,
-  type DaemonState,
-} from "../../src/daemon/transport.js";
 
 class FakeTransport implements AnalysisTransport {
   readonly #startState: DaemonState;
@@ -216,7 +216,7 @@ class FakeTransport implements AnalysisTransport {
       indexes: [0],
       results: [
         {
-          target: request.targets[0]!,
+          target: request.targets[0],
           hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 100 },
           error: null,
         },

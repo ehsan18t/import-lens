@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ImportAnalysisState } from "../../src/analysis/state.js";
+import type { DetectedImport, ImportResult } from "../../src/ipc/protocol.js";
 import { shouldOfferNamedExportCandidates } from "../../src/ui/namedExportCandidatePolicy.js";
 import { treeShakeActionReason } from "../../src/ui/treeShakeActionReason.js";
-import type { ImportAnalysisState } from "../../src/analysis/state.js";
-import type { DetectedImport } from "../../src/ipc/protocol.js";
-import type { ImportResult } from "../../src/ipc/protocol.js";
 import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
 const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({

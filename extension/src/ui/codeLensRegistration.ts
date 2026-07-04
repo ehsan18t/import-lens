@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
-import { languageSelector } from "../languages.js";
 import type { ImportLensConfig } from "../config.js";
+import { languageSelector } from "../languages.js";
 import { nextCodeLensRegistrationAction } from "./codeLensRegistrationPolicy.js";
 import type { ImportLensCodeLensProvider } from "./codelens.js";
 

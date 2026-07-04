@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
-import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   cleanupFailedDaemonStartup,
   pipeDaemonProcessLogs,

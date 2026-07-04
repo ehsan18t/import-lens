@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
+import type { Logger } from "../logging/types.js";
+import { encodeFrame, FrameDecoder } from "./codec.js";
 import type {
   AnalyzeDocumentRequest,
   AnalyzeDocumentResponse,
@@ -28,8 +30,6 @@ import type {
   WorkspaceReportRequest,
   WorkspaceReportResponse,
 } from "./protocol.js";
-import type { Logger } from "../logging/types.js";
-import { FrameDecoder, encodeFrame } from "./codec.js";
 
 export interface IpcClientConnectOptions {
   timeoutMs?: number;

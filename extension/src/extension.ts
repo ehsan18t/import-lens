@@ -1,26 +1,28 @@
 import * as vscode from "vscode";
+import { type ImportCostHistoryItem, importCostHistoryKey } from "./analysis/history.js";
 import { applyImportAnalysisInsights } from "./analysis/insights.js";
-import { importCostHistoryKey, type ImportCostHistoryItem } from "./analysis/history.js";
 import { AnalysisStore } from "./analysis/state.js";
+import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { classifyImportLensConfigChange } from "./configChange.js";
 import {
   applyDaemonStateTransition,
-  refreshVisibleImportLensDocuments,
   type ConfigRefreshMode,
+  refreshVisibleImportLensDocuments,
 } from "./configRefresh.js";
-import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { DaemonManager } from "./daemon/manager.js";
 import { PackageJsonAnalysisController } from "./guidance/packageJsonAnalysis.js";
-import { DocumentAnalysisController } from "./listener.js";
+import type {
+  DetectedImport,
+  ImportResult,
+  ImportRuntime,
+  PackageJsonDependencySectionName,
+} from "./ipc/protocol.js";
 import { languageSelector } from "./languages.js";
+import { DocumentAnalysisController } from "./listener.js";
 import { ImportLensLogger } from "./logger.js";
-import { registerNodeModulesWatchers } from "./watcher.js";
 import { registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
 import { prewarmPackageJsonDocuments } from "./prewarm/packageJsonHelpers.js";
 import { BudgetDiagnosticsController } from "./ui/budgetDiagnostics.js";
-import { ImportLensCodeLensProvider } from "./ui/codelens.js";
-import { syncCodeLensRegistration } from "./ui/codeLensRegistration.js";
-import { compareImports, compareImportsCommand } from "./ui/compareImports.js";
 import {
   clearAllCaches,
   clearAllCachesCommand,
@@ -29,12 +31,15 @@ import {
   manageCacheCommand,
   showCacheManager,
 } from "./ui/cacheManager.js";
+import { syncCodeLensRegistration } from "./ui/codeLensRegistration.js";
+import { ImportLensCodeLensProvider } from "./ui/codelens.js";
+import { compareImports, compareImportsCommand } from "./ui/compareImports.js";
 import { ImportMemberCompletionProvider } from "./ui/completions.js";
+import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
 import { ImportLensHoverProvider } from "./ui/hoverProvider.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
-import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import {
   showNamedExportCandidates,
   showNamedExportCandidatesCommand,
@@ -48,12 +53,7 @@ import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
 import { TreeShakeCodeActionProvider } from "./ui/treeShakeActions.js";
-import type {
-  DetectedImport,
-  ImportResult,
-  ImportRuntime,
-  PackageJsonDependencySectionName,
-} from "./ipc/protocol.js";
+import { registerNodeModulesWatchers } from "./watcher.js";
 
 let daemon: DaemonManager | undefined;
 
@@ -117,6 +117,10 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const treeShakeActions = new TreeShakeCodeActionProvider(store);
 
   daemon = new DaemonManager(context, logger);
+  // Non-null handle for the command closures below: the module-level `daemon`
+  // widens back to `| undefined` inside a closure, but it is always assigned
+  // here before any command can run.
+  const activeDaemon = daemon;
   const packageJsonAnalysis = new PackageJsonAnalysisController(context, daemon, logger);
   const packageJsonDecorations = new PackageJsonDecorationController(packageJsonAnalysis);
   const completions = new ImportMemberCompletionProvider(daemon);
@@ -216,7 +220,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("importLens.showLogs", () => logger.show()),
     vscode.commands.registerCommand(
       "importLens.showCurrentFileSize",
-      () => void showCurrentFileSize(context, daemon!, logger),
+      () => void showCurrentFileSize(context, activeDaemon, logger),
     ),
     vscode.commands.registerCommand(
       "importLens.showBundleImpactHistory",
@@ -225,31 +229,31 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(
       clearCurrentProjectCacheCommand,
       () =>
-        void clearCurrentProjectCache(daemon!, logger, () =>
+        void clearCurrentProjectCache(activeDaemon, logger, () =>
           refreshVisibleDocuments(getImportLensConfig(), "reanalyze"),
         ),
     ),
     vscode.commands.registerCommand(
       clearAllCachesCommand,
       () =>
-        void clearAllCaches(daemon!, logger, () =>
+        void clearAllCaches(activeDaemon, logger, () =>
           refreshVisibleDocuments(getImportLensConfig(), "reanalyze"),
         ),
     ),
     vscode.commands.registerCommand(
       manageCacheCommand,
       () =>
-        void showCacheManager(daemon!, logger, () =>
+        void showCacheManager(activeDaemon, logger, () =>
           refreshVisibleDocuments(getImportLensConfig(), "reanalyze"),
         ),
     ),
     vscode.commands.registerCommand(
       "importLens.showReport",
-      () => void showReport(context, daemon!, logger),
+      () => void showReport(context, activeDaemon, logger),
     ),
     vscode.commands.registerCommand(
       compareImportsCommand,
-      (initialSpecifier?: string) => void compareImports(daemon!, logger, initialSpecifier),
+      (initialSpecifier?: string) => void compareImports(activeDaemon, logger, initialSpecifier),
     ),
     vscode.commands.registerCommand(
       "importLens.copySubstitutionSuggestion",
@@ -320,7 +324,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(
       showNamedExportCandidatesCommand,
       async (uri: vscode.Uri, detected: DetectedImport) => {
-        await showNamedExportCandidates(daemon!, logger, uri, detected);
+        await showNamedExportCandidates(activeDaemon, logger, uri, detected);
       },
     ),
     vscode.workspace.onDidChangeConfiguration((event) => {
@@ -353,7 +357,10 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       applyDaemonStateTransition(nextState, {
         setStatus: (state) => statusBar.setStatus(state),
         prewarmPackageJson: () => {
-          const prewarmCount = prewarmPackageJsonDocuments(vscode.workspace.textDocuments, daemon!);
+          const prewarmCount = prewarmPackageJsonDocuments(
+            vscode.workspace.textDocuments,
+            activeDaemon,
+          );
           if (prewarmCount > 0) {
             logger.debug(`Replayed package.json prewarm for ${prewarmCount} open document(s).`);
           }

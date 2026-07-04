@@ -1,16 +1,16 @@
 import * as vscode from "vscode";
 import type { AnalysisStore, ImportAnalysisState } from "../analysis/state.js";
 import { getImportLensConfig, type ImportLensConfig } from "../config.js";
+import { shouldShowDecorations } from "./displayGuards.js";
+import { importHintAnchorPosition } from "./importHintAnchor.js";
+import { importHintParts } from "./importHintParts.js";
+import { InlineHintDecorationController } from "./inlineHintDecorationController.js";
 import {
   emptyInlineHintDecorationLayers,
   inlineHintDecorationLayers,
   mergeInlineHintDecorationLayers,
 } from "./inlineHintDecorationTypes.js";
-import { InlineHintDecorationController } from "./inlineHintDecorationController.js";
 import { inlineHintSegmentsFromParts } from "./inlineHintSegments.js";
-import { importHintAnchorPosition } from "./importHintAnchor.js";
-import { importHintParts } from "./importHintParts.js";
-import { shouldShowDecorations } from "./displayGuards.js";
 import { tooltipForAnalysisState } from "./tooltip.js";
 
 export class DecorationController extends InlineHintDecorationController {

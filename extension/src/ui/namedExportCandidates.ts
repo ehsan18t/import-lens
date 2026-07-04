@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
-import { protocolVersion, type DetectedImport } from "../ipc/protocol.js";
+import { type DetectedImport, protocolVersion } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { ImportLensLogger } from "../logger.js";
 import { analysisRootForFile } from "../workspaceContext.js";

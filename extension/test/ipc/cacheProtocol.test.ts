@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  protocolVersion,
   type CacheCleanupRequest,
   type CacheListRequest,
   type CacheRemoveRequest,
   type CacheStatusRequest,
   type ClientMessage,
   type HelloMessage,
+  protocolVersion,
 } from "../../src/ipc/protocol.js";
 
 test("cache management protocol uses protocol version 7", () => {

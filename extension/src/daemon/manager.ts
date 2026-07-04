@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { getImportLensConfig } from "../config.js";
 import type {
   AnalyzeDocumentRequest,
   AnalyzeDocumentResponse,
@@ -26,9 +27,8 @@ import type {
   WorkspaceReportResponse,
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
-import { getImportLensConfig } from "../config.js";
 import { NativeDaemonTransport } from "./nativeTransport.js";
-import { TransportCoordinator, type DaemonState, type DaemonStateEvent } from "./transport.js";
+import { type DaemonState, type DaemonStateEvent, TransportCoordinator } from "./transport.js";
 
 export class DaemonManager implements vscode.Disposable {
   readonly #transport: TransportCoordinator;

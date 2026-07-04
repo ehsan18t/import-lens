@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  inlineHintDecorationLayerBuckets,
   INLINE_HINT_DECORATION_SLOTS,
+  inlineHintDecorationLayerBuckets,
   slotForSegmentIndex,
 } from "../../src/ui/inlineHintDecorationLayerBuilder.js";
 import type { InlineHintSegment } from "../../src/ui/inlineHintSegments.js";

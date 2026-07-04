@@ -155,10 +155,14 @@ export const packageJsonSectionSummaryLabel = (
   }
 
   const measuredStates = sectionStates.filter(
-    (state) => state.status === "ready" && state.result && !state.result.error,
+    (
+      state,
+    ): state is PackageJsonDependencyHintState & {
+      result: NonNullable<PackageJsonDependencyHintState["result"]>;
+    } => state.status === "ready" && Boolean(state.result) && !state.result?.error,
   );
   const totalBytes = measuredStates.reduce(
-    (sum, state) => sum + bytesForCompression(state.result!, config.compression),
+    (sum, state) => sum + bytesForCompression(state.result, config.compression),
     0,
   );
   const missingCount = sectionStates.filter((state) => state.status === "missing").length;

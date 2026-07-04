@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { DebouncedDocumentScheduler } from "../../src/analysis/debouncedDocumentScheduler.js";
 
 test("DebouncedDocumentScheduler runs the callback once after the delay", async () => {

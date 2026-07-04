@@ -1,5 +1,4 @@
-import type { ConfidenceLevel, ImportResult } from "../ipc/protocol.js";
-import type { ImportRuntime } from "../ipc/protocol.js";
+import type { ConfidenceLevel, ImportResult, ImportRuntime } from "../ipc/protocol.js";
 import type { InlineHintTone } from "./inlineHintVisuals.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 

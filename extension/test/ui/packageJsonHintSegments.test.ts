@@ -3,13 +3,13 @@ import test from "node:test";
 import type { ImportLensConfig } from "../../src/config.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
 import {
-  packageJsonDependencyHintParts,
-  type PackageJsonDependencyHintState,
-} from "../../src/ui/packageJsonLabels.js";
-import {
   packageJsonHintDisplayText,
   packageJsonHintSegments,
 } from "../../src/ui/packageJsonHintSegments.js";
+import {
+  type PackageJsonDependencyHintState,
+  packageJsonDependencyHintParts,
+} from "../../src/ui/packageJsonLabels.js";
 
 const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => ({
   enabled: true,

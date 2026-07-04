@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { bundleImpactHistoryHtml } from "../../src/ui/bundleImpactHistoryView.js";
 import type { BundleImpactHistoryItem } from "../../src/analysis/history.js";
+import { bundleImpactHistoryHtml } from "../../src/ui/bundleImpactHistoryView.js";
 
 const historyItem = (
   overrides: Partial<BundleImpactHistoryItem> = {},

@@ -4,8 +4,8 @@ import { applyImportAnalysisInsights } from "../../src/analysis/insights.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import type { ImportLensConfig } from "../../src/config.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
-import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 import { importHintParts } from "../../src/ui/importHintParts.js";
+import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
 const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => ({
   enabled: true,

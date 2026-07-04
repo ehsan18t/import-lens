@@ -1,6 +1,6 @@
-import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
 import type { SourceRange } from "../ipc/protocol.js";
 import { formatBytes } from "../ui/format.js";
+import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
 
 export interface ImportLensBudgets {
   perImportBrotliBytes?: number;

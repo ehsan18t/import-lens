@@ -4,11 +4,11 @@ import { AnalysisFreshnessTracker } from "../analysis/freshness.js";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
 import {
-  protocolVersion,
   type AnalyzePackageJsonResponse,
   type PackageJsonDependencyEntry,
-  type PackageJsonDependencySectionName,
   type PackageJsonDependencySection,
+  type PackageJsonDependencySectionName,
+  protocolVersion,
 } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { ImportLensLogger } from "../logger.js";

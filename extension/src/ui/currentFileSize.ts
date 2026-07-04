@@ -1,12 +1,12 @@
 import * as vscode from "vscode";
+import { formatCurrentFileSizeSummary } from "../analysis/fileSize.js";
 import {
-  bundleImpactHistoryKey,
+  type BundleImpactHistoryItem,
   bundleImpactHistoryDeltaLabel,
+  bundleImpactHistoryKey,
   previousBundleImpactForFile,
   recordBundleImpactHistory,
-  type BundleImpactHistoryItem,
 } from "../analysis/history.js";
-import { formatCurrentFileSizeSummary } from "../analysis/fileSize.js";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
 import { protocolVersion } from "../ipc/protocol.js";

@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ImportLensConfig } from "../../src/config.js";
 import {
   shouldOfferImportCompletions,
+  shouldShowCodeLens,
   shouldShowColoredSourceHovers,
   shouldShowDecorations,
   shouldShowInlayHints,
   shouldShowNativeInlayHints,
-  shouldShowCodeLens,
   shouldShowPackageJsonDecorations,
 } from "../../src/ui/displayGuards.js";
-import type { ImportLensConfig } from "../../src/config.js";
 
 const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => ({
   enabled: true,

@@ -1,9 +1,9 @@
 import * as vscode from "vscode";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
-import { inlineHintDisplayText } from "./inlineHintSegments.js";
-import { importHintParts } from "./importHintParts.js";
 import { shouldShowCodeLens } from "./displayGuards.js";
+import { importHintParts } from "./importHintParts.js";
+import { inlineHintDisplayText } from "./inlineHintSegments.js";
 
 export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
   readonly #store: AnalysisStore;
@@ -24,22 +24,24 @@ export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vsco
       return [];
     }
 
-    return this.#store
-      .get(document.uri)
-      .filter((state) => state.status === "ready" && Boolean(state.result))
-      .map((state) => {
-        const line = Math.max(0, state.detected.line);
-        const range = new vscode.Range(line, 0, line, 0);
-        const result = state.result!;
-        const parts = importHintParts(state, config);
-        const title = parts ? inlineHintDisplayText(parts) : "";
+    return this.#store.get(document.uri).flatMap((state) => {
+      const { result } = state;
+      if (state.status !== "ready" || !result) {
+        return [];
+      }
+      const line = Math.max(0, state.detected.line);
+      const range = new vscode.Range(line, 0, line, 0);
+      const parts = importHintParts(state, config);
+      const title = parts ? inlineHintDisplayText(parts) : "";
 
-        return new vscode.CodeLens(range, {
+      return [
+        new vscode.CodeLens(range, {
           title,
           command: "importLens.showImportDetails",
           arguments: [result, state.detected.runtime],
-        });
-      });
+        }),
+      ];
+    });
   }
 
   refresh(): void {

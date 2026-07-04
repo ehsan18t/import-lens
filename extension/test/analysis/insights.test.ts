@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyImportAnalysisInsights, insightLabelSuffix } from "../../src/analysis/insights.js";
 import {
+  type ImportCostHistoryItem,
   importCostHistoryItem,
   importCostHistoryKey,
   recordImportCostHistory,
-  type ImportCostHistoryItem,
 } from "../../src/analysis/history.js";
+import { applyImportAnalysisInsights, insightLabelSuffix } from "../../src/analysis/insights.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
-import type { DetectedImport } from "../../src/ipc/protocol.js";
-import type { ImportResult } from "../../src/ipc/protocol.js";
+import type { DetectedImport, ImportResult } from "../../src/ipc/protocol.js";
 import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
 class MemoryStore {

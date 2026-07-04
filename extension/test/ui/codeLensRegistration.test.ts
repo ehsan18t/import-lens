@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { nextCodeLensRegistrationAction } from "../../src/ui/codeLensRegistrationPolicy.js";
 import type { ImportLensConfig } from "../../src/config.js";
+import { nextCodeLensRegistrationAction } from "../../src/ui/codeLensRegistrationPolicy.js";
 
 const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => ({
   enabled: true,

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -34,8 +34,8 @@ import type {
 } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import type { Logger } from "../logging/types.js";
-import { currentPlatformTarget, daemonRelativePath } from "./platform.js";
 import { knownDaemonHashes } from "./knownHashes.generated.js";
+import { currentPlatformTarget, daemonRelativePath } from "./platform.js";
 import {
   cleanupFailedDaemonStartup,
   pipeDaemonProcessLogs,
@@ -44,7 +44,7 @@ import {
 import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 import { resolveDaemonStartRoot } from "./startRoot.js";
-import { resolveDaemonStoragePaths, type DaemonStorageContext } from "./storagePaths.js";
+import { type DaemonStorageContext, resolveDaemonStoragePaths } from "./storagePaths.js";
 import type { AnalysisTransport, DaemonState, DaemonStateEvent } from "./transport.js";
 
 const STABLE_SESSION_RESET_MS = 60_000;

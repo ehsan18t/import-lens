@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cacheManagerActionItems, cacheShardPickItems } from "../../src/ui/cacheManagerItems.js";
 import type { CacheListResponse, CacheStatusResponse } from "../../src/ipc/protocol.js";
+import { cacheManagerActionItems, cacheShardPickItems } from "../../src/ui/cacheManagerItems.js";
 
 test("cacheManagerActionItems presents summary and maintenance actions", () => {
   const items = cacheManagerActionItems(status());

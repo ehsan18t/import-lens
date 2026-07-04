@@ -1,8 +1,7 @@
 import * as vscode from "vscode";
 import type { ImportAnalysisInsight, ImportAnalysisState } from "../analysis/state.js";
-import type { ImportResult } from "../ipc/protocol.js";
-import type { ImportRuntime } from "../ipc/protocol.js";
 import { getImportLensConfig } from "../config.js";
+import type { ImportResult, ImportRuntime } from "../ipc/protocol.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import { resultHasDiagnosticsLink, tooltipForResultMarkdown } from "./tooltipMarkdown.js";
 

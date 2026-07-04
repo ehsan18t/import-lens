@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatImportDiagnostics } from "../../src/ui/diagnostics.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
+import { formatImportDiagnostics } from "../../src/ui/diagnostics.js";
 
 const failedResult: ImportResult = {
   specifier: "@nestjs/common",

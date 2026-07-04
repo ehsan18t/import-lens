@@ -1,21 +1,21 @@
 import type { ImportLensConfig } from "../config.js";
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 import type { PackageJsonDependencySectionName } from "../ipc/protocol.js";
+import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import {
   isFreshLatestRelease,
   packageJsonDependencyVersionStatusLabel,
 } from "./packageJsonLabels.js";
-import { isTypesOnlyResult } from "./resultDiagnostics.js";
-import {
-  copyDiagnosticsMarkdown,
-  conservativeSizingMarkdown,
-  importResultSizeMarkdown,
-} from "./tooltipMarkdown.js";
-import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import {
   refreshPackageJsonRegistryHintCommand,
   refreshPackageJsonRegistryHintsCommand,
 } from "./packageJsonRegistryCommands.js";
+import { isTypesOnlyResult } from "./resultDiagnostics.js";
+import {
+  conservativeSizingMarkdown,
+  copyDiagnosticsMarkdown,
+  importResultSizeMarkdown,
+} from "./tooltipMarkdown.js";
 
 export interface PackageJsonDependencyTooltipState extends PackageJsonDependencyHintState {
   message?: string;

@@ -1,6 +1,6 @@
 import {
-  bundleImpactHistoryDeltaLabel,
   type BundleImpactHistoryItem,
+  bundleImpactHistoryDeltaLabel,
 } from "../analysis/history.js";
 import { formatBytes } from "./format.js";
 

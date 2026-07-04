@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type {
-  RefreshRegistryHintsRequest,
-  RefreshRegistryHintsResponse,
-  RegistryHintTarget,
-} from "../../src/ipc/protocol.js";
 import type { PackageJsonDependencyHintState } from "../../src/guidance/packageJsonState.js";
 import {
   RegistryHintRefresher,
   type RegistryRefreshHost,
   type RegistryRefreshTransport,
 } from "../../src/guidance/registryRefresh.js";
+import type {
+  RefreshRegistryHintsRequest,
+  RefreshRegistryHintsResponse,
+  RegistryHintTarget,
+} from "../../src/ipc/protocol.js";
 
 const uriKey = "file:///workspace/package.json";
 
@@ -100,7 +100,7 @@ test("final response error only fails targets not completed by earlier partials"
   const daemon: RegistryRefreshTransport = {
     refreshRegistryHints: (request, onPartial) => {
       const reactResult = {
-        target: request.targets[0]!,
+        target: request.targets[0],
         hint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 200 },
         error: null,
       };

@@ -2,8 +2,8 @@ import * as vscode from "vscode";
 import type { DaemonManager } from "../daemon/manager.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
-import { analysisRootForFile } from "../workspaceContext.js";
 import type { Logger } from "../logging/types.js";
+import { analysisRootForFile } from "../workspaceContext.js";
 import { compareImportItemsForResults } from "./compareImportItems.js";
 
 export const compareImportsCommand = "importLens.compareImports";

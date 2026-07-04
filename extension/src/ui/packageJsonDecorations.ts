@@ -1,12 +1,23 @@
 import * as vscode from "vscode";
+import { getImportLensConfig } from "../config.js";
 import type {
   PackageJsonAnalysisController,
   PackageJsonDependencyAnalysisState,
 } from "../guidance/packageJsonAnalysis.js";
 import type { PackageJsonDependencySection } from "../ipc/protocol.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
-import { getImportLensConfig } from "../config.js";
 import { shouldShowPackageJsonDecorations } from "./displayGuards.js";
+import { InlineHintDecorationController } from "./inlineHintDecorationController.js";
+import {
+  emptyInlineHintDecorationLayers,
+  inlineHintDecorationLayers,
+  mergeInlineHintDecorationLayers,
+} from "./inlineHintDecorationTypes.js";
+import { packageJsonDependencyHintAnchorCharacter } from "./packageJsonDecorationAnchor.js";
+import {
+  packageJsonHintSegments,
+  packageJsonSectionSummarySegment,
+} from "./packageJsonHintSegments.js";
 import {
   packageJsonDependencyHintParts,
   packageJsonSectionSummaryLabel,
@@ -17,17 +28,6 @@ import {
   packageJsonSectionSummaryTooltipMarkdown,
   packageJsonSectionSummaryTooltipTrustedCommands,
 } from "./packageJsonTooltip.js";
-import { packageJsonDependencyHintAnchorCharacter } from "./packageJsonDecorationAnchor.js";
-import {
-  emptyInlineHintDecorationLayers,
-  inlineHintDecorationLayers,
-  mergeInlineHintDecorationLayers,
-} from "./inlineHintDecorationTypes.js";
-import { InlineHintDecorationController } from "./inlineHintDecorationController.js";
-import {
-  packageJsonHintSegments,
-  packageJsonSectionSummarySegment,
-} from "./packageJsonHintSegments.js";
 
 export class PackageJsonDecorationController extends InlineHintDecorationController {
   readonly #analysis: PackageJsonAnalysisController;

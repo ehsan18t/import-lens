@@ -1,11 +1,11 @@
 import type { ImportLensConfig } from "../config.js";
-import type { PackageJsonHintParts } from "./packageJsonLabels.js";
+import type { InlineHintSegment } from "./inlineHintSegments.js";
 import {
+  type PackageJsonSuffixTone,
   primaryToneThemeColor,
   suffixToneThemeColor,
-  type PackageJsonSuffixTone,
 } from "./packageJsonHintVisuals.js";
-import type { InlineHintSegment } from "./inlineHintSegments.js";
+import type { PackageJsonHintParts } from "./packageJsonLabels.js";
 
 export const packageJsonHintDisplayText = (
   parts: PackageJsonHintParts,

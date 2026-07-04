@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { IpcClient } from "../../src/ipc/client.js";
-import { FrameDecoder, encodeFrame } from "../../src/ipc/codec.js";
+import { encodeFrame, FrameDecoder } from "../../src/ipc/codec.js";
 import type {
   AnalyzePackageJsonRequest,
   AnalyzePackageJsonResponse,

@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  bundleImpactHistoryLabel,
+  type BundleImpactHistoryItem,
   bundleImpactHistoryDeltaLabel,
+  bundleImpactHistoryLabel,
+  type ImportCostHistoryItem,
   importCostHistoryKey,
   recordBundleImpactHistory,
   recordImportCostHistory,
-  type BundleImpactHistoryItem,
-  type ImportCostHistoryItem,
 } from "../../src/analysis/history.js";
 
 class MemoryStore {

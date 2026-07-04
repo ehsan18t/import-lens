@@ -3,24 +3,24 @@ import { DebouncedDocumentScheduler } from "./analysis/debouncedDocumentSchedule
 import { AnalysisFreshnessTracker } from "./analysis/freshness.js";
 import { changedLinesForFile } from "./analysis/gitDiff.js";
 import {
+  type BundleImpactHistoryStore,
+  type ImportCostHistoryItem,
+  importCostHistoryKey,
+  recordImportCostHistory,
+} from "./analysis/history.js";
+import {
   applyImportAnalysisInsights,
   importCostHistoryItemsForStates,
 } from "./analysis/insights.js";
-import {
-  importCostHistoryKey,
-  recordImportCostHistory,
-  type BundleImpactHistoryStore,
-  type ImportCostHistoryItem,
-} from "./analysis/history.js";
 import { ImportResultLogTracker } from "./analysis/resultLogging.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
+import { type ImportAnalysisItem, protocolVersion } from "./ipc/protocol.js";
+import { nextIpcRequestId } from "./ipc/requestIds.js";
 import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import type { StatusBarController } from "./ui/statusbar.js";
-import { protocolVersion, type ImportAnalysisItem } from "./ipc/protocol.js";
-import { nextIpcRequestId } from "./ipc/requestIds.js";
 import { analysisRootForFile } from "./workspaceContext.js";
 
 export class DocumentAnalysisController implements vscode.Disposable {

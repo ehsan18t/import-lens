@@ -1,16 +1,16 @@
 import * as vscode from "vscode";
 import {
   INLINE_HINT_DECORATION_SLOTS,
-  inlineHintDecorationLayerBuckets,
   type InlineHintDecorationSlot,
+  inlineHintDecorationLayerBuckets,
 } from "./inlineHintDecorationLayerBuilder.js";
 import type { InlineHintSegment } from "./inlineHintSegments.js";
 
+export type { InlineHintDecorationSlot } from "./inlineHintDecorationLayerBuilder.js";
 export {
   INLINE_HINT_DECORATION_SLOTS,
   INLINE_HINT_SUFFIX_SLOT_COUNT,
 } from "./inlineHintDecorationLayerBuilder.js";
-export type { InlineHintDecorationSlot } from "./inlineHintDecorationLayerBuilder.js";
 
 export interface InlineHintDecorationLayers {
   readonly primary: vscode.DecorationOptions[];

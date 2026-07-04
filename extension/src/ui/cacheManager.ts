@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { DaemonManager } from "../daemon/manager.js";
-import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { CacheCleanupResponse, CacheRemoveResponse } from "../ipc/protocol.js";
+import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { Logger } from "../logging/types.js";
 import { analysisRootForFile } from "../workspaceContext.js";
 import { cacheManagerActionItems, cacheShardPickItems } from "./cacheManagerItems.js";

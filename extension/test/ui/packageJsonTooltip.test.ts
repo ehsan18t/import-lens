@@ -2,17 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ImportLensConfig } from "../../src/config.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
-import { packageJsonDependencyTooltipMarkdown } from "../../src/ui/packageJsonTooltip.js";
-import {
-  packageJsonDependencyTooltipTrustedCommands,
-  packageJsonSectionSummaryTooltipMarkdown,
-  packageJsonSectionSummaryTooltipTrustedCommands,
-} from "../../src/ui/packageJsonTooltip.js";
+import { copyImportDiagnosticsCommand } from "../../src/ui/diagnostics.js";
 import {
   refreshPackageJsonRegistryHintCommand,
   refreshPackageJsonRegistryHintsCommand,
 } from "../../src/ui/packageJsonRegistryCommands.js";
-import { copyImportDiagnosticsCommand } from "../../src/ui/diagnostics.js";
+import {
+  packageJsonDependencyTooltipMarkdown,
+  packageJsonDependencyTooltipTrustedCommands,
+  packageJsonSectionSummaryTooltipMarkdown,
+  packageJsonSectionSummaryTooltipTrustedCommands,
+} from "../../src/ui/packageJsonTooltip.js";
 import { tooltipForResultMarkdown } from "../../src/ui/tooltipMarkdown.js";
 
 const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => ({
@@ -55,7 +55,7 @@ const commandArgs = (markdown: string, command: string): unknown[] => {
   const match = markdown.match(new RegExp(`command:${escaped}\\?([^)]*)`, "u"));
 
   assert.ok(match, `Expected markdown to include ${command}`);
-  return JSON.parse(decodeURIComponent(match[1]!)) as unknown[];
+  return JSON.parse(decodeURIComponent(match[1])) as unknown[];
 };
 
 test("packageJsonDependencyTooltipMarkdown includes package registry freshness details", () => {

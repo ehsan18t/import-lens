@@ -1,9 +1,9 @@
 import * as vscode from "vscode";
 import { getImportLensConfig } from "../config.js";
-import { protocolVersion } from "../ipc/protocol.js";
 import type { DaemonManager } from "../daemon/manager.js";
-import { analysisRootForFile } from "../workspaceContext.js";
+import { protocolVersion } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
+import { analysisRootForFile } from "../workspaceContext.js";
 import { shouldOfferImportCompletions } from "./displayGuards.js";
 
 export class ImportMemberCompletionProvider implements vscode.CompletionItemProvider {

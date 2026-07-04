@@ -1,6 +1,5 @@
 import path from "node:path";
-import type { DetectedImport } from "../ipc/protocol.js";
-import type { ImportResult } from "../ipc/protocol.js";
+import type { DetectedImport, ImportResult } from "../ipc/protocol.js";
 import { formatBytes } from "../ui/format.js";
 
 export const bundleImpactHistoryKey = "importLens.bundleImpactHistory";
@@ -134,7 +133,12 @@ export const recordImportCostHistory = (
     );
   });
 
-  historyWriteChain = write.catch(() => {});
+  // Retained serialization handle only: swallow here so a failed write cannot
+  // become an unhandled rejection or block the next chained write. The real
+  // error still surfaces through the returned promise below.
+  historyWriteChain = write.catch(() => {
+    // intentionally ignored on the retained chain reference
+  });
   return write;
 };
 
