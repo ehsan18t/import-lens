@@ -99,6 +99,16 @@ export const cargoZigbuildArgsForTarget = (platformTarget) => {
   return ["zigbuild", "-p", "import-lens-daemon", "--release", "--target", info.rustTarget];
 };
 
+// zig cannot target the MSVC ABI, so the Windows targets cross-compile from
+// Linux with cargo-xwin (clang-cl + lld-link against a splatted Windows
+// SDK/CRT). The artifact lands at the same target/<triple>/release path as a
+// native build, so artifactPathForTarget needs no special-casing.
+export const cargoXwinArgsForTarget = (platformTarget) => {
+  const info = targetInfo(platformTarget);
+
+  return ["xwin", "build", "-p", "import-lens-daemon", "--release", "--target", info.rustTarget];
+};
+
 // All build artifacts live under dist/ (target/ is the one Rust-convention
 // exception). These relative segments are the single source for every script.
 export const vsixDir = "dist/vsix";

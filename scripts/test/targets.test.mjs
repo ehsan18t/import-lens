@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   artifactPathForTarget,
   cargoBuildArgsForTarget,
+  cargoXwinArgsForTarget,
   cargoZigbuildArgsForTarget,
   platformTargets,
   targetInfo,
@@ -60,6 +61,27 @@ test("cargoZigbuildArgsForTarget uses explicit Rust target triples", () => {
     "--release",
     "--target",
     "aarch64-unknown-linux-gnu",
+  ]);
+});
+
+test("cargoXwinArgsForTarget cross-compiles the MSVC target from Linux", () => {
+  assert.deepEqual(cargoXwinArgsForTarget("win32-x64"), [
+    "xwin",
+    "build",
+    "-p",
+    "import-lens-daemon",
+    "--release",
+    "--target",
+    "x86_64-pc-windows-msvc",
+  ]);
+  assert.deepEqual(cargoXwinArgsForTarget("win32-arm64"), [
+    "xwin",
+    "build",
+    "-p",
+    "import-lens-daemon",
+    "--release",
+    "--target",
+    "aarch64-pc-windows-msvc",
   ]);
 });
 

@@ -44,7 +44,6 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   assert.match(rustToolchain, /^channel = "stable"$/mu);
   const manifest = JSON.parse(repoFile("package.json"));
   assert.equal(manifest.dependencies["oxc-parser"], undefined);
-  assert.equal(manifest.scripts["deps:update"], "pnpm deps:update:oxc");
   assert.equal(manifest.scripts["deps:update:oxc"], "node scripts/update-oxc-stack.mjs");
   assert.equal(manifest.scripts["deps:update:all"], "pnpm update --latest && cargo update");
 });

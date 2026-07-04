@@ -29,7 +29,9 @@ RUN rustup target add \
   x86_64-unknown-linux-gnu \
   aarch64-unknown-linux-gnu \
   x86_64-apple-darwin \
-  aarch64-apple-darwin
+  aarch64-apple-darwin \
+  x86_64-pc-windows-msvc \
+  aarch64-pc-windows-msvc
 
 RUN node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major !== 24 || minor < 11) { throw new Error(`Expected Node 24.11+ build image, got ${process.version}`); }'
 
@@ -52,6 +54,28 @@ RUN set -eux; \
   else \
     cargo install cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}" --locked; \
   fi
+
+# Windows (MSVC ABI) cross-compilation. zig cannot target the MSVC ABI, so the
+# win32 daemons build with cargo-xwin: clang-cl + lld-link against a Windows
+# SDK/CRT that xwin downloads and splats. This keeps the container-built Windows
+# binaries the same ABI as the native windows-latest CI builds. The Microsoft
+# CRT/SDK license is accepted non-interactively for the build.
+ENV XWIN_ACCEPT_LICENSE=1
+ENV XWIN_CACHE_DIR=/opt/xwin
+
+# clang-cl compiles, lld-link links, and llvm supplies llvm-lib / llvm-dlltool
+# (the MSVC lib.exe / dlltool equivalents) that cc-rs needs to archive the C
+# deps (zstd-sys) and generate import libs for the windows-msvc target.
+RUN apt-get update && apt-get install -y --no-install-recommends clang lld llvm && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-xwin --locked
+
+# Pre-download and splat the Windows SDK/CRT into the image so container runs
+# build offline instead of re-downloading it every time. cargo-xwin reuses the
+# splat under ${XWIN_CACHE_DIR}/splat.
+RUN cargo install xwin --locked \
+  && xwin --accept-license splat --output "${XWIN_CACHE_DIR}/splat" \
+  && rm -rf ./.xwin-cache
 
 WORKDIR /workspace
 

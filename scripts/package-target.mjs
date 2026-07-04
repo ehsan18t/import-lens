@@ -9,6 +9,7 @@ import { targetInfo, vsixNameForTarget } from "./targets.mjs";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const useZigbuild = args.includes("--zigbuild");
+const useXwin = args.includes("--xwin");
 const target = args.find((arg) => !arg.startsWith("--"));
 
 const fail = (message) => {
@@ -36,8 +37,14 @@ const run = (command, commandArgs) => {
 };
 
 if (!target) {
-  fail("Usage: node scripts/package-target.mjs <target> [--zigbuild]");
+  fail("Usage: node scripts/package-target.mjs <target> [--zigbuild | --xwin]");
 }
+
+if (useZigbuild && useXwin) {
+  fail("Choose one cross-compiler: pass --zigbuild or --xwin, not both.");
+}
+
+const crossCompileFlags = useXwin ? ["--xwin"] : useZigbuild ? ["--zigbuild"] : [];
 
 targetInfo(target);
 
@@ -48,7 +55,7 @@ if (manifest.icon && !existsSync(path.join(repoRoot, manifest.icon))) {
   fail(`Extension icon is declared at ${manifest.icon}, but the file does not exist.`);
 }
 
-run(process.execPath, ["scripts/build-daemon.mjs", target, ...(useZigbuild ? ["--zigbuild"] : [])]);
+run(process.execPath, ["scripts/build-daemon.mjs", target, ...crossCompileFlags]);
 run(process.execPath, ["scripts/copy-daemon.mjs", target]);
 run(process.execPath, ["scripts/generate-daemon-hashes.mjs", target]);
 run("pnpm", ["build"]);
