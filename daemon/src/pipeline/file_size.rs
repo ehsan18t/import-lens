@@ -19,7 +19,7 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FileSizeComputation {
     pub raw_bytes: u64,
     pub minified_bytes: u64,

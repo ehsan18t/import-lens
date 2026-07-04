@@ -5,6 +5,7 @@ use import_lens_daemon::{
         EnumerateExportsRequest, FileSizeDocumentRequest, FileSizeRequest, ImportAnalysisStatus,
         ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION,
     },
+    pipeline::file_size_cache::shared_file_size_cache,
     pipeline::graph::{build_module_graph_cached, clear_module_graph_cache},
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
 };
@@ -515,6 +516,29 @@ fn file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
         active_document_path: batch.active_document_path,
         imports: batch.imports,
     }
+}
+
+#[test]
+fn handle_file_size_populates_and_reuses_aggregate_cache() {
+    let workspace = temp_workspace();
+    write_shared_packages(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let request = file_size_request(&workspace, 1);
+    let path = PathBuf::from(&request.active_document_path);
+    let first = service.handle_file_size(request);
+    let second = service.handle_file_size(file_size_request(&workspace, 2));
+
+    // Same import set -> identical aggregate numbers on the repeat request.
+    assert_eq!(first.minified_bytes, second.minified_bytes);
+    assert_eq!(first.gzip_bytes, second.gzip_bytes);
+
+    // The handler populated L1 for this document. Presence is checked
+    // signature-independently so a concurrent generation bump in another test
+    // cannot make this assertion flaky.
+    assert!(shared_file_size_cache().contains_path(&path));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
 }
 
 fn cjs_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {

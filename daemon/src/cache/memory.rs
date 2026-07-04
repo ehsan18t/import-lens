@@ -34,6 +34,13 @@ fn current_cache_generation() -> u64 {
     CACHE_GENERATION.load(Ordering::Acquire)
 }
 
+/// Public reader for the global cache generation. The file-size L1 cache folds
+/// this into its freshness signature so a node_modules invalidation forces every
+/// file entry to recompute.
+pub fn cache_generation() -> u64 {
+    current_cache_generation()
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedImport {
     pub result: ImportResult,

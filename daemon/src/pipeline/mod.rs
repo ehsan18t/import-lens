@@ -5,6 +5,7 @@ mod cjs_scan;
 pub mod compress;
 mod fallback;
 pub mod file_size;
+pub mod file_size_cache;
 pub mod graph;
 pub mod minify;
 pub mod reachability;

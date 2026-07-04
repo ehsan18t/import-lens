@@ -432,7 +432,8 @@ impl ImportLensService {
             .map(|item| self.analyze_with_cache(&context, item))
             .collect::<Vec<_>>();
         annotate_shared_bytes(&mut imports);
-        let file_size = compute_file_size(&context, &request.imports);
+        let file_size =
+            self.file_size_with_cache(&context, &request.active_document_path, &request.imports);
 
         FileSizeResponse {
             version: request.version,
@@ -596,7 +597,8 @@ impl ImportLensService {
             .iter()
             .filter_map(|state| state.result.clone())
             .collect::<Vec<_>>();
-        let file_size = compute_file_size(&context, &requests);
+        let file_size =
+            self.file_size_with_cache(&context, &request.active_document_path, &requests);
 
         FileSizeDocumentResponse {
             version: request.version,
@@ -1227,6 +1229,30 @@ impl ImportLensService {
         }
 
         items
+    }
+
+    // L1 aggregate cache: return the cached FileSizeComputation when the file's
+    // import set is unchanged (and node_modules has not been invalidated),
+    // otherwise recompute once and overwrite this document's single slot.
+    fn file_size_with_cache(
+        &self,
+        context: &AnalysisContext,
+        active_document_path: &str,
+        requests: &[ImportRequest],
+    ) -> crate::pipeline::file_size::FileSizeComputation {
+        let cache = crate::pipeline::file_size_cache::shared_file_size_cache();
+        let path = PathBuf::from(active_document_path);
+        let signature = crate::pipeline::file_size_cache::file_size_signature(context, requests);
+
+        if let Some(hit) = cache.get(&path, signature) {
+            crate::logging::log_debug("file_size_cache", format!("hit: {}", path.display()));
+            return hit;
+        }
+
+        crate::logging::log_debug("file_size_cache", format!("miss: {}", path.display()));
+        let computed = compute_file_size(context, requests);
+        cache.insert(path, signature, computed.clone());
+        computed
     }
 
     fn analyze_with_cache(
