@@ -1,12 +1,13 @@
 use super::{
     cache::{self, RegistryMetadataCache},
     constants::{
-        FRESH_HINT_TTL_MS, MAX_ATTEMPTS, NOT_FOUND_TTL_MS, REGISTRY_RATE_LIMIT_REQUESTS,
-        REGISTRY_RATE_LIMIT_WINDOW_MS, REGISTRY_RETRY_BASE_DELAY_MS, TRANSIENT_ERROR_RETRY_MS,
+        FRESH_HINT_TTL_MS, MAX_ATTEMPTS, NOT_FOUND_TTL_MS, REGISTRY_BODY_TOO_LARGE_ERROR,
+        REGISTRY_RATE_LIMIT_REQUESTS, REGISTRY_RATE_LIMIT_WINDOW_MS, REGISTRY_RETRY_BASE_DELAY_MS,
+        TRANSIENT_ERROR_RETRY_MS,
     },
     types::{
-        HttpRegistryResponse, RegistryHintLookup, RegistryHttpClient, RegistryPackageMetadata,
-        RegistryPackageMetadataEntry,
+        HttpRegistryResponse, RegistryHintLookup, RegistryHintOrigin, RegistryHttpClient,
+        RegistryPackageMetadata, RegistryPackageMetadataEntry,
     },
 };
 use crate::{ipc::protocol::RegistryHint, logging};
@@ -170,6 +171,7 @@ impl RegistryHintService {
             return RegistryHintLookup {
                 hint: None,
                 error: None,
+                origin: RegistryHintOrigin::Cache,
             };
         }
 
@@ -177,28 +179,29 @@ impl RegistryHintService {
         if mode == RegistryHintMode::Cached {
             return cached
                 .as_ref()
-                .map(|entry| lookup_from_entry(entry, installed_version))
+                .map(|entry| lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache))
                 .unwrap_or(RegistryHintLookup {
                     hint: None,
                     error: None,
+                    origin: RegistryHintOrigin::Cache,
                 });
         }
         if mode != RegistryHintMode::ForceRefresh
             && let Some(entry) = cached.as_ref()
         {
             if mode == RegistryHintMode::RefreshStale && is_usable_without_fetch(entry, now_ms) {
-                return lookup_from_entry(entry, installed_version);
+                return lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache);
             }
             if entry
                 .retry_after
                 .is_some_and(|retry_after| retry_after > now_ms)
             {
-                return lookup_from_entry(entry, installed_version);
+                return lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache);
             }
         }
 
         let entry = self.fetch_package_singleflight(package_name, now_ms);
-        lookup_from_entry(&entry, installed_version)
+        lookup_from_entry(&entry, installed_version, RegistryHintOrigin::Network)
     }
 
     fn fetch_package_singleflight(
@@ -260,10 +263,16 @@ impl RegistryHintService {
         now_ms: u64,
     ) -> RegistryPackageMetadataEntry {
         let mut last_error = None;
+        let mut permanent = false;
+        let mut attempts_made = 0;
         for attempt in 1..=MAX_ATTEMPTS {
+            attempts_made = attempt;
             self.wait_for_rate_limit_slot();
+            let started = Instant::now();
             match self.client.get_package_metadata(package_name) {
                 Ok(response) if response.status == 200 => {
+                    let body_bytes = response.body.len();
+                    let elapsed_ms = started.elapsed().as_millis();
                     let metadata = match package_metadata_from_response(response) {
                         Ok(metadata) => metadata,
                         Err(error) => {
@@ -275,6 +284,12 @@ impl RegistryHintService {
                             break;
                         }
                     };
+                    logging::log_debug(
+                        "registry",
+                        format!(
+                            "fetched npm metadata for {package_name}: 200, {body_bytes} bytes, {elapsed_ms}ms"
+                        ),
+                    );
                     let entry = RegistryPackageMetadataEntry {
                         metadata: Some(metadata),
                         updated_at: now_ms,
@@ -349,6 +364,11 @@ impl RegistryHintService {
                     sleep_before_retry(attempt);
                 }
                 Err(error) => {
+                    if is_permanent_fetch_error(&error) {
+                        last_error = Some(error);
+                        permanent = true;
+                        break;
+                    }
                     last_error = Some(error);
                     if attempt == MAX_ATTEMPTS {
                         break;
@@ -364,10 +384,20 @@ impl RegistryHintService {
             }
         }
 
+        let retry_after_ms = if permanent {
+            now_ms + NOT_FOUND_TTL_MS
+        } else {
+            now_ms + TRANSIENT_ERROR_RETRY_MS
+        };
         logging::log_warn(
             "registry",
             format!(
-                "failed to refresh npm metadata for {package_name} after {MAX_ATTEMPTS} attempt(s): {}",
+                "failed to refresh npm metadata for {package_name} after {attempts_made} attempt(s){}: {}",
+                if permanent {
+                    " (permanent, cached 6h)"
+                } else {
+                    ""
+                },
                 last_error.as_deref().unwrap_or("unknown error"),
             ),
         );
@@ -376,7 +406,7 @@ impl RegistryHintService {
             last_error
                 .clone()
                 .unwrap_or_else(|| "unknown registry error".to_owned()),
-            now_ms + TRANSIENT_ERROR_RETRY_MS,
+            retry_after_ms,
         );
         if let Err(error) = self.cache.write_entry(package_name, entry.clone()) {
             logging::log_warn(
@@ -439,12 +469,14 @@ fn is_usable_without_fetch(entry: &RegistryPackageMetadataEntry, now_ms: u64) ->
 fn lookup_from_entry(
     entry: &RegistryPackageMetadataEntry,
     installed_version: Option<&str>,
+    origin: RegistryHintOrigin,
 ) -> RegistryHintLookup {
     RegistryHintLookup {
         hint: entry.metadata.as_ref().map(|metadata| {
             registry_hint_from_metadata(metadata, installed_version, entry.updated_at)
         }),
         error: entry.error.clone(),
+        origin,
     }
 }
 
@@ -530,6 +562,15 @@ fn is_transient_status(status: u16) -> bool {
     status == 408 || status == 425 || status == 429 || status >= 500
 }
 
+/// A permanent fetch failure will not succeed on retry within a short window, so
+/// we skip the remaining attempts and cache it for the not-found TTL instead of
+/// the 5-minute transient window. An oversize response body (exceeds
+/// `MAX_REGISTRY_BODY_BYTES`) is the current instance; the client normalizes it
+/// to `REGISTRY_BODY_TOO_LARGE_ERROR` so this check is stable across ureq versions.
+fn is_permanent_fetch_error(message: &str) -> bool {
+    message == REGISTRY_BODY_TOO_LARGE_ERROR
+}
+
 fn transient_backoff_ms(attempt: usize) -> u64 {
     REGISTRY_RETRY_BASE_DELAY_MS * attempt as u64
 }
@@ -541,6 +582,7 @@ fn sleep_before_retry(attempt: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn rate_limiter_throttles_every_caller_once_the_window_limit_is_hit() {
@@ -563,5 +605,51 @@ mod tests {
             .reserve_slot()
             .expect("followers arriving during a reserved window should also wait");
         assert!(follower <= window);
+    }
+
+    #[test]
+    fn permanent_errors_are_recognized() {
+        assert!(is_permanent_fetch_error(REGISTRY_BODY_TOO_LARGE_ERROR));
+        assert!(!is_permanent_fetch_error(
+            "the response body is larger than request limit: 67108864"
+        ));
+        assert!(!is_permanent_fetch_error("connection reset by peer"));
+        assert!(!is_permanent_fetch_error("timed out"));
+    }
+
+    struct CountingOversizeClient {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RegistryHttpClient for CountingOversizeClient {
+        fn get_package_metadata(
+            &self,
+            _package_name: &str,
+        ) -> Result<HttpRegistryResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(REGISTRY_BODY_TOO_LARGE_ERROR.to_owned())
+        }
+    }
+
+    #[test]
+    fn permanent_error_does_not_retry_and_caches_long() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = RegistryHintService::new(
+            RegistryMetadataCache::empty(),
+            Box::new(CountingOversizeClient {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let entry = service.fetch_package_with_retries("next", 1_000);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "permanent error must not retry"
+        );
+        assert!(entry.error.is_some());
+        // Permanent -> cached for the 6h not-found TTL, not the 5-min transient window.
+        assert_eq!(entry.retry_after, Some(1_000 + NOT_FOUND_TTL_MS));
     }
 }

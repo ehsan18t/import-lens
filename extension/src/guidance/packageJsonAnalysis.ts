@@ -14,6 +14,7 @@ import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { ImportLensLogger } from "../logger.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
 import { analysisRootForFile } from "../workspaceContext.js";
+import { AnalyzedContentTracker } from "./analyzedContentTracker.js";
 import {
   markPackageJsonLoadingUnavailable,
   mergePackageJsonAnalysisPartial,
@@ -33,6 +34,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   readonly #freshness = new AnalysisFreshnessTracker();
   readonly #states = new Map<string, PackageJsonDependencyAnalysisState[]>();
   readonly #sections = new Map<string, PackageJsonDependencySection[]>();
+  readonly #analyzedContent = new AnalyzedContentTracker();
   readonly #onDidChange = new vscode.EventEmitter<vscode.Uri>();
   readonly #registryRefresher: RegistryHintRefresher<
     vscode.Uri,
@@ -52,6 +54,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
         setStates: (uri, states) => this.setStates(uri, states),
       },
       logger,
+      () => getImportLensConfig().verboseRegistryLogging,
     );
 
     context.subscriptions.push(
@@ -100,6 +103,14 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       return;
     }
 
+    // Skip redundant re-analysis on passive triggers (tab focus, re-open) when
+    // the document text is identical to the last successful analysis. Explicit
+    // refreshes call refreshVisibleDocuments(), which forgets this first.
+    const currentText = document.getText();
+    if (this.#analyzedContent.isUnchanged(key, currentText)) {
+      return;
+    }
+
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
     const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
 
@@ -120,7 +131,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
           request_id: requestId,
           workspace_root: workspaceRoot,
           active_document_path: document.fileName,
-          source: document.getText(),
+          // Reuse the text captured for the unchanged-content guard so the
+          // recorded key always matches the text actually analyzed.
+          source: currentText,
           streaming: true,
           include_registry_hints: config.enableRegistryHints,
           registry_hint_mode: config.enableRegistryHints ? "cached" : "off",
@@ -149,6 +162,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       const states = mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], response);
       this.setStates(document.uri, states);
       this.queueRegistryRefreshes(document.uri, states);
+      this.#analyzedContent.record(key, currentText);
     } catch (error) {
       this.#logger.warn(
         `Package.json dependency analysis failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -164,6 +178,11 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   }
 
   refreshVisibleDocuments(): void {
+    // Explicit refresh (config change, daemon restart, cache clear, node_modules
+    // watcher) must bypass the unchanged-content guard so re-analysis runs. Forget
+    // ALL tracked docs, not just visible ones — a background package.json tab would
+    // otherwise stay stale (same text) until edited when next focused.
+    this.#analyzedContent.forgetAll();
     for (const editor of vscode.window.visibleTextEditors) {
       this.schedule(editor.document);
     }
@@ -200,6 +219,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     this.#states.delete(key);
     this.#sections.delete(key);
     this.#freshness.forget(key);
+    this.#analyzedContent.forget(key);
     this.#registryRefresher.forget(uri);
     this.#onDidChange.fire(uri);
   }
@@ -248,24 +268,20 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
 
     const states = mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], partial);
     this.setStates(uri, states);
-    this.queueRegistryRefreshes(uri, states, partial.indexes);
+    // Registry refreshes are queued once from analyze() after the final response,
+    // not per streaming partial — otherwise every per-package partial fires its
+    // own refresh IPC (~one batch + one-per-package + a final batch per analysis).
   }
 
   private queueRegistryRefreshes(
     uri: vscode.Uri,
     states: readonly PackageJsonDependencyAnalysisState[],
-    indexes?: readonly number[],
   ): void {
     if (!getImportLensConfig().enableRegistryHints) {
       return;
     }
 
-    const selectedStates = indexes
-      ? indexes
-          .map((index) => states[index])
-          .filter((state): state is PackageJsonDependencyAnalysisState => !!state)
-      : states;
-    const targets = registryTargetsForStates(selectedStates);
+    const targets = registryTargetsForStates(states);
 
     if (targets.length === 0) {
       return;

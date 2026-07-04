@@ -31,10 +31,19 @@ pub struct HttpRegistryResponse {
     pub body: String,
 }
 
+/// Whether a hint was served from the local cache or required a network fetch.
+/// Surfaced so the extension can log cache-vs-network behavior per package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryHintOrigin {
+    Cache,
+    Network,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryHintLookup {
     pub hint: Option<RegistryHint>,
     pub error: Option<String>,
+    pub origin: RegistryHintOrigin,
 }
 
 pub trait RegistryHttpClient: Send + Sync {

@@ -183,10 +183,15 @@ impl ImportLensService {
             now_ms,
         );
 
+        let origin = match lookup.origin {
+            crate::registry::types::RegistryHintOrigin::Cache => "cache",
+            crate::registry::types::RegistryHintOrigin::Network => "network",
+        };
         RegistryHintResult {
             target,
             hint: lookup.hint,
             error: lookup.error,
+            origin: Some(origin.to_owned()),
         }
     }
 

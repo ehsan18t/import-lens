@@ -158,6 +158,7 @@ export interface RegistryHintResult {
   target: RegistryHintTarget;
   hint?: RegistryHint | null;
   error?: string | null;
+  origin?: "cache" | "network";
 }
 
 export interface RefreshRegistryHintsRequest {

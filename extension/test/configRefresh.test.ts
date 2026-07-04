@@ -18,6 +18,7 @@ const config = (enabled: boolean): ImportLensConfig => ({
   cacheMaxSizeMB: 512,
   cacheMaxAgeDays: 30,
   enableRegistryHints: false,
+  verboseRegistryLogging: false,
   logLevel: "error",
   budgets: {},
 });

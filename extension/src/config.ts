@@ -18,6 +18,7 @@ export interface ImportLensConfig {
   cacheMaxSizeMB: number;
   cacheMaxAgeDays: number;
   enableRegistryHints: boolean;
+  verboseRegistryLogging: boolean;
   logLevel: LogLevel;
   budgets: ImportLensBudgets;
 }
@@ -37,6 +38,7 @@ export const getImportLensConfig = (): ImportLensConfig => {
     cacheMaxSizeMB: config.get("cacheMaxSizeMB", 512),
     cacheMaxAgeDays: config.get("cacheMaxAgeDays", 30),
     enableRegistryHints: config.get("enableRegistryHints", true),
+    verboseRegistryLogging: config.get("verboseRegistryLogging", false),
     logLevel: config.get<LogLevel>("logLevel", defaultLogLevel),
     budgets: sanitizeBudgets(config.get("budgets", {})),
   };

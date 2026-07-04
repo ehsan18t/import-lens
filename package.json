@@ -179,6 +179,11 @@
           "default": true,
           "description": "Enable short-timeout npm registry metadata hints for package.json dependency surfaces."
         },
+        "importLens.verboseRegistryLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log every package's registry refresh outcome (cache hit vs network fetch). Noisy on large dependency lists; enable only when diagnosing refresh behavior."
+        },
         "importLens.logLevel": {
           "type": "string",
           "enum": [

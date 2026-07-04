@@ -113,9 +113,24 @@ impl RegistryMetadataCache {
         let Ok(_persist_guard) = self.persist_lock.lock() else {
             return Err("registry cache persist lock poisoned".to_owned());
         };
-        let Ok(snapshot) = self.entries.lock().map(|entries| entries.clone()) else {
+        let Ok(mut snapshot) = self.entries.lock().map(|entries| entries.clone()) else {
             return Err("registry cache lock poisoned".to_owned());
         };
+        // The registry cache is shared across every workspace's daemon via global
+        // storage. Another process may have persisted entries since we loaded, so
+        // union the on-disk view in (keeping the newest `updated_at` per package)
+        // before this full-snapshot write, instead of clobbering their entries.
+        // A tiny cross-process read->rename race window remains, but this turns
+        // "clobber everything another process wrote" into "clobber only what it
+        // wrote in the few ms between our read and rename".
+        for (key, on_disk) in load_entries(&self.path) {
+            let keep_ours = snapshot
+                .get(&key)
+                .is_some_and(|ours| ours.updated_at >= on_disk.updated_at);
+            if !keep_ours {
+                snapshot.insert(key, on_disk);
+            }
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -123,7 +138,14 @@ impl RegistryMetadataCache {
         // Persist atomically: a direct `fs::write` to the live path can truncate the
         // cache if the process crashes mid-write. Write the full last-writer-wins
         // snapshot to a temp file, then rename it over the target.
-        let temp_path = self.path.with_extension("json.tmp");
+        // Per-process temp name: the cache lives in shared global storage, so a
+        // fixed temp path would let two windows' writes interleave into one file
+        // and rename corrupt JSON into place (which load_entries then silently
+        // resets to empty). Each process writes its own complete, merged file;
+        // renames are atomic and the last one wins with a superset snapshot.
+        let temp_path = self
+            .path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
         fs::write(&temp_path, bytes).map_err(|error| error.to_string())?;
         fs::rename(&temp_path, &self.path).map_err(|error| error.to_string())
     }

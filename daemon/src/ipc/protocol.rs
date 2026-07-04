@@ -320,6 +320,10 @@ pub struct RegistryHintResult {
     pub hint: Option<RegistryHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// "cache" or "network" — how this hint was resolved. Optional for
+    /// backward compatibility with older daemons/extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

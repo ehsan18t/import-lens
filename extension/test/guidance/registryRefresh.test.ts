@@ -241,3 +241,145 @@ test("a later refresh of a disjoint target does not supersede an earlier target'
 
   assert.equal(harness.current("react")?.registryHintRefreshStatus, "fresh");
 });
+
+test("logs a cache/network/failed summary from result origins", async () => {
+  const a = stateFor("a");
+  const b = stateFor("b");
+  const c = stateFor("c");
+  const harness = createHarness([a, b, c]);
+  const messages: string[] = [];
+  const logger = {
+    debug: (message: string): void => void messages.push(message),
+    warn: (): void => undefined,
+  };
+  const daemon: RegistryRefreshTransport = {
+    refreshRegistryHints: (request) =>
+      Promise.resolve({
+        version: request.version,
+        request_id: request.request_id,
+        results: [
+          {
+            target: request.targets[0],
+            hint: { latestVersion: "1", isLatest: true, fetchedAt: 1 },
+            error: null,
+            origin: "cache",
+          },
+          {
+            target: request.targets[1],
+            hint: { latestVersion: "2", isLatest: false, fetchedAt: 1 },
+            error: null,
+            origin: "network",
+          },
+          { target: request.targets[2], hint: null, error: "boom", origin: "network" },
+        ],
+        error: null,
+        diagnostics: [],
+      }),
+  };
+  const refresher = new RegistryHintRefresher(daemon, harness.host, logger);
+
+  await refresher.refresh(uriKey, [targetFor(a), targetFor(b), targetFor(c)], "refresh_stale");
+
+  assert.ok(
+    messages.some((message) => message.includes("3 target(s): 1 cached, 1 fetched, 1 failed")),
+    `expected a summary line, got: ${messages.join(" | ")}`,
+  );
+});
+
+test("verbose mode logs per-package cache/network lines", async () => {
+  const a = stateFor("a");
+  const harness = createHarness([a]);
+  const messages: string[] = [];
+  const logger = {
+    debug: (message: string): void => void messages.push(message),
+    warn: (): void => undefined,
+  };
+  const daemon: RegistryRefreshTransport = {
+    refreshRegistryHints: (request) =>
+      Promise.resolve({
+        version: request.version,
+        request_id: request.request_id,
+        results: [
+          {
+            target: request.targets[0],
+            hint: { latestVersion: "1", isLatest: true, fetchedAt: 1 },
+            error: null,
+            origin: "network",
+          },
+        ],
+        error: null,
+        diagnostics: [],
+      }),
+  };
+  const refresher = new RegistryHintRefresher(daemon, harness.host, logger, () => true);
+
+  await refresher.refresh(uriKey, [targetFor(a)], "refresh_stale");
+
+  assert.ok(
+    messages.some((message) => message.includes("fetched (network) for a")),
+    messages.join(" | "),
+  );
+});
+
+test("logs the summary once even when the daemon streams partials", async () => {
+  const a = stateFor("a");
+  const b = stateFor("b");
+  const harness = createHarness([a, b]);
+  const messages: string[] = [];
+  const logger = {
+    debug: (message: string): void => void messages.push(message),
+    warn: (): void => undefined,
+  };
+  const daemon: RegistryRefreshTransport = {
+    refreshRegistryHints: (request, onPartial) => {
+      const results = [
+        {
+          target: request.targets[0],
+          hint: { latestVersion: "1", isLatest: true, fetchedAt: 1 },
+          error: null,
+          origin: "network" as const,
+        },
+        {
+          target: request.targets[1],
+          hint: { latestVersion: "2", isLatest: true, fetchedAt: 1 },
+          error: null,
+          origin: "cache" as const,
+        },
+      ];
+      // The daemon streams one partial per target, then a final aggregate that
+      // repeats every result.
+      onPartial?.({
+        version: request.version,
+        request_id: request.request_id,
+        results: [results[0]],
+        indexes: [0],
+        error: null,
+        diagnostics: [],
+      });
+      onPartial?.({
+        version: request.version,
+        request_id: request.request_id,
+        results: [results[1]],
+        indexes: [1],
+        error: null,
+        diagnostics: [],
+      });
+      return Promise.resolve({
+        version: request.version,
+        request_id: request.request_id,
+        results,
+        error: null,
+        diagnostics: [],
+      });
+    },
+  };
+  const refresher = new RegistryHintRefresher(daemon, harness.host, logger, () => true);
+
+  await refresher.refresh(uriKey, [targetFor(a), targetFor(b)], "refresh_stale");
+
+  const summaries = messages.filter((message) => message.includes("target(s):"));
+  assert.equal(summaries.length, 1, `expected exactly one summary, got: ${messages.join(" | ")}`);
+  assert.ok(summaries[0].includes("2 target(s): 1 cached, 1 fetched, 0 failed"));
+  // Each package's verbose line appears once, not once per partial + once for final.
+  assert.equal(messages.filter((message) => message.includes("fetched (network) for a")).length, 1);
+});

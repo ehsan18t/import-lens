@@ -1,4 +1,7 @@
-use super::{constants::DEFAULT_TIMEOUT_MS, types::HttpRegistryResponse};
+use super::{
+    constants::{DEFAULT_TIMEOUT_MS, MAX_REGISTRY_BODY_BYTES, REGISTRY_BODY_TOO_LARGE_ERROR},
+    types::HttpRegistryResponse,
+};
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
@@ -43,8 +46,15 @@ impl super::types::RegistryHttpClient for UreqRegistryHttpClient {
             .and_then(|value| retry_after_delay_ms(value, SystemTime::now()));
         let body = response
             .body_mut()
+            .with_config()
+            .limit(MAX_REGISTRY_BODY_BYTES)
             .read_to_string()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| match error {
+                // Translate ureq's oversize-body error into a stable marker so the
+                // permanent-failure classifier does not depend on ureq's wording.
+                ureq::Error::BodyExceedsLimit(_) => REGISTRY_BODY_TOO_LARGE_ERROR.to_owned(),
+                other => other.to_string(),
+            })?;
 
         Ok(HttpRegistryResponse {
             status,

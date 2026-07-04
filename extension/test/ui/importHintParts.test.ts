@@ -19,6 +19,7 @@ const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => 
   cacheMaxSizeMB: 512,
   cacheMaxAgeDays: 30,
   enableRegistryHints: false,
+  verboseRegistryLogging: false,
   logLevel: "error",
   budgets: { perImportBrotliBytes: 1000 },
   ...overrides,

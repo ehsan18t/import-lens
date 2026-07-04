@@ -530,8 +530,13 @@ export class NativeDaemonTransport implements AnalysisTransport {
       return null;
     }
 
+    const names = request.targets.map((target) => target.name);
+    const preview =
+      names.length <= 8
+        ? names.join(", ")
+        : `${names.slice(0, 8).join(", ")}, +${names.length - 8} more`;
     this.#logger.debug(
-      `Requesting registry hint refresh ${request.request_id} for ${request.targets.length} package(s).`,
+      `Requesting registry hint refresh ${request.request_id} for ${request.targets.length} package(s): ${preview}.`,
     );
     return this.#client.requestRefreshRegistryHints(request, 30000, onPartial);
   }

@@ -537,6 +537,7 @@ where
                                 target: target_for_error,
                                 hint: None,
                                 error: Some("registry worker panicked".to_owned()),
+                                origin: None,
                             }
                         });
                         let _ = tx.send((index, result));
@@ -574,6 +575,7 @@ where
                                 error: Some(
                                     "registry refresh worker did not return a result".to_owned(),
                                 ),
+                                origin: None,
                             })
                         })
                         .collect();
