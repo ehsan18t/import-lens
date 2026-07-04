@@ -95,6 +95,12 @@ impl FileSizeCache {
         self.entries.pin().get(path).is_some()
     }
 
+    /// Drops every cached aggregate. Called when the user clears caches so the
+    /// status-bar size recomputes fresh rather than serving a memory-only entry.
+    pub fn clear(&self) {
+        self.entries.pin().clear();
+    }
+
     pub fn len(&self) -> usize {
         self.entries.pin().len()
     }

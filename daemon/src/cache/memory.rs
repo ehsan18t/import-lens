@@ -10,12 +10,18 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 pub const RECENT_PRELOAD_LIMIT: usize = 20;
+
+// Cap the in-memory entry count so a long multi-package session cannot grow the
+// map without bound. Eviction drops the least-recently-used entry; its disk copy
+// (if any) survives and re-hydrates on the next hit. The cap is generous, so it
+// only triggers in very large sessions.
+pub const MAX_MEMORY_ENTRIES: usize = 4096;
 
 // Dependency fingerprints only change when node_modules changes, which the
 // extension signals via cache invalidation. Between invalidations, re-stat'ing
@@ -49,6 +55,9 @@ pub struct CachedImport {
     // at which this entry's fingerprints were last confirmed current.
     pub verified_generation: u64,
     pub verified_at_millis: u64,
+    // Wall-clock of the last cache hit; drives LRU eviction. Shared via Arc so a
+    // hit can bump it in place without re-inserting the entry.
+    pub last_used_millis: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -101,6 +110,9 @@ impl ImportCache {
         if let Some(cached) = memory.get(key) {
             let generation = current_cache_generation();
             let now = crate::time::unix_millis_now();
+            // Bump LRU recency on every hit. The Arc is shared with the restamp
+            // clone below, so this stays current across both return paths.
+            cached.last_used_millis.store(now, Ordering::Relaxed);
             let fresh_without_restat = cached.verified_generation == generation
                 && now.saturating_sub(cached.verified_at_millis) <= REVERIFY_TTL_MS;
 
@@ -139,6 +151,10 @@ impl ImportCache {
             let mut result = cached.result.clone();
             memory.insert(key.to_owned(), cached);
             result.cache_hit = true;
+            drop(memory);
+            // Re-hydrating from disk grows the map too, so enforce the cap here as
+            // well as on fresh inserts.
+            self.enforce_memory_cap();
             return Some(result);
         }
 
@@ -155,11 +171,13 @@ impl ImportCache {
         result: ImportResult,
         dependency_fingerprints: Vec<FileFingerprint>,
     ) {
+        let now = crate::time::unix_millis_now();
         let cached = CachedImport {
             result,
             dependency_fingerprints,
             verified_generation: current_cache_generation(),
-            verified_at_millis: crate::time::unix_millis_now(),
+            verified_at_millis: now,
+            last_used_millis: Arc::new(AtomicU64::new(now)),
         };
 
         if let Err(error) = self.disk.insert(&key, &cached) {
@@ -170,6 +188,26 @@ impl ImportCache {
         }
 
         self.memory.pin().insert(key, cached);
+        self.enforce_memory_cap();
+    }
+
+    /// Evicts the least-recently-used entry while the in-memory map is over the
+    /// cap. The disk copy (if any) survives and re-hydrates on the next hit, so
+    /// this only sheds the memory mirror. Called from every path that grows the
+    /// map (fresh insert and disk re-hydration), not the restamp path (which
+    /// replaces an existing key and cannot grow the map).
+    fn enforce_memory_cap(&self) {
+        let memory = self.memory.pin();
+        while memory.len() > MAX_MEMORY_ENTRIES {
+            let Some(oldest) = memory
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_millis.load(Ordering::Relaxed))
+                .map(|(oldest_key, _)| oldest_key.clone())
+            else {
+                break;
+            };
+            memory.remove(&oldest);
+        }
     }
 
     pub fn invalidate_package(&self, package_name: &str) {

@@ -69,6 +69,18 @@ fn import_cache_invalidates_package_prefixes() {
 }
 
 #[test]
+fn import_cache_bounds_memory_entries_with_lru_eviction() {
+    use import_lens_daemon::cache::memory::MAX_MEMORY_ENTRIES;
+    let cache = ImportCache::new(None, false);
+
+    for index in 0..(MAX_MEMORY_ENTRIES + 50) {
+        cache.insert(format!("pkg-{index}@1.0.0::default"), result("pkg", false));
+    }
+
+    assert!(cache.memory_len() <= MAX_MEMORY_ENTRIES);
+}
+
+#[test]
 fn import_cache_invalidates_multiple_packages_in_one_pass() {
     let cache = ImportCache::default();
     cache.insert("react@18.3.1::default".to_owned(), result("react", false));

@@ -1114,6 +1114,9 @@ impl ImportLensService {
 
         if !removed.is_empty() {
             clear_module_graph_cache();
+            // Drop L1 aggregate sizes too so the status-bar size recomputes fresh
+            // after a cache clear (the memory-only L1 is not generation-bumped here).
+            crate::pipeline::file_size_cache::shared_file_size_cache().clear();
         }
 
         CacheRemoveResponse {

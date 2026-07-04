@@ -14,7 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex, atomic::AtomicU64},
 };
 
 const CACHE_DB_FILE_NAME: &str = "importlens.redb";
@@ -658,6 +658,7 @@ fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
                 dependency_fingerprints: envelope.dependency_fingerprints,
                 verified_generation: 0,
                 verified_at_millis: 0,
+                last_used_millis: Arc::new(AtomicU64::new(unix_millis_now())),
             });
         }
         return None;
@@ -670,6 +671,7 @@ fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
             dependency_fingerprints: Vec::new(),
             verified_generation: 0,
             verified_at_millis: 0,
+            last_used_millis: Arc::new(AtomicU64::new(unix_millis_now())),
         })
 }
 
