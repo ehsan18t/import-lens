@@ -9,10 +9,12 @@ pre-commit:
       run: cargo fmt
       stage_fixed: true
     - name: rust-clippy
-      glob: ["*.rs", "Cargo.toml", "Cargo.lock", "clippy.toml"]
+      # `*Cargo.toml` (not the literal `Cargo.toml`) so a nested manifest such as
+      # daemon/Cargo.toml also triggers the gate; lefthook's `*` crosses `/`.
+      glob: ["*.rs", "*Cargo.toml", "*Cargo.lock", "clippy.toml"]
       run: cargo clippy --workspace --all-targets
     - name: rust-deny
-      glob: ["Cargo.toml", "Cargo.lock", "deny.toml"]
+      glob: ["*Cargo.toml", "*Cargo.lock", "deny.toml"]
       run: cargo deny check
     - name: ts-biome
       glob: ["*.ts", "*.mts", "*.mjs", "*.json"]
