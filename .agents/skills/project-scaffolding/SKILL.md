@@ -64,7 +64,7 @@ import-lens/
 │       ├── lifecycle.rs               # Graceful shutdown, self-recycle (NFR-004a)
 │       └── prefetch.rs               # Background pre-warm logic
 │
-├── bin/                               # Native daemon binaries (gitignored, CI-populated)
+├── dist/bin/                          # Native daemon binaries (gitignored, CI-populated)
 │   ├── linux-x64/import-lens-daemon
 │   ├── linux-arm64/import-lens-daemon
 │   ├── darwin-x64/import-lens-daemon
@@ -153,7 +153,7 @@ strip = true
   "engines": {
     "vscode": "^1.100.0"
   },
-  "main": "./extension/dist/extension.cjs",
+  "main": "./dist/extension/extension.cjs",
   "activationEvents": [
     "onLanguage:javascript",
     "onLanguage:typescript",
@@ -191,6 +191,6 @@ These must NEVER appear in `Cargo.toml` or `package.json`:
 
 ## Rules
 
-- The `bin/` directory is gitignored and CI-populated.
+- The `dist/bin/` directory is gitignored and CI-populated.
 - The extension must be bundled to a single file by `tsdown`. Only `oxc-parser` (NAPI) and `@msgpack/msgpack` are runtime dependencies.
 - The `vscode` module must always be marked as `external` in tsdown config.

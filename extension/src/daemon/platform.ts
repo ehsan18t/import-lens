@@ -38,3 +38,12 @@ export const currentPlatformTarget = (): PlatformTarget | null => platformTarget
 
 export const daemonBinaryName = (target: PlatformTarget): string => target.startsWith("win32") ? "import-lens-daemon.exe" : "import-lens-daemon";
 
+// Where the daemon binaries live, relative to the extension root — identical in
+// the repo (dev resolves against the repo root) and inside the packaged VSIX.
+// Mirrors daemonRoot in scripts/targets.mjs (this bundle cannot import build
+// scripts); the daemon-path-contract test keeps the two in lockstep.
+export const daemonRoot = "dist/bin";
+
+export const daemonRelativePath = (target: PlatformTarget): string =>
+  `${daemonRoot}/${target}/${daemonBinaryName(target)}`;
+

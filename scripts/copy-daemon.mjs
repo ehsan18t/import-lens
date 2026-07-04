@@ -3,7 +3,7 @@
 import { cpSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { artifactPathForTarget, targetInfo } from "./targets.mjs";
+import { artifactPathForTarget, relativeDaemonPath, targetInfo } from "./targets.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const target = process.argv[2];
@@ -13,7 +13,7 @@ if (!target) {
   process.exit(1);
 }
 
-const info = targetInfo(target);
+targetInfo(target);
 const source = artifactPathForTarget(repoRoot, target);
 
 if (!existsSync(source)) {
@@ -22,8 +22,8 @@ if (!existsSync(source)) {
   process.exit(1);
 }
 
-const targetDir = path.join(repoRoot, "bin", target);
-const destination = path.join(targetDir, info.binaryName);
+const destination = path.join(repoRoot, relativeDaemonPath(target));
+const targetDir = path.dirname(destination);
 
 mkdirSync(targetDir, { recursive: true });
 cpSync(source, destination, { force: true });

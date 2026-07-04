@@ -117,7 +117,7 @@ test("runImportLensCheck resolves changed files against resolveRoot but reports 
 test("daemonBinaryPath resolves from the installed package root", () => {
   assert.equal(
     daemonBinaryPath({ packageRoot: path.join("C:", "ImportLens"), platformTarget: "win32-x64" }),
-    path.join("C:", "ImportLens", "bin", "win32-x64", "import-lens-daemon.exe"),
+    path.join("C:", "ImportLens", "dist", "bin", "win32-x64", "import-lens-daemon.exe"),
   );
 });
 

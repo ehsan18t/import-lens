@@ -41,7 +41,10 @@ test("build workflow builds each target on its native OS", () => {
 test("build workflow caches each VSIX per target and resolved version and supports force rebuild", () => {
   const source = workflow();
 
-  assert.match(source, /key: vsix-\$\{\{ matrix\.target \}\}-\$\{\{ needs\.validate\.outputs\.version \}\}/u);
+  // vsix-v2: the namespace was bumped when the VSIX path moved to dist/vsix,
+  // so stale caches created under builds/ can never be restored.
+  assert.match(source, /key: vsix-v2-\$\{\{ matrix\.target \}\}-\$\{\{ needs\.validate\.outputs\.version \}\}/u);
+  assert.match(source, /VSIX_PATH: dist\/vsix\/import-lens-/u);
   assert.match(source, /inputs\.force/u);
   assert.match(source, /retention-days: 1/u);
   assert.match(source, /if-no-files-found: error/u);

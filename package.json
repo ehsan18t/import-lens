@@ -16,7 +16,7 @@
     "importlens": "./cli/importlens.mjs"
   },
   "packageManager": "pnpm@11.9.0+sha512.bd682d5d03fe525ef7c9fd6780c6884d1e756ac4c9c9fe00c538782824310dcf90e3ddc4f53835f06dfaebd5085e41855e0bcbb3b60de2ac5bbab89e5036f03b",
-  "main": "./extension/dist/extension.cjs",
+  "main": "./dist/extension/extension.cjs",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -194,8 +194,8 @@
     }
   },
   "files": [
-    "extension/dist/extension.cjs",
-    "bin/",
+    "dist/extension/extension.cjs",
+    "dist/bin/",
     "cli/",
     "media/icon.png",
     "README.md",
@@ -205,7 +205,7 @@
     "build": "tsdown",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "pnpm build && pnpm test:ts && pnpm test:scripts && pnpm test:rust",
-    "test:ts": "node -e \"require('node:fs').rmSync('extension/test-dist', { recursive: true, force: true })\" && tsc -p tsconfig.test.json && node --test \"extension/test-dist/**/*.test.js\"",
+    "test:ts": "node -e \"require('node:fs').rmSync('dist/test-dist', { recursive: true, force: true })\" && tsc -p tsconfig.test.json && node --test \"dist/test-dist/**/*.test.js\"",
     "test:scripts": "node --test \"scripts/**/*.test.mjs\"",
     "test:rust": "cargo test --workspace",
     "test:accuracy": "node scripts/accuracy-compare.mjs",

@@ -64,7 +64,7 @@ jobs:
             rust-target: aarch64-apple-darwin
 
     env:
-      VSIX_PATH: builds/import-lens-${{ matrix.target }}-${{ needs.validate.outputs.version }}.vsix
+      VSIX_PATH: dist/vsix/import-lens-${{ matrix.target }}-${{ needs.validate.outputs.version }}.vsix
 
     steps:
       - name: Checkout
@@ -78,7 +78,9 @@ jobs:
         uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ env.VSIX_PATH }}
-          key: vsix-${{ matrix.target }}-${{ needs.validate.outputs.version }}
+          # vsix-v2: the cached path moved from builds/ to dist/vsix; the old
+          # namespace would restore to the old path and fail the upload.
+          key: vsix-v2-${{ matrix.target }}-${{ needs.validate.outputs.version }}
 
       # Everything below only runs when we actually need to build this target
       # (cache miss, or force). On a cache hit the restored VSIX is uploaded as-is.
@@ -132,7 +134,9 @@ jobs:
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ env.VSIX_PATH }}
-          key: vsix-${{ matrix.target }}-${{ needs.validate.outputs.version }}
+          # vsix-v2: the cached path moved from builds/ to dist/vsix; the old
+          # namespace would restore to the old path and fail the upload.
+          key: vsix-v2-${{ matrix.target }}-${{ needs.validate.outputs.version }}
 
       # Always upload, whether the VSIX was restored from cache or freshly built,
       # so this run's artifact set accumulates to the full six targets.

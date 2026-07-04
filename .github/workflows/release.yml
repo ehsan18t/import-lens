@@ -131,7 +131,7 @@ jobs:
         uses: actions/download-artifact@v8.0.1
         with:
           pattern: import-lens-*-${{ env.RELEASE_VERSION }}
-          path: builds
+          path: dist/vsix
           merge-multiple: true
           run-id: ${{ steps.buildrun.outputs.run_id }}
           github-token: ${{ github.token }}
@@ -150,7 +150,7 @@ jobs:
             "darwin-arm64",
           ];
           const missing = targets
-            .map((target) => `builds/import-lens-${target}-${process.env.RELEASE_VERSION}.vsix`)
+            .map((target) => `dist/vsix/import-lens-${target}-${process.env.RELEASE_VERSION}.vsix`)
             .filter((file) => !existsSync(file));
 
           if (missing.length > 0) {
@@ -161,7 +161,7 @@ jobs:
           NODE
 
       - name: Check VSIX size budget
-        run: pnpm assert:vsix-size builds/*.vsix
+        run: pnpm assert:vsix-size dist/vsix/*.vsix
 
       - name: Install git-cliff
         uses: taiki-e/install-action@v2.82.7
@@ -194,7 +194,7 @@ jobs:
       - name: Create draft GitHub release
         if: ${{ !inputs.dry_run && inputs.release_github }}
         run: |
-          gh release create "$RELEASE_TAG" builds/*.vsix \
+          gh release create "$RELEASE_TAG" dist/vsix/*.vsix \
             --draft \
             --target "$GITHUB_SHA" \
             --title "ImportLens $RELEASE_VERSION" \
@@ -203,13 +203,13 @@ jobs:
       - name: Publish VSIXs to Visual Studio Marketplace
         if: ${{ !inputs.dry_run && inputs.publish_vscode }}
         run: |
-          for file in builds/*.vsix; do
+          for file in dist/vsix/*.vsix; do
             pnpm exec vsce publish --packagePath "$file" --pat "$VSCE_PAT"
           done
 
       - name: Publish VSIXs to Open VSX
         if: ${{ !inputs.dry_run && inputs.publish_openvsx }}
         run: |
-          for file in builds/*.vsix; do
+          for file in dist/vsix/*.vsix; do
             pnpm exec ovsx publish "$file" --pat "$OVSX_PAT"
           done

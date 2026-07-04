@@ -1,7 +1,7 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "outDir": "./extension/test-dist",
+    "outDir": "./dist/test-dist",
     "rootDir": "./extension",
     "noEmit": false,
     "declaration": false,

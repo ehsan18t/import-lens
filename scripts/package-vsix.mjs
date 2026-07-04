@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStagedManifest } from "./package-vsix-manifest.mjs";
-import { targetInfo, vsixNameForTarget } from "./targets.mjs";
+import { daemonRoot, extensionBundle, stagingDir, targetInfo, vsixNameForTarget } from "./targets.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -59,7 +59,7 @@ targetInfo(target);
 
 const manifestPath = path.join(repoRoot, "package.json");
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-const stagingRoot = path.join(repoRoot, ".vsix-staging", target);
+const stagingRoot = path.join(repoRoot, stagingDir, target);
 const outputPath = path.join(repoRoot, vsixNameForTarget(manifest, target));
 
 // Resolve vsce binary *before* the staging pnpm install, which may strip devDependencies.
@@ -84,11 +84,8 @@ run("pnpm", ["install", "--prod", "--force", "--no-lockfile", "--node-linker=hoi
 copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));
 copyPath(path.join(repoRoot, "LICENSE"), path.join(stagingRoot, "LICENSE"));
 copyPath(path.join(repoRoot, "cli"), path.join(stagingRoot, "cli"));
-copyPath(
-  path.join(repoRoot, "extension", "dist", "extension.cjs"),
-  path.join(stagingRoot, "extension", "dist", "extension.cjs"),
-);
-copyPath(path.join(repoRoot, "bin", target), path.join(stagingRoot, "bin", target));
+copyPath(path.join(repoRoot, extensionBundle), path.join(stagingRoot, extensionBundle));
+copyPath(path.join(repoRoot, daemonRoot, target), path.join(stagingRoot, daemonRoot, target));
 
 if (manifest.icon) {
   const iconPath = path.join(repoRoot, manifest.icon);

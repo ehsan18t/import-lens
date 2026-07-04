@@ -12,7 +12,7 @@ The extension must spawn the native daemon, verify its integrity, and guarantee 
 Before spawning the daemon, the extension host MUST:
 
 1. Compute the SHA-256 hash of the daemon executable.
-2. Compare it against a known-good hash embedded in the extension package (e.g., in a `bin/<platform>/sha256` file or hardcoded in the build).
+2. Compare it against a known-good hash embedded in the extension package (e.g., in a `dist/bin/<platform>/sha256` file or hardcoded in the build).
 3. If the hash does NOT match, refuse to spawn, log a security warning to the `ImportLens` output channel, and enter degraded mode.
 
 ```typescript
@@ -31,7 +31,7 @@ async function verifyBinaryIntegrity(
 
 ## 2. Spawning
 
-Spawn the correct binary per the current OS/architecture. The binary is in the extension's `bin/<platform>/` directory.
+Spawn the correct binary per the current OS/architecture. The binary is in the extension's `dist/bin/<platform>/` directory.
 
 ```typescript
 import { spawn, ChildProcess } from "child_process";

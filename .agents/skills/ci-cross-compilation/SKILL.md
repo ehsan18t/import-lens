@@ -39,8 +39,8 @@ For each native target:
 # Cross-compile for a specific target
 cargo build --release --target <rust-target> -p import-lens-daemon
 
-# Copy binary to the correct bin/ directory
-cp target/<rust-target>/release/import-lens-daemon bin/<vsix-platform>/
+# Copy binary to the correct dist/bin/ directory
+cp target/<rust-target>/release/import-lens-daemon dist/bin/<vsix-platform>/
 ```
 
 Use `cross` or platform-specific CI runners for cross-compilation.
@@ -56,7 +56,7 @@ it can become a release artifact.
 After compilation, generate SHA-256 hashes for integrity verification:
 
 ```bash
-sha256sum bin/<platform>/import-lens-daemon > bin/<platform>/sha256
+sha256sum dist/bin/<platform>/import-lens-daemon > dist/bin/<platform>/sha256
 ```
 
 These hashes are embedded in the VSIX and checked by the extension host before spawning the daemon.

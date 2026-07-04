@@ -12,7 +12,7 @@
     "isolatedDeclarations": true,
     "noUncheckedSideEffectImports": true,
     "skipLibCheck": true,
-    "outDir": "./extension/dist",
+    "outDir": "./dist/extension",
     "rootDir": "./extension/src"
   },
   "include": [

@@ -45,7 +45,7 @@ pnpm package:win32-x64
 ## Packaging Notes
 
 - `pnpm package:win32-x64` rebuilds the daemon, copies the Windows binary, refreshes `extension/src/daemon/knownHashes.generated.ts`, builds the extension bundle, and creates the Windows VSIX.
-- Generated build artifacts such as `bin/`, `extension/dist/`, `target/`, and `*.vsix` are ignored unless the repository policy changes.
+- Generated build artifacts such as `dist/` (daemon binaries, extension bundle, VSIXes) and `target/` are ignored unless the repository policy changes.
 
 ## Git Expectations
 

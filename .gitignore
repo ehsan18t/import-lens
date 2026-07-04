@@ -1,15 +1,9 @@
 node_modules/
 .pnpm-store/
-extension/dist/
-extension/test-dist/
-coverage/
+/dist/
 target/
-bin/
-wasm/
 *.vsix
 *.log
 .worktrees/
-.vsix-staging/
 
 daemon/tests/fixtures/packages/
-builds/

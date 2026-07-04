@@ -14,9 +14,9 @@ done
 
 version=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")
 pnpm assert:vsix-size \
-  "builds/import-lens-linux-x64-${version}.vsix" \
-  "builds/import-lens-linux-arm64-${version}.vsix" \
-  "builds/import-lens-darwin-x64-${version}.vsix" \
-  "builds/import-lens-darwin-arm64-${version}.vsix"
+  "dist/vsix/import-lens-linux-x64-${version}.vsix" \
+  "dist/vsix/import-lens-linux-arm64-${version}.vsix" \
+  "dist/vsix/import-lens-darwin-x64-${version}.vsix" \
+  "dist/vsix/import-lens-darwin-arm64-${version}.vsix"
 
 echo "Docker build completed successfully."

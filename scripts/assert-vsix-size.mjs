@@ -3,19 +3,20 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { vsixDir } from "./targets.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const maxBytes = 20 * 1024 * 1024;
-const buildsDir = path.join(repoRoot, "builds");
+const buildsDir = path.join(repoRoot, vsixDir);
 const inputs = process.argv.slice(2);
 const vsixFiles = inputs.length > 0
   ? inputs
   : (existsSync(buildsDir) ? readdirSync(buildsDir) : [])
       .filter((entry) => entry.endsWith(".vsix"))
-      .map((entry) => path.join("builds", entry));
+      .map((entry) => path.join(vsixDir, entry));
 
 if (vsixFiles.length === 0) {
-  console.error("No VSIX files were provided or found under builds/.");
+  console.error(`No VSIX files were provided or found under ${vsixDir}/.`);
   process.exit(1);
 }
 

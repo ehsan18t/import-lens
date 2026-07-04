@@ -1,11 +1,6 @@
 .git
-.vsix-staging
-bin
-coverage
-extension/dist
-extension/test-dist
+dist
 node_modules
 target
-wasm
 *.log
 *.vsix

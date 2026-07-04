@@ -1,7 +1,9 @@
+import { daemonRoot, extensionBundle } from "./targets.mjs";
+
 export const createStagedManifest = ({ manifest }) => {
   const files = [
-    "extension/dist/extension.cjs",
-    "bin/",
+    extensionBundle,
+    `${daemonRoot}/`,
     "cli/",
     "README.md",
     "LICENSE",

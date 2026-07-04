@@ -25,9 +25,9 @@ test("updateKnownDaemonHashes preserves unrelated target hashes during a target 
   const winBinary = "win-daemon";
 
   try {
-    writeBinary(repoRoot, "bin/win32-x64/import-lens-daemon.exe", winBinary);
+    writeBinary(repoRoot, "dist/bin/win32-x64/import-lens-daemon.exe", winBinary);
     const existingSource = knownHashesSource({
-      "bin/darwin-arm64/import-lens-daemon": "old-darwin-hash",
+      "dist/bin/darwin-arm64/import-lens-daemon": "old-darwin-hash",
     });
     const { hashes, source } = updateKnownDaemonHashes({
       repoRoot,
@@ -35,8 +35,8 @@ test("updateKnownDaemonHashes preserves unrelated target hashes during a target 
       existingSource,
     });
 
-    assert.equal(hashes["bin/darwin-arm64/import-lens-daemon"], "old-darwin-hash");
-    assert.equal(hashes["bin/win32-x64/import-lens-daemon.exe"], sha256(winBinary));
+    assert.equal(hashes["dist/bin/darwin-arm64/import-lens-daemon"], "old-darwin-hash");
+    assert.equal(hashes["dist/bin/win32-x64/import-lens-daemon.exe"], sha256(winBinary));
     assert.deepEqual(parseKnownHashesSource(source), hashes);
   } finally {
     rmSync(repoRoot, { force: true, recursive: true });
@@ -48,9 +48,9 @@ test("updateKnownDaemonHashes throws instead of stripping when a selected target
 
   try {
     // win32-x64 is built locally; win32-arm64 is not.
-    writeBinary(repoRoot, "bin/win32-x64/import-lens-daemon.exe", "win-x64");
+    writeBinary(repoRoot, "dist/bin/win32-x64/import-lens-daemon.exe", "win-x64");
     const existingSource = knownHashesSource({
-      "bin/win32-arm64/import-lens-daemon.exe": "old-arm64-hash",
+      "dist/bin/win32-arm64/import-lens-daemon.exe": "old-arm64-hash",
     });
 
     assert.throws(
@@ -65,7 +65,7 @@ test("updateKnownDaemonHashes throws instead of stripping when a selected target
 
     // Aborting before any write leaves the previously trusted hash intact.
     assert.equal(
-      parseKnownHashesSource(existingSource)["bin/win32-arm64/import-lens-daemon.exe"],
+      parseKnownHashesSource(existingSource)["dist/bin/win32-arm64/import-lens-daemon.exe"],
       "old-arm64-hash",
     );
   } finally {
@@ -76,13 +76,13 @@ test("updateKnownDaemonHashes throws instead of stripping when a selected target
 test("knownHashesSource emits deterministic sorted TypeScript", () => {
   assert.equal(
     knownHashesSource({
-      "bin/win32-x64/import-lens-daemon.exe": "win",
-      "bin/darwin-arm64/import-lens-daemon": "darwin",
+      "dist/bin/win32-x64/import-lens-daemon.exe": "win",
+      "dist/bin/darwin-arm64/import-lens-daemon": "darwin",
     }),
     [
       "export const knownDaemonHashes: Readonly<Record<string, string>> = {",
-      "  \"bin/darwin-arm64/import-lens-daemon\": \"darwin\",",
-      "  \"bin/win32-x64/import-lens-daemon.exe\": \"win\"",
+      "  \"dist/bin/darwin-arm64/import-lens-daemon\": \"darwin\",",
+      "  \"dist/bin/win32-x64/import-lens-daemon.exe\": \"win\"",
       "};",
       "",
     ].join("\n"),

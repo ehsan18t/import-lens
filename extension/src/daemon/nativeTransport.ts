@@ -34,7 +34,7 @@ import type {
 } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import type { Logger } from "../logging/types.js";
-import { currentPlatformTarget, daemonBinaryName } from "./platform.js";
+import { currentPlatformTarget, daemonRelativePath } from "./platform.js";
 import { knownDaemonHashes } from "./knownHashes.generated.js";
 import { cleanupFailedDaemonStartup, pipeDaemonProcessLogs, terminateProcess } from "./processLifecycle.js";
 import { RecycleGuard } from "./recycleGuard.js";
@@ -145,7 +145,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       return this.#state;
     }
 
-    const relativeBinaryPath = `bin/${target}/${daemonBinaryName(target)}`;
+    const relativeBinaryPath = daemonRelativePath(target);
     const binaryPath = path.join(this.#context.extensionPath, relativeBinaryPath);
 
     if (!(await this.#verifyBinary(relativeBinaryPath, binaryPath))) {

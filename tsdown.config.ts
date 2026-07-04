@@ -3,7 +3,7 @@ import { defineConfig } from "tsdown";
 export default defineConfig({
   entry: ["./extension/src/extension.ts"],
   format: ["cjs"],
-  outDir: "./extension/dist",
+  outDir: "./dist/extension",
   clean: true,
   minify: true,
   target: "node20",

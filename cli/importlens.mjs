@@ -288,8 +288,13 @@ export const daemonBinaryPath = ({
     throw new Error(`Unsupported platform for ImportLens daemon: ${process.platform}-${os.arch()}`);
   }
 
-  return path.join(packageRoot, "bin", requestedTarget, daemonBinaryName(requestedTarget));
+  return path.join(packageRoot, DAEMON_ROOT, requestedTarget, daemonBinaryName(requestedTarget));
 };
+
+// Where the daemon binaries live relative to the package root. Mirrors
+// daemonRoot in scripts/targets.mjs (this CLI ships standalone and cannot
+// import build scripts); the daemon-path-contract test keeps them in lockstep.
+const DAEMON_ROOT = "dist/bin";
 
 const daemonBinaryName = (target) =>
   target.startsWith("win32-") ? "import-lens-daemon.exe" : "import-lens-daemon";

@@ -4,7 +4,7 @@ import test from "node:test";
 
 const BUNDLED_RUNTIME_DEPS = ["@msgpack/msgpack"];
 
-const bundlePath = new URL("../../extension/dist/extension.cjs", import.meta.url);
+const bundlePath = new URL("../../dist/extension/extension.cjs", import.meta.url);
 
 test("CJS bundle must not externalize bundled runtime dependencies", () => {
   let bundle;

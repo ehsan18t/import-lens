@@ -112,5 +112,22 @@ export const cargoZigbuildArgsForTarget = (platformTarget) => {
   ];
 };
 
+// All build artifacts live under dist/ (target/ is the one Rust-convention
+// exception). These relative segments are the single source for every script.
+export const vsixDir = "dist/vsix";
+export const stagingDir = "dist/staging";
+// Shipped artifacts. These repo-relative paths are also the in-VSIX layout: in
+// dev the extension resolves against the repo root, so the two cannot diverge.
+// The extension mirrors daemonRoot in extension/src/daemon/platform.ts and the
+// CLI in cli/importlens.mjs (neither can import this module at runtime); the
+// daemon-path-contract test keeps all three in lockstep.
+export const daemonRoot = "dist/bin";
+export const extensionBundle = "dist/extension/extension.cjs";
+
+export const relativeDaemonPath = (platformTarget) => {
+  const { binaryName } = targetInfo(platformTarget);
+  return `${daemonRoot}/${platformTarget}/${binaryName}`;
+};
+
 export const vsixNameForTarget = (manifest, platformTarget) =>
-  `builds/${manifest.name}-${platformTarget}-${manifest.version}.vsix`;
+  `${vsixDir}/${manifest.name}-${platformTarget}-${manifest.version}.vsix`;

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { targetInfo } from "./targets.mjs";
+import { relativeDaemonPath } from "./targets.mjs";
 
 const generatedObjectPattern =
   /export\s+const\s+knownDaemonHashes:\s+Readonly<Record<string,\s+string>>\s+=\s+(\{[\s\S]*?\})\s*;\s*$/u;
@@ -45,12 +45,6 @@ export const knownHashesSource = (hashes) => {
     "};",
     "",
   ].join("\n");
-};
-
-export const relativeDaemonPath = (target) => {
-  const { binaryName } = targetInfo(target);
-
-  return `bin/${target}/${binaryName}`;
 };
 
 export const collectDaemonHashes = ({ repoRoot, selectedTargets }) => {
