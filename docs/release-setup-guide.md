@@ -48,12 +48,14 @@ you only need a token for a store if you want to publish to that store.
 | --- | --- | --- | --- |
 | `VSCE_PAT` | Secrets | Publishing to the **VS Code Marketplace** | (a token — see §2.2) |
 | `OVSX_PAT` | Secrets | Publishing to **Open VSX** | (a token — see §2.3) |
-| `AI_API_KEY` | Secrets | **AI-written** changelogs (optional) | (a token — see §2.4) |
-| `AI_BASE_URL` | Variables | Which AI provider (optional) | `https://api.groq.com/openai/v1` |
-| `AI_MODEL` | Variables | Which AI model (optional) | `llama-3.3-70b-versatile` |
+| `GEMINI_API_KEY` | Secrets | **AI-written** changelogs via Gemini (optional, preferred) | (a token — see §2.4) |
+| `GROQ_API_KEY` | Secrets | AI-written changelogs via Groq (optional fallback) | (a token — see §2.4) |
+| `AI_API_KEY` | Secrets | AI-written changelogs via a custom endpoint (optional) | (a token — see §2.4) |
+| `AI_BASE_URL` | Variables | Custom AI endpoint (optional) | `https://api.groq.com/openai/v1` |
+| `AI_MODEL` | Variables | Custom AI model (optional) | `llama-3.3-70b-versatile` |
 
 If you skip the store tokens, releases still work — they just draft the GitHub release and skip the
-stores. If you skip `AI_API_KEY`, changelogs are still generated, just by the deterministic tool
+stores. If you skip every AI key, changelogs are still generated, just by the deterministic tool
 (git-cliff) instead of an AI.
 
 Each of the following subsections tells you how to obtain one value.
@@ -133,33 +135,44 @@ pnpm exec ovsx create-namespace importlens -p <YOUR_OVSX_TOKEN>
 
 ---
 
-### 2.4 `AI_API_KEY` (optional) — AI-written changelogs
+### 2.4 AI-written changelogs (optional)
 
-If set, the Release workflow asks a free AI model to turn your commit messages into a clean,
-categorized changelog for the GitHub release. If **not** set, it uses git-cliff (a deterministic
+If a provider key is set, the Release workflow asks a free AI model to turn your commit messages into
+a clean, categorized changelog for the GitHub release. If **none** is set, it uses git-cliff (a deterministic
 tool) instead — so this is purely a "nicer notes" upgrade, never required.
 
-The default provider is **Groq** (free, fast, does not train on your data). To use it:
+Changelog generation tries AI providers in order and falls back automatically:
+**Gemini → Groq → any custom endpoint → git-cliff → plain git-log**. Set the key for whichever
+provider(s) you want; each is optional and independent.
 
-1. Go to <https://console.groq.com/> and sign up (free).
-2. Open **API Keys** → **Create API Key** → **copy it now**.
-3. Repo → Settings → Secrets and variables → Actions → **Secrets** tab → **New repository secret**.
-   - Name: `AI_API_KEY`. Value: the key. Save.
+**Gemini (preferred, free):** `gemini-3.5-flash`, free tier 15 requests/min and 1,500/day — far more
+than a release needs.
 
-**Using a different provider (optional):** the workflow talks to any **OpenAI-compatible** endpoint.
-To switch providers, set these two **Variables** (Variables tab, not Secrets):
+1. Go to <https://aistudio.google.com/apikey> and create an API key (free).
+2. Repo → Settings → Secrets and variables → Actions → **Secrets** → **New repository secret**.
+   - Name: `GEMINI_API_KEY`. Value: the key. Save.
+
+**Groq (fallback, free):** used if Gemini is unset or its call fails.
+
+1. Go to <https://console.groq.com/> and create an API key (free).
+2. Add it as the secret `GROQ_API_KEY`.
+
+Set the model per provider with the optional **Variables** `GEMINI_MODEL` / `GROQ_MODEL` if you ever
+want to override the defaults (`gemini-3.5-flash`, `llama-3.3-70b-versatile`).
+
+**Custom / any OpenAI-compatible endpoint (optional):** set the `AI_API_KEY` secret plus the
+`AI_BASE_URL` / `AI_MODEL` variables. This slot is tried last and defaults to Groq, so an existing
+`AI_API_KEY`-only setup keeps working unchanged.
 
 | Variable | Groq (default) | Example alternative (Cerebras) |
 | --- | --- | --- |
 | `AI_BASE_URL` | `https://api.groq.com/openai/v1` | `https://api.cerebras.ai/v1` |
 | `AI_MODEL` | `llama-3.3-70b-versatile` | `llama-3.3-70b` |
 
-If you don't set these variables, the Groq defaults are used. You still need a matching `AI_API_KEY`
-for whichever provider you point at.
-
-> **Note:** commit messages are sent to the AI provider. This repo's commits are public anyway, and
-> Groq does not train on your inputs. If you ever put secrets in commit messages (you shouldn't),
-> leave `AI_API_KEY` unset to keep everything local.
+> **Note:** commit messages are sent to whichever AI provider you enable. This repo's commits are
+> public anyway. Groq states it does not train on your inputs; Google's **free** Gemini tier may use
+> prompts to improve its products (the paid tier does not). If you ever put secrets in commit messages
+> (you shouldn't), leave every AI key unset to keep everything local.
 
 ---
 
@@ -183,8 +196,8 @@ Tick these off once. You only need the rows for the stores you actually want to 
 - [ ] `package.json` `publisher` is `importlens`.
 - [ ] **VS Code Marketplace:** publisher `importlens` created; `VSCE_PAT` secret added.
 - [ ] **Open VSX:** agreement signed; namespace `importlens` created; `OVSX_PAT` secret added.
-- [ ] **AI changelog (optional):** `AI_API_KEY` secret added (and `AI_BASE_URL` / `AI_MODEL`
-      variables if not using Groq).
+- [ ] **AI changelog (optional):** `GEMINI_API_KEY` and/or `GROQ_API_KEY` secret added (or the custom
+      `AI_API_KEY` + `AI_BASE_URL` / `AI_MODEL` variables).
 - [ ] Actions are enabled and can request write permissions.
 
 ---
@@ -281,7 +294,7 @@ preflight check** with a clear message — before doing any work — so you neve
 | Release can't find the build | The version Release resolved has no matching Build artifacts | Use the same version for Build and Release (leave both blank to use `package.json`) |
 | VS Code Marketplace publish rejected | Publisher ID mismatch, or `VSCE_PAT` lacks **Marketplace → Manage** scope, or token expired | Recreate the PAT per §2.2 (All accessible organizations + Manage scope) |
 | Open VSX publish rejected | Namespace `importlens` not created, or agreement unsigned | Do §2.3 Step A and Step C |
-| Changelog is plain / not AI-written | `AI_API_KEY` unset, or the AI call failed and it fell back | Expected behavior — add/fix `AI_API_KEY` for AI notes; git-cliff notes are always fine to ship |
+| Changelog is plain / not AI-written | No AI key set, or every configured provider failed and it fell back | Expected behavior — add/fix `GEMINI_API_KEY` (or `GROQ_API_KEY`) for AI notes; git-cliff notes are always fine to ship |
 | A build platform keeps failing | A genuine compile error for that target | Open the failed job's logs; fix the code; re-run Build (only that platform rebuilds) |
 | I need to rebuild everything cleanly | Stale/cached build for a version | Run Build with **force** checked |
 

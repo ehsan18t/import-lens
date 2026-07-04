@@ -49,6 +49,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       AI_API_KEY: ${{ secrets.AI_API_KEY }}
       AI_BASE_URL: ${{ vars.AI_BASE_URL }}
       AI_MODEL: ${{ vars.AI_MODEL }}
