@@ -33,6 +33,21 @@ fn write_installed_package(workspace: &Path, package_name: &str, version: &str) 
     .expect("package entry should be written");
 }
 
+fn write_installed_named_only_package(workspace: &Path, package_name: &str, version: &str) {
+    let package_root = workspace.join("node_modules").join(package_name);
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        format!(r#"{{"version":"{version}","module":"index.js","sideEffects":false}}"#),
+    )
+    .expect("package manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "export const value = 1; export const other = 2;",
+    )
+    .expect("package entry should be written");
+}
+
 #[test]
 fn package_json_dependency_names_include_all_installable_dependency_sections() {
     let names = package_json_dependency_names(
@@ -102,6 +117,28 @@ fn package_json_prewarm_requests_use_installed_package_versions() {
     assert_eq!(requests[1].specifier, "react");
     assert_eq!(requests[1].version, "19.2.3");
     assert_eq!(requests[1].import_kind, ImportKind::Namespace);
+}
+
+#[test]
+fn package_json_prewarm_requests_skip_default_for_packages_without_default_export() {
+    let workspace = temp_workspace();
+    let package_json_path = workspace.join("package.json");
+    let active_document_path = workspace.join("package.json");
+    write_installed_named_only_package(&workspace, "named-lib", "1.0.0");
+    fs::write(
+        &package_json_path,
+        r#"{"dependencies":{"named-lib":"^1.0.0"}}"#,
+    )
+    .expect("workspace package json should be written");
+
+    let requests = package_json_prewarm_requests(&package_json_path, &active_document_path)
+        .expect("prewarm requests should be created");
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    // No default export -> only the (cacheable) Namespace variant is prewarmed.
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].specifier, "named-lib");
+    assert_eq!(requests[0].import_kind, ImportKind::Namespace);
 }
 
 #[test]

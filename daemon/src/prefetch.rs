@@ -3,6 +3,7 @@ use crate::{
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
+        graph::{build_module_graph_cached_with_runtime, module_provides_export},
         resolver::{ResolvedPackage, resolve_package_entry, resolved_from_cache_identity},
     },
     service::ImportLensService,
@@ -10,6 +11,7 @@ use crate::{
 use rayon::{ThreadPoolBuilder, prelude::*};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -177,10 +179,12 @@ fn package_json_prewarm_jobs(
             continue;
         };
 
-        requests.push(PrewarmJob {
-            request: prewarm_request(&package_name, &version, ImportKind::Default),
-            resolved: resolved.clone(),
-        });
+        if exposes_default_export(&resolved) {
+            requests.push(PrewarmJob {
+                request: prewarm_request(&package_name, &version, ImportKind::Default),
+                resolved: resolved.clone(),
+            });
+        }
         requests.push(PrewarmJob {
             request: prewarm_request(&package_name, &version, ImportKind::Namespace),
             resolved,
@@ -188,6 +192,24 @@ fn package_json_prewarm_jobs(
     }
 
     Ok(requests)
+}
+
+// A `Default` prewarm job for a package with no `default` export emits an
+// "exports" diagnostic, so `should_cache_result` refuses to cache the result and
+// every prewarm trigger re-runs bundle+minify+compress for nothing. Only enqueue
+// the Default variant when the entry actually exposes a default export. The graph
+// is GRAPH_CACHE-shared with the Namespace job, so this adds no net graph builds;
+// on a warm cache (the repeated-trigger case this targets) it is a cheap lookup.
+fn exposes_default_export(resolved: &ResolvedPackage) -> bool {
+    // CommonJS default interop always yields a usable default binding.
+    if resolved.is_cjs {
+        return true;
+    }
+    match build_module_graph_cached_with_runtime(&resolved.entry_path, ImportRuntime::Component) {
+        Ok(graph) => module_provides_export(&graph, graph.entry_id, "default", &mut HashSet::new()),
+        // If the graph can't be built here, don't suppress the Default variant.
+        Err(_) => true,
+    }
 }
 
 fn run_prewarm_job(
