@@ -72,9 +72,12 @@ export const updateManifest = (manifest, oxcVersion) => {
 
   next.scripts = {
     ...(next.scripts ?? {}),
-    "deps:update": "pnpm deps:update:oxc",
     "deps:update:oxc": "node scripts/update-oxc-stack.mjs",
-    "deps:update:all": "pnpm update --latest && cargo update",
+    // Range-respecting refresh: `pnpm update` stays within the package.json
+    // semver ranges (caret/tilde/exact) and `cargo update` within Cargo.toml's,
+    // so neither forces a breaking major. Not `--latest`, which would ignore
+    // the ranges and defeat the blast-radius policy.
+    "deps:update:safe": "pnpm update && cargo update",
   };
 
   return `${JSON.stringify(next, null, 2)}\n`;

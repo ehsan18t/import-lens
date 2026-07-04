@@ -706,7 +706,7 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 
 ### 9.4 Dependency Manifest (Current Resolved Versions)
 
-> **This table tracks the current resolved dependency versions and the intended upgrade policy.** OXC monorepo Rust crates are patch-pinned (`~`) as a coordinated stack — patch releases flow in on a deliberate `cargo update`, while minor/major jumps are coordinated batch upgrades; `Cargo.lock` and `pnpm-lock.yaml` provide reproducible builds between upgrade runs. Run `pnpm deps:update:oxc` when intentionally refreshing the OXC stack; use `pnpm deps:update:all` only for broad dependency refreshes. Re-run the dependency policy and `pnpm test:accuracy` suites after either path. OXC versioning policy last audited: **4 July 2026.**
+> **This table tracks the current resolved dependency versions and the intended upgrade policy.** OXC monorepo Rust crates are patch-pinned (`~`) as a coordinated stack — patch releases flow in on a deliberate `cargo update`, while minor/major jumps are coordinated batch upgrades; `Cargo.lock` and `pnpm-lock.yaml` provide reproducible builds between upgrade runs. Run `pnpm deps:update:oxc` when intentionally refreshing the OXC stack; use `pnpm deps:update:safe` for a broad refresh of everything else — it advances each dependency to the newest version that still satisfies its declared range (`pnpm update` within the `package.json` caret/tilde/exact ranges, `cargo update` within `Cargo.toml`'s), so it never forces a breaking major and honors the blast-radius version policy. Re-run the dependency policy and `pnpm test:accuracy` suites after either path. OXC versioning policy last audited: **4 July 2026.**
 
 #### 9.4.1 Rust Crates (`Cargo.toml`)
 

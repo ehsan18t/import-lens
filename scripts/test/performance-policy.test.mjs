@@ -23,6 +23,6 @@ test("performance smoke is explicit and runs in release mode", () => {
 
 test("accuracy comparator is explicit and esbuild-backed", () => {
   assert.equal(manifest.scripts["test:accuracy"], "node scripts/accuracy-compare.mjs");
-  assert.equal(manifest.devDependencies.esbuild, "0.28.1");
+  assert.match(manifest.devDependencies.esbuild, /^\^/u);
   assert.match(accuracyCompare, /import \* as esbuild from "esbuild"/);
 });

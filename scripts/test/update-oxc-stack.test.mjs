@@ -189,9 +189,8 @@ test("updateOxcStack resolves latest versions before editing", async () => {
 test("updateOxcStack reports no changed files when target versions and scripts already match", async () => {
   const manifest = manifestFixture();
   manifest.scripts = {
-    "deps:update": "pnpm deps:update:oxc",
     "deps:update:oxc": "node scripts/update-oxc-stack.mjs",
-    "deps:update:all": "pnpm update --latest && cargo update",
+    "deps:update:safe": "pnpm update && cargo update",
   };
   const repo = await tempRepo({ manifest });
 
@@ -314,8 +313,10 @@ zstd = "^0.13"
 `;
 
 const manifestFixture = () => ({
+  // Intentionally missing deps:update:oxc so updateManifest normalizes it,
+  // which is what the "manifest is a changed file" assertions exercise.
   scripts: {
-    "deps:update": "pnpm update --latest && cargo update",
+    "deps:update:safe": "pnpm update && cargo update",
   },
   dependencies: {
     "@msgpack/msgpack": "3.1.3",

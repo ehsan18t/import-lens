@@ -45,7 +45,10 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   const manifest = JSON.parse(repoFile("package.json"));
   assert.equal(manifest.dependencies["oxc-parser"], undefined);
   assert.equal(manifest.scripts["deps:update:oxc"], "node scripts/update-oxc-stack.mjs");
-  assert.equal(manifest.scripts["deps:update:all"], "pnpm update --latest && cargo update");
+  // Range-respecting refresh, not `--latest` (which would ignore the ranges).
+  assert.equal(manifest.scripts["deps:update:safe"], "pnpm update && cargo update");
+  // The redundant `deps:update` alias was removed; the oxc updater must not re-add it.
+  assert.equal(manifest.scripts["deps:update"], undefined);
 });
 
 test("dependency policy pins build tooling and removes stale extension-host queue deps", () => {
@@ -58,9 +61,27 @@ test("dependency policy pins build tooling and removes stale extension-host queu
   const tsdownConfig = repoFile("tsdown.config.ts");
 
   assert.match(manifest.packageManager, /^pnpm@11[.]9[.]0[+]sha512[.]/u);
-  assert.equal(manifest.devDependencies.esbuild, "0.28.1");
-  assert.equal(manifest.devDependencies.tsdown, "0.22.3");
-  assert.equal(manifest.devDependencies["@vscode/vsce"], "3.9.2");
+
+  // Version constraints follow the blast-radius policy.
+  // Exact pin: @types/vscode tracks the engines.vscode floor (min supported API),
+  // never the latest — floating it up would let us call APIs absent in old VS Code.
+  assert.equal(manifest.devDependencies["@types/vscode"], "1.90.0");
+  // Tilde (patch-only): a typescript minor can add stricter checks that break tsc.
+  assert.match(manifest.devDependencies.typescript, /^~6[.]/u);
+  // Caret: dev tooling and well-behaved libs stay current; a break is caught in
+  // CI, never shipped, and the lockfile holds the build steady between deliberate
+  // updates. For the 0.x tools (esbuild, tsdown) caret is effectively patch-only.
+  // tsdown bundles the extension, vsce packages the VSIX, esbuild backs the
+  // accuracy comparator — all left to float rather than frozen exact.
+  assert.match(manifest.devDependencies.esbuild, /^\^/u);
+  assert.match(manifest.devDependencies.tsdown, /^\^/u);
+  assert.match(manifest.devDependencies["@vscode/vsce"], /^\^/u);
+  assert.match(manifest.devDependencies["@biomejs/biome"], /^\^/u);
+  assert.match(manifest.devDependencies.lefthook, /^\^/u);
+  assert.match(manifest.devDependencies.ovsx, /^\^/u);
+  assert.match(manifest.dependencies["@msgpack/msgpack"], /^\^/u);
+  // @types/node tracks the Node 24 toolchain, minor+patch floating.
+  assert.match(manifest.devDependencies["@types/node"], /^\^24[.]/u);
 
   // PNPM_VERSION lives in every workflow that installs pnpm; keep them in lockstep.
   assert.match(validateWorkflow, /^ {2}PNPM_VERSION: 11[.]9[.]0$/mu);
