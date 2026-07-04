@@ -1,6 +1,11 @@
 # Local quality gates. Bypass in a genuine emergency with --no-verify (CI still enforces).
 # Rust jobs are glob-scoped so a TypeScript-only commit never compiles Rust, and vice versa.
 
+commit-msg:
+  jobs:
+    - name: commit-convention
+      run: node scripts/check-commit-msg.mjs {1}
+
 pre-commit:
   parallel: true
   jobs:
@@ -23,11 +28,6 @@ pre-commit:
     - name: ts-typecheck
       glob: ["*.ts", "*.mts", "tsconfig*.json"]
       run: pnpm check
-
-commit-msg:
-  jobs:
-    - name: commit-convention
-      run: node scripts/check-commit-msg.mjs {1}
 
 pre-push:
   jobs:
