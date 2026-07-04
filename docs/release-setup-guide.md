@@ -191,8 +191,10 @@ Tick these off once. You only need the rows for the stores you actually want to 
 
 ## 4. Before every release
 
-1. **Bump the version** in `package.json` (e.g. `0.1.0` → `0.2.0`) and commit it to `main`. The
-   version you type into the workflows must match this exactly.
+1. **Bump the version** in `package.json` (e.g. `0.1.0` → `0.2.0`) and commit it to `main`. This is
+   the normal path: leave the workflow `version` field **blank** and it uses `package.json`. If you
+   instead type a `version`, that value **overrides** `package.json` for that run. Whatever value you
+   use, use the **same one** for Build and Release.
 2. Make sure `main` is in the state you want to ship (the release is built from the latest commit).
 
 ---
@@ -204,7 +206,8 @@ Tick these off once. You only need the rows for the stores you actually want to 
 1. Go to the repo's **Actions** tab.
 2. In the left sidebar, click **Build**.
 3. Click **Run workflow** (top-right of the runs list). Fill in:
-   - **version:** e.g. `0.2.0` (no leading `v`; must match `package.json`).
+   - **version:** leave **blank** to use `package.json` (normal), or type e.g. `0.2.0` to override
+     it (no leading `v`).
    - **force:** leave **unchecked** normally. Check it only if you want to rebuild every platform
      from scratch, ignoring anything already built for this version.
 4. Click the green **Run workflow** button and wait. You'll see the 6 platform jobs run.
@@ -219,7 +222,7 @@ Repeat until all 6 are green in a single run.
 ### Step 2 — Dry-run the Release workflow (recommended)
 
 1. Actions tab → **Release** → **Run workflow**. Fill in:
-   - **version:** the same `0.2.0`.
+   - **version:** the **same** value you built with (blank if you built from `package.json`).
    - **release_github:** checked (on by default).
    - **publish_vscode / publish_openvsx:** tick the stores you want (off by default).
    - **dry_run:** **checked.**
@@ -275,7 +278,7 @@ preflight check** with a clear message — before doing any work — so you neve
 | --- | --- | --- |
 | Release fails instantly with "…secret is not configured" | You ticked a store but its token secret is missing | Add `VSCE_PAT` / `OVSX_PAT` (§2.2 / §2.3), or untick that store |
 | Release fails with "Missing VSIX artifacts" | Not all 6 platforms were built for this version, or the artifacts expired (they last 1 day) | Re-run the **Build** workflow for this version, then Release again |
-| Release can't find the build | The version typed doesn't match any Build run | Use the exact same version string in Build and Release |
+| Release can't find the build | The version Release resolved has no matching Build artifacts | Use the same version for Build and Release (leave both blank to use `package.json`) |
 | VS Code Marketplace publish rejected | Publisher ID mismatch, or `VSCE_PAT` lacks **Marketplace → Manage** scope, or token expired | Recreate the PAT per §2.2 (All accessible organizations + Manage scope) |
 | Open VSX publish rejected | Namespace `importlens` not created, or agreement unsigned | Do §2.3 Step A and Step C |
 | Changelog is plain / not AI-written | `AI_API_KEY` unset, or the AI call failed and it fell back | Expected behavior — add/fix `AI_API_KEY` for AI notes; git-cliff notes are always fine to ship |

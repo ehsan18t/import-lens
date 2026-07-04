@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release. Must match package.json and a completed Build run."
-        required: true
+        description: "Version to release. Leave blank to use package.json; must match a completed Build run."
+        required: false
         type: string
       release_github:
         description: "Create the draft GitHub release."
@@ -46,8 +46,6 @@ jobs:
       contents: write
       actions: read
     env:
-      RELEASE_VERSION: ${{ inputs.version }}
-      RELEASE_TAG: v${{ inputs.version }}
       GH_TOKEN: ${{ github.token }}
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
@@ -61,11 +59,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Resolve the version once: a blank input falls back to package.json, a
+      # value overrides it. Everything downstream keys off RELEASE_VERSION.
+      - name: Resolve version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          version="$(node scripts/resolve-version.mjs "$REQUESTED_VERSION")"
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=v$version" >> "$GITHUB_ENV"
+          echo "Resolved release version: $version"
+
       # Fail fast, before any expensive download, if the request can't succeed.
       - name: Preflight
         run: |
-          node -e "const pkg = require('./package.json'); if (pkg.version !== process.env.RELEASE_VERSION) { console.error(\`package.json version \${pkg.version} does not match release input \${process.env.RELEASE_VERSION}\`); process.exit(1); }"
-
           github='${{ inputs.release_github }}'
           vscode='${{ inputs.publish_vscode }}'
           openvsx='${{ inputs.publish_openvsx }}'
@@ -101,14 +108,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Correlate to the Build run by the version-stamped artifact it produced,
+      # not by run name (which no longer carries the version when the Build input
+      # was left blank). Pick the newest matching run if a version was rebuilt.
       - name: Locate build run
         id: buildrun
         run: |
-          run_id=$(gh run list --workflow build.yml --limit 100 \
-            --json databaseId,name \
-            --jq "[.[] | select(.name == \"Build v${RELEASE_VERSION}\")] | .[0].databaseId // empty")
+          artifact="import-lens-win32-x64-${RELEASE_VERSION}"
+          run_id=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${artifact}" \
+            --jq '[.artifacts[].workflow_run.id] | max // empty')
           if [ -z "$run_id" ]; then
-            echo "::error::No Build run found for v${RELEASE_VERSION}. Run the Build workflow first."
+            echo "::error::No Build artifact ${artifact} found. Run the Build workflow for ${RELEASE_VERSION} first."
             exit 1
           fi
           echo "Using build run $run_id."
@@ -117,7 +128,7 @@ jobs:
       - name: Download VSIX artifacts
         uses: actions/download-artifact@v8.0.1
         with:
-          pattern: import-lens-*-${{ inputs.version }}
+          pattern: import-lens-*-${{ env.RELEASE_VERSION }}
           path: builds
           merge-multiple: true
           run-id: ${{ steps.buildrun.outputs.run_id }}

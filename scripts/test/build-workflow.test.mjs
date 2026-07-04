@@ -38,13 +38,27 @@ test("build workflow builds each target on its native OS", () => {
   assert.match(source, /runner: macos-latest/u);
 });
 
-test("build workflow caches each VSIX per target and version and supports force rebuild", () => {
+test("build workflow caches each VSIX per target and resolved version and supports force rebuild", () => {
   const source = workflow();
 
-  assert.match(source, /key: vsix-\$\{\{ matrix\.target \}\}-\$\{\{ inputs\.version \}\}/u);
+  assert.match(source, /key: vsix-\$\{\{ matrix\.target \}\}-\$\{\{ needs\.validate\.outputs\.version \}\}/u);
   assert.match(source, /inputs\.force/u);
   assert.match(source, /retention-days: 1/u);
   assert.match(source, /if-no-files-found: error/u);
+});
+
+test("build workflow resolves the version once and overrides package.json before packaging", () => {
+  const source = workflow();
+
+  // The optional input falls back to package.json via a single resolve step
+  // whose output feeds the matrix.
+  assert.match(source, /required: false/u);
+  assert.match(source, /resolve-version\.mjs/u);
+  assert.match(source, /version: \$\{\{ steps\.resolve\.outputs\.version \}\}/u);
+  assert.match(source, /set-version\.mjs/u);
+
+  // The old hard equality guard against package.json is gone.
+  assert.doesNotMatch(source, /does not match build input/u);
 });
 
 test("build workflow pins current action versions exactly", () => {

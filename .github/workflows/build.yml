@@ -1,12 +1,12 @@
 name: Build
-run-name: Build v${{ inputs.version }}
+run-name: Build ${{ inputs.version && format('v{0}', inputs.version) || 'from package.json' }}
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build. Must match package.json."
-        required: true
+        description: "Version to build. Leave blank to use package.json; a value overrides it."
+        required: false
         type: string
       force:
         description: "Rebuild every target, ignoring cached artifacts."
@@ -29,6 +29,8 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
 
     steps:
       - name: Checkout
@@ -45,6 +47,17 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      # Resolve the version once, here, so every matrix package job below agrees
+      # on it. A blank input falls back to package.json; a value overrides it.
+      - name: Resolve version
+        id: resolve
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          version="$(node scripts/resolve-version.mjs "$REQUESTED_VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $version"
+
       - name: Install Rust
         run: |
           rustup toolchain install "${RUST_VERSION}" --profile minimal
@@ -53,12 +66,6 @@ jobs:
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --version 0.8.7 --locked
-
-      - name: Verify release version
-        env:
-          RELEASE_VERSION: ${{ inputs.version }}
-        run: |
-          node -e "const pkg = require('./package.json'); if (pkg.version !== process.env.RELEASE_VERSION) { console.error(\`package.json version \${pkg.version} does not match build input \${process.env.RELEASE_VERSION}\`); process.exit(1); }"
 
       - name: Verify release icon
         run: |
@@ -112,7 +119,7 @@ jobs:
             rust-target: aarch64-apple-darwin
 
     env:
-      VSIX_PATH: builds/import-lens-${{ matrix.target }}-${{ inputs.version }}.vsix
+      VSIX_PATH: builds/import-lens-${{ matrix.target }}-${{ needs.validate.outputs.version }}.vsix
 
     steps:
       - name: Checkout
@@ -126,7 +133,7 @@ jobs:
         uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ env.VSIX_PATH }}
-          key: vsix-${{ matrix.target }}-${{ inputs.version }}
+          key: vsix-${{ matrix.target }}-${{ needs.validate.outputs.version }}
 
       # Everything below only runs when we actually need to build this target
       # (cache miss, or force). On a cache hit the restored VSIX is uploaded as-is.
@@ -154,6 +161,15 @@ jobs:
         if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
         run: pnpm install --frozen-lockfile
 
+      # Bake the resolved version into package.json so vsce packages it (and names
+      # the VSIX) as that version. A no-op when the input matched package.json.
+      - name: Set version
+        if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        env:
+          RESOLVED_VERSION: ${{ needs.validate.outputs.version }}
+        run: node scripts/set-version.mjs "$RESOLVED_VERSION"
+
       - name: Package VSIX
         if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
         run: pnpm run package:${{ matrix.target }}
@@ -163,14 +179,14 @@ jobs:
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ env.VSIX_PATH }}
-          key: vsix-${{ matrix.target }}-${{ inputs.version }}
+          key: vsix-${{ matrix.target }}-${{ needs.validate.outputs.version }}
 
       # Always upload, whether the VSIX was restored from cache or freshly built,
       # so this run's artifact set accumulates to the full six targets.
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: import-lens-${{ matrix.target }}-${{ inputs.version }}
+          name: import-lens-${{ matrix.target }}-${{ needs.validate.outputs.version }}
           path: ${{ env.VSIX_PATH }}
           if-no-files-found: error
           retention-days: 1

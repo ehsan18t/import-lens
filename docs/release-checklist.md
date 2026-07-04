@@ -5,7 +5,9 @@ setup*, see the [Release Setup Guide](release-setup-guide.md) — this page is j
 
 ## Before you start
 
-- [ ] `package.json` `version` bumped and committed to `main` (e.g. `0.1.0` → `0.2.0`).
+- [ ] `package.json` `version` bumped and committed to `main` (e.g. `0.1.0` → `0.2.0`) — the normal
+      path is to leave the workflow `version` blank and let it read this. (You *can* instead type a
+      `version` into the workflows to override `package.json` for that run.)
 - [ ] `main` is in the exact state you want to ship (the release builds from the latest commit).
 - [ ] `media/icon.png` exists and is the final marketplace icon.
 - [ ] (Optional local sanity) from a clean checkout: `pnpm install --frozen-lockfile`, `pnpm check`,
@@ -13,7 +15,8 @@ setup*, see the [Release Setup Guide](release-setup-guide.md) — this page is j
 
 ## Build stage — run the **Build** workflow
 
-- [ ] Ran **Build** with the correct `version` (no leading `v`, matches `package.json`).
+- [ ] Ran **Build** — `version` left blank to use `package.json`, or a value typed to override it
+      (no leading `v`).
 - [ ] All **6** platform jobs are green **in a single run**: `win32-x64`, `win32-arm64`,
       `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`.
 - [ ] If any platform failed, re-ran Build (same version) until all 6 succeeded — cached targets

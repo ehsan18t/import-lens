@@ -47,6 +47,21 @@ test("release workflow fails fast in preflight on missing store secrets or no de
   assert.match(source, /OVSX_PAT secret is not configured/u);
 });
 
+test("release workflow resolves an optional version and locates the build by artifact", () => {
+  const source = workflow();
+
+  assert.match(source, /required: false/u);
+  assert.match(source, /resolve-version\.mjs/u);
+  assert.match(source, /RELEASE_VERSION=\$version/u);
+
+  // The build run is correlated via its version-stamped artifact, not run-name.
+  assert.match(source, /actions\/artifacts\?name=/u);
+  assert.doesNotMatch(source, /gh run list/u);
+
+  // The old hard equality guard against package.json is gone.
+  assert.doesNotMatch(source, /does not match release input/u);
+});
+
 test("release workflow generates the changelog with full history and no wasm targets", () => {
   const source = workflow();
 
