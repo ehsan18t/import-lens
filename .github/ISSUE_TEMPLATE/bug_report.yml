@@ -1,0 +1,93 @@
+name: Bug report
+description: Report a bug or unexpected behavior in ImportLens.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please fill out the
+        sections below so we can reproduce and fix the issue quickly.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checklist
+      options:
+        - label: I searched existing issues and this has not been reported yet.
+          required: true
+        - label: I'm running the latest version of ImportLens.
+          required: false
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected to happen instead.
+      placeholder: ImportLens showed ... but I expected ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps — and a small import/code sample if possible — that trigger the bug.
+      placeholder: |
+        1. Open a file containing `import { X } from "some-package"`
+        2. ...
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: extension-version
+    attributes:
+      label: ImportLens version
+      description: Find it in the Extensions view, or run `code --list-extensions --show-versions | grep importlens`.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: vscode-version
+    attributes:
+      label: VS Code version
+      description: Help → About, or run `code --version`.
+      placeholder: 1.90.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: CPU architecture
+      description: ImportLens ships a native daemon per platform, so this helps narrow down daemon-specific issues.
+      options:
+        - x64
+        - arm64
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: ImportLens logs
+      description: >
+        Run the `ImportLens: Show Logs` command from the Command Palette and paste the
+        relevant output. Set `importLens.logLevel` to `debug` first for more detail.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: settings
+    attributes:
+      label: Relevant settings
+      description: Any non-default `importLens.*` settings (e.g. `display`, `inlineRenderer`, `compression`).
+      render: json
+    validations:
+      required: false
