@@ -1,7 +1,7 @@
 use crate::{
     cache::{
         disk::DiskCache,
-        key::{FileFingerprint, cache_key_matches_package, fingerprints_are_current},
+        key::{FileFingerprint, cache_key_matches_any_package, fingerprints_are_current},
     },
     ipc::protocol::ImportResult,
 };
@@ -173,12 +173,22 @@ impl ImportCache {
     }
 
     pub fn invalidate_package(&self, package_name: &str) {
-        self.disk.invalidate_package(package_name);
+        self.invalidate_packages(&HashSet::from([package_name.to_owned()]));
+    }
+
+    /// Evicts every entry for any package in `package_names` from both the disk
+    /// and memory layers in a single scan per layer (each key decoded once),
+    /// rather than one full scan per package.
+    pub fn invalidate_packages(&self, package_names: &HashSet<String>) {
+        if package_names.is_empty() {
+            return;
+        }
+        self.disk.invalidate_packages(package_names);
 
         let memory = self.memory.pin();
         let keys = memory
             .iter()
-            .filter(|(key, _)| cache_key_matches_package(key, package_name))
+            .filter(|(key, _)| cache_key_matches_any_package(key, package_names))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
 

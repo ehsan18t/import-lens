@@ -1,6 +1,6 @@
 use crate::{
     cache::key::{
-        ANALYZER_VERSION, CacheIdentityV3, FileFingerprint, cache_key_matches_package,
+        ANALYZER_VERSION, CacheIdentityV3, FileFingerprint, cache_key_matches_any_package,
         decode_cache_identity, fingerprints_are_current,
     },
     cache::memory::CachedImport,
@@ -11,7 +11,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -309,8 +309,19 @@ impl DiskCache {
     }
 
     pub fn invalidate_package(&self, package_name: &str) {
+        self.invalidate_packages(&HashSet::from([package_name.to_owned()]));
+    }
+
+    /// Evicts every entry belonging to any package in `package_names` in a single
+    /// table scan that decodes each key once, rather than one full scan (with a
+    /// per-key decode) per package.
+    pub fn invalidate_packages(&self, package_names: &HashSet<String>) {
+        if package_names.is_empty() {
+            return;
+        }
+
         if let Ok(mut pending) = self.pending_inserts.lock() {
-            pending.retain(|key, _| !cache_key_matches_package(key, package_name));
+            pending.retain(|key, _| !cache_key_matches_any_package(key, package_names));
         }
         let db = match self.db.as_ref() {
             Some(db) => db,
@@ -324,7 +335,7 @@ impl DiskCache {
                 if let Ok(iter) = table.iter() {
                     for result in iter {
                         if let Ok((key, _)) = result
-                            && cache_key_matches_package(key.value(), package_name)
+                            && cache_key_matches_any_package(key.value(), package_names)
                         {
                             keys_to_remove.push(key.value().to_owned());
                         }

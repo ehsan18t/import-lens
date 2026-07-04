@@ -4,6 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -84,6 +85,21 @@ pub fn cache_key_matches_package(key: &str, package_name: &str) -> bool {
     let root_prefix = format!("{package_name}@");
     let subpath_prefix = format!("{package_name}/");
     key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix)
+}
+
+/// Whether `key` belongs to any package in `package_names`. Decodes the key's
+/// identity exactly once and tests set membership, so invalidating a burst of
+/// packages is a single O(keys) pass instead of O(keys * packages) with a full
+/// hex+msgpack decode per (key, package).
+pub fn cache_key_matches_any_package(key: &str, package_names: &HashSet<String>) -> bool {
+    if let Some(identity) = decode_cache_identity(key) {
+        return package_names.contains(&identity.package_name);
+    }
+
+    // Legacy non-v3 keys carry the package name as a plaintext prefix.
+    package_names.iter().any(|package_name| {
+        key.starts_with(&format!("{package_name}@")) || key.starts_with(&format!("{package_name}/"))
+    })
 }
 
 pub fn fingerprints_for_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<FileFingerprint> {

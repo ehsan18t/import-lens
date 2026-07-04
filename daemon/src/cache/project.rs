@@ -252,14 +252,14 @@ impl ProjectCacheRegistry {
             return;
         }
 
+        let package_set: HashSet<String> = package_names.iter().cloned().collect();
+
         let loaded_ids = self
             .loaded
             .lock()
             .map(|loaded| {
                 for shard in loaded.values() {
-                    for package_name in package_names {
-                        shard.cache.invalidate_package(package_name);
-                    }
+                    shard.cache.invalidate_packages(&package_set);
                 }
 
                 loaded.keys().cloned().collect::<HashSet<_>>()
@@ -275,9 +275,7 @@ impl ProjectCacheRegistry {
                 self.enable_disk_cache,
                 0,
             );
-            for package_name in package_names {
-                cache.invalidate_package(package_name);
-            }
+            cache.invalidate_packages(&package_set);
         }
     }
 

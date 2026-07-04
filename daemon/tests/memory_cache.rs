@@ -69,6 +69,24 @@ fn import_cache_invalidates_package_prefixes() {
 }
 
 #[test]
+fn import_cache_invalidates_multiple_packages_in_one_pass() {
+    let cache = ImportCache::default();
+    cache.insert("react@18.3.1::default".to_owned(), result("react", false));
+    cache.insert("vue@3.4.0::ref".to_owned(), result("vue", false));
+    cache.insert(
+        "lodash-es@4.17.21::debounce".to_owned(),
+        result("lodash-es", false),
+    );
+
+    let packages = std::collections::HashSet::from(["react".to_owned(), "vue".to_owned()]);
+    cache.invalidate_packages(&packages);
+
+    assert!(cache.get("react@18.3.1::default").is_none());
+    assert!(cache.get("vue@3.4.0::ref").is_none());
+    assert!(cache.get("lodash-es@4.17.21::debounce").is_some());
+}
+
+#[test]
 fn import_cache_invalidates_subpath_entries() {
     let cache = ImportCache::default();
     cache.insert("svelte@5.0.0::*".to_owned(), result("svelte", false));

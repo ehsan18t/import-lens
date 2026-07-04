@@ -74,6 +74,36 @@ fn cache_key_v3_separates_workspaces_for_same_package_version() {
 }
 
 #[test]
+fn cache_key_matches_any_package_decodes_once_and_tests_set_membership() {
+    use import_lens_daemon::cache::key::cache_key_matches_any_package;
+    use std::collections::HashSet;
+
+    let key = cache_key_for_resolved_import(
+        &request(ImportKind::Namespace, &[], ImportRuntime::Component),
+        &resolved(&PathBuf::from("C:/workspace-a")),
+    );
+
+    assert!(cache_key_matches_any_package(
+        &key,
+        &HashSet::from(["pkg".to_owned(), "other".to_owned()])
+    ));
+    assert!(!cache_key_matches_any_package(
+        &key,
+        &HashSet::from(["other".to_owned(), "third".to_owned()])
+    ));
+
+    // Legacy (non-v3) keys fall back to plaintext prefix matching.
+    assert!(cache_key_matches_any_package(
+        "react@18.3.1::default",
+        &HashSet::from(["react".to_owned()])
+    ));
+    assert!(!cache_key_matches_any_package(
+        "react@18.3.1::default",
+        &HashSet::from(["vue".to_owned()])
+    ));
+}
+
+#[test]
 fn cache_key_v3_separates_runtime_profiles() {
     let root = PathBuf::from("C:/workspace-a");
     let resolved = resolved(&root);
