@@ -15,7 +15,7 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   for (const crate of oxcStackConfig.oxcCrates) {
     assert.match(
       cargoToml,
-      new RegExp(`^${crate} = "=${escapedVersion(oxcStackConfig.currentOxcVersion)}"$`, "mu"),
+      new RegExp(`^${crate} = "~${escapedVersion(oxcStackConfig.currentOxcVersion)}"$`, "mu"),
     );
   }
 
@@ -23,7 +23,7 @@ test("dependency policy pins the oxc analysis stack as one coordinated version",
   assert.match(
     cargoToml,
     new RegExp(
-      `^oxc_resolver = "=${escapedVersion(oxcStackConfig.currentResolverVersion)}"$`,
+      `^oxc_resolver = "~${escapedVersion(oxcStackConfig.currentResolverVersion)}"$`,
       "mu",
     ),
   );

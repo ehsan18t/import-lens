@@ -8,9 +8,9 @@ export const validateCurrentStack = (cargoToml, _manifest) => {
   }
 
   const crateVersions = oxcStackConfig.oxcCrates.map((crate) => {
-    const match = cargoToml.match(new RegExp(`^${crate}\\s*=\\s*"(=[^"]+)"$`, "mu"));
+    const match = cargoToml.match(new RegExp(`^${crate}\\s*=\\s*"(~[^"]+)"$`, "mu"));
     if (!match) {
-      throw new Error(`Missing exact OXC crate pin: ${crate}`);
+      throw new Error(`Missing patch-pin (~) for OXC crate: ${crate}`);
     }
     return match[1].slice(1);
   });
@@ -21,8 +21,8 @@ export const validateCurrentStack = (cargoToml, _manifest) => {
     );
   }
 
-  if (!/^oxc_resolver\s*=\s*"=[^"]+"$/mu.test(cargoToml)) {
-    throw new Error("Missing exact oxc_resolver pin");
+  if (!/^oxc_resolver\s*=\s*"~[^"]+"$/mu.test(cargoToml)) {
+    throw new Error("Missing patch-pin (~) for oxc_resolver");
   }
 };
 
@@ -60,10 +60,10 @@ export const updateCargoToml = (cargoToml, oxcVersion, resolverVersion) => {
   for (const crate of oxcStackConfig.oxcCrates) {
     next = next.replace(
       new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"),
-      `${crate} = "=${oxcVersion}"`,
+      `${crate} = "~${oxcVersion}"`,
     );
   }
-  return next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "=${resolverVersion}"`);
+  return next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "~${resolverVersion}"`);
 };
 
 export const updateManifest = (manifest, oxcVersion) => {

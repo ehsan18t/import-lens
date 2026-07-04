@@ -42,14 +42,14 @@ test("replaceKnownVersions updates pinned tokens without touching substrings or 
   const oldResolver = oxcStackConfig.currentResolverVersion;
 
   const content = [
-    `| \`oxc_parser\` | ${oldOxc} | exact pin |`,
+    `| \`oxc_parser\` | ${oldOxc} | patch pin |`,
     `currently resolved to ${oldResolver}.`,
     `unrelated build number 10${oldOxc}9 must survive`,
   ].join("\n");
 
   const lines = replaceKnownVersions(content, "0.139.0", "11.23.0").split("\n");
 
-  assert.equal(lines[0], "| `oxc_parser` | 0.139.0 | exact pin |");
+  assert.equal(lines[0], "| `oxc_parser` | 0.139.0 | patch pin |");
   assert.equal(lines[1], "currently resolved to 11.23.0.");
   // The old version embedded inside a longer number is not a pinned token.
   assert.equal(lines[2], `unrelated build number 10${oldOxc}9 must survive`);
@@ -96,7 +96,7 @@ test("updateOxcStack dry-run reports planned edits without writing files or lock
   assert.deepEqual(execs, []);
   assert.match(
     await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8"),
-    /oxc_parser = "=0\.138\.0"/,
+    /oxc_parser = "~0\.138\.0"/,
   );
 });
 
@@ -124,10 +124,10 @@ test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () =>
   const config = await readFile(path.join(repo.root, repo.paths.config), "utf8");
 
   for (const crate of oxcStackConfig.oxcCrates) {
-    assert.match(cargoToml, new RegExp(`^${crate} = "=0\\.139\\.0"$`, "mu"));
+    assert.match(cargoToml, new RegExp(`^${crate} = "~0\\.139\\.0"$`, "mu"));
   }
 
-  assert.match(cargoToml, /^oxc_resolver = "=11\.22\.0"$/mu);
+  assert.match(cargoToml, /^oxc_resolver = "~11\.22\.0"$/mu);
   assert.equal(manifest.dependencies["oxc-parser"], undefined);
   assert.doesNotMatch(packageVsix, /oxc-parser/);
   assert.match(srs, /0\.139\.0/);
@@ -247,10 +247,10 @@ test("updateOxcStack rejects invalid or unavailable versions before edits", asyn
 
 test("updateOxcStack rejects non-coordinated current OXC crates and oxc_mangler before edits", async () => {
   const nonCoordinated = await tempRepo({
-    cargoToml: cargoTomlFixture().replace('oxc_ast = "=0.138.0"', 'oxc_ast = "=0.137.0"'),
+    cargoToml: cargoTomlFixture().replace('oxc_ast = "~0.138.0"', 'oxc_ast = "~0.137.0"'),
   });
   const withMangler = await tempRepo({
-    cargoToml: `${cargoTomlFixture()}oxc_mangler = "=0.138.0"\n`,
+    cargoToml: `${cargoTomlFixture()}oxc_mangler = "~0.138.0"\n`,
   });
 
   await assert.rejects(
@@ -308,8 +308,8 @@ const availableVersionPayload = (url) => {
 
 const cargoTomlFixture = () => `[dependencies]
 brotli = "^8"
-${oxcStackConfig.oxcCrates.map((crate) => `${crate} = "=0.138.0"`).join("\n")}
-oxc_resolver = "=11.22.0"
+${oxcStackConfig.oxcCrates.map((crate) => `${crate} = "~0.138.0"`).join("\n")}
+oxc_resolver = "~11.22.0"
 zstd = "^0.13"
 `;
 
@@ -322,8 +322,8 @@ const manifestFixture = () => ({
   },
 });
 
-const dependencyPolicyFixture = () => `assert.match(cargoToml, /^oxc_parser = "=0\\.138\\.0"$/mu);
-assert.match(cargoToml, /^oxc_resolver = "=11\\.22\\.0"$/mu);
+const dependencyPolicyFixture = () => `assert.match(cargoToml, /^oxc_parser = "~0\\.138\\.0"$/mu);
+assert.match(cargoToml, /^oxc_resolver = "~11\\.22\\.0"$/mu);
 assert.equal(manifest.dependencies["oxc-parser"], undefined);
 `;
 
