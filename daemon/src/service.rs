@@ -1108,7 +1108,16 @@ impl ImportLensService {
                 .cache_registry
                 .remove_selected(request.shard_ids.as_deref().unwrap_or(&[])),
             CacheRemoveScope::All => self.cache_registry.remove_all(),
-            CacheRemoveScope::Orphans => self.cache_registry.purge_orphans(),
+            CacheRemoveScope::Orphans => {
+                let registry_removed = self.registry_hints.purge_expired_metadata();
+                if registry_removed > 0 {
+                    crate::logging::log_debug(
+                        "registry",
+                        format!("orphan purge dropped {registry_removed} stale registry entries"),
+                    );
+                }
+                self.cache_registry.purge_orphans()
+            }
         };
         let (removed, failed): (Vec<_>, Vec<_>) =
             results.into_iter().partition(|result| result.removed);

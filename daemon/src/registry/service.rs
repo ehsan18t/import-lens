@@ -160,6 +160,16 @@ impl RegistryHintService {
         }
     }
 
+    /// Prunes registry metadata past the retention window. Called from the
+    /// user-triggered orphan purge so the shared metadata file stops growing
+    /// monotonically. No-op for the disabled service. Returns the count removed.
+    pub fn purge_expired_metadata(&self) -> usize {
+        self.cache.purge_expired(
+            crate::time::unix_millis_now(),
+            crate::registry::constants::REGISTRY_RETENTION_MS,
+        )
+    }
+
     pub fn hint_for(
         &self,
         package_name: &str,

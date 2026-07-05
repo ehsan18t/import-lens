@@ -80,12 +80,27 @@ impl RegistryMetadataCache {
         if had == 0 {
             return Ok(());
         }
-        if let Err(error) = self.persist_latest_snapshot() {
+        if let Err(error) = self.persist_snapshot(None) {
             // Restore the dirty count so a later flush retries.
             self.unpersisted_writes.fetch_add(had, Ordering::AcqRel);
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Drops entries not refreshed within `retention_ms` from the in-memory map
+    /// and writes an authoritative snapshot that also prunes the on-disk union,
+    /// so the shared metadata file cannot grow monotonically. Called only from
+    /// the user-triggered orphan purge (never on automatic load/persist, which
+    /// would break tests that persist entries with synthetic timestamps).
+    /// Returns the number removed from memory.
+    pub fn purge_expired(&self, now_ms: u64, retention_ms: u64) -> usize {
+        let removed = match self.entries.lock() {
+            Ok(mut entries) => prune_expired_entries(&mut entries, now_ms, retention_ms),
+            Err(_) => 0,
+        };
+        let _ = self.persist_snapshot(Some((now_ms, retention_ms)));
+        removed
     }
 
     pub fn write_metadata(
@@ -106,7 +121,12 @@ impl RegistryMetadataCache {
         )
     }
 
-    fn persist_latest_snapshot(&self) -> Result<(), String> {
+    /// Writes the merged snapshot. `prune_older_than = Some((now, retention))`
+    /// drops entries past the retention window from the post-union snapshot
+    /// before writing, so the orphan purge's deletions stick despite the union;
+    /// `None` keeps every entry (the default flush path — automatic pruning would
+    /// break tests that persist entries with synthetic timestamps).
+    fn persist_snapshot(&self, prune_older_than: Option<(u64, u64)>) -> Result<(), String> {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
@@ -130,6 +150,9 @@ impl RegistryMetadataCache {
             if !keep_ours {
                 snapshot.insert(key, on_disk);
             }
+        }
+        if let Some((now_ms, retention_ms)) = prune_older_than {
+            prune_expired_entries(&mut snapshot, now_ms, retention_ms);
         }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -166,4 +189,46 @@ fn load_entries(path: &Path) -> HashMap<String, RegistryPackageMetadataEntry> {
         return HashMap::new();
     };
     serde_json::from_str(&contents).unwrap_or_default()
+}
+
+fn prune_expired_entries(
+    entries: &mut HashMap<String, RegistryPackageMetadataEntry>,
+    now_ms: u64,
+    retention_ms: u64,
+) -> usize {
+    let before = entries.len();
+    entries.retain(|_, entry| now_ms.saturating_sub(entry.updated_at) <= retention_ms);
+    before - entries.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::constants::REGISTRY_RETENTION_MS;
+
+    fn entry(updated_at: u64) -> RegistryPackageMetadataEntry {
+        RegistryPackageMetadataEntry {
+            metadata: None,
+            updated_at,
+            retry_after: None,
+            error: None,
+            not_found: false,
+        }
+    }
+
+    #[test]
+    fn prune_expired_entries_drops_only_stale_rows() {
+        let now = 100 * REGISTRY_RETENTION_MS;
+        let mut entries = HashMap::new();
+        entries.insert("fresh".to_owned(), entry(now));
+        entries.insert("edge".to_owned(), entry(now - REGISTRY_RETENTION_MS));
+        entries.insert("stale".to_owned(), entry(now - REGISTRY_RETENTION_MS - 1));
+
+        let removed = prune_expired_entries(&mut entries, now, REGISTRY_RETENTION_MS);
+
+        assert_eq!(removed, 1);
+        assert!(entries.contains_key("fresh"));
+        assert!(entries.contains_key("edge"));
+        assert!(!entries.contains_key("stale"));
+    }
 }

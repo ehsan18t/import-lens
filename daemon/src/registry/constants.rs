@@ -8,6 +8,10 @@ pub const REGISTRY_RATE_LIMIT_REQUESTS: usize = 20;
 pub const REGISTRY_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 pub const REGISTRY_RETRY_BASE_DELAY_MS: u64 = 100;
 pub const REGISTRY_CACHE_FILE_NAME: &str = "registry-metadata.json";
+/// How long a registry entry is retained before the orphan-purge action drops
+/// it. Distinct from the 6h refetch TTL: this bounds retention, that bounds
+/// refetch.
+pub const REGISTRY_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Upper bound for a single npm packument body. npm's abbreviated ("corgi")
 /// metadata for very high-churn packages exceeds ureq's 10 MiB default

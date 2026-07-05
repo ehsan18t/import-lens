@@ -2,7 +2,7 @@ use import_lens_daemon::{
     ipc::protocol::RegistryHint,
     registry::{
         cache::RegistryMetadataCache,
-        constants::FRESH_HINT_TTL_MS,
+        constants::{FRESH_HINT_TTL_MS, REGISTRY_RETENTION_MS},
         service::{RegistryHintMode, RegistryHintService},
         types::{HttpRegistryResponse, RegistryHttpClient, RegistryPackageMetadata},
     },
@@ -531,6 +531,34 @@ fn registry_cache_persists_latest_snapshot_under_concurrent_writes() {
 
     fs::remove_dir_all(cache_path).expect("cache cleanup");
     assert_eq!(value.as_object().expect("cache object").len(), 16);
+}
+
+#[test]
+fn purge_expired_drops_stale_registry_entries_and_they_stay_gone_on_reload() {
+    let cache_path = temp_cache_path("purge-expired");
+    let now = 1_000 * REGISTRY_RETENTION_MS;
+    {
+        let cache = RegistryMetadataCache::new(cache_path.clone());
+        cache
+            .write_metadata("fresh", sample_metadata("1.0.0"), now)
+            .expect("write fresh");
+        cache
+            .write_metadata(
+                "stale",
+                sample_metadata("1.0.0"),
+                now - REGISTRY_RETENTION_MS - 1,
+            )
+            .expect("write stale");
+        cache.flush().expect("flush");
+
+        assert_eq!(cache.purge_expired(now, REGISTRY_RETENTION_MS), 1);
+    }
+
+    // Reload: the on-disk union must not resurrect the pruned entry.
+    let reloaded = RegistryMetadataCache::new(cache_path.clone());
+    assert!(reloaded.get("fresh").is_some());
+    assert!(reloaded.get("stale").is_none());
+    fs::remove_dir_all(cache_path).expect("cleanup");
 }
 
 fn sample_metadata(latest: &str) -> RegistryPackageMetadata {
