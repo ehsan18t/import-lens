@@ -1,0 +1,224 @@
+# Cache Lifecycle — Decision Log
+
+Chronological record of the design and scope decisions for the cache-lifecycle
+redesign (branch `redesign/cache-lifecycle`). This is the companion to the review
+backlog (`superpowers/plans/2026-07-08-cache-lifecycle-review-backlog.md`, which
+tracks the findings); this file tracks the **decisions**. Keep it updated as new
+decisions are made.
+
+Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
+**Consequences / status**, with the commits and related findings.
+
+---
+
+## Standing policies
+
+- **No deprecated / back-compat code.** The app is unreleased, so we delete stubs
+  and legacy paths outright rather than keeping them for wire/settings
+  compatibility. (2026-07-08)
+
+---
+
+## Decisions
+
+### D1 — Remove dead / deprecated cache code (three cleanups) · 2026-07-08
+- **Context:** The redesign was almost entirely additive (~6.7 K net production
+  lines added, <1 K removed); a chunk of old machinery was left alongside the new,
+  which also made the diff hard to review.
+- **Decision:** Delete the genuinely dead / deprecated code now; keep the bug-fix
+  work separate.
+- **Rationale + verification (confirmed non-load-bearing before deleting):**
+  - `8f20cfc` — dead `cleanupCache` RPC chain (no production sender) + its orphaned
+    `last_cleanup_millis` status field. **Periodic maintenance is unaffected** — the
+    tick calls `run_maintenance(false)`; only the unreachable manual `cleanup()`
+    wrapper (`run_maintenance(true)`) went.
+  - `800823e` — deprecated `cacheMaxAgeDays` end-to-end, incl. the `package.json`
+    declaration (no deprecation stub kept, per the standing policy). **Closes P1-12**
+    (editing it no longer bounces the daemon).
+  - `53f5b15` — write-only `CachedImport.size_bytes` field. **Budget enforcement is
+    unaffected** — the limit sums `ShardRollup.total_bytes` (the incrementally
+    maintained SUMMARY scalar), never that per-entry field.
+- **Status:** Done. All three verified green (`cargo test --workspace`, `tsc`,
+  biome, TS tests).
+
+### D2 — Orphan reclaim is a first-class feature; do NOT retire it · 2026-07-08
+- **Context:** The redesign had marked the orphan-cache purge "deprecated / retire
+  in Part F" and retired its UI button. But it addresses a real gap the owner cares
+  about: a project that is **moved or deleted** is never reopened, so the on-access
+  reclaim (name invalidation + freshness `Gone` eviction) never reaches it and its
+  whole cache shard lingers — worst for a *recently* used project, which the LRU
+  byte budget evicts last.
+- **Decision:** Reverse the retirement. Keep orphan reclaim, make it **drive-safe**
+  and **automatic**, and **re-add the manual button**. (An in-progress removal of
+  the feature was reverted.)
+- **Rationale:** Entry-level staleness in *live* projects is already handled
+  automatically; the uncovered case is a whole **abandoned-project shard**, which
+  nothing scans for. The old scan was also unsafe (RB-7): a Windows unplugged drive
+  reports `ERROR_PATH_NOT_FOUND` (→ `NotFound`), so it could destroy a valid shard.
+  The fix is to make it safe, not to delete it.
+- **Consequences / status:** Done — see [RB-17](superpowers/plans/2026-07-08-cache-lifecycle-review-backlog.md#rb-17-orphaned-project-cache-shards-are-never-proactively-reclaimed--purge-must-be-drive-safe).
+  - `354d297` — daemon: `classify_project_root` (Present / Orphaned /
+    VolumeUnreachable) so an offline drive keeps its shard (**closes RB-7**);
+    drive-safe `purge_orphans`; throttled `sweep_orphaned_shards_if_due` on the
+    maintenance pass; unit + integration tests.
+  - `6551ce9` — extension: Manage-Cache "Remove Orphaned Caches" action.
+
+### D3 — Cache maintenance runs once per project-open, not on a recurring 60 s tick · 2026-07-08
+- **Context:** The maintenance pass ran every 60 s per connected window, which felt
+  wasteful. (It does: byte-budget eviction + compaction, registry 30-day retention +
+  size cap, and the orphan sweep.)
+- **Decision:** Replace the recurring tick with a **single pass scheduled 60 s after
+  Hello** (once the cold-open analysis burst has settled), then stop. Each new
+  project-open schedules its own pass.
+- **Rationale:** A project's cache **converges** to its distinct-import footprint —
+  re-analysis is a cache hit, not growth — so it cannot grow unboundedly over a
+  session; continuous polling is wasted work. Multi-project growth is still bounded
+  because every open triggers a global pass.
+- **Consequences / status:** Done (`3500d64`).
+  - **Accepted tradeoff:** a heavy long *single*-project session may sit up to ~2×
+    the budget until the next open/relaunch — bounded, cheap, self-correcting.
+  - **Reframes RB-9:** enforcement is now per-open, not a 60 s window; bounded
+    overshoot is a deliberate choice over synchronous insert-path eviction (which
+    stays the clean fix if the overshoot ever proves too loose).
+  - **Defangs the every-60 s symptoms of RB-15** (idle shard-scan) and **P1-10**
+    (registry snapshot rewrite) — they now fire at most once per open.
+
+### D4 — Registry `Retry-After` is clamped, not honored verbatim · 2026-07-08
+- **Context:** A registry `429` may carry a `Retry-After` the server picks; honoring a
+  huge value verbatim parks a connection-pool slot for that whole duration, and a hostile
+  or buggy header (`Retry-After: 999999`) could wedge the pool indefinitely.
+- **Decision:** Clamp the honored delay at `REGISTRY_MAX_BACKOFF_MS` (5 min). We do NOT
+  fail-fast/cancel the sleep, and we do NOT honor the raw value.
+- **Rationale:** The clamp alone removes the unbounded-wedge harm while still backing off
+  a real 429 for a meaningful window; 5 min is longer than any legitimate transient rate
+  limit needs and short enough that a bad header can't strand a slot. Fail-fast would
+  throw away a legitimate backoff signal.
+- **Status:** `c2dffbe` (RB-12). A capped-not-verbatim `Retry-After` is deliberate — not a
+  dropped-header bug.
+
+### D5 — Module-graph reuse gate: strict hash, but reuse on transient `Unknown` · 2026-07-08
+- **Context:** The `GRAPH_CACHE` reuse gate re-checks a cached graph's fingerprints before
+  serving it. Two independent choices live here.
+- **Decision:** (a) Use `check_fingerprints_strict` (content-hash-verify first-party
+  modules) on BOTH reuse gates, not the cheap mtime+len pre-filter. (b) On a tri-state
+  `Unknown` (a transient stat/read error), REUSE the cached graph; rebuild only on a
+  definite `Stale`/`Gone`.
+- **Rationale:** (a) L2 recomputes *through* this cache, so a first-party edit that the
+  mtime+len pre-filter misses (equal-length, mtime-preserving) would be served stale
+  forever — the strict hash closes that. (b) A momentarily-locked file must not force a
+  rebuild storm; serving the last-known graph while the error is transient mirrors L2's
+  stale-while-revalidate contract. Reuse-on-`Unknown` is therefore intentional, not a
+  staleness hole.
+- **Status:** `6eddb2f` (RB-1).
+
+### D6 — First-party CJS freshness via a cached module set, not a short TTL · 2026-07-08
+- **Context:** The CommonJS analyzer walks and reads every transitive `require()`, but
+  produced no `ModuleGraph`, so a first-party (workspace/`file:`/npm-link) CJS dep was
+  unfingerprinted in both L2 (`dependency_fingerprints`) and L1
+  (`first_party_module_token`) — a deep-module edit never invalidated.
+- **Decision:** Cache the CJS walk's module set (canonical paths + read-time content-hash
+  fingerprints) in a bounded LRU `CJS_MODULE_CACHE` mirroring `GRAPH_CACHE`, peeked by L1
+  (paths) and L2 (fingerprints). Deliberately NOT a short-TTL/force-probe on the entry
+  alone. The set is cached for every completed walk, including one the caller later rejects
+  to static-entry sizing.
+- **Rationale:** A short TTL on the entry would miss the transitive deps entirely (the
+  actual gap) and reintroduce time-based staleness the redesign removed. The cache reuses
+  the bytes already read during the walk, so it adds no I/O. Populating on the
+  static-fallback path is the deliberate call: the module set is then unused or yields
+  slight L2 over-coverage (an extra recompute on a transitive edit) — never a stale-serve —
+  and gating it would add branchy special-casing for no correctness gain. So the
+  populate-always and the occasional over-coverage are intentional, not over-invalidation
+  bugs.
+- **Consequences / status:** `204e303` (RB-5). Cleared/invalidated/purged on the same seams
+  as the graph cache. Also closes the RB-2 residual for CJS (the manifest/entry re-stat's
+  narrow TOCTOU): first-party CJS modules now carry read-time hashes; the ESM path already
+  did.
+
+### D7 — Clear-race guard is an optimistic generation, not a hot-path lock · 2026-07-08
+- **Context:** `clear()` ("Clear cache") races concurrent cache writers, which could
+  resurrect just-cleared entries (RB-3). The clean textbook fix is one lock spanning the
+  wipe and every writer commit — but inserts run on the parallel cold-analysis hot path
+  and are deliberately lock-light (a batched pending queue), so a global insert lock would
+  serialize exactly what the redesign parallelized.
+- **Decision:** Guard with a `clear_generation` counter instead. Writers tag their queued
+  bytes / capture the generation before deriving them; `clear()` bumps it and the flush
+  drops any entry whose tag is stale. Only the rare `clear()` and the batched flush take a
+  lock (`clear_lock`); the per-insert path stays lock-free apart from one atomic load.
+- **Rationale:** The generation makes a stale write self-identify, so correctness needs
+  mutual exclusion only between `clear()` and the flush — not on every insert. Two
+  `disk.insert` variants exist by design: `insert` tags the CURRENT generation (fresh,
+  derive-now bytes), `insert_at_generation` tags a caller-captured one (snapshot-derived
+  writers: `flush_to_disk`, `enforce_memory_cap`) — not redundancy.
+- **Accepted residual (so it is not later filed as a bug):** the memory-side guard
+  (`insert_into_memory_guarded`) is optimistic — pre-check, insert, then an
+  identity-checked (`Arc::ptr_eq`) rollback. It never resurrects a cleared entry and never
+  serves stale data; the only residual is an astronomically-rare interleaving (a writer's
+  pre-check passes, then a clear AND a concurrent same-key insert both land before its
+  insert) that can drop that one entry to a **cache miss** — self-healing (recompute; on a
+  disk-enabled cache the disk copy re-hydrates). Chosen over a hot-path lock or a
+  per-attempt clone in `papaya::compute`. Adversarially reviewed (opus): no resurrection
+  window, no deadlock (`clear_lock → db → pending` order; `clear_lock` never re-entered).
+- **Consequences / status:** `5b4cdfc` (RB-3).
+
+### D8 — SWR pushes a refreshed size only when the cache would accept it · 2026-07-08
+- **Context:** RB-13 — a stale-while-revalidate recompute could push an error/degraded
+  result over a good last-known size. The finding offered two fixes: filter *errors*, or
+  "push only when the cache also accepts them."
+- **Decision:** Gate the SWR push on the SAME `should_cache_result` predicate the cache
+  write uses (daemon `revalidate_document_sizes`) — so it drops BOTH hard errors AND
+  request-specific diagnostics (e.g. a default import of a named-only package → missing
+  export). The client-side merge keeps a weaker `error === null` filter.
+- **Rationale (so this is not misread as a bug):** coupling push⟺cacheable means display
+  and cache can never disagree (the exact RB-13 harm). Dropping diagnostic-carrying results
+  from the *proactive* push is deliberate, not an oversight — they are still shown on the
+  next interactive `file_size_document` (not cached → recomputed), so nothing is hidden;
+  the SWR badge just doesn't chase them. The daemon/client filter asymmetry is intentional:
+  the daemon is the authoritative filter (the client never receives a diagnostic result to
+  mishandle), and the client's `error === null` is redundant defense-in-depth for other
+  push paths / an older daemon — the client can't cheaply replicate
+  `has_request_specific_diagnostics`. *Test note:* the pre-existing same-specifier-variants
+  test was reconciled (its fixture gained a real default export) because its default variant
+  is now correctly filtered; the identity-alignment purpose is preserved and the filtered
+  case is covered by a new dedicated test.
+- **Consequences / status:** `df1eacb` (RB-13).
+
+### D9 — SWR supersession is per-document, accepting redundant cross-document recompute · 2026-07-08
+- **Context:** RB-14 — SWR revalidation was starved by the prefetcher's *global* cancel
+  token (any unrelated message cancelled it) and by a per-cache-key in-flight claim (a
+  second document sharing a package got no push).
+- **Decision:** Give SWR its own per-document cancel token (`SwrRefreshLifecycle`, keyed by
+  workspace+document) and make the in-flight claim document+generation-scoped, not the bare
+  cache key.
+- **Rationale (so these are not misread as bugs):** (a) two different documents importing
+  the same package now BOTH recompute it — deliberate redundant CPU traded for
+  anti-starvation; the global cache key means the *result* is still shared, only the compute
+  is duplicated, and genuinely identical work (same key+doc+generation) still coalesces.
+  (b) `active_by_document` accumulates one small entry per document opened per connection and
+  is freed on disconnect — a bounded, accepted footprint, not a leak (a `strong_count == 1`
+  sweep could prune it if it ever matters). (c) `start_document` fires on every
+  `FileSizeDocument`, so a fresh read of a document cancels that document's own older
+  refresh even when it finds nothing stale — correct supersession, not an over-cancel.
+- **Consequences / status:** `df1eacb` (RB-14).
+
+### D10 — `registryCacheMaxSizeMB: 0` means "no cap", not "evict everything" · 2026-07-08
+- **Context:** RB-16 wired `registryCacheMaxSizeMB` through Hello, making the value live
+  end-to-end (the old code always used the hardcoded 32 MiB constant). A hand-edited `0`
+  (out of the package.json schema) now reaches the registry evictor.
+- **Decision:** Guard `evict_oldest_over_budget` so `max_bytes == 0` evicts nothing (the
+  store is uncapped), matching the main byte budget's `budget_bytes == 0` early return —
+  rather than draining the whole hint store every maintenance pass.
+- **Rationale:** 0 as "disabled" is consistent with the main budget and is the safe reading
+  of an out-of-schema value; a proper minimum-clamp at Hello is the shared P2-1 follow-up
+  (parked). Surfaced by the RB-16 adversarial review.
+- **Consequences / status:** `df1eacb` (RB-16).
+
+---
+
+## Parked / deferred
+
+- **Back-compat vestige sweep** — audit for other deprecated/back-compat remnants
+  (serde "older peers" defaults, log-and-skip comments), *excluding* the orphan code
+  (now a wanted feature). Awaiting go-ahead.
+- **Budget-honesty cluster** (RB-9 / RB-11 / RB-15 / P2-1) — lower urgency after D3
+  (overshoot is now a bounded, deliberate tradeoff). The clean fix is a synchronous
+  `evict_if_over_budget` on the flush path, if tighter enforcement is ever wanted.
