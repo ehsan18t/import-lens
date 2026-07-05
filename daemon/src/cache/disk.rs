@@ -7,7 +7,7 @@ use crate::{
     ipc::protocol::{ImportResult, ModuleContribution},
     time::unix_millis_now,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
@@ -25,6 +25,11 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CURRENT_SCHEMA_VERSION: u64 = 4;
 const RECENCY_TOUCH_FLUSH_BATCH: usize = 64;
 const INSERT_FLUSH_BATCH: usize = 64;
+// Cap the on-disk entry count per shard so a single long-lived project cannot
+// grow its cache database without bound (shard-level cleanup only removes whole
+// projects). Enforced on the batched insert flush by evicting the least-recently
+// -used entries (by recents timestamp).
+pub const MAX_DISK_ENTRIES: usize = 20_000;
 
 #[derive(Debug, Clone)]
 struct PendingInsert {
@@ -625,6 +630,35 @@ fn write_pending_inserts(
                     .map_err(|error| format!("failed to update recents table: {error}"))?;
             }
         }
+
+        // Bound the on-disk entry count: once over the cap, evict the least
+        // -recently-used entries (by recents timestamp) from both tables so a
+        // single active project's shard cannot grow without limit.
+        let entry_count = table
+            .len()
+            .map_err(|error| format!("failed to count cache entries: {error}"))?
+            as usize;
+        if entry_count > MAX_DISK_ENTRIES {
+            let excess = entry_count - MAX_DISK_ENTRIES;
+            let mut by_recency = Vec::new();
+            for row in recents
+                .iter()
+                .map_err(|error| format!("failed to iterate recents: {error}"))?
+            {
+                let (key, timestamp) =
+                    row.map_err(|error| format!("failed to read recents row: {error}"))?;
+                by_recency.push((timestamp.value(), key.value().to_owned()));
+            }
+            by_recency.sort_by_key(|entry| entry.0);
+            for (_, key) in by_recency.into_iter().take(excess) {
+                table
+                    .remove(key.as_str())
+                    .map_err(|error| format!("failed to evict cache entry: {error}"))?;
+                recents
+                    .remove(key.as_str())
+                    .map_err(|error| format!("failed to evict recents row: {error}"))?;
+            }
+        }
     }
 
     write_txn
@@ -787,6 +821,42 @@ mod tests {
         assert_eq!(
             stored, 2_000,
             "insert flush must not lower a newer recents timestamp"
+        );
+    }
+
+    #[test]
+    fn write_pending_inserts_bounds_disk_entry_count() {
+        use super::{CACHE_TABLE, MAX_DISK_ENTRIES, PendingInsert, write_pending_inserts};
+        use redb::{Database, ReadableDatabase, ReadableTableMetadata};
+
+        let dir =
+            std::env::temp_dir().join(format!("import-lens-disk-entry-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let db = Database::create(dir.join("cap.redb")).expect("db should open");
+
+        let mut pending = HashMap::new();
+        for index in 0..(MAX_DISK_ENTRIES + 50) {
+            pending.insert(
+                format!("v3:key{index}"),
+                PendingInsert {
+                    bytes: vec![1, 2, 3],
+                    recorded_at_millis: index as u64,
+                },
+            );
+        }
+        write_pending_inserts(&db, &pending).expect("insert flush should succeed");
+
+        let count = {
+            let txn = db.begin_read().expect("read txn");
+            let table = txn.open_table(CACHE_TABLE).expect("cache table");
+            table.len().expect("len") as usize
+        };
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            count <= MAX_DISK_ENTRIES,
+            "on-disk entry count must be capped, got {count}"
         );
     }
 }
