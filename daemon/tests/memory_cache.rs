@@ -116,6 +116,54 @@ fn import_cache_purge_orphan_entries_removes_uninstalled_package_entries() {
 }
 
 #[test]
+fn import_cache_purge_orphan_entries_drops_disk_entries_on_version_mismatch() {
+    use import_lens_daemon::cache::key::{ANALYZER_VERSION, cache_key_for_resolved_import};
+    use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
+    use import_lens_daemon::pipeline::resolver::resolve_package_entry;
+    use std::fs;
+
+    let workspace = std::env::temp_dir().join(format!("il-disk-purge-{}", std::process::id()));
+    let package_root = workspace.join("node_modules").join("disk-purge-lib");
+    fs::create_dir_all(&package_root).expect("package root");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+    )
+    .expect("manifest");
+    fs::write(package_root.join("index.js"), "export const value = 1;").expect("entry");
+
+    let document = workspace.join("src").join("index.ts");
+    let request = ImportRequest {
+        specifier: "disk-purge-lib".to_owned(),
+        package_name: "disk-purge-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: Vec::new(),
+        import_kind: ImportKind::Namespace,
+        runtime: ImportRuntime::Component,
+    };
+    let resolved = resolve_package_entry(&document, &request).expect("package should resolve");
+    let key = cache_key_for_resolved_import(&request, &resolved);
+
+    // Disk-ENABLED so the redb scan/remove in DiskCache::purge_orphan_entries runs.
+    let cache = ImportCache::new(Some(workspace.join("shard")), true);
+    cache.insert(key.clone(), result("disk-purge-lib", false));
+    cache.flush_to_disk().expect("flush to disk");
+
+    // Live paths + current analyzer version -> survives the disk + memory scan.
+    cache.purge_orphan_entries(ANALYZER_VERSION);
+    assert!(cache.get(&key).is_some());
+
+    // A different analyzer version marks every current entry as release-stale.
+    cache.purge_orphan_entries("some-other-analyzer-version");
+    assert!(
+        cache.get(&key).is_none(),
+        "stale-analyzer-version entry should be purged from disk and memory"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
 fn import_cache_bounds_memory_entries_with_lru_eviction() {
     use import_lens_daemon::cache::memory::MAX_MEMORY_ENTRIES;
     let cache = ImportCache::new(None, false);

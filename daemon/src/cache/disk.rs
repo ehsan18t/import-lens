@@ -854,9 +854,11 @@ mod tests {
         };
 
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            count <= MAX_DISK_ENTRIES,
-            "on-disk entry count must be capped, got {count}"
+        // Exactly the cap: inserting MAX+50 must evict exactly 50 (no under- or
+        // over-eviction).
+        assert_eq!(
+            count, MAX_DISK_ENTRIES,
+            "on-disk entry count must be capped to exactly MAX_DISK_ENTRIES"
         );
     }
 }

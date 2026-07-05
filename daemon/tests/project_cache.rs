@@ -60,6 +60,46 @@ fn project_cache_shard_id_is_stable_for_normalized_project_root() {
 }
 
 #[test]
+fn purge_orphans_removes_shards_for_deleted_project_roots() {
+    let storage = common::temp_workspace("import-lens-project-cache-purge-orphans");
+    let live_root = storage.join("live-app");
+    let dead_root = storage.join("dead-app");
+    fs::create_dir_all(&live_root).expect("live root should exist");
+    // dead_root is intentionally never created: the project was deleted.
+    let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512, 30);
+
+    registry
+        .cache_for_root(&live_root)
+        .insert("react@18.3.1::default".to_owned(), result("react"));
+    registry
+        .cache_for_root(&dead_root)
+        .insert("vue@3.4.0::default".to_owned(), result("vue"));
+
+    let removed = registry.purge_orphans();
+    let shards = registry.list_shards();
+
+    fs::remove_dir_all(storage).expect("temp storage should be removed");
+    assert!(
+        removed
+            .iter()
+            .any(|op| op.removed && op.project_root == dead_root.to_string_lossy()),
+        "the deleted project's shard should be purged"
+    );
+    assert!(
+        shards
+            .iter()
+            .any(|shard| shard.project_root == live_root.to_string_lossy()),
+        "the live project's shard should survive"
+    );
+    assert!(
+        !shards
+            .iter()
+            .any(|shard| shard.project_root == dead_root.to_string_lossy()),
+        "the deleted project's shard should no longer be listed"
+    );
+}
+
+#[test]
 fn project_cache_registry_stores_projects_in_separate_shards() {
     let storage = common::temp_workspace("import-lens-project-cache");
     let first_root = storage.join("first-app");
