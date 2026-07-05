@@ -101,6 +101,22 @@ impl FileSizeCache {
         self.entries.pin().clear();
     }
 
+    /// Drops entries whose document path no longer exists on disk. Used by the
+    /// orphan purge, which removes no shards for a deleted-file case and so would
+    /// otherwise leave the aggregate cached. Returns the number removed.
+    pub fn purge_missing_paths(&self) -> usize {
+        let pinned = self.entries.pin();
+        let missing = pinned
+            .iter()
+            .filter(|(path, _)| !path.exists())
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        for path in &missing {
+            pinned.remove(path);
+        }
+        missing.len()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.pin().len()
     }
@@ -210,6 +226,26 @@ mod tests {
                 .minified_bytes,
             20
         );
+    }
+
+    #[test]
+    fn purge_missing_paths_drops_entries_for_deleted_documents() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("il-fsc-purge-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let present = dir.join("present.ts");
+        fs::write(&present, "x").expect("write");
+        let missing = dir.join("missing.ts");
+
+        let cache = FileSizeCache::new();
+        cache.insert(present.clone(), 1, computation(10));
+        cache.insert(missing.clone(), 1, computation(20));
+
+        assert_eq!(cache.purge_missing_paths(), 1);
+        assert!(cache.contains_path(&present));
+        assert!(!cache.contains_path(&missing));
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

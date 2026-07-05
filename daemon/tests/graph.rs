@@ -2,6 +2,7 @@ use import_lens_daemon::pipeline::{
     graph::{
         GraphLimits, MAX_CACHED_GRAPHS, ModuleGraph, build_module_graph, build_module_graph_cached,
         build_module_graph_with_limits, clear_module_graph_cache, module_graph_cache_len,
+        purge_missing_module_graphs,
     },
     reachability::reachable_exports,
 };
@@ -353,6 +354,24 @@ fn graph_cache_returns_shared_graph_handle_without_deep_clone() {
     fs::remove_dir_all(root).expect("temp graph workspace should be removed");
     clear_module_graph_cache();
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn purge_missing_module_graphs_drops_graphs_for_deleted_entries() {
+    let _guard = GRAPH_CACHE_TEST_LOCK.lock().expect("graph cache test lock");
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export const value = 1;");
+    clear_module_graph_cache();
+
+    build_module_graph_cached(&root.join("entry.js")).expect("graph should build");
+    assert_eq!(module_graph_cache_len(), 1);
+
+    // Uninstall the package: the cached graph's entry path no longer exists.
+    fs::remove_dir_all(&root).expect("temp graph workspace should be removed");
+    let removed = purge_missing_module_graphs();
+
+    clear_module_graph_cache();
+    assert_eq!(removed, 1);
 }
 
 #[test]

@@ -1122,6 +1122,14 @@ impl ImportLensService {
         let (removed, failed): (Vec<_>, Vec<_>) =
             results.into_iter().partition(|result| result.removed);
 
+        if matches!(request.scope, CacheRemoveScope::Orphans) {
+            // An entry-only orphan purge (uninstalled package, project still
+            // present) removes no shards, so the blanket clear below doesn't fire.
+            // Drop the L1/graph entries whose paths are specifically gone.
+            crate::pipeline::file_size_cache::shared_file_size_cache().purge_missing_paths();
+            crate::pipeline::graph::purge_missing_module_graphs();
+        }
+
         if !removed.is_empty() {
             clear_module_graph_cache();
             // Drop L1 aggregate sizes too so the status-bar size recomputes fresh

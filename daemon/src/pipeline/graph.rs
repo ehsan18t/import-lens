@@ -279,6 +279,24 @@ pub fn build_module_graph_cached_with_runtime(
     Ok(graph)
 }
 
+/// Drops cached module graphs whose entry-path key no longer exists on disk
+/// (uninstalled package). Used by the orphan purge. Returns the number removed.
+pub fn purge_missing_module_graphs() -> usize {
+    let Some(cache) = GRAPH_CACHE.get() else {
+        return 0;
+    };
+    let pinned = cache.pin();
+    let missing = pinned
+        .iter()
+        .filter(|((entry_path, _runtime), _)| !entry_path.exists())
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in &missing {
+        pinned.remove(key);
+    }
+    missing.len()
+}
+
 /// Returns the module graph for `entry_path` only if it is already cached and
 /// still current; never builds one. Used where building would be wasteful, e.g.
 /// a prewarm enumeration over a large manifest that would otherwise serialize
