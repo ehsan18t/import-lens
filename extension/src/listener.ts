@@ -19,7 +19,9 @@ import type { DaemonManager } from "./daemon/manager.js";
 import {
   type FileSizeDocumentResponse,
   type ImportAnalysisItem,
+  type ImportResult,
   protocolVersion,
+  type RefreshedImportIdentity,
 } from "./ipc/protocol.js";
 import { nextIpcRequestId } from "./ipc/requestIds.js";
 import { supportedLanguageIds } from "./languages.js";
@@ -78,6 +80,26 @@ export class DocumentAnalysisController implements vscode.Disposable {
       getImportLensConfig().debounceMs,
       () => void this.analyze(document),
     );
+  }
+
+  /**
+   * Apply the daemon's background stale-while-revalidate refresh push to a
+   * document's states. Gated by the SAME freshness generation that guards
+   * `updateFileSize`: if a newer analysis has superseded the generation this batch
+   * was computed for (the user edited after the size read that triggered it), the
+   * push is dropped rather than overwriting the current (post-edit) states. Both
+   * `identities` and `generation` are optional so an older daemon still merges
+   * (specifier-keyed, ungated).
+   */
+  applyRefreshedResults(
+    uri: vscode.Uri,
+    results: ImportResult[],
+    identities?: RefreshedImportIdentity[],
+    generation?: number,
+  ): void {
+    const isCurrent =
+      generation === undefined ? true : this.#freshness.isCurrent(uri.toString(), generation);
+    this.#store.applyRefreshedResults(uri, results, { identities, isCurrent });
   }
 
   async analyze(document: vscode.TextDocument): Promise<void> {
@@ -197,6 +219,10 @@ export class DocumentAnalysisController implements vscode.Disposable {
         workspace_root: workspaceRoot,
         active_document_path: document.fileName,
         source: document.getText(),
+        // Tag this size read with the analysis generation it belongs to. The daemon
+        // echoes it on the resulting SWR refresh push so we can drop a push that a
+        // newer analysis has since superseded (see applyRefreshedResults).
+        analysis_generation: analysisRequestId,
       });
     } catch (error) {
       this.#logger.warn(

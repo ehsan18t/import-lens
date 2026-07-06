@@ -3,6 +3,7 @@ use import_lens_daemon::ipc::protocol::{ConfidenceLevel, ImportResult};
 
 fn result(specifier: &str, cache_hit: bool) -> ImportResult {
     ImportResult {
+        freshness: import_lens_daemon::ipc::protocol::ResultFreshness::fresh(),
         specifier: specifier.to_owned(),
         raw_bytes: 10,
         minified_bytes: 8,
@@ -23,6 +24,23 @@ fn result(specifier: &str, cache_hit: bool) -> ImportResult {
     }
 }
 
+/// Reads a key's PERSISTED `last_seq` straight off disk via a standalone
+/// `DiskCache` handle that is opened and dropped within this call. The
+/// disk-hydration promotion tests below need this because integration tests
+/// (this file) have no access to `ImportCache`'s private in-memory map — only
+/// its public API and the also-public `DiskCache`.
+fn disk_persisted_last_seq(shard: &std::path::Path, key: &str) -> u64 {
+    use import_lens_daemon::cache::disk::DiskCache;
+    use std::sync::atomic::Ordering;
+
+    let disk = DiskCache::new(Some(shard.to_path_buf()), true);
+    disk.get_with_freshness(key)
+        .unwrap_or_else(|| panic!("entry for {key} should be present on disk"))
+        .0
+        .last_seq
+        .load(Ordering::Relaxed)
+}
+
 #[test]
 fn import_cache_returns_cache_hit_clone_without_mutating_stored_value() {
     let cache = ImportCache::default();
@@ -40,17 +58,18 @@ fn import_cache_returns_cache_hit_clone_without_mutating_stored_value() {
 }
 
 #[test]
-fn import_cache_does_not_track_recency_touches_when_disk_cache_is_disabled() {
+fn import_cache_serves_memory_hits_when_disk_cache_is_disabled() {
     let cache = ImportCache::new(None, false);
     cache.insert("react@18.3.1::default".to_owned(), result("react", false));
 
+    // Memory-only mode: recency lives in-entry (bumped on hit), and there is no
+    // disk byte budget or recents queue.
     assert!(
         cache
             .get("react@18.3.1::default")
             .expect("cache entry should exist")
             .cache_hit
     );
-    assert_eq!(cache.pending_recency_touch_count(), 0);
 }
 
 #[test]
@@ -253,4 +272,242 @@ fn cache_hit_skips_fingerprint_restat_until_generation_bumps() {
     );
 
     std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn get_if_fresh_cold_daemon_serves_fresh_but_never_serves_unknown() {
+    // §4.5 / Finding 13b (cold daemon): `importlens check` starts a FRESH daemon
+    // that HYDRATES a prior run's DISK cache. A disk entry whose dependency can no
+    // longer be verified (`Freshness::Unknown` — a transient stat/read error) must
+    // never reach CI as a verified `cache_hit`. `get_if_fresh` is the unified
+    // "serve only if disk-verified Fresh" read the force-fresh path uses: it returns
+    // None on Unknown across BOTH the memory working set and the disk cache, so the
+    // caller recomputes. The control — a genuinely Fresh cold disk entry — must
+    // still be served, so the fix does not over-recompute.
+    use import_lens_daemon::cache::key::{file_fingerprint_with_hash, fingerprints_for_paths};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("il-getiffresh-{}-{nanos}", std::process::id()));
+    let shard = root.join("shard");
+    fs::create_dir_all(&root).expect("temp root");
+
+    // Two dependencies: one stays valid (the Fresh control); one is swapped for a
+    // directory after seeding so its verification hits a non-`NotFound` read error
+    // (`Unknown` — the deterministic B3/B4 directory technique, no mocking).
+    let fresh_dep = root.join("fresh_dep.js");
+    fs::write(&fresh_dep, "export const a = 1;").expect("fresh dep");
+    let unknown_dep = root.join("unknown_dep.js");
+    fs::write(&unknown_dep, "export const b = 2;").expect("unknown dep");
+
+    // The Unknown entry needs a fingerprint carrying a CONTENT HASH: only then does
+    // a later mtime/len mismatch fall through to `fs::read` (which fails on a
+    // directory → Unknown). A hashless fingerprint would classify the change as
+    // Stale (evict), not Unknown. The hash value is irrelevant — the directory read
+    // fails before any comparison.
+    let unknown_fp = vec![file_fingerprint_with_hash(&unknown_dep, Some(0x1234_5678)).expect("fp")];
+    let fresh_fp = fingerprints_for_paths([fresh_dep.clone()]);
+
+    // Seed the DISK cache, then DROP it so the redb file is flushed and closed (a
+    // real cold daemon reopens the shard fresh, with nothing in the working set).
+    {
+        let seed = ImportCache::new(Some(shard.clone()), true);
+        seed.insert_with_fingerprints("v3:fresh".to_owned(), result("fresh", false), fresh_fp);
+        seed.insert_with_fingerprints(
+            "v3:unknown".to_owned(),
+            result("unknown", false),
+            unknown_fp,
+        );
+        seed.flush_to_disk().expect("seed flush");
+    }
+
+    // Make the unknown dep unverifiable: swap the file for a directory at its path.
+    fs::remove_file(&unknown_dep).expect("remove unknown dep file");
+    fs::create_dir(&unknown_dep).expect("unknown dep becomes a directory");
+
+    // COLD daemon: a fresh cache over the same shard with preload DISABLED, so the
+    // entries live on disk but NOT in the memory working set — the exact cold-CI
+    // state where the old force-fresh path fell through to `cache.get`'s disk
+    // hydration and served the Unknown.
+    let cold = ImportCache::new_with_recent_preload_limit(Some(shard.clone()), true, 0);
+    assert_eq!(
+        cold.memory_len(),
+        0,
+        "cold daemon must start with an empty working set"
+    );
+
+    // Control: the genuinely Fresh disk entry IS served (no over-recompute).
+    let fresh_hit = cold.get_if_fresh("v3:fresh");
+    assert!(
+        fresh_hit.as_ref().is_some_and(|hit| hit.cache_hit),
+        "a cold, disk-verified Fresh entry must be served by get_if_fresh: {fresh_hit:?}"
+    );
+
+    // The fix: the cold, disk-hydrated Unknown entry must NOT be served — every
+    // non-Fresh state yields None so the force-fresh caller recomputes.
+    assert!(
+        cold.get_if_fresh("v3:unknown").is_none(),
+        "get_if_fresh must never serve an Unknown (unverified) disk entry (§4.5)"
+    );
+
+    // ...and it must KEEP (never delete) the Unknown entry. The normal evicting read
+    // still finds+serves it from disk (Unknown → keep), which both proves
+    // get_if_fresh left the disk copy intact AND documents the exact laundering — a
+    // `cache_hit` on an unverified value — that the force-fresh path must avoid.
+    let laundered = cold.get("v3:unknown");
+    assert!(
+        laundered.as_ref().is_some_and(|hit| hit.cache_hit),
+        "the normal get keeps+serves Unknown unchanged; get_if_fresh must not delete it: {laundered:?}"
+    );
+
+    drop(cold);
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn disk_hydration_interactive_get_promotes_recency() {
+    // Finding 10b / §3.2: a memory miss + disk hit must promote recency for an
+    // INTERACTIVE `get` (the disk-hydrated entry is about to be the working
+    // set's most-recently-used one), but must leave the persisted `last_seq`
+    // alone for non-promoting reads (prewarm / force-fresh) — otherwise a
+    // just-accessed rehydrated entry stays a prime eviction victim.
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("il-diskhydrate-get-{}-{nanos}", std::process::id()));
+    let shard = root.join("shard");
+    fs::create_dir_all(&root).expect("temp root");
+
+    let interactive_key = "v4:diskhydrate-interactive";
+    let prewarm_key = "v4:diskhydrate-prewarm";
+    let forcefresh_key = "v4:diskhydrate-forcefresh";
+
+    // Seed three DISK-only entries. Each `insert` stamps a fresh, strictly
+    // increasing `last_seq`, so each key's pre-hydration persisted value
+    // (read back below) is known and distinct.
+    {
+        let seed = ImportCache::new(Some(shard.clone()), true);
+        seed.insert(interactive_key.to_owned(), result("interactive-pkg", false));
+        seed.insert(prewarm_key.to_owned(), result("prewarm-pkg", false));
+        seed.insert(forcefresh_key.to_owned(), result("forcefresh-pkg", false));
+        seed.flush_to_disk().expect("seed flush");
+    }
+
+    let interactive_before = disk_persisted_last_seq(&shard, interactive_key);
+    let prewarm_before = disk_persisted_last_seq(&shard, prewarm_key);
+    let forcefresh_before = disk_persisted_last_seq(&shard, forcefresh_key);
+
+    // Cold reopen with preload DISABLED: none of the three keys are
+    // memory-resident, so every read below goes through the disk-hydration
+    // branch of `read`, never the memory-hit branch.
+    let cold = ImportCache::new_with_recent_preload_limit(Some(shard.clone()), true, 0);
+    assert_eq!(
+        cold.memory_len(),
+        0,
+        "cold reopen must start with an empty working set"
+    );
+
+    // INTERACTIVE (promoting) disk-hydration hit.
+    assert!(cold.get(interactive_key).is_some());
+    // Non-promoting disk-hydration hits — controls (must NOT regress C2/B4b).
+    assert!(cold.get_for_prewarm(prewarm_key).is_some());
+    assert!(cold.get_if_fresh(forcefresh_key).is_some());
+
+    // `flush_to_disk`'s recency sweep re-persists anything promoted since its
+    // last persist, so the after-state can be read straight back off disk.
+    cold.flush_to_disk().expect("flush after reads");
+    drop(cold);
+
+    let interactive_after = disk_persisted_last_seq(&shard, interactive_key);
+    let prewarm_after = disk_persisted_last_seq(&shard, prewarm_key);
+    let forcefresh_after = disk_persisted_last_seq(&shard, forcefresh_key);
+
+    assert!(
+        interactive_after > interactive_before,
+        "an interactive disk-hydration hit must promote last_seq to a fresh value: \
+         {interactive_before} -> {interactive_after}"
+    );
+    assert_eq!(
+        prewarm_after, prewarm_before,
+        "a prewarm disk-hydration hit must NOT promote last_seq"
+    );
+    assert_eq!(
+        forcefresh_after, forcefresh_before,
+        "a force-fresh disk-hydration hit must NOT promote last_seq"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn disk_hydration_interactive_swr_read_promotes_recency() {
+    // Same bug (Finding 10b / §3.2), for the C2 stale-while-revalidate read
+    // path: `get_with_result_freshness` (interactive) must promote a disk
+    // hydration hit; `get_with_result_freshness_for_bulk` must not.
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("il-diskhydrate-swr-{}-{nanos}", std::process::id()));
+    let shard = root.join("shard");
+    fs::create_dir_all(&root).expect("temp root");
+
+    let interactive_key = "v4:diskhydrate-swr-interactive";
+    let bulk_key = "v4:diskhydrate-swr-bulk";
+
+    {
+        let seed = ImportCache::new(Some(shard.clone()), true);
+        seed.insert(interactive_key.to_owned(), result("interactive-pkg", false));
+        seed.insert(bulk_key.to_owned(), result("bulk-pkg", false));
+        seed.flush_to_disk().expect("seed flush");
+    }
+
+    let interactive_before = disk_persisted_last_seq(&shard, interactive_key);
+    let bulk_before = disk_persisted_last_seq(&shard, bulk_key);
+
+    // Cold reopen with preload DISABLED: neither key is memory-resident, so
+    // both reads below go through `read_with_result_freshness`'s disk-hydration
+    // branch, never its memory-hit branch.
+    let cold = ImportCache::new_with_recent_preload_limit(Some(shard.clone()), true, 0);
+    assert_eq!(
+        cold.memory_len(),
+        0,
+        "cold reopen must start with an empty working set"
+    );
+
+    // Interactive (promoting) SWR disk-hydration hit.
+    assert!(cold.get_with_result_freshness(interactive_key).is_some());
+    // Bulk (non-promoting) SWR disk-hydration hit — control.
+    assert!(cold.get_with_result_freshness_for_bulk(bulk_key).is_some());
+
+    cold.flush_to_disk().expect("flush after reads");
+    drop(cold);
+
+    let interactive_after = disk_persisted_last_seq(&shard, interactive_key);
+    let bulk_after = disk_persisted_last_seq(&shard, bulk_key);
+
+    assert!(
+        interactive_after > interactive_before,
+        "an interactive SWR disk-hydration hit must promote last_seq to a fresh value: \
+         {interactive_before} -> {interactive_after}"
+    );
+    assert_eq!(
+        bulk_after, bulk_before,
+        "a bulk SWR disk-hydration hit must NOT promote last_seq"
+    );
+
+    fs::remove_dir_all(&root).ok();
 }

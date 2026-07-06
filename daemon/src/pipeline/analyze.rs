@@ -1,7 +1,7 @@
 use crate::{
     ipc::protocol::{
         ConfidenceLevel, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
-        ModuleContribution,
+        ModuleContribution, ResultFreshness,
     },
     pipeline::{
         bundle::bundle_reachable_modules_with_metadata,
@@ -22,6 +22,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Debug, Clone)]
@@ -49,9 +50,24 @@ pub fn analyze_resolved_import(
     request: &ImportRequest,
     resolved: ResolvedPackage,
 ) -> ImportResult {
+    analyze_resolved_import_with_graph(context, request, resolved).0
+}
+
+/// Like [`analyze_resolved_import`], but also returns the `Arc<ModuleGraph>` the
+/// result was computed from, when the OXC pipeline produced one. The cache path
+/// uses this to fingerprint the exact analyzed graph instead of re-fetching it
+/// by key: a re-fetch can rebuild against dependency bytes that changed during
+/// the analysis window, pairing a stale result with fresh-looking fingerprints
+/// that are then served `Fresh` (Finding 4). Returns `None` for the CJS,
+/// oversized-entry, and static-fallback branches, which have no module graph.
+pub fn analyze_resolved_import_with_graph(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    resolved: ResolvedPackage,
+) -> (ImportResult, Option<Arc<ModuleGraph>>) {
     match analyze_import_inner_resolved(context, request, resolved) {
-        Ok(result) => result,
-        Err(error) => error_result(request, error),
+        Ok((result, graph)) => (result, graph),
+        Err(error) => (error_result(request, error), None),
     }
 }
 
@@ -75,7 +91,10 @@ fn analyze_import_inner(
         }
         Err(error) => return Err(error),
     };
-    analyze_import_inner_resolved(context, request, resolved)
+    // The non-resolved path has no caller that needs the analyzed graph, so it
+    // discards it and keeps returning a bare `ImportResult`.
+    let (result, _graph) = analyze_import_inner_resolved(context, request, resolved)?;
+    Ok(result)
 }
 
 fn resolve_import_package(
@@ -107,7 +126,7 @@ fn analyze_import_inner_resolved(
     context: &AnalysisContext,
     request: &ImportRequest,
     resolved: ResolvedPackage,
-) -> Result<ImportResult, AnalysisError> {
+) -> Result<(ImportResult, Option<Arc<ModuleGraph>>), AnalysisError> {
     let side_effects_mode = resolved.side_effects;
     let entry_path = resolved.entry_path;
     let is_cjs = resolved.is_cjs;
@@ -144,20 +163,20 @@ fn analyze_import_inner_resolved(
             0,
             "Entry exceeds module graph source limit; size is static entry fallback.".to_owned(),
         );
-        return Ok(result);
+        return Ok((result, None));
     }
 
     let mut fallback_diagnostics = Vec::new();
     if is_cjs {
         match analyze_with_cjs_graph(request, &entry_path) {
-            Ok(result) => return Ok(result),
+            Ok(result) => return Ok((result, None)),
             Err(diagnostics) => fallback_diagnostics.extend(diagnostics),
         }
     }
 
     if !is_cjs {
         match analyze_with_oxc_pipeline(context, request, entry_path.clone(), &side_effects_mode) {
-            Ok(result) => return Ok(result),
+            Ok((result, graph)) => return Ok((result, Some(graph))),
             Err(error) => fallback_diagnostics.push(oxc_fallback_diagnostic(error)),
         }
     }
@@ -165,7 +184,7 @@ fn analyze_import_inner_resolved(
     let mut result =
         analyze_static_entry(context, request, entry_path, &side_effects_mode, is_cjs)?;
     result.diagnostics.extend(fallback_diagnostics);
-    Ok(result)
+    Ok((result, None))
 }
 
 fn analyze_with_cjs_graph(
@@ -211,6 +230,7 @@ fn cjs_graph_result(request: &ImportRequest, graph: CjsGraphAnalysis) -> ImportR
 
     match compressed {
         Ok(compressed) => ImportResult {
+            freshness: ResultFreshness::fresh(),
             specifier: request.specifier.clone(),
             raw_bytes: graph.source.len() as u64,
             minified_bytes: minified.len() as u64,
@@ -248,7 +268,7 @@ fn analyze_with_oxc_pipeline(
     request: &ImportRequest,
     entry_path: PathBuf,
     side_effects_mode: &SideEffectsMode,
-) -> Result<ImportResult, AnalysisError> {
+) -> Result<(ImportResult, Arc<ModuleGraph>), AnalysisError> {
     let graph =
         build_module_graph_cached_with_runtime(&entry_path, request.runtime).map_err(|error| {
             error_with_context(
@@ -332,7 +352,8 @@ fn analyze_with_oxc_pipeline(
     diagnostics.extend(missing_export_diagnostics(request, &graph));
     let (confidence, confidence_reasons) = oxc_confidence(side_effects, &diagnostics);
 
-    Ok(ImportResult {
+    let result = ImportResult {
+        freshness: ResultFreshness::fresh(),
         specifier: request.specifier.clone(),
         raw_bytes: bundled.source.len() as u64,
         minified_bytes: minified.len() as u64,
@@ -356,7 +377,10 @@ fn analyze_with_oxc_pipeline(
         module_breakdown: Some(top_module_contributions(&bundled.contributions)),
         shared_bytes: None,
         internal_contributions: bundled.contributions,
-    })
+    };
+    // Return the exact graph the result was computed from so the cache path can
+    // fingerprint it directly instead of re-fetching (and possibly rebuilding).
+    Ok((result, graph))
 }
 
 fn is_truly_treeshakeable(
@@ -430,6 +454,7 @@ fn analyze_static_entry(
     let minified_bytes = minified.len() as u64;
 
     Ok(ImportResult {
+        freshness: ResultFreshness::fresh(),
         specifier: request.specifier.clone(),
         raw_bytes,
         minified_bytes,
@@ -479,6 +504,7 @@ fn approximate_manifest_fallback(
     );
 
     Ok(ImportResult {
+        freshness: ResultFreshness::fresh(),
         specifier: request.specifier.clone(),
         raw_bytes,
         minified_bytes: raw_bytes,
@@ -692,6 +718,7 @@ fn missing_cjs_export_message(request: &ImportRequest, missing: &[String]) -> St
 
 fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
     ImportResult {
+        freshness: ResultFreshness::fresh(),
         specifier: request.specifier.clone(),
         raw_bytes: 0,
         minified_bytes: 0,

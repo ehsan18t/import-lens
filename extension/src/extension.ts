@@ -372,6 +372,16 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       });
     }),
   );
+  context.subscriptions.push(
+    daemon.onRefreshedResults((message) => {
+      analysis.applyRefreshedResults(
+        vscode.Uri.file(message.document_path),
+        message.results,
+        message.identities,
+        message.generation,
+      );
+    }),
+  );
   const state = await daemon.start();
   logger.info(`ImportLens daemon startup completed with state: ${state}.`);
   statusBar.setState({ kind: state === "ready" ? "ready" : "unavailable" });

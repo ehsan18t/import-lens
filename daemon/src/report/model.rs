@@ -408,6 +408,7 @@ mod tests {
 
     fn ok_result(specifier: &str, brotli_bytes: u64) -> ImportResult {
         ImportResult {
+            freshness: crate::ipc::protocol::ResultFreshness::fresh(),
             specifier: specifier.to_owned(),
             raw_bytes: brotli_bytes,
             minified_bytes: brotli_bytes,

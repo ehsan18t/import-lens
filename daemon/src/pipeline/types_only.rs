@@ -1,5 +1,7 @@
 use crate::{
-    ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportRequest, ImportResult},
+    ipc::protocol::{
+        ConfidenceLevel, ImportDiagnostic, ImportRequest, ImportResult, ResultFreshness,
+    },
     pipeline::{resolver::find_package_root, util::should_skip_package_directory},
 };
 use std::{
@@ -34,6 +36,7 @@ pub fn declaration_only_package_result(
     }
 
     Some(ImportResult {
+        freshness: ResultFreshness::fresh(),
         specifier: request.specifier.clone(),
         raw_bytes: 0,
         minified_bytes: 0,

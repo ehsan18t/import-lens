@@ -1,5 +1,4 @@
 import {
-  type CacheCleanupRequest,
   type CacheListRequest,
   type CacheRemoveRequest,
   type CacheStatusRequest,
@@ -14,12 +13,6 @@ export const cacheStatusRequest = (
   version: protocolVersion,
   request_id: requestId,
   workspace_root: workspaceRoot,
-});
-
-export const cacheCleanupRequest = (requestId: number): CacheCleanupRequest => ({
-  type: "cache_cleanup",
-  version: protocolVersion,
-  request_id: requestId,
 });
 
 export const cacheListRequest = (requestId: number): CacheListRequest => ({
@@ -57,7 +50,14 @@ export const cacheRemoveAllRequest = (requestId: number): CacheRemoveRequest => 
   scope: "all",
 });
 
-export const cachePurgeOrphansRequest = (requestId: number): CacheRemoveRequest => ({
+export const cacheRemoveRegistryRequest = (requestId: number): CacheRemoveRequest => ({
+  type: "cache_remove",
+  version: protocolVersion,
+  request_id: requestId,
+  scope: "registry",
+});
+
+export const cacheRemoveOrphansRequest = (requestId: number): CacheRemoveRequest => ({
   type: "cache_remove",
   version: protocolVersion,
   request_id: requestId,

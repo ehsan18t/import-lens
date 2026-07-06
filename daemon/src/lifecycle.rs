@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-pub const CACHE_RECYCLE_ENTRY_LIMIT: usize = 200_000;
 const UPTIME_RECYCLE_AFTER: Duration = Duration::from_secs(4 * 60 * 60);
 const IDLE_RECYCLE_AFTER: Duration = Duration::from_secs(15 * 60);
 const RECYCLE_DETECTION_WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -15,7 +14,6 @@ const RECYCLE_FILE_NAME: &str = "importlens-recycles.json";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecycleReason {
     IdleAfterUptime,
-    CacheEntryLimit,
 }
 
 #[derive(Debug, Clone)]
@@ -50,11 +48,10 @@ impl LifecycleState {
         self.last_batch_at = Some(now);
     }
 
-    pub fn should_recycle(&self, now: Instant, cache_len: usize) -> Option<RecycleReason> {
-        if cache_len > CACHE_RECYCLE_ENTRY_LIMIT {
-            return Some(RecycleReason::CacheEntryLimit);
-        }
-
+    pub fn should_recycle(&self, now: Instant) -> Option<RecycleReason> {
+        // The 200k in-memory entry-count recycle is gone: the global disk-byte
+        // budget (Layer 2) now bounds capacity, and the memory working set is
+        // separately count-bounded. Only the idle-after-uptime recycle remains.
         if now.saturating_duration_since(self.started_at) <= UPTIME_RECYCLE_AFTER {
             return None;
         }

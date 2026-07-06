@@ -202,11 +202,24 @@ fn client_message_decodes_cache_management_requests() {
             "storage_path": "C:/Code/User/workspaceStorage/importlens/daemon-cache",
             "enable_disk_cache": true,
             "cache_max_size_mb": 512,
-            "cache_max_age_days": 30,
+            "registry_cache_max_size_mb": 64,
             "log_level": "info"
         })),
         ClientMessage::Hello(message)
-            if message.cache_max_size_mb == 512 && message.cache_max_age_days == 30,
+            if message.cache_max_size_mb == 512 && message.registry_cache_max_size_mb == 64,
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "hello",
+            "version": PROTOCOL_VERSION,
+            "workspace_root": "C:/workspace",
+            "storage_path": "C:/Code/User/workspaceStorage/importlens/daemon-cache",
+            "enable_disk_cache": true,
+            "cache_max_size_mb": 512,
+            "log_level": "info"
+        })),
+        ClientMessage::Hello(message)
+            if message.registry_cache_max_size_mb == 32,
     ));
     assert!(matches!(
         decode_client_message(serde_json::json!({
@@ -217,14 +230,6 @@ fn client_message_decodes_cache_management_requests() {
         })),
         ClientMessage::CacheStatus(message)
             if message.request_id == 21 && message.workspace_root.as_deref() == Some("C:/workspace"),
-    ));
-    assert!(matches!(
-        decode_client_message(serde_json::json!({
-            "type": "cache_cleanup",
-            "version": PROTOCOL_VERSION,
-            "request_id": 22
-        })),
-        ClientMessage::CacheCleanup(message) if message.request_id == 22,
     ));
     assert!(matches!(
         decode_client_message(serde_json::json!({
@@ -244,6 +249,16 @@ fn client_message_decodes_cache_management_requests() {
         })),
         ClientMessage::CacheRemove(message)
             if message.request_id == 24 && message.scope == CacheRemoveScope::CurrentProject,
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "cache_remove",
+            "version": PROTOCOL_VERSION,
+            "request_id": 25,
+            "scope": "registry"
+        })),
+        ClientMessage::CacheRemove(message)
+            if message.request_id == 25 && message.scope == CacheRemoveScope::Registry,
     ));
 }
 

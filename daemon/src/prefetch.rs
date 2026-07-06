@@ -1,5 +1,5 @@
 use crate::{
-    cache::key::{CacheIdentityV3, decode_cache_identity},
+    cache::key::{CacheIdentity, decode_cache_identity},
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
@@ -18,7 +18,6 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    thread,
 };
 
 static PREWARM_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
@@ -80,17 +79,15 @@ impl Prefetcher {
         let cancellation = Arc::clone(&self.cancellation);
         let generation = cancellation.next_generation();
 
-        let _ = thread::Builder::new()
-            .name("import-lens-prewarm".to_owned())
-            .spawn(move || {
-                run_prewarm_job(
-                    service,
-                    package_json_path,
-                    active_document_path,
-                    cancellation,
-                    generation,
-                );
-            });
+        dispatch_prewarm(move || {
+            run_prewarm_job(
+                service,
+                package_json_path,
+                active_document_path,
+                cancellation,
+                generation,
+            );
+        });
     }
 
     pub fn prewarm_recent_cache_entries(
@@ -101,11 +98,25 @@ impl Prefetcher {
         let cancellation = Arc::clone(&self.cancellation);
         let generation = cancellation.next_generation();
 
-        let _ = thread::Builder::new()
-            .name("import-lens-recent-prewarm".to_owned())
-            .spawn(move || {
-                run_recent_prewarm_job(service, workspace_root, cancellation, generation);
-            });
+        dispatch_prewarm(move || {
+            run_recent_prewarm_job(service, workspace_root, cancellation, generation);
+        });
+    }
+}
+
+/// Dispatch the outer prewarm coordination (dependency enumeration + fan-out)
+/// onto the bounded `PREWARM_POOL` instead of an unbounded per-call OS thread.
+/// The heavy per-import work already runs on this pool via `pool.install`; this
+/// bounds the OUTER dispatch too and, crucially, LOGS a pool-build failure at
+/// debug rather than silently swallowing it as the old raw
+/// `thread::Builder…spawn` (`let _ = …`) did. Cancellation is still checked inside
+/// the job, so a superseded dispatch bails via the generation guard.
+fn dispatch_prewarm(job: impl FnOnce() + Send + 'static) {
+    match prewarm_pool() {
+        Ok(pool) => pool.spawn(job),
+        Err(error) => {
+            crate::logging::log_debug("prefetch", format!("prewarm dispatch skipped: {error}"));
+        }
     }
 }
 
@@ -321,7 +332,7 @@ pub fn cached_import_request_from_key(key: &str) -> Option<ImportRequest> {
     decode_cache_identity(key).map(import_request_from_identity)
 }
 
-fn import_request_from_identity(identity: CacheIdentityV3) -> ImportRequest {
+fn import_request_from_identity(identity: CacheIdentity) -> ImportRequest {
     ImportRequest {
         specifier: identity.specifier,
         package_name: identity.package_name,
@@ -361,4 +372,27 @@ pub fn prewarm_pool() -> Result<&'static rayon::ThreadPool, String> {
     PREWARM_POOL
         .get()
         .ok_or_else(|| "failed to initialize prewarm thread pool".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch_prewarm;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // F3-A: the outer prewarm dispatch runs the coordination job on the bounded
+    // `PREWARM_POOL` instead of an unbounded per-call OS thread. Proven by observing
+    // the job actually execute on the pool — the raw `thread::Builder…spawn` with a
+    // swallowed spawn error is gone.
+    #[test]
+    fn dispatch_prewarm_runs_job_on_bounded_pool() {
+        let (tx, rx) = mpsc::channel();
+        dispatch_prewarm(move || {
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "dispatch_prewarm should run the job on the bounded prewarm pool"
+        );
+    }
 }

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  type CacheCleanupRequest,
   type CacheListRequest,
   type CacheRemoveRequest,
   type CacheStatusRequest,
@@ -22,12 +21,12 @@ test("hello message carries cache policy fields", () => {
     storage_path: "C:/Code/User/workspaceStorage/importlens/daemon-cache",
     enable_disk_cache: true,
     cache_max_size_mb: 512,
-    cache_max_age_days: 30,
+    registry_cache_max_size_mb: 32,
     log_level: "info",
   };
 
   assert.equal(hello.cache_max_size_mb, 512);
-  assert.equal(hello.cache_max_age_days, 30);
+  assert.equal(hello.registry_cache_max_size_mb, 32);
 });
 
 test("cache management requests are client messages", () => {
@@ -36,11 +35,6 @@ test("cache management requests are client messages", () => {
     version: protocolVersion,
     request_id: 1,
     workspace_root: "C:/workspace",
-  };
-  const cleanup: CacheCleanupRequest = {
-    type: "cache_cleanup",
-    version: protocolVersion,
-    request_id: 2,
   };
   const list: CacheListRequest = {
     type: "cache_list",
@@ -54,10 +48,10 @@ test("cache management requests are client messages", () => {
     scope: "selected",
     shard_ids: ["v1-demo"],
   };
-  const messages = [status, cleanup, list, remove] satisfies ClientMessage[];
+  const messages = [status, list, remove] satisfies ClientMessage[];
 
   assert.deepEqual(
     messages.map((message) => message.type),
-    ["cache_status", "cache_cleanup", "cache_list", "cache_remove"],
+    ["cache_status", "cache_list", "cache_remove"],
   );
 });

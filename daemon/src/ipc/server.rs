@@ -5,11 +5,11 @@ use crate::{
         protocol::{
             AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
             AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-            CacheCleanupRequest, CacheCleanupResponse, CacheListRequest, CacheListResponse,
-            CacheRemoveRequest, CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest,
-            CacheStatusResponse, ClientMessage, CompleteImportMembersRequest,
-            CompleteImportMembersResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
-            ImportDiagnostic, PROTOCOL_VERSION, RefreshRegistryHintsResponse, RegistryHintResult,
+            CacheListRequest, CacheListResponse, CacheRemoveRequest, CacheRemoveResponse,
+            CacheRemoveScope, CacheStatusRequest, CacheStatusResponse, ClientMessage,
+            CompleteImportMembersRequest, CompleteImportMembersResponse, FileSizeDocumentRequest,
+            FileSizeDocumentResponse, FreshnessKind, ImportDiagnostic, PROTOCOL_VERSION,
+            RefreshRegistryHintsResponse, RefreshedResultsResponse, RegistryHintResult,
             WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
             is_supported_protocol_version,
         },
@@ -24,8 +24,13 @@ use crate::{
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
+    collections::HashMap,
     error::Error,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -34,10 +39,125 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const LIFECYCLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// Delay after Hello before the single cache-maintenance pass runs, letting the
+/// cold-open analysis burst settle first (see `spawn_cache_maintenance`).
+const CACHE_MAINTENANCE_DELAY: Duration = Duration::from_secs(60);
+
+/// Aborts the wrapped task when dropped (connection end, or replacement by a
+/// post-Hello respawn).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Tracks the active bulk registry-refresh block for one connection so a newer
+/// bulk request can supersede (cancel) the block it replaces, and so an ending
+/// connection cancels whatever is still draining (D7 / §6.1). Cancellation only
+/// flips a shared `AtomicBool` that the isolated registry pool's jobs re-read
+/// before each network fetch — a superseded/abandoned block skips its remaining
+/// fetches, with no error surfaced for the skipped work.
+struct RegistryRefreshLifecycle {
+    active: Option<Arc<AtomicBool>>,
+}
+
+impl RegistryRefreshLifecycle {
+    fn new() -> Self {
+        Self { active: None }
+    }
+
+    /// Cancels the previous block (so its queued jobs skip their remaining
+    /// fetches) and hands back a fresh cancel flag for the new block. Release
+    /// pairs with the Acquire load each pool job does before fetching.
+    fn start_new_block(&mut self) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = self.active.replace(Arc::clone(&flag)) {
+            previous.store(true, Ordering::Release);
+        }
+        flag
+    }
+}
+
+impl Drop for RegistryRefreshLifecycle {
+    fn drop(&mut self) {
+        // Connection ended (disconnect, idle recycle, shutdown): cancel the
+        // still-draining block so its queued jobs skip their remaining fetches.
+        if let Some(active) = &self.active {
+            active.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct SwrRefreshLifecycle {
+    active_by_document: HashMap<String, Arc<AtomicBool>>,
+}
+
+impl SwrRefreshLifecycle {
+    fn new() -> Self {
+        Self {
+            active_by_document: HashMap::new(),
+        }
+    }
+
+    fn start_document(&mut self, workspace_root: &str, document_path: &str) -> Arc<AtomicBool> {
+        let key = swr_document_key(workspace_root, document_path);
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = self.active_by_document.insert(key, Arc::clone(&flag)) {
+            previous.store(true, Ordering::Release);
+        }
+        flag
+    }
+}
+
+impl Drop for SwrRefreshLifecycle {
+    fn drop(&mut self) {
+        for active in self.active_by_document.values() {
+            active.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn swr_document_key(workspace_root: &str, document_path: &str) -> String {
+    format!("{workspace_root}\0{document_path}")
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/ipc_server_swr.rs"]
+mod ipc_server_swr_tests;
+
+/// Schedules ONE cache-maintenance pass (byte-budget eviction + compaction +
+/// registry retention + orphan-shard sweep) a short delay after Hello, then
+/// stops — no recurring tick.
+///
+/// Rationale (design 2026-07-08): a project's cache converges to its
+/// distinct-import footprint (re-analysis is a cache hit, not growth), so it
+/// cannot grow unboundedly over a session — continuous polling is wasted work.
+/// One pass per project-open, run after the cold-analysis burst has settled (the
+/// delay), reclaims/compacts/prunes exactly when there is something to do. Each
+/// new project-open (new connection) schedules its own pass, so multi-project
+/// growth stays bounded; the only cost is that a heavy long single-project
+/// session may sit up to ~2x the budget until the next open/relaunch — bounded,
+/// cheap, and self-correcting. The pass runs via `spawn_blocking` so its shard
+/// scans never stall the connection's frame loop, and `AbortOnDrop` cancels it if
+/// the window closes before it fires.
+fn spawn_cache_maintenance(service: std::sync::Arc<ImportLensService>) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        tokio::time::sleep(CACHE_MAINTENANCE_DELAY).await;
+        if tokio::task::spawn_blocking(move || service.run_cache_maintenance())
+            .await
+            .is_err()
+        {
+            logging::log_warn("cache", "cache maintenance pass panicked");
+        }
+    }))
+}
 
 enum ServerOutboundMessage {
     RefreshRegistryHints(RefreshRegistryHintsResponse),
     WorkspaceReport(WorkspaceReportResponse),
+    RefreshedResults(RefreshedResultsResponse),
 }
 
 async fn send_outbound_message<S>(
@@ -52,6 +172,9 @@ where
             framed.send(payload_bytes(&response)?).await?
         }
         ServerOutboundMessage::WorkspaceReport(response) => {
+            framed.send(payload_bytes(&response)?).await?
+        }
+        ServerOutboundMessage::RefreshedResults(response) => {
             framed.send(payload_bytes(&response)?).await?
         }
     }
@@ -137,7 +260,14 @@ where
 {
     let mut framed = Framed::new(stream, message_frame_codec());
     let mut hello_received = false;
+    // Detached byte-budget maintenance; spawned at Hello (the pre-Hello service
+    // has no storage). Aborted on drop when the connection ends.
+    let mut _maintenance_task: Option<AbortOnDrop> = None;
     let mut lifecycle = LifecycleState::new();
+    // Cancels the in-flight bulk registry-refresh block when a newer bulk
+    // request supersedes it or when this connection ends (its `Drop`).
+    let mut registry_refresh_lifecycle = RegistryRefreshLifecycle::new();
+    let mut swr_refresh_lifecycle = SwrRefreshLifecycle::new();
     let lifecycle_storage_path = storage_path;
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerOutboundMessage>();
 
@@ -157,9 +287,10 @@ where
             }
             payload = framed.next() => payload.transpose()?,
             _ = tokio::time::sleep(LIFECYCLE_CHECK_INTERVAL) => {
+                // Byte-budget maintenance runs on its own interval task (spawned
+                // at Hello); this arm only checks for an idle recycle.
                 if recycle_if_needed(
                     &lifecycle,
-                    service.cache_len(),
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
@@ -220,7 +351,7 @@ where
                                 Some(hello_storage_path),
                                 hello.enable_disk_cache,
                                 hello.cache_max_size_mb,
-                                hello.cache_max_age_days,
+                                hello.registry_cache_max_size_mb,
                             ))
                         }
                         Err(_shared) => {
@@ -233,7 +364,7 @@ where
                                 Some(hello_storage_path),
                                 hello.enable_disk_cache,
                                 hello.cache_max_size_mb,
-                                hello.cache_max_age_days,
+                                hello.registry_cache_max_size_mb,
                             ))
                         }
                     }
@@ -242,7 +373,7 @@ where
                         Some(hello_storage_path),
                         hello.enable_disk_cache,
                         hello.cache_max_size_mb,
-                        hello.cache_max_age_days,
+                        hello.registry_cache_max_size_mb,
                     ))
                 };
                 hello_received = true;
@@ -251,29 +382,23 @@ where
                 {
                     log_legacy_cache_removal(&result);
                 }
-                let cleanup = service.cleanup_cache(CacheCleanupRequest {
-                    message_type: "cache_cleanup".to_owned(),
-                    version: PROTOCOL_VERSION,
-                    request_id: 0,
-                });
-                if !cleanup.removed.is_empty() {
-                    logging::log_info(
-                        "cache",
-                        format!(
-                            "startup cache cleanup removed {} shard(s)",
-                            cleanup.removed.len()
-                        ),
-                    );
-                }
-                if !cleanup.failed.is_empty() {
-                    logging::log_warn(
-                        "cache",
-                        format!(
-                            "startup cache cleanup failed for {} shard(s)",
-                            cleanup.failed.len()
-                        ),
-                    );
-                }
+                // Recency seed (C5 / Finding 10d, §3.3): lift the process-global
+                // recency clock above every persisted shard's max seq BEFORE any
+                // request can create a new entry. The clock resets to 1 each process
+                // start, so without this a fresh post-restart access (small seq)
+                // could sort as older than an untouched prior-session shard, letting
+                // the evictor pick the active project as its victim. Run inline here
+                // (like the legacy-cache removal above): the connection loop
+                // processes this Hello to completion before it reads the first
+                // Batch/Analyze frame, so the seed is guaranteed to finish before the
+                // first `analyze_and_cache`.
+                service.seed_recency_clock_from_disk();
+                // Byte-budget enforcement + compaction: a detached interval task
+                // whose first pass runs right after this handshake (via
+                // spawn_blocking — the old inline cleanup blocked the handshake on
+                // full shard scans). Replacing the handle aborts the previous
+                // task if a client re-handshakes.
+                _maintenance_task = Some(spawn_cache_maintenance(std::sync::Arc::clone(&service)));
                 prefetcher.prewarm_recent_cache_entries(
                     std::sync::Arc::clone(&service),
                     hello_workspace_root,
@@ -281,7 +406,6 @@ where
 
                 if recycle_if_needed(
                     &lifecycle,
-                    service.cache_len(),
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
@@ -326,7 +450,6 @@ where
 
                 if recycle_if_needed(
                     &lifecycle,
-                    service.cache_len(),
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
@@ -451,18 +574,6 @@ where
                 );
                 send_message!(response);
             }
-            ClientMessage::CacheCleanup(request) if hello_received => {
-                prefetcher.cancel();
-                let response = service.cleanup_cache(request);
-                send_message!(response);
-            }
-            ClientMessage::CacheCleanup(request) => {
-                let response = protocol_error_cache_cleanup_response(
-                    &request,
-                    "hello message not received".to_owned(),
-                );
-                send_message!(response);
-            }
             ClientMessage::CacheList(request) if hello_received => {
                 let response = service.list_cache(request);
                 send_message!(response);
@@ -520,34 +631,32 @@ where
                 let (partial_tx, mut partial_rx) = mpsc::unbounded_channel();
                 let outbound = outbound_tx.clone();
 
-                for (index, target) in targets.iter().cloned().enumerate() {
-                    let svc = std::sync::Arc::clone(&service);
-                    let tx = partial_tx.clone();
-                    service.spawn_registry_refresh(move || {
-                        let target_for_error = target.clone();
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            svc.refresh_registry_hint_target(target, mode, now_ms)
-                        }))
-                        .unwrap_or_else(|_| {
-                            logging::log_warn(
-                                "registry",
-                                format!("registry worker panicked for {}", target_for_error.name),
-                            );
-                            RegistryHintResult {
-                                target: target_for_error,
-                                hint: None,
-                                error: Some("registry worker panicked".to_owned()),
-                                origin: None,
-                            }
-                        });
-                        let _ = tx.send((index, result));
-                    });
-                }
-                drop(partial_tx);
+                // A newer bulk request supersedes the previous block for this
+                // connection: flip the prior block's cancel flag so its still-
+                // queued jobs skip their remaining fetches. The returned flag
+                // governs THIS block; each of its pool jobs re-reads it before
+                // its network fetch.
+                let cancelled = registry_refresh_lifecycle.start_new_block();
+                let final_targets = targets.clone();
+                let target_count = targets.len();
+
+                service.spawn_registry_refresh_block(
+                    targets,
+                    mode,
+                    now_ms,
+                    cancelled,
+                    move |index, result| {
+                        // A cancelled (skipped) job reports `None` and streams no
+                        // partial; the collector fills its slot from the fallback.
+                        if let Some(result) = result {
+                            let _ = partial_tx.send((index, result));
+                        }
+                    },
+                );
                 let flush_service = std::sync::Arc::clone(&service);
 
                 tokio::spawn(async move {
-                    let mut ordered_results = vec![None; targets.len()];
+                    let mut ordered_results = vec![None; target_count];
                     while let Some((index, result)) = partial_rx.recv().await {
                         ordered_results[index] = Some(result.clone());
                         let _ = outbound.send(ServerOutboundMessage::RefreshRegistryHints(
@@ -561,13 +670,13 @@ where
                             },
                         ));
                     }
-                    // All refresh workers have finished; persist their fetched
-                    // metadata in one snapshot write.
+                    // All refresh workers have finished or been skipped; persist
+                    // any fetched metadata in one snapshot write.
                     flush_service.flush_registry_hints();
 
                     let results = ordered_results
                         .into_iter()
-                        .zip(targets)
+                        .zip(final_targets)
                         .map(|(result, target)| {
                             result.unwrap_or(RegistryHintResult {
                                 target,
@@ -687,6 +796,8 @@ where
             ClientMessage::FileSizeDocument(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
+                let swr_cancelled = swr_refresh_lifecycle
+                    .start_document(&request.workspace_root, &request.active_document_path);
                 let svc = std::sync::Arc::clone(&service);
                 let request_for_error = request.clone();
                 let response_handle =
@@ -697,7 +808,48 @@ where
                     protocol_error_file_size_document_response,
                 )
                 .await;
+                // SWR: any served size flagged Stale was served from a changed cache
+                // entry. Recompute ONLY those imports fresh in the background (a fresh
+                // sibling must not be re-analyzed) and push the refreshed results to the
+                // client (the request/response has already closed, so delivery rides the
+                // outbound channel like registry hints).
+                let stale_specifiers = response
+                    .imports
+                    .iter()
+                    .filter(|result| matches!(result.freshness.kind, FreshnessKind::Stale))
+                    .map(|result| result.specifier.clone())
+                    .collect::<std::collections::HashSet<_>>();
                 send_message!(response);
+                if !stale_specifiers.is_empty() {
+                    let svc = std::sync::Arc::clone(&service);
+                    let outbound = outbound_tx.clone();
+                    // F3-B pre-recompute cancellation is scoped to this document:
+                    // a newer size read for the same document supersedes the push,
+                    // while unrelated prefetch/file-size work must not starve SWR.
+                    tokio::task::spawn_blocking(move || {
+                        if let Some((workspace_root, document_path, results, identities)) = svc
+                            .revalidate_document_sizes(
+                                &request_for_error,
+                                &stale_specifiers,
+                                || !swr_cancelled.load(Ordering::Acquire),
+                            )
+                        {
+                            let _ = outbound.send(ServerOutboundMessage::RefreshedResults(
+                                RefreshedResultsResponse {
+                                    message_type: "refreshed_results".to_owned(),
+                                    version: PROTOCOL_VERSION,
+                                    workspace_root,
+                                    document_path,
+                                    results,
+                                    identities,
+                                    // Echo the generation so the client can drop this push if a
+                                    // newer analysis has since superseded the one it was computed for.
+                                    generation: request_for_error.analysis_generation,
+                                },
+                            ));
+                        }
+                    });
+                }
             }
             ClientMessage::FileSizeDocument(request) => {
                 let response = protocol_error_file_size_document_response(
@@ -739,7 +891,6 @@ where
                         format!("failed to flush cache on shutdown: {error}"),
                     );
                 }
-                service.flush_cache_recency_touches();
                 return Ok(());
             }
             ClientMessage::PrewarmPackageJson(_)
@@ -876,24 +1027,10 @@ fn protocol_error_cache_status_response(
         total_size_bytes: 0,
         project_count: 0,
         max_size_mb: 0,
-        max_age_days: 0,
-        last_cleanup_millis: None,
         current_project: None,
-        error: Some(message.clone()),
-        diagnostics: protocol_diagnostics(message),
-    }
-}
-
-fn protocol_error_cache_cleanup_response(
-    request: &CacheCleanupRequest,
-    message: String,
-) -> CacheCleanupResponse {
-    CacheCleanupResponse {
-        version: request.version.min(PROTOCOL_VERSION),
-        request_id: request.request_id,
-        total_size_bytes: 0,
-        removed: Vec::new(),
-        failed: Vec::new(),
+        total_bytes: 0,
+        budget_bytes: 0,
+        registry_size_bytes: 0,
         error: Some(message.clone()),
         diagnostics: protocol_diagnostics(message),
     }
@@ -932,12 +1069,11 @@ fn protocol_diagnostics(message: String) -> Vec<ImportDiagnostic> {
 
 fn recycle_if_needed(
     lifecycle: &LifecycleState,
-    cache_len: usize,
     storage_path: Option<&Path>,
     prefetcher: &Prefetcher,
     service: &ImportLensService,
 ) -> bool {
-    let Some(reason) = lifecycle.should_recycle(Instant::now(), cache_len) else {
+    let Some(reason) = lifecycle.should_recycle(Instant::now()) else {
         return false;
     };
 
@@ -972,4 +1108,36 @@ fn restrict_unix_socket_permissions(pipe_name: &str) -> Result<(), Box<dyn Error
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RegistryRefreshLifecycle;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn registry_refresh_lifecycle_supersedes_prior_block_and_cancels_on_drop() {
+        let mut lifecycle = RegistryRefreshLifecycle::new();
+        let first = lifecycle.start_new_block();
+        assert!(!first.load(Ordering::Acquire), "a fresh block starts live");
+
+        // A newer bulk request supersedes the previous block: the prior flag
+        // flips, the new one starts live.
+        let second = lifecycle.start_new_block();
+        assert!(
+            first.load(Ordering::Acquire),
+            "a new bulk block must cancel the block it supersedes"
+        );
+        assert!(
+            !second.load(Ordering::Acquire),
+            "the superseding block itself starts live"
+        );
+
+        // Connection end (guard drop) cancels whatever is still draining.
+        drop(lifecycle);
+        assert!(
+            second.load(Ordering::Acquire),
+            "dropping the connection lifecycle must cancel the active block"
+        );
+    }
 }

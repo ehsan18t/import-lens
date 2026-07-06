@@ -3,10 +3,16 @@ use import_lens_daemon::{
         AnalyzeDocumentRequest, AnalyzePackageJsonRequest, AnalyzeSpecifiersRequest, BatchRequest,
         CacheRemoveRequest, CacheRemoveScope, CacheStatusRequest, CompleteImportMembersRequest,
         EnumerateExportsRequest, FileSizeDocumentRequest, FileSizeRequest, ImportAnalysisStatus,
-        ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION,
+        ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION, RegistryHintMode,
+        RegistryHintTarget,
     },
+    pipeline::file_size::FileSizeComputation,
     pipeline::file_size_cache::shared_file_size_cache,
-    pipeline::graph::{build_module_graph_cached, clear_module_graph_cache},
+    pipeline::graph::{
+        build_module_graph_cached, clear_module_graph_cache, peek_cached_module_paths,
+    },
+    pipeline::resolver::shared_resolvers,
+    registry::service::RegistryHintService,
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
 };
 use std::{
@@ -25,6 +31,21 @@ fn temp_workspace() -> PathBuf {
 
 fn write_package(workspace: &Path) {
     let package_root = workspace.join("node_modules").join("tiny-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(package_root.join("index.js"), "export const value = 1;")
+        .expect("entry should be written");
+}
+
+/// Same cacheable shape as `write_package`, under a caller-chosen name -- used
+/// to prove an invalidation call scoped to one package leaves a sibling
+/// package's cache entry alone.
+fn write_named_package(workspace: &Path, name: &str) {
+    let package_root = workspace.join("node_modules").join(name);
     fs::create_dir_all(&package_root).expect("package root should be created");
     fs::write(
         package_root.join("package.json"),
@@ -679,6 +700,8 @@ fn service_computes_file_size_from_document_source() {
         workspace_root: workspace.to_string_lossy().to_string(),
         active_document_path: active_document_path(&workspace),
         source: "import { left } from 'left-lib';\nimport { right } from 'right-lib';".to_owned(),
+        force_fresh: false,
+        analysis_generation: None,
     });
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
@@ -694,6 +717,399 @@ fn service_computes_file_size_from_document_source() {
             .all(|result| result.shared_bytes.is_some_and(|bytes| bytes > 0)),
         "{response:?}",
     );
+}
+
+#[test]
+fn file_size_document_force_fresh_bypasses_serve_stale() {
+    use import_lens_daemon::ipc::protocol::FreshnessKind;
+
+    let workspace = temp_workspace();
+    write_dependent_package(&workspace, "export const helper = 1;");
+    let service = ImportLensService::new(None, false);
+    let document = active_document_path(&workspace);
+    let source = "import { value } from 'dependent-lib';".to_owned();
+    let make = |request_id: u64, force_fresh: bool| FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document.clone(),
+        source: source.clone(),
+        force_fresh,
+        analysis_generation: None,
+    };
+
+    // Populate the cache (Fresh), then change the transitive dependency + bump the
+    // generation so the entry is stale.
+    let baseline = service.handle_file_size_document(make(1, false)).raw_bytes;
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("dependent-lib")
+            .join("helper.js"),
+        "export const helper = 'a substantially larger changed dependency payload value';",
+    )
+    .expect("helper should be updated");
+    import_lens_daemon::cache::memory::bump_cache_generation();
+
+    // force_fresh = false → stale-while-revalidate: serve the last-known value flagged
+    // Stale, size unchanged.
+    let stale = service.handle_file_size_document(make(2, false));
+    assert!(
+        stale
+            .imports
+            .iter()
+            .any(|result| matches!(result.freshness.kind, FreshnessKind::Stale)),
+        "force_fresh=false serves the stale value flagged Stale: {stale:?}"
+    );
+
+    // force_fresh = true → recompute synchronously: Fresh, and reflecting the changed
+    // dependency (different size), never the stale value.
+    let fresh = service.handle_file_size_document(make(3, true));
+    assert!(
+        fresh
+            .imports
+            .iter()
+            .all(|result| matches!(result.freshness.kind, FreshnessKind::Fresh)),
+        "force_fresh=true recomputes fresh: {fresh:?}"
+    );
+    assert_ne!(
+        fresh.raw_bytes, baseline,
+        "force_fresh reflects the changed dependency"
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[test]
+fn file_size_document_force_fresh_recomputes_on_unknown_dependency() {
+    // §4.5 / Finding 13b: the force-fresh (CI / `importlens check`) path serves cache
+    // via the evicting `get`, which on `Freshness::Unknown` (a transient stat/read
+    // error on a dependency) KEEPS the entry and returns it with `cache_hit = true`
+    // and freshness left at its stored default (`Fresh`) — so CI could judge a budget
+    // against an unverified last-known value it is told is verified. force_fresh must
+    // recompute synchronously instead of serving that laundered value.
+    let workspace = temp_workspace();
+    write_dependent_package(&workspace, "export const helper = 1;");
+    let service = ImportLensService::new(None, false);
+    let document = active_document_path(&workspace);
+    let source = "import { value } from 'dependent-lib';".to_owned();
+    let make = |request_id: u64, force_fresh: bool| FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document.clone(),
+        source: source.clone(),
+        force_fresh,
+        analysis_generation: None,
+    };
+
+    // Populate the cache (Fresh).
+    service.handle_file_size_document(make(1, false));
+
+    // Sanity check: with the dependency untouched, force_fresh still serves the
+    // genuinely verified Fresh hit — the fast path this fix must not regress.
+    let still_fresh = service.handle_file_size_document(make(2, true));
+    assert_eq!(still_fresh.imports.len(), 1, "{still_fresh:?}");
+    assert!(
+        still_fresh.imports[0].cache_hit,
+        "force_fresh should still serve a genuinely verified Fresh hit: {still_fresh:?}"
+    );
+
+    // Make the cached entry's dependency fingerprint unverifiable: swap the real
+    // `helper.js` (its cached fingerprint carries a content hash captured at analysis
+    // time) for a directory at the same path. The mtime+len pre-filter never matches a
+    // directory, so `check_fingerprint` falls to its content-hash `fs::read`, which
+    // fails on a directory with a non-`NotFound` error → `Freshness::Unknown`
+    // (deterministic, no mocking — the B3 technique from
+    // freshness_core.rs/result_freshness.rs). Bump the generation so the lookup takes
+    // the slow re-verify path instead of the TTL fast path (mirrors
+    // `file_size_document_force_fresh_bypasses_serve_stale` above).
+    let helper_path = workspace
+        .join("node_modules")
+        .join("dependent-lib")
+        .join("helper.js");
+    fs::remove_file(&helper_path).expect("helper.js should be removable");
+    fs::create_dir(&helper_path).expect("helper.js path should become a directory");
+    import_lens_daemon::cache::memory::bump_cache_generation();
+
+    // force_fresh = true, dependency now Unknown → must recompute synchronously,
+    // never serve the cached value just because the evicting `get` treats Unknown as
+    // "keep". `cache_hit` is set exclusively by the cache-serve paths (never by a
+    // fresh `analyze_and_cache`), so `cache_hit == false` is a direct signal that a
+    // real recompute ran instead of a cache serve.
+    let recomputed = service.handle_file_size_document(make(3, true));
+    assert_eq!(recomputed.imports.len(), 1, "{recomputed:?}");
+    assert!(
+        !recomputed.imports[0].cache_hit,
+        "force_fresh must recompute (never serve the cached value) when the dependency \
+         cannot be verified (Unknown): {recomputed:?}"
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[test]
+fn entry_with_missing_dependency_self_heals_on_access() {
+    use import_lens_daemon::ipc::protocol::FreshnessKind;
+
+    // §7 / §4.3: a cached entry whose transitive dependency is DELETED (NotFound ->
+    // Gone) is evicted and recomputed on the next NORMAL access -- proving path-missing
+    // reclaim needs no orphan scan. This exercises the freshness probe alone (no
+    // name-invalidation call): a GONE dependency, unlike a merely CHANGED one (Stale,
+    // which is served stale-while-revalidating -- see
+    // `file_size_document_force_fresh_bypasses_serve_stale`), must NEVER be served
+    // stale. It evicts even on the serve-stale read path and recomputes synchronously.
+    let workspace = temp_workspace();
+    write_dependent_package(&workspace, "export const helper = 1;");
+    let service = ImportLensService::new(None, false);
+    let document = active_document_path(&workspace);
+    let source = "import { value } from 'dependent-lib';".to_owned();
+    // NORMAL (serve-stale) reads throughout -- force_fresh stays false, so any recompute
+    // is driven by the freshness probe evicting the Gone entry, not by a force-fresh
+    // bypass.
+    let make = |request_id: u64| FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document.clone(),
+        source: source.clone(),
+        force_fresh: false,
+        analysis_generation: None,
+    };
+
+    // Populate the cache, then confirm the second normal read is genuinely a cache hit.
+    let baseline = service.handle_file_size_document(make(1));
+    assert_eq!(baseline.imports.len(), 1, "{baseline:?}");
+    let cached = service.handle_file_size_document(make(2));
+    assert!(
+        cached.imports[0].cache_hit,
+        "precondition: the entry must be cached before the dependency is deleted: {cached:?}"
+    );
+
+    // Delete the transitive dependency (helper.js): its next fingerprint stat reports
+    // NotFound -> Gone. Bump the generation as a real node_modules mutation would (the
+    // extension fires NodeModulesChanged), taking the entry off the TTL fast path onto
+    // re-verification -- the same seam the automatic reclaim rides in production.
+    let helper_path = workspace
+        .join("node_modules")
+        .join("dependent-lib")
+        .join("helper.js");
+    fs::remove_file(&helper_path).expect("helper.js should be removable");
+    import_lens_daemon::cache::memory::bump_cache_generation();
+
+    // Next NORMAL access self-heals: the Gone dependency evicts the entry and a real
+    // recompute runs. `cache_hit` is set exclusively by the cache-serve paths, so
+    // `cache_hit == false` is a direct signal the entry was reclaimed and recomputed,
+    // never served stale.
+    let healed = service.handle_file_size_document(make(3));
+
+    fs::remove_dir_all(&workspace).ok();
+    assert_eq!(healed.imports.len(), 1, "{healed:?}");
+    assert!(
+        !healed.imports[0].cache_hit,
+        "a Gone dependency must evict + recompute on access, never serve stale: {healed:?}"
+    );
+    assert!(
+        !matches!(healed.imports[0].freshness.kind, FreshnessKind::Stale),
+        "path-missing reclaim recomputes fresh; a Gone entry is never flagged Stale: {healed:?}"
+    );
+}
+
+#[test]
+fn revalidate_document_sizes_recomputes_only_stale_specifiers() {
+    use std::collections::HashSet;
+
+    let workspace = temp_workspace();
+    write_dependent_package(&workspace, "export const helper = 1;");
+    write_tiny_package_with_source(&workspace, "export const value = 'tiny';");
+    let service = ImportLensService::new(None, false);
+    let document = active_document_path(&workspace);
+    let source =
+        "import { value } from 'dependent-lib';\nimport { value as t } from 'tiny-lib';".to_owned();
+    let request = FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document,
+        source,
+        force_fresh: false,
+        analysis_generation: None,
+    };
+
+    // Only `dependent-lib` is flagged stale. A fresh sibling (`tiny-lib`) must NOT be
+    // recomputed — one changed dep must not trigger a full re-analysis of the file.
+    let stale = HashSet::from(["dependent-lib".to_owned()]);
+    let (_, _, results, identities) = service
+        .revalidate_document_sizes(&request, &stale, || true)
+        .expect("a stale specifier should produce a refreshed result");
+
+    let specifiers = results
+        .iter()
+        .map(|result| result.specifier.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        specifiers,
+        vec!["dependent-lib"],
+        "only the stale specifier is recomputed, not the fresh sibling: {specifiers:?}"
+    );
+    // The push carries a per-import identity index-aligned 1:1 with the results.
+    assert_eq!(
+        identities.len(),
+        results.len(),
+        "identities are index-aligned with results"
+    );
+    assert_eq!(identities[0].specifier, "dependent-lib");
+
+    // An empty stale set is a no-op (nothing to revalidate).
+    assert!(
+        service
+            .revalidate_document_sizes(&request, &HashSet::new(), || true)
+            .is_none(),
+        "an empty stale set recomputes nothing"
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[test]
+fn revalidate_document_sizes_bails_when_superseded() {
+    use std::collections::HashSet;
+
+    // F3-B: a background revalidation whose document has been superseded (its
+    // continuation predicate returns false) must bail before the expensive
+    // recompute rather than recomputing a result no client will use.
+    let workspace = temp_workspace();
+    write_dependent_package(&workspace, "export const helper = 1;");
+    let service = ImportLensService::new(None, false);
+    let request = FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        source: "import { value } from 'dependent-lib';".to_owned(),
+        force_fresh: false,
+        analysis_generation: None,
+    };
+    let stale = HashSet::from(["dependent-lib".to_owned()]);
+
+    assert!(
+        service
+            .revalidate_document_sizes(&request, &stale, || false)
+            .is_none(),
+        "a superseded revalidation recomputes nothing"
+    );
+    // Control: with a live continuation the same stale specifier still recomputes.
+    assert!(
+        service
+            .revalidate_document_sizes(&request, &stale, || true)
+            .is_some(),
+        "a live revalidation still recomputes the stale specifier"
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[test]
+fn revalidate_document_sizes_omits_non_cacheable_results() {
+    use std::collections::HashSet;
+
+    let workspace = temp_workspace();
+    write_missing_export_effectful_package(&workspace);
+    let service = ImportLensService::new(None, false);
+    let request = FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        source: "import { missing } from 'missing-effectful-lib';".to_owned(),
+        force_fresh: false,
+        analysis_generation: None,
+    };
+    let stale = HashSet::from(["missing-effectful-lib".to_owned()]);
+
+    assert!(
+        service
+            .revalidate_document_sizes(&request, &stale, || true)
+            .is_none(),
+        "SWR must not push request-specific diagnostics over a good stale value"
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[test]
+fn revalidate_document_sizes_distinguishes_same_specifier_variants() {
+    use std::collections::HashSet;
+
+    // Two imports of the SAME package differing only by import kind / named exports
+    // (default vs named). They share a specifier, so the push MUST carry a per-import
+    // identity that distinguishes them — otherwise the client collapses them by
+    // specifier and stamps one variant's size onto both (Finding 9).
+    let workspace = temp_workspace();
+    // Both a default AND a named export, so BOTH import variants resolve cleanly and
+    // are cacheable: RB-13 now filters non-cacheable results (e.g. a default import of
+    // a named-only package, which carries a missing-export diagnostic) off the SWR
+    // push, so a valid default export is required for the Default variant to be pushed.
+    write_tiny_package_with_source(
+        &workspace,
+        "export default 42;\nexport const value = 'tiny';",
+    );
+    let service = ImportLensService::new(None, false);
+    let document = active_document_path(&workspace);
+    let source = "import def from 'tiny-lib';\nimport { value } from 'tiny-lib';".to_owned();
+    let request = FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document,
+        source,
+        force_fresh: false,
+        analysis_generation: Some(7),
+    };
+
+    // Both variants share the specifier `tiny-lib`, so both are recomputed.
+    let stale = HashSet::from(["tiny-lib".to_owned()]);
+    let (_, _, results, identities) = service
+        .revalidate_document_sizes(&request, &stale, || true)
+        .expect("stale same-specifier variants should produce refreshed results");
+
+    assert_eq!(
+        results.len(),
+        2,
+        "both same-specifier variants recompute: {results:?}"
+    );
+    assert_eq!(
+        identities.len(),
+        results.len(),
+        "identities align 1:1 with results"
+    );
+    assert!(
+        identities
+            .iter()
+            .all(|identity| identity.specifier == "tiny-lib"),
+        "both identities carry the shared specifier: {identities:?}"
+    );
+    // The identities differ by import kind, so the client can tell the variants apart
+    // even though the specifier is identical.
+    let has_default = identities
+        .iter()
+        .any(|identity| matches!(identity.import_kind, ImportKind::Default));
+    let has_named = identities
+        .iter()
+        .any(|identity| matches!(identity.import_kind, ImportKind::Named));
+    assert!(
+        has_default && has_named,
+        "the two variants are distinguished by import kind: {identities:?}"
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
 #[test]
@@ -930,6 +1346,134 @@ fn service_bulk_invalidation_is_scoped_to_changed_packages() {
 }
 
 #[test]
+fn service_skips_unmappable_package_json_paths_and_targets_only_mappable_ones() {
+    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+        .lock()
+        .expect("graph cache test lock should be available");
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    write_named_package(&workspace, "other-lib");
+    let service = ImportLensService::new(None, false);
+
+    let _ = service.handle_batch(batch(&workspace, 1));
+    let _ = service.handle_batch(package_batch(&workspace, 2, "other-lib", "value"));
+
+    let tiny_lib_path = workspace
+        .join("node_modules")
+        .join("tiny-lib")
+        .join("package.json")
+        .to_string_lossy()
+        .to_string();
+    // No "/node_modules/" segment anywhere in this path, so
+    // `package_name_from_package_json_path` returns `None` for it -- the same
+    // shape an unusual layout (pnpm's `.pnpm/…` store, a symlinked package, or
+    // any structure the mapper doesn't recognize) would produce on a routine
+    // install.
+    let unmappable_path = workspace.join("package.json").to_string_lossy().to_string();
+
+    let invalidated = service.invalidate_package_json_paths(&[tiny_lib_path, unmappable_path]);
+
+    let after_tiny = service.handle_batch(batch(&workspace, 3));
+    let after_other = service.handle_batch(package_batch(&workspace, 4, "other-lib", "value"));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(invalidated);
+    assert!(
+        !after_tiny.imports[0].cache_hit,
+        "the mappable path's package must still be invalidated"
+    );
+    assert!(
+        after_other.imports[0].cache_hit,
+        "an unrelated cached package must survive -- one unmappable path must not trigger invalidate_all"
+    );
+}
+
+#[test]
+fn service_invalidates_all_when_every_package_json_path_is_unmappable() {
+    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+        .lock()
+        .expect("graph cache test lock should be available");
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    write_named_package(&workspace, "other-lib");
+    let service = ImportLensService::new(None, false);
+
+    let _ = service.handle_batch(batch(&workspace, 1));
+    let _ = service.handle_batch(package_batch(&workspace, 2, "other-lib", "value"));
+
+    let unmappable_path = workspace.join("package.json").to_string_lossy().to_string();
+
+    let invalidated = service.invalidate_package_json_paths(&[unmappable_path]);
+
+    let after_tiny = service.handle_batch(batch(&workspace, 3));
+    let after_other = service.handle_batch(package_batch(&workspace, 4, "other-lib", "value"));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(invalidated);
+    assert!(
+        !after_tiny.imports[0].cache_hit,
+        "a wholly unmappable, non-empty batch must fall back to invalidate_all"
+    );
+    assert!(
+        !after_other.imports[0].cache_hit,
+        "a wholly unmappable, non-empty batch must fall back to invalidate_all"
+    );
+}
+
+#[test]
+fn node_modules_change_reclaims_uninstalled_package_entries() {
+    // §7 / B5: an UNINSTALLED package's cached entries are reclaimed AUTOMATICALLY by
+    // the `NodeModulesChanged` event (targeted name invalidation) -- no orphan scan and
+    // no user action. `invalidate_package_json_paths` maps the package name from the
+    // manifest PATH STRING, so it still targets the right package after the manifest is
+    // gone (it never stats or reads the deleted file). A sibling package that is still
+    // installed must survive, proving the reclaim is targeted, not a workspace nuke.
+    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+        .lock()
+        .expect("graph cache test lock should be available");
+    let workspace = temp_workspace();
+    write_package(&workspace); // node_modules/tiny-lib
+    write_named_package(&workspace, "other-lib");
+    let service = ImportLensService::new(None, false);
+
+    // Cache both packages.
+    let _ = service.handle_batch(batch(&workspace, 1));
+    let _ = service.handle_batch(package_batch(&workspace, 2, "other-lib", "value"));
+
+    // Uninstall tiny-lib entirely (manifest + entry gone); other-lib stays installed.
+    fs::remove_dir_all(workspace.join("node_modules").join("tiny-lib"))
+        .expect("tiny-lib should be uninstallable");
+
+    // The extension observes the node_modules mutation and fires `NodeModulesChanged`
+    // with the (now-removed) tiny-lib manifest path -- the automatic reclaim path.
+    let manifest_path = workspace
+        .join("node_modules")
+        .join("tiny-lib")
+        .join("package.json")
+        .to_string_lossy()
+        .to_string();
+    let invalidated = service.invalidate_package_json_paths(&[manifest_path]);
+
+    let after_tiny = service.handle_batch(batch(&workspace, 3));
+    let after_other = service.handle_batch(package_batch(&workspace, 4, "other-lib", "value"));
+
+    fs::remove_dir_all(&workspace).ok();
+    assert!(
+        invalidated,
+        "a mappable manifest path must invalidate by name even after the package is \
+         uninstalled -- the name comes from the path string, never a stat of the file"
+    );
+    assert!(
+        !after_tiny.imports[0].cache_hit,
+        "the uninstalled package's entries must be reclaimed automatically (no orphan scan)"
+    );
+    assert!(
+        after_other.imports[0].cache_hit,
+        "a still-installed sibling must survive -- the reclaim is targeted, not a nuke"
+    );
+}
+
+#[test]
 fn service_processes_batch_and_serves_second_request_from_cache() {
     let workspace = temp_workspace();
     write_package(&workspace);
@@ -1008,7 +1552,7 @@ fn service_reports_and_removes_per_project_cache_shards() {
         &right_workspace,
         "export const value = 'right workspace has different package bytes';",
     );
-    let service = ImportLensService::new_with_cache_policy(Some(storage.clone()), true, 512, 30);
+    let service = ImportLensService::new_with_cache_policy(Some(storage.clone()), true, 512, 32);
 
     let _ = service.handle_batch(batch(&left_workspace, 1));
     let _ = service.handle_batch(batch(&right_workspace, 2));
@@ -1051,6 +1595,314 @@ fn service_reports_and_removes_per_project_cache_shards() {
     fs::remove_dir_all(left_workspace).expect("left workspace should be removed");
     fs::remove_dir_all(right_workspace).expect("right workspace should be removed");
     fs::remove_dir_all(storage).expect("cache storage should be removed");
+}
+
+#[test]
+fn cache_status_reports_total_budget_registry_and_per_project_counts() {
+    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+        .lock()
+        .expect("graph cache test lock should be available");
+    let storage = common::temp_workspace("import-lens-service-cache-status-observability");
+    let left_workspace = temp_workspace();
+    let right_workspace = temp_workspace();
+    write_package(&left_workspace);
+    write_tiny_package_with_source(
+        &right_workspace,
+        "export const value = 'right workspace has different package bytes';",
+    );
+    let max_size_mb = 512u64;
+    let service =
+        ImportLensService::new_with_cache_policy(Some(storage.clone()), true, max_size_mb, 32);
+
+    // Two analyses seed two disk shards, each holding at least one entry.
+    let _ = service.handle_batch(batch(&left_workspace, 1));
+    let _ = service.handle_batch(batch(&right_workspace, 2));
+
+    // Baseline registry size BEFORE seeding a hint: the empty snapshot still
+    // serializes to a small non-zero envelope, so seeding must grow it.
+    let before = service.cache_status(CacheStatusRequest {
+        message_type: "cache_status".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 3,
+        workspace_root: Some(left_workspace.to_string_lossy().to_string()),
+    });
+
+    service
+        .registry_hints_for_tests()
+        .write_metadata_for_tests("observability-pkg", "1.0.0", 100);
+
+    let status = service.cache_status(CacheStatusRequest {
+        message_type: "cache_status".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 4,
+        workspace_root: Some(left_workspace.to_string_lossy().to_string()),
+    });
+
+    assert_eq!(status.project_count, 2);
+    // `budget_bytes` is the configured cache size expressed in bytes.
+    assert_eq!(status.budget_bytes, max_size_mb * 1024 * 1024);
+    // `total_bytes` sums every shard's logical (envelope) bytes from the C1
+    // rollup; both seeded shards hold entries, so it is non-zero and can never
+    // exceed the physical on-disk footprint.
+    assert!(status.total_bytes > 0, "{status:?}");
+    assert!(status.total_bytes <= status.total_size_bytes, "{status:?}");
+    // Seeding a registry hint grows the serialized registry snapshot.
+    assert!(status.registry_size_bytes > 0, "{status:?}");
+    assert!(
+        status.registry_size_bytes > before.registry_size_bytes,
+        "seeding a registry hint must grow registry_size_bytes: {before:?} -> {status:?}"
+    );
+    // The current project's per-project entry count comes from the O(1) rollup.
+    let current = status
+        .current_project
+        .as_ref()
+        .expect("left workspace shard should be the current project");
+    assert!(current.entry_count >= 1, "{current:?}");
+
+    fs::remove_dir_all(left_workspace).expect("left workspace should be removed");
+    fs::remove_dir_all(right_workspace).expect("right workspace should be removed");
+    fs::remove_dir_all(storage).expect("cache storage should be removed");
+}
+
+#[test]
+fn user_clear_bumps_generation_so_inflight_insert_revalidates() {
+    let service = ImportLensService::new(None, false);
+    let before = import_lens_daemon::cache::memory::cache_generation();
+
+    let response = service.remove_cache(CacheRemoveRequest {
+        message_type: "cache_remove".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        scope: CacheRemoveScope::All,
+        workspace_root: None,
+        shard_ids: None,
+    });
+
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(
+        import_lens_daemon::cache::memory::cache_generation() > before,
+        "every mutating clear scope must bump the generation (X-17)"
+    );
+}
+
+#[test]
+fn user_clear_bumps_generation_for_current_project_and_selected_scopes() {
+    let workspace = temp_workspace();
+
+    // Both cases have nothing to actually remove (no shard was ever cached for
+    // this workspace; the selected-shard list is empty) -- the bump must still
+    // fire unconditionally for any non-error scope (X-17).
+    for (scope, workspace_root, shard_ids) in [
+        (
+            CacheRemoveScope::CurrentProject,
+            Some(workspace.to_string_lossy().to_string()),
+            None,
+        ),
+        (CacheRemoveScope::Selected, None, Some(Vec::new())),
+    ] {
+        let service = ImportLensService::new(None, false);
+        let before = import_lens_daemon::cache::memory::cache_generation();
+
+        let response = service.remove_cache(CacheRemoveRequest {
+            message_type: "cache_remove".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 1,
+            scope,
+            workspace_root,
+            shard_ids,
+        });
+
+        assert!(response.error.is_none(), "{response:?}");
+        assert!(
+            import_lens_daemon::cache::memory::cache_generation() > before,
+            "scope must bump the generation even when nothing matched (X-17)"
+        );
+    }
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[test]
+fn remove_registry_scope_clears_only_registry() {
+    let storage = common::temp_workspace("import-lens-registry-scope-storage");
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    let service = ImportLensService::new_with_cache_policy(Some(storage.clone()), true, 512, 32);
+
+    // Seed BOTH a bundle shard (a real analysis) and a registry hint.
+    let _ = service.handle_batch(batch(&workspace, 1));
+    service
+        .registry_hints_for_tests()
+        .write_metadata_for_tests("registry-scope-pkg", "1.0.0", 100);
+
+    let target = RegistryHintTarget {
+        name: "registry-scope-pkg".to_owned(),
+        installed_version: None,
+    };
+    assert!(
+        service
+            .refresh_registry_hint_target(target.clone(), RegistryHintMode::Cached, 100)
+            .hint
+            .is_some(),
+        "registry hint should be seeded before the clear"
+    );
+    let seeded_status = service.cache_status(CacheStatusRequest {
+        message_type: "cache_status".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 2,
+        workspace_root: Some(workspace.to_string_lossy().to_string()),
+    });
+    assert_eq!(
+        seeded_status.project_count, 1,
+        "bundle shard should be seeded before the clear"
+    );
+
+    let before_gen = import_lens_daemon::cache::memory::cache_generation();
+
+    let response = service.remove_cache(CacheRemoveRequest {
+        message_type: "cache_remove".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 3,
+        scope: CacheRemoveScope::Registry,
+        workspace_root: None,
+        shard_ids: None,
+    });
+
+    // A registry-only clear reports no shard removals and no failures (honest:
+    // it must not claim bundle-shard removals it never made).
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(
+        response.removed.is_empty() && response.failed.is_empty(),
+        "Registry scope must not touch bundle shards: {response:?}"
+    );
+
+    // The registry hint is gone...
+    assert!(
+        service
+            .refresh_registry_hint_target(target, RegistryHintMode::Cached, 100)
+            .hint
+            .is_none(),
+        "Registry scope must clear the npm-hint store"
+    );
+
+    // ...but the bundle shard SURVIVES.
+    let after_status = service.cache_status(CacheStatusRequest {
+        message_type: "cache_status".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 4,
+        workspace_root: Some(workspace.to_string_lossy().to_string()),
+    });
+    assert_eq!(
+        after_status.project_count, 1,
+        "Registry scope must leave bundle shards intact"
+    );
+
+    // Every mutating scope bumps the generation (X-17).
+    assert!(
+        import_lens_daemon::cache::memory::cache_generation() > before_gen,
+        "Registry scope must bump the cache generation"
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    fs::remove_dir_all(&storage).expect("cache storage should be removed");
+}
+
+#[test]
+fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
+    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+        .lock()
+        .expect("graph cache test lock should be available");
+
+    // No disk bundle cache -> `remove_all` removes zero shards, exercising the
+    // X-21 "no shard removed" path where the derived caches must still be
+    // dropped unconditionally.
+    let service =
+        ImportLensService::new_with_registry_hints_for_tests(RegistryHintService::disabled());
+
+    // Seed the registry hint store (observable via a cached-mode lookup).
+    service
+        .registry_hints_for_tests()
+        .write_metadata_for_tests("clear-all-pkg", "1.0.0", 100);
+    let target = RegistryHintTarget {
+        name: "clear-all-pkg".to_owned(),
+        installed_version: None,
+    };
+    assert!(
+        service
+            .refresh_registry_hint_target(target.clone(), RegistryHintMode::Cached, 100)
+            .hint
+            .is_some(),
+        "registry hint should be seeded before the clear"
+    );
+
+    // Seed L1 (file-size aggregate) under a unique document path.
+    let l1_workspace = temp_workspace();
+    let l1_path = l1_workspace.join("src").join("l1-doc.ts");
+    shared_file_size_cache().insert(l1_path.clone(), 1, FileSizeComputation::default());
+    assert!(
+        shared_file_size_cache().contains_path(&l1_path),
+        "L1 aggregate should be seeded before the clear"
+    );
+
+    // Seed the module-graph cache under a unique entry that exists on disk.
+    let graph_workspace = temp_workspace();
+    let graph_entry = graph_workspace.join("entry.ts");
+    fs::write(&graph_entry, "export const value = 1;\n").expect("graph entry should be written");
+    let _ = build_module_graph_cached(&graph_entry).expect("module graph should build");
+    assert!(
+        peek_cached_module_paths(&graph_entry, ImportRuntime::Component).is_some(),
+        "module graph should be seeded before the clear"
+    );
+
+    let before_resolvers = shared_resolvers();
+    let before_gen = import_lens_daemon::cache::memory::cache_generation();
+
+    let response = service.remove_cache(CacheRemoveRequest {
+        message_type: "cache_remove".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        scope: CacheRemoveScope::All,
+        workspace_root: None,
+        shard_ids: None,
+    });
+
+    assert!(response.error.is_none(), "{response:?}");
+    assert!(
+        response.removed.is_empty(),
+        "no shard should have been removed -- the X-21 condition: {response:?}"
+    );
+
+    // Registry hint store cleared (X-14).
+    assert!(
+        service
+            .refresh_registry_hint_target(target, RegistryHintMode::Cached, 100)
+            .hint
+            .is_none(),
+        "All must clear the registry hint store"
+    );
+    // Shared resolvers invalidated -- a fresh ResolverSet was published (X-16).
+    assert!(
+        !Arc::ptr_eq(&before_resolvers, &shared_resolvers()),
+        "All must invalidate the shared resolvers"
+    );
+    // L1 aggregate cache cleared even though no shard was removed (X-21).
+    assert!(
+        !shared_file_size_cache().contains_path(&l1_path),
+        "All must clear the L1 file-size cache even when no shard was removed"
+    );
+    // Module-graph cache cleared even though no shard was removed (X-21).
+    assert!(
+        peek_cached_module_paths(&graph_entry, ImportRuntime::Component).is_none(),
+        "All must clear the module-graph cache even when no shard was removed"
+    );
+    // Generation bumped (X-17).
+    assert!(
+        import_lens_daemon::cache::memory::cache_generation() > before_gen,
+        "All must bump the cache generation"
+    );
+
+    fs::remove_dir_all(&l1_workspace).expect("l1 workspace should be removed");
+    fs::remove_dir_all(&graph_workspace).expect("graph workspace should be removed");
 }
 
 #[test]
@@ -1446,7 +2298,7 @@ fn protocol_error_exports_response_returns_request_scoped_error() {
 fn package_json_analysis_includes_cached_registry_hints_when_requested() {
     let workspace = temp_workspace();
     write_package(&workspace);
-    let service = ImportLensService::new_with_cache_policy(None, false, 512, 30);
+    let service = ImportLensService::new_with_cache_policy(None, false, 512, 32);
     service
         .registry_hints_for_tests()
         .write_metadata_for_tests("tiny-lib", "1.1.0", 100);

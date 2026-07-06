@@ -13,7 +13,7 @@ export const classifyImportLensConfigChange = (
     return "daemonRestart";
   }
 
-  if (event.affectsConfiguration("importLens.cacheMaxAgeDays")) {
+  if (event.affectsConfiguration("importLens.registryCacheMaxSizeMB")) {
     return "daemonRestart";
   }
 

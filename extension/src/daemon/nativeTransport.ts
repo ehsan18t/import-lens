@@ -12,8 +12,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  CacheCleanupRequest,
-  CacheCleanupResponse,
   CacheListRequest,
   CacheListResponse,
   CacheRemoveRequest,
@@ -27,6 +25,7 @@ import type {
   FileSizeDocumentRequest,
   FileSizeDocumentResponse,
   HelloMessage,
+  RefreshedResultsResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
   WorkspaceReportRequest,
@@ -45,7 +44,12 @@ import { RecycleGuard } from "./recycleGuard.js";
 import { recentCrashTimes, restartDelayMs, shouldEnterCrashDegradedMode } from "./restartPolicy.js";
 import { resolveDaemonStartRoot } from "./startRoot.js";
 import { type DaemonStorageContext, resolveDaemonStoragePaths } from "./storagePaths.js";
-import type { AnalysisTransport, DaemonState, DaemonStateEvent } from "./transport.js";
+import type {
+  AnalysisTransport,
+  DaemonRefreshedResultsEvent,
+  DaemonState,
+  DaemonStateEvent,
+} from "./transport.js";
 
 const STABLE_SESSION_RESET_MS = 60_000;
 const CLEAN_RECYCLE_SESSION_MS = 30 * 60 * 1000;
@@ -64,6 +68,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
   readonly #logger: Logger;
   readonly #recycleGuard: RecycleGuard;
   readonly #stateListeners = new Set<(state: DaemonState) => void>();
+  readonly #refreshedResultsListeners = new Set<(message: RefreshedResultsResponse) => void>();
   #process: ChildProcessWithoutNullStreams | null = null;
   #client: IpcClient | null = null;
   #state: DaemonState = "unavailable";
@@ -104,6 +109,16 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return {
       dispose: () => {
         this.#stateListeners.delete(listener);
+      },
+    };
+  };
+
+  readonly onRefreshedResults: DaemonRefreshedResultsEvent = (listener) => {
+    this.#refreshedResultsListeners.add(listener);
+
+    return {
+      dispose: () => {
+        this.#refreshedResultsListeners.delete(listener);
       },
     };
   };
@@ -223,6 +238,15 @@ export class NativeDaemonTransport implements AnalysisTransport {
       }
 
       this.#handleUnexpectedDisconnect();
+    });
+
+    client.on("refreshedResults", (message: RefreshedResultsResponse) => {
+      if (client !== this.#client) {
+        this.#logger.debug("Ignoring stale daemon refreshed-results event.");
+        return;
+      }
+
+      this.#emitRefreshedResults(message);
     });
 
     try {
@@ -481,18 +505,6 @@ export class NativeDaemonTransport implements AnalysisTransport {
     return this.#client.requestCacheStatus(request);
   }
 
-  async cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null> {
-    if (!this.#client || this.#state !== "ready") {
-      this.#logger.warn(
-        `Cache cleanup request ${request.request_id} skipped because daemon is ${this.#state}.`,
-      );
-      return null;
-    }
-
-    this.#logger.info(`Requesting cache cleanup ${request.request_id}.`);
-    return this.#client.requestCacheCleanup(request);
-  }
-
   async listCache(request: CacheListRequest): Promise<CacheListResponse | null> {
     if (!this.#client || this.#state !== "ready") {
       this.#logger.warn(
@@ -643,6 +655,12 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
   }
 
+  #emitRefreshedResults(message: RefreshedResultsResponse): void {
+    for (const listener of this.#refreshedResultsListeners) {
+      listener(message);
+    }
+  }
+
   async #verifyBinary(relativePath: string, binaryPath: string): Promise<boolean> {
     const expectedHash = knownDaemonHashes[relativePath];
 
@@ -683,7 +701,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       storage_path: storagePaths.cacheBasePath,
       enable_disk_cache: config.enableDiskCache,
       cache_max_size_mb: config.cacheMaxSizeMB,
-      cache_max_age_days: config.cacheMaxAgeDays,
+      registry_cache_max_size_mb: config.registryCacheMaxSizeMB,
       log_level: config.logLevel,
     };
   }

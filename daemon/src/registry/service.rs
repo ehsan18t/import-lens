@@ -1,9 +1,10 @@
 use super::{
     cache::{self, RegistryMetadataCache},
     constants::{
-        FRESH_HINT_TTL_MS, MAX_ATTEMPTS, NOT_FOUND_TTL_MS, REGISTRY_BODY_TOO_LARGE_ERROR,
-        REGISTRY_RATE_LIMIT_REQUESTS, REGISTRY_RATE_LIMIT_WINDOW_MS, REGISTRY_RETRY_BASE_DELAY_MS,
-        TRANSIENT_ERROR_RETRY_MS,
+        FRESH_HINT_TTL_MS, MANUAL_REFRESH_COOLDOWN_MS, MAX_ATTEMPTS, NOT_FOUND_TTL_MS,
+        REGISTRY_BODY_TOO_LARGE_ERROR, REGISTRY_MANUAL_RATE_LIMIT_REQUESTS,
+        REGISTRY_MAX_BACKOFF_MS, REGISTRY_RATE_LIMIT_REQUESTS, REGISTRY_RATE_LIMIT_WINDOW_MS,
+        REGISTRY_RETRY_BASE_DELAY_MS, TRANSIENT_ERROR_RETRY_MS,
     },
     types::{
         HttpRegistryResponse, RegistryHintLookup, RegistryHintOrigin, RegistryHttpClient,
@@ -32,6 +33,12 @@ pub struct RegistryHintService {
     client: Box<dyn RegistryHttpClient>,
     in_flight: Mutex<HashMap<String, Arc<InflightRegistryPackageFetch>>>,
     rate_limiter: Mutex<RegistryRateLimiter>,
+    /// Monotonic instant of the last SUCCESSFUL manual (`ForceRefresh`) fetch per
+    /// package. A re-click whose entry is younger than `MANUAL_REFRESH_COOLDOWN_MS`
+    /// coalesces to the cached value instead of firing a fresh request (D5). Kept
+    /// in memory only (never serialized) because `Instant` is monotonic and
+    /// process-local.
+    manual_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 struct InflightRegistryPackageFetch {
@@ -85,13 +92,39 @@ impl Drop for InflightFetchGuard<'_> {
 struct RegistryRateLimiter {
     window_opens_at: Instant,
     request_count: usize,
+    /// Global Retry-After floor: no reservation — manual or background — may
+    /// proceed before this monotonic instant. A `429 Retry-After` pushes it
+    /// forward so the whole daemon honors the registry's ask (D6), not just the
+    /// rate-limited package's per-entry retry window.
+    backoff_until: Instant,
 }
 
 impl RegistryRateLimiter {
     fn new() -> Self {
+        let now = Instant::now();
         Self {
-            window_opens_at: Instant::now(),
+            window_opens_at: now,
             request_count: 0,
+            // Already elapsed: no backoff in effect until a 429 installs one.
+            backoff_until: now,
+        }
+    }
+
+    /// Installs a GLOBAL Retry-After backoff: every subsequent reservation waits
+    /// until `delay` from now elapses, regardless of window-slot availability.
+    /// Only ever pushes the floor forward — a later, shorter Retry-After never
+    /// shortens a longer one already in effect. Monotonic `Instant`, so a
+    /// wall-clock change cannot move the floor.
+    fn apply_retry_after(&mut self, delay: Duration) {
+        // Clamp the server-supplied Retry-After (RB-12): the pool is only
+        // `REGISTRY_REFRESH_CONCURRENCY` threads and a backing-off worker holds
+        // its single-flight slot across the wait, so an unclamped `Retry-After:
+        // 3600` would wedge every worker (and its waiters) for an hour,
+        // uncancellable. Cap the floor at `REGISTRY_MAX_BACKOFF_MS`.
+        let delay = delay.min(Duration::from_millis(REGISTRY_MAX_BACKOFF_MS));
+        let until = Instant::now() + delay;
+        if until > self.backoff_until {
+            self.backoff_until = until;
         }
     }
 
@@ -100,32 +133,42 @@ impl RegistryRateLimiter {
     /// serialize every registry worker during backoff and defeat the bounded
     /// concurrency this refresh path is built around.
     ///
+    /// `request_limit` is the per-window cap to enforce: background sweeps pass
+    /// the looser `REGISTRY_RATE_LIMIT_REQUESTS`, manual `ForceRefresh` the
+    /// stricter `REGISTRY_MANUAL_RATE_LIMIT_REQUESTS` (D6). Both share the one
+    /// window and `request_count`, so a manual fetch also counts against the
+    /// background budget; it simply throttles at the lower threshold.
+    ///
     /// `window_opens_at` may point into the future when a full window forced a
     /// caller to reserve the next one. Later callers must count against that
     /// reserved window (and sleep until it opens) instead of treating the
     /// reservation as a fresh open window, otherwise a burst fires everything
     /// after the boundary caller immediately.
-    fn reserve_slot(&mut self) -> Option<Duration> {
+    fn reserve_slot(&mut self, request_limit: usize) -> Option<Duration> {
         let window = Duration::from_millis(REGISTRY_RATE_LIMIT_WINDOW_MS);
         let now = Instant::now();
-        if now >= self.window_opens_at + window {
+        let window_wait = if now >= self.window_opens_at + window {
             // The most recently reserved window has fully elapsed: start a
             // fresh one right now.
             self.window_opens_at = now;
             self.request_count = 1;
-            return None;
-        }
-        if self.request_count < REGISTRY_RATE_LIMIT_REQUESTS {
+            Duration::ZERO
+        } else if self.request_count < request_limit {
             self.request_count += 1;
             // Sleep until the reserved window opens; a zero wait means the
             // window is already open and the caller may proceed immediately.
-            let wait = self.window_opens_at.saturating_duration_since(now);
-            return if wait.is_zero() { None } else { Some(wait) };
-        }
-        // The reserved window is full: reserve the first slot of the next one.
-        self.window_opens_at += window;
-        self.request_count = 1;
-        Some(self.window_opens_at.saturating_duration_since(now))
+            self.window_opens_at.saturating_duration_since(now)
+        } else {
+            // The reserved window is full for this budget: reserve the first
+            // slot of the next one.
+            self.window_opens_at += window;
+            self.request_count = 1;
+            self.window_opens_at.saturating_duration_since(now)
+        };
+        // The global Retry-After floor delays the reservation past whatever
+        // window slot it would otherwise get.
+        let wait = window_wait.max(self.backoff_until.saturating_duration_since(now));
+        if wait.is_zero() { None } else { Some(wait) }
     }
 }
 
@@ -136,6 +179,7 @@ impl RegistryHintService {
             client,
             in_flight: Mutex::new(HashMap::new()),
             rate_limiter: Mutex::new(RegistryRateLimiter::new()),
+            manual_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -145,6 +189,7 @@ impl RegistryHintService {
             client: Box::new(NoopRegistryHttpClient),
             in_flight: Mutex::new(HashMap::new()),
             rate_limiter: Mutex::new(RegistryRateLimiter::new()),
+            manual_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,6 +205,38 @@ impl RegistryHintService {
         }
     }
 
+    /// Serialized size in bytes of the shared npm-registry metadata snapshot, for
+    /// cache-status observability (§8/X-24). Delegates to the metadata cache's
+    /// single-measurement [`RegistryMetadataCache::serialized_size_bytes`]; the
+    /// disabled service's empty cache reports its small empty-envelope size.
+    pub fn registry_size_bytes(&self) -> u64 {
+        self.cache.serialized_size_bytes()
+    }
+
+    /// Clears the ENTIRE npm-hint metadata store via D-a's authoritative,
+    /// union-bypassing [`RegistryMetadataCache::clear`], so the cleared entries do
+    /// not resurrect from the shared on-disk file on the next save (X-14). Wired
+    /// to the `Registry` and `All` cache-remove scopes. No-op for the disabled
+    /// service (its empty cache has no backing file).
+    ///
+    /// Concurrent-write note: a background refresh that lands between the
+    /// in-memory wipe and the authoritative persist could re-seed one entry (the
+    /// dirty-flag race D-a flagged). That is acceptable for a user-triggered
+    /// clear — the stray entry is a fresh fetch, not stale data, and the next
+    /// maintenance pass reconciles it — and not worth serializing the refresh hot
+    /// path against clears.
+    pub fn clear(&self) {
+        // D-a: `clear` now writes the empty snapshot authoritatively and reports a
+        // failed write. Surface it at the service boundary (a user-triggered clear
+        // does not fail the request, but the failure must not be invisible).
+        if let Err(error) = self.cache.clear() {
+            logging::log_warn(
+                "registry",
+                format!("failed to persist cleared registry snapshot: {error}"),
+            );
+        }
+    }
+
     /// Prunes registry metadata past the retention window. Called from the
     /// user-triggered orphan purge so the shared metadata file stops growing
     /// monotonically. No-op for the disabled service. Returns the count removed.
@@ -168,6 +245,31 @@ impl RegistryHintService {
             crate::time::unix_millis_now(),
             crate::registry::constants::REGISTRY_RETENTION_MS,
         )
+    }
+
+    /// Runs the registry-store maintenance pass — 30-day retention prune plus the
+    /// `max_bytes` size cap, written authoritatively (D3 + D4 / §6.1) — and sweeps the
+    /// in-memory manual-refresh cooldown map (D-c). Called at daemon startup and on the
+    /// periodic cache-maintenance tick. No-op for the disabled service (its empty cache
+    /// has no backing file). Returns the total store entries removed (the cooldown
+    /// sweep is in-memory only and not counted).
+    pub fn run_maintenance(&self, now_ms: u64, max_bytes: u64) -> usize {
+        self.sweep_manual_cooldowns();
+        self.cache.run_maintenance(now_ms, max_bytes)
+    }
+
+    /// Prunes manual-refresh cooldown stamps whose window has fully elapsed. The map
+    /// gains one `(package, Instant)` per distinct manually-refreshed package and is
+    /// otherwise never pruned; once a stamp is older than `MANUAL_REFRESH_COOLDOWN_MS`
+    /// it can never suppress a refresh again (`manual_cooldown_active` tests
+    /// `elapsed() < cooldown`), so it is pure dead weight. Swept on the registry
+    /// maintenance pass (D-c). Uses monotonic `Instant::elapsed` — never a wall clock —
+    /// so a backward clock jump can neither wrongly retain nor wrongly drop a stamp.
+    fn sweep_manual_cooldowns(&self) {
+        let cooldown = Duration::from_millis(MANUAL_REFRESH_COOLDOWN_MS);
+        if let Ok(mut cooldowns) = self.manual_cooldowns.lock() {
+            cooldowns.retain(|_, last| last.elapsed() < cooldown);
+        }
     }
 
     pub fn hint_for(
@@ -210,14 +312,55 @@ impl RegistryHintService {
             }
         }
 
-        let entry = self.fetch_package_singleflight(package_name, now_ms);
+        // D5: a manual re-click within the cooldown coalesces to the value the
+        // previous manual fetch just cached — no new request, no error. Ordered
+        // before single-flight and the rate limiter so an accidental double-click
+        // is a pure no-op returning the cached entry.
+        let manual = mode == RegistryHintMode::ForceRefresh;
+        if manual
+            && let Some(entry) = cached.as_ref()
+            && self.manual_cooldown_active(package_name)
+        {
+            return lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache);
+        }
+
+        let entry = self.fetch_package_singleflight(package_name, now_ms, manual);
+        // Record the cooldown only on a definitive success (200/404 -> no error),
+        // so a failed manual fetch stays retryable while the global backoff and
+        // stricter manual budget throttle the retries.
+        if manual && entry.error.is_none() {
+            self.record_manual_fetch(package_name);
+        }
         lookup_from_entry(&entry, installed_version, RegistryHintOrigin::Network)
+    }
+
+    /// Whether package `P` had a successful manual fetch within the last
+    /// `MANUAL_REFRESH_COOLDOWN_MS`. Uses a monotonic `Instant::elapsed`, never a
+    /// wall clock, so a clock jump cannot suppress or release a refresh.
+    fn manual_cooldown_active(&self, package_name: &str) -> bool {
+        let cooldown = Duration::from_millis(MANUAL_REFRESH_COOLDOWN_MS);
+        match self.manual_cooldowns.lock() {
+            Ok(cooldowns) => cooldowns
+                .get(&cache::cache_key(package_name))
+                .is_some_and(|last| last.elapsed() < cooldown),
+            // Poisoned cooldown map: do not suppress the refresh.
+            Err(_) => false,
+        }
+    }
+
+    /// Stamps a successful manual fetch of `P` at the current monotonic instant so
+    /// an immediate re-click coalesces to the cached value.
+    fn record_manual_fetch(&self, package_name: &str) {
+        if let Ok(mut cooldowns) = self.manual_cooldowns.lock() {
+            cooldowns.insert(cache::cache_key(package_name), Instant::now());
+        }
     }
 
     fn fetch_package_singleflight(
         &self,
         package_name: &str,
         now_ms: u64,
+        manual: bool,
     ) -> RegistryPackageMetadataEntry {
         let key = cache::cache_key(package_name);
         let (flight, is_owner) = match self.in_flight.lock() {
@@ -231,7 +374,7 @@ impl RegistryHintService {
                 }
             }
             // Poisoned in-flight map: skip de-duplication and fetch directly.
-            Err(_) => return self.fetch_package_with_retries(package_name, now_ms),
+            Err(_) => return self.fetch_package_with_retries(package_name, now_ms, manual),
         };
 
         if is_owner {
@@ -243,7 +386,7 @@ impl RegistryHintService {
                 key,
                 flight: Arc::clone(&flight),
             };
-            let result = self.fetch_package_with_retries(package_name, now_ms);
+            let result = self.fetch_package_with_retries(package_name, now_ms, manual);
             if let Ok(mut guard) = flight.result.lock() {
                 *guard = Some(result.clone());
             }
@@ -252,13 +395,13 @@ impl RegistryHintService {
 
         let Ok(mut guard) = flight.result.lock() else {
             // Poisoned in-flight result: fall back to fetching directly.
-            return self.fetch_package_with_retries(package_name, now_ms);
+            return self.fetch_package_with_retries(package_name, now_ms, manual);
         };
         while guard.is_none() {
             match flight.ready.wait(guard) {
                 Ok(next) => guard = next,
                 // Poisoned while waiting: fall back to fetching directly.
-                Err(_) => return self.fetch_package_with_retries(package_name, now_ms),
+                Err(_) => return self.fetch_package_with_retries(package_name, now_ms, manual),
             }
         }
         // The loop above only exits once the owner (or its drop guard)
@@ -271,13 +414,14 @@ impl RegistryHintService {
         &self,
         package_name: &str,
         now_ms: u64,
+        manual: bool,
     ) -> RegistryPackageMetadataEntry {
         let mut last_error = None;
         let mut permanent = false;
         let mut attempts_made = 0;
         for attempt in 1..=MAX_ATTEMPTS {
             attempts_made = attempt;
-            self.wait_for_rate_limit_slot();
+            self.wait_for_rate_limit_slot(manual);
             let started = Instant::now();
             match self.client.get_package_metadata(package_name) {
                 Ok(response) if response.status == 200 => {
@@ -334,10 +478,14 @@ impl RegistryHintService {
                     return entry;
                 }
                 Ok(response) if response.status == 429 => {
-                    let retry_after = now_ms
-                        + response
-                            .retry_after_ms
-                            .unwrap_or_else(|| transient_backoff_ms(attempt));
+                    let delay_ms = response
+                        .retry_after_ms
+                        .unwrap_or_else(|| transient_backoff_ms(attempt));
+                    // D6: honor Retry-After GLOBALLY — back off every subsequent
+                    // fetch (manual and background) through the shared limiter,
+                    // not just this package's per-entry retry window below.
+                    self.apply_global_backoff(delay_ms);
+                    let retry_after = now_ms + delay_ms;
                     logging::log_warn(
                         "registry",
                         format!(
@@ -448,15 +596,32 @@ impl RegistryHintService {
         )
     }
 
-    fn wait_for_rate_limit_slot(&self) {
+    fn wait_for_rate_limit_slot(&self, manual: bool) {
+        // Manual `ForceRefresh` reserves against the stricter budget; background
+        // sweeps keep the looser one (D6).
+        let request_limit = if manual {
+            REGISTRY_MANUAL_RATE_LIMIT_REQUESTS
+        } else {
+            REGISTRY_RATE_LIMIT_REQUESTS
+        };
         // Poisoned rate limiter: proceed without throttling rather than
         // failing the fetch.
         let wait = match self.rate_limiter.lock() {
-            Ok(mut rate_limiter) => rate_limiter.reserve_slot(),
+            Ok(mut rate_limiter) => rate_limiter.reserve_slot(request_limit),
             Err(_) => None,
         };
         if let Some(delay) = wait {
             thread::sleep(delay);
+        }
+    }
+
+    /// Feeds a parsed `429 Retry-After` delay into the SHARED rate limiter so it
+    /// suppresses every subsequent fetch — manual and background — for that
+    /// duration (D6). Locks only the limiter (never held across the network
+    /// call), so it cannot deadlock with the in-flight or cooldown maps.
+    fn apply_global_backoff(&self, delay_ms: u64) {
+        if let Ok(mut rate_limiter) = self.rate_limiter.lock() {
+            rate_limiter.apply_retry_after(Duration::from_millis(delay_ms));
         }
     }
 }
@@ -600,11 +765,11 @@ mod tests {
         let window = Duration::from_millis(REGISTRY_RATE_LIMIT_WINDOW_MS);
 
         for _ in 0..REGISTRY_RATE_LIMIT_REQUESTS {
-            assert_eq!(limiter.reserve_slot(), None);
+            assert_eq!(limiter.reserve_slot(REGISTRY_RATE_LIMIT_REQUESTS), None);
         }
 
         let boundary = limiter
-            .reserve_slot()
+            .reserve_slot(REGISTRY_RATE_LIMIT_REQUESTS)
             .expect("boundary caller should wait for the next window");
         assert!(boundary <= window);
 
@@ -612,9 +777,88 @@ mod tests {
         // instead of firing immediately; otherwise a burst blows through the
         // per-window request limit.
         let follower = limiter
-            .reserve_slot()
+            .reserve_slot(REGISTRY_RATE_LIMIT_REQUESTS)
             .expect("followers arriving during a reserved window should also wait");
         assert!(follower <= window);
+    }
+
+    #[test]
+    fn manual_budget_throttles_sooner_than_background() {
+        // The stricter manual cap is a compile-time invariant of the two consts.
+        const {
+            assert!(REGISTRY_MANUAL_RATE_LIMIT_REQUESTS < REGISTRY_RATE_LIMIT_REQUESTS);
+        }
+
+        // Fill exactly the manual budget within one window: the next MANUAL
+        // reservation is throttled to the following window.
+        let mut manual = RegistryRateLimiter::new();
+        for _ in 0..REGISTRY_MANUAL_RATE_LIMIT_REQUESTS {
+            assert_eq!(
+                manual.reserve_slot(REGISTRY_MANUAL_RATE_LIMIT_REQUESTS),
+                None
+            );
+        }
+        assert!(
+            manual
+                .reserve_slot(REGISTRY_MANUAL_RATE_LIMIT_REQUESTS)
+                .is_some(),
+            "a manual burst must throttle once it hits the stricter manual cap"
+        );
+
+        // At the very same request count, a BACKGROUND reservation is still free:
+        // the looser budget has not been reached, proving manual is stricter.
+        let mut background = RegistryRateLimiter::new();
+        for _ in 0..REGISTRY_MANUAL_RATE_LIMIT_REQUESTS {
+            assert_eq!(background.reserve_slot(REGISTRY_RATE_LIMIT_REQUESTS), None);
+        }
+        assert_eq!(
+            background.reserve_slot(REGISTRY_RATE_LIMIT_REQUESTS),
+            None,
+            "background must not be throttled at the manual cap — it keeps the looser budget"
+        );
+    }
+
+    #[test]
+    fn retry_after_backs_off_shared_limiter_globally() {
+        let mut limiter = RegistryRateLimiter::new();
+        // A fresh window would normally admit the first request with no wait.
+        limiter.apply_retry_after(Duration::from_secs(30));
+
+        let wait = limiter
+            .reserve_slot(REGISTRY_RATE_LIMIT_REQUESTS)
+            .expect("a Retry-After backoff must delay even the first reservation");
+        // The floor is global: the wait tracks the Retry-After, not the window.
+        assert!(wait > Duration::from_secs(29));
+        assert!(wait <= Duration::from_secs(30));
+
+        // A later, shorter Retry-After must not shorten the longer floor already
+        // in effect.
+        limiter.apply_retry_after(Duration::from_millis(1));
+        let still_backed_off = limiter
+            .reserve_slot(REGISTRY_RATE_LIMIT_REQUESTS)
+            .expect("the longer backoff must still be in force");
+        assert!(still_backed_off > Duration::from_secs(29));
+    }
+
+    #[test]
+    fn retry_after_is_clamped_so_a_hostile_header_cannot_wedge_the_pool() {
+        // RB-12: a proxy-supplied `Retry-After: 3600` must not park the bounded
+        // worker pool for an hour — the global floor is capped at
+        // `REGISTRY_MAX_BACKOFF_MS`.
+        let mut limiter = RegistryRateLimiter::new();
+        limiter.apply_retry_after(Duration::from_secs(3600));
+
+        let wait = limiter
+            .reserve_slot(REGISTRY_RATE_LIMIT_REQUESTS)
+            .expect("the clamped backoff still delays the reservation");
+        assert!(
+            wait <= Duration::from_millis(REGISTRY_MAX_BACKOFF_MS),
+            "an hour-long Retry-After must be clamped to at most {REGISTRY_MAX_BACKOFF_MS}ms, got {wait:?}"
+        );
+        assert!(
+            wait > Duration::from_millis(REGISTRY_MAX_BACKOFF_MS) - Duration::from_secs(5),
+            "the clamp must still install a ~5 min floor, not drop the backoff entirely: {wait:?}"
+        );
     }
 
     #[test]
@@ -642,6 +886,38 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_sweeps_expired_manual_cooldowns() {
+        let service = RegistryHintService::disabled();
+        // One fresh stamp (kept) and one already past the cooldown window (swept). The
+        // stale Instant is built by subtracting more than the cooldown from now;
+        // checked_sub only returns None if the monotonic clock is younger than the
+        // cooldown, which never happens in practice (host uptime >> 10s cooldown).
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(MANUAL_REFRESH_COOLDOWN_MS + 5_000))
+            .expect("monotonic clock predates the manual-refresh cooldown");
+        {
+            let mut cooldowns = service.manual_cooldowns.lock().expect("cooldowns lock");
+            cooldowns.insert(cache::cache_key("fresh"), Instant::now());
+            cooldowns.insert(cache::cache_key("stale"), expired);
+        }
+
+        // run_maintenance drives the sweep; the empty disabled cache + u64::MAX budget
+        // make the store maintenance a no-op, isolating the cooldown sweep.
+        let removed = service.run_maintenance(crate::time::unix_millis_now(), u64::MAX);
+        assert_eq!(removed, 0, "the empty registry store removes nothing");
+
+        let cooldowns = service.manual_cooldowns.lock().expect("cooldowns lock");
+        assert!(
+            cooldowns.contains_key(&cache::cache_key("fresh")),
+            "a still-fresh cooldown stamp is kept"
+        );
+        assert!(
+            !cooldowns.contains_key(&cache::cache_key("stale")),
+            "an elapsed cooldown stamp is swept"
+        );
+    }
+
+    #[test]
     fn permanent_error_does_not_retry_and_caches_long() {
         let calls = Arc::new(AtomicUsize::new(0));
         let service = RegistryHintService::new(
@@ -651,7 +927,7 @@ mod tests {
             }),
         );
 
-        let entry = service.fetch_package_with_retries("next", 1_000);
+        let entry = service.fetch_package_with_retries("next", 1_000, false);
 
         assert_eq!(
             calls.load(Ordering::SeqCst),

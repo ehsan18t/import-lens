@@ -59,6 +59,19 @@ export interface ImportResult {
   diagnostics: ImportDiagnostic[];
   module_breakdown?: ModuleContribution[];
   shared_bytes?: number;
+  // Data-layer freshness of this served value. Omitted by the daemon when Fresh
+  // (skip_serializing_if), so an absent field means Fresh. No consumer reads it yet.
+  freshness?: ResultFreshness;
+}
+
+export type FreshnessKind = "fresh" | "stale" | "unverified";
+
+export interface ResultFreshness {
+  kind: FreshnessKind;
+  // Meaningful when kind === "stale": a background recompute is in flight.
+  revalidating: boolean;
+  // Meaningful when kind === "unverified": why verification could not complete.
+  reason?: string;
 }
 
 export interface ImportDiagnostic {
@@ -123,6 +136,14 @@ export interface FileSizeDocumentRequest {
   workspace_root: string;
   active_document_path: string;
   source: string;
+  // When true, the daemon bypasses stale-while-revalidate and recomputes
+  // synchronously (CI / budget checks). Omitted by interactive clients, which get SWR.
+  force_fresh?: boolean;
+  // The analysis generation (the triggering document analysis's request id) this
+  // size read belongs to. The daemon echoes it back on the resulting SWR
+  // `refreshed_results` push so the client can drop a push that a newer analysis
+  // has since superseded. Optional / additive for back-compat.
+  analysis_generation?: number;
 }
 
 export interface FileSizeDocumentResponse {
@@ -137,6 +158,34 @@ export interface FileSizeDocumentResponse {
   states: ImportAnalysisItem[];
   error: string | null;
   diagnostics: ImportDiagnostic[];
+}
+
+// A stable per-import identity for the SWR refresh push: the specifier alone is
+// NOT unique (two imports of the same package differ by kind / named exports but
+// share a specifier), so pushes carry this alongside each result to disambiguate.
+export interface RefreshedImportIdentity {
+  specifier: string;
+  import_kind: ImportKind;
+  named: string[];
+}
+
+// Unsolicited server->client push: freshly-recomputed sizes for a document after a
+// background stale-while-revalidate. Dispatched by `type`, not `request_id`.
+export interface RefreshedResultsResponse {
+  type: "refreshed_results";
+  version: number;
+  workspace_root: string;
+  document_path: string;
+  results: ImportResult[];
+  // Per-result import identity, index-aligned with `results`, so the client can
+  // disambiguate same-specifier variants (e.g. `import React from "react"` vs
+  // `import { useState } from "react"`). Omitted by an older daemon -> the client
+  // falls back to specifier-only keying.
+  identities?: RefreshedImportIdentity[];
+  // The analysis generation this refresh was computed for (echoed from the
+  // triggering file_size_document request). The client drops the push if a newer
+  // analysis has since superseded it. Omitted by an older daemon.
+  generation?: number;
 }
 
 export interface RegistryHint {
@@ -241,7 +290,7 @@ export interface HelloMessage {
   storage_path: string;
   enable_disk_cache: boolean;
   cache_max_size_mb: number;
-  cache_max_age_days: number;
+  registry_cache_max_size_mb: number;
   log_level: LogLevel;
 }
 
@@ -335,6 +384,12 @@ export interface CacheShardInfo {
   size_bytes: number;
   last_used_millis: number | null;
   loaded: boolean;
+  /**
+   * Number of cache entries this shard holds, from the daemon's O(1) per-shard
+   * summary. Optional so a response from an older daemon that predates the field
+   * still decodes (read it as `entry_count ?? 0`).
+   */
+  entry_count?: number;
 }
 
 export interface CacheOperationResult {
@@ -358,25 +413,17 @@ export interface CacheStatusResponse {
   total_size_bytes: number;
   project_count: number;
   max_size_mb: number;
-  max_age_days: number;
-  last_cleanup_millis: number | null;
   current_project: CacheShardInfo | null;
-  error: string | null;
-  diagnostics: ImportDiagnostic[];
-}
-
-export interface CacheCleanupRequest {
-  type: "cache_cleanup";
-  version: number;
-  request_id: number;
-}
-
-export interface CacheCleanupResponse {
-  version: number;
-  request_id: number;
-  total_size_bytes: number;
-  removed: CacheOperationResult[];
-  failed: CacheOperationResult[];
+  /**
+   * Sum of every shard's logical (envelope) bytes — the budget-tracked total,
+   * distinct from `total_size_bytes` (the physical on-disk footprint). Optional
+   * for forward/back-compat (`total_bytes ?? 0`).
+   */
+  total_bytes?: number;
+  /** Global disk-byte budget the daemon enforces (`cacheMaxSizeMB` in bytes). */
+  budget_bytes?: number;
+  /** Serialized size of the shared npm-registry metadata snapshot, in bytes. */
+  registry_size_bytes?: number;
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }
@@ -395,7 +442,7 @@ export interface CacheListResponse {
   diagnostics: ImportDiagnostic[];
 }
 
-export type CacheRemoveScope = "current_project" | "selected" | "all" | "orphans";
+export type CacheRemoveScope = "current_project" | "selected" | "all" | "orphans" | "registry";
 
 export interface CacheRemoveRequest {
   type: "cache_remove";
@@ -511,7 +558,6 @@ export type ClientMessage =
   | FileSizeDocumentRequest
   | CompleteImportMembersRequest
   | CacheStatusRequest
-  | CacheCleanupRequest
   | CacheListRequest
   | CacheRemoveRequest
   | WorkspaceReportRequest

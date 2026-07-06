@@ -1,18 +1,28 @@
 use import_lens_daemon::{
-    ipc::protocol::RegistryHint,
+    ipc::protocol::{
+        RegistryHint, RegistryHintMode as ProtocolRegistryHintMode, RegistryHintTarget,
+    },
     registry::{
         cache::RegistryMetadataCache,
-        constants::{FRESH_HINT_TTL_MS, REGISTRY_RETENTION_MS},
+        constants::{
+            FRESH_HINT_TTL_MS, REGISTRY_MANUAL_RATE_LIMIT_REQUESTS, REGISTRY_RATE_LIMIT_REQUESTS,
+            REGISTRY_REFRESH_CONCURRENCY, REGISTRY_RETENTION_MS,
+        },
         service::{RegistryHintMode, RegistryHintService},
         types::{HttpRegistryResponse, RegistryHttpClient, RegistryPackageMetadata},
     },
+    service::ImportLensService,
 };
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, Barrier, Mutex},
+    sync::{
+        Arc, Barrier, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Default)]
@@ -530,7 +540,13 @@ fn registry_cache_persists_latest_snapshot_under_concurrent_writes() {
     let value = serde_json::from_str::<serde_json::Value>(&persisted).expect("cache json");
 
     fs::remove_dir_all(cache_path).expect("cache cleanup");
-    assert_eq!(value.as_object().expect("cache object").len(), 16);
+    // The snapshot is now a versioned envelope; the 16 concurrent writes land
+    // under `entries`, not at the top level.
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(
+        value["entries"].as_object().expect("entries object").len(),
+        16
+    );
 }
 
 #[test]
@@ -601,4 +617,334 @@ fn registry_metadata_defers_persistence_until_flush() {
         );
     }
     fs::remove_dir_all(cache_path).expect("cleanup");
+}
+
+#[test]
+fn run_cache_maintenance_invokes_registry_retention() {
+    let cache_path = temp_cache_path("service-maintenance");
+    let registry = RegistryHintService::new(
+        RegistryMetadataCache::new(cache_path.clone()),
+        Box::new(FakeRegistryHttpClient::default()),
+    );
+    let service = ImportLensService::new_with_registry_hints_for_tests(registry);
+
+    // `run_cache_maintenance` reads the real wall clock for `now`, so seed one
+    // entry stamped at the epoch (unconditionally past the 30-day retention
+    // window) and one stamped "now" that must survive the pass.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64;
+    service
+        .registry_hints_for_tests()
+        .write_metadata_for_tests("fresh", "1.0.0", now);
+    service
+        .registry_hints_for_tests()
+        .write_metadata_for_tests("expired", "1.0.0", 0);
+
+    service.run_cache_maintenance();
+
+    // Reconstruct over the same shared file: the service-level maintenance pass
+    // must have invoked registry retention and written it authoritatively.
+    let reloaded = RegistryMetadataCache::new(cache_path.clone());
+    let fresh_present = reloaded.get("fresh").is_some();
+    let expired_present = reloaded.get("expired").is_some();
+    fs::remove_dir_all(cache_path).expect("cleanup");
+    assert!(
+        fresh_present,
+        "a fresh registry entry must survive service cache maintenance"
+    );
+    assert!(
+        !expired_present,
+        "run_cache_maintenance must invoke registry retention and drop the expired entry"
+    );
+}
+
+#[test]
+fn manual_refresh_cooldown_coalesces_to_cached() {
+    let cache_path = temp_cache_path("manual-cooldown");
+    // Two distinct responses are queued, but the cooldown must let only the FIRST
+    // manual fetch reach the network; an immediate re-click coalesces to the
+    // just-cached value and never consumes the second response.
+    let client = FakeRegistryHttpClient::with_responses(vec![
+        Ok(HttpRegistryResponse {
+            status: 200,
+            retry_after_ms: None,
+            body: r#"{"dist-tags":{"latest":"19.0.0"},"versions":{"18.2.0":{}}}"#.to_owned(),
+        }),
+        Ok(HttpRegistryResponse {
+            status: 200,
+            retry_after_ms: None,
+            body: r#"{"dist-tags":{"latest":"20.0.0"},"versions":{"18.2.0":{}}}"#.to_owned(),
+        }),
+    ]);
+    let service = RegistryHintService::new(
+        RegistryMetadataCache::new(cache_path.clone()),
+        Box::new(client.clone()),
+    );
+
+    let first = service.hint_for("react", Some("18.2.0"), RegistryHintMode::ForceRefresh, 100);
+    // Immediate re-click: within the manual cooldown it must NOT fetch again.
+    let second = service.hint_for("react", Some("18.2.0"), RegistryHintMode::ForceRefresh, 200);
+
+    fs::remove_dir_all(cache_path).expect("cache cleanup");
+    assert_eq!(
+        client.calls(),
+        vec!["react"],
+        "a re-click within the cooldown must coalesce to the cached value, not refetch"
+    );
+    assert_eq!(
+        first.hint.and_then(|item| item.latest_version),
+        Some("19.0.0".to_owned())
+    );
+    // The second lookup returns the FIRST fetch's cached value (19.0.0), not the
+    // un-consumed 20.0.0 response, and is not an error.
+    assert_eq!(second.error, None);
+    assert_eq!(
+        second.hint.and_then(|item| item.latest_version),
+        Some("19.0.0".to_owned())
+    );
+}
+
+#[test]
+fn retry_after_backs_off_all_manual_fetches() {
+    let cache_path = temp_cache_path("global-backoff");
+    // Package A returns a 429 with a Retry-After; package B (distinct) would
+    // return 200 but must be held off by the GLOBAL backoff the 429 installed on
+    // the shared rate limiter — proving Retry-After suppresses ALL fetches, not
+    // just the rate-limited package's own per-entry retry window.
+    let client = FakeRegistryHttpClient::with_responses(vec![
+        Ok(HttpRegistryResponse {
+            status: 429,
+            retry_after_ms: Some(250),
+            body: r#"{"error":"rate limited"}"#.to_owned(),
+        }),
+        Ok(HttpRegistryResponse {
+            status: 200,
+            retry_after_ms: None,
+            body: r#"{"dist-tags":{"latest":"19.0.0"},"versions":{"18.2.0":{}}}"#.to_owned(),
+        }),
+    ]);
+    let service = RegistryHintService::new(
+        RegistryMetadataCache::new(cache_path.clone()),
+        Box::new(client.clone()),
+    );
+
+    let _a = service.hint_for("pkg-a", Some("1.0.0"), RegistryHintMode::ForceRefresh, 100);
+    let started = Instant::now();
+    let b = service.hint_for("pkg-b", Some("1.0.0"), RegistryHintMode::ForceRefresh, 200);
+    let elapsed = started.elapsed();
+
+    fs::remove_dir_all(cache_path).expect("cache cleanup");
+    assert_eq!(client.calls(), vec!["pkg-a", "pkg-b"]);
+    // B is delayed, not dropped: it still fetches once the backoff elapses.
+    assert_eq!(
+        b.hint.and_then(|item| item.latest_version),
+        Some("19.0.0".to_owned())
+    );
+    // The distinct package's manual fetch waited ~the Retry-After A asked for.
+    // `thread::sleep` never returns early, so this lower bound is not flaky.
+    assert!(
+        elapsed >= Duration::from_millis(180),
+        "the 429 Retry-After must globally delay a distinct package's manual fetch (waited {elapsed:?})"
+    );
+}
+
+#[test]
+fn manual_rate_is_stricter_than_background() {
+    // The manual `ForceRefresh` budget is deliberately stricter than the
+    // background `RefreshStale` budget (D6 / §6.1). The behavioral proof — that a
+    // burst throttles at the lower cap while background does not — lives in the
+    // limiter's own unit test; here we pin the public consts' relationship so the
+    // stricter-manual guarantee cannot silently regress. Compile-time asserts so a
+    // regression fails the build, not just the run.
+    const {
+        assert!(
+            REGISTRY_MANUAL_RATE_LIMIT_REQUESTS < REGISTRY_RATE_LIMIT_REQUESTS,
+            "manual fetches must reserve against a stricter per-window budget than background"
+        );
+    }
+    const {
+        assert!(
+            REGISTRY_MANUAL_RATE_LIMIT_REQUESTS >= 1,
+            "the manual budget must still admit at least one fetch per window"
+        );
+    }
+}
+
+/// Records the peak number of `get_package_metadata` calls in flight at once so
+/// a bulk block can prove its fan-out never overlaps more than the isolated
+/// registry pool's `REGISTRY_REFRESH_CONCURRENCY` fetches.
+struct ConcurrencyProbeRegistryClient {
+    concurrent: Arc<AtomicUsize>,
+    max_concurrent: Arc<AtomicUsize>,
+}
+
+impl RegistryHttpClient for ConcurrencyProbeRegistryClient {
+    fn get_package_metadata(&self, _package_name: &str) -> Result<HttpRegistryResponse, String> {
+        let in_flight = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_concurrent.fetch_max(in_flight, Ordering::SeqCst);
+        // Hold the "connection" open long enough that, were the fan-out not
+        // bounded by the pool, far more than the pool size would overlap here.
+        thread::sleep(Duration::from_millis(50));
+        self.concurrent.fetch_sub(1, Ordering::SeqCst);
+        Ok(HttpRegistryResponse {
+            status: 200,
+            retry_after_ms: None,
+            body: r#"{"dist-tags":{"latest":"1.0.0"},"versions":{}}"#.to_owned(),
+        })
+    }
+}
+
+/// Counts every network fetch and blocks each one on a shared gate the test
+/// opens on demand, so a bulk block can be frozen with exactly the pool size in
+/// flight before cancellation is triggered.
+struct GatedCountingRegistryClient {
+    calls: Arc<AtomicUsize>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RegistryHttpClient for GatedCountingRegistryClient {
+    fn get_package_metadata(&self, _package_name: &str) -> Result<HttpRegistryResponse, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let (open, ready) = &*self.gate;
+        let mut opened = open.lock().expect("gate lock");
+        while !*opened {
+            opened = ready.wait(opened).expect("gate wait");
+        }
+        Ok(HttpRegistryResponse {
+            status: 200,
+            retry_after_ms: None,
+            body: r#"{"dist-tags":{"latest":"1.0.0"},"versions":{}}"#.to_owned(),
+        })
+    }
+}
+
+fn bulk_targets(count: usize) -> Vec<RegistryHintTarget> {
+    (0..count)
+        .map(|index| RegistryHintTarget {
+            name: format!("pkg-{index}"),
+            installed_version: Some("1.0.0".to_owned()),
+        })
+        .collect()
+}
+
+#[test]
+fn bulk_refresh_in_flight_is_bounded() {
+    let concurrent = Arc::new(AtomicUsize::new(0));
+    let max_concurrent = Arc::new(AtomicUsize::new(0));
+    let registry = RegistryHintService::new(
+        RegistryMetadataCache::empty(),
+        Box::new(ConcurrencyProbeRegistryClient {
+            concurrent: Arc::clone(&concurrent),
+            max_concurrent: Arc::clone(&max_concurrent),
+        }),
+    );
+    let service = Arc::new(ImportLensService::new_with_registry_hints_for_tests(
+        registry,
+    ));
+
+    // A block several times the pool size. If the fan-out spawned a thread per
+    // target (rather than dispatching onto the bounded pool), every fetch would
+    // overlap at once. Kept within one rate-limit window so the shared limiter
+    // never serializes the fan-out and masks the bound.
+    let target_count = 16;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = mpsc::channel();
+    service.spawn_registry_refresh_block(
+        bulk_targets(target_count),
+        ProtocolRegistryHintMode::RefreshStale,
+        1_000,
+        cancelled,
+        move |_index, _result| {
+            let _ = done_tx.send(());
+        },
+    );
+
+    for _ in 0..target_count {
+        done_rx
+            .recv()
+            .expect("every bulk job should report completion");
+    }
+
+    let peak = max_concurrent.load(Ordering::SeqCst);
+    assert!(
+        peak <= REGISTRY_REFRESH_CONCURRENCY,
+        "bulk fan-out exceeded the pool's in-flight cap: {peak} > {REGISTRY_REFRESH_CONCURRENCY}"
+    );
+    assert!(
+        peak >= 2,
+        "bulk fetches never overlapped ({peak} peak); the concurrency probe is vacuous"
+    );
+}
+
+#[test]
+fn bulk_refresh_stops_after_cancel() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let registry = RegistryHintService::new(
+        RegistryMetadataCache::empty(),
+        Box::new(GatedCountingRegistryClient {
+            calls: Arc::clone(&calls),
+            gate: Arc::clone(&gate),
+        }),
+    );
+    let service = Arc::new(ImportLensService::new_with_registry_hints_for_tests(
+        registry,
+    ));
+
+    let target_count = 20;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    service.spawn_registry_refresh_block(
+        bulk_targets(target_count),
+        ProtocolRegistryHintMode::RefreshStale,
+        1_000,
+        Arc::clone(&cancelled),
+        move |_index, result| {
+            let _ = done_tx.send(result.is_some());
+        },
+    );
+
+    // Freeze the block with exactly the pool size in flight: each of the first
+    // `REGISTRY_REFRESH_CONCURRENCY` jobs is parked in the gated client, and the
+    // shut gate stops any worker returning to pick up a further target, so the
+    // call count parks here rather than racing ahead.
+    while calls.load(Ordering::SeqCst) < REGISTRY_REFRESH_CONCURRENCY {
+        thread::yield_now();
+    }
+
+    // Supersede the block, THEN release the in-flight fetches. Every worker that
+    // now returns and picks up a remaining target observes the cancel flag and
+    // skips its fetch, so no further network call is made.
+    cancelled.store(true, Ordering::Release);
+    {
+        let (open, ready) = &*gate;
+        *open.lock().expect("gate lock") = true;
+        ready.notify_all();
+    }
+
+    let mut ran = 0;
+    for _ in 0..target_count {
+        if done_rx
+            .recv()
+            .expect("every bulk job should report completion")
+        {
+            ran += 1;
+        }
+    }
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        REGISTRY_REFRESH_CONCURRENCY,
+        "a cancelled block must not fetch beyond what was already in flight"
+    );
+    assert_eq!(
+        ran, REGISTRY_REFRESH_CONCURRENCY,
+        "only the already-in-flight jobs should complete with a fetched result"
+    );
+    assert!(
+        ran < target_count,
+        "cancellation must have skipped the remaining targets"
+    );
 }

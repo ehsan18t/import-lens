@@ -1,5 +1,5 @@
 use crate::{
-    cache::key::{FileFingerprint, fingerprints_are_current, fingerprints_for_paths},
+    cache::key::{FileFingerprint, Freshness, check_fingerprints_strict},
     ipc::protocol::ImportRuntime,
     pipeline::resolver::{
         ResolverSet, normalize_existing_path, resolve_module_path, shared_resolvers,
@@ -75,6 +75,17 @@ pub struct ModuleRecord {
     pub path: PathBuf,
     pub source: String,
     pub original_source_bytes: usize,
+    /// xxh3 of the raw file bytes read for this module (pre-transform). Lets the
+    /// cache detect real content changes without re-reading on a warm graph.
+    pub content_hash: u64,
+    /// File length + mtime captured immediately BEFORE the source read (never
+    /// after). A change landing between the stat and the read then mismatches the
+    /// stored len/mtime, so the freshness check falls through to `content_hash`
+    /// (which describes the bytes actually analyzed). Capturing after the read
+    /// would pair fresh len/mtime with a stale hash and let the mtime+len
+    /// pre-filter serve a stale analysis as Fresh indefinitely.
+    pub content_len: u64,
+    pub content_mtime_millis: u64,
     pub imports: Vec<ImportEdge>,
     pub external_imports: Vec<ExternalImportEdge>,
     pub import_statement_spans: Vec<(usize, usize)>,
@@ -210,6 +221,54 @@ impl ModuleGraph {
         self.path_to_id.get(path).copied()
     }
 
+    /// Raw-source content hash for a loaded module path, if present in the graph.
+    /// Canonicalizes first: the graph keys paths canonically (on Windows the
+    /// verbatim `\\?\C:\...` form via `fs::canonicalize`), so a raw caller path
+    /// must be normalized to match — this also hardens the `dependency_fingerprints`
+    /// callers below, which pass raw `package_root.join(..)` / `entry_path` values.
+    pub fn content_hash_for(&self, path: &Path) -> Option<u64> {
+        let canonical = std::fs::canonicalize(path).ok()?;
+        self.module_id_by_path(&canonical)
+            .and_then(|id| self.module_by_id(id))
+            .map(|module| module.content_hash)
+    }
+
+    /// Full read-time fingerprint (len+mtime+hash captured when the module was read)
+    /// for a loaded module path, built WITHOUT re-stat'ing for len/mtime. Returns
+    /// `None` for a path that is not a loaded graph module (the caller then falls back
+    /// to a stat-only fingerprint).
+    ///
+    /// The graph keys every module by its canonical path (`normalize_existing_path`
+    /// = `fs::canonicalize`), and the fingerprint callers pass those canonical keys
+    /// directly (`graph.modules[*].path`, resolver-produced `dependency_paths`, and
+    /// the already-canonicalized entry). So the RAW path is looked up against the keys
+    /// FIRST and only `fs::canonicalize`d on a miss — collapsing the per-module
+    /// canonicalize syscall (one per path, ≈N per graph) down to O(non-module paths).
+    /// A raw hit and the canonicalize-then-hit return the same module, since
+    /// `fs::canonicalize` is idempotent on a path that is already a canonical key.
+    /// `module.path` is itself that canonical key, so `file_fingerprint_from_read_time`
+    /// forward-slashes it directly without re-canonicalizing (a second per-module
+    /// syscall removed). `content_hash_for` still canonicalizes: its sole caller (a
+    /// test) passes a raw, non-canonical path.
+    pub fn module_fingerprint_for(&self, path: &Path) -> Option<FileFingerprint> {
+        let module = match self.module_id_by_path(path) {
+            Some(id) => self.module_by_id(id)?,
+            None => {
+                #[cfg(test)]
+                canonicalize_probe::record();
+                let canonical = std::fs::canonicalize(path).ok()?;
+                self.module_id_by_path(&canonical)
+                    .and_then(|id| self.module_by_id(id))?
+            }
+        };
+        Some(crate::cache::key::file_fingerprint_from_read_time(
+            &module.path,
+            module.content_len,
+            module.content_mtime_millis,
+            module.content_hash,
+        ))
+    }
+
     pub fn cached_full_bundle_minified_len_or_init(
         &self,
         init: impl FnOnce() -> Option<u64>,
@@ -237,23 +296,122 @@ pub fn build_module_graph_cached(entry_path: &Path) -> Result<Arc<ModuleGraph>, 
     build_module_graph_cached_with_runtime(entry_path, ImportRuntime::Component)
 }
 
+/// Test-only probe that counts calls to `build_module_graph_cached_with_runtime`
+/// for a single armed entry path. The count is recorded before the cache lookup,
+/// so cache hits are counted too. Scoping to one path keeps sibling unit tests
+/// that build unrelated graphs in the same test binary from perturbing the
+/// count. Task A4's regression test uses this seam to prove `analyze_and_cache`
+/// fetches the analyzed graph exactly once (reusing it for fingerprints) instead
+/// of re-fetching it — the TOCTOU that Finding 4 describes.
+#[cfg(test)]
+pub mod graph_fetch_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    // (armed_entry, hits). `None` = disarmed; fetches are ignored.
+    static STATE: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
+
+    fn lock() -> std::sync::MutexGuard<'static, Option<(PathBuf, usize)>> {
+        STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Begin counting fetches for `entry`, resetting the count to zero. Only one
+    /// path is armed at a time, so probe tests must not run concurrently with
+    /// one another (there is a single such test).
+    pub fn arm(entry: PathBuf) {
+        *lock() = Some((entry, 0));
+    }
+
+    /// Number of fetches recorded for the armed path since `arm`.
+    pub fn hits() -> usize {
+        lock().as_ref().map(|(_, count)| *count).unwrap_or(0)
+    }
+
+    /// Stop counting; subsequent fetches are ignored.
+    pub fn disarm() {
+        *lock() = None;
+    }
+
+    pub(super) fn record(entry: &Path) {
+        if let Some((watched, count)) = lock().as_mut()
+            && watched.as_path() == entry
+        {
+            *count += 1;
+        }
+    }
+}
+
+/// Test-only probe that counts the `fs::canonicalize` syscalls
+/// `module_fingerprint_for` performs while building a graph's fingerprints. Task
+/// C8's regression test uses it to prove fingerprint-building is O(non-module
+/// paths) canonicalize calls, not O(modules): the module/dep paths are already the
+/// graph's canonical keys and must be looked up WITHOUT re-canonicalizing. The
+/// counter is thread-local so the synchronous fingerprint call under test is
+/// isolated from unrelated graphs built concurrently on other test threads.
+#[cfg(test)]
+pub mod canonicalize_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        // `Some(count)` = armed on this thread; `None` = disarmed.
+        static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Begin counting on the current thread, resetting the count to zero.
+    pub fn arm() {
+        COUNT.with(|count| count.set(Some(0)));
+    }
+
+    /// Canonicalize calls recorded on the current thread since `arm`.
+    pub fn hits() -> usize {
+        COUNT.with(|count| count.get().unwrap_or(0))
+    }
+
+    /// Stop counting on the current thread; subsequent calls are ignored.
+    pub fn disarm() {
+        COUNT.with(|count| count.set(None));
+    }
+
+    pub(super) fn record() {
+        COUNT.with(|count| {
+            if let Some(current) = count.get() {
+                count.set(Some(current + 1));
+            }
+        });
+    }
+}
+
 pub fn build_module_graph_cached_with_runtime(
     entry_path: &Path,
     runtime: ImportRuntime,
 ) -> Result<Arc<ModuleGraph>, String> {
+    #[cfg(test)]
+    graph_fetch_probe::record(entry_path);
+
     let entry_path = normalize_existing_path(entry_path)?;
     let cache = GRAPH_CACHE.get_or_init(papaya::HashMap::new);
     let pinned = cache.pin();
     let cache_key = (entry_path.clone(), runtime);
     if let Some(graph) = pinned.get(&cache_key) {
-        if fingerprints_are_current(&graph.fingerprints) {
-            graph
-                .last_used_millis
-                .store(crate::time::unix_millis_now(), Ordering::Relaxed);
-            return Ok(Arc::clone(&graph.graph));
+        // Strict gate (RB-1 / X-7): hash-verify first-party modules so an
+        // equal-length, mtime-preserving rewrite is detected — the non-strict
+        // mtime+len pre-filter would reuse the STALE graph here, and since L2
+        // recomputes THROUGH this cache, a first-party edit would be served stale
+        // forever. Keep serving on a transient `Unknown` (a momentarily-locked
+        // file), matching L2's SWR; only a definite `Stale`/`Gone` rebuilds.
+        match check_fingerprints_strict(&graph.fingerprints) {
+            Freshness::Fresh | Freshness::Unknown => {
+                graph
+                    .last_used_millis
+                    .store(crate::time::unix_millis_now(), Ordering::Relaxed);
+                return Ok(Arc::clone(&graph.graph));
+            }
+            Freshness::Stale | Freshness::Gone => {
+                pinned.remove(&cache_key);
+            }
         }
-
-        pinned.remove(&cache_key);
     }
 
     let graph = Arc::new(build_module_graph_with_runtime(&entry_path, runtime)?);
@@ -288,7 +446,9 @@ pub fn purge_missing_module_graphs() -> usize {
     let pinned = cache.pin();
     let missing = pinned
         .iter()
-        .filter(|((entry_path, _runtime), _)| !entry_path.exists())
+        .filter(|((entry_path, _runtime), _)| {
+            crate::cache::key::path_is_definitely_gone(entry_path)
+        })
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     for key in &missing {
@@ -309,13 +469,39 @@ pub fn cached_module_graph_with_runtime(
     let cache = GRAPH_CACHE.get()?;
     let pinned = cache.pin();
     let cached = pinned.get(&(entry_path, runtime))?;
-    if fingerprints_are_current(&cached.fingerprints) {
-        cached
-            .last_used_millis
-            .store(crate::time::unix_millis_now(), Ordering::Relaxed);
-        return Some(Arc::clone(&cached.graph));
+    // Strict gate (RB-1 / X-7), same as the building path: hash-verify first-party
+    // modules; keep serving on a transient `Unknown`, decline on `Stale`/`Gone`.
+    match check_fingerprints_strict(&cached.fingerprints) {
+        Freshness::Fresh | Freshness::Unknown => {
+            cached
+                .last_used_millis
+                .store(crate::time::unix_millis_now(), Ordering::Relaxed);
+            Some(Arc::clone(&cached.graph))
+        }
+        Freshness::Stale | Freshness::Gone => None,
     }
-    None
+}
+
+/// Returns the cached graph's module paths for `(entry, runtime)` WITHOUT the
+/// `fingerprints_are_current` freshness gate. The L1 file-size signature re-stats
+/// each path itself, so it needs the raw file set, not a validated graph — and a
+/// gated accessor would return `None` exactly when a module changed, hiding the very
+/// edit L1 must react to. Never builds; leaves `last_used_millis` untouched (a cheap
+/// signature peek is not a real consumption that should reshape the LRU). `None` if
+/// nothing is cached for the key.
+pub fn peek_cached_module_paths(entry_path: &Path, runtime: ImportRuntime) -> Option<Vec<PathBuf>> {
+    let entry_path = normalize_existing_path(entry_path).ok()?;
+    let cache = GRAPH_CACHE.get()?;
+    let pinned = cache.pin();
+    let cached = pinned.get(&(entry_path, runtime))?;
+    Some(
+        cached
+            .graph
+            .modules
+            .iter()
+            .map(|module| module.path.clone())
+            .collect(),
+    )
 }
 
 pub fn module_graph_cache_len() -> usize {
@@ -329,7 +515,30 @@ fn module_graph_fingerprints(entry_path: &Path, graph: &ModuleGraph) -> Vec<File
     let mut paths = Vec::with_capacity(graph.dependency_paths.len() + 1);
     paths.push(entry_path.to_path_buf());
     paths.extend(graph.dependency_paths.iter().cloned());
-    fingerprints_for_paths(paths)
+    fingerprints_with_content_hashes(paths, graph)
+}
+
+/// Build content-hash-aware fingerprints for a set of paths, deduped by their
+/// normalized `.path` AFTER fingerprinting (so raw and canonical spellings of
+/// the same file collapse, matching the pre-redesign `fingerprints_for_paths`).
+pub fn fingerprints_with_content_hashes(
+    paths: Vec<PathBuf>,
+    graph: &ModuleGraph,
+) -> Vec<FileFingerprint> {
+    let mut fingerprints: Vec<FileFingerprint> = paths
+        .into_iter()
+        .filter_map(|path| {
+            // Loaded modules use their read-time len+mtime+hash (no post-analysis
+            // re-stat); non-module paths (e.g. package.json) are read+hashed here
+            // (RB-2) so an equal-length, mtime-preserving change is still detected.
+            graph
+                .module_fingerprint_for(&path)
+                .or_else(|| crate::cache::key::file_fingerprint_reading_hash(&path))
+        })
+        .collect();
+    fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
+    fingerprints.dedup_by(|a, b| a.path == b.path);
+    fingerprints
 }
 
 pub fn invalidate_module_graph_cache_for_package(package_name: &str) {
@@ -445,8 +654,16 @@ impl ModuleGraphBuilder {
             ));
         }
 
+        // Stat BEFORE reading: if the file changes between the stat and the read,
+        // the stored fingerprint's len/mtime mismatch the live file and the check
+        // falls through to the content hash, which matches the bytes actually
+        // analyzed — correct. The reverse order (read, then stat) would pair fresh
+        // len/mtime with a stale hash, and the len+mtime pre-filter would then
+        // serve the stale analysis as Fresh indefinitely.
+        let (content_len, content_mtime_millis) = crate::cache::key::read_time_len_mtime(&path);
         let source = fs::read_to_string(&path)
             .map_err(|error| format!("failed to read module {}: {error}", path.display()))?;
+        let content_hash = crate::cache::key::content_hash(source.as_bytes());
         let source_bytes = source.len();
         if source_bytes > self.limits.max_module_source_bytes {
             return Err(format!(
@@ -537,6 +754,9 @@ impl ModuleGraphBuilder {
             path: path.clone(),
             source: prepared_source.source,
             original_source_bytes: source_bytes,
+            content_hash,
+            content_len,
+            content_mtime_millis,
             imports: parsed.imports,
             external_imports: parsed.external_imports,
             import_statement_spans: parsed.import_statement_spans,
@@ -1665,5 +1885,133 @@ fn collect_binding_pattern_spans(
                 collect_binding_pattern_spans(&rest.argument, spans);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_canonicalize_tests {
+    use super::*;
+    use crate::cache::key::{FileFingerprint, file_fingerprint_reading_hash};
+    use crate::ipc::protocol::ImportRuntime;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "il-c8-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Reference implementation of the PRE-CHANGE fingerprint algorithm: it
+    /// `fs::canonicalize`s EVERY input path to find its module (the redundant
+    /// per-module syscall Task C8 removes) and rebuilds each module fingerprint
+    /// through the original `normalize_identity_path` (canonicalize-then-slash),
+    /// falling back to a stat-only fingerprint for non-module paths. Byte-identical
+    /// output to this oracle is the proof that the optimization did not change the
+    /// produced fingerprints (same paths + hash + len + mtime + sort + dedup).
+    fn reference_pre_change(paths: &[PathBuf], graph: &ModuleGraph) -> Vec<FileFingerprint> {
+        let mut fingerprints: Vec<FileFingerprint> = paths
+            .iter()
+            .filter_map(|path| {
+                let via_module = std::fs::canonicalize(path)
+                    .ok()
+                    .and_then(|canonical| graph.module_id_by_path(&canonical))
+                    .and_then(|id| graph.module_by_id(id))
+                    .map(|module| FileFingerprint {
+                        // The original `normalize_identity_path(&module.path)`.
+                        path: std::fs::canonicalize(&module.path)
+                            .unwrap_or_else(|_| module.path.clone())
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        len: module.content_len,
+                        modified_millis: module.content_mtime_millis,
+                        content_hash: Some(module.content_hash),
+                    });
+                via_module.or_else(|| file_fingerprint_reading_hash(path))
+            })
+            .collect();
+        fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
+        fingerprints.dedup_by(|a, b| a.path == b.path);
+        fingerprints
+    }
+
+    #[test]
+    fn fingerprints_reuse_graph_canonical_paths_without_per_module_canonicalize() {
+        let dir = unique_dir("reuse");
+        // Canonicalize the root so every child path is already the graph's canonical
+        // module-key spelling (exactly how the resolver hands paths to the real
+        // callers), which is what lets the raw-path lookup hit without a syscall.
+        let root = fs::canonicalize(&dir).expect("canonical root");
+        let entry = root.join("entry.mjs");
+        let deps: Vec<PathBuf> = (0..5).map(|i| root.join(format!("dep{i}.mjs"))).collect();
+        for (i, dep) in deps.iter().enumerate() {
+            fs::write(dep, format!("export const v{i} = {i};\n")).expect("write dep");
+        }
+        let mut entry_src = String::new();
+        for i in 0..deps.len() {
+            entry_src.push_str(&format!("import {{ v{i} }} from './dep{i}.mjs';\n"));
+        }
+        entry_src.push_str("export const total = 0;\n");
+        fs::write(&entry, entry_src).expect("write entry");
+        let package_json = root.join("package.json");
+        fs::write(&package_json, "{\"name\":\"c8\",\"version\":\"1.0.0\"}\n").expect("pkg");
+
+        let graph =
+            build_module_graph_with_runtime(&entry, ImportRuntime::Component).expect("build graph");
+        assert_eq!(
+            graph.modules.len(),
+            deps.len() + 1,
+            "entry + every dep must be loaded as a module"
+        );
+
+        // Mirror `service::dependency_fingerprints`' hot-path input set: the
+        // non-module manifest, the (canonical) entry, every graph module, and the
+        // resolver's dependency paths. All but `package.json` are ALREADY the graph's
+        // canonical keys.
+        let mut paths = vec![package_json.clone(), entry.clone()];
+        paths.extend(graph.modules.iter().map(|module| module.path.clone()));
+        paths.extend(graph.dependency_paths.iter().cloned());
+
+        // CORRECTNESS (the important half): byte-identical to the pre-change output.
+        let expected = reference_pre_change(&paths, &graph);
+        let actual = fingerprints_with_content_hashes(paths.clone(), &graph);
+        assert_eq!(
+            actual, expected,
+            "optimized fingerprints must be byte-identical to the pre-change algorithm"
+        );
+        // Non-vacuous: every loaded module carries its read-time content hash, and
+        // the non-module manifest is now read+hashed too (RB-2), so ALL fingerprints
+        // are content-hashed.
+        assert!(
+            actual
+                .iter()
+                .all(|fingerprint| fingerprint.content_hash.is_some()),
+            "every fingerprint (modules + read-hashed manifest) must carry a content hash: {actual:?}"
+        );
+        assert_eq!(
+            actual.len(),
+            graph.modules.len() + 1,
+            "the fingerprint set is every module plus the read-hashed manifest"
+        );
+
+        // PERF: building those fingerprints canonicalizes only the non-module path
+        // (package.json), NOT once per module. Before the fix this was O(N paths).
+        canonicalize_probe::arm();
+        let _ = fingerprints_with_content_hashes(paths, &graph);
+        let canonicalizes = canonicalize_probe::hits();
+        canonicalize_probe::disarm();
+        assert_eq!(
+            canonicalizes,
+            1,
+            "only the non-module package.json should hit fs::canonicalize; the \
+             entry + {} module/dep paths must reuse the graph's canonical keys",
+            graph.modules.len()
+        );
+
+        fs::remove_dir_all(dir).ok();
     }
 }

@@ -16,7 +16,7 @@ export interface ImportLensConfig {
   useCodeLens: boolean;
   enableDiskCache: boolean;
   cacheMaxSizeMB: number;
-  cacheMaxAgeDays: number;
+  registryCacheMaxSizeMB: number;
   enableRegistryHints: boolean;
   verboseRegistryLogging: boolean;
   logLevel: LogLevel;
@@ -36,7 +36,7 @@ export const getImportLensConfig = (): ImportLensConfig => {
     useCodeLens: config.get("useCodeLens", false),
     enableDiskCache: config.get("enableDiskCache", true),
     cacheMaxSizeMB: config.get("cacheMaxSizeMB", 512),
-    cacheMaxAgeDays: config.get("cacheMaxAgeDays", 30),
+    registryCacheMaxSizeMB: config.get("registryCacheMaxSizeMB", 32),
     enableRegistryHints: config.get("enableRegistryHints", true),
     verboseRegistryLogging: config.get("verboseRegistryLogging", false),
     logLevel: config.get<LogLevel>("logLevel", defaultLogLevel),

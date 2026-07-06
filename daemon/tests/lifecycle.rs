@@ -1,6 +1,4 @@
-use import_lens_daemon::lifecycle::{
-    CACHE_RECYCLE_ENTRY_LIMIT, LifecycleState, RecycleReason, record_recycle_timestamp,
-};
+use import_lens_daemon::lifecycle::{LifecycleState, RecycleReason, record_recycle_timestamp};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -24,10 +22,8 @@ fn lifecycle_recycles_after_four_hours_when_idle_for_fifteen_minutes() {
 
     lifecycle.record_batch_at(started_at + Duration::from_secs(60));
 
-    let reason = lifecycle.should_recycle(
-        started_at + Duration::from_secs((4 * 60 * 60) + (15 * 60) + 1),
-        10,
-    );
+    let reason =
+        lifecycle.should_recycle(started_at + Duration::from_secs((4 * 60 * 60) + (15 * 60) + 1));
 
     assert_eq!(reason, Some(RecycleReason::IdleAfterUptime));
 }
@@ -40,17 +36,7 @@ fn lifecycle_does_not_recycle_when_recent_batch_keeps_daemon_active() {
 
     lifecycle.record_batch_at(now - Duration::from_secs(30));
 
-    assert_eq!(lifecycle.should_recycle(now, 10), None);
-}
-
-#[test]
-fn lifecycle_recycles_when_cache_exceeds_entry_limit() {
-    let lifecycle = LifecycleState::new_at(Instant::now());
-
-    assert_eq!(
-        lifecycle.should_recycle(Instant::now(), CACHE_RECYCLE_ENTRY_LIMIT + 1),
-        Some(RecycleReason::CacheEntryLimit)
-    );
+    assert_eq!(lifecycle.should_recycle(now), None);
 }
 
 #[test]

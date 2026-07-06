@@ -410,13 +410,13 @@ The virtual entry must never use `console.log` or any pattern that can be static
 
 ### 5.5 Caching
 
-**FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. Cache keys must use the structured v3 identity format described in Section 10.2, including analyzer version, package identity, runtime profile, import kind, sorted named exports, resolved package paths when known, and relevant file fingerprints. Valid cache hits must be returned without running any computation.
+**FR-025** (Critical) - The daemon must maintain an in-memory cache using a `papaya::HashMap`. Cache keys must use the structured v4 identity format described in Section 10.2, including analyzer version, package identity, runtime profile, import kind, sorted named exports, and resolved package paths when known. File fingerprints are NOT part of the key (identity is pure); they are stored on the value side and verified through the tri-state freshness check on every serve. Valid, fresh cache hits must be returned without running any computation.
 
 **FR-026** (Critical) - When `importLens.enableDiskCache` is `true` (the default), the daemon must persist computed cache entries to `redb` databases under an extension-owned cache base. VS Code Desktop must prefer the workspace-specific `ExtensionContext.storageUri` cache base and fall back to `globalStorageUri/workspace-cache` only when workspace storage is unavailable. The daemon must create one stable project shard per normalized analysis root under that cache base, so multi-root windows and loose-file projects do not share one growing database. The extension and daemon must not create cache folders inside the user's project tree. On startup or first project use, the daemon must preload only the configured bounded recent-entry set into the matching project's `papaya` cache; other valid disk entries remain available through lazy disk lookup and are promoted into memory on first hit. During upgrade from the previous centralized-cache design, the daemon must remove the legacy central `globalStorageUri/importlens.redb` file when present.
 
-**FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer. The current schema version is `4`. On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration and protocol-result shape changes).
+**FR-026a** (High) - The `redb` database must include a metadata table containing a `schema_version` integer. The current schema version is `6`. On startup, the daemon must read this value before loading cache entries. If `schema_version` is missing or does not match the version expected by the current daemon binary, the daemon must delete the existing database file, create a fresh empty database with the current schema version, and log a warning. This ensures forward compatibility across daemon upgrades (including the redb v3→v4 major version migration and protocol-result shape changes).
 
-**FR-026b** (Medium) - The daemon must track recent cache usage in each project shard's `cache_recents` table so that startup can preload and prewarm the most useful entries for the active project shard. Each successful disk insert must update the recent-entry timestamp for the corresponding cache key. Disk and memory hits may batch or debounce recency updates to avoid synchronous redb writes on every hot memory hit, but failed pending-recency flushes must be logged and requeued so touches are not silently dropped. Pending recency updates must be flushed during normal shutdown/drop without forcing a full memory-to-disk rewrite because computed entries are inserted write-through. On handshake completion, the daemon must prewarm up to the 20 most recent valid entries from the active project shard after resolving them from the active workspace dependency tree.
+**FR-026b** (Medium) - The daemon must track recency as a process-global monotonic sequence (`last_seq`) stored inside each cache entry: interactive hits promote the in-memory sequence, bulk/prewarm reads do not (scan resistance), and promoted sequences are re-persisted during the shutdown/recycle flush so recency survives restarts. There is no separate recents table - removing an entry removes its recency, so dangling recency rows are structurally impossible. Startup preload and post-hello prewarm select up to the 20 highest-sequence entries by reading each stored value's fixed sequence prefix. On handshake completion, the daemon must prewarm those entries after resolving them from the active workspace dependency tree.
 
 **FR-027** (High) - The TypeScript extension host must watch `node_modules` for package version changes using VS Code's native `vscode.workspace.createFileSystemWatcher` API with two glob patterns: `**/node_modules/*/package.json` for regular packages and `**/node_modules/@*/*/package.json` for scoped packages (e.g. `@babel/core`). Both watchers must be registered at activation and disposed on extension deactivation. The `notify` Rust crate must not be used for this purpose. On Linux, a Rust process watching `node_modules` directly would register one `inotify` file descriptor per directory, which on kernels before 5.11 could rapidly exhaust the system-wide `inotify` limit (`fs.inotify.max_user_watches`, which defaulted to 8,192 prior to kernel 5.11). Since kernel 5.11 (February 2021), the default is dynamically scaled based on available memory (up to 1,048,576 on 64-bit systems with >=128 GB RAM), but the old default persists on older kernels and in constrained containers. Regardless of kernel version, VS Code's file watcher already manages file descriptor budgets safely for all extensions combined, making it the correct abstraction. Watcher events must be debounced into bursts. Empty bursts must be ignored. For 1 through 20 changed `package.json` paths in one burst, the extension host must send a single `NodeModulesChanged` message containing the changed paths; the daemon then resolves package names from those paths and evicts matching cache entries from both `papaya` and `redb`. For entire `node_modules` deletion/replacement, malformed package paths, or more than 20 changed packages in one burst, the extension host or daemon must use `CacheInvalidateAll` semantics and evict all entries from both cache tiers. See Section 10.1 for the `NodeModulesChangedMessage` and `CacheInvalidateAllMessage` schemas.
 
@@ -502,8 +502,8 @@ The virtual entry must never use `console.log` or any pattern that can be static
 | `importLens.showWarnings`    | boolean | `true`      | Show warning indicator for non-tree-shakeable imports                                                    |
 | `importLens.useCodeLens`     | boolean | `false`     | Use code lens above the line instead of end-of-line decorations                                          |
 | `importLens.enableDiskCache` | boolean | `true`      | Persist computed sizes to disk via redb across editor restarts                                           |
-| `importLens.cacheMaxSizeMB`  | number  | `512`       | Maximum total disk space for ImportLens project cache shards before least-recently-used cleanup          |
-| `importLens.cacheMaxAgeDays` | number  | `30`        | Maximum inactive age for project cache shards before cleanup removes them                                |
+| `importLens.cacheMaxSizeMB`  | number  | `512`       | Global disk-byte budget across all project cache shards; least-recently-used entries are evicted when exceeded |
+| `importLens.cacheMaxAgeDays` | number  | `30`        | Deprecated and ignored; capacity is governed entirely by the byte budget (`cacheMaxSizeMB`)               |
 | `importLens.budgets`         | object  | `{}`        | Optional per-import and per-file Brotli thresholds for diagnostics and CLI checks                         |
 | `importLens.enableRegistryHints` | boolean | `true`   | Enable short-timeout npm metadata hints cached in the daemon's centralized package metadata cache        |
 | `importLens.logLevel`        | enum    | `info`      | Logging verbosity for the ImportLens output channel. Options: `error`, `warn`, `info`, `debug`           |
@@ -935,7 +935,7 @@ interface HelloMessage {
   storage_path: string;         // Absolute extension-owned cache base; daemon creates project shards below it
   enable_disk_cache: boolean;   // From importLens.enableDiskCache setting
   cache_max_size_mb: number;    // From importLens.cacheMaxSizeMB
-  cache_max_age_days: number;   // From importLens.cacheMaxAgeDays
+  cache_max_age_days: number;   // Deprecated and ignored; kept for wire compatibility
   log_level: "error" | "warn" | "info" | "debug";
 }
 ```
@@ -1155,7 +1155,7 @@ interface CacheStatusResponse {
   total_size_bytes: number;
   project_count: number;
   max_size_mb: number;
-  max_age_days: number;
+  max_age_days: number; // Deprecated echo; never a live limit
   last_cleanup_millis: number | null;
   current_project: CacheShardInfo | null;
   error: string | null;
@@ -1223,13 +1223,13 @@ interface ShutdownMessage {
 
 ### 10.2 Cache Key Format
 
-The cache key for both `papaya` and `redb` size entries is a UTF-8 string using the v3 prefix and a hex-encoded MessagePack `CacheIdentityV3` payload:
+The cache key for both `papaya` and `redb` size entries is a UTF-8 string using the v4 prefix and a hex-encoded MessagePack `CacheIdentity` payload:
 
 ```
-v3:<hex-msgpack-cache-identity>
+v4:<hex-msgpack-cache-identity>
 ```
 
-The identity payload contains `analyzer_version`, `specifier`, root `package_name`, `package_version`, optional canonical `package_root`, optional canonical `entry_path`, `runtime`, `import_kind`, sorted/deduplicated `named_exports`, and manifest/entry fingerprints when available. Sorting named exports ensures import order does not create duplicate entries. Namespace, default, and dynamic imports are distinguished by `import_kind`, so a named export literally called `"dynamic"` cannot collide with dynamic-import analysis.
+The identity payload contains `analyzer_version`, `specifier`, root `package_name`, `package_version`, optional canonical `package_root`, optional canonical `entry_path`, `runtime`, `import_kind`, and sorted/deduplicated `named_exports`. The identity is pure: file fingerprints live on the value side and are re-verified on every serve, so an edited dependency updates the same key in place instead of minting an orphan. Sorting named exports ensures import order does not create duplicate entries. Namespace, default, and dynamic imports are distinguished by `import_kind`, so a named export literally called `"dynamic"` cannot collide with dynamic-import analysis.
 
 The `specifier` field in `ImportRequest` must carry the full subpath (e.g. `"date-fns/format"`) so the daemon can resolve the correct entry point via `oxc_resolver`. The `package` field carries the root package name only (e.g. `"date-fns"`) for `node_modules` lookup purposes. The `version` field is read from the root package's `package.json` regardless of subpath, since subpaths do not have independent versions.
 
@@ -1490,17 +1490,16 @@ The daemon may keep parsed module graphs in a side in-memory cache keyed by cano
 
 ### 11.1 Persistent Cache Schema (redb)
 
-Each project cache shard is a directory under the extension-owned cache base. The shard directory name is a stable `v1-<hash>` identifier derived from the normalized analysis root. Each shard contains one `redb` database and a small JSON metadata file recording `shard_id`, `project_root`, `normalized_root`, and `last_used_millis`. The metadata file powers cache management UI and least-recently-used cleanup without opening every database. Loaded shards must update `last_used_millis` in memory on each access, but JSON metadata writes may be throttled to avoid repeated filesystem writes during parallel import batches.
+Each project cache shard is a directory under the extension-owned cache base. The shard directory name is a stable `v1-<hash>` identifier derived from the normalized analysis root. Each shard contains one `redb` database and a small JSON metadata file recording `shard_id`, `project_root`, `normalized_root`, and `last_used_millis`. The metadata file powers cache management UI without opening every database. Loaded shards must update `last_used_millis` in memory on each access, but JSON metadata writes may be throttled to avoid repeated filesystem writes during parallel import batches.
 
-The `redb` database schema version is `4` and contains these tables:
+The `redb` database schema version is `6` and contains these tables:
 
-| Table name      | Key type                                      | Value type                                       |
-| --------------- | --------------------------------------------- | ------------------------------------------------ |
-| `metadata`      | `&str`                                        | `u64` (`schema_version`)                         |
-| `size_cache`    | `&str` (cache key as defined in Section 10.2) | `&[u8]` (MessagePack-encoded cache envelope)     |
-| `cache_recents` | `&str` (cache key as defined in Section 10.2) | `u64` (last-used Unix timestamp in milliseconds) |
+| Table name      | Key type                                      | Value type                                                                    |
+| --------------- | --------------------------------------------- | ----------------------------------------------------------------------------- |
+| `metadata`      | `&str`                                        | `u64` (`schema_version`)                                                       |
+| `size_cache`    | `&str` (cache key as defined in Section 10.2) | `&[u8]` (8-byte little-endian `last_seq` prefix + MessagePack cache envelope)  |
 
-`size_cache` values persist an internal cache envelope containing the public `ImportResult`, analyzer version, package identity, dependency fingerprints, and full contribution list needed for accurate shared-byte accounting. The daemon normalizes `cache_hit` to `false` before writing and sets it to `true` when serving a memory or disk hit. `cache_recents` is updated on insert and through batched/debounced hit touches, and is used to select up to 20 recent entries for bounded startup preload and best-effort prewarm after hello for the active project shard.
+`size_cache` values persist an internal cache envelope containing the public `ImportResult`, analyzer version, package identity, dependency fingerprints, and full contribution list needed for accurate shared-byte accounting. The daemon normalizes `cache_hit` to `false` before writing and sets it to `true` when serving a memory or disk hit. The fixed sequence prefix lets recency scans (startup preload, byte-budget eviction, per-shard rollups) read each entry's recency without deserializing the envelope. Capacity is enforced by a global byte budget with entry-granular least-recently-used eviction across shards (per-project floor of the newest 128 entries), plus threshold-triggered database compaction so freed pages return to the filesystem.
 
 ### 11.2 Extension Global Storage
 

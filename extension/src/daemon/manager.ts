@@ -7,8 +7,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  CacheCleanupRequest,
-  CacheCleanupResponse,
   CacheListRequest,
   CacheListResponse,
   CacheRemoveRequest,
@@ -28,7 +26,12 @@ import type {
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { NativeDaemonTransport } from "./nativeTransport.js";
-import { type DaemonState, type DaemonStateEvent, TransportCoordinator } from "./transport.js";
+import {
+  type DaemonRefreshedResultsEvent,
+  type DaemonState,
+  type DaemonStateEvent,
+  TransportCoordinator,
+} from "./transport.js";
 
 export class DaemonManager implements vscode.Disposable {
   readonly #transport: TransportCoordinator;
@@ -53,6 +56,10 @@ export class DaemonManager implements vscode.Disposable {
 
   get onDidChangeState(): DaemonStateEvent {
     return this.#transport.onDidChangeState;
+  }
+
+  get onRefreshedResults(): DaemonRefreshedResultsEvent {
+    return this.#transport.onRefreshedResults;
   }
 
   start(analysisRoot?: string): Promise<DaemonState> {
@@ -92,10 +99,6 @@ export class DaemonManager implements vscode.Disposable {
 
   cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null> {
     return this.#transport.cacheStatus(request);
-  }
-
-  cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null> {
-    return this.#transport.cleanupCache(request);
   }
 
   listCache(request: CacheListRequest): Promise<CacheListResponse | null> {

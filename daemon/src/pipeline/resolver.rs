@@ -1,4 +1,4 @@
-use crate::cache::key::CacheIdentityV3;
+use crate::cache::key::CacheIdentity;
 use crate::ipc::protocol::{ImportRequest, ImportRuntime};
 use oxc_resolver::{ModuleType, ResolveOptions, Resolver};
 use serde_json::Value;
@@ -112,7 +112,7 @@ pub fn resolve_package_entry(
     })
 }
 
-pub fn resolved_from_cache_identity(identity: &CacheIdentityV3) -> Option<ResolvedPackage> {
+pub fn resolved_from_cache_identity(identity: &CacheIdentity) -> Option<ResolvedPackage> {
     let package_root = PathBuf::from(identity.package_root.as_ref()?);
     let entry_path = PathBuf::from(identity.entry_path.as_ref()?);
     let package_json_path = package_root.join("package.json");

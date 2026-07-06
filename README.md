@@ -131,8 +131,8 @@ All settings live under `importLens.*` in your VS Code `settings.json`:
 | `importLens.useCodeLens` | `false` | CodeLens above the import instead of end-of-line decorations (ignored in `inlayHint` mode). |
 | `importLens.enableRegistryHints` | `true` | npm registry metadata hints for `package.json`, served from the daemon's local cache with bounded refreshes. |
 | `importLens.enableDiskCache` | `true` | Persist computed sizes to disk across editor restarts. |
-| `importLens.cacheMaxSizeMB` | `512` | Max disk space for project caches before LRU cleanup. |
-| `importLens.cacheMaxAgeDays` | `30` | Max inactive age for project caches before cleanup. |
+| `importLens.cacheMaxSizeMB` | `512` | Global disk-byte budget for project caches; least-recently-used entries are evicted across projects when exceeded. |
+| `importLens.cacheMaxAgeDays` | `30` | **Deprecated and ignored** — capacity is governed entirely by `cacheMaxSizeMB`. |
 | `importLens.logLevel` | `"info"` | Output channel verbosity: `error`, `warn`, `info`, or `debug`. |
 
 ## Ignoring Imports

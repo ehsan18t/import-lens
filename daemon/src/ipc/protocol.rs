@@ -114,6 +114,70 @@ pub struct BatchRequest {
     pub streaming: bool,
 }
 
+/// Which freshness state a served size result is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessKind {
+    /// Verified current against the files on disk.
+    #[default]
+    Fresh,
+    /// A dependency changed (still present); a background recompute may be in flight.
+    Stale,
+    /// A dependency could not be checked (transient stat/read error); the last-known
+    /// value is shown.
+    Unverified,
+}
+
+/// Data-layer freshness of a served size result. Carried over IPC and stored in the
+/// disk cache; no UI consumes it yet.
+///
+/// Modeled as a flat struct with a unit-only `kind` enum rather than an enum with
+/// struct variants: the disk cache serializes `ImportResult` with `rmp_serde` in
+/// compact (positional) mode, which cannot round-trip enum struct/newtype variants
+/// (they encode as a map but decode expecting a sequence). A plain struct + unit enum
+/// is msgpack-safe (same shape the crate already uses for `ConfidenceLevel`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ResultFreshness {
+    #[serde(default)]
+    pub kind: FreshnessKind,
+    /// Only meaningful when `kind == Stale`: a background recompute is in flight.
+    #[serde(default)]
+    pub revalidating: bool,
+    /// Only meaningful when `kind == Unverified`: why verification could not complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ResultFreshness {
+    pub fn fresh() -> Self {
+        Self::default()
+    }
+
+    pub fn stale(revalidating: bool) -> Self {
+        Self {
+            kind: FreshnessKind::Stale,
+            revalidating,
+            reason: None,
+        }
+    }
+
+    pub fn unverified(reason: impl Into<String>) -> Self {
+        Self {
+            kind: FreshnessKind::Unverified,
+            revalidating: false,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// True for the default `Fresh` state. Used by `skip_serializing_if` so a `Fresh`
+    /// result omits the field entirely — which keeps the positional-msgpack DISK
+    /// encoding aligned (the disk only ever stores `Fresh`, since freshness is a
+    /// serve-time property) and trims the common case over the named IPC encoding.
+    pub fn is_fresh(&self) -> bool {
+        self.kind == FreshnessKind::Fresh
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportResult {
     pub specifier: String,
@@ -136,6 +200,13 @@ pub struct ImportResult {
     pub module_breakdown: Option<Vec<ModuleContribution>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_bytes: Option<u64>,
+    /// Freshness of this served value. `#[serde(default)]` so old disk entries decode
+    /// as `Fresh`; `skip_serializing_if = is_fresh` so the DISK (positional msgpack)
+    /// never emits it (disk only stores `Fresh`), keeping the array aligned past the
+    /// conditionally-skipped `module_breakdown`/`shared_bytes`. Non-`Fresh` values
+    /// travel only over the named IPC encoding, which is position-independent.
+    #[serde(default, skip_serializing_if = "ResultFreshness::is_fresh")]
+    pub freshness: ResultFreshness,
     #[serde(default, skip)]
     pub internal_contributions: Vec<ModuleContribution>,
 }
@@ -246,6 +317,17 @@ pub struct FileSizeDocumentRequest {
     pub workspace_root: String,
     pub active_document_path: String,
     pub source: String,
+    /// When true, bypass stale-while-revalidate: recompute synchronously and never
+    /// serve a stale/unverified size (CI / CLI budget checks require the true current
+    /// size). Defaults false for interactive clients, which get SWR.
+    #[serde(default)]
+    pub force_fresh: bool,
+    /// The analysis generation (the triggering document analysis's request id) this
+    /// size read belongs to. Echoed back on the resulting SWR `refreshed_results`
+    /// push so the client can drop a push a newer analysis has since superseded.
+    /// Optional / additive for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +343,42 @@ pub struct FileSizeDocumentResponse {
     pub states: Vec<ImportAnalysisItem>,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+/// A stable per-import identity for the SWR refresh push. The specifier alone is
+/// NOT unique — two imports of the same package differ by import kind / named
+/// exports but share a specifier — so each pushed result is paired with this to
+/// disambiguate variants on the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshedImportIdentity {
+    pub specifier: String,
+    pub import_kind: ImportKind,
+    #[serde(default)]
+    pub named: Vec<String>,
+}
+
+/// Unsolicited server→client push carrying freshly-recomputed sizes for a document
+/// after a background SWR revalidation. Unlike a request/response, it is not keyed by
+/// `request_id`; the client dispatches it by its `message_type` and locates the store
+/// rows by `workspace_root` + `document_path`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshedResultsResponse {
+    #[serde(rename = "type", default = "refreshed_results_message_type")]
+    pub message_type: String,
+    pub version: u32,
+    pub workspace_root: String,
+    pub document_path: String,
+    pub results: Vec<ImportResult>,
+    /// Per-result import identity, index-aligned with `results`, so the client can
+    /// disambiguate same-specifier variants. `skip_serializing_if` empty keeps the
+    /// push compact and lets an older client ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identities: Vec<RefreshedImportIdentity>,
+    /// The analysis generation this refresh was computed for (echoed from the
+    /// triggering `FileSizeDocumentRequest`). The client drops the push if a newer
+    /// analysis has since superseded it. Optional / additive for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,8 +631,10 @@ pub struct HelloMessage {
     pub enable_disk_cache: bool,
     #[serde(default = "default_cache_max_size_mb")]
     pub cache_max_size_mb: u64,
-    #[serde(default = "default_cache_max_age_days")]
-    pub cache_max_age_days: u64,
+    // Registry-metadata store byte budget (`importLens.registryCacheMaxSizeMB`).
+    // Serde-defaulted so an older client that omits it keeps the daemon default.
+    #[serde(default = "default_registry_cache_max_size_mb")]
+    pub registry_cache_max_size_mb: u64,
     pub log_level: String,
 }
 
@@ -611,6 +731,13 @@ pub struct CacheShardInfo {
     pub size_bytes: u64,
     pub last_used_millis: Option<u64>,
     pub loaded: bool,
+    /// Number of cache entries this shard holds, read O(1) from the C1 per-shard
+    /// SUMMARY (never a CACHE_TABLE scan). `#[serde(default)]` so an older peer
+    /// that predates the field still decodes it as 0. The comparable "recency"
+    /// signal §8/X-24 asks for is already carried by `last_used_millis` above,
+    /// so no separate `last_used` field is added.
+    #[serde(default)]
+    pub entry_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,29 +767,21 @@ pub struct CacheStatusResponse {
     pub total_size_bytes: u64,
     pub project_count: usize,
     pub max_size_mb: u64,
-    pub max_age_days: u64,
-    pub last_cleanup_millis: Option<u64>,
     pub current_project: Option<CacheShardInfo>,
-    pub error: Option<String>,
-    pub diagnostics: Vec<ImportDiagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheCleanupRequest {
-    #[serde(rename = "type")]
-    #[serde(default = "cache_cleanup_message_type")]
-    pub message_type: String,
-    pub version: u32,
-    pub request_id: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheCleanupResponse {
-    pub version: u32,
-    pub request_id: u64,
-    pub total_size_bytes: u64,
-    pub removed: Vec<CacheOperationResult>,
-    pub failed: Vec<CacheOperationResult>,
+    /// Σ of every shard's logical (envelope) bytes from the C1 rollups — the
+    /// budget-tracked total, distinct from `total_size_bytes` (the physical
+    /// on-disk directory footprint, which includes redb overhead and metadata).
+    /// `#[serde(default)]` so version skew degrades gracefully.
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// The global disk-byte budget the BudgetCoordinator enforces
+    /// (`cache_max_size_mb` expressed in bytes; 0 disables the budget).
+    #[serde(default)]
+    pub budget_bytes: u64,
+    /// Serialized size of the shared npm-registry metadata snapshot — a single
+    /// length measurement of the persisted envelope, not a scan.
+    #[serde(default)]
+    pub registry_size_bytes: u64,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }
@@ -691,7 +810,19 @@ pub enum CacheRemoveScope {
     CurrentProject,
     Selected,
     All,
+    /// Reclaim orphaned caches (RB-17): remove shards whose project root was
+    /// moved/deleted, and scrub stale/uninstalled entries from surviving shards.
+    /// Complements the automatic reclaim — entry-level staleness self-heals on
+    /// access (name invalidation + the freshness `Gone` eviction), but a whole
+    /// abandoned project is never reopened, so its shard is reclaimed only here
+    /// (manual button) or by the throttled maintenance-tick sweep. Drive-safe:
+    /// an offline/unplugged drive keeps its shard (`ProjectCacheRegistry::purge_orphans`
+    /// via `classify_project_root`, X-3).
     Orphans,
+    /// Clear ONLY the shared npm-hint registry metadata store, leaving every
+    /// bundle shard (and its derived L1/graph caches) untouched. Serializes as
+    /// `"registry"`; older peers that predate this variant log-and-skip it.
+    Registry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -741,7 +872,6 @@ pub enum ClientMessage {
     FileSizeDocument(FileSizeDocumentRequest),
     CompleteImportMembers(CompleteImportMembersRequest),
     CacheStatus(CacheStatusRequest),
-    CacheCleanup(CacheCleanupRequest),
     CacheList(CacheListRequest),
     CacheRemove(CacheRemoveRequest),
     RefreshRegistryHints(RefreshRegistryHintsRequest),
@@ -772,7 +902,6 @@ enum TypedClientMessage {
     FileSizeDocument(FileSizeDocumentRequest),
     CompleteImportMembers(CompleteImportMembersRequest),
     CacheStatus(CacheStatusRequest),
-    CacheCleanup(CacheCleanupRequest),
     CacheList(CacheListRequest),
     CacheRemove(CacheRemoveRequest),
     RefreshRegistryHints(RefreshRegistryHintsRequest),
@@ -828,7 +957,6 @@ impl From<TypedClientMessage> for ClientMessage {
                 Self::CompleteImportMembers(message)
             }
             TypedClientMessage::CacheStatus(message) => Self::CacheStatus(message),
-            TypedClientMessage::CacheCleanup(message) => Self::CacheCleanup(message),
             TypedClientMessage::CacheList(message) => Self::CacheList(message),
             TypedClientMessage::CacheRemove(message) => Self::CacheRemove(message),
             TypedClientMessage::RefreshRegistryHints(message) => {
@@ -861,8 +989,10 @@ fn default_cache_max_size_mb() -> u64 {
     512
 }
 
-fn default_cache_max_age_days() -> u64 {
-    30
+fn default_registry_cache_max_size_mb() -> u64 {
+    // 32 MiB, matching `REGISTRY_CACHE_MAX_SIZE_BYTES` and the extension's
+    // `registryCacheMaxSizeMB` default, so an omitted field is a no-op.
+    32
 }
 
 fn analyze_document_message_type() -> String {
@@ -905,16 +1035,16 @@ fn file_size_document_message_type() -> String {
     "file_size_document".to_owned()
 }
 
+fn refreshed_results_message_type() -> String {
+    "refreshed_results".to_owned()
+}
+
 fn complete_import_members_message_type() -> String {
     "complete_import_members".to_owned()
 }
 
 fn cache_status_message_type() -> String {
     "cache_status".to_owned()
-}
-
-fn cache_cleanup_message_type() -> String {
-    "cache_cleanup".to_owned()
 }
 
 fn cache_list_message_type() -> String {

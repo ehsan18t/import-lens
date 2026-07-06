@@ -1,8 +1,14 @@
 use crate::{
-    cache::{key::cache_key_for_resolved_import, memory::cache_generation},
-    ipc::protocol::ImportRequest,
+    cache::{
+        key::{cache_key_for_resolved_import, path_is_definitely_gone},
+        memory::cache_generation,
+    },
+    ipc::protocol::{ImportRequest, ImportRuntime},
     pipeline::{
-        analyze::AnalysisContext, file_size::FileSizeComputation, resolver::resolve_package_entry,
+        analyze::AnalysisContext,
+        file_size::FileSizeComputation,
+        graph::peek_cached_module_paths,
+        resolver::{ResolvedPackage, resolve_package_entry},
     },
 };
 use papaya::HashMap;
@@ -21,13 +27,15 @@ use std::{
 // Distinct files are bounded by LRU eviction, mirroring GRAPH_CACHE.
 const MAX_CACHED_FILE_SIZES: usize = 64;
 
-// Bound how long an aggregate is served without any freshness signal. The
-// signature only fingerprints each package's entry + manifest (via the cache
-// key) plus the generation, NOT the transitive graph that `compute_file_size`
-// bundles. A node_modules content change with no watcher event (e.g. a
-// watcher-excluded folder) is reflected in the L2 per-import cache after its own
-// re-verify window but would otherwise never reach L1. This TTL gives L1 the
-// same backstop as `memory::REVERIFY_TTL_MS`, capping staleness to one window.
+// Bound how long an aggregate is served without any freshness signal. Per import
+// the signature folds the package's manifest plus a content token: for node_modules
+// imports just the entry stat, for first-party imports a stat per cached-graph
+// module (see `resolved_import_token`). It never re-reads the transitive bundle. A
+// node_modules content change with no watcher event (e.g. a watcher-excluded
+// folder), or a first-party deep edit while that package's graph is not cached (the
+// fallback stats only the entry), is reflected in the L2 per-import cache after its
+// own re-verify window but would otherwise never reach L1. This TTL gives L1 the
+// same backstop as `memory::REVERIFY_TTL`, capping staleness to one window.
 const REVERIFY_TTL_MS: u64 = 30_000;
 
 #[derive(Debug)]
@@ -108,7 +116,7 @@ impl FileSizeCache {
         let pinned = self.entries.pin();
         let missing = pinned
             .iter()
-            .filter(|(path, _)| !path.exists())
+            .filter(|(path, _)| path_is_definitely_gone(path))
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         for path in &missing {
@@ -133,17 +141,17 @@ pub fn shared_file_size_cache() -> &'static FileSizeCache {
     SHARED_FILE_SIZE_CACHE.get_or_init(FileSizeCache::new)
 }
 
-/// Freshness key for an L1 file-size entry: sorted resolved per-import cache keys
-/// (which fold in each package's manifest + entry fingerprint) plus the cache
-/// generation. Unresolvable requests contribute a stable request-shape token.
-/// Sorting makes it order-independent, matching `compute_file_size` which
-/// combines all imports regardless of order.
+/// Freshness key for an L1 file-size entry: sorted per-import freshness tokens (see
+/// `resolved_import_token`) plus the cache generation, folded once. Unresolvable
+/// requests contribute a stable request-shape token. Sorting makes it
+/// order-independent, matching `compute_file_size` which combines all imports
+/// regardless of order.
 pub fn file_size_signature(context: &AnalysisContext, requests: &[ImportRequest]) -> u64 {
     let mut tokens = requests
         .iter()
         .map(
             |request| match resolve_package_entry(&context.active_document_path, request) {
-                Ok(resolved) => cache_key_for_resolved_import(request, &resolved),
+                Ok(resolved) => resolved_import_token(request, &resolved),
                 Err(_) => format!(
                     "unresolved:{}:{}:{}:{:?}:{:?}:{}",
                     request.package_name,
@@ -166,6 +174,85 @@ pub fn file_size_signature(context: &AnalysisContext, requests: &[ImportRequest]
         token.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Per-import freshness token folded into the L1 signature.
+///
+/// The cache key is fingerprint-free (identity is pure), so an independent stat
+/// token carries the edit signal without depending on the key. A raw len+mtime stat
+/// holds all the freshness signal a full `FileFingerprint` would here, without its
+/// `fs::canonicalize` (which opens the file on Windows) — this runs per import per
+/// poll BEFORE the L1 hit check, so it must stay stat-only: never read contents,
+/// never trigger a graph build.
+///
+/// A first-party package (workspace / `file:` / npm-link — a resolved entry with no
+/// `node_modules` segment) is fully editable, so a deep, transitively-imported module
+/// edit must move the signature. A node_modules package changes only via install,
+/// which bumps `cache_generation` (folded once by the caller), so it keeps the cheap
+/// entry+manifest stat and never pays to enumerate its internal modules.
+fn resolved_import_token(request: &ImportRequest, resolved: &ResolvedPackage) -> String {
+    let key = cache_key_for_resolved_import(request, resolved);
+    let manifest_token = stat_token(&resolved.package_root.join("package.json"));
+    let content_token = if path_has_node_modules_segment(&resolved.entry_path) {
+        stat_token(&resolved.entry_path)
+    } else {
+        first_party_module_token(&resolved.entry_path, request.runtime)
+    };
+    format!("{key}|{content_token}|{manifest_token}")
+}
+
+/// Stat token covering every first-party module reachable from `entry_path`. Peeks
+/// the cached module graph for the package's module path set — or, for a CommonJS
+/// package (which produces no ESM graph, RB-5), the cached CJS module set — and folds
+/// a `stat_token` per module, so a deep-module edit — which changes neither the cache
+/// key nor the entry stat — moves the L1 signature. Neither peek ever builds. Any
+/// `node_modules` modules a first-party package pulls in are skipped: they invalidate
+/// via `cache_generation`, not mtime, and re-stat'ing them every poll is the cost the
+/// node_modules branch deliberately avoids. With nothing cached yet, falls back to the
+/// entry stat alone; a later poll, once L2 has populated a graph / CJS module set,
+/// upgrades to full coverage. The tokens are sorted so the result is stable regardless
+/// of module order.
+fn first_party_module_token(entry_path: &Path, runtime: ImportRuntime) -> String {
+    let module_paths = peek_cached_module_paths(entry_path, runtime)
+        .or_else(|| crate::pipeline::cjs::peek_cjs_module_paths(entry_path, runtime));
+    let Some(module_paths) = module_paths else {
+        return stat_token(entry_path);
+    };
+    let mut tokens = module_paths
+        .iter()
+        .filter(|path| !path_has_node_modules_segment(path))
+        .map(|path| stat_token(path))
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.join(",")
+}
+
+/// Whether any component of `path` is a `node_modules` directory. Mirrors
+/// `key::cache_key_is_first_party`'s notion (a resolved entry with no `node_modules`
+/// segment is first-party) but tests the live `Path` directly, sparing a cache-key
+/// decode per import per poll.
+fn path_has_node_modules_segment(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if name == "node_modules")
+    })
+}
+
+/// Cheap edit-sensitivity token for one file: len + mtime from a single stat.
+/// A missing/unstatable file yields a distinct constant so its transition into
+/// or out of existence also changes the signature.
+fn stat_token(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let modified_millis = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            format!("{}:{modified_millis}", metadata.len())
+        }
+        Err(_) => "absent".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +376,46 @@ mod tests {
     }
 
     #[test]
+    fn file_size_signature_changes_when_entry_bytes_change() {
+        // Real node_modules fixture so resolve_package_entry succeeds and the
+        // Ok(resolved) arm folds in the entry+manifest fingerprint.
+        let ws = std::env::temp_dir().join(format!("il-l1-sig-{}", std::process::id()));
+        let pkg = ws.join("node_modules").join("l1-lib");
+        std::fs::create_dir_all(&pkg).expect("pkg");
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"version":"1.0.0","module":"index.js"}"#,
+        )
+        .expect("manifest");
+        std::fs::write(pkg.join("index.js"), "export const a = 1;").expect("entry v1");
+
+        let context = AnalysisContext {
+            workspace_root: ws.clone(),
+            active_document_path: ws.join("src").join("index.ts"),
+        };
+        let requests = vec![ImportRequest {
+            specifier: "l1-lib".to_owned(),
+            package_name: "l1-lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: Vec::new(),
+            import_kind: ImportKind::Namespace,
+            runtime: ImportRuntime::Component,
+        }];
+
+        let sig1 = file_size_signature(&context, &requests);
+        // Change the entry's content+length; the signature must change even though
+        // the cache key no longer carries entry fingerprints.
+        std::fs::write(pkg.join("index.js"), "export const a = 222222;").expect("entry v2");
+        let sig2 = file_size_signature(&context, &requests);
+
+        assert_ne!(
+            sig1, sig2,
+            "L1 signature must react to a resolved entry's content change"
+        );
+        std::fs::remove_dir_all(ws).ok();
+    }
+
+    #[test]
     fn signature_is_order_independent() {
         let ctx = unresolvable_context();
         let a = named_request("alpha", &["x"]);
@@ -315,5 +442,132 @@ mod tests {
         let before = file_size_signature(&ctx, &reqs);
         bump_cache_generation();
         assert_ne!(before, file_size_signature(&ctx, &reqs));
+    }
+
+    #[test]
+    fn resolved_import_token_folds_first_party_deep_module_stat() {
+        use crate::pipeline::graph::build_module_graph_cached_with_runtime;
+        use crate::pipeline::resolver::SideEffectsMode;
+
+        // A first-party fixture lives OUTSIDE node_modules: entry imports a deep
+        // module, both editable. Finding 8: editing the deep module must move L1.
+        let root = std::env::temp_dir().join(format!("il-l1-fp-{}", std::process::id()));
+        let pkg = root.join("pkg");
+        std::fs::create_dir_all(&pkg).expect("pkg dir");
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"version":"1.0.0","module":"index.js"}"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            pkg.join("index.js"),
+            "import './deep.js';\nexport const a = 1;\n",
+        )
+        .expect("entry");
+        std::fs::write(pkg.join("deep.js"), "export const d = 1;\n").expect("deep v1");
+
+        let entry_path = std::fs::canonicalize(pkg.join("index.js")).expect("canonical entry");
+        assert!(
+            !path_has_node_modules_segment(&entry_path),
+            "test setup: fixture must be first-party (no node_modules segment)"
+        );
+
+        let resolved = ResolvedPackage {
+            package_root: pkg.clone(),
+            package_json: serde_json::Value::Null,
+            entry_path: entry_path.clone(),
+            is_cjs: false,
+            side_effects: SideEffectsMode::Unknown,
+        };
+        let request = ImportRequest {
+            specifier: "pkg".to_owned(),
+            package_name: "pkg".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: Vec::new(),
+            import_kind: ImportKind::Namespace,
+            runtime: ImportRuntime::Component,
+        };
+
+        // Cache the module graph so the first-party branch can peek its module set.
+        // Rebuilt immediately before each token so a concurrent LRU eviction/clear in
+        // the process-shared GRAPH_CACHE cannot drop it mid-test.
+        build_module_graph_cached_with_runtime(&entry_path, ImportRuntime::Component)
+            .expect("graph should build");
+        let token_before = resolved_import_token(&request, &resolved);
+
+        // Edit the DEEP module only (not the entry, not the manifest): its len+mtime move.
+        std::fs::write(pkg.join("deep.js"), "export const d = 22222222;\n").expect("deep v2");
+        build_module_graph_cached_with_runtime(&entry_path, ImportRuntime::Component)
+            .expect("graph should rebuild");
+        let token_after = resolved_import_token(&request, &resolved);
+
+        assert_ne!(
+            token_before, token_after,
+            "editing a deep first-party module must change the L1 token"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolved_import_token_ignores_node_modules_internal_modules() {
+        use crate::pipeline::resolver::SideEffectsMode;
+
+        // Cost bound: a node_modules import must keep the cheap entry+manifest stat and
+        // NOT re-stat its internal modules (they change only via install → generation).
+        let root = std::env::temp_dir().join(format!("il-l1-nm-{}", std::process::id()));
+        let pkg = root.join("node_modules").join("lib");
+        std::fs::create_dir_all(&pkg).expect("pkg dir");
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"version":"1.0.0","module":"index.js"}"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            pkg.join("index.js"),
+            "import './deep.js';\nexport const a = 1;\n",
+        )
+        .expect("entry");
+        std::fs::write(pkg.join("deep.js"), "export const d = 1;\n").expect("deep v1");
+
+        let entry_path = std::fs::canonicalize(pkg.join("index.js")).expect("canonical entry");
+        assert!(
+            path_has_node_modules_segment(&entry_path),
+            "test setup: fixture must be under node_modules"
+        );
+
+        let resolved = ResolvedPackage {
+            package_root: pkg.clone(),
+            package_json: serde_json::Value::Null,
+            entry_path: entry_path.clone(),
+            is_cjs: false,
+            side_effects: SideEffectsMode::Unknown,
+        };
+        let request = ImportRequest {
+            specifier: "lib".to_owned(),
+            package_name: "lib".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: Vec::new(),
+            import_kind: ImportKind::Namespace,
+            runtime: ImportRuntime::Component,
+        };
+
+        let token_before = resolved_import_token(&request, &resolved);
+        // Editing an internal module must leave the token unchanged.
+        std::fs::write(pkg.join("deep.js"), "export const d = 22222222;\n").expect("deep v2");
+        let token_after = resolved_import_token(&request, &resolved);
+        assert_eq!(
+            token_before, token_after,
+            "a node_modules import must not fold its internal modules into L1"
+        );
+
+        // Sanity: the entry itself is still covered, so a reinstall that rewrites the
+        // entry still moves L1.
+        std::fs::write(pkg.join("index.js"), "export const a = 22222222;\n").expect("entry v2");
+        let token_entry_changed = resolved_import_token(&request, &resolved);
+        assert_ne!(
+            token_before, token_entry_changed,
+            "editing the node_modules entry must change the L1 token"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

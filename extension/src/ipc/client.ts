@@ -9,8 +9,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  CacheCleanupRequest,
-  CacheCleanupResponse,
   CacheListRequest,
   CacheListResponse,
   CacheRemoveRequest,
@@ -25,6 +23,7 @@ import type {
   FileSizeDocumentRequest,
   FileSizeDocumentResponse,
   FileSizeResponse,
+  RefreshedResultsResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
   WorkspaceReportRequest,
@@ -65,7 +64,6 @@ export class IpcClient extends EventEmitter {
   readonly #fileSizeDocumentPending = new Map<number, PendingRequest<FileSizeDocumentResponse>>();
   readonly #completionPending = new Map<number, PendingRequest<CompleteImportMembersResponse>>();
   readonly #cacheStatusPending = new Map<number, PendingRequest<CacheStatusResponse>>();
-  readonly #cacheCleanupPending = new Map<number, PendingRequest<CacheCleanupResponse>>();
   readonly #cacheListPending = new Map<number, PendingRequest<CacheListResponse>>();
   readonly #cacheRemovePending = new Map<number, PendingRequest<CacheRemoveResponse>>();
   readonly #registryHintRefreshPending = new Map<number, PendingRegistryHintRefreshRequest>();
@@ -240,13 +238,6 @@ export class IpcClient extends EventEmitter {
     return this.#requestWithPending(this.#cacheStatusPending, request, timeoutMs);
   }
 
-  requestCacheCleanup(
-    request: CacheCleanupRequest,
-    timeoutMs = 30000,
-  ): Promise<CacheCleanupResponse> {
-    return this.#requestWithPending(this.#cacheCleanupPending, request, timeoutMs);
-  }
-
   requestCacheList(request: CacheListRequest, timeoutMs = 10000): Promise<CacheListResponse> {
     return this.#requestWithPending(this.#cacheListPending, request, timeoutMs);
   }
@@ -317,11 +308,6 @@ export class IpcClient extends EventEmitter {
         continue;
       }
 
-      if (isCacheCleanupResponse(message)) {
-        this.#resolvePending(this.#cacheCleanupPending, message);
-        continue;
-      }
-
       if (isCacheListResponse(message)) {
         this.#resolvePending(this.#cacheListPending, message);
         continue;
@@ -381,6 +367,13 @@ export class IpcClient extends EventEmitter {
 
       if (isWorkspaceReportResponse(message)) {
         this.#resolvePending(this.#workspaceReportPending, message);
+        continue;
+      }
+
+      if (isRefreshedResultsResponse(message)) {
+        // Unsolicited SWR push — no pending request to resolve. Emit for the
+        // subscriber that owns the AnalysisStore to merge in place.
+        this.emit("refreshedResults", message);
         continue;
       }
 
@@ -452,10 +445,6 @@ export class IpcClient extends EventEmitter {
       pending.reject(error);
     }
 
-    for (const pending of this.#cacheCleanupPending.values()) {
-      pending.reject(error);
-    }
-
     for (const pending of this.#cacheListPending.values()) {
       pending.reject(error);
     }
@@ -481,7 +470,6 @@ export class IpcClient extends EventEmitter {
     this.#fileSizeDocumentPending.clear();
     this.#completionPending.clear();
     this.#cacheStatusPending.clear();
-    this.#cacheCleanupPending.clear();
     this.#cacheListPending.clear();
     this.#cacheRemovePending.clear();
 
@@ -522,6 +510,20 @@ const isRefreshRegistryHintsResponse = (value: unknown): value is RefreshRegistr
 
 const isRegistryHintRefreshPartial = (response: RefreshRegistryHintsResponse): boolean =>
   Array.isArray(response.indexes) && response.indexes.length > 0;
+
+const isRefreshedResultsResponse = (value: unknown): value is RefreshedResultsResponse => {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<RefreshedResultsResponse>;
+  return (
+    candidate.type === "refreshed_results" &&
+    typeof candidate.workspace_root === "string" &&
+    typeof candidate.document_path === "string" &&
+    Array.isArray(candidate.results)
+  );
+};
 
 const isWorkspaceReportResponse = (value: unknown): value is WorkspaceReportResponse => {
   if (!value || typeof value !== "object") {
@@ -717,24 +719,7 @@ const isCacheStatusResponse = (value: unknown): value is CacheStatusResponse => 
     typeof candidate.total_size_bytes === "number" &&
     typeof candidate.project_count === "number" &&
     typeof candidate.max_size_mb === "number" &&
-    typeof candidate.max_age_days === "number" &&
-    (candidate.last_cleanup_millis === null || typeof candidate.last_cleanup_millis === "number") &&
     (candidate.current_project === null || isCacheShardInfo(candidate.current_project))
-  );
-};
-
-const isCacheCleanupResponse = (value: unknown): value is CacheCleanupResponse => {
-  if (!hasCacheResponseBase(value)) {
-    return false;
-  }
-
-  const candidate = value as Partial<CacheCleanupResponse>;
-  return (
-    typeof candidate.total_size_bytes === "number" &&
-    Array.isArray(candidate.removed) &&
-    candidate.removed.every(isCacheOperationResult) &&
-    Array.isArray(candidate.failed) &&
-    candidate.failed.every(isCacheOperationResult)
   );
 };
 

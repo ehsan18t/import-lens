@@ -5,8 +5,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  CacheCleanupRequest,
-  CacheCleanupResponse,
   CacheListRequest,
   CacheListResponse,
   CacheRemoveRequest,
@@ -19,6 +17,7 @@ import type {
   EnumerateExportsResponse,
   FileSizeDocumentRequest,
   FileSizeDocumentResponse,
+  RefreshedResultsResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
   WorkspaceReportRequest,
@@ -29,10 +28,14 @@ import type { Logger } from "../logging/types.js";
 
 export type DaemonState = "ready" | "unavailable";
 export type DaemonStateEvent = (listener: (state: DaemonState) => void) => { dispose(): void };
+export type DaemonRefreshedResultsEvent = (
+  listener: (message: RefreshedResultsResponse) => void,
+) => { dispose(): void };
 
 export interface AnalysisTransport {
   readonly state: DaemonState;
   readonly onDidChangeState?: DaemonStateEvent;
+  readonly onRefreshedResults?: DaemonRefreshedResultsEvent;
   start(analysisRoot?: string): Promise<DaemonState>;
   analyzeDocument(request: AnalyzeDocumentRequest): Promise<AnalyzeDocumentResponse | null>;
   analyzePackageJson(
@@ -48,7 +51,6 @@ export interface AnalysisTransport {
     request: CompleteImportMembersRequest,
   ): Promise<CompleteImportMembersResponse | null>;
   cacheStatus(request: CacheStatusRequest): Promise<CacheStatusResponse | null>;
-  cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null>;
   listCache(request: CacheListRequest): Promise<CacheListResponse | null>;
   removeCache(request: CacheRemoveRequest): Promise<CacheRemoveResponse | null>;
   refreshRegistryHints(
@@ -67,6 +69,7 @@ export interface AnalysisTransport {
 export class TransportCoordinator implements AnalysisTransport {
   readonly #transports: readonly AnalysisTransport[];
   readonly #stateListeners = new Set<(state: DaemonState) => void>();
+  readonly #refreshedResultsListeners = new Set<(message: RefreshedResultsResponse) => void>();
   readonly #logger?: Pick<Logger, "debug" | "info">;
   #activeTransport: AnalysisTransport | null = null;
   #startPromise: Promise<DaemonState> | null = null;
@@ -78,6 +81,7 @@ export class TransportCoordinator implements AnalysisTransport {
 
     for (const transport of transports) {
       transport.onDidChangeState?.((state) => this.#handleTransportState(transport, state));
+      transport.onRefreshedResults?.((message) => this.#emitRefreshedResults(message));
     }
   }
 
@@ -91,6 +95,16 @@ export class TransportCoordinator implements AnalysisTransport {
     return {
       dispose: () => {
         this.#stateListeners.delete(listener);
+      },
+    };
+  };
+
+  readonly onRefreshedResults: DaemonRefreshedResultsEvent = (listener) => {
+    this.#refreshedResultsListeners.add(listener);
+
+    return {
+      dispose: () => {
+        this.#refreshedResultsListeners.delete(listener);
       },
     };
   };
@@ -165,10 +179,6 @@ export class TransportCoordinator implements AnalysisTransport {
     return this.#activeTransport?.cacheStatus(request) ?? Promise.resolve(null);
   }
 
-  cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse | null> {
-    return this.#activeTransport?.cleanupCache(request) ?? Promise.resolve(null);
-  }
-
   listCache(request: CacheListRequest): Promise<CacheListResponse | null> {
     return this.#activeTransport?.listCache(request) ?? Promise.resolve(null);
   }
@@ -239,6 +249,12 @@ export class TransportCoordinator implements AnalysisTransport {
 
     for (const listener of this.#stateListeners) {
       listener(state);
+    }
+  }
+
+  #emitRefreshedResults(message: RefreshedResultsResponse): void {
+    for (const listener of this.#refreshedResultsListeners) {
+      listener(message);
     }
   }
 }

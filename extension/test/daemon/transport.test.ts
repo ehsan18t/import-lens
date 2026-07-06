@@ -12,8 +12,6 @@ import type {
   AnalyzePackageJsonResponse,
   AnalyzeSpecifiersRequest,
   AnalyzeSpecifiersResponse,
-  CacheCleanupRequest,
-  CacheCleanupResponse,
   CacheListRequest,
   CacheListResponse,
   CacheRemoveRequest,
@@ -161,22 +159,7 @@ class FakeTransport implements AnalysisTransport {
       total_size_bytes: 2048,
       project_count: 1,
       max_size_mb: 512,
-      max_age_days: 30,
-      last_cleanup_millis: null,
       current_project: null,
-      error: null,
-      diagnostics: [],
-    };
-  }
-
-  async cleanupCache(request: CacheCleanupRequest): Promise<CacheCleanupResponse> {
-    this.calls.push(`cleanupCache:${request.request_id}`);
-    return {
-      version: request.version,
-      request_id: request.request_id,
-      total_size_bytes: 1024,
-      removed: [],
-      failed: [],
       error: null,
       diagnostics: [],
     };
@@ -332,10 +315,6 @@ class SlowReadyTransport implements AnalysisTransport {
     return null;
   }
 
-  async cleanupCache(): Promise<CacheCleanupResponse | null> {
-    return null;
-  }
-
   async listCache(): Promise<CacheListResponse | null> {
     return null;
   }
@@ -375,7 +354,6 @@ test("TransportCoordinator selects the first ready transport and delegates reque
   assert.equal(await coordinator.start(), "ready");
   await coordinator.enumerateExports(exportsRequest(8));
   await coordinator.cacheStatus(cacheStatusRequest(10));
-  await coordinator.cleanupCache(cacheCleanupRequest(11));
   await coordinator.listCache(cacheListRequest(12));
   await coordinator.removeCache(cacheRemoveRequest(13));
   coordinator.invalidatePackage("react");
@@ -386,7 +364,6 @@ test("TransportCoordinator selects the first ready transport and delegates reque
     "start",
     "exports:8:tiny-lib",
     "cacheStatus:10",
-    "cleanupCache:11",
     "listCache:12",
     "removeCache:13:current_project",
     "invalidate:react",
@@ -488,12 +465,6 @@ const cacheStatusRequest = (requestId: number): CacheStatusRequest => ({
   version: 6,
   request_id: requestId,
   workspace_root: "/workspace",
-});
-
-const cacheCleanupRequest = (requestId: number): CacheCleanupRequest => ({
-  type: "cache_cleanup",
-  version: 6,
-  request_id: requestId,
 });
 
 const cacheListRequest = (requestId: number): CacheListRequest => ({

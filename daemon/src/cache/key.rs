@@ -10,7 +10,17 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-pub const CACHE_KEY_PREFIX_V3: &str = "v3:";
+/// Fast, non-cryptographic content hash of the bytes actually read during
+/// analysis. Used to detect real content changes (and ignore no-op touches
+/// such as `npm ci` that only bump mtime). Not for security.
+pub fn content_hash(bytes: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(bytes)
+}
+
+/// Single source of truth for the cache-key schema version. The key prefix
+/// (`v{N}:`) derives from this, so a schema bump is a one-line change here with
+/// no type renames.
+const CACHE_KEY_VERSION: u32 = 4;
 pub const ANALYZER_REVISION: &str = "graph2";
 pub const ANALYZER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+graph2");
 
@@ -19,10 +29,15 @@ pub struct FileFingerprint {
     pub path: String,
     pub len: u64,
     pub modified_millis: u64,
+    /// xxh3 of the bytes read during analysis. Absent for fingerprints built by
+    /// a pure stat (`file_fingerprint`). Skipped when None so the serialized key
+    /// stays identical to the pre-content-hash format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheIdentityV3 {
+pub struct CacheIdentity {
     pub analyzer_version: String,
     pub specifier: String,
     pub package_name: String,
@@ -32,8 +47,6 @@ pub struct CacheIdentityV3 {
     pub runtime: ImportRuntime,
     pub import_kind: ImportKind,
     pub named_exports: Vec<String>,
-    pub manifest_fingerprint: Option<FileFingerprint>,
-    pub entry_fingerprint: Option<FileFingerprint>,
 }
 
 pub fn cache_key_for_resolved_import(
@@ -43,10 +56,49 @@ pub fn cache_key_for_resolved_import(
     encode_cache_identity(&cache_identity_for_import(request, Some(resolved)))
 }
 
+/// True when the key's resolved entry is a first-party dependency — a workspace
+/// package, `npm link`, or `file:` dep whose entry path contains no `node_modules`
+/// component. These change without a `NodeModulesChanged` generation bump, so they
+/// must bypass the TTL fast path and be re-validated on every `get` (D3). A key that
+/// does not decode to an identity (opaque/legacy) defaults to `false`, preserving the
+/// existing fast-path behavior. The identity path is normalized `/`-separated (see
+/// `normalize_identity_path`).
+///
+/// Fail-safe window (F5 / D3 edge). Classification relies on `normalize_identity_path`
+/// having `fs::canonicalize`d the entry OUT of `node_modules` at key-build time: a
+/// workspace / `npm link` dep symlinked under `node_modules` canonicalizes to its real
+/// first-party location, so the stored path carries no `node_modules` segment and this
+/// returns `true`. The sole window where such a dep is misclassified as NOT first-party
+/// is when `fs::canonicalize` FAILED at key-build time and the raw symlink path under
+/// `node_modules` was stored instead of the canonical target. That is bounded and narrow:
+///  - Bounded: a misclassified entry takes the TTL fast path, so a first-party edit is
+///    missed for at most `REVERIFY_TTL` (30s), after which it re-verifies anyway; any
+///    `NodeModulesChanged`/generation bump forces the re-check sooner.
+///  - Narrow: `fs::canonicalize` only fails on an inaccessible path, but analysis has
+///    just read that exact file microseconds earlier, so in practice it is present and
+///    the symlink resolves out of `node_modules`.
+///
+/// This is documented, not "fixed", by design: a `node_modules` path that MIGHT be a
+/// failed-canonicalize symlink is indistinguishable from a genuine `node_modules` dep by
+/// the path string alone, so failing safe (treating it as first-party) would force the
+/// strict per-`get` re-read on EVERY dependency and defeat the TTL fast path; recording
+/// the canonicalize-failure signal instead would require a new field in the cache-key
+/// identity (the schema embedded in the key). Neither is warranted for a window this
+/// narrow and this bounded.
+pub fn cache_key_is_first_party(key: &str) -> bool {
+    decode_cache_identity(key)
+        .and_then(|identity| identity.entry_path)
+        .is_some_and(|entry_path| {
+            !entry_path
+                .split('/')
+                .any(|segment| segment == "node_modules")
+        })
+}
+
 fn cache_identity_for_import(
     request: &ImportRequest,
     resolved: Option<&ResolvedPackage>,
-) -> CacheIdentityV3 {
+) -> CacheIdentity {
     let mut named_exports = if matches!(&request.import_kind, ImportKind::Named) {
         request.named.clone()
     } else {
@@ -55,7 +107,7 @@ fn cache_identity_for_import(
     named_exports.sort();
     named_exports.dedup();
 
-    CacheIdentityV3 {
+    CacheIdentity {
         analyzer_version: ANALYZER_VERSION.to_owned(),
         specifier: request.specifier.clone(),
         package_name: request.package_name.clone(),
@@ -65,14 +117,15 @@ fn cache_identity_for_import(
         runtime: request.runtime,
         import_kind: request.import_kind,
         named_exports,
-        manifest_fingerprint: resolved
-            .and_then(|package| file_fingerprint(package.package_root.join("package.json"))),
-        entry_fingerprint: resolved.and_then(|package| file_fingerprint(&package.entry_path)),
     }
 }
 
-pub fn decode_cache_identity(key: &str) -> Option<CacheIdentityV3> {
-    let encoded = key.strip_prefix(CACHE_KEY_PREFIX_V3)?;
+pub fn decode_cache_identity(key: &str) -> Option<CacheIdentity> {
+    // Built once: decode runs on scan-style paths (invalidation, orphan checks)
+    // where a per-call `format!` allocation is pure churn.
+    static PREFIX: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("v{CACHE_KEY_VERSION}:"));
+    let encoded = key.strip_prefix(PREFIX.as_str())?;
     let bytes = hex_decode(encoded)?;
     rmp_serde::from_slice(&bytes).ok()
 }
@@ -85,6 +138,70 @@ pub fn cache_key_matches_package(key: &str, package_name: &str) -> bool {
     let root_prefix = format!("{package_name}@");
     let subpath_prefix = format!("{package_name}/");
     key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix)
+}
+
+/// Definitive-absence test for reclaim/delete paths. Unlike `Path::exists()`
+/// (which maps every error to `false`), this returns `true` only when a stat
+/// reports `NotFound`; a locked file, offline drive, or permission error returns
+/// `false` (keep — never destroy a valid cache on a transient condition). §4.3 / X-3 / X-4.
+pub fn path_is_definitely_gone(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Reachability of a project root, for the destructive orphan-shard reclaim
+/// (RB-17). `path_is_definitely_gone` alone is unsafe here: on Windows a released
+/// drive letter reports `ERROR_PATH_NOT_FOUND`, which Rust maps to `NotFound` —
+/// so an unplugged drive would look like a deleted project and get its cache
+/// destroyed (X-3 / RB-7). This distinguishes a genuinely deleted project (its
+/// volume is live but the folder is gone) from an unreachable volume by requiring
+/// that *some ancestor* of the root confirmably exists before declaring an orphan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectRootState {
+    /// The root exists (or is present-but-unreadable) — keep the shard.
+    Present,
+    /// The root is confirmably absent AND its volume is reachable (an ancestor
+    /// exists) — a genuine orphan; the shard may be removed.
+    Orphaned,
+    /// Neither the root nor any ancestor is reachable (offline/unplugged volume,
+    /// or a stat error) — keep the shard; deletion cannot be proven.
+    VolumeUnreachable,
+}
+
+/// Classify a project root for orphan reclaim. Only `Orphaned` authorizes a
+/// destructive shard removal; both other states keep the shard.
+pub fn classify_project_root(root: &Path) -> ProjectRootState {
+    classify_project_root_with(root, |path| path.try_exists())
+}
+
+/// Core of [`classify_project_root`], with the existence probe injected so the
+/// drive-safety logic — including the Windows unplugged-drive case, where every
+/// ancestor reports `NotFound` and no real filesystem can reproduce it portably —
+/// is deterministically testable.
+fn classify_project_root_with(
+    root: &Path,
+    exists: impl Fn(&Path) -> std::io::Result<bool>,
+) -> ProjectRootState {
+    match exists(root) {
+        Ok(true) => ProjectRootState::Present,
+        // Confirmed absent (`NotFound`). Prove the volume is live before treating
+        // this as a deletion: an unplugged drive reports every ancestor absent too.
+        Ok(false) => {
+            if root
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| matches!(exists(ancestor), Ok(true)))
+            {
+                ProjectRootState::Orphaned
+            } else {
+                ProjectRootState::VolumeUnreachable
+            }
+        }
+        // Permission / not-ready / other transient error — never destroy on doubt.
+        Err(_) => ProjectRootState::VolumeUnreachable,
+    }
 }
 
 /// Whether a cache entry is an orphan the user's purge action should drop:
@@ -103,14 +220,14 @@ pub fn cache_key_is_orphan(key: &str, current_analyzer_version: &str) -> bool {
     if identity
         .entry_path
         .as_deref()
-        .is_some_and(|path| !Path::new(path).exists())
+        .is_some_and(|path| path_is_definitely_gone(Path::new(path)))
     {
         return true;
     }
     identity
         .package_root
         .as_deref()
-        .is_some_and(|path| !Path::new(path).exists())
+        .is_some_and(|path| path_is_definitely_gone(Path::new(path)))
 }
 
 /// Whether `key` belongs to any package in `package_names`. Decodes the key's
@@ -138,34 +255,218 @@ pub fn fingerprints_for_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<F
     fingerprints
 }
 
-pub fn fingerprints_are_current(fingerprints: &[FileFingerprint]) -> bool {
-    fingerprints.iter().all(|stored| {
-        file_fingerprint(&stored.path).is_some_and(|current| {
-            current.len == stored.len && current.modified_millis == stored.modified_millis
-        })
-    })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Verified current against the file on disk.
+    Fresh,
+    /// A dependency file's content changed (still present).
+    Stale,
+    /// A dependency file is definitively absent (`NotFound`).
+    Gone,
+    /// Could not verify (transient stat/read error). Caller must KEEP, not evict.
+    Unknown,
 }
 
-fn encode_cache_identity(identity: &CacheIdentityV3) -> String {
-    let bytes = rmp_serde::to_vec(identity).unwrap_or_default();
-    format!("{CACHE_KEY_PREFIX_V3}{}", hex_encode(&bytes))
+fn classify_stat_error(kind: std::io::ErrorKind) -> Freshness {
+    if kind == std::io::ErrorKind::NotFound {
+        Freshness::Gone
+    } else {
+        Freshness::Unknown
+    }
 }
 
-fn file_fingerprint(path: impl AsRef<Path>) -> Option<FileFingerprint> {
-    let path = path.as_ref();
-    let metadata = fs::metadata(path).ok()?;
-    let modified_millis = metadata
+/// Milliseconds since the Unix epoch of a file's mtime, or 0 when the platform
+/// reports no mtime or a value that does not fit a `u64` of milliseconds.
+fn modified_millis(metadata: &std::fs::Metadata) -> u64 {
+    metadata
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
+/// Tri-state freshness of one stored fingerprint against the current file.
+pub fn check_fingerprint(stored: &FileFingerprint) -> Freshness {
+    let metadata = match fs::metadata(&stored.path) {
+        Ok(metadata) => metadata,
+        Err(error) => return classify_stat_error(error.kind()),
+    };
+    let current_len = metadata.len();
+    let current_mtime = modified_millis(&metadata);
+
+    // Cheap pre-filter: unchanged mtime+len means unchanged content — skip the read.
+    if current_len == stored.len && current_mtime == stored.modified_millis {
+        return Freshness::Fresh;
+    }
+
+    // mtime/len differ. With a content hash we can tell a real change from a
+    // no-op touch; without one we can only assume Stale.
+    let Some(expected) = stored.content_hash else {
+        return Freshness::Stale;
+    };
+    match fs::read(&stored.path) {
+        Ok(bytes) if content_hash(&bytes) == expected => Freshness::Fresh,
+        Ok(_) => Freshness::Stale,
+        Err(error) => classify_stat_error(error.kind()),
+    }
+}
+
+/// Worst-case freshness across a set. `Unknown` dominates so a transient error on
+/// any file never triggers a destructive decision; otherwise Gone, then Stale.
+pub fn check_fingerprints(fingerprints: &[FileFingerprint]) -> Freshness {
+    let mut worst = Freshness::Fresh;
+    for fingerprint in fingerprints {
+        match check_fingerprint(fingerprint) {
+            Freshness::Unknown => return Freshness::Unknown,
+            // The `Unknown` arm returns early, so `worst` is never `Unknown` here;
+            // and the `Stale` arm below only upgrades `Fresh`, so it can never
+            // downgrade a `Gone`. Precedence stays Unknown > Gone > Stale > Fresh.
+            Freshness::Gone => worst = Freshness::Gone,
+            Freshness::Stale if matches!(worst, Freshness::Fresh) => worst = Freshness::Stale,
+            _ => {}
+        }
+    }
+    worst
+}
+
+/// Like `check_fingerprint`, but never trusts the mtime+len pre-filter when a
+/// content hash is present: it re-reads and compares the hash. Used for
+/// first-party/linked source files (probed every get), where a mtime-preserving,
+/// equal-length rewrite would otherwise be served stale (X-7).
+pub fn check_fingerprint_strict(stored: &FileFingerprint) -> Freshness {
+    let Some(expected) = stored.content_hash else {
+        return check_fingerprint(stored); // no hash to verify — mtime+len is all we have
+    };
+    match fs::read(&stored.path) {
+        Ok(bytes) if content_hash(&bytes) == expected => Freshness::Fresh,
+        Ok(_) => Freshness::Stale,
+        Err(error) => classify_stat_error(error.kind()),
+    }
+}
+
+/// Worst-case freshness across a set, hash-verifying first-party (non-node_modules)
+/// files strictly while keeping the cheap `check_fingerprint` pre-filter for
+/// node_modules files (which cannot silently change without a generation bump).
+/// Same precedence as `check_fingerprints`: Unknown > Gone > Stale > Fresh.
+pub fn check_fingerprints_strict(fingerprints: &[FileFingerprint]) -> Freshness {
+    let mut worst = Freshness::Fresh;
+    for fingerprint in fingerprints {
+        let freshness = if fingerprint.path.contains("/node_modules/") {
+            check_fingerprint(fingerprint)
+        } else {
+            check_fingerprint_strict(fingerprint)
+        };
+        match freshness {
+            Freshness::Unknown => return Freshness::Unknown,
+            Freshness::Gone => worst = Freshness::Gone,
+            Freshness::Stale if matches!(worst, Freshness::Fresh) => worst = Freshness::Stale,
+            _ => {}
+        }
+    }
+    worst
+}
+
+/// Back-compatible boolean: true only when every fingerprint is `Fresh`.
+pub fn fingerprints_are_current(fingerprints: &[FileFingerprint]) -> bool {
+    matches!(check_fingerprints(fingerprints), Freshness::Fresh)
+}
+
+fn encode_cache_identity(identity: &CacheIdentity) -> String {
+    let bytes = rmp_serde::to_vec(identity).unwrap_or_default();
+    format!("v{CACHE_KEY_VERSION}:{}", hex_encode(&bytes))
+}
+
+fn file_fingerprint(path: impl AsRef<Path>) -> Option<FileFingerprint> {
+    file_fingerprint_with_hash(path, None)
+}
+
+/// Stat `path` for len+mtime and attach an already-computed content hash (from
+/// the bytes read at analysis time). `content_hash: None` degrades to mtime+len.
+pub fn file_fingerprint_with_hash(
+    path: impl AsRef<Path>,
+    content_hash: Option<u64>,
+) -> Option<FileFingerprint> {
+    let path = path.as_ref();
+    let metadata = fs::metadata(path).ok()?;
+    let modified_millis = modified_millis(&metadata);
     Some(FileFingerprint {
         path: normalize_identity_path(path),
         len: metadata.len(),
         modified_millis,
+        content_hash,
     })
+}
+
+/// Read `path` NOW and fingerprint it WITH a content hash — for fallback paths
+/// (the manifest, the no-graph entry) that carry no read-time hash threaded out of
+/// analysis. Per §4.2 the hash IS the read: with it, a later equal-length,
+/// mtime-preserving change is detected instead of silently probing Fresh (RB-2 /
+/// X-1), and a no-op mtime touch (same content) no longer forces a re-verify.
+/// Falls back to a stat-only fingerprint if the read fails (locked/permission) so
+/// the file is not dropped from the fingerprint set.
+pub fn file_fingerprint_reading_hash(path: impl AsRef<Path>) -> Option<FileFingerprint> {
+    let path = path.as_ref();
+    match fs::read(path) {
+        Ok(bytes) => file_fingerprint_with_hash(path, Some(content_hash(&bytes))),
+        Err(_) => file_fingerprint_with_hash(path, None),
+    }
+}
+
+/// Len + mtime captured at the moment a module's bytes are read during analysis,
+/// using the same mtime derivation as `check_fingerprint` so a later probe of an
+/// unchanged file hits the `Fresh` pre-filter. Returns `(len, modified_millis)`;
+/// falls back to `(0, 0)` when the stat fails — the caller already holds the bytes,
+/// so a missed stat only weakens the pre-filter, never correctness (the content
+/// hash still decides).
+pub fn read_time_len_mtime(path: impl AsRef<Path>) -> (u64, u64) {
+    match fs::metadata(path.as_ref()) {
+        Ok(metadata) => (metadata.len(), modified_millis(&metadata)),
+        Err(_) => (0, 0),
+    }
+}
+
+/// Build a fingerprint from values captured at analysis read-time (len+mtime from
+/// the stat taken alongside the byte read, hash of those exact bytes) WITHOUT
+/// re-stat'ing, for a path that is ALREADY the canonical module key (the module
+/// graph keys every module by its `fs::canonicalize`d path).
+///
+/// `normalize_identity_path` would re-`canonicalize` that path — an idempotent no-op
+/// on an already-canonical path — so this skips the syscall and applies only the
+/// `\` → `/` identity-path normalization directly. The result is byte-identical to
+/// `normalize_identity_path(canonical_path)`: on an already-canonical existing path
+/// `fs::canonicalize` returns it unchanged, and if the file has since disappeared
+/// `normalize_identity_path` falls back to that same raw path we forward-slash here.
+/// An unchanged file still matches the pre-filter, and a file changed *after* analysis
+/// yields a mismatched len/mtime (closing the post-analysis TOCTOU window).
+pub fn file_fingerprint_from_read_time(
+    canonical_path: impl AsRef<Path>,
+    len: u64,
+    modified_millis: u64,
+    content_hash: u64,
+) -> FileFingerprint {
+    let path_ref = canonical_path.as_ref();
+    // C8 precondition: `path_ref` MUST already be canonical (the module graph's
+    // `fs::canonicalize`d module key). This fn deliberately skips the canonicalize
+    // syscall and only forward-slashes the path, so a non-canonical input would key the
+    // fingerprint off a path a later probe's canonical path never matches. `canonicalize`
+    // is idempotent on a canonical path, so in debug/test builds assert the input
+    // round-trips; a file deleted since analysis (canonicalize errors) is accepted
+    // (`unwrap_or(true)`) — the fingerprint then falls back to the raw path exactly as
+    // documented above. Compiles out entirely in release.
+    debug_assert!(
+        std::fs::canonicalize(path_ref)
+            .map(|resolved| resolved.as_path() == path_ref)
+            .unwrap_or(true),
+        "file_fingerprint_from_read_time requires an already-canonical path, got {}",
+        path_ref.display()
+    );
+    FileFingerprint {
+        path: path_ref.to_string_lossy().replace('\\', "/"),
+        len,
+        modified_millis,
+        content_hash: Some(content_hash),
+    }
 }
 
 fn normalize_identity_path(path: impl AsRef<Path>) -> String {
@@ -207,5 +508,412 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_project_root_present_when_root_exists() {
+        let state = classify_project_root_with(Path::new("C:/live/app"), |_| Ok(true));
+        assert_eq!(state, ProjectRootState::Present);
+    }
+
+    #[test]
+    fn classify_project_root_orphaned_when_folder_gone_but_volume_live() {
+        // Root absent, but its parent (the live drive) exists → genuine deletion.
+        let root = Path::new("C:/live/deleted-app");
+        let state = classify_project_root_with(root, |path| Ok(path != root));
+        assert_eq!(state, ProjectRootState::Orphaned);
+    }
+
+    #[test]
+    fn classify_project_root_keeps_shard_on_unplugged_drive() {
+        // RB-7 / X-3 regression: a released Windows drive letter reports
+        // ERROR_PATH_NOT_FOUND (→ NotFound) for the root AND every ancestor.
+        // The shard must be KEPT, never destroyed.
+        let state = classify_project_root_with(Path::new("D:/app"), |_| Ok(false));
+        assert_eq!(state, ProjectRootState::VolumeUnreachable);
+    }
+
+    #[test]
+    fn classify_project_root_keeps_shard_on_stat_error() {
+        let state = classify_project_root_with(Path::new("C:/locked/app"), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(state, ProjectRootState::VolumeUnreachable);
+    }
+
+    #[test]
+    fn content_hash_is_deterministic_and_distinguishes_content() {
+        assert_eq!(
+            content_hash(b"export const x = 1;"),
+            content_hash(b"export const x = 1;")
+        );
+        assert_ne!(
+            content_hash(b"export const x = 1;"),
+            content_hash(b"export const x = 2;")
+        );
+        // Same length, different content — the case mtime+len can miss.
+        assert_ne!(content_hash(b"aaaa"), content_hash(b"bbbb"));
+    }
+
+    #[test]
+    fn cache_key_is_first_party_detects_node_modules_entry() {
+        let base = CacheIdentity {
+            analyzer_version: ANALYZER_VERSION.to_owned(),
+            specifier: "lib".to_owned(),
+            package_name: "lib".to_owned(),
+            package_version: "1.0.0".to_owned(),
+            package_root: Some("C:/proj/node_modules/lib".to_owned()),
+            entry_path: Some("//?/c:/proj/node_modules/lib/index.js".to_owned()),
+            runtime: ImportRuntime::Component,
+            import_kind: ImportKind::Namespace,
+            named_exports: Vec::new(),
+        };
+        let node_modules_key = encode_cache_identity(&base);
+        assert!(
+            !cache_key_is_first_party(&node_modules_key),
+            "a node_modules entry is not first-party"
+        );
+
+        let first_party = CacheIdentity {
+            package_root: Some("C:/proj/packages/ui".to_owned()),
+            entry_path: Some("//?/c:/proj/packages/ui/index.ts".to_owned()),
+            ..base
+        };
+        let first_party_key = encode_cache_identity(&first_party);
+        assert!(
+            cache_key_is_first_party(&first_party_key),
+            "a workspace entry (no node_modules) is first-party"
+        );
+
+        // An opaque/non-decodable key defaults to NOT first-party, preserving the
+        // existing fast-path behavior for anything that is not a real identity.
+        assert!(!cache_key_is_first_party("v4:not-hex"));
+    }
+
+    #[test]
+    fn file_fingerprint_without_hash_serializes_byte_identical_to_pre_hash_format() {
+        // The single most important invariant of this change: a hashless
+        // fingerprint (content_hash: None) must serialize to the exact same
+        // msgpack bytes as the pre-Task-2 3-field struct, since FileFingerprint
+        // is embedded in the cache KEY, not just the value. rmp_serde encodes
+        // both structs and tuples as bare arrays (no field names), so a 3-tuple
+        // of the same three field values is a faithful stand-in for "the old
+        // 3-field struct" and must byte-match.
+        let fp = FileFingerprint {
+            path: "/pkg/index.js".to_string(),
+            len: 42,
+            modified_millis: 1_700_000_000_000,
+            content_hash: None,
+        };
+        let legacy_equivalent = ("/pkg/index.js".to_string(), 42u64, 1_700_000_000_000u64);
+        assert_eq!(
+            rmp_serde::to_vec(&fp).expect("serialize fingerprint"),
+            rmp_serde::to_vec(&legacy_equivalent).expect("serialize legacy tuple"),
+        );
+
+        // With a hash present, the encoding must differ (grows to 4 elements) —
+        // guards against a vacuously-true comparison above.
+        let fp_with_hash = FileFingerprint {
+            content_hash: Some(123),
+            ..fp.clone()
+        };
+        assert_ne!(
+            rmp_serde::to_vec(&fp).expect("serialize fingerprint"),
+            rmp_serde::to_vec(&fp_with_hash).expect("serialize fingerprint with hash"),
+        );
+    }
+
+    #[test]
+    fn classify_stat_error_only_notfound_is_gone() {
+        use std::io::ErrorKind;
+        assert!(matches!(
+            classify_stat_error(ErrorKind::NotFound),
+            Freshness::Gone
+        ));
+        assert!(matches!(
+            classify_stat_error(ErrorKind::PermissionDenied),
+            Freshness::Unknown
+        ));
+        // Any non-NotFound (locked file, offline drive) is transient → keep.
+        assert!(matches!(
+            classify_stat_error(ErrorKind::Other),
+            Freshness::Unknown
+        ));
+    }
+
+    #[test]
+    fn check_fingerprint_content_hash_ignores_mtime_only_touch() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-fp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("m.js");
+        std::fs::write(&file, b"export const x = 1;").expect("write");
+
+        // Fingerprint WITH content hash of the real bytes.
+        let hash = content_hash(b"export const x = 1;");
+        let fp = file_fingerprint_with_hash(&file, Some(hash)).expect("fp");
+        assert!(matches!(check_fingerprint(&fp), Freshness::Fresh));
+
+        // Rewrite identical content but force a NEW mtime+len signature by lying in
+        // the stored fingerprint: same content hash, stale mtime/len. Content hash
+        // wins → still Fresh (no-op touch is not a change).
+        let touched = FileFingerprint {
+            modified_millis: fp.modified_millis + 5_000,
+            len: fp.len + 99,
+            ..fp.clone()
+        };
+        assert!(matches!(check_fingerprint(&touched), Freshness::Fresh));
+
+        // Real content change → Stale. Sleep first so the rewrite's mtime
+        // (truncated to milliseconds by our fingerprint) is guaranteed to land
+        // in a new tick: without this, two same-length writes completing within
+        // the same millisecond coincide on len+mtime and the cheap pre-filter
+        // returns Fresh without ever consulting the content hash (observed
+        // flaky ~50% of runs on a fast NVMe/NTFS setup without the sleep).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&file, b"export const x = 2;").expect("rewrite");
+        assert!(matches!(check_fingerprint(&fp), Freshness::Stale));
+
+        // Deleted → Gone.
+        std::fs::remove_file(&file).expect("rm");
+        assert!(matches!(check_fingerprint(&fp), Freshness::Gone));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn file_fingerprint_reading_hash_detects_mtime_preserving_change() {
+        // RB-2 / X-1: a fallback fingerprint (manifest / no-graph entry) built with
+        // a read-time content hash must catch an equal-length, mtime-preserving edit
+        // — the stat-only (hashless) fingerprint it replaces probes Fresh forever.
+        let dir = std::env::temp_dir().join(format!(
+            "il-fp-rb2-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("package.json");
+        std::fs::write(&file, b"export const x = 1;").expect("write");
+
+        let original_mtime = std::fs::metadata(&file)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+
+        let hashed = file_fingerprint_reading_hash(&file).expect("hashed fp");
+        assert!(
+            hashed.content_hash.is_some(),
+            "read+hash must capture a content hash"
+        );
+        // The OLD behavior, for contrast: a stat-only fingerprint of the same file.
+        let hashless = file_fingerprint_with_hash(&file, None).expect("hashless fp");
+
+        // Equal-length rewrite, mtime restored → len+mtime identical, content differs.
+        std::fs::write(&file, b"export const x = 2;").expect("rewrite");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|handle| handle.set_modified(original_mtime))
+            .expect("restore mtime");
+
+        // The read-hashed fingerprint catches it; the hashless one is fooled (bug).
+        assert!(matches!(
+            check_fingerprint_strict(&hashed),
+            Freshness::Stale
+        ));
+        assert!(matches!(check_fingerprint(&hashless), Freshness::Fresh));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn check_fingerprints_precedence_across_real_files() {
+        // Empty set is Fresh.
+        assert_eq!(check_fingerprints(&[]), Freshness::Fresh);
+
+        let dir = std::env::temp_dir().join(format!(
+            "il-fp-prec-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+
+        // A present, unchanged file → Fresh. Captured with its real content hash.
+        let fresh_path = dir.join("fresh.js");
+        let fresh_bytes: &[u8] = b"export const a = 1;";
+        std::fs::write(&fresh_path, fresh_bytes).expect("write fresh");
+        let fresh_fp =
+            file_fingerprint_with_hash(&fresh_path, Some(content_hash(fresh_bytes))).expect("fp");
+
+        // A file whose content later changes → Stale. The rewrite changes the
+        // LENGTH so detection never depends on mtime resolution, and the stored
+        // fingerprint still carries the ORIGINAL content hash so Stale-vs-Fresh is
+        // unambiguous (the content-hash read confirms the change).
+        let stale_path = dir.join("stale.js");
+        let stale_orig: &[u8] = b"export const b = 1;";
+        std::fs::write(&stale_path, stale_orig).expect("write stale");
+        let stale_fp =
+            file_fingerprint_with_hash(&stale_path, Some(content_hash(stale_orig))).expect("fp");
+
+        // A file that is later deleted → Gone.
+        let gone_path = dir.join("gone.js");
+        let gone_bytes: &[u8] = b"export const c = 1;";
+        std::fs::write(&gone_path, gone_bytes).expect("write gone");
+        let gone_fp =
+            file_fingerprint_with_hash(&gone_path, Some(content_hash(gone_bytes))).expect("fp");
+
+        // Apply the mutations the fingerprints are meant to detect.
+        std::fs::write(&stale_path, b"export const b = 222222;").expect("rewrite stale");
+        std::fs::remove_file(&gone_path).expect("rm gone");
+
+        // Per-file classifications hold (proves the setup is non-vacuous).
+        assert_eq!(check_fingerprint(&fresh_fp), Freshness::Fresh);
+        assert_eq!(check_fingerprint(&stale_fp), Freshness::Stale);
+        assert_eq!(check_fingerprint(&gone_fp), Freshness::Gone);
+
+        // Precedence across a set: Gone > Stale > Fresh (Unknown has no portable
+        // Windows repro, so it is covered only by the empty-set + unit cases).
+        assert_eq!(
+            check_fingerprints(std::slice::from_ref(&fresh_fp)),
+            Freshness::Fresh
+        );
+        assert_eq!(
+            check_fingerprints(&[fresh_fp.clone(), stale_fp.clone()]),
+            Freshness::Stale
+        );
+        assert_eq!(
+            check_fingerprints(&[fresh_fp.clone(), gone_fp.clone()]),
+            Freshness::Gone
+        );
+        assert_eq!(
+            check_fingerprints(&[stale_fp, gone_fp]),
+            Freshness::Gone,
+            "Gone must dominate Stale regardless of order"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn check_fingerprints_strict_catches_equal_length_rewrite_the_cheap_path_misses() {
+        // X-7: a first-party source file rewritten with the SAME length (`cp -p`,
+        // `rsync -a`, `tar -x`, codegen, or a same-millisecond edit can also preserve
+        // mtime) is invisible to the mtime+len pre-filter. Rather than rely on hitting
+        // the same real mtime tick (flaky — see the sleep note on
+        // `check_fingerprint_content_hash_ignores_mtime_only_touch` above), this
+        // fabricates the stored fingerprint the same way that test does: the STORED
+        // len+mtime are forced to equal the file's ACTUAL post-rewrite stat, while the
+        // stored hash is the PRE-rewrite content's hash — deterministically modeling
+        // the collision instead of gambling on the clock.
+        let dir = std::env::temp_dir().join(format!(
+            "il-fp-strict-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let pkg_dir = dir.join("packages").join("ui");
+        std::fs::create_dir_all(&pkg_dir).expect("dir");
+        let file = pkg_dir.join("index.ts");
+
+        let original: &[u8] = b"export const x = 1;";
+        std::fs::write(&file, original).expect("write v1");
+        let fp = file_fingerprint_with_hash(&file, Some(content_hash(original))).expect("fp");
+        assert!(
+            !fp.path.contains("/node_modules/"),
+            "test setup: fixture must be first-party (no node_modules segment)"
+        );
+
+        // Equal-length, different-content rewrite — the exact case mtime+len can't see.
+        let rewritten: &[u8] = b"export const x = 9;";
+        assert_eq!(
+            original.len(),
+            rewritten.len(),
+            "test setup: rewrite must be equal length to model the X-7 blind spot"
+        );
+        std::fs::write(&file, rewritten).expect("rewrite v2");
+
+        // Force the STORED fp's len+mtime to match the file's real post-rewrite stat,
+        // while its content_hash still reflects the ORIGINAL bytes — exactly what an
+        // undetectable-by-stat rewrite leaves behind in the stored fingerprint.
+        let new_metadata = std::fs::metadata(&file).expect("stat v2");
+        let stored = FileFingerprint {
+            len: new_metadata.len(),
+            modified_millis: modified_millis(&new_metadata),
+            ..fp.clone()
+        };
+
+        // The cheap pre-filter is fooled — proves the blind spot is real here.
+        assert_eq!(check_fingerprint(&stored), Freshness::Fresh);
+        assert_eq!(
+            check_fingerprints(std::slice::from_ref(&stored)),
+            Freshness::Fresh
+        );
+
+        // Strict hash-verifies unconditionally, regardless of the mtime+len match.
+        assert_eq!(check_fingerprint_strict(&stored), Freshness::Stale);
+        assert_eq!(
+            check_fingerprints_strict(std::slice::from_ref(&stored)),
+            Freshness::Stale
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn check_fingerprints_strict_keeps_cheap_prefilter_for_node_modules() {
+        // node_modules deps cannot silently change (only via install, which bumps the
+        // generation), so check_fingerprints_strict must route them through the cheap
+        // check_fingerprint pre-filter — never pay for a hash read on this hot path.
+        let dir = std::env::temp_dir().join(format!(
+            "il-fp-strict-nm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let nm_dir = dir.join("node_modules").join("lib");
+        std::fs::create_dir_all(&nm_dir).expect("dir");
+        let file = nm_dir.join("index.js");
+
+        let original: &[u8] = b"module.exports = 1;";
+        std::fs::write(&file, original).expect("write v1");
+        let fp = file_fingerprint_with_hash(&file, Some(content_hash(original))).expect("fp");
+        assert!(
+            fp.path.contains("/node_modules/"),
+            "test setup: fixture must be under node_modules"
+        );
+
+        let rewritten: &[u8] = b"module.exports = 2;";
+        assert_eq!(
+            original.len(),
+            rewritten.len(),
+            "test setup: rewrite must be equal length"
+        );
+        std::fs::write(&file, rewritten).expect("rewrite v2");
+
+        let new_metadata = std::fs::metadata(&file).expect("stat v2");
+        let stored = FileFingerprint {
+            len: new_metadata.len(),
+            modified_millis: modified_millis(&new_metadata),
+            ..fp.clone()
+        };
+
+        // Sanity: hash-verified directly (bypassing the node_modules routing), this
+        // fingerprint IS Stale — so the Fresh result below comes from the routing
+        // choice, not from the fixture failing to change.
+        assert_eq!(check_fingerprint_strict(&stored), Freshness::Stale);
+
+        // Routed through check_fingerprints_strict, the node_modules path takes the
+        // cheap pre-filter instead and stays Fresh (perf preserved).
+        assert_eq!(
+            check_fingerprints_strict(std::slice::from_ref(&stored)),
+            Freshness::Fresh
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 }

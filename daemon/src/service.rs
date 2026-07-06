@@ -1,8 +1,6 @@
 use crate::{
     cache::{
-        key::{cache_key_for_resolved_import, fingerprints_for_paths},
-        memory::ImportCache,
-        project::ProjectCacheRegistry,
+        key::cache_key_for_resolved_import, memory::ImportCache, project::ProjectCacheRegistry,
     },
     document::{
         IgnoreRuleResolver, analyze_imports, get_package_name, is_runtime_package_specifier,
@@ -12,23 +10,22 @@ use crate::{
     ipc::protocol::{
         AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
         AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-        BatchRequest, BatchResponse, CacheCleanupRequest, CacheCleanupResponse, CacheListRequest,
-        CacheListResponse, CacheRemoveRequest, CacheRemoveResponse, CacheRemoveScope,
-        CacheStatusRequest, CacheStatusResponse, CompleteImportMembersRequest,
-        CompleteImportMembersResponse, ConfidenceLevel, DetectedImport, EnumerateExportsRequest,
-        EnumerateExportsResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
-        FileSizeRequest, FileSizeResponse, ImportAnalysisItem, ImportAnalysisStatus,
-        ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ImportRuntime, ImportSyntax,
-        PROTOCOL_VERSION, PackageJsonDependencyAnalysisItem,
-        RegistryHintMode as ProtocolRegistryHintMode, RegistryHintResult, RegistryHintTarget,
-        WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
-        is_supported_protocol_version,
+        BatchRequest, BatchResponse, CacheListRequest, CacheListResponse, CacheRemoveRequest,
+        CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest, CacheStatusResponse,
+        CompleteImportMembersRequest, CompleteImportMembersResponse, ConfidenceLevel,
+        DetectedImport, EnumerateExportsRequest, EnumerateExportsResponse, FileSizeDocumentRequest,
+        FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse, ImportAnalysisItem,
+        ImportAnalysisStatus, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
+        ImportRuntime, ImportSyntax, PROTOCOL_VERSION, PackageJsonDependencyAnalysisItem,
+        RefreshedImportIdentity, RegistryHintMode as ProtocolRegistryHintMode, RegistryHintResult,
+        RegistryHintTarget, WorkspaceReportRequest, WorkspaceReportResponse,
+        WorkspaceReportSummary, is_supported_protocol_version,
     },
-    pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import},
+    pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import_with_graph},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
     pipeline::graph::{
-        ModuleGraph, ModuleId, build_module_graph_cached, build_module_graph_cached_with_runtime,
-        clear_module_graph_cache, invalidate_module_graph_cache_for_package,
+        ModuleGraph, ModuleId, build_module_graph_cached, clear_module_graph_cache,
+        invalidate_module_graph_cache_for_package,
     },
     pipeline::resolver::{ResolvedPackage, find_package_root, resolve_package_entry},
 };
@@ -40,6 +37,67 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Whether a cached-analyze read promotes the entry's LRU recency (scan
+/// resistance, §5.1). An interactive read whose result the user is looking at now
+/// promotes; a bulk/background scan (`WorkspaceReport`, `Compare`) does not, so a
+/// full-workspace pass can't flood the recency signal and evict the user's warm
+/// working set. When a caller's intent is ambiguous, prefer `Interactive` —
+/// over-promoting is safe; the finding targets full-workspace report/Compare scans.
+#[derive(Clone, Copy)]
+enum ReadIntent {
+    Interactive,
+    Bulk,
+}
+
+/// F1 trailing-re-check decision for the background SWR revalidation. After a
+/// revalidation recomputes and re-inserts a key, its freshness is re-probed: a
+/// `Stale` result means a dependency changed AGAIN while the recompute ran (and a
+/// concurrent stale serve was coalesced away by the in-flight guard), so exactly
+/// ONE more revalidation is re-armed and the served value catches up to the newer
+/// state without waiting for the next interactive read. A graduated transient
+/// `Unknown` is NEVER re-armed — re-analyzing would re-hit the same stat/read
+/// error and could overwrite the good cached value; `Fresh`/`Gone`/absent need no
+/// re-run either.
+fn should_rearm_revalidation(freshness: Option<crate::cache::key::Freshness>) -> bool {
+    matches!(freshness, Some(crate::cache::key::Freshness::Stale))
+}
+
+/// Process-global "a cache-maintenance pass is running" flag (F4-B). Cache
+/// maintenance operates on the process-global on-disk cache — a single storage
+/// path shared by every service instance — so passes must serialize even across
+/// instances: a re-Hello builds a fresh service and spawns a new maintenance task
+/// whose immediate first tick would otherwise run concurrently with the previous
+/// connection's still-detached `spawn_blocking` pass. The passes already serialize
+/// on redb's single writer; this simply skips the redundant duplicate scan.
+static CACHE_MAINTENANCE_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII claim on [`CACHE_MAINTENANCE_IN_PROGRESS`]. Clears the flag on drop —
+/// including on panic/unwind — so a panicking pass cannot wedge maintenance off.
+struct MaintenanceGuard;
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        CACHE_MAINTENANCE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Claims the maintenance-in-progress flag. Returns `Some(guard)` for the caller
+/// that wins the claim (which should run the pass) and `None` while a pass is
+/// already in flight, so a redundant concurrent pass is skipped. The guard
+/// releases the claim on drop.
+fn try_begin_cache_maintenance() -> Option<MaintenanceGuard> {
+    CACHE_MAINTENANCE_IN_PROGRESS
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+        .then_some(MaintenanceGuard)
+}
+
 // `RegistryHintService` and `RegistryRefreshExecutor` hold trait objects and a
 // thread pool respectively, so `ImportLensService` no longer derives `Debug`.
 pub struct ImportLensService {
@@ -47,6 +105,10 @@ pub struct ImportLensService {
     registry_hints: crate::registry::service::RegistryHintService,
     registry_executor: crate::registry::executor::RegistryRefreshExecutor,
     report_executor: crate::report::executor::WorkspaceReportExecutor,
+    // Registry-metadata store byte budget (`importLens.registryCacheMaxSizeMB`,
+    // wired through Hello — RB-16). The maintenance pass caps the registry store at
+    // this instead of the hardcoded default constant.
+    registry_cache_max_size_bytes: u64,
     // Set only by `new_with_registry_hints_for_tests`. When true, the IPC
     // server's Hello handler preserves `registry_hints`/`registry_executor`
     // across the Hello-driven service rebuild instead of reconstructing them
@@ -59,21 +121,22 @@ pub struct ImportLensService {
 
 impl ImportLensService {
     pub fn new(storage_path: Option<PathBuf>, enable_disk_cache: bool) -> Self {
-        Self::new_with_cache_policy(storage_path, enable_disk_cache, 512, 30)
+        Self::new_with_cache_policy(
+            storage_path,
+            enable_disk_cache,
+            512,
+            crate::registry::constants::REGISTRY_CACHE_MAX_SIZE_BYTES / (1024 * 1024),
+        )
     }
 
     pub fn new_with_cache_policy(
         storage_path: Option<PathBuf>,
         enable_disk_cache: bool,
         cache_max_size_mb: u64,
-        cache_max_age_days: u64,
+        registry_cache_max_size_mb: u64,
     ) -> Self {
-        let cache_registry = ProjectCacheRegistry::new(
-            storage_path.clone(),
-            enable_disk_cache,
-            cache_max_size_mb,
-            cache_max_age_days,
-        );
+        let cache_registry =
+            ProjectCacheRegistry::new(storage_path.clone(), enable_disk_cache, cache_max_size_mb);
         let registry_hints = storage_path
             .clone()
             .map(|path| {
@@ -92,6 +155,7 @@ impl ImportLensService {
             registry_hints,
             registry_executor,
             report_executor,
+            registry_cache_max_size_bytes: registry_cache_max_size_mb.saturating_mul(1024 * 1024),
             preserve_registry_across_hello: false,
         }
     }
@@ -105,12 +169,14 @@ impl ImportLensService {
         registry_hints: crate::registry::service::RegistryHintService,
     ) -> Self {
         Self {
-            cache_registry: ProjectCacheRegistry::new(None, false, 512, 30),
+            cache_registry: ProjectCacheRegistry::new(None, false, 512),
             registry_hints,
             registry_executor: crate::registry::executor::RegistryRefreshExecutor::new(
                 crate::registry::constants::REGISTRY_REFRESH_CONCURRENCY,
             ),
             report_executor: crate::report::executor::WorkspaceReportExecutor::new(),
+            registry_cache_max_size_bytes:
+                crate::registry::constants::REGISTRY_CACHE_MAX_SIZE_BYTES,
             preserve_registry_across_hello: true,
         }
     }
@@ -136,24 +202,33 @@ impl ImportLensService {
         storage_path: Option<PathBuf>,
         enable_disk_cache: bool,
         cache_max_size_mb: u64,
-        cache_max_age_days: u64,
+        registry_cache_max_size_mb: u64,
     ) -> Self {
         Self {
             cache_registry: ProjectCacheRegistry::new(
                 storage_path,
                 enable_disk_cache,
                 cache_max_size_mb,
-                cache_max_age_days,
             ),
             registry_hints: self.registry_hints,
             registry_executor: self.registry_executor,
             report_executor: self.report_executor,
+            registry_cache_max_size_bytes: registry_cache_max_size_mb.saturating_mul(1024 * 1024),
             preserve_registry_across_hello: self.preserve_registry_across_hello,
         }
     }
 
     pub fn preserve_registry_across_hello(&self) -> bool {
         self.preserve_registry_across_hello
+    }
+
+    /// Startup recency seed (C5 / Finding 10d, §3.3). Delegated to the cache
+    /// registry; the IPC server calls this synchronously in its Hello handler —
+    /// AFTER the registry is (re)built with the negotiated disk config and BEFORE
+    /// any analyze/cache request is served — so no new entry is created with a
+    /// pre-seed low seq. See `ProjectCacheRegistry::seed_recency_clock_from_disk`.
+    pub fn seed_recency_clock_from_disk(&self) {
+        self.cache_registry.seed_recency_clock_from_disk();
     }
 
     pub fn refresh_registry_hint_target(
@@ -197,6 +272,71 @@ impl ImportLensService {
         self.registry_executor.spawn(job);
     }
 
+    /// Fans a bulk "refresh dependency block" onto the isolated registry pool
+    /// (D7 / §6.1). Two properties this drain guarantees:
+    ///
+    /// * **Bounded in flight.** Each target is a `spawn` onto the
+    ///   `REGISTRY_REFRESH_CONCURRENCY`-thread pool, never a per-target thread,
+    ///   so at most the pool size is ever fetching at once — the pool IS the
+    ///   in-flight cap; no extra semaphore is layered on.
+    /// * **Cancellable.** Every job re-reads the shared `cancelled` flag BEFORE
+    ///   its network fetch. Once a newer block supersedes this one (or the
+    ///   connection ends) the flag flips and each still-queued job skips its
+    ///   fetch and reports `None` — no error is surfaced for the skipped work,
+    ///   and the jobs already in flight are left to finish. The registry is
+    ///   blocking std on rayon, so a plain `Arc<AtomicBool>` checked per job is
+    ///   the fit, not a tokio token.
+    ///
+    /// `on_result` is invoked exactly once per target with the job's index and
+    /// either the fetched `RegistryHintResult` or `None` when the job was
+    /// skipped by cancellation. Every job that runs still honors single-flight,
+    /// the D-c cooldown, and the shared rate limiter.
+    pub fn spawn_registry_refresh_block<F>(
+        self: &std::sync::Arc<Self>,
+        targets: Vec<RegistryHintTarget>,
+        mode: ProtocolRegistryHintMode,
+        now_ms: u64,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        on_result: F,
+    ) where
+        F: Fn(usize, Option<RegistryHintResult>) + Send + Clone + 'static,
+    {
+        for (index, target) in targets.into_iter().enumerate() {
+            let svc = std::sync::Arc::clone(self);
+            let cancelled = std::sync::Arc::clone(&cancelled);
+            let on_result = on_result.clone();
+            self.spawn_registry_refresh(move || {
+                // Per-job pre-fetch cancellation check: a superseded/abandoned
+                // block skips its remaining network fetches. Acquire pairs with
+                // the Release store on the supersede/disconnect side so a worker
+                // that observes the flag also sees everything sequenced before
+                // it.
+                let outcome = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    None
+                } else {
+                    let target_for_error = target.clone();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        svc.refresh_registry_hint_target(target, mode, now_ms)
+                    }))
+                    .unwrap_or_else(|_| {
+                        crate::logging::log_warn(
+                            "registry",
+                            format!("registry worker panicked for {}", target_for_error.name),
+                        );
+                        RegistryHintResult {
+                            target: target_for_error,
+                            hint: None,
+                            error: Some("registry worker panicked".to_owned()),
+                            origin: None,
+                        }
+                    });
+                    Some(result)
+                };
+                on_result(index, outcome);
+            });
+        }
+    }
+
     pub fn flush_registry_hints(&self) {
         self.registry_hints.flush();
     }
@@ -227,13 +367,56 @@ impl ImportLensService {
             };
         }
 
-        self.build_workspace_report_inner(request)
+        // F4-A: the report aggregation (workspace scan + build_report_rows +
+        // summary) runs on a fire-and-forget rayon worker via `spawn_workspace_report`;
+        // an uncaught panic here would unwind the pool job and drop the `oneshot`
+        // sender, surfacing only a generic transport error. Catch it and return an
+        // explicit error response — matching the registry worker (ipc/server) and the
+        // per-file report hardening (`analyze_report_source`). `AssertUnwindSafe` is
+        // sound: a panic that poisons a cache mutex is handled by the cache's
+        // poisoned-lock fallback, and no `&mut` state straddles the boundary.
+        let version = request.version;
+        let request_id = request.request_id;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.build_workspace_report_inner(request)
+        }))
+        .unwrap_or_else(|_| {
+            crate::logging::log_warn(
+                "report",
+                "workspace report aggregation panicked; returning error response",
+            );
+            WorkspaceReportResponse {
+                version,
+                request_id,
+                rows: Vec::new(),
+                summary: WorkspaceReportSummary::default(),
+                error: Some("workspace report aggregation panicked".to_owned()),
+                diagnostics: vec![ImportDiagnostic::for_stage(
+                    "workspace_report",
+                    "aggregation panicked",
+                )],
+            }
+        })
     }
 
     fn build_workspace_report_inner(
         &self,
         request: WorkspaceReportRequest,
     ) -> WorkspaceReportResponse {
+        // Forces an AGGREGATION panic (outside per-file analysis, which is caught
+        // separately in `analyze_report_source`) so the `catch_unwind` in
+        // `build_workspace_report_on_worker` is exercised. Compiled only under
+        // cfg(test); a no-op in release builds.
+        #[cfg(test)]
+        {
+            if request
+                .workspace_root
+                .contains("__IMPORTLENS_FORCE_REPORT_PANIC__")
+            {
+                panic!("forced workspace report aggregation panic (test only)");
+            }
+        }
+
         let workspace_root = PathBuf::from(&request.workspace_root);
         let files = crate::report::scanner::scan_workspace_sources(&workspace_root);
         // One resolver per report run: files sharing a directory share a single
@@ -296,7 +479,13 @@ impl ImportLensService {
                 }
             }
 
-            self.handle_analyze_document(document_request, ignore_resolver)
+            // WorkspaceReport is a full-workspace scan: read cache non-promoting so it
+            // can't flood the recency signal and evict the user's warm set (§5.1).
+            self.handle_analyze_document_with_intent(
+                document_request,
+                ignore_resolver,
+                ReadIntent::Bulk,
+            )
         }));
 
         let response = match response {
@@ -356,7 +545,7 @@ impl ImportLensService {
         let mut imports = request
             .imports
             .par_iter()
-            .map(|item| self.analyze_with_cache(&context, item))
+            .map(|item| self.analyze_with_cache(&context, item, false, ReadIntent::Interactive))
             .collect::<Vec<_>>();
         annotate_shared_bytes(&mut imports);
 
@@ -392,7 +581,8 @@ impl ImportLensService {
             .par_iter()
             .enumerate()
             .map(|(index, item)| {
-                let result = self.analyze_with_cache(&context, item);
+                let result =
+                    self.analyze_with_cache(&context, item, false, ReadIntent::Interactive);
                 emit_partial(BatchResponse {
                     version: request.version,
                     request_id: request.request_id,
@@ -427,7 +617,7 @@ impl ImportLensService {
         let mut imports = request
             .imports
             .par_iter()
-            .map(|item| self.analyze_with_cache(&context, item))
+            .map(|item| self.analyze_with_cache(&context, item, false, ReadIntent::Interactive))
             .collect::<Vec<_>>();
         annotate_shared_bytes(&mut imports);
         let file_size =
@@ -451,6 +641,19 @@ impl ImportLensService {
         &self,
         request: AnalyzeDocumentRequest,
         ignore_resolver: &IgnoreRuleResolver,
+    ) -> AnalyzeDocumentResponse {
+        // Interactive analyze (an editor request for the active document the user is
+        // looking at) promotes recency. The bulk WorkspaceReport scan reuses this same
+        // per-file analysis via `_with_intent(.., ReadIntent::Bulk)` so it does NOT
+        // promote — a full-workspace pass can't flood the recency signal (§5.1).
+        self.handle_analyze_document_with_intent(request, ignore_resolver, ReadIntent::Interactive)
+    }
+
+    fn handle_analyze_document_with_intent(
+        &self,
+        request: AnalyzeDocumentRequest,
+        ignore_resolver: &IgnoreRuleResolver,
+        intent: ReadIntent,
     ) -> AnalyzeDocumentResponse {
         if !is_supported_protocol_version(request.version) {
             return AnalyzeDocumentResponse {
@@ -486,7 +689,7 @@ impl ImportLensService {
                 };
             }
         };
-        let imports = self.analysis_items_for_detected(&context, detected);
+        let imports = self.analysis_items_for_detected(&context, detected, false, intent);
 
         AnalyzeDocumentResponse {
             version: request.version,
@@ -524,7 +727,8 @@ impl ImportLensService {
             .filter(|specifier| is_runtime_package_specifier(specifier))
             .map(|specifier| detected_import_for_specifier(specifier))
             .collect::<Vec<_>>();
-        let imports = self.analysis_items_for_detected(&context, detected);
+        let imports =
+            self.analysis_items_for_detected(&context, detected, false, ReadIntent::Interactive);
 
         AnalyzeSpecifiersResponse {
             version: request.version,
@@ -586,7 +790,15 @@ impl ImportLensService {
                 };
             }
         };
-        let states = self.analysis_items_for_detected(&context, detected);
+        // Interactive size read → serve stale (SWR) unless the client forces fresh
+        // (CI / CLI budget checks). A stale serve here triggers the background
+        // revalidation + RefreshedResults push in the FileSizeDocument handler.
+        let states = self.analysis_items_for_detected(
+            &context,
+            detected,
+            !request.force_fresh,
+            ReadIntent::Interactive,
+        );
         let requests = states
             .iter()
             .filter_map(|state| state.request.clone())
@@ -611,6 +823,171 @@ impl ImportLensService {
             error: file_size.error,
             diagnostics: file_size.diagnostics,
         }
+    }
+
+    /// Background SWR revalidation for a document's sizes: recompute the imports that
+    /// were served stale FRESH (bypassing serve-stale), deduped per cache key via a
+    /// `RevalidationGuard` so concurrent stale serves coalesce to one recompute and a
+    /// panicking recompute cannot leak the in-flight claim. `should_continue` is a
+    /// pre-recompute cancellation check (F3-B): a document superseded before/while the
+    /// revalidation runs bails before the expensive recompute. After a recompute the
+    /// entry's freshness is re-probed and, if it is STILL `Stale` (a dep changed again
+    /// mid-recompute), EXACTLY ONE more revalidation is re-armed (F1 — never a loop).
+    /// Only the specifiers in `stale_specifiers` are recomputed — a fresh sibling import
+    /// in the same document must NOT be re-analyzed, or one changed dep would trigger a
+    /// full re-analysis of every import in the file. Returns
+    /// `(workspace_root, document_path, fresh_results)` for the client push, or `None`
+    /// when nothing was recomputed (parse failure, no stale specifiers, or every stale
+    /// key already owned by an in-flight revalidation).
+    ///
+    /// F2 — no daemon-side debounce. §4.5 asks for background revalidation to be
+    /// debounced by `importLens.debounceMs`; that debounce already lives in the CLIENT.
+    /// The extension routes every `FileSizeDocument` request through
+    /// `DebouncedDocumentScheduler` (see `extension/src/listener.ts`), keyed per document
+    /// URI with `config.debounceMs` (default 300ms) and cancel-and-replace semantics, so
+    /// the settled requests that reach this per-request revalidation are already
+    /// ≥`debounceMs` apart per document. A second per-key debounce here would be
+    /// redundant; the in-flight `RevalidationGuard` dedupe below already coalesces the
+    /// only remaining concurrency (overlapping requests for the same key).
+    pub fn revalidate_document_sizes(
+        &self,
+        request: &FileSizeDocumentRequest,
+        stale_specifiers: &HashSet<String>,
+        should_continue: impl Fn() -> bool,
+    ) -> Option<(
+        String,
+        String,
+        Vec<ImportResult>,
+        Vec<RefreshedImportIdentity>,
+    )> {
+        if stale_specifiers.is_empty() {
+            return None;
+        }
+        // F3-B pre-recompute cancellation: a document superseded before this
+        // background revalidation starts (a newer FileSizeDocument or prewarm bumped
+        // the prefetcher's cancellation generation) bails before any expensive
+        // recompute, reusing the prefetch cancellation-generation bailout pattern.
+        if !should_continue() {
+            return None;
+        }
+        let context = AnalysisContext {
+            workspace_root: PathBuf::from(&request.workspace_root),
+            active_document_path: PathBuf::from(&request.active_document_path),
+        };
+        let ignore_resolver = IgnoreRuleResolver::default();
+        let detected = detected_imports_for_document(
+            &request.active_document_path,
+            &request.source,
+            true,
+            &ignore_resolver,
+        )
+        .ok()?;
+
+        let cache = self.cache_registry.cache_for_root(&context.workspace_root);
+        let mut fresh = Vec::new();
+        // Index-aligned with `fresh`: each recomputed result is paired with the
+        // identity of the import it belongs to, so the client can assign it to the
+        // right same-specifier variant instead of collapsing them by specifier.
+        let mut identities = Vec::new();
+        for detected_import in &detected {
+            // Only recompute the imports that were served stale; a fresh sibling has a
+            // valid cache entry and re-analyzing it would waste a full bundle+compress.
+            if !stale_specifiers.contains(&detected_import.specifier) {
+                continue;
+            }
+            // F3-B: a document superseded mid-iteration bails before the remaining
+            // (expensive) recomputes rather than finishing work no client will use.
+            if !should_continue() {
+                break;
+            }
+            // Build the request straight from the detected import — do NOT route through
+            // analysis_items_for_detected, which would run a full recompute per import
+            // just to harvest the request list (doubling work and letting the dedupe
+            // gate below fire only after the expensive recompute).
+            let Ok(import_request) =
+                import_request_for_detected(&context.active_document_path, detected_import)
+            else {
+                continue;
+            };
+            let Ok(resolved) =
+                resolve_package_entry(&context.active_document_path, &import_request)
+            else {
+                continue;
+            };
+            let key = cache_key_for_resolved_import(&import_request, &resolved);
+            // A served-`Stale` specifier is either a genuine content change (recompute
+            // it) or a transient `Unknown` graduated to a quiet `Stale{revalidating}`
+            // (§4.3.1). Re-PROBE the raw freshness and NEVER route a graduated `Unknown`
+            // into recompute: `analyze_and_cache` would re-read the same locked file, hit
+            // the same transient error, and could overwrite the good cached value with an
+            // error result. The re-probe itself re-stats the dependency, so for a
+            // graduated key it doubles as the active re-check that heals it on a later get.
+            if matches!(
+                cache.probe_freshness(&key),
+                Some(crate::cache::key::Freshness::Unknown)
+            ) {
+                continue;
+            }
+            // Dedupe only within one document generation. The real cache key remains
+            // global, but the in-flight claim is delivery-scoped so another document
+            // importing the same package is not starved of its own refresh push.
+            let claim_key = revalidation_claim_key(
+                &key,
+                &request.workspace_root,
+                &request.active_document_path,
+                request.analysis_generation,
+            );
+            let Some(_guard) = cache.begin_revalidation(&claim_key) else {
+                continue;
+            };
+            let mut result = self.analyze_and_cache(
+                cache.as_ref(),
+                &context,
+                &import_request,
+                key.clone(),
+                resolved.clone(),
+                || true,
+            );
+            // F1 trailing re-check: if a dependency changed AGAIN while this recompute
+            // ran, the value just inserted already reflects the older state and
+            // `probe_freshness` re-stats it to `Stale`. A concurrent stale serve during
+            // the recompute was coalesced away by the in-flight guard, so nothing else
+            // heals it until the next interactive read. Re-arm EXACTLY ONE more
+            // revalidation (never a loop — a still-`Stale` second result is left for the
+            // next interactive read) so the served value catches up to the newer state.
+            if should_rearm_revalidation(cache.probe_freshness(&key)) {
+                result = self.analyze_and_cache(
+                    cache.as_ref(),
+                    &context,
+                    &import_request,
+                    key.clone(),
+                    resolved,
+                    || true,
+                );
+            }
+            if !should_continue() {
+                break;
+            }
+            if !should_cache_result(&result) {
+                continue;
+            }
+            fresh.push(result);
+            identities.push(RefreshedImportIdentity {
+                specifier: detected_import.specifier.clone(),
+                import_kind: detected_import.import_kind,
+                named: detected_import.named.clone(),
+            });
+        }
+
+        if fresh.is_empty() {
+            return None;
+        }
+        Some((
+            request.workspace_root.clone(),
+            request.active_document_path.clone(),
+            fresh,
+            identities,
+        ))
     }
 
     pub fn handle_analyze_package_json(
@@ -774,10 +1151,19 @@ impl ImportLensService {
             .filter_map(|(index, prepared)| prepared.as_ref().map(|item| (index, item)))
             .map(|(index, (import_request, resolved))| {
                 let result = match resolved {
-                    Some(resolved) => {
-                        self.analyze_resolved_with_cache(&context, import_request, resolved.clone())
-                    }
-                    None => self.analyze_with_cache(&context, import_request),
+                    Some(resolved) => self.analyze_resolved_with_cache(
+                        &context,
+                        import_request,
+                        resolved.clone(),
+                        false,
+                        ReadIntent::Interactive,
+                    ),
+                    None => self.analyze_with_cache(
+                        &context,
+                        import_request,
+                        false,
+                        ReadIntent::Interactive,
+                    ),
                 };
 
                 if let Some(emit_partial) = emit_partial.as_ref() {
@@ -983,9 +1369,10 @@ impl ImportLensService {
                 total_size_bytes: 0,
                 project_count: 0,
                 max_size_mb: 0,
-                max_age_days: 0,
-                last_cleanup_millis: None,
                 current_project: None,
+                total_bytes: 0,
+                budget_bytes: 0,
+                registry_size_bytes: 0,
                 error: Some(format!("unsupported protocol version {}", request.version)),
                 diagnostics: vec![ImportDiagnostic::for_stage(
                     "protocol",
@@ -1003,42 +1390,12 @@ impl ImportLensService {
             total_size_bytes: status.total_size_bytes,
             project_count: status.project_count,
             max_size_mb: status.max_size_mb,
-            max_age_days: status.max_age_days,
-            last_cleanup_millis: status.last_cleanup_millis,
             current_project: status.current_project,
-            error: None,
-            diagnostics: Vec::new(),
-        }
-    }
-
-    pub fn cleanup_cache(&self, request: CacheCleanupRequest) -> CacheCleanupResponse {
-        if !is_supported_protocol_version(request.version) {
-            return CacheCleanupResponse {
-                version: request.version.min(PROTOCOL_VERSION),
-                request_id: request.request_id,
-                total_size_bytes: 0,
-                removed: Vec::new(),
-                failed: Vec::new(),
-                error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage(
-                    "protocol",
-                    "unsupported protocol version",
-                )],
-            };
-        }
-
-        let cleanup = self.cache_registry.cleanup();
-
-        if !cleanup.removed.is_empty() {
-            clear_module_graph_cache();
-        }
-
-        CacheCleanupResponse {
-            version: request.version,
-            request_id: request.request_id,
-            total_size_bytes: cleanup.total_size_bytes,
-            removed: cleanup.removed,
-            failed: cleanup.failed,
+            total_bytes: status.total_bytes,
+            budget_bytes: status.budget_bytes,
+            // A single serialized-length measurement of the shared registry
+            // snapshot (D-b's envelope size), not a scan.
+            registry_size_bytes: self.registry_hints.registry_size_bytes(),
             error: None,
             diagnostics: Vec::new(),
         }
@@ -1107,8 +1464,29 @@ impl ImportLensService {
             CacheRemoveScope::Selected => self
                 .cache_registry
                 .remove_selected(request.shard_ids.as_deref().unwrap_or(&[])),
-            CacheRemoveScope::All => self.cache_registry.remove_all(),
+            CacheRemoveScope::All => {
+                let removed = self.cache_registry.remove_all();
+                // "Clear everything" drops the shared npm-hint store and the
+                // shared resolver caches in addition to the bundle shards, so no
+                // derived state survives the clear (X-14/X-16). The L1/graph
+                // caches are cleared unconditionally below (X-21).
+                self.registry_hints.clear();
+                crate::pipeline::resolver::invalidate_shared_resolvers();
+                removed
+            }
+            CacheRemoveScope::Registry => {
+                // Registry-only: drop the npm-hint store and nothing else. Bundle
+                // shards and their derived L1/graph caches stay put, so this
+                // returns no shard-removal results.
+                self.registry_hints.clear();
+                Vec::new()
+            }
             CacheRemoveScope::Orphans => {
+                // Manual "Remove Orphaned Caches" (RB-17): drive-safe shard reclaim
+                // for moved/deleted projects + a stale-entry scrub of surviving
+                // shards, plus a stale-registry-metadata prune. The maintenance tick
+                // runs the shard-only half of this automatically (throttled); this
+                // button is the on-demand, entry-inclusive pass.
                 let registry_removed = self.registry_hints.purge_expired_metadata();
                 if registry_removed > 0 {
                     crate::logging::log_debug(
@@ -1128,14 +1506,27 @@ impl ImportLensService {
             // Drop the L1/graph entries whose paths are specifically gone.
             crate::pipeline::file_size_cache::shared_file_size_cache().purge_missing_paths();
             crate::pipeline::graph::purge_missing_module_graphs();
+            crate::pipeline::cjs::purge_missing_cjs_module_sets();
         }
 
-        if !removed.is_empty() {
+        // Drop the derived L1/graph caches when a store-clearing scope ran. `All`
+        // clears them UNCONDITIONALLY (X-21): a "Clear everything" that removed no
+        // shard (nothing was cached yet, or only the registry was populated) must
+        // still drop the derived caches so no stale derived state survives. Scoped
+        // shard removals still only pay this when they actually removed a shard;
+        // the registry-only scope leaves these caches untouched.
+        if matches!(request.scope, CacheRemoveScope::All) || !removed.is_empty() {
             clear_module_graph_cache();
+            crate::pipeline::cjs::clear_cjs_module_cache();
             // Drop L1 aggregate sizes too so the status-bar size recomputes fresh
             // after a cache clear (the memory-only L1 is not generation-bumped here).
             crate::pipeline::file_size_cache::shared_file_size_cache().clear();
         }
+
+        // A just-cleared store must not be silently repopulated as "fresh" by an
+        // analysis that captured the pre-clear generation. Bump so any in-flight
+        // insert lands `verified_generation < current` and re-validates (X-17).
+        crate::cache::memory::bump_cache_generation();
 
         CacheRemoveResponse {
             version: request.version,
@@ -1150,6 +1541,7 @@ impl ImportLensService {
     pub fn invalidate_package(&self, package_name: &str) {
         self.cache_registry.invalidate_package(package_name);
         invalidate_module_graph_cache_for_package(package_name);
+        crate::pipeline::cjs::invalidate_cjs_module_cache_for_package(package_name);
         crate::pipeline::resolver::invalidate_shared_resolvers();
         crate::cache::memory::bump_cache_generation();
     }
@@ -1157,12 +1549,87 @@ impl ImportLensService {
     pub fn invalidate_all(&self) {
         self.cache_registry.clear_all();
         clear_module_graph_cache();
+        crate::pipeline::cjs::clear_cjs_module_cache();
         crate::pipeline::resolver::invalidate_shared_resolvers();
         crate::cache::memory::bump_cache_generation();
     }
 
-    pub fn cache_len(&self) -> usize {
-        self.cache_registry.memory_len()
+    /// Periodic cache maintenance: enforce the global disk-byte budget by
+    /// evicting the least-recently-used entries across shards, then reclaim
+    /// fragmented shard files. Runs on the maintenance interval task via
+    /// `spawn_blocking` — never on the connection's async loop.
+    ///
+    /// The maintenance task's first tick fires immediately after Hello, so this
+    /// also serves as the daemon's STARTUP maintenance pass; subsequent ticks are
+    /// the periodic pass. The registry-store retention + size cap ride the same
+    /// seam (A5/X-15, D3+D4 / §6.1): they must not run on the write hot path, so
+    /// they run here rather than on every registry write.
+    pub fn run_cache_maintenance(&self) {
+        // F4-B skip-if-running: a redundant concurrent pass (e.g. a re-Hello's new
+        // maintenance task first tick overlapping the previous connection's still-
+        // running detached pass) is a no-op. Passes already serialize on redb's
+        // single writer; this avoids the wasted duplicate scan/compaction. The guard
+        // clears the flag on drop (including on panic), so a failed pass never wedges
+        // maintenance off permanently.
+        let Some(_maintenance_guard) = try_begin_cache_maintenance() else {
+            return;
+        };
+        let outcome = self.cache_registry.run_maintenance(false);
+        if outcome.eviction.evicted_keys > 0 {
+            crate::logging::log_debug(
+                "cache",
+                format!(
+                    "byte-budget eviction freed {} bytes across {} entries",
+                    outcome.eviction.evicted_bytes, outcome.eviction.evicted_keys
+                ),
+            );
+        }
+        if outcome.compacted_shards > 0 {
+            crate::logging::log_debug(
+                "cache",
+                format!("compacted {} shard file(s)", outcome.compacted_shards),
+            );
+        }
+
+        // Registry metadata store: automatic 30-day retention + byte-budget size
+        // cap, both written authoritatively so the deletions stick. The byte budget
+        // is the user's `importLens.registryCacheMaxSizeMB`, negotiated at Hello and
+        // stored here (RB-16); it falls back to the daemon default for an older
+        // client that omits the field (serde-defaulted in `HelloMessage`).
+        let registry_removed = self.registry_hints.run_maintenance(
+            crate::time::unix_millis_now(),
+            self.registry_cache_max_size_bytes,
+        );
+        if registry_removed > 0 {
+            crate::logging::log_debug(
+                "registry",
+                format!("maintenance dropped {registry_removed} stale/over-cap registry entries"),
+            );
+        }
+
+        // Orphaned-shard reclaim (RB-17): a project that was moved/deleted is never
+        // reopened, so the on-access reclaim (name invalidation + `Gone` eviction)
+        // never reaches it and its whole shard lingers — reclaimed here instead.
+        // Drive-safe (an offline/unplugged drive keeps its shard, X-3) and throttled
+        // (`ORPHAN_SWEEP_INTERVAL`), so most ticks are a cheap no-op. Removing a shard
+        // strands its derived L1/graph entries, so clear those + bump the generation,
+        // exactly as the manual cache-remove path does.
+        let orphans_removed = self
+            .cache_registry
+            .sweep_orphaned_shards_if_due()
+            .iter()
+            .filter(|result| result.removed)
+            .count();
+        if orphans_removed > 0 {
+            clear_module_graph_cache();
+            crate::pipeline::cjs::clear_cjs_module_cache();
+            crate::pipeline::file_size_cache::shared_file_size_cache().clear();
+            crate::cache::memory::bump_cache_generation();
+            crate::logging::log_info(
+                "cache",
+                format!("reclaimed {orphans_removed} orphaned project cache shard(s)"),
+            );
+        }
     }
 
     pub fn recent_cache_keys(&self, workspace_root: &Path, limit: usize) -> Vec<String> {
@@ -1171,10 +1638,6 @@ impl ImportLensService {
 
     pub fn flush_cache(&self) -> Result<(), String> {
         self.cache_registry.flush_to_disk()
-    }
-
-    pub fn flush_cache_recency_touches(&self) {
-        self.cache_registry.flush_recency_touches();
     }
 
     pub fn prewarm_import<F>(
@@ -1203,7 +1666,10 @@ impl ImportLensService {
         let key = cache_key_for_resolved_import(request, &resolved);
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
-        if cache.get(&key).is_some() || !should_continue() {
+        // Prewarm dedup check: a bulk/background read must not promote recency
+        // (scan resistance, design §5.1) — prewarming the whole document should not
+        // evict the user's warm working set.
+        if cache.get_for_prewarm(&key).is_some() || !should_continue() {
             return;
         }
 
@@ -1220,17 +1686,31 @@ impl ImportLensService {
     pub fn invalidate_package_json_paths(&self, package_json_paths: &[String]) -> bool {
         let mut package_names = Vec::with_capacity(package_json_paths.len());
         for package_json_path in package_json_paths {
-            let Some(package_name) = package_name_from_package_json_path(package_json_path) else {
-                // A path we can't map to a package name is opaque, so fall back
-                // to a full invalidation -- the only safe option.
-                self.invalidate_all();
-                return true;
-            };
-            package_names.push(package_name);
+            match package_name_from_package_json_path(package_json_path) {
+                Some(package_name) => package_names.push(package_name),
+                // A path we can't map to a package name is opaque, but the
+                // presence of one odd path (pnpm's `.pnpm/…` store, a symlinked
+                // package, or any layout the mapper doesn't recognize) is not a
+                // reason to nuke every OTHER project's cache -- skip it and keep
+                // targeting whatever did map.
+                None => crate::logging::log_debug(
+                    "cache",
+                    format!(
+                        "unmappable package.json path, skipping targeted invalidation: {package_json_path}"
+                    ),
+                ),
+            }
         }
 
         if package_names.is_empty() {
-            return false;
+            // Nothing mapped. An empty batch is a no-op (unchanged); a
+            // non-empty batch where every path was opaque has no safe
+            // targeted fallback, so a full clear is the only safe option.
+            if package_json_paths.is_empty() {
+                return false;
+            }
+            self.invalidate_all();
+            return true;
         }
 
         // Even for a large burst, invalidate only the affected packages (a single
@@ -1241,6 +1721,7 @@ impl ImportLensService {
         self.cache_registry.invalidate_packages(&package_names);
         for package_name in &package_names {
             invalidate_module_graph_cache_for_package(package_name);
+            crate::pipeline::cjs::invalidate_cjs_module_cache_for_package(package_name);
         }
         crate::pipeline::resolver::invalidate_shared_resolvers();
         crate::cache::memory::bump_cache_generation();
@@ -1251,13 +1732,20 @@ impl ImportLensService {
         &self,
         context: &AnalysisContext,
         detected: Vec<DetectedImport>,
+        serve_stale: bool,
+        intent: ReadIntent,
     ) -> Vec<ImportAnalysisItem> {
         let mut items = detected
             .into_par_iter()
             .map(|detected| {
                 match import_request_for_detected(&context.active_document_path, &detected) {
                     Ok(request) => ImportAnalysisItem {
-                        result: Some(self.analyze_with_cache(context, &request)),
+                        result: Some(self.analyze_with_cache(
+                            context,
+                            &request,
+                            serve_stale,
+                            intent,
+                        )),
                         detected,
                         status: ImportAnalysisStatus::Ready,
                         message: None,
@@ -1317,9 +1805,13 @@ impl ImportLensService {
         &self,
         context: &AnalysisContext,
         request: &ImportRequest,
+        serve_stale: bool,
+        intent: ReadIntent,
     ) -> ImportResult {
         match resolve_package_entry(&context.active_document_path, request) {
-            Ok(resolved) => self.analyze_resolved_with_cache(context, request, resolved),
+            Ok(resolved) => {
+                self.analyze_resolved_with_cache(context, request, resolved, serve_stale, intent)
+            }
             Err(_) => analyze_import(context, request),
         }
     }
@@ -1327,17 +1819,47 @@ impl ImportLensService {
     // Cache lookup + analysis for an already-resolved package. The package.json
     // analysis path resolves each dependency once and reuses the ResolvedPackage
     // here, avoiding a second resolve_package_entry (and its manifest read).
+    //
+    // `serve_stale` selects the read semantics: interactive size reads serve the
+    // last-known value instantly (flagged on the result's `freshness`) via
+    // stale-while-revalidate; batch/CI reads pass `false` so a changed dependency is
+    // recomputed synchronously and never served stale (spec §4.5).
     fn analyze_resolved_with_cache(
         &self,
         context: &AnalysisContext,
         request: &ImportRequest,
         resolved: ResolvedPackage,
+        serve_stale: bool,
+        intent: ReadIntent,
     ) -> ImportResult {
         let key = cache_key_for_resolved_import(request, &resolved);
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
-        if let Some(result) = cache.get(&key) {
-            return result;
+        if serve_stale {
+            // SWR: serve the last-known value (flagged Stale/Unverified) instead of
+            // evicting-and-recomputing. The FileSizeDocument handler spawns a background
+            // recompute + push when a served result is Stale. A bulk read
+            // (WorkspaceReport, Compare) uses the non-promoting variant so a
+            // full-workspace scan can't flood the recency signal (scan resistance, §5.1).
+            let served = match intent {
+                ReadIntent::Interactive => cache.get_with_result_freshness(&key),
+                ReadIntent::Bulk => cache.get_with_result_freshness_for_bulk(&key),
+            };
+            if let Some((result, _freshness)) = served {
+                return result;
+            }
+        } else {
+            // Force-fresh (CI / `importlens check`, §4.5): serve ONLY a value verified
+            // `Fresh` against disk, across BOTH the memory working set and the disk
+            // cache. `get_if_fresh` returns `None` on Unknown/Stale/Gone/miss, so a
+            // transient `Unknown` — which the evicting `get` would launder into a
+            // `cache_hit`, whether memory-resident OR cold-daemon disk-hydrated — never
+            // reaches CI; we recompute synchronously below instead. This single gate
+            // also removes the double dependency re-verification of the prior
+            // memory-only `probe_freshness` + `get`.
+            if let Some(result) = cache.get_if_fresh(&key) {
+                return result;
+            }
         }
 
         self.analyze_and_cache(cache.as_ref(), context, request, key, resolved, || true)
@@ -1352,12 +1874,27 @@ impl ImportLensService {
         resolved: ResolvedPackage,
         should_store: impl Fn() -> bool,
     ) -> ImportResult {
-        let result = analyze_resolved_import(context, request, resolved.clone());
+        let captured_generation = crate::cache::memory::cache_generation();
+        let (result, analyzed_graph) =
+            analyze_resolved_import_with_graph(context, request, resolved.clone());
 
         if should_cache_result(&result) && should_store() {
-            let fingerprints = dependency_fingerprints(request, &resolved, &result);
-            self.cache_full_variant_alias(cache, request, &result, &resolved, &fingerprints);
-            cache.insert_with_fingerprints(key, result.clone(), fingerprints);
+            let fingerprints =
+                dependency_fingerprints(&resolved, analyzed_graph.as_ref(), request.runtime);
+            self.cache_full_variant_alias(
+                cache,
+                request,
+                &result,
+                &resolved,
+                &fingerprints,
+                captured_generation,
+            );
+            cache.insert_with_fingerprints_at_generation(
+                key,
+                result.clone(),
+                fingerprints,
+                captured_generation,
+            );
         }
 
         result
@@ -1370,6 +1907,7 @@ impl ImportLensService {
         result: &ImportResult,
         resolved: &ResolvedPackage,
         dependency_fingerprints: &[crate::cache::key::FileFingerprint],
+        verified_generation: u64,
     ) {
         if !resolved.side_effects.has_side_effects()
             || result.is_cjs
@@ -1394,10 +1932,11 @@ impl ImportLensService {
         let mut namespace_result = result.clone();
         namespace_result.cache_hit = false;
         namespace_result.truly_treeshakeable = false;
-        cache.insert_with_fingerprints(
+        cache.insert_with_fingerprints_at_generation(
             namespace_key,
             namespace_result,
             dependency_fingerprints.to_vec(),
+            verified_generation,
         );
     }
 }
@@ -1451,6 +1990,28 @@ fn effective_registry_hint_mode(
 fn should_cache_result(result: &ImportResult) -> bool {
     result.error.is_none() && !has_request_specific_diagnostics(result)
 }
+
+fn revalidation_claim_key(
+    cache_key: &str,
+    workspace_root: &str,
+    document_path: &str,
+    generation: Option<u64>,
+) -> String {
+    format!(
+        "{cache_key}\0{workspace_root}\0{document_path}\0{}",
+        generation
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    )
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/service_swr.rs"]
+mod service_swr_tests;
+
+#[cfg(test)]
+#[path = "../tests/unit/service_registry_budget.rs"]
+mod service_registry_budget_tests;
 
 fn detected_imports_for_document(
     active_document_path: &str,
@@ -1539,24 +2100,58 @@ fn has_request_specific_diagnostics(result: &ImportResult) -> bool {
 }
 
 fn dependency_fingerprints(
-    request: &ImportRequest,
     resolved: &ResolvedPackage,
-    result: &ImportResult,
+    graph: Option<&std::sync::Arc<ModuleGraph>>,
+    runtime: crate::ipc::protocol::ImportRuntime,
 ) -> Vec<crate::cache::key::FileFingerprint> {
+    use crate::cache::key::file_fingerprint_reading_hash;
+
+    // No analyzed graph (CJS, oversized entry, or static fallback): the result was
+    // not computed from a module graph, so freshness is pinned to the manifest and
+    // entry — read+hashed here (RB-2) so an equal-length, mtime-preserving edit is
+    // still detected rather than probing Fresh forever.
+    let Some(graph) = graph else {
+        let mut fingerprints: Vec<crate::cache::key::FileFingerprint> = [
+            resolved.package_root.join("package.json"),
+            resolved.entry_path.clone(),
+        ]
+        .into_iter()
+        .filter_map(file_fingerprint_reading_hash)
+        .collect();
+
+        // A CJS package has no `ModuleGraph`, but the analyzer cached read-time
+        // fingerprints for every transitively `require()`d module (RB-5). Fold them in
+        // so a first-party CJS dep edit invalidates instead of probing Fresh against
+        // manifest+entry alone. The fingerprints carry read-time content hashes, so the
+        // strict per-get gate hash-verifies first-party CJS modules. (A CJS result that
+        // fell back to static-entry sizing may pull in a partial/unused module set —
+        // harmless over-coverage, never a stale-serve.)
+        if resolved.is_cjs
+            && let Some(cjs_fingerprints) =
+                crate::pipeline::cjs::cjs_module_fingerprints(&resolved.entry_path, runtime)
+        {
+            fingerprints.extend(cjs_fingerprints);
+        }
+        fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
+        fingerprints.dedup_by(|a, b| a.path == b.path);
+        return fingerprints;
+    };
+
     let mut paths = vec![
+        // The manifest is not a graph module, so fingerprints_with_content_hashes
+        // read+hashes it (RB-2) rather than degrading to mtime+len — a same-content
+        // touch no longer re-verifies, and a same-length edit is still caught.
         resolved.package_root.join("package.json"),
         resolved.entry_path.clone(),
     ];
-
-    if !result.is_cjs
-        && let Ok(graph) =
-            build_module_graph_cached_with_runtime(&resolved.entry_path, request.runtime)
-    {
-        paths.extend(graph.modules.iter().map(|module| module.path.clone()));
-        paths.extend(graph.dependency_paths.iter().cloned());
-    }
-
-    fingerprints_for_paths(paths)
+    paths.extend(graph.modules.iter().map(|module| module.path.clone()));
+    paths.extend(graph.dependency_paths.iter().cloned());
+    // Content hashes come from the EXACT graph instance the result was computed
+    // from (threaded out of analysis), so these fingerprints describe the
+    // analyzed bytes with no second fetch that could rebuild against a dependency
+    // that changed during the analysis window (Finding 4). The pre-analysis
+    // generation gate still backstops the node_modules-changed case.
+    crate::pipeline::graph::fingerprints_with_content_hashes(paths, graph)
 }
 
 pub fn protocol_error_batch_response(request: &BatchRequest, message: String) -> BatchResponse {
@@ -1667,6 +2262,7 @@ fn collect_module_exports(
 
 fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
     ImportResult {
+        freshness: crate::ipc::protocol::ResultFreshness::fresh(),
         specifier: request.specifier.clone(),
         raw_bytes: 0,
         minified_bytes: 0,
@@ -1726,5 +2322,181 @@ mod report_panic_isolation_tests {
         );
 
         assert!(items.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod task_lifecycle_tests {
+    use super::{ImportLensService, should_rearm_revalidation, try_begin_cache_maintenance};
+    use crate::cache::key::Freshness;
+    use crate::ipc::protocol::{PROTOCOL_VERSION, WorkspaceReportBudgets, WorkspaceReportRequest};
+
+    // F1: the trailing re-check re-arms EXACTLY ONE more revalidation, and only when
+    // the entry is still `Stale` after a recompute. A fully deterministic
+    // mid-recompute timing repro is impractical — the second dependency change must
+    // land inside the synchronous recompute window, and freshness is content-hash
+    // based — so the DECISION is tested directly: `Stale` -> re-arm; every other
+    // outcome -> no re-run. The re-run is one-shot by construction (a straight-line
+    // second `analyze_and_cache`, not a loop), so a still-`Stale` second result is
+    // left for the next interactive read rather than spinning.
+    #[test]
+    fn swr_re_arms_one_trailing_revalidation_only_when_still_stale() {
+        assert!(
+            should_rearm_revalidation(Some(Freshness::Stale)),
+            "a still-Stale entry re-arms one trailing revalidation"
+        );
+        assert!(!should_rearm_revalidation(Some(Freshness::Fresh)));
+        assert!(
+            !should_rearm_revalidation(Some(Freshness::Unknown)),
+            "a graduated transient Unknown must never route into recompute"
+        );
+        assert!(!should_rearm_revalidation(Some(Freshness::Gone)));
+        assert!(!should_rearm_revalidation(None));
+    }
+
+    // F4-B: while a maintenance pass holds the in-progress claim, a second
+    // concurrent `run_cache_maintenance` must be a no-op. The old-detached-pass vs
+    // re-Hello-new-pass race is not deterministically reproducible, so the flag
+    // decision is tested directly: the claim is exclusive while held and frees on
+    // drop so the next pass can proceed.
+    #[test]
+    fn maintenance_skips_when_already_running() {
+        let guard = try_begin_cache_maintenance().expect("first claim should win");
+        assert!(
+            try_begin_cache_maintenance().is_none(),
+            "a second maintenance pass is a no-op while one is in flight"
+        );
+        drop(guard);
+        let next = try_begin_cache_maintenance().expect("claim frees on drop for the next pass");
+        drop(next);
+    }
+
+    // F4-A: a panic in the report AGGREGATION (outside per-file analysis) must
+    // surface as an explicit error response through the fire-and-forget spawn path,
+    // rather than unwinding the rayon job and dropping the `oneshot` sender.
+    #[test]
+    fn workspace_report_aggregation_panic_yields_error_response() {
+        let service = std::sync::Arc::new(ImportLensService::new(None, false));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        service.spawn_workspace_report(
+            WorkspaceReportRequest {
+                message_type: "workspace_report".to_owned(),
+                version: PROTOCOL_VERSION,
+                request_id: 77,
+                // Sentinel (compiled only under cfg(test)) panics inside the
+                // aggregation, exercising the catch_unwind.
+                workspace_root: "__IMPORTLENS_FORCE_REPORT_PANIC__".to_owned(),
+                budgets: WorkspaceReportBudgets {
+                    per_import_brotli_bytes: None,
+                    per_file_brotli_bytes: None,
+                },
+            },
+            tx,
+        );
+        let response = rx
+            .blocking_recv()
+            .expect("catch_unwind must send an error response, not drop the sender");
+        assert_eq!(response.request_id, 77);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("panicked")),
+            "an aggregation panic must yield an error response: {response:?}"
+        );
+        assert!(response.rows.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod analyze_and_cache_graph_reuse_tests {
+    use super::{ImportLensService, should_cache_result};
+    use crate::cache::key::cache_key_for_resolved_import;
+    use crate::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
+    use crate::pipeline::analyze::AnalysisContext;
+    use crate::pipeline::graph::graph_fetch_probe;
+    use crate::pipeline::resolver::{ResolvedPackage, SideEffectsMode};
+    use std::fs;
+
+    /// Finding 4 regression: `analyze_and_cache` must build content-hash
+    /// fingerprints from the SAME module graph instance it analyzed, never
+    /// re-fetch the graph by key. The probe counts
+    /// `build_module_graph_cached_with_runtime` calls for the analyzed entry:
+    /// the fix makes that exactly one (analysis only); the pre-fix code fetched
+    /// a second time inside `dependency_fingerprints`, which — if a dependency
+    /// changed during the analysis window — pairs a stale result with
+    /// fresh-looking fingerprints and serves it `Fresh`.
+    #[test]
+    fn analyze_and_cache_fetches_module_graph_once() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let workspace =
+            std::env::temp_dir().join(format!("il-a4-graph-reuse-{}-{unique}", std::process::id()));
+        let package_root = workspace.join("node_modules").join("pkg-a4");
+        fs::create_dir_all(&package_root).expect("package root");
+        // ESM entry + one internal dependency so the OXC pipeline builds a real
+        // multi-module graph (`Some(graph)`), exercising the content-hash path.
+        fs::write(
+            package_root.join("index.mjs"),
+            "export { value } from './dep.mjs';\n",
+        )
+        .expect("entry");
+        fs::write(
+            package_root.join("dep.mjs"),
+            "export const value = 41;\nexport const spare = 7;\n",
+        )
+        .expect("dep");
+        fs::write(package_root.join("package.json"), "{\"name\":\"pkg-a4\"}").expect("manifest");
+
+        let entry_path = package_root.join("index.mjs");
+        let resolved = ResolvedPackage {
+            package_root: package_root.clone(),
+            package_json: serde_json::json!({ "name": "pkg-a4", "version": "1.0.0" }),
+            entry_path: entry_path.clone(),
+            is_cjs: false,
+            side_effects: SideEffectsMode::False,
+        };
+        let request = ImportRequest {
+            specifier: "pkg-a4".to_owned(),
+            package_name: "pkg-a4".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec!["value".to_owned()],
+            import_kind: ImportKind::Named,
+            runtime: ImportRuntime::Component,
+        };
+        let context = AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("app.ts"),
+        };
+
+        // Arm the probe on the exact entry both analysis and (pre-fix)
+        // fingerprinting fetch. The path is unique to this test, so concurrent
+        // sibling tests building other graphs never perturb the count.
+        graph_fetch_probe::arm(entry_path.clone());
+
+        let service = ImportLensService::new(None, false);
+        let cache = service
+            .cache_registry
+            .cache_for_root(&context.workspace_root);
+        let key = cache_key_for_resolved_import(&request, &resolved);
+        let result =
+            service.analyze_and_cache(cache.as_ref(), &context, &request, key, resolved, || true);
+
+        let hits = graph_fetch_probe::hits();
+        graph_fetch_probe::disarm();
+        fs::remove_dir_all(&workspace).ok();
+
+        assert_eq!(result.error, None, "analysis should succeed: {result:?}");
+        assert!(
+            should_cache_result(&result),
+            "result must reach the fingerprint path or the fetch count is vacuous",
+        );
+        assert_eq!(
+            hits, 1,
+            "analyze_and_cache must reuse the analyzed graph for fingerprints \
+             (one fetch); a second fetch is the Finding 4 TOCTOU",
+        );
     }
 }

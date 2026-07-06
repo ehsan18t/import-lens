@@ -3,10 +3,11 @@ use import_lens_daemon::{
         codec::{FrameDecoder, decode_payload, encode_frame},
         protocol::{
             AnalyzePackageJsonRequest, AnalyzePackageJsonResponse, BatchRequest, BatchResponse,
-            CacheStatusRequest, CacheStatusResponse, FileSizeRequest, FileSizeResponse,
+            CacheStatusRequest, CacheStatusResponse, FileSizeDocumentRequest,
+            FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse, FreshnessKind,
             HelloMessage, ImportAnalysisStatus, ImportKind, ImportRequest, ImportRuntime,
             PROTOCOL_VERSION, RefreshRegistryHintsRequest, RefreshRegistryHintsResponse,
-            RegistryHintMode, RegistryHintTarget, ShutdownMessage,
+            RefreshedResultsResponse, RegistryHintMode, RegistryHintTarget, ShutdownMessage,
         },
         server::{handle_connection, response_from_join},
     },
@@ -317,7 +318,7 @@ fn hello(workspace: &Path) -> HelloMessage {
         storage_path: workspace.join(".import-lens").to_string_lossy().to_string(),
         enable_disk_cache: false,
         cache_max_size_mb: 512,
-        cache_max_age_days: 30,
+        registry_cache_max_size_mb: 32,
         log_level: "error".to_owned(),
     }
 }
@@ -557,6 +558,195 @@ async fn server_cancels_prewarm_before_file_size_requests() {
     let response = reader.read_response(&mut client_stream).await;
     assert_eq!(response.request_id, 12);
     assert!(cancellation.generation() > prewarm_generation);
+
+    client_stream
+        .write_all(
+            &encode_frame(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("shutdown should encode"),
+        )
+        .await
+        .expect("shutdown should be written");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should exit cleanly");
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+/// Reads raw framed payloads so one stream can carry two different response types in
+/// sequence — the FileSizeDocument reply, then the unsolicited RefreshedResults push.
+struct RawFrameReader {
+    decoder: FrameDecoder,
+    pending: VecDeque<Vec<u8>>,
+}
+
+impl RawFrameReader {
+    fn new() -> Self {
+        Self {
+            decoder: FrameDecoder::default(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    async fn next_payload(&mut self, stream: &mut DuplexStream) -> Vec<u8> {
+        if let Some(payload) = self.pending.pop_front() {
+            return payload;
+        }
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("server response should be readable");
+            assert!(read > 0, "server closed before writing a frame");
+            for payload in self
+                .decoder
+                .push(&buffer[..read])
+                .expect("server frame should decode")
+            {
+                self.pending.push_back(payload);
+            }
+            if let Some(payload) = self.pending.pop_front() {
+                return payload;
+            }
+        }
+    }
+}
+
+fn file_size_document(
+    workspace: &Path,
+    document: &Path,
+    source: &str,
+    request_id: u64,
+) -> FileSizeDocumentRequest {
+    FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document.to_string_lossy().to_string(),
+        source: source.to_owned(),
+        force_fresh: false,
+        // Mirror the extension: tag the size read with the analysis generation so the
+        // resulting SWR push echoes it back for the client's supersession guard.
+        analysis_generation: Some(request_id),
+    }
+}
+
+#[tokio::test]
+async fn server_pushes_refreshed_results_after_serving_stale_size() {
+    let workspace = temp_workspace();
+    write_tiny_package(&workspace);
+    let document = workspace.join("src").join("index.ts");
+    let source = "import { value } from 'tiny-stream-lib';\nexport const total = value;\n";
+    fs::write(&document, source).expect("document should be written");
+
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new(None, false)),
+            Prefetcher::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = RawFrameReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+
+    // First request populates the cache with a Fresh entry.
+    client_stream
+        .write_all(
+            &encode_frame(&file_size_document(&workspace, &document, source, 1))
+                .expect("request should encode"),
+        )
+        .await
+        .expect("request should be written");
+    let first: FileSizeDocumentResponse =
+        decode_payload(&reader.next_payload(&mut client_stream).await)
+            .expect("first response should decode");
+    assert_eq!(first.request_id, 1);
+
+    // Change the resolved dependency so the cached entry is stale, and bump the cache
+    // generation so the next read takes the slow (re-validating) path.
+    let package_index = workspace
+        .join("node_modules")
+        .join("tiny-stream-lib")
+        .join("index.js");
+    fs::write(&package_index, "export const value = 1234567890123456789;")
+        .expect("dependency change should be written");
+    import_lens_daemon::cache::memory::bump_cache_generation();
+
+    // Second request serves the STALE value immediately, then pushes RefreshedResults.
+    client_stream
+        .write_all(
+            &encode_frame(&file_size_document(&workspace, &document, source, 2))
+                .expect("request should encode"),
+        )
+        .await
+        .expect("request should be written");
+
+    let second: FileSizeDocumentResponse =
+        decode_payload(&reader.next_payload(&mut client_stream).await)
+            .expect("second response should decode");
+    assert_eq!(second.request_id, 2);
+    assert!(
+        second
+            .imports
+            .iter()
+            .any(|result| matches!(result.freshness.kind, FreshnessKind::Stale)),
+        "the immediate response serves the stale value flagged Stale"
+    );
+
+    // The unsolicited refreshed-results push arrives afterward with Fresh results.
+    let refreshed: RefreshedResultsResponse = tokio::time::timeout(Duration::from_secs(5), async {
+        decode_payload::<RefreshedResultsResponse>(&reader.next_payload(&mut client_stream).await)
+            .expect("refreshed frame should decode")
+    })
+    .await
+    .expect("a RefreshedResults push should arrive after the stale serve");
+    assert_eq!(refreshed.message_type, "refreshed_results");
+    assert_eq!(refreshed.document_path, document.to_string_lossy());
+    assert!(
+        !refreshed.results.is_empty(),
+        "the refreshed push carries recomputed results"
+    );
+    assert!(
+        refreshed
+            .results
+            .iter()
+            .all(|result| matches!(result.freshness.kind, FreshnessKind::Fresh)),
+        "recomputed results are Fresh"
+    );
+    // The push echoes the triggering size read's analysis generation (request_id 2)
+    // so the client can drop it if a newer analysis has since superseded it.
+    assert_eq!(
+        refreshed.generation,
+        Some(2),
+        "the push echoes the triggering request's analysis generation"
+    );
+    // Each result is paired with a per-import identity so the client can disambiguate
+    // same-specifier variants.
+    assert_eq!(
+        refreshed.identities.len(),
+        refreshed.results.len(),
+        "identities are index-aligned with results"
+    );
+    assert!(
+        refreshed
+            .identities
+            .iter()
+            .all(|identity| identity.specifier == "tiny-stream-lib"),
+        "identities carry the import specifier: {:?}",
+        refreshed.identities
+    );
 
     client_stream
         .write_all(

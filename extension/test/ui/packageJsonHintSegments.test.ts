@@ -21,7 +21,7 @@ const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => 
   useCodeLens: false,
   enableDiskCache: true,
   cacheMaxSizeMB: 512,
-  cacheMaxAgeDays: 30,
+  registryCacheMaxSizeMB: 32,
   enableRegistryHints: true,
   verboseRegistryLogging: false,
   logLevel: "error",

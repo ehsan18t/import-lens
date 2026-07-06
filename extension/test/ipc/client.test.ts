@@ -9,8 +9,6 @@ import { encodeFrame, FrameDecoder } from "../../src/ipc/codec.js";
 import type {
   AnalyzePackageJsonRequest,
   AnalyzePackageJsonResponse,
-  CacheCleanupRequest,
-  CacheCleanupResponse,
   CacheListRequest,
   CacheListResponse,
   CacheRemoveRequest,
@@ -22,6 +20,7 @@ import type {
   ImportResult,
   PackageJsonDependencyAnalysisItem,
   PackageJsonDependencyEntry,
+  RefreshedResultsResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
   WorkspaceReportRequest,
@@ -103,12 +102,6 @@ const cacheStatusRequest = (requestId: number): CacheStatusRequest => ({
   version: 6,
   request_id: requestId,
   workspace_root: "/workspace",
-});
-
-const cacheCleanupRequest = (requestId: number): CacheCleanupRequest => ({
-  type: "cache_cleanup",
-  version: 6,
-  request_id: requestId,
 });
 
 const cacheListRequest = (requestId: number): CacheListRequest => ({
@@ -486,10 +479,6 @@ test("IpcClient resolves cache management responses independently from analysis 
           socket.write(encodeFrame(cacheStatusResponse(request.request_id ?? 0)));
         }
 
-        if (request.type === "cache_cleanup") {
-          socket.write(encodeFrame(cacheCleanupResponse(request.request_id ?? 0)));
-        }
-
         if (request.type === "cache_list") {
           socket.write(encodeFrame(cacheListResponse(request.request_id ?? 0)));
         }
@@ -506,20 +495,13 @@ test("IpcClient resolves cache management responses independently from analysis 
     const client = await IpcClient.connect(pipeName);
 
     const status = await client.requestCacheStatus(cacheStatusRequest(201));
-    const cleanup = await client.requestCacheCleanup(cacheCleanupRequest(202));
     const list = await client.requestCacheList(cacheListRequest(203));
     const remove = await client.requestCacheRemove(cacheRemoveRequest(204));
 
     assert.equal(status.project_count, 2);
-    assert.equal(cleanup.total_size_bytes, 1024);
     assert.equal(list.shards.length, 1);
     assert.equal(remove.removed.length, 1);
-    assert.deepEqual(observed, [
-      "cache_status:201",
-      "cache_cleanup:202",
-      "cache_list:203",
-      "cache_remove:204",
-    ]);
+    assert.deepEqual(observed, ["cache_status:201", "cache_list:203", "cache_remove:204"]);
     client.dispose();
   } finally {
     destroySockets(sockets);
@@ -610,19 +592,30 @@ const cacheStatusResponse = (requestId: number): CacheStatusResponse => ({
   total_size_bytes: 4096,
   project_count: 2,
   max_size_mb: 512,
-  max_age_days: 30,
-  last_cleanup_millis: null,
   current_project: null,
   error: null,
   diagnostics: [],
 });
 
-const cacheCleanupResponse = (requestId: number): CacheCleanupResponse => ({
-  version: 6,
+const cacheStatusResponseWithObservability = (requestId: number): CacheStatusResponse => ({
+  version: protocolVersion,
   request_id: requestId,
-  total_size_bytes: 1024,
-  removed: [],
-  failed: [],
+  total_size_bytes: 8192,
+  project_count: 1,
+  max_size_mb: 512,
+  total_bytes: 4096,
+  budget_bytes: 512 * 1024 * 1024,
+  registry_size_bytes: 321,
+  current_project: {
+    shard_id: "v1-abc",
+    project_root: "/workspace",
+    normalized_root: "/workspace",
+    cache_path: "/cache/v1-abc/cache.redb",
+    size_bytes: 8192,
+    last_used_millis: 123,
+    loaded: true,
+    entry_count: 7,
+  },
   error: null,
   diagnostics: [],
 });
@@ -660,4 +653,117 @@ const cacheRemoveResponse = (requestId: number): CacheRemoveResponse => ({
   failed: [],
   error: null,
   diagnostics: [],
+});
+
+test("IpcClient routes unsolicited refreshed_results pushes by message type", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const push: RefreshedResultsResponse = {
+    type: "refreshed_results",
+    version: protocolVersion,
+    workspace_root: "C:/workspace/app",
+    document_path: "C:/workspace/app/src/index.ts",
+    results: [
+      {
+        specifier: "lodash-es",
+        raw_bytes: 10_000,
+        minified_bytes: 4_000,
+        gzip_bytes: 1_800,
+        brotli_bytes: 1_500,
+        zstd_bytes: 1_700,
+        cache_hit: false,
+        side_effects: false,
+        truly_treeshakeable: true,
+        is_cjs: false,
+        confidence: "high",
+        confidence_reasons: [],
+        error: null,
+        diagnostics: [],
+      },
+    ],
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.resume();
+    // Unsolicited: no request precedes this frame — the SWR revalidation push
+    // arrives after the original request/response pair has fully completed, so
+    // it must be dispatched by message TYPE, never by a pending request_id.
+    setTimeout(() => {
+      socket.write(encodeFrame(push));
+    }, 10);
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    const received: RefreshedResultsResponse[] = [];
+    const gotPush = new Promise<void>((resolve) => {
+      client.on("refreshedResults", (message: RefreshedResultsResponse) => {
+        received.push(message);
+        resolve();
+      });
+    });
+
+    await gotPush;
+
+    assert.equal(received.length, 1);
+    assert.equal(received[0]?.document_path, "C:/workspace/app/src/index.ts");
+    assert.equal(received[0]?.results[0]?.specifier, "lodash-es");
+    assert.equal(received[0]?.results[0]?.brotli_bytes, 1_500);
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
+test("IpcClient decodes cache status observability fields and defaults legacy responses", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    const decoder = new FrameDecoder();
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("data", (chunk) => {
+      for (const message of decoder.push(chunk)) {
+        const request = message as { request_id?: number };
+        const requestId = request.request_id ?? 0;
+        // 401 receives the new-field response; any other id gets the legacy one
+        // (an older daemon that predates the observability fields).
+        socket.write(
+          encodeFrame(
+            requestId === 401
+              ? cacheStatusResponseWithObservability(requestId)
+              : cacheStatusResponse(requestId),
+          ),
+        );
+      }
+    });
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+
+    const withFields = await client.requestCacheStatus(cacheStatusRequest(401));
+    assert.equal(withFields.total_bytes, 4096);
+    assert.equal(withFields.budget_bytes, 512 * 1024 * 1024);
+    assert.equal(withFields.registry_size_bytes, 321);
+    assert.equal(withFields.current_project?.entry_count, 7);
+
+    // A legacy daemon omits the new fields; the response still decodes and the
+    // optional fields read as undefined so consumers can default them (`?? 0`).
+    const legacy = await client.requestCacheStatus(cacheStatusRequest(402));
+    assert.equal(legacy.total_bytes, undefined);
+    assert.equal(legacy.budget_bytes, undefined);
+    assert.equal(legacy.registry_size_bytes, undefined);
+    assert.equal(legacy.total_bytes ?? 0, 0);
+    assert.equal(legacy.current_project, null);
+
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
 });

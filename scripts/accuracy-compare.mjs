@@ -224,6 +224,7 @@ const startDaemon = async (workspace) => {
       storage_path: storagePath,
       enable_disk_cache: false,
       cache_max_size_mb: 512,
+      // Deprecated and ignored by the daemon; kept for Hello frame compatibility.
       cache_max_age_days: 30,
       log_level: "warn",
     });

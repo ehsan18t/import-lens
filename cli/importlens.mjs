@@ -209,6 +209,9 @@ const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
     workspace_root: workspaceRoot,
     active_document_path: filePath,
     source,
+    // CI budget checks must judge against the true current size — never a
+    // stale-while-revalidate value — so force a synchronous fresh recompute.
+    force_fresh: true,
   });
 
   if (response.error) {
@@ -260,6 +263,8 @@ const startDaemon = async (workspaceRoot) => {
       storage_path: cachePath,
       enable_disk_cache: true,
       cache_max_size_mb: 512,
+      // Deprecated and ignored by the daemon (the byte budget governs capacity);
+      // kept on the wire for Hello frame compatibility.
       cache_max_age_days: 30,
       log_level: "warn",
     });

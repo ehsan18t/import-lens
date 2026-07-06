@@ -1,8 +1,10 @@
+use import_lens_daemon::ipc::protocol::ImportRuntime;
 use import_lens_daemon::pipeline::{
     graph::{
         GraphLimits, MAX_CACHED_GRAPHS, ModuleGraph, build_module_graph, build_module_graph_cached,
-        build_module_graph_with_limits, clear_module_graph_cache, module_graph_cache_len,
-        purge_missing_module_graphs,
+        build_module_graph_cached_with_runtime, build_module_graph_with_limits,
+        cached_module_graph_with_runtime, clear_module_graph_cache, module_graph_cache_len,
+        peek_cached_module_paths, purge_missing_module_graphs,
     },
     reachability::reachable_exports,
 };
@@ -406,6 +408,117 @@ fn graph_cache_rebuilds_when_dependency_file_changes() {
             .any(|module| module.source.contains("after dependency change")),
         "{second:?}",
     );
+}
+
+// RB-1 / X-7: an equal-length, mtime-preserving rewrite of a first-party module
+// (cp -p, rsync -a, tar -x, some formatters) leaves len+mtime identical, so the
+// old non-strict pre-filter reused the STALE cached graph — and because L2
+// recomputes THROUGH this cache, the stale size was served forever. The strict
+// gate hash-verifies first-party modules and must rebuild.
+#[test]
+fn graph_cache_rebuilds_on_mtime_preserving_first_party_edit() {
+    let _guard = GRAPH_CACHE_TEST_LOCK.lock().expect("graph cache test lock");
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { value } from './dep.js';\nexport const answer = value;",
+    );
+    let dep = root.join("dep.js");
+    // Two bodies of IDENTICAL length, differing only in content.
+    fs::write(&dep, "export const value = 'aaaaa';").expect("write dep");
+    clear_module_graph_cache();
+
+    let original_mtime = fs::metadata(&dep)
+        .and_then(|meta| meta.modified())
+        .expect("dep mtime");
+
+    let first = build_module_graph_cached(&root.join("entry.js")).expect("graph should build");
+
+    // Same-length rewrite, then restore the ORIGINAL mtime so len+mtime match the
+    // cached fingerprint exactly — only the content hash differs.
+    fs::write(&dep, "export const value = 'bbbbb';").expect("rewrite dep");
+    fs::File::options()
+        .write(true)
+        .open(&dep)
+        .and_then(|file| file.set_modified(original_mtime))
+        .expect("restore dep mtime");
+    assert_eq!(
+        fs::metadata(&dep).and_then(|meta| meta.modified()).ok(),
+        Some(original_mtime),
+        "test setup must preserve mtime so a non-strict gate would have served stale",
+    );
+
+    let second = build_module_graph_cached(&root.join("entry.js"))
+        .expect("graph should rebuild after a mtime-preserving content change");
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+    clear_module_graph_cache();
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "the strict gate must rebuild on a mtime-preserving first-party edit",
+    );
+    assert!(
+        second
+            .modules
+            .iter()
+            .any(|module| module.source.contains("bbbbb")),
+        "the rebuilt graph must reflect the new content: {second:?}",
+    );
+}
+
+#[test]
+fn peek_cached_module_paths_returns_module_set_without_freshness_gate() {
+    let _guard = GRAPH_CACHE_TEST_LOCK.lock().expect("graph cache test lock");
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { value } from './dep.js';\nexport const answer = value;\n",
+    );
+    write_source(&root, "dep.js", "export const value = 'before';\n");
+    clear_module_graph_cache();
+
+    let entry = fs::canonicalize(root.join("entry.js")).expect("canonical entry");
+    let dep = fs::canonicalize(root.join("dep.js")).expect("canonical dep");
+
+    build_module_graph_cached_with_runtime(&entry, ImportRuntime::Component)
+        .expect("graph should build");
+
+    // Fresh: the gated accessor hits, and the peek returns the full module set —
+    // including the deep dependency L1 must be able to re-stat.
+    assert!(cached_module_graph_with_runtime(&entry, ImportRuntime::Component).is_some());
+    let peeked_fresh =
+        peek_cached_module_paths(&entry, ImportRuntime::Component).expect("peek while fresh");
+    assert!(
+        peeked_fresh.iter().any(|path| path == &entry),
+        "peek must include the entry module"
+    );
+    assert!(
+        peeked_fresh.iter().any(|path| path == &dep),
+        "peek must include the deep dependency module"
+    );
+
+    // Edit the deep dependency so the cached graph's fingerprints go stale.
+    thread::sleep(Duration::from_millis(2));
+    write_source(&root, "dep.js", "export const value = 'after the edit';\n");
+
+    // The freshness-gated accessor now reports None (stale) without evicting the entry,
+    // but the L1 peek must STILL return the same raw path set — a gate here would return
+    // None exactly when a module changed, blinding L1 to the edit it must catch.
+    assert!(
+        cached_module_graph_with_runtime(&entry, ImportRuntime::Component).is_none(),
+        "gated accessor must treat the edited graph as stale"
+    );
+    let peeked_stale = peek_cached_module_paths(&entry, ImportRuntime::Component)
+        .expect("peek must ignore the freshness gate");
+    assert_eq!(
+        peeked_fresh, peeked_stale,
+        "peek must return the same module set regardless of freshness"
+    );
+
+    fs::remove_dir_all(&root).ok();
+    clear_module_graph_cache();
 }
 
 static NEXT_TEMP_GRAPH_WORKSPACE_ID: std::sync::atomic::AtomicU64 =

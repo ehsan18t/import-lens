@@ -1,16 +1,20 @@
 import * as vscode from "vscode";
 import type { DaemonManager } from "../daemon/manager.js";
-import type { CacheCleanupResponse, CacheRemoveResponse } from "../ipc/protocol.js";
+import type { CacheRemoveResponse } from "../ipc/protocol.js";
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { Logger } from "../logging/types.js";
 import { analysisRootForFile } from "../workspaceContext.js";
-import { cacheManagerActionItems, cacheShardPickItems } from "./cacheManagerItems.js";
 import {
-  cacheCleanupRequest,
+  type CacheClearScope,
+  cacheManagerActionItems,
+  cacheRemovalToast,
+} from "./cacheManagerItems.js";
+import {
   cacheListRequest,
-  cachePurgeOrphansRequest,
   cacheRemoveAllRequest,
   cacheRemoveCurrentProjectRequest,
+  cacheRemoveOrphansRequest,
+  cacheRemoveRegistryRequest,
   cacheRemoveSelectedRequest,
   cacheStatusRequest,
 } from "./cacheManagerRequests.js";
@@ -51,67 +55,31 @@ export const showCacheManager = async (
 
   const selected = await vscode.window.showQuickPick(cacheManagerActionItems(status), {
     title: "ImportLens Cache",
-    placeHolder: "Choose a cache maintenance action",
+    placeHolder: "Review cache status, then choose what to clear",
   });
 
+  // The status rows are read-only (action "summary"); picking one is a no-op.
   if (!selected || selected.action === "summary") {
     return;
   }
 
-  if (selected.action === "cleanup") {
-    await cleanupCache(daemon, logger, afterMutation);
-    return;
+  switch (selected.action) {
+    case "clearCurrent":
+      await clearCurrentProjectCache(daemon, logger, afterMutation);
+      return;
+    case "clearAllProjects":
+      await clearAllProjectsCache(daemon, logger, afterMutation);
+      return;
+    case "clearOrphans":
+      await clearOrphanedCaches(daemon, logger, afterMutation);
+      return;
+    case "clearRegistry":
+      await clearRegistryCache(daemon, logger, afterMutation);
+      return;
+    case "clearEverything":
+      await clearAllCaches(daemon, logger, afterMutation);
+      return;
   }
-
-  if (selected.action === "clearCurrent") {
-    await clearCurrentProjectCache(daemon, logger, afterMutation);
-    return;
-  }
-
-  if (selected.action === "clearAll") {
-    await clearAllCaches(daemon, logger, afterMutation);
-    return;
-  }
-
-  if (selected.action === "purgeOrphans") {
-    await purgeOrphanCaches(daemon, logger, afterMutation);
-    return;
-  }
-
-  await inspectProjectCaches(daemon, logger, afterMutation);
-};
-
-export const purgeOrphanCaches = async (
-  daemon: DaemonManager,
-  logger: Pick<Logger, "info" | "warn">,
-  afterMutation?: () => void,
-): Promise<void> => {
-  const workspaceRoot = await requireWorkspaceRoot();
-
-  if (!workspaceRoot || !(await ensureDaemonReady(daemon, workspaceRoot))) {
-    return;
-  }
-
-  const confirmed = await vscode.window.showWarningMessage(
-    "Purge orphan ImportLens caches for deleted projects and uninstalled packages?",
-    { modal: true },
-    "Purge Orphans",
-  );
-
-  if (confirmed !== "Purge Orphans") {
-    return;
-  }
-
-  const response = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Purging orphan caches",
-    },
-    () => daemon.removeCache(cachePurgeOrphansRequest(nextIpcRequestId())),
-  );
-
-  await reportRemoveResponse(logger, "orphan", response);
-  notifyAfterMutation(response, afterMutation);
 };
 
 export const clearCurrentProjectCache = async (
@@ -143,10 +111,148 @@ export const clearCurrentProjectCache = async (
     () => daemon.removeCache(cacheRemoveCurrentProjectRequest(nextIpcRequestId(), workspaceRoot)),
   );
 
-  await reportRemoveResponse(logger, "current project", response);
-  notifyAfterMutation(response, afterMutation);
+  await reportRemoveResponse(logger, "currentProject", response);
+  notifyAfterRemove("currentProject", response, afterMutation);
 };
 
+// "Clear all projects": there is no dedicated daemon scope that clears every
+// project shard while keeping the shared registry, so enumerate the shards and
+// remove them via the Selected scope. This leaves the npm-hint registry and the
+// shared resolvers intact — that is what separates it from "Clear everything".
+const clearAllProjectsCache = async (
+  daemon: DaemonManager,
+  logger: Pick<Logger, "info" | "warn">,
+  afterMutation?: () => void,
+): Promise<void> => {
+  const workspaceRoot = await requireWorkspaceRoot();
+
+  if (!workspaceRoot || !(await ensureDaemonReady(daemon, workspaceRoot))) {
+    return;
+  }
+
+  const list = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "ImportLens: Loading project caches",
+    },
+    () => daemon.listCache(cacheListRequest(nextIpcRequestId())),
+  );
+
+  if (!list) {
+    await vscode.window.showWarningMessage("ImportLens project cache list is unavailable.");
+    return;
+  }
+
+  if (list.error) {
+    logger.warn(`Cache list failed: ${list.error}`);
+    await vscode.window.showWarningMessage(`ImportLens cache list failed: ${list.error}`);
+    return;
+  }
+
+  const shardIds = list.shards.map((shard) => shard.shard_id);
+
+  if (shardIds.length === 0) {
+    await vscode.window.showInformationMessage("ImportLens has no project caches to clear.");
+    return;
+  }
+
+  const confirmed = await vscode.window.showWarningMessage(
+    `Clear ImportLens bundle caches for all ${shardIds.length} project${
+      shardIds.length === 1 ? "" : "s"
+    }? Registry metadata is kept.`,
+    { modal: true },
+    "Clear All Projects",
+  );
+
+  if (confirmed !== "Clear All Projects") {
+    return;
+  }
+
+  const response = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "ImportLens: Clearing all project caches",
+    },
+    () => daemon.removeCache(cacheRemoveSelectedRequest(nextIpcRequestId(), shardIds)),
+  );
+
+  await reportRemoveResponse(logger, "allProjects", response);
+  notifyAfterRemove("allProjects", response, afterMutation);
+};
+
+// "Remove orphaned caches" maps to the daemon Orphans scope: remove shards whose
+// project root was moved/deleted (drive-safe — an offline drive keeps its shard)
+// and scrub stale/uninstalled entries from surviving shards. Complements the
+// automatic maintenance-tick sweep with an on-demand, entry-inclusive pass (RB-17).
+const clearOrphanedCaches = async (
+  daemon: DaemonManager,
+  logger: Pick<Logger, "info" | "warn">,
+  afterMutation?: () => void,
+): Promise<void> => {
+  const workspaceRoot = await requireWorkspaceRoot();
+
+  if (!workspaceRoot || !(await ensureDaemonReady(daemon, workspaceRoot))) {
+    return;
+  }
+
+  const confirmed = await vscode.window.showWarningMessage(
+    "Remove ImportLens caches for moved or deleted projects? Caches for projects that still exist are kept.",
+    { modal: true },
+    "Remove Orphaned",
+  );
+
+  if (confirmed !== "Remove Orphaned") {
+    return;
+  }
+
+  const response = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "ImportLens: Removing orphaned caches",
+    },
+    () => daemon.removeCache(cacheRemoveOrphansRequest(nextIpcRequestId())),
+  );
+
+  await reportRemoveResponse(logger, "orphans", response);
+  notifyAfterRemove("orphans", response, afterMutation);
+};
+
+const clearRegistryCache = async (
+  daemon: DaemonManager,
+  logger: Pick<Logger, "info" | "warn">,
+  afterMutation?: () => void,
+): Promise<void> => {
+  const workspaceRoot = await requireWorkspaceRoot();
+
+  if (!workspaceRoot || !(await ensureDaemonReady(daemon, workspaceRoot))) {
+    return;
+  }
+
+  const confirmed = await vscode.window.showWarningMessage(
+    "Clear ImportLens registry metadata (npm hints)?",
+    { modal: true },
+    "Clear Registry",
+  );
+
+  if (confirmed !== "Clear Registry") {
+    return;
+  }
+
+  const response = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "ImportLens: Clearing registry metadata",
+    },
+    () => daemon.removeCache(cacheRemoveRegistryRequest(nextIpcRequestId())),
+  );
+
+  await reportRemoveResponse(logger, "registry", response);
+  notifyAfterRemove("registry", response, afterMutation);
+};
+
+// "Clear everything" maps to the daemon All scope: every project shard plus the
+// shared registry, resolvers, and derived L1/graph caches, and it bumps the
+// cache generation.
 export const clearAllCaches = async (
   daemon: DaemonManager,
   logger: Pick<Logger, "info" | "warn">,
@@ -159,123 +265,25 @@ export const clearAllCaches = async (
   }
 
   const confirmed = await vscode.window.showWarningMessage(
-    "Clear all ImportLens project caches?",
+    "Clear everything? This removes all ImportLens project caches, registry metadata, and derived state.",
     { modal: true },
-    "Clear All",
+    "Clear Everything",
   );
 
-  if (confirmed !== "Clear All") {
+  if (confirmed !== "Clear Everything") {
     return;
   }
 
   const response = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Clearing all project caches",
+      title: "ImportLens: Clearing all caches",
     },
     () => daemon.removeCache(cacheRemoveAllRequest(nextIpcRequestId())),
   );
 
-  await reportRemoveResponse(logger, "all projects", response);
-  notifyAfterMutation(response, afterMutation);
-};
-
-const cleanupCache = async (
-  daemon: DaemonManager,
-  logger: Pick<Logger, "info" | "warn">,
-  afterMutation?: () => void,
-): Promise<void> => {
-  const workspaceRoot = await requireWorkspaceRoot();
-
-  if (!workspaceRoot || !(await ensureDaemonReady(daemon, workspaceRoot))) {
-    return;
-  }
-
-  const response = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Cleaning up project caches",
-    },
-    () => daemon.cleanupCache(cacheCleanupRequest(nextIpcRequestId())),
-  );
-
-  await reportCleanupResponse(logger, response);
-  notifyAfterMutation(response, afterMutation);
-};
-
-const inspectProjectCaches = async (
-  daemon: DaemonManager,
-  logger: Pick<Logger, "info" | "warn">,
-  afterMutation?: () => void,
-): Promise<void> => {
-  const workspaceRoot = await requireWorkspaceRoot();
-
-  if (!workspaceRoot || !(await ensureDaemonReady(daemon, workspaceRoot))) {
-    return;
-  }
-
-  const response = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Loading project caches",
-    },
-    () => daemon.listCache(cacheListRequest(nextIpcRequestId())),
-  );
-
-  if (!response) {
-    await vscode.window.showWarningMessage("ImportLens project cache list is unavailable.");
-    return;
-  }
-
-  if (response.error) {
-    logger.warn(`Cache list failed: ${response.error}`);
-    await vscode.window.showWarningMessage(`ImportLens cache list failed: ${response.error}`);
-    return;
-  }
-
-  const items = cacheShardPickItems(response);
-
-  if (items.length === 0) {
-    await vscode.window.showInformationMessage("ImportLens has no project caches yet.");
-    return;
-  }
-
-  const selected = await vscode.window.showQuickPick(items, {
-    canPickMany: true,
-    title: "ImportLens Project Caches",
-    placeHolder: "Select project caches to remove",
-  });
-
-  if (!selected || selected.length === 0) {
-    return;
-  }
-
-  const confirmed = await vscode.window.showWarningMessage(
-    `Remove ${selected.length} selected ImportLens project cache${selected.length === 1 ? "" : "s"}?`,
-    { modal: true },
-    "Remove Selected",
-  );
-
-  if (confirmed !== "Remove Selected") {
-    return;
-  }
-
-  const removeResponse = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Removing selected project caches",
-    },
-    () =>
-      daemon.removeCache(
-        cacheRemoveSelectedRequest(
-          nextIpcRequestId(),
-          selected.map((item) => item.shardId),
-        ),
-      ),
-  );
-
-  await reportRemoveResponse(logger, "selected projects", removeResponse);
-  notifyAfterMutation(removeResponse, afterMutation);
+  await reportRemoveResponse(logger, "everything", response);
+  notifyAfterRemove("everything", response, afterMutation);
 };
 
 const requireWorkspaceRoot = async (): Promise<string | null> => {
@@ -313,40 +321,9 @@ const ensureDaemonReady = async (
   return false;
 };
 
-const reportCleanupResponse = async (
-  logger: Pick<Logger, "info" | "warn">,
-  response: CacheCleanupResponse | null,
-): Promise<void> => {
-  if (!response) {
-    await vscode.window.showWarningMessage("ImportLens cache cleanup did not return a result.");
-    return;
-  }
-
-  if (response.error) {
-    logger.warn(`Cache cleanup failed: ${response.error}`);
-    await vscode.window.showWarningMessage(`ImportLens cache cleanup failed: ${response.error}`);
-    return;
-  }
-
-  if (response.failed.length > 0) {
-    logger.warn(
-      `Cache cleanup removed ${response.removed.length} cache(s), failed ${response.failed.length}.`,
-    );
-    await vscode.window.showWarningMessage(
-      `ImportLens cache cleanup removed ${response.removed.length} cache(s), failed ${response.failed.length}.`,
-    );
-    return;
-  }
-
-  logger.info(`Cache cleanup removed ${response.removed.length} project cache(s).`);
-  await vscode.window.showInformationMessage(
-    `ImportLens cache cleanup removed ${response.removed.length} project cache(s).`,
-  );
-};
-
 const reportRemoveResponse = async (
   logger: Pick<Logger, "info" | "warn">,
-  scopeLabel: string,
+  scope: CacheClearScope,
   response: CacheRemoveResponse | null,
 ): Promise<void> => {
   if (!response) {
@@ -355,32 +332,39 @@ const reportRemoveResponse = async (
   }
 
   if (response.error) {
-    logger.warn(`Cache removal failed for ${scopeLabel}: ${response.error}`);
+    logger.warn(`Cache removal failed for ${scope}: ${response.error}`);
     await vscode.window.showWarningMessage(`ImportLens cache removal failed: ${response.error}`);
     return;
   }
 
-  if (response.failed.length > 0) {
-    logger.warn(
-      `Cache removal for ${scopeLabel} removed ${response.removed.length} cache(s), failed ${response.failed.length}.`,
-    );
-    await vscode.window.showWarningMessage(
-      `ImportLens removed ${response.removed.length} cache(s), failed ${response.failed.length}.`,
-    );
+  const removed = response.removed.length;
+  const failed = response.failed.length;
+  const message = cacheRemovalToast(scope, removed, failed);
+
+  if (failed > 0) {
+    logger.warn(message);
+    await vscode.window.showWarningMessage(message);
     return;
   }
 
-  logger.info(`Removed ${response.removed.length} ImportLens cache(s) for ${scopeLabel}.`);
-  await vscode.window.showInformationMessage(
-    `Removed ${response.removed.length} ImportLens cache(s) for ${scopeLabel}.`,
-  );
+  logger.info(message);
+  await vscode.window.showInformationMessage(message);
 };
 
-const notifyAfterMutation = (
-  response: CacheCleanupResponse | CacheRemoveResponse | null,
+const notifyAfterRemove = (
+  scope: CacheClearScope,
+  response: CacheRemoveResponse | null,
   afterMutation?: () => void,
 ): void => {
-  if (response && !response.error && response.removed.length > 0) {
+  if (!response || response.error) {
+    return;
+  }
+  // Registry and "everything" mutate shared/derived state (registry hints,
+  // resolvers, L1/graph, generation bump) even when they remove zero shards, so
+  // a refresh is always warranted; the shard-only scopes refresh only when they
+  // actually removed a shard.
+  const mutated = scope === "registry" || scope === "everything" || response.removed.length > 0;
+  if (mutated) {
     afterMutation?.();
   }
 };

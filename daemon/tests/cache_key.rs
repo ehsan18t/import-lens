@@ -28,13 +28,13 @@ fn resolved(root: &Path) -> ResolvedPackage {
 }
 
 #[test]
-fn cache_key_v3_includes_analyzer_revision() {
+fn cache_key_includes_analyzer_revision() {
     let key = cache_key_for_resolved_import(
         &request(ImportKind::Named, &["used"], ImportRuntime::Component),
         &resolved(&PathBuf::from("C:/workspace-a")),
     );
 
-    let identity = decode_cache_identity(&key).expect("v3 key should decode");
+    let identity = decode_cache_identity(&key).expect("key should decode");
     assert!(
         identity.analyzer_version.ends_with("+graph2"),
         "analyzer version should invalidate graph2 accuracy changes: {identity:?}",
@@ -42,7 +42,7 @@ fn cache_key_v3_includes_analyzer_revision() {
 }
 
 #[test]
-fn cache_key_v3_distinguishes_named_dynamic_from_dynamic_import() {
+fn cache_key_distinguishes_named_dynamic_from_dynamic_import() {
     let root = PathBuf::from("C:/workspace-a");
     let resolved = resolved(&root);
     let named_dynamic = cache_key_for_resolved_import(
@@ -54,17 +54,17 @@ fn cache_key_v3_distinguishes_named_dynamic_from_dynamic_import() {
         &resolved,
     );
 
-    assert!(named_dynamic.starts_with("v3:"));
-    assert!(dynamic.starts_with("v3:"));
+    assert!(named_dynamic.starts_with("v4:"));
+    assert!(dynamic.starts_with("v4:"));
     assert_ne!(named_dynamic, dynamic);
 
-    let identity = decode_cache_identity(&named_dynamic).expect("v3 key should decode");
+    let identity = decode_cache_identity(&named_dynamic).expect("key should decode");
     assert_eq!(identity.import_kind, ImportKind::Named);
     assert_eq!(identity.named_exports, vec!["dynamic".to_owned()]);
 }
 
 #[test]
-fn cache_key_v3_separates_workspaces_for_same_package_version() {
+fn cache_key_separates_workspaces_for_same_package_version() {
     let request = request(ImportKind::Namespace, &[], ImportRuntime::Component);
     let left = cache_key_for_resolved_import(&request, &resolved(&PathBuf::from("C:/workspace-a")));
     let right =
@@ -92,7 +92,7 @@ fn cache_key_matches_any_package_decodes_once_and_tests_set_membership() {
         &HashSet::from(["other".to_owned(), "third".to_owned()])
     ));
 
-    // Legacy (non-v3) keys fall back to plaintext prefix matching.
+    // Legacy (non-versioned) keys fall back to plaintext prefix matching.
     assert!(cache_key_matches_any_package(
         "react@18.3.1::default",
         &HashSet::from(["react".to_owned()])
@@ -104,7 +104,7 @@ fn cache_key_matches_any_package_decodes_once_and_tests_set_membership() {
 }
 
 #[test]
-fn cache_key_v3_separates_runtime_profiles() {
+fn cache_key_separates_runtime_profiles() {
     let root = PathBuf::from("C:/workspace-a");
     let resolved = resolved(&root);
     let component = cache_key_for_resolved_import(
@@ -117,4 +117,13 @@ fn cache_key_v3_separates_runtime_profiles() {
     );
 
     assert_ne!(component, server);
+}
+
+#[test]
+fn path_is_definitely_gone_only_on_notfound() {
+    use import_lens_daemon::cache::key::path_is_definitely_gone;
+    let missing = std::env::temp_dir().join("il-surely-absent-xyz-123");
+    let _ = std::fs::remove_file(&missing); // ensure absent
+    assert!(path_is_definitely_gone(&missing)); // NotFound → gone
+    assert!(!path_is_definitely_gone(std::env::temp_dir().as_path())); // exists → keep
 }

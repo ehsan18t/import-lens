@@ -1,12 +1,12 @@
-import type { CacheListResponse, CacheShardInfo, CacheStatusResponse } from "../ipc/protocol.js";
+import type { CacheStatusResponse } from "../ipc/protocol.js";
 
 export type CacheManagerAction =
   | "summary"
-  | "cleanup"
   | "clearCurrent"
-  | "clearAll"
-  | "purgeOrphans"
-  | "inspect";
+  | "clearAllProjects"
+  | "clearOrphans"
+  | "clearRegistry"
+  | "clearEverything";
 
 export interface CacheManagerActionItem {
   label: string;
@@ -15,12 +15,19 @@ export interface CacheManagerActionItem {
   action: CacheManagerAction;
 }
 
-export interface CacheShardPickItem {
-  label: string;
-  description: string;
-  detail: string;
-  shardId: string;
-}
+/**
+ * The four scoped clears, mapped to their real daemon `CacheRemoveScope`:
+ * `currentProject` -> CurrentProject, `allProjects` -> Selected (every shard id;
+ * no dedicated all-shards scope exists, so registry + resolvers survive),
+ * `registry` -> Registry, `everything` -> All (shards + registry + resolvers +
+ * derived caches). Used to keep the success toast honest per scope.
+ */
+export type CacheClearScope =
+  | "currentProject"
+  | "allProjects"
+  | "orphans"
+  | "registry"
+  | "everything";
 
 export const formatCacheBytes = (bytes: number): string => {
   if (bytes < 1024) {
@@ -42,55 +49,140 @@ export const formatCacheBytes = (bytes: number): string => {
   return `${(megabytes / 1024).toFixed(1)} GB`;
 };
 
-export const cacheManagerActionItems = (status: CacheStatusResponse): CacheManagerActionItem[] => [
-  {
-    label: "ImportLens cache",
-    description: `${formatCacheBytes(status.total_size_bytes)} across ${status.project_count} projects - limit ${status.max_size_mb} MB - ${status.max_age_days} days`,
-    detail: status.current_project
-      ? `Current project: ${formatCacheBytes(status.current_project.size_bytes)}`
-      : "No cache has been created for the current project yet.",
-    action: "summary",
-  },
-  {
-    label: "$(sync) Run Cleanup Now",
-    description: "Remove expired and oversized project cache shards",
-    action: "cleanup",
-  },
-  {
-    label: "$(trash) Clear Current Project Cache",
-    description: status.current_project
-      ? formatCacheBytes(status.current_project.size_bytes)
-      : "No current project cache",
-    action: "clearCurrent",
-  },
-  {
-    label: "$(trash) Clear All ImportLens Cache",
-    description: formatCacheBytes(status.total_size_bytes),
-    action: "clearAll",
-  },
-  {
-    label: "$(clear-all) Purge Orphan Cache",
-    description: "Remove caches for deleted projects and uninstalled packages",
-    detail: "Keeps caches whose files still exist; drops only genuinely orphaned entries.",
-    action: "purgeOrphans",
-  },
-  {
-    label: "$(folder-opened) Inspect Project Caches",
-    description: `${status.project_count} project${status.project_count === 1 ? "" : "s"}`,
-    action: "inspect",
-  },
-];
+const entriesLabel = (count: number): string => `${count} entr${count === 1 ? "y" : "ies"}`;
 
-export const cacheShardPickItems = (response: CacheListResponse): CacheShardPickItem[] =>
-  response.shards
-    .slice()
-    .sort(compareCacheShards)
-    .map((shard) => ({
-      label: shard.project_root,
-      description: formatCacheBytes(shard.size_bytes),
-      detail: shard.cache_path,
-      shardId: shard.shard_id,
-    }));
+const projectsLabel = (count: number): string => `${count} project${count === 1 ? "" : "s"}`;
 
-const compareCacheShards = (left: CacheShardInfo, right: CacheShardInfo): number =>
-  right.size_bytes - left.size_bytes || left.project_root.localeCompare(right.project_root);
+// Coarse relative age for the read-only "last used" row. `now` is injected so the
+// rendering stays deterministic in tests.
+const formatLastUsedAge = (millis: number, now: number): string => {
+  const deltaMs = Math.max(0, now - millis);
+  const days = Math.floor(deltaMs / 86_400_000);
+  if (days >= 1) {
+    return `${days}d ago`;
+  }
+  const hours = Math.floor(deltaMs / 3_600_000);
+  if (hours >= 1) {
+    return `${hours}h ago`;
+  }
+  const minutes = Math.floor(deltaMs / 60_000);
+  if (minutes >= 1) {
+    return `${minutes}m ago`;
+  }
+  return "just now";
+};
+
+/**
+ * Builds the Manage-Cache quick-pick: two read-only status rows (E-status
+ * observability — total vs budget, headroom, registry size, per-project
+ * size/entry-count/last-used) followed by the four scoped clear actions (§8).
+ */
+export const cacheManagerActionItems = (
+  status: CacheStatusResponse,
+  now: number = Date.now(),
+): CacheManagerActionItem[] => {
+  // Prefer the E-status fields; fall back so a response from a daemon that
+  // predates them still renders (`?? ...`).
+  const totalBytes = status.total_bytes ?? status.total_size_bytes;
+  const budgetBytes = status.budget_bytes ?? status.max_size_mb * 1024 * 1024;
+  const registryBytes = status.registry_size_bytes ?? 0;
+  const headroomBytes = Math.max(0, budgetBytes - totalBytes);
+  const projects = projectsLabel(status.project_count);
+
+  const current = status.current_project;
+  const currentDescription = current
+    ? `${formatCacheBytes(current.size_bytes)} - ${entriesLabel(current.entry_count ?? 0)}`
+    : "Not cached yet";
+  const currentDetail = current
+    ? current.last_used_millis != null
+      ? `Last used ${formatLastUsedAge(current.last_used_millis, now)}`
+      : "Never used"
+    : undefined;
+
+  return [
+    {
+      label: "$(database) ImportLens cache",
+      description: `${formatCacheBytes(totalBytes)} / ${formatCacheBytes(budgetBytes)}`,
+      detail: `${formatCacheBytes(headroomBytes)} free - ${projects} - registry ${formatCacheBytes(registryBytes)}`,
+      action: "summary",
+    },
+    {
+      label: "$(folder) Current project",
+      description: currentDescription,
+      detail: currentDetail,
+      action: "summary",
+    },
+    {
+      label: "$(trash) Clear current project",
+      description: current ? formatCacheBytes(current.size_bytes) : "No cache yet",
+      action: "clearCurrent",
+    },
+    {
+      label: "$(trash) Clear all projects",
+      description: `${projects} - bundle caches (keeps registry)`,
+      action: "clearAllProjects",
+    },
+    {
+      label: "$(history) Remove orphaned caches",
+      description: "Reclaim caches for moved or deleted projects",
+      action: "clearOrphans",
+    },
+    {
+      label: "$(trash) Clear registry metadata",
+      description: `npm hints - ${formatCacheBytes(registryBytes)}`,
+      action: "clearRegistry",
+    },
+    {
+      label: "$(clear-all) Clear everything",
+      description: "All project caches + registry + derived state",
+      action: "clearEverything",
+    },
+  ];
+};
+
+/**
+ * Honest success/partial-failure copy for a scoped clear (X-23/X-24): counts
+ * come from `CacheRemoveResponse`, the registry-only scope never claims shard
+ * removals, and "everything" states everything it cleared — no overclaiming.
+ */
+export const cacheRemovalToast = (
+  scope: CacheClearScope,
+  removed: number,
+  failed: number,
+): string => {
+  if (scope === "registry") {
+    // Registry clear returns no shard-level results; report exactly what it did.
+    return "Cleared ImportLens registry metadata (npm hints).";
+  }
+
+  const caches = (count: number): string => `${count} ImportLens cache${count === 1 ? "" : "s"}`;
+
+  if (scope === "orphans") {
+    if (failed > 0) {
+      return `Reclaimed ${caches(removed)} for moved or deleted projects; ${failed} could not be removed.`;
+    }
+    return removed > 0
+      ? `Reclaimed ${caches(removed)} for moved or deleted projects.`
+      : "No orphaned ImportLens caches to reclaim.";
+  }
+
+  if (failed > 0) {
+    const removedClause =
+      scope === "currentProject"
+        ? `Removed ${caches(removed)} for the current project`
+        : scope === "allProjects"
+          ? `Removed ${caches(removed)} across all projects`
+          : `Removed ${caches(removed)} plus registry metadata and derived caches`;
+    return `${removedClause}; ${failed} could not be removed.`;
+  }
+
+  if (scope === "currentProject") {
+    return removed > 0
+      ? "Cleared the current project's ImportLens cache."
+      : "No ImportLens cache to clear for the current project.";
+  }
+  if (scope === "allProjects") {
+    return `Cleared ${caches(removed)} across all projects.`;
+  }
+  return `Cleared everything: ${caches(removed)} plus registry metadata and derived caches.`;
+};

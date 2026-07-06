@@ -166,13 +166,13 @@
           "type": "number",
           "default": 512,
           "minimum": 64,
-          "description": "Maximum disk space in megabytes used by ImportLens project caches before least-recently-used cleanup runs."
+          "description": "Global disk-byte budget in megabytes for ImportLens project caches. When the total across all projects exceeds this, the least-recently-used cache entries are evicted (entry-granular, across projects) down to ~90% of the budget."
         },
-        "importLens.cacheMaxAgeDays": {
+        "importLens.registryCacheMaxSizeMB": {
           "type": "number",
-          "default": 30,
+          "default": 32,
           "minimum": 1,
-          "description": "Maximum age in days for inactive ImportLens project caches before automatic cleanup removes them."
+          "description": "Byte budget in megabytes for the shared npm registry metadata store. When the store grows past this, the oldest (least-recently-updated) entries are evicted on the periodic maintenance pass, alongside a 30-day retention prune of stale entries."
         },
         "importLens.enableRegistryHints": {
           "type": "boolean",
