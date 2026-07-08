@@ -1039,6 +1039,35 @@ impl ImportLensService {
         let sections = package_json_dependency_sections(&request.source);
         let registry_hint_mode = effective_registry_hint_mode(&request);
         let now_ms = crate::time::unix_millis_now();
+        let entries = package_json_dependency_entries(&request.source);
+
+        if let Some(emit_partial) = emit_partial.as_ref()
+            && !entries.is_empty()
+        {
+            let loading_states = entries
+                .iter()
+                .map(|entry| PackageJsonDependencyAnalysisItem {
+                    name: entry.name.clone(),
+                    section: entry.section.clone(),
+                    entry: entry.clone(),
+                    status: ImportAnalysisStatus::Loading,
+                    installed_version: None,
+                    registry_hint: None,
+                    message: None,
+                    result: None,
+                })
+                .collect::<Vec<_>>();
+            emit_partial(AnalyzePackageJsonResponse {
+                version: request.version,
+                request_id: request.request_id,
+                sections: sections.clone(),
+                states: loading_states,
+                indexes: Some((0..entries.len()).collect()),
+                error: None,
+                diagnostics: Vec::new(),
+            });
+        }
+
         // Resolve each dependency's installed version (an ancestor walk plus a
         // package.json read) in parallel; into_par_iter preserves order, so the
         // resulting states and import_requests still line up with streaming
@@ -1047,7 +1076,7 @@ impl ImportLensService {
         let resolved: Vec<(
             PackageJsonDependencyAnalysisItem,
             Option<PreparedDependency>,
-        )> = package_json_dependency_entries(&request.source)
+        )> = entries
             .into_par_iter()
             .map(|entry| {
                 // Resolve the package once here and carry the ResolvedPackage

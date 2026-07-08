@@ -90,6 +90,66 @@ test("mergePackageJsonAnalysisPartial preserves newer registry hints while apply
   assert.equal(merged[0]?.registryHint?.latestVersion, "19.0.0");
 });
 
+test("mergePackageJsonAnalysisPartial refines names-only package.json loading rows", () => {
+  const namesOnly: AnalyzePackageJsonResponse = {
+    version: 7,
+    request_id: 10,
+    sections: [],
+    indexes: [0],
+    states: [
+      {
+        ...stateFor("react", "loading"),
+        installedVersion: undefined,
+      },
+    ],
+    error: null,
+    diagnostics: [],
+  };
+  const resolved: AnalyzePackageJsonResponse = {
+    version: 7,
+    request_id: 10,
+    sections: [],
+    indexes: [0],
+    states: [
+      {
+        ...stateFor("react", "loading"),
+        registryHint: {
+          latestVersion: "19.0.0",
+          isLatest: false,
+          fetchedAt: 100,
+        },
+      },
+    ],
+    error: null,
+    diagnostics: [],
+  };
+  const ready: AnalyzePackageJsonResponse = {
+    version: 7,
+    request_id: 10,
+    sections: [],
+    indexes: [0],
+    states: [
+      {
+        ...stateFor("react", "ready"),
+        result: resultFor("react"),
+      },
+    ],
+    error: null,
+    diagnostics: [],
+  };
+
+  const loading = mergePackageJsonAnalysisPartial([], namesOnly);
+  const withVersion = mergePackageJsonAnalysisPartial(loading, resolved);
+  const done = mergePackageJsonAnalysisPartial(withVersion, ready);
+
+  assert.equal(loading[0]?.status, "loading");
+  assert.equal(loading[0]?.installedVersion, undefined);
+  assert.equal(withVersion[0]?.installedVersion, "1.0.0");
+  assert.equal(done[0]?.status, "ready");
+  assert.equal(done[0]?.result?.specifier, "react");
+  assert.equal(done[0]?.registryHint?.latestVersion, "19.0.0");
+});
+
 test("mergePackageJsonAnalysisPartial ignores stale indexes and mismatched package names", () => {
   const current = [stateFor("react", "loading")];
   const partial: AnalyzePackageJsonResponse = {

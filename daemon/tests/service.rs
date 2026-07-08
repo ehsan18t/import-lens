@@ -1219,20 +1219,31 @@ fn service_streams_package_json_loading_states_before_ready_results() {
     assert_eq!(initial.request_id, 36);
     assert_eq!(initial.indexes, Some(vec![0, 1]));
     assert_eq!(initial.states.len(), 2);
+    assert!(initial.states.iter().all(|state| {
+        state.status == ImportAnalysisStatus::Loading && state.installed_version.is_none()
+    }));
+
+    let resolved_loading = partials
+        .iter()
+        .skip(1)
+        .find(|partial| partial.indexes.as_deref() == Some(&[0, 1]))
+        .expect("resolved loading package.json partial should be emitted");
     assert!(
-        initial
+        resolved_loading
             .states
             .iter()
-            .any(|state| state.name == "tiny-lib" && state.status == ImportAnalysisStatus::Loading),
-        "{initial:?}",
+            .any(|state| state.name == "tiny-lib"
+                && state.status == ImportAnalysisStatus::Loading
+                && state.installed_version.as_deref() == Some("1.0.0")),
+        "{resolved_loading:?}",
     );
     assert!(
-        initial
+        resolved_loading
             .states
             .iter()
             .any(|state| state.name == "missing-lib"
                 && state.status == ImportAnalysisStatus::Missing),
-        "{initial:?}",
+        "{resolved_loading:?}",
     );
     let tiny_index = initial
         .states
