@@ -5,13 +5,13 @@ use crate::{
         protocol::{
             AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
             AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-            CacheListRequest, CacheListResponse, CacheRemoveRequest, CacheRemoveResponse,
-            CacheRemoveScope, CacheStatusRequest, CacheStatusResponse, ClientMessage,
-            CompleteImportMembersRequest, CompleteImportMembersResponse, FileSizeDocumentRequest,
-            FileSizeDocumentResponse, FreshnessKind, ImportDiagnostic, PROTOCOL_VERSION,
-            RefreshRegistryHintsResponse, RefreshedResultsResponse, RegistryHintResult,
-            WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
-            is_supported_protocol_version,
+            BatchResponse, CacheListRequest, CacheListResponse, CacheRemoveRequest,
+            CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest, CacheStatusResponse,
+            ClientMessage, CompleteImportMembersRequest, CompleteImportMembersResponse,
+            FileSizeDocumentRequest, FileSizeDocumentResponse, FreshnessKind, ImportDiagnostic,
+            PROTOCOL_VERSION, RefreshRegistryHintsResponse, RefreshedResultsResponse,
+            RegistryHintResult, WorkspaceReportRequest, WorkspaceReportResponse,
+            WorkspaceReportSummary, is_supported_protocol_version,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
@@ -171,6 +171,8 @@ enum ServerOutboundMessage {
     RefreshRegistryHints(RefreshRegistryHintsResponse),
     WorkspaceReport(WorkspaceReportResponse),
     RefreshedResults(RefreshedResultsResponse),
+    Batch(BatchResponse),
+    AnalyzePackageJson(AnalyzePackageJsonResponse),
 }
 
 async fn send_outbound_message<S>(
@@ -188,6 +190,10 @@ where
             framed.send(payload_bytes(&response)?).await?
         }
         ServerOutboundMessage::RefreshedResults(response) => {
+            framed.send(payload_bytes(&response)?).await?
+        }
+        ServerOutboundMessage::Batch(response) => framed.send(payload_bytes(&response)?).await?,
+        ServerOutboundMessage::AnalyzePackageJson(response) => {
             framed.send(payload_bytes(&response)?).await?
         }
     }
@@ -283,10 +289,16 @@ where
     let mut swr_refresh_lifecycle = SwrRefreshLifecycle::new();
     let lifecycle_storage_path = storage_path;
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerOutboundMessage>();
+    let mut active_streams: Vec<JoinHandle<()>> = Vec::new();
 
     macro_rules! send_message {
         ($message:expr) => {
-            framed.send(payload_bytes(&$message)?).await?;
+            let bytes = payload_bytes(&$message)?;
+            if let Err(error) = framed.send(bytes).await {
+                prefetcher.cancel();
+                wait_for_active_streams(&mut active_streams).await;
+                return Err(Box::new(error));
+            }
         };
     }
 
@@ -294,11 +306,25 @@ where
         let payload = tokio::select! {
             outbound = outbound_rx.recv() => {
                 if let Some(message) = outbound {
-                    send_outbound_message(&mut framed, message).await?;
+                    let outbound_result = send_outbound_message(&mut framed, message)
+                        .await
+                        .map_err(|error| error.to_string());
+                    if let Err(message) = outbound_result {
+                        prefetcher.cancel();
+                        wait_for_active_streams(&mut active_streams).await;
+                        return Err(Box::new(std::io::Error::other(message)));
+                    }
                 }
                 continue;
             }
-            payload = framed.next() => payload.transpose()?,
+            payload = framed.next() => match payload.transpose() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    prefetcher.cancel();
+                    wait_for_active_streams(&mut active_streams).await;
+                    return Err(Box::new(error));
+                }
+            },
             _ = tokio::time::sleep(LIFECYCLE_CHECK_INTERVAL) => {
                 // Byte-budget maintenance runs on its own interval task (spawned
                 // at Hello); this arm only checks for an idle recycle.
@@ -307,13 +333,18 @@ where
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
-                ) {
+                    &mut active_streams,
+                )
+                .await
+                {
                     return Ok(());
                 }
                 continue;
             }
         };
         let Some(payload) = payload else {
+            prefetcher.cancel();
+            wait_for_active_streams(&mut active_streams).await;
             break;
         };
 
@@ -422,7 +453,10 @@ where
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
-                ) {
+                    &mut active_streams,
+                )
+                .await
+                {
                     return Ok(());
                 }
             }
@@ -432,22 +466,23 @@ where
                 let svc = std::sync::Arc::clone(&service);
                 if request.version >= 2 && request.streaming {
                     let request_for_error = request.clone();
-                    let (partial_tx, mut partial_rx) = mpsc::unbounded_channel();
+                    let (partial_tx, partial_rx) = mpsc::unbounded_channel();
                     let response_handle = tokio::task::spawn_blocking(move || {
                         svc.handle_batch_streaming(request, move |partial| {
                             let _ = partial_tx.send(partial);
                         })
                     });
-                    while let Some(response) = partial_rx.recv().await {
-                        send_message!(response);
-                    }
-                    let response = response_from_join(
-                        response_handle,
-                        &request_for_error,
-                        protocol_error_batch_response,
-                    )
-                    .await;
-                    send_message!(response);
+                    track_streaming_forwarder(
+                        &mut active_streams,
+                        spawn_streaming_forwarder(
+                            &outbound_tx,
+                            partial_rx,
+                            response_handle,
+                            request_for_error,
+                            protocol_error_batch_response,
+                            ServerOutboundMessage::Batch,
+                        ),
+                    );
                 } else {
                     let request_for_error = request.clone();
                     let response_handle =
@@ -466,7 +501,10 @@ where
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
-                ) {
+                    &mut active_streams,
+                )
+                .await
+                {
                     return Ok(());
                 }
             }
@@ -509,22 +547,23 @@ where
                 let svc = std::sync::Arc::clone(&service);
                 if request.version >= 2 && request.streaming {
                     let request_for_error = request.clone();
-                    let (partial_tx, mut partial_rx) = mpsc::unbounded_channel();
+                    let (partial_tx, partial_rx) = mpsc::unbounded_channel();
                     let response_handle = tokio::task::spawn_blocking(move || {
                         svc.handle_analyze_package_json_streaming(request, move |partial| {
                             let _ = partial_tx.send(partial);
                         })
                     });
-                    while let Some(response) = partial_rx.recv().await {
-                        send_message!(response);
-                    }
-                    let response = response_from_join(
-                        response_handle,
-                        &request_for_error,
-                        protocol_error_analyze_package_json_response,
-                    )
-                    .await;
-                    send_message!(response);
+                    track_streaming_forwarder(
+                        &mut active_streams,
+                        spawn_streaming_forwarder(
+                            &outbound_tx,
+                            partial_rx,
+                            response_handle,
+                            request_for_error,
+                            protocol_error_analyze_package_json_response,
+                            ServerOutboundMessage::AnalyzePackageJson,
+                        ),
+                    );
                 } else {
                     let request_for_error = request.clone();
                     let response_handle = tokio::task::spawn_blocking(move || {
@@ -898,6 +937,7 @@ where
             }
             ClientMessage::Shutdown(_) => {
                 prefetcher.cancel();
+                wait_for_active_streams(&mut active_streams).await;
                 // Drain pending disk inserts (not just recency touches) so a
                 // clean shutdown never relies on Drop running before the process
                 // exits, mirroring the recycle path.
@@ -923,6 +963,49 @@ where
 /// cancelled, produces the request-scoped protocol error via `on_error`. One
 /// generic replaces the per-request join wrappers each message type used to
 /// carry verbatim.
+fn track_streaming_forwarder(active_streams: &mut Vec<JoinHandle<()>>, handle: JoinHandle<()>) {
+    active_streams.retain(|active| !active.is_finished());
+    active_streams.push(handle);
+}
+
+async fn wait_for_active_streams(active_streams: &mut Vec<JoinHandle<()>>) {
+    while let Some(handle) = active_streams.pop() {
+        if let Err(error) = handle.await {
+            logging::log_warn("ipc", format!("streaming forwarder failed: {error}"));
+        }
+    }
+}
+
+fn spawn_streaming_forwarder<T, R>(
+    outbound_tx: &mpsc::UnboundedSender<ServerOutboundMessage>,
+    mut partial_rx: mpsc::UnboundedReceiver<T>,
+    response_handle: JoinHandle<T>,
+    request_for_error: R,
+    on_error: impl FnOnce(&R, String) -> T + Send + 'static,
+    into_outbound: impl Fn(T) -> ServerOutboundMessage + Send + 'static,
+) -> JoinHandle<()>
+where
+    T: Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let outbound = outbound_tx.clone();
+    tokio::spawn(async move {
+        let mut outbound_open = true;
+        while let Some(partial) = partial_rx.recv().await {
+            if outbound_open && outbound.send(into_outbound(partial)).is_err() {
+                outbound_open = false;
+                break;
+            }
+        }
+
+        let final_response =
+            response_from_join(response_handle, &request_for_error, on_error).await;
+        if outbound_open {
+            let _ = outbound.send(into_outbound(final_response));
+        }
+    })
+}
+
 pub async fn response_from_join<T, R>(
     response_handle: JoinHandle<T>,
     request: &R,
@@ -1083,17 +1166,22 @@ fn protocol_diagnostics(message: String) -> Vec<ImportDiagnostic> {
     vec![ImportDiagnostic::for_stage("protocol", message)]
 }
 
-fn recycle_if_needed(
+async fn recycle_if_needed(
     lifecycle: &LifecycleState,
     storage_path: Option<&Path>,
     prefetcher: &Prefetcher,
     service: &ImportLensService,
+    active_streams: &mut Vec<JoinHandle<()>>,
 ) -> bool {
     let Some(reason) = lifecycle.should_recycle(Instant::now()) else {
         return false;
     };
 
     prefetcher.cancel();
+    if !active_streams.is_empty() {
+        wait_for_active_streams(active_streams).await;
+        return false;
+    }
 
     if let Err(error) = service.flush_cache() {
         logging::log_warn(
