@@ -503,9 +503,10 @@ The virtual entry must never use `console.log` or any pattern that can be static
 | `importLens.useCodeLens`     | boolean | `false`     | Use code lens above the line instead of end-of-line decorations                                          |
 | `importLens.enableDiskCache` | boolean | `true`      | Persist computed sizes to disk via redb across editor restarts                                           |
 | `importLens.cacheMaxSizeMB`  | number  | `512`       | Global disk-byte budget across all project cache shards; least-recently-used entries are evicted when exceeded |
-| `importLens.cacheMaxAgeDays` | number  | `30`        | Deprecated and ignored; capacity is governed entirely by the byte budget (`cacheMaxSizeMB`)               |
+| `importLens.registryCacheMaxSizeMB` | number | `32` | Byte budget for the shared npm registry metadata cache; oldest entries are evicted when exceeded          |
 | `importLens.budgets`         | object  | `{}`        | Optional per-import and per-file Brotli thresholds for diagnostics and CLI checks                         |
 | `importLens.enableRegistryHints` | boolean | `true`   | Enable short-timeout npm metadata hints cached in the daemon's centralized package metadata cache        |
+| `importLens.verboseRegistryLogging` | boolean | `false` | Log per-package registry refresh outcomes for diagnostics                                               |
 | `importLens.logLevel`        | enum    | `info`      | Logging verbosity for the ImportLens output channel. Options: `error`, `warn`, `info`, `debug`           |
 
 ### 5.8 Daemon Lifecycle

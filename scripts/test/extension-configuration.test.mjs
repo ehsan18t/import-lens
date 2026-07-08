@@ -45,12 +45,13 @@ test("ImportLens registry hints default on", () => {
 
 test("ImportLens exposes cache retention policy settings", () => {
   const maxSize = manifest.contributes.configuration.properties["importLens.cacheMaxSizeMB"];
-  const maxAge = manifest.contributes.configuration.properties["importLens.cacheMaxAgeDays"];
+  const registryMaxSize =
+    manifest.contributes.configuration.properties["importLens.registryCacheMaxSizeMB"];
 
   assert.equal(maxSize.default, 512);
   assert.equal(maxSize.minimum, 64);
-  assert.equal(maxAge.default, 30);
-  assert.equal(maxAge.minimum, 1);
+  assert.equal(registryMaxSize.default, 32);
+  assert.equal(registryMaxSize.minimum, 1);
 });
 
 test("ImportLens compare workflow is contributed and package.json can activate the extension", () => {
