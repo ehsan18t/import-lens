@@ -17,12 +17,13 @@ use crate::{
         CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest, CacheStatusResponse,
         CompleteImportMembersRequest, CompleteImportMembersResponse, ConfidenceLevel,
         DetectedImport, EnumerateExportsRequest, EnumerateExportsResponse, FileSizeDocumentRequest,
-        FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse, ImportAnalysisItem,
-        ImportAnalysisStatus, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
-        ImportRuntime, ImportSyntax, PROTOCOL_VERSION, PackageJsonDependencyAnalysisItem,
-        RefreshedImportIdentity, RegistryHintMode as ProtocolRegistryHintMode, RegistryHintResult,
-        RegistryHintTarget, WorkspaceReportRequest, WorkspaceReportResponse,
-        WorkspaceReportSummary, is_supported_protocol_version,
+        FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse, FreshnessKind,
+        ImportAnalysisItem, ImportAnalysisStatus, ImportDiagnostic, ImportKind, ImportRequest,
+        ImportResult, ImportRuntime, ImportSyntax, PROTOCOL_VERSION,
+        PackageJsonDependencyAnalysisItem, RefreshedImportIdentity,
+        RegistryHintMode as ProtocolRegistryHintMode, RegistryHintResult, RegistryHintTarget,
+        WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
+        is_supported_protocol_version,
     },
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import_with_graph},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
@@ -38,6 +39,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 /// Whether a cached-analyze read promotes the entry's LRU recency (scan
@@ -51,6 +53,8 @@ enum ReadIntent {
     Interactive,
     Bulk,
 }
+
+const SLOW_CACHE_LOOKUP_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 struct ComputedAnalysis {
@@ -1030,6 +1034,7 @@ impl ImportLensService {
     where
         F: Fn(AnalyzePackageJsonResponse) + Sync,
     {
+        let request_started_at = Instant::now();
         if !is_supported_protocol_version(request.version) {
             return AnalyzePackageJsonResponse {
                 version: request.version.min(PROTOCOL_VERSION),
@@ -1053,6 +1058,18 @@ impl ImportLensService {
         let registry_hint_mode = effective_registry_hint_mode(&request);
         let now_ms = crate::time::unix_millis_now();
         let entries = package_json_dependency_entries(&request.source);
+        crate::logging::log_debug(
+            "package_json",
+            format!(
+                "request {} parsed {} dependencies across {} section(s) in {}ms (source_chars={}, registry_mode={:?})",
+                request.request_id,
+                entries.len(),
+                sections.len(),
+                request_started_at.elapsed().as_millis(),
+                request.source.len(),
+                registry_hint_mode
+            ),
+        );
 
         if let Some(emit_partial) = emit_partial.as_ref()
             && !entries.is_empty()
@@ -1079,6 +1096,15 @@ impl ImportLensService {
                 error: None,
                 diagnostics: Vec::new(),
             });
+            crate::logging::log_debug(
+                "package_json",
+                format!(
+                    "request {} emitted loading partial for {} dependencies after {}ms",
+                    request.request_id,
+                    entries.len(),
+                    request_started_at.elapsed().as_millis()
+                ),
+            );
         }
 
         // Resolve each dependency's installed version (an ancestor walk plus a
@@ -1086,6 +1112,7 @@ impl ImportLensService {
         // resulting states and import_requests still line up with streaming
         // indexes exactly as the sequential loop did.
         type PreparedDependency = (ImportRequest, Option<ResolvedPackage>);
+        let resolution_started_at = Instant::now();
         let resolved: Vec<(
             PackageJsonDependencyAnalysisItem,
             Option<PreparedDependency>,
@@ -1169,6 +1196,14 @@ impl ImportLensService {
                 }
             })
             .collect();
+        crate::logging::log_debug(
+            "package_json",
+            format!(
+                "request {} resolved dependency metadata in {}ms",
+                request.request_id,
+                resolution_started_at.elapsed().as_millis()
+            ),
+        );
         let (mut states, import_requests): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
         // Persist any registry metadata fetched above in one snapshot write.
         self.registry_hints.flush();
@@ -1185,8 +1220,18 @@ impl ImportLensService {
                 error: None,
                 diagnostics: Vec::new(),
             });
+            crate::logging::log_debug(
+                "package_json",
+                format!(
+                    "request {} emitted resolved partial for {} dependencies after {}ms",
+                    request.request_id,
+                    states.len(),
+                    request_started_at.elapsed().as_millis()
+                ),
+            );
         }
 
+        let analysis_started_at = Instant::now();
         let indexed_results = import_requests
             .par_iter()
             .enumerate()
@@ -1226,12 +1271,47 @@ impl ImportLensService {
                 (index, result)
             })
             .collect::<Vec<_>>();
+        let cache_hits = indexed_results
+            .iter()
+            .filter(|(_, result)| result.cache_hit)
+            .count();
+        let stale_results = indexed_results
+            .iter()
+            .filter(|(_, result)| matches!(result.freshness.kind, FreshnessKind::Stale))
+            .count();
+        let unverified_results = indexed_results
+            .iter()
+            .filter(|(_, result)| matches!(result.freshness.kind, FreshnessKind::Unverified))
+            .count();
+        crate::logging::log_debug(
+            "package_json",
+            format!(
+                "request {} analyzed {} dependencies in {}ms (cache_hits={}/{}, stale={}, unverified={})",
+                request.request_id,
+                indexed_results.len(),
+                analysis_started_at.elapsed().as_millis(),
+                cache_hits,
+                indexed_results.len(),
+                stale_results,
+                unverified_results
+            ),
+        );
         let (indexes, mut results): (Vec<_>, Vec<_>) = indexed_results.into_iter().unzip();
         annotate_shared_bytes(&mut results);
         for (index, result) in indexes.into_iter().zip(results) {
             states[index].status = ImportAnalysisStatus::Ready;
             states[index].result = Some(result);
         }
+
+        crate::logging::log_debug(
+            "package_json",
+            format!(
+                "request {} completed in {}ms (states={})",
+                request.request_id,
+                request_started_at.elapsed().as_millis(),
+                states.len()
+            ),
+        );
 
         AnalyzePackageJsonResponse {
             version: request.version,
@@ -1878,6 +1958,7 @@ impl ImportLensService {
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
         if serve_stale {
+            let lookup_started_at = Instant::now();
             // SWR: serve the last-known value (flagged Stale/Unverified) instead of
             // evicting-and-recomputing. The FileSizeDocument handler spawns a background
             // recompute + push when a served result is Stale. A bulk read
@@ -1888,9 +1969,24 @@ impl ImportLensService {
                 ReadIntent::Bulk => cache.get_with_result_freshness_for_bulk(&key),
             };
             if let Some((result, _freshness)) = served {
+                log_cache_lookup_timing(
+                    request,
+                    cache_read_mode_label(serve_stale, intent),
+                    true,
+                    Some(&result),
+                    lookup_started_at.elapsed(),
+                );
                 return result;
             }
+            log_cache_lookup_timing(
+                request,
+                cache_read_mode_label(serve_stale, intent),
+                false,
+                None,
+                lookup_started_at.elapsed(),
+            );
         } else {
+            let lookup_started_at = Instant::now();
             // Force-fresh (CI / `importlens check`, §4.5): serve ONLY a value verified
             // `Fresh` against disk, across BOTH the memory working set and the disk
             // cache. `get_if_fresh` returns `None` on Unknown/Stale/Gone/miss, so a
@@ -1900,8 +1996,22 @@ impl ImportLensService {
             // also removes the double dependency re-verification of the prior
             // memory-only `probe_freshness` + `get`.
             if let Some(result) = cache.get_if_fresh(&key) {
+                log_cache_lookup_timing(
+                    request,
+                    cache_read_mode_label(serve_stale, intent),
+                    true,
+                    Some(&result),
+                    lookup_started_at.elapsed(),
+                );
                 return result;
             }
+            log_cache_lookup_timing(
+                request,
+                cache_read_mode_label(serve_stale, intent),
+                false,
+                None,
+                lookup_started_at.elapsed(),
+            );
         }
 
         self.analyze_and_cache(cache.as_ref(), context, request, key, resolved, || true)
@@ -2043,6 +2153,43 @@ fn effective_registry_hint_mode(
 
 fn should_cache_result(result: &ImportResult) -> bool {
     result.error.is_none() && !has_request_specific_diagnostics(result)
+}
+
+fn cache_read_mode_label(serve_stale: bool, intent: ReadIntent) -> &'static str {
+    match (serve_stale, intent) {
+        (true, ReadIntent::Interactive) => "serve_stale_interactive",
+        (true, ReadIntent::Bulk) => "serve_stale_bulk",
+        (false, ReadIntent::Interactive) => "force_fresh_interactive",
+        (false, ReadIntent::Bulk) => "force_fresh_bulk",
+    }
+}
+
+fn log_cache_lookup_timing(
+    request: &ImportRequest,
+    mode: &str,
+    hit: bool,
+    result: Option<&ImportResult>,
+    elapsed: Duration,
+) {
+    if elapsed < SLOW_CACHE_LOOKUP_LOG_THRESHOLD {
+        return;
+    }
+
+    let freshness = result
+        .map(|result| format!("{:?}", result.freshness.kind))
+        .unwrap_or_else(|| "miss".to_owned());
+    crate::logging::log_debug(
+        "cache",
+        format!(
+            "slow cache lookup for package={} specifier={} mode={} hit={} freshness={} elapsed={}ms",
+            request.package_name.as_str(),
+            request.specifier.as_str(),
+            mode,
+            hit,
+            freshness,
+            elapsed.as_millis()
+        ),
+    );
 }
 
 fn revalidation_claim_key(

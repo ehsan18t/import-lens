@@ -167,24 +167,28 @@ impl ProjectCacheRegistry {
     /// robustness if ever called later) are observed from their live handles.
     pub fn seed_recency_clock_from_disk(&self) {
         if !self.storage_enabled() {
+            crate::logging::log_debug("cache", "skipped recency seed; disk cache is disabled");
             return;
         }
 
-        let loaded_ids = self
+        let started_at = Instant::now();
+        let (loaded_count, loaded_ids) = self
             .loaded
             .lock()
             .map(|loaded| {
                 for shard in loaded.values() {
                     crate::cache::recency::RecencyClock::observe(shard.cache.summary_max_seq());
                 }
-                loaded.keys().cloned().collect::<HashSet<_>>()
+                (loaded.len(), loaded.keys().cloned().collect::<HashSet<_>>())
             })
             .unwrap_or_default();
 
+        let mut scanned_shards = 0usize;
         for (shard_id, cache_path) in self.scan_disk_shard_paths() {
             if loaded_ids.contains(&shard_id) || cache_path.as_os_str().is_empty() {
                 continue;
             }
+            scanned_shards += 1;
             let cache = ImportCache::new_with_recent_preload_limit(
                 Some(cache_path),
                 self.enable_disk_cache,
@@ -192,6 +196,16 @@ impl ProjectCacheRegistry {
             );
             crate::cache::recency::RecencyClock::observe(cache.summary_max_seq());
         }
+
+        crate::logging::log_debug(
+            "cache",
+            format!(
+                "seeded recency clock from disk in {}ms (loaded_shards={}, scanned_shards={})",
+                started_at.elapsed().as_millis(),
+                loaded_count,
+                scanned_shards
+            ),
+        );
     }
 
     /// Enforces the global disk-byte budget by evicting the least-recently-used

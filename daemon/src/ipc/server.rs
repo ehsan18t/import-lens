@@ -436,7 +436,15 @@ where
                 // processes this Hello to completion before it reads the first
                 // Batch/Analyze frame, so the seed is guaranteed to finish before the
                 // first `analyze_and_cache`.
+                let seed_started_at = Instant::now();
                 service.seed_recency_clock_from_disk();
+                logging::log_debug(
+                    "cache",
+                    format!(
+                        "hello recency seed finished in {}ms",
+                        seed_started_at.elapsed().as_millis()
+                    ),
+                );
                 // Byte-budget enforcement + compaction: a detached interval task
                 // whose first pass runs right after this handshake (via
                 // spawn_blocking — the old inline cleanup blocked the handshake on
