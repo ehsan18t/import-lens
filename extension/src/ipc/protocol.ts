@@ -216,6 +216,10 @@ export interface RefreshRegistryHintsRequest {
   request_id: number;
   targets: RegistryHintTarget[];
   mode: "refresh_stale" | "force_refresh";
+  // Opaque per-manifest key (the document key) that scopes the daemon's bulk
+  // supersession to one source, so refreshing a different package.json does not
+  // cancel this manifest's in-flight block.
+  source?: string;
 }
 
 export interface RefreshRegistryHintsResponse {

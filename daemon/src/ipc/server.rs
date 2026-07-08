@@ -53,27 +53,40 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Tracks the active bulk registry-refresh block for one connection so a newer
-/// bulk request can supersede (cancel) the block it replaces, and so an ending
-/// connection cancels whatever is still draining (D7 / §6.1). Cancellation only
-/// flips a shared `AtomicBool` that the isolated registry pool's jobs re-read
-/// before each network fetch — a superseded/abandoned block skips its remaining
-/// fetches, with no error surfaced for the skipped work.
+/// Tracks the active bulk registry-refresh block **per source manifest** for one
+/// connection so a newer bulk request supersedes (cancels) only the block for the
+/// SAME source it replaces, and so an ending connection cancels whatever is still
+/// draining (D7 / §6.1, keyed per-source per D11). Cancellation only flips a
+/// shared `AtomicBool` that the isolated registry pool's jobs re-read before each
+/// network fetch — a superseded/abandoned block skips its remaining fetches, with
+/// no error surfaced for the skipped work.
+///
+/// Keying per source (mirroring `SwrRefreshLifecycle`, decision-log D9) is what
+/// keeps a cold-cache multi-manifest prewarm honest: refreshing `backend/
+/// package.json` must not cancel the still-in-flight `web/package.json` block,
+/// which would otherwise strand every not-yet-fetched target with a fabricated
+/// "worker did not return a result" error (regression P1-5).
 struct RegistryRefreshLifecycle {
-    active: Option<Arc<AtomicBool>>,
+    active_by_source: HashMap<String, Arc<AtomicBool>>,
 }
 
 impl RegistryRefreshLifecycle {
     fn new() -> Self {
-        Self { active: None }
+        Self {
+            active_by_source: HashMap::new(),
+        }
     }
 
-    /// Cancels the previous block (so its queued jobs skip their remaining
-    /// fetches) and hands back a fresh cancel flag for the new block. Release
-    /// pairs with the Acquire load each pool job does before fetching.
-    fn start_new_block(&mut self) -> Arc<AtomicBool> {
+    /// Cancels the previous block for this source (so its queued jobs skip their
+    /// remaining fetches) and hands back a fresh cancel flag for the new block.
+    /// Release pairs with the Acquire load each pool job does before fetching.
+    /// Blocks for other sources are left draining untouched.
+    fn start_new_block(&mut self, source: &str) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
-        if let Some(previous) = self.active.replace(Arc::clone(&flag)) {
+        if let Some(previous) = self
+            .active_by_source
+            .insert(source.to_owned(), Arc::clone(&flag))
+        {
             previous.store(true, Ordering::Release);
         }
         flag
@@ -82,9 +95,9 @@ impl RegistryRefreshLifecycle {
 
 impl Drop for RegistryRefreshLifecycle {
     fn drop(&mut self) {
-        // Connection ended (disconnect, idle recycle, shutdown): cancel the
-        // still-draining block so its queued jobs skip their remaining fetches.
-        if let Some(active) = &self.active {
+        // Connection ended (disconnect, idle recycle, shutdown): cancel every
+        // source's still-draining block so its queued jobs skip remaining fetches.
+        for active in self.active_by_source.values() {
             active.store(true, Ordering::Release);
         }
     }
@@ -631,12 +644,15 @@ where
                 let (partial_tx, mut partial_rx) = mpsc::unbounded_channel();
                 let outbound = outbound_tx.clone();
 
-                // A newer bulk request supersedes the previous block for this
-                // connection: flip the prior block's cancel flag so its still-
-                // queued jobs skip their remaining fetches. The returned flag
-                // governs THIS block; each of its pool jobs re-reads it before
-                // its network fetch.
-                let cancelled = registry_refresh_lifecycle.start_new_block();
+                // A newer bulk request for the SAME source manifest supersedes
+                // the previous block: flip that block's cancel flag so its still-
+                // queued jobs skip their remaining fetches. Blocks for other
+                // manifests keep draining. The returned flag governs THIS block;
+                // each of its pool jobs re-reads it before its network fetch.
+                // Absent source (older client) → all share the empty-key bucket,
+                // preserving the pre-D10 connection-global supersede for them.
+                let source = request.source.clone().unwrap_or_default();
+                let cancelled = registry_refresh_lifecycle.start_new_block(&source);
                 let final_targets = targets.clone();
                 let target_count = targets.len();
 
@@ -1116,28 +1132,43 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[test]
-    fn registry_refresh_lifecycle_supersedes_prior_block_and_cancels_on_drop() {
+    fn registry_refresh_lifecycle_supersedes_only_within_the_same_source() {
         let mut lifecycle = RegistryRefreshLifecycle::new();
-        let first = lifecycle.start_new_block();
+        let first = lifecycle.start_new_block("web/package.json");
         assert!(!first.load(Ordering::Acquire), "a fresh block starts live");
 
-        // A newer bulk request supersedes the previous block: the prior flag
-        // flips, the new one starts live.
-        let second = lifecycle.start_new_block();
+        // A block for a DIFFERENT source (another package.json in the same
+        // workspace) must not cancel an unrelated in-flight block — otherwise a
+        // cold-cache multi-manifest prewarm loses the first manifest's hints
+        // (regression P1-5 / decision-log D11).
+        let other = lifecycle.start_new_block("backend/package.json");
+        assert!(
+            !first.load(Ordering::Acquire),
+            "a block for a different source must not cancel another source's block"
+        );
+        assert!(!other.load(Ordering::Acquire), "the new block starts live");
+
+        // A newer bulk request for the SAME source still supersedes the block it
+        // replaces: the prior flag flips, the new one starts live.
+        let second = lifecycle.start_new_block("web/package.json");
         assert!(
             first.load(Ordering::Acquire),
-            "a new bulk block must cancel the block it supersedes"
+            "a new bulk block must cancel the same-source block it supersedes"
         );
         assert!(
             !second.load(Ordering::Acquire),
             "the superseding block itself starts live"
         );
 
-        // Connection end (guard drop) cancels whatever is still draining.
+        // Connection end (guard drop) cancels every source's still-draining block.
         drop(lifecycle);
         assert!(
             second.load(Ordering::Acquire),
-            "dropping the connection lifecycle must cancel the active block"
+            "dropping the connection lifecycle must cancel the active web block"
+        );
+        assert!(
+            other.load(Ordering::Acquire),
+            "dropping the connection lifecycle must cancel the active backend block"
         );
     }
 }

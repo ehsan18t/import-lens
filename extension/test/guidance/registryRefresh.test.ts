@@ -70,6 +70,23 @@ const successResponse = (
   diagnostics: [],
 });
 
+test("refresh sends the document key as the request source so the daemon scopes supersession per manifest", async () => {
+  const react = stateFor("react");
+  const harness = createHarness([react]);
+  let captured: RefreshRegistryHintsRequest | undefined;
+  const daemon: RegistryRefreshTransport = {
+    refreshRegistryHints: (request) => {
+      captured = request;
+      return Promise.resolve(successResponse(request, 100));
+    },
+  };
+  const refresher = new RegistryHintRefresher(daemon, harness.host, silentLogger);
+
+  await refresher.refresh(uriKey, [targetFor(react)], "refresh_stale");
+
+  assert.equal(captured?.source, harness.host.keyFor(uriKey));
+});
+
 test("daemon unavailable marks pending targets with a refresh error and stale only where cached", async () => {
   const react = stateFor("react", {
     registryHint: { latestVersion: "18.9.0", isLatest: false, fetchedAt: 50 },

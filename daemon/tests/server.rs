@@ -1042,6 +1042,7 @@ async fn server_streams_registry_hint_partials_before_final_response() {
                     },
                 ],
                 mode: RegistryHintMode::RefreshStale,
+                source: Some("test/package.json".to_owned()),
             })
             .expect("registry refresh request should encode"),
         )

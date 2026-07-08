@@ -212,6 +212,29 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   (parked). Surfaced by the RB-16 adversarial review.
 - **Consequences / status:** `df1eacb` (RB-16).
 
+### D11 — Bulk registry-refresh supersession is per-source manifest, mirroring D9 · 2026-07-08
+- **Context:** P1-5 — the redesign (`610f27d`) added `RegistryRefreshLifecycle` with a single
+  *connection-global* cancel slot: any new bulk refresh cancelled the prior block. A workspace
+  prewarms several manifests (web + backend + `.next` `package.json`), each firing its own
+  bulk block. On a **cold cache** the web block's network fetches are still in flight when the
+  backend block starts, so it flips web's cancel flag; every not-yet-fetched web target reports
+  `None` and the collector backfills a fabricated `"registry refresh worker did not return a
+  result"`. The client keys generations per (uri, target), so those errors are *not* seen as
+  superseded — they surface as real "hint unavailable", and the manifest renders no versions.
+  Warm cache hid it (the web block finished before the backend block arrived).
+- **Decision:** Key `RegistryRefreshLifecycle` **per source manifest** (a `HashMap<source,
+  flag>`, exactly mirroring `SwrRefreshLifecycle` / D9). A refresh supersedes only the prior
+  block for the *same* source; other manifests keep draining; connection-drop still cancels all.
+  Threaded a new optional `source` field (the client's document key) through
+  `RefreshRegistryHintsRequest`; absent source (older peer) shares one empty-key bucket,
+  preserving the pre-D11 connection-global behavior for it.
+- **Rationale:** identical shape to D9 — the sibling SWR path already made exactly this
+  per-document move; registry refresh was simply left per-connection. The `active_by_source`
+  map is one small entry per manifest per connection, freed on disconnect (bounded, not a leak).
+- **Consequences / status:** fixes P1-5. Tests: daemon `registry_refresh_lifecycle_supersedes_
+  only_within_the_same_source` (cross-source isolation + same-source supersede + drop-cancels-all)
+  and extension `refresh sends the document key as the request source`.
+
 ---
 
 ## Parked / deferred

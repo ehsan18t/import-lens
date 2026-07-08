@@ -453,6 +453,12 @@ pub struct RefreshRegistryHintsRequest {
     pub request_id: u64,
     pub targets: Vec<RegistryHintTarget>,
     pub mode: RegistryHintMode,
+    /// Opaque per-manifest key (the client's document key) that scopes bulk
+    /// supersession to one source: a refresh of a different manifest must not
+    /// cancel this one's in-flight block. Optional for wire back-compat with
+    /// clients that predate the field (they fall back to a shared bucket).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
