@@ -1,6 +1,9 @@
 use crate::{
+    analysis_flight::AnalysisFlightRegistry,
     cache::{
-        key::cache_key_for_resolved_import, memory::ImportCache, project::ProjectCacheRegistry,
+        key::{FileFingerprint, cache_key_for_resolved_import},
+        memory::ImportCache,
+        project::ProjectCacheRegistry,
     },
     document::{
         IgnoreRuleResolver, analyze_imports, get_package_name, is_runtime_package_specifier,
@@ -47,6 +50,12 @@ use std::{
 enum ReadIntent {
     Interactive,
     Bulk,
+}
+
+#[derive(Clone)]
+struct ComputedAnalysis {
+    result: ImportResult,
+    dependency_fingerprints: Vec<FileFingerprint>,
 }
 
 /// F1 trailing-re-check decision for the background SWR revalidation. After a
@@ -102,6 +111,7 @@ fn try_begin_cache_maintenance() -> Option<MaintenanceGuard> {
 // thread pool respectively, so `ImportLensService` no longer derives `Debug`.
 pub struct ImportLensService {
     cache_registry: ProjectCacheRegistry,
+    analysis_flights: AnalysisFlightRegistry<ComputedAnalysis>,
     registry_hints: crate::registry::service::RegistryHintService,
     registry_executor: crate::registry::executor::RegistryRefreshExecutor,
     report_executor: crate::report::executor::WorkspaceReportExecutor,
@@ -152,6 +162,7 @@ impl ImportLensService {
         let report_executor = crate::report::executor::WorkspaceReportExecutor::new();
         Self {
             cache_registry,
+            analysis_flights: AnalysisFlightRegistry::new(),
             registry_hints,
             registry_executor,
             report_executor,
@@ -170,6 +181,7 @@ impl ImportLensService {
     ) -> Self {
         Self {
             cache_registry: ProjectCacheRegistry::new(None, false, 512),
+            analysis_flights: AnalysisFlightRegistry::new(),
             registry_hints,
             registry_executor: crate::registry::executor::RegistryRefreshExecutor::new(
                 crate::registry::constants::REGISTRY_REFRESH_CONCURRENCY,
@@ -210,6 +222,7 @@ impl ImportLensService {
                 enable_disk_cache,
                 cache_max_size_mb,
             ),
+            analysis_flights: self.analysis_flights,
             registry_hints: self.registry_hints,
             registry_executor: self.registry_executor,
             report_executor: self.report_executor,
@@ -1904,29 +1917,41 @@ impl ImportLensService {
         should_store: impl Fn() -> bool,
     ) -> ImportResult {
         let captured_generation = crate::cache::memory::cache_generation();
-        let (result, analyzed_graph) =
-            analyze_resolved_import_with_graph(context, request, resolved.clone());
+        let computed = self
+            .analysis_flights
+            .run_or_join(key.clone(), captured_generation, || {
+                let (result, analyzed_graph) =
+                    analyze_resolved_import_with_graph(context, request, resolved.clone());
+                let dependency_fingerprints = if should_cache_result(&result) {
+                    dependency_fingerprints(&resolved, analyzed_graph.as_ref(), request.runtime)
+                } else {
+                    Vec::new()
+                };
 
-        if should_cache_result(&result) && should_store() {
-            let fingerprints =
-                dependency_fingerprints(&resolved, analyzed_graph.as_ref(), request.runtime);
+                ComputedAnalysis {
+                    result,
+                    dependency_fingerprints,
+                }
+            });
+
+        if should_cache_result(&computed.result) && should_store() {
             self.cache_full_variant_alias(
                 cache,
                 request,
-                &result,
+                &computed.result,
                 &resolved,
-                &fingerprints,
+                &computed.dependency_fingerprints,
                 captured_generation,
             );
             cache.insert_with_fingerprints_at_generation(
                 key,
-                result.clone(),
-                fingerprints,
+                computed.result.clone(),
+                computed.dependency_fingerprints.clone(),
                 captured_generation,
             );
         }
 
-        result
+        computed.result
     }
 
     fn cache_full_variant_alias(
@@ -2526,6 +2551,155 @@ mod analyze_and_cache_graph_reuse_tests {
             hits, 1,
             "analyze_and_cache must reuse the analyzed graph for fingerprints \
              (one fetch); a second fetch is the Finding 4 TOCTOU",
+        );
+    }
+}
+
+#[cfg(test)]
+mod analyze_and_cache_single_flight_tests {
+    use super::{ComputedAnalysis, ImportLensService};
+    use crate::cache::key::cache_key_for_resolved_import;
+    use crate::ipc::protocol::{
+        ConfidenceLevel, ImportKind, ImportRequest, ImportResult, ImportRuntime, ResultFreshness,
+    };
+    use crate::pipeline::analyze::AnalysisContext;
+    use crate::pipeline::resolver::{ResolvedPackage, SideEffectsMode};
+    use std::{
+        sync::{Arc, Condvar, Mutex, mpsc},
+        thread,
+        time::Duration,
+    };
+
+    fn cacheable_result(specifier: &str) -> ImportResult {
+        ImportResult {
+            specifier: specifier.to_owned(),
+            raw_bytes: 42,
+            minified_bytes: 21,
+            gzip_bytes: 10,
+            brotli_bytes: 8,
+            zstd_bytes: 9,
+            cache_hit: false,
+            side_effects: true,
+            truly_treeshakeable: false,
+            is_cjs: false,
+            confidence: ConfidenceLevel::High,
+            confidence_reasons: Vec::new(),
+            error: None,
+            diagnostics: Vec::new(),
+            module_breakdown: None,
+            shared_bytes: None,
+            freshness: ResultFreshness::fresh(),
+            internal_contributions: Vec::new(),
+        }
+    }
+
+    fn wait_until_released(pair: &(Mutex<bool>, Condvar)) {
+        let (lock, cvar) = pair;
+        let mut released = lock.lock().expect("release lock");
+        while !*released {
+            released = cvar.wait(released).expect("release wait");
+        }
+    }
+
+    fn release(pair: &(Mutex<bool>, Condvar)) {
+        let (lock, cvar) = pair;
+        *lock.lock().expect("release lock") = true;
+        cvar.notify_all();
+    }
+
+    fn request() -> ImportRequest {
+        ImportRequest {
+            specifier: "pkg-flight".to_owned(),
+            package_name: "pkg-flight".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: Vec::new(),
+            import_kind: ImportKind::Dynamic,
+            runtime: ImportRuntime::Component,
+        }
+    }
+
+    fn resolved(workspace: &std::path::Path) -> ResolvedPackage {
+        let package_root = workspace.join("node_modules").join("pkg-flight");
+        ResolvedPackage {
+            package_root: package_root.clone(),
+            package_json: serde_json::json!({ "name": "pkg-flight", "version": "1.0.0" }),
+            entry_path: package_root.join("index.js"),
+            is_cjs: false,
+            side_effects: SideEffectsMode::True,
+        }
+    }
+
+    #[test]
+    fn analyze_and_cache_follower_keeps_own_cache_write_when_leader_does_not_store() {
+        let service = Arc::new(ImportLensService::new(None, false));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let workspace = std::env::temp_dir().join(format!(
+            "il-analysis-flight-cache-write-{}-{unique}",
+            std::process::id()
+        ));
+        let context = AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("app.ts"),
+        };
+        let request = request();
+        let resolved = resolved(&workspace);
+        let key = cache_key_for_resolved_import(&request, &resolved);
+        let cache = service
+            .cache_registry
+            .cache_for_root(&context.workspace_root);
+        let generation = crate::cache::memory::cache_generation();
+        let release_compute = Arc::new((Mutex::new(false), Condvar::new()));
+        let (leader_started_tx, leader_started_rx) = mpsc::channel();
+
+        let leader_service = Arc::clone(&service);
+        let leader_key = key.clone();
+        let leader_release = Arc::clone(&release_compute);
+        let leader = thread::spawn(move || {
+            leader_service
+                .analysis_flights
+                .run_or_join(leader_key, generation, || {
+                    leader_started_tx.send(()).expect("leader started");
+                    wait_until_released(&leader_release);
+                    ComputedAnalysis {
+                        result: cacheable_result("pkg-flight"),
+                        dependency_fingerprints: Vec::new(),
+                    }
+                })
+        });
+
+        leader_started_rx.recv().expect("leader should start");
+
+        let follower_service = Arc::clone(&service);
+        let follower_cache = Arc::clone(&cache);
+        let follower_context = context.clone();
+        let follower_request = request.clone();
+        let follower_key = key.clone();
+        let follower_resolved = resolved.clone();
+        let follower = thread::spawn(move || {
+            follower_service.analyze_and_cache(
+                follower_cache.as_ref(),
+                &follower_context,
+                &follower_request,
+                follower_key,
+                follower_resolved,
+                || true,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        release(&release_compute);
+
+        let leader_result = leader.join().expect("leader thread");
+        let follower_result = follower.join().expect("follower thread");
+
+        assert_eq!(leader_result.result, cacheable_result("pkg-flight"));
+        assert_eq!(follower_result, cacheable_result("pkg-flight"));
+        assert!(
+            cache.get(&key).is_some(),
+            "a follower with should_store=true must keep its cache write even when the leader did not store",
         );
     }
 }

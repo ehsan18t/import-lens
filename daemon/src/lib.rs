@@ -1,3 +1,4 @@
+pub mod analysis_flight;
 pub mod cache;
 pub mod document;
 pub mod ipc;
