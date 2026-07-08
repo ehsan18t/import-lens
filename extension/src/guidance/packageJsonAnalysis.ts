@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import { DebouncedDocumentScheduler } from "../analysis/debouncedDocumentScheduler.js";
-import { AnalysisFreshnessTracker } from "../analysis/freshness.js";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
 import {
@@ -10,15 +9,14 @@ import {
   type PackageJsonDependencySectionName,
   protocolVersion,
 } from "../ipc/protocol.js";
-import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { ImportLensLogger } from "../logger.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
 import { analysisRootForFile } from "../workspaceContext.js";
-import { AnalyzedContentTracker } from "./analyzedContentTracker.js";
 import {
   markPackageJsonLoadingUnavailable,
   mergePackageJsonAnalysisPartial,
 } from "./packageJsonPartial.js";
+import { PackageJsonRequestLifecycle } from "./packageJsonRequestLifecycle.js";
 import type { PackageJsonDependencyHintState } from "./packageJsonState.js";
 import { RegistryHintRefresher, registryTargetsForStates } from "./registryRefresh.js";
 
@@ -31,10 +29,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   readonly #daemon: DaemonManager;
   readonly #logger: ImportLensLogger;
   readonly #scheduler = new DebouncedDocumentScheduler();
-  readonly #freshness = new AnalysisFreshnessTracker();
+  readonly #lifecycle = new PackageJsonRequestLifecycle();
   readonly #states = new Map<string, PackageJsonDependencyAnalysisState[]>();
   readonly #sections = new Map<string, PackageJsonDependencySection[]>();
-  readonly #analyzedContent = new AnalyzedContentTracker();
   readonly #onDidChange = new vscode.EventEmitter<vscode.Uri>();
   readonly #registryRefresher: RegistryHintRefresher<
     vscode.Uri,
@@ -96,7 +93,6 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   async analyze(document: vscode.TextDocument): Promise<void> {
     const config = getImportLensConfig();
     const key = document.uri.toString();
-    const requestId = this.#freshness.begin(key, nextIpcRequestId());
 
     if (!config.enabled || !isPackageJsonDocument(document)) {
       this.clear(document.uri);
@@ -104,26 +100,35 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     }
 
     // Skip redundant re-analysis on passive triggers (tab focus, re-open) when
-    // the document text is identical to the last successful analysis. Explicit
-    // refreshes call refreshVisibleDocuments(), which forgets this first.
+    // the document text is already covered by a sent request. Explicit refreshes
+    // call refreshVisibleDocuments(), which forgets this first.
     const currentText = document.getText();
-    if (this.#analyzedContent.isUnchanged(key, currentText)) {
+    if (this.#lifecycle.shouldSkipUnchanged(key, currentText)) {
       return;
     }
 
-    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
-    const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
-
-    if (!this.#freshness.isCurrent(key, requestId)) {
-      return;
-    }
-
-    if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
-      this.clear(document.uri);
-      return;
-    }
+    const requestId = this.#lifecycle.begin(key, currentText);
 
     try {
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+      const workspaceRoot = await analysisRootForFile(
+        document.fileName,
+        workspaceFolder?.uri.fsPath,
+      );
+
+      if (!this.#lifecycle.isCurrent(key, requestId)) {
+        return;
+      }
+
+      if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
+        if (!this.#lifecycle.isCurrent(key, requestId)) {
+          return;
+        }
+        this.#lifecycle.fail(key);
+        this.clear(document.uri);
+        return;
+      }
+
       const response = await this.#daemon.analyzePackageJson(
         {
           type: "analyze_package_json",
@@ -142,18 +147,20 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       );
 
       if (!response) {
-        if (!this.#freshness.isCurrent(key, requestId)) {
+        if (!this.#lifecycle.isCurrent(key, requestId)) {
           return;
         }
+        this.#lifecycle.fail(key);
         this.markLoadingUnavailable(document.uri, "Daemon unavailable");
         return;
       }
 
-      if (!this.#freshness.isCurrent(key, response.request_id)) {
+      if (!this.#lifecycle.isCurrent(key, response.request_id)) {
         return;
       }
 
       if (response.error || response.states.length === 0) {
+        this.#lifecycle.fail(key);
         this.clear(document.uri);
         return;
       }
@@ -162,14 +169,14 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       const states = mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], response);
       this.setStates(document.uri, states);
       this.queueRegistryRefreshes(document.uri, states);
-      this.#analyzedContent.record(key, currentText);
     } catch (error) {
       this.#logger.warn(
         `Package.json dependency analysis failed: ${error instanceof Error ? error.message : String(error)}`,
       );
-      if (!this.#freshness.isCurrent(key, requestId)) {
+      if (!this.#lifecycle.isCurrent(key, requestId)) {
         return;
       }
+      this.#lifecycle.fail(key);
       this.markLoadingUnavailable(
         document.uri,
         error instanceof Error ? error.message : "Daemon unavailable",
@@ -182,7 +189,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     // watcher) must bypass the unchanged-content guard so re-analysis runs. Forget
     // ALL tracked docs, not just visible ones — a background package.json tab would
     // otherwise stay stale (same text) until edited when next focused.
-    this.#analyzedContent.forgetAll();
+    this.#lifecycle.supersedeAll();
     for (const editor of vscode.window.visibleTextEditors) {
       this.schedule(editor.document);
     }
@@ -218,8 +225,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     const key = uri.toString();
     this.#states.delete(key);
     this.#sections.delete(key);
-    this.#freshness.forget(key);
-    this.#analyzedContent.forget(key);
+    this.#lifecycle.forget(key);
     this.#registryRefresher.forget(uri);
     this.#onDidChange.fire(uri);
   }
@@ -258,7 +264,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     key: string,
     partial: AnalyzePackageJsonResponse,
   ): void {
-    if (!this.#freshness.isCurrent(key, partial.request_id) || partial.error) {
+    if (!this.#lifecycle.isCurrent(key, partial.request_id) || partial.error) {
       return;
     }
 
@@ -308,7 +314,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
 
   dispose(): void {
     this.#scheduler.dispose();
-    this.#freshness.clear();
+    this.#lifecycle.supersedeAll();
     this.#onDidChange.dispose();
   }
 }

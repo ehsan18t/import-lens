@@ -53,6 +53,7 @@ import type {
 
 const STABLE_SESSION_RESET_MS = 60_000;
 const CLEAN_RECYCLE_SESSION_MS = 30 * 60 * 1000;
+const PACKAGE_JSON_ANALYSIS_TIMEOUT_MS = 300_000;
 // A whole-workspace report scans, resolves, graphs, minifies, and compresses every file, so it
 // can exceed the 60s per-document budget on large monorepos.
 // The subset of `vscode.ExtensionContext` this transport reads. Typing against
@@ -430,7 +431,11 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
 
     this.#logger.debug(`Requesting package.json analysis ${request.request_id}.`);
-    return this.#client.requestAnalyzePackageJson(request, 30000, onPartial);
+    return this.#client.requestAnalyzePackageJson(
+      request,
+      PACKAGE_JSON_ANALYSIS_TIMEOUT_MS,
+      onPartial,
+    );
   }
 
   async analyzeSpecifiers(
