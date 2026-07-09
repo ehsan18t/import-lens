@@ -13,7 +13,10 @@ import {
   packageJsonSectionSummaryTooltipMarkdown,
   packageJsonSectionSummaryTooltipTrustedCommands,
 } from "../../src/ui/packageJsonTooltip.js";
-import { tooltipForResultMarkdown } from "../../src/ui/tooltipMarkdown.js";
+import {
+  importResultSizeMarkdown,
+  tooltipForResultMarkdown,
+} from "../../src/ui/tooltipMarkdown.js";
 
 const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => ({
   enabled: true,
@@ -242,6 +245,77 @@ test("packageJsonDependencyTooltipMarkdown includes type-only status", () => {
   assert.match(markdown, /Version status: latest/u);
   assert.doesNotMatch(markdown, /0 B/u);
   assert.doesNotMatch(markdown, /0 B br · types only/u);
+});
+
+test("importResultSizeMarkdown renders sectioned size rows", () => {
+  assert.equal(
+    importResultSizeMarkdown(result(), "brotli"),
+    [
+      "**Size**",
+      "- Selected Brotli: **1.5 kB br**",
+      "- Raw: 12.0 kB",
+      "- Minified: 4.6 kB",
+      "- Gzip: 2.1 kB",
+      "- Brotli: 1.5 kB",
+      "- Zstd: 1.7 kB",
+    ].join("\n"),
+  );
+});
+
+test("tooltipForResultMarkdown renders size and analysis sections", () => {
+  const markdown = tooltipForResultMarkdown(
+    result({
+      shared_bytes: 700,
+      confidence_reasons: ["Detected side-effect import."],
+      side_effects: true,
+    }),
+    config(),
+    "server",
+  );
+
+  assert.match(markdown, /\*\*Size\*\*/u);
+  assert.match(markdown, /- Selected Brotli: \*\*1\.5 kB br\*\*/u);
+  assert.match(markdown, /\*\*Analysis\*\*/u);
+  assert.match(markdown, /- Runtime: server/u);
+  assert.match(markdown, /- Confidence: \*\*High\*\*/u);
+  assert.match(markdown, /- Shared in file: 700 B/u);
+  assert.match(markdown, /\*\*Confidence notes\*\*/u);
+  assert.match(markdown, /- Detected side-effect import\./u);
+});
+
+test("tooltipForResultMarkdown renders conservative sizing without em dash", () => {
+  const markdown = tooltipForResultMarkdown(
+    result({ side_effects: true, truly_treeshakeable: false }),
+    config(),
+  );
+
+  assert.match(
+    markdown,
+    /\$\(warning\) \*\*Conservative sizing:\*\* Size may include unused exports or side-effect modules\./u,
+  );
+  assert.doesNotMatch(markdown, /—/u);
+});
+
+test("tooltipForResultMarkdown renders compact diagnostics for errored results", () => {
+  const markdown = tooltipForResultMarkdown(
+    result({
+      error: "failed to resolve package",
+      confidence: "low",
+      confidence_reasons: ["Resolver returned no entry."],
+      diagnostics: [
+        { stage: "resolve", message: "Cannot resolve react.", details: ["from app.ts"] },
+      ],
+    }),
+    config(),
+  );
+
+  assert.match(markdown, /\*\*Diagnostics\*\*/u);
+  assert.match(markdown, /ImportLens could not compute this import size\./u);
+  assert.match(markdown, /- Error: failed to resolve package/u);
+  assert.match(markdown, /- Confidence: \*\*Low\*\*/u);
+  assert.match(markdown, /- Resolver returned no entry\./u);
+  assert.match(markdown, /\$\(copy\) Copy diagnostics/u);
+  assert.equal(commandArgs(markdown, copyImportDiagnosticsCommand).length, 1);
 });
 
 test("packageJsonDependencyTooltipMarkdown explains stale cached registry data", () => {

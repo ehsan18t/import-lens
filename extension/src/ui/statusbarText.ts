@@ -24,12 +24,12 @@ export const statusBarText = (state: StatusBarState): string => {
 export const statusBarTooltip = (state: StatusBarState): string => {
   switch (state.kind) {
     case "size":
-      return `ImportLens — current file bundle size (${state.label})`;
+      return `ImportLens: Current file bundle size (${state.label})`;
     case "computing":
-      return "ImportLens — computing current file size";
+      return "ImportLens: Computing current file size";
     case "unavailable":
-      return "ImportLens — daemon unavailable";
+      return "ImportLens: Daemon unavailable";
     case "ready":
-      return "ImportLens — ready";
+      return "ImportLens: Ready";
   }
 };
