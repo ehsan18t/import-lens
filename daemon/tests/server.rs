@@ -514,6 +514,113 @@ async fn shutdown_server(
 }
 
 #[tokio::test]
+async fn server_batches_cached_registry_hint_partials() {
+    let workspace = temp_workspace();
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let registry_hints = RegistryHintService::new(
+        RegistryMetadataCache::empty(),
+        Box::new(DelayedRegistryClient),
+    );
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64;
+    for package_name in ["react", "vue", "svelte"] {
+        registry_hints
+            .write_metadata_for_tests(package_name, "9.0.0", now)
+            .expect("seed cached registry metadata");
+    }
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new_with_registry_hints_for_tests(
+                registry_hints,
+            )),
+            Prefetcher::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = RegistryRefreshResponseReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+    client_stream
+        .write_all(
+            &encode_frame(&RefreshRegistryHintsRequest {
+                message_type: "refresh_registry_hints".to_owned(),
+                version: PROTOCOL_VERSION,
+                request_id: 23,
+                targets: vec![
+                    RegistryHintTarget {
+                        name: "react".to_owned(),
+                        installed_version: Some("1.0.0".to_owned()),
+                    },
+                    RegistryHintTarget {
+                        name: "vue".to_owned(),
+                        installed_version: Some("1.0.0".to_owned()),
+                    },
+                    RegistryHintTarget {
+                        name: "svelte".to_owned(),
+                        installed_version: Some("1.0.0".to_owned()),
+                    },
+                ],
+                mode: RegistryHintMode::RefreshStale,
+                source: Some("test/package.json".to_owned()),
+            })
+            .expect("registry refresh request should encode"),
+        )
+        .await
+        .expect("request should be written");
+
+    let cached_partial = tokio::time::timeout(
+        Duration::from_millis(200),
+        reader.read_response(&mut client_stream),
+    )
+    .await
+    .expect("cached registry partial should arrive");
+    assert_eq!(cached_partial.request_id, 23);
+    assert_eq!(cached_partial.indexes, Some(vec![0, 1, 2]));
+    assert_eq!(cached_partial.results.len(), 3);
+    assert!(
+        cached_partial
+            .results
+            .iter()
+            .all(|result| result.origin.as_deref() == Some("cache"))
+    );
+
+    let final_response = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let response = reader.read_response(&mut client_stream).await;
+            if response.indexes.is_none() {
+                return response;
+            }
+        }
+    })
+    .await
+    .expect("final registry refresh response should arrive");
+    assert_eq!(final_response.results.len(), 3);
+
+    client_stream
+        .write_all(
+            &encode_frame(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("shutdown should encode"),
+        )
+        .await
+        .expect("shutdown should be written");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should exit cleanly");
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+#[tokio::test]
 async fn server_responds_to_cache_status_request() {
     let workspace = temp_workspace();
     let (mut client_stream, server_stream) = duplex(64 * 1024);

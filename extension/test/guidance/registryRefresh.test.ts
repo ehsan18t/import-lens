@@ -38,20 +38,24 @@ const targetFor = (state: PackageJsonDependencyHintState): RegistryHintTarget =>
 interface TestHarness {
   host: RegistryRefreshHost<string, PackageJsonDependencyHintState>;
   current(name: string): PackageJsonDependencyHintState | undefined;
+  setCalls(): number;
 }
 
 const createHarness = (initial: PackageJsonDependencyHintState[]): TestHarness => {
   const states = new Map<string, PackageJsonDependencyHintState[]>([[uriKey, initial]]);
+  let setCallCount = 0;
 
   return {
     host: {
       keyFor: (uri) => uri,
       getStates: (uri) => states.get(uri),
       setStates: (uri, next) => {
+        setCallCount += 1;
         states.set(uri, next);
       },
     },
     current: (name) => states.get(uriKey)?.find((state) => state.name === name),
+    setCalls: () => setCallCount,
   };
 };
 
@@ -399,4 +403,50 @@ test("logs the summary once even when the daemon streams partials", async () => 
   assert.ok(summaries[0].includes("2 target(s): 1 cached, 1 fetched, 0 failed"));
   // Each package's verbose line appears once, not once per partial + once for final.
   assert.equal(messages.filter((message) => message.includes("fetched (network) for a")).length, 1);
+});
+
+test("applies batched registry hint partials with one state update", async () => {
+  const a = stateFor("a");
+  const b = stateFor("b");
+  const harness = createHarness([a, b]);
+  const daemon: RegistryRefreshTransport = {
+    refreshRegistryHints: (request, onPartial) => {
+      const results = [
+        {
+          target: request.targets[0],
+          hint: { latestVersion: "2.0.0", isLatest: false, fetchedAt: 1 },
+          error: null,
+          origin: "cache" as const,
+        },
+        {
+          target: request.targets[1],
+          hint: { latestVersion: "3.0.0", isLatest: false, fetchedAt: 1 },
+          error: null,
+          origin: "cache" as const,
+        },
+      ];
+      onPartial?.({
+        version: request.version,
+        request_id: request.request_id,
+        results,
+        indexes: [0, 1],
+        error: null,
+        diagnostics: [],
+      });
+      return Promise.resolve({
+        version: request.version,
+        request_id: request.request_id,
+        results,
+        error: null,
+        diagnostics: [],
+      });
+    },
+  };
+  const refresher = new RegistryHintRefresher(daemon, harness.host, silentLogger);
+
+  await refresher.refresh(uriKey, [targetFor(a), targetFor(b)], "refresh_stale");
+
+  assert.equal(harness.current("a")?.registryHint?.latestVersion, "2.0.0");
+  assert.equal(harness.current("b")?.registryHint?.latestVersion, "3.0.0");
+  assert.equal(harness.setCalls(), 1);
 });

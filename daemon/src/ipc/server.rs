@@ -721,13 +721,21 @@ where
                 tokio::spawn(async move {
                     let mut ordered_results = vec![None; target_count];
                     while let Some((index, result)) = partial_rx.recv().await {
-                        ordered_results[index] = Some(result.clone());
+                        let mut indexes = vec![index];
+                        let mut results = vec![result];
+                        while let Ok((index, result)) = partial_rx.try_recv() {
+                            indexes.push(index);
+                            results.push(result);
+                        }
+                        for (index, result) in indexes.iter().zip(results.iter()) {
+                            ordered_results[*index] = Some(result.clone());
+                        }
                         let _ = outbound.send(ServerOutboundMessage::RefreshRegistryHints(
                             RefreshRegistryHintsResponse {
                                 version,
                                 request_id,
-                                results: vec![result],
-                                indexes: Some(vec![index]),
+                                results,
+                                indexes: Some(indexes),
                                 error: None,
                                 diagnostics: Vec::new(),
                             },
