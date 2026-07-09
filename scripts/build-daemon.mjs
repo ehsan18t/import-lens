@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   cargoBuildArgsForTarget,
   cargoXwinArgsForTarget,
+  cargoXwinEnvForTarget,
   cargoZigbuildArgsForTarget,
   currentPlatformTarget,
   targetInfo,
@@ -33,10 +34,12 @@ const cargoArgs = useXwin
   : useZigbuild
     ? cargoZigbuildArgsForTarget(platformTarget)
     : cargoBuildArgsForTarget(platformTarget);
+const cargoEnv = useXwin ? cargoXwinEnvForTarget(platformTarget, process.env) : process.env;
 
 console.log(`Building daemon for ${platformTarget} (${info.rustTarget})...`);
 const result = spawnSync("cargo", cargoArgs, {
   cwd: repoRoot,
+  env: cargoEnv,
   stdio: "inherit",
 });
 

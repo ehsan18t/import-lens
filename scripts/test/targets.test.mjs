@@ -5,6 +5,7 @@ import {
   artifactPathForTarget,
   cargoBuildArgsForTarget,
   cargoXwinArgsForTarget,
+  cargoXwinEnvForTarget,
   cargoZigbuildArgsForTarget,
   platformTargets,
   targetInfo,
@@ -77,12 +78,26 @@ test("cargoXwinArgsForTarget cross-compiles the MSVC target from Linux", () => {
   assert.deepEqual(cargoXwinArgsForTarget("win32-arm64"), [
     "xwin",
     "build",
+    "--cross-compiler",
+    "clang",
     "-p",
     "import-lens-daemon",
     "--release",
     "--target",
     "aarch64-pc-windows-msvc",
   ]);
+});
+
+test("cargoXwinEnvForTarget disables zstd intrinsics only for Windows ARM64", () => {
+  assert.deepEqual(cargoXwinEnvForTarget("win32-x64", { CFLAGS: "-DEXISTING=1" }), {
+    CFLAGS: "-DEXISTING=1",
+  });
+  assert.deepEqual(cargoXwinEnvForTarget("win32-arm64", {}), {
+    CFLAGS: "-DZSTD_NO_INTRINSICS",
+  });
+  assert.deepEqual(cargoXwinEnvForTarget("win32-arm64", { CFLAGS: "-DEXISTING=1" }), {
+    CFLAGS: "-DEXISTING=1 -DZSTD_NO_INTRINSICS",
+  });
 });
 
 test("vsixNameForTarget includes package name, platform target, and version", () => {

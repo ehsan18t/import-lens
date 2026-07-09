@@ -99,14 +99,43 @@ export const cargoZigbuildArgsForTarget = (platformTarget) => {
   return ["zigbuild", "-p", "import-lens-daemon", "--release", "--target", info.rustTarget];
 };
 
+const appendCFlag = (existingValue, flag) => (existingValue ? `${existingValue} ${flag}` : flag);
+
 // zig cannot target the MSVC ABI, so the Windows targets cross-compile from
-// Linux with cargo-xwin (clang-cl + lld-link against a splatted Windows
-// SDK/CRT). The artifact lands at the same target/<triple>/release path as a
-// native build, so artifactPathForTarget needs no special-casing.
+// Linux with cargo-xwin against a splatted Windows SDK/CRT. The artifact lands
+// at the same target/<triple>/release path as a native build, so
+// artifactPathForTarget needs no special-casing.
 export const cargoXwinArgsForTarget = (platformTarget) => {
   const info = targetInfo(platformTarget);
+  // ring's build script trips over the clang-cl CFLAGS shape for Windows ARM64
+  // in the Linux builder, while cargo-xwin's clang backend compiles it cleanly.
+  const crossCompilerArgs = platformTarget === "win32-arm64" ? ["--cross-compiler", "clang"] : [];
 
-  return ["xwin", "build", "-p", "import-lens-daemon", "--release", "--target", info.rustTarget];
+  return [
+    "xwin",
+    "build",
+    ...crossCompilerArgs,
+    "-p",
+    "import-lens-daemon",
+    "--release",
+    "--target",
+    info.rustTarget,
+  ];
+};
+
+export const cargoXwinEnvForTarget = (platformTarget, baseEnv = process.env) => {
+  targetInfo(platformTarget);
+
+  if (platformTarget !== "win32-arm64") {
+    return baseEnv;
+  }
+
+  return {
+    ...baseEnv,
+    // zstd's ARM64 NEON intrinsics produce unresolved SIMDe helper symbols under
+    // the clang cargo-xwin backend; scalar code keeps this cross-build linkable.
+    CFLAGS: appendCFlag(baseEnv.CFLAGS, "-DZSTD_NO_INTRINSICS"),
+  };
 };
 
 // All build artifacts live under dist/ (target/ is the one Rust-convention
