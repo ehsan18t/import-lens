@@ -1280,26 +1280,135 @@ impl ImportLensService {
             );
         }
 
-        let analysis_started_at = Instant::now();
-        let indexed_results = import_requests
+        enum PendingPackageJsonAnalysis {
+            Resolved {
+                import_request: ImportRequest,
+                resolved: ResolvedPackage,
+                cache_key: String,
+            },
+            Unresolved {
+                import_request: ImportRequest,
+            },
+        }
+
+        enum PackageJsonCacheClassification {
+            Cached {
+                index: usize,
+                result: ImportResult,
+            },
+            Pending {
+                index: usize,
+                analysis: PendingPackageJsonAnalysis,
+            },
+        }
+
+        let package_cache = self.cache_registry.cache_for_root(&context.workspace_root);
+        let classifications = import_requests
             .par_iter()
             .enumerate()
-            .filter_map(|(index, prepared)| prepared.as_ref().map(|item| (index, item)))
-            .map(|(index, (import_request, resolved))| {
-                let result = match resolved {
-                    Some(resolved) => self.analyze_resolved_with_cache(
-                        &context,
+            .filter_map(|(index, prepared)| {
+                let (import_request, resolved) = prepared.as_ref()?;
+
+                let Some(resolved) = resolved else {
+                    return Some(PackageJsonCacheClassification::Pending {
+                        index,
+                        analysis: PendingPackageJsonAnalysis::Unresolved {
+                            import_request: import_request.clone(),
+                        },
+                    });
+                };
+
+                let (cache_key, cached_result) = fresh_cached_result_for_resolved_import(
+                    package_cache.as_ref(),
+                    import_request,
+                    resolved,
+                    ReadIntent::Interactive,
+                );
+                if let Some(result) = cached_result {
+                    return Some(PackageJsonCacheClassification::Cached { index, result });
+                }
+
+                Some(PackageJsonCacheClassification::Pending {
+                    index,
+                    analysis: PendingPackageJsonAnalysis::Resolved {
+                        import_request: import_request.clone(),
+                        resolved: resolved.clone(),
+                        cache_key,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut cached_indexed_results = Vec::new();
+        let mut pending_analysis = Vec::new();
+        for classification in classifications {
+            match classification {
+                PackageJsonCacheClassification::Cached { index, result } => {
+                    cached_indexed_results.push((index, result));
+                }
+                PackageJsonCacheClassification::Pending { index, analysis } => {
+                    pending_analysis.push((index, analysis));
+                }
+            }
+        }
+        cached_indexed_results.sort_by_key(|(index, _)| *index);
+        pending_analysis.sort_by_key(|(index, _)| *index);
+
+        if let Some(emit_partial) = emit_partial.as_ref()
+            && !cached_indexed_results.is_empty()
+        {
+            let mut indexes = Vec::with_capacity(cached_indexed_results.len());
+            let mut cached_states = Vec::with_capacity(cached_indexed_results.len());
+            for (index, result) in &cached_indexed_results {
+                let mut state = states[*index].clone();
+                state.status = ImportAnalysisStatus::Ready;
+                state.result = Some(result.clone());
+                indexes.push(*index);
+                cached_states.push(state);
+            }
+            emit_partial(AnalyzePackageJsonResponse {
+                version: request.version,
+                request_id: request.request_id,
+                sections: Vec::new(),
+                states: cached_states,
+                indexes: Some(indexes),
+                error: None,
+                diagnostics: Vec::new(),
+            });
+            crate::logging::log_debug(
+                "package_json",
+                format!(
+                    "request {} emitted cached size partial for {} dependencies after {}ms",
+                    request.request_id,
+                    cached_indexed_results.len(),
+                    request_started_at.elapsed().as_millis()
+                ),
+            );
+        }
+
+        let analysis_started_at = Instant::now();
+        let analyzed_results = pending_analysis
+            .into_par_iter()
+            .map(|(index, pending)| {
+                let result = match pending {
+                    PendingPackageJsonAnalysis::Resolved {
                         import_request,
-                        resolved.clone(),
-                        false,
-                        ReadIntent::Interactive,
-                    ),
-                    None => self.analyze_with_cache(
+                        resolved,
+                        cache_key,
+                    } => self.analyze_and_cache(
+                        package_cache.as_ref(),
                         &context,
-                        import_request,
-                        false,
-                        ReadIntent::Interactive,
+                        &import_request,
+                        cache_key,
+                        resolved,
+                        || true,
                     ),
+                    PendingPackageJsonAnalysis::Unresolved { import_request } => self
+                        .analyze_with_cache(
+                            &context,
+                            &import_request,
+                            false,
+                            ReadIntent::Interactive,
+                        ),
                 };
 
                 if let Some(emit_partial) = emit_partial.as_ref() {
@@ -1320,6 +1429,9 @@ impl ImportLensService {
                 (index, result)
             })
             .collect::<Vec<_>>();
+        let mut indexed_results = cached_indexed_results;
+        indexed_results.extend(analyzed_results);
+        indexed_results.sort_by_key(|(index, _)| *index);
         let cache_hits = indexed_results
             .iter()
             .filter(|(_, result)| result.cache_hit)
@@ -2035,7 +2147,6 @@ impl ImportLensService {
                 lookup_started_at.elapsed(),
             );
         } else {
-            let lookup_started_at = Instant::now();
             // Force-fresh (CI / `importlens check`, §4.5): serve ONLY a value verified
             // `Fresh` against disk, across BOTH the memory working set and the disk
             // cache. `get_if_fresh` returns `None` on Unknown/Stale/Gone/miss, so a
@@ -2044,23 +2155,10 @@ impl ImportLensService {
             // reaches CI; we recompute synchronously below instead. This single gate
             // also removes the double dependency re-verification of the prior
             // memory-only `probe_freshness` + `get`.
-            if let Some(result) = cache.get_if_fresh(&key) {
-                log_cache_lookup_timing(
-                    request,
-                    cache_read_mode_label(serve_stale, intent),
-                    true,
-                    Some(&result),
-                    lookup_started_at.elapsed(),
-                );
+            let cached = fresh_cached_result_for_key(cache.as_ref(), request, &key, intent);
+            if let Some(result) = cached {
                 return result;
             }
-            log_cache_lookup_timing(
-                request,
-                cache_read_mode_label(serve_stale, intent),
-                false,
-                None,
-                lookup_started_at.elapsed(),
-            );
         }
 
         self.analyze_and_cache(cache.as_ref(), context, request, key, resolved, || true)
@@ -2211,6 +2309,35 @@ fn cache_read_mode_label(serve_stale: bool, intent: ReadIntent) -> &'static str 
         (false, ReadIntent::Interactive) => "force_fresh_interactive",
         (false, ReadIntent::Bulk) => "force_fresh_bulk",
     }
+}
+
+fn fresh_cached_result_for_resolved_import(
+    cache: &ImportCache,
+    request: &ImportRequest,
+    resolved: &ResolvedPackage,
+    intent: ReadIntent,
+) -> (String, Option<ImportResult>) {
+    let key = cache_key_for_resolved_import(request, resolved);
+    let result = fresh_cached_result_for_key(cache, request, &key, intent);
+    (key, result)
+}
+
+fn fresh_cached_result_for_key(
+    cache: &ImportCache,
+    request: &ImportRequest,
+    key: &str,
+    intent: ReadIntent,
+) -> Option<ImportResult> {
+    let lookup_started_at = Instant::now();
+    let result = cache.get_if_fresh(key);
+    log_cache_lookup_timing(
+        request,
+        cache_read_mode_label(false, intent),
+        result.is_some(),
+        result.as_ref(),
+        lookup_started_at.elapsed(),
+    );
+    result
 }
 
 fn log_cache_lookup_timing(

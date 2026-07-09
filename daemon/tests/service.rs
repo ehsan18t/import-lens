@@ -76,6 +76,27 @@ fn active_document_path(workspace: &Path) -> String {
         .to_string()
 }
 
+fn package_json_request(
+    workspace: &Path,
+    request_id: u64,
+    source: &str,
+    streaming: bool,
+) -> AnalyzePackageJsonRequest {
+    AnalyzePackageJsonRequest {
+        message_type: "analyze_package_json".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace.join("package.json").to_string_lossy().to_string(),
+        source: source.to_owned(),
+        include_registry_hints: false,
+        force_registry_refresh: false,
+        refresh_section: None,
+        registry_hint_mode: None,
+        streaming,
+    }
+}
+
 fn write_tiny_package_with_source(workspace: &Path, source: &str) {
     let package_root = workspace.join("node_modules").join("tiny-lib");
     fs::create_dir_all(&package_root).expect("package root should be created");
@@ -1255,6 +1276,86 @@ fn service_streams_package_json_loading_states_before_ready_results() {
             partial.indexes.as_deref() == Some(&[tiny_index])
                 && partial.states.first().is_some_and(|state| {
                     state.name == "tiny-lib" && state.status == ImportAnalysisStatus::Ready
+                })
+        }),
+        "{partials:?}",
+    );
+}
+
+#[test]
+fn service_batches_cached_package_json_size_partials_before_uncached_work() {
+    let workspace = temp_workspace();
+    for package_name in ["cached-a", "cached-b", "cached-c", "uncached-d"] {
+        write_named_package(&workspace, package_name);
+    }
+    let service = ImportLensService::new(None, false);
+    let warm_source =
+        r#"{"dependencies":{"cached-a":"^1.0.0","cached-b":"^1.0.0","cached-c":"^1.0.0"}}"#;
+    let streamed_source = r#"{"dependencies":{"cached-a":"^1.0.0","cached-b":"^1.0.0","cached-c":"^1.0.0","uncached-d":"^1.0.0"}}"#;
+
+    let warmup = service.handle_analyze_package_json(package_json_request(
+        &workspace,
+        37,
+        warm_source,
+        false,
+    ));
+    assert_eq!(warmup.error, None);
+    assert_eq!(warmup.states.len(), 3);
+    assert!(
+        warmup
+            .states
+            .iter()
+            .all(|state| state.status == ImportAnalysisStatus::Ready),
+        "{warmup:?}",
+    );
+
+    let partials = Mutex::new(Vec::new());
+    let response = service.handle_analyze_package_json_streaming(
+        package_json_request(&workspace, 38, streamed_source, true),
+        |partial| {
+            partials
+                .lock()
+                .expect("partials lock should not be poisoned")
+                .push(partial);
+        },
+    );
+    let partials = partials
+        .into_inner()
+        .expect("partials lock should not be poisoned");
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.error, None);
+    assert_eq!(response.states.len(), 4);
+    let cached_ready = partials
+        .iter()
+        .find(|partial| {
+            partial.indexes.as_deref() == Some(&[0, 1, 2])
+                && partial.states.len() == 3
+                && partial.states.iter().all(|state| {
+                    state.status == ImportAnalysisStatus::Ready
+                        && state.result.as_ref().is_some_and(|result| result.cache_hit)
+                })
+        })
+        .expect("cached package sizes should stream as one indexed partial");
+    assert_eq!(
+        cached_ready
+            .states
+            .iter()
+            .map(|state| state.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cached-a", "cached-b", "cached-c"],
+        "{cached_ready:?}",
+    );
+    assert!(
+        partials.iter().any(|partial| {
+            partial.indexes.as_deref() == Some(&[3])
+                && partial.states.first().is_some_and(|state| {
+                    state.name == "uncached-d"
+                        && state.status == ImportAnalysisStatus::Ready
+                        && state
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| !result.cache_hit)
                 })
         }),
         "{partials:?}",
