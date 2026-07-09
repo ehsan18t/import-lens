@@ -60,7 +60,7 @@ test("dependency policy pins build tooling and removes stale extension-host queu
   const dockerfile = repoFile("Dockerfile.build");
   const tsdownConfig = repoFile("tsdown.config.ts");
 
-  assert.match(manifest.packageManager, /^pnpm@11[.]9[.]0[+]sha512[.]/u);
+  assert.match(manifest.packageManager, /^pnpm@11[.]10[.]0[+]sha512[.]/u);
 
   // Version constraints follow the blast-radius policy.
   // Exact pin: @types/vscode tracks the engines.vscode floor (min supported API),
@@ -84,16 +84,16 @@ test("dependency policy pins build tooling and removes stale extension-host queu
   assert.match(manifest.devDependencies["@types/node"], /^\^24[.]/u);
 
   // PNPM_VERSION lives in every workflow that installs pnpm; keep them in lockstep.
-  assert.match(validateWorkflow, /^ {2}PNPM_VERSION: 11[.]9[.]0$/mu);
-  assert.match(buildWorkflow, /^ {2}PNPM_VERSION: 11[.]9[.]0$/mu);
-  assert.match(releaseWorkflow, /^ {2}PNPM_VERSION: 11[.]9[.]0$/mu);
+  assert.match(validateWorkflow, /^ {2}PNPM_VERSION: 11[.]10[.]0$/mu);
+  assert.match(buildWorkflow, /^ {2}PNPM_VERSION: 11[.]10[.]0$/mu);
+  assert.match(releaseWorkflow, /^ {2}PNPM_VERSION: 11[.]10[.]0$/mu);
   assert.match(validateWorkflow, /node-version: 24/u);
   assert.match(releaseWorkflow, /node-version: 24/u);
   assert.doesNotMatch(validateWorkflow, new RegExp(`node-version: ${22}`, "u"));
   assert.doesNotMatch(releaseWorkflow, new RegExp(`node-version: ${22}`, "u"));
 
   assert.match(dockerfile, /^FROM node:24-bookworm$/mu);
-  assert.match(dockerfile, /^ARG PNPM_VERSION=11[.]9[.]0$/mu);
+  assert.match(dockerfile, /^ARG PNPM_VERSION=11[.]10[.]0$/mu);
   assert.match(dockerfile, /Expected Node 24[.]11[+] build image/u);
   assert.match(tsdownConfig, /target: "node20"/u);
   assert.match(tsdownConfig, /platform: "node"/u);

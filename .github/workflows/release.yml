@@ -36,7 +36,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PNPM_VERSION: 11.9.0
+  PNPM_VERSION: 11.10.0
 
 jobs:
   release:

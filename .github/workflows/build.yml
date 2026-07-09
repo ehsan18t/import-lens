@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PNPM_VERSION: 11.9.0
+  PNPM_VERSION: 11.10.0
 
 jobs:
   # Resolve the version once and run the full release-gate validation (perf +

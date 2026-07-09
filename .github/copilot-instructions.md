@@ -26,7 +26,7 @@ A caret/tilde range is the intended policy — **do not flag it as an error**.
 | `redb` (Rust)         | `^4`       | Track minor+patch. v4.0.0 minimum (NOT v3).     |
 | `papaya` (Rust)       | `~0.2`     | Patch-pin; lock-free, requires pin API.         |
 | Node.js (build)       | `24 LTS`   | Build/test/package only.                        |
-| `pnpm`                | `11.9.0`   | Pinned through Corepack and CI.                 |
+| `pnpm`                | `11.10.0`  | Pinned through Corepack and CI.                 |
 | `@types/vscode`       | `1.90.0`   | Matches `engines.vscode` baseline.              |
 | `typescript`          | `6.0.3`    | TS 6.x, NOT 5.x.                                |
 | `tsdown`              | `0.22.3`   | Rolldown-powered bundler.                       |
