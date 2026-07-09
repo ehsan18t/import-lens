@@ -303,57 +303,63 @@ impl RegistryHintService {
         mode: RegistryHintMode,
         now_ms: u64,
     ) -> Option<RegistryHintLookup> {
-        if mode == RegistryHintMode::Off {
-            return Some(RegistryHintLookup {
-                hint: None,
-                error: None,
-                origin: RegistryHintOrigin::Cache,
-            });
-        }
-
         let cached = self.cache.get(package_name);
-        if mode == RegistryHintMode::Cached {
-            return Some(
-                cached
-                    .as_ref()
-                    .map(|entry| {
-                        lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache)
-                    })
-                    .unwrap_or(RegistryHintLookup {
+        let manual_cooldown_active = mode == RegistryHintMode::ForceRefresh
+            && cached.is_some()
+            && self.manual_cooldown_active(package_name);
+        cached_lookup_from_entry(
+            cached.as_ref(),
+            installed_version,
+            mode,
+            now_ms,
+            manual_cooldown_active,
+        )
+    }
+
+    pub(crate) fn cached_lookups_for_mode(
+        &self,
+        targets: &[(&str, Option<&str>)],
+        mode: RegistryHintMode,
+        now_ms: u64,
+    ) -> Vec<Option<RegistryHintLookup>> {
+        if mode == RegistryHintMode::Off {
+            return targets
+                .iter()
+                .map(|_| {
+                    Some(RegistryHintLookup {
                         hint: None,
                         error: None,
                         origin: RegistryHintOrigin::Cache,
-                    }),
-            );
+                    })
+                })
+                .collect();
         }
 
-        let entry = cached.as_ref()?;
-        if mode == RegistryHintMode::RefreshStale
-            && (is_usable_without_fetch(entry, now_ms)
-                || entry
-                    .retry_after
-                    .is_some_and(|retry_after| retry_after > now_ms))
-        {
-            return Some(lookup_from_entry(
-                entry,
-                installed_version,
-                RegistryHintOrigin::Cache,
-            ));
-        }
+        let cached_entries = self
+            .cache
+            .get_many(targets.iter().map(|(package_name, _)| *package_name));
+        let manual_cooldown_hits = if mode == RegistryHintMode::ForceRefresh {
+            self.manual_cooldown_hits(targets.iter().map(|(package_name, _)| *package_name))
+        } else {
+            vec![false; targets.len()]
+        };
 
-        // D5: a manual re-click within the cooldown coalesces to the value the
-        // previous manual fetch just cached — no new request, no error. Ordered
-        // before single-flight and the rate limiter so an accidental double-click
-        // is a pure no-op returning the cached entry.
-        if mode == RegistryHintMode::ForceRefresh && self.manual_cooldown_active(package_name) {
-            return Some(lookup_from_entry(
-                entry,
-                installed_version,
-                RegistryHintOrigin::Cache,
-            ));
-        }
-
-        None
+        targets
+            .iter()
+            .zip(cached_entries.iter())
+            .zip(manual_cooldown_hits.iter())
+            .map(
+                |(((.., installed_version), cached), manual_cooldown_active)| {
+                    cached_lookup_from_entry(
+                        cached.as_ref(),
+                        *installed_version,
+                        mode,
+                        now_ms,
+                        *manual_cooldown_active,
+                    )
+                },
+            )
+            .collect()
     }
 
     /// Whether package `P` had a successful manual fetch within the last
@@ -367,6 +373,26 @@ impl RegistryHintService {
                 .is_some_and(|last| last.elapsed() < cooldown),
             // Poisoned cooldown map: do not suppress the refresh.
             Err(_) => false,
+        }
+    }
+
+    fn manual_cooldown_hits<'a>(
+        &self,
+        package_names: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<bool> {
+        let keys: Vec<_> = package_names.into_iter().map(cache::cache_key).collect();
+        let cooldown = Duration::from_millis(MANUAL_REFRESH_COOLDOWN_MS);
+        match self.manual_cooldowns.lock() {
+            Ok(cooldowns) => keys
+                .iter()
+                .map(|key| {
+                    cooldowns
+                        .get(key)
+                        .is_some_and(|last| last.elapsed() < cooldown)
+                })
+                .collect(),
+            // Poisoned cooldown map: do not suppress any refresh.
+            Err(_) => vec![false; keys.len()],
         }
     }
 
@@ -663,6 +689,60 @@ fn is_usable_without_fetch(entry: &RegistryPackageMetadataEntry, now_ms: u64) ->
     entry.not_found && now_ms.saturating_sub(entry.updated_at) <= NOT_FOUND_TTL_MS
 }
 
+fn cached_lookup_from_entry(
+    cached: Option<&RegistryPackageMetadataEntry>,
+    installed_version: Option<&str>,
+    mode: RegistryHintMode,
+    now_ms: u64,
+    manual_cooldown_active: bool,
+) -> Option<RegistryHintLookup> {
+    if mode == RegistryHintMode::Off {
+        return Some(RegistryHintLookup {
+            hint: None,
+            error: None,
+            origin: RegistryHintOrigin::Cache,
+        });
+    }
+
+    if mode == RegistryHintMode::Cached {
+        return Some(
+            cached
+                .map(|entry| lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache))
+                .unwrap_or(RegistryHintLookup {
+                    hint: None,
+                    error: None,
+                    origin: RegistryHintOrigin::Cache,
+                }),
+        );
+    }
+
+    let entry = cached?;
+    if mode == RegistryHintMode::RefreshStale
+        && (is_usable_without_fetch(entry, now_ms)
+            || entry
+                .retry_after
+                .is_some_and(|retry_after| retry_after > now_ms))
+    {
+        return Some(lookup_from_entry(
+            entry,
+            installed_version,
+            RegistryHintOrigin::Cache,
+        ));
+    }
+
+    // D5: a manual re-click within the cooldown coalesces to the value the
+    // previous manual fetch just cached — no new request, no error.
+    if mode == RegistryHintMode::ForceRefresh && manual_cooldown_active {
+        return Some(lookup_from_entry(
+            entry,
+            installed_version,
+            RegistryHintOrigin::Cache,
+        ));
+    }
+
+    None
+}
+
 fn lookup_from_entry(
     entry: &RegistryPackageMetadataEntry,
     installed_version: Option<&str>,
@@ -936,6 +1016,73 @@ mod tests {
         assert!(
             !cooldowns.contains_key(&cache::cache_key("stale")),
             "an elapsed cooldown stamp is swept"
+        );
+    }
+
+    #[test]
+    fn batched_cached_lookup_preserves_refresh_and_manual_cooldown_policy() {
+        let service = RegistryHintService::disabled();
+        let now_ms = FRESH_HINT_TTL_MS + 2_000;
+        service
+            .write_metadata_for_tests("fresh", "2.0.0", now_ms - 1_000)
+            .expect("write fresh");
+        service
+            .write_metadata_for_tests("stale", "2.0.0", 0)
+            .expect("write stale");
+        service
+            .write_metadata_for_tests("manual-cached", "2.0.0", 1_000)
+            .expect("write manual cached");
+        service
+            .write_metadata_for_tests("manual-no-cooldown", "2.0.0", 1_000)
+            .expect("write manual no cooldown");
+        service.record_manual_fetch("manual-cached");
+
+        let refresh = service.cached_lookups_for_mode(
+            &[
+                ("fresh", Some("1.0.0")),
+                ("stale", Some("1.0.0")),
+                ("missing", Some("1.0.0")),
+            ],
+            RegistryHintMode::RefreshStale,
+            now_ms,
+        );
+
+        assert_eq!(refresh.len(), 3);
+        assert_eq!(
+            refresh[0].as_ref().map(|lookup| lookup.origin),
+            Some(RegistryHintOrigin::Cache)
+        );
+        assert!(
+            refresh[1].is_none(),
+            "stale cached refresh target must still go to the network pool"
+        );
+        assert!(
+            refresh[2].is_none(),
+            "missing refresh target must still go to the network pool"
+        );
+
+        let force = service.cached_lookups_for_mode(
+            &[
+                ("manual-cached", Some("1.0.0")),
+                ("manual-no-cooldown", Some("1.0.0")),
+                ("missing", Some("1.0.0")),
+            ],
+            RegistryHintMode::ForceRefresh,
+            1_100,
+        );
+
+        assert_eq!(force.len(), 3);
+        assert_eq!(
+            force[0].as_ref().map(|lookup| lookup.origin),
+            Some(RegistryHintOrigin::Cache)
+        );
+        assert!(
+            force[1].is_none(),
+            "manual refresh without an active cooldown must go to the network pool"
+        );
+        assert!(
+            force[2].is_none(),
+            "missing manual refresh target must go to the network pool"
         );
     }
 

@@ -84,6 +84,21 @@ impl RegistryMetadataCache {
             .cloned()
     }
 
+    pub fn get_many<I, S>(&self, package_names: I) -> Vec<Option<RegistryPackageMetadataEntry>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let keys: Vec<_> = package_names
+            .into_iter()
+            .map(|package_name| cache_key(package_name.as_ref()))
+            .collect();
+        let Ok(entries) = self.entries.lock() else {
+            return vec![None; keys.len()];
+        };
+        keys.iter().map(|key| entries.get(key).cloned()).collect()
+    }
+
     pub fn write_entry(
         &self,
         package_name: &str,

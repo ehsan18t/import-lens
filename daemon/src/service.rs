@@ -300,24 +300,12 @@ impl ImportLensService {
         self.registry_executor.spawn(job);
     }
 
-    fn cached_registry_hint_target(
-        &self,
-        target: &RegistryHintTarget,
-        mode: ProtocolRegistryHintMode,
-        now_ms: u64,
-    ) -> Option<RegistryHintResult> {
-        self.registry_hints
-            .cached_lookup_for_mode(
-                &target.name,
-                target.installed_version.as_deref(),
-                registry_hint_service_mode(mode),
-                now_ms,
-            )
-            .map(|lookup| registry_hint_result_from_lookup(target.clone(), lookup))
-    }
-
     /// Fans a bulk "refresh dependency block" onto the isolated registry pool
-    /// (D7 / §6.1). Two properties this drain guarantees:
+    /// (D7 / §6.1). Three properties this drain guarantees:
+    ///
+    /// * **Cache first.** Non-cancelled targets are classified through one
+    ///   cache-only pre-pass. Cache-eligible results stream immediately, and
+    ///   only unresolved targets are enqueued for network refresh.
     ///
     /// * **Bounded in flight.** Each target is a `spawn` onto the
     ///   `REGISTRY_REFRESH_CONCURRENCY`-thread pool, never a per-target thread,
@@ -333,8 +321,8 @@ impl ImportLensService {
     ///
     /// `on_result` is invoked exactly once per target with the job's index and
     /// either the fetched `RegistryHintResult` or `None` when the job was
-    /// skipped by cancellation. Every job that runs still honors single-flight,
-    /// the D-c cooldown, and the shared rate limiter.
+    /// skipped by cancellation. Every unresolved target that runs as a worker
+    /// still honors single-flight, the D-c cooldown, and the shared rate limiter.
     pub fn spawn_registry_refresh_block<F>(
         self: &std::sync::Arc<Self>,
         targets: Vec<RegistryHintTarget>,
@@ -345,14 +333,39 @@ impl ImportLensService {
     ) where
         F: Fn(usize, Option<RegistryHintResult>) + Send + Clone + 'static,
     {
+        let mut pending = Vec::with_capacity(targets.len());
         for (index, target) in targets.into_iter().enumerate() {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                let on_result = on_result.clone();
+                on_result(index, None);
+                continue;
+            }
+            pending.push((index, target));
+        }
+
+        let cached_lookups = {
+            let lookup_targets: Vec<_> = pending
+                .iter()
+                .map(|(_, target)| (target.name.as_str(), target.installed_version.as_deref()))
+                .collect();
+            self.registry_hints.cached_lookups_for_mode(
+                &lookup_targets,
+                registry_hint_service_mode(mode),
+                now_ms,
+            )
+        };
+
+        for ((index, target), cached_lookup) in pending.into_iter().zip(cached_lookups) {
             let on_result = on_result.clone();
             if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 on_result(index, None);
                 continue;
             }
-            if let Some(result) = self.cached_registry_hint_target(&target, mode, now_ms) {
-                on_result(index, Some(result));
+            if let Some(lookup) = cached_lookup {
+                on_result(
+                    index,
+                    Some(registry_hint_result_from_lookup(target, lookup)),
+                );
                 continue;
             }
 

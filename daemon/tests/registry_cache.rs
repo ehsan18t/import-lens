@@ -84,6 +84,37 @@ fn schema_mismatch_wipes_on_load() {
 }
 
 #[test]
+fn get_many_returns_entries_in_input_order() {
+    let dir = common::temp_workspace("import-lens-registry-get-many");
+    let cache = RegistryMetadataCache::new(dir);
+    cache
+        .write_metadata("react", metadata("18.0.0"), 100)
+        .expect("write react");
+    cache
+        .write_metadata("vue", metadata("3.4.0"), 200)
+        .expect("write vue");
+
+    let results = cache.get_many(["missing", "vue", "react"]);
+
+    assert_eq!(results.len(), 3);
+    assert!(results[0].is_none(), "missing package should be a miss");
+    assert_eq!(
+        results[1]
+            .as_ref()
+            .and_then(|entry| entry.metadata.as_ref())
+            .and_then(|metadata| metadata.latest_version.as_deref()),
+        Some("3.4.0")
+    );
+    assert_eq!(
+        results[2]
+            .as_ref()
+            .and_then(|entry| entry.metadata.as_ref())
+            .and_then(|metadata| metadata.latest_version.as_deref()),
+        Some("18.0.0")
+    );
+}
+
+#[test]
 fn unrecognized_schema_version_wiped_on_load() {
     let dir = common::temp_workspace("import-lens-registry-version");
     let path = dir.join(REGISTRY_CACHE_FILE_NAME);
