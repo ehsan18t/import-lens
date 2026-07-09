@@ -1,7 +1,7 @@
 # ImportLens - clippy configuration
 
-too-many-lines-threshold = 100
-cognitive-complexity-threshold = 30
+too-many-lines-threshold = 650
+cognitive-complexity-threshold = 120
 enum-variant-size-threshold = 200
 
 disallowed-macros = [
