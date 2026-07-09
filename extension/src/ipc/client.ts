@@ -287,10 +287,20 @@ export class IpcClient extends EventEmitter {
   }
 
   #handleData(chunk: Buffer): void {
-    let messages: unknown[];
+    const messages = this.#decodeIncomingMessages(chunk);
 
+    if (!messages) {
+      return;
+    }
+
+    for (const message of messages) {
+      this.#routeIncomingMessage(message);
+    }
+  }
+
+  #decodeIncomingMessages(chunk: Buffer): unknown[] | null {
     try {
-      messages = this.#decoder.push(chunk);
+      return this.#decoder.push(chunk);
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(String(error));
 
@@ -299,99 +309,121 @@ export class IpcClient extends EventEmitter {
       }
 
       this.#handleClose(normalized);
+      return null;
+    }
+  }
+
+  #routeIncomingMessage(message: unknown): void {
+    if (isCacheStatusResponse(message)) {
+      this.#resolvePending(this.#cacheStatusPending, message);
       return;
     }
 
-    for (const message of messages) {
-      if (isCacheStatusResponse(message)) {
-        this.#resolvePending(this.#cacheStatusPending, message);
-        continue;
-      }
+    if (isCacheListResponse(message)) {
+      this.#resolvePending(this.#cacheListPending, message);
+      return;
+    }
 
-      if (isCacheListResponse(message)) {
-        this.#resolvePending(this.#cacheListPending, message);
-        continue;
-      }
+    if (isCacheRemoveResponse(message)) {
+      this.#resolvePending(this.#cacheRemovePending, message);
+      return;
+    }
 
-      if (isCacheRemoveResponse(message)) {
-        this.#resolvePending(this.#cacheRemovePending, message);
-        continue;
-      }
+    if (this.#routePackageJsonResponse(message)) {
+      return;
+    }
 
-      if (isAnalyzePackageJsonResponse(message)) {
-        const pending = this.#packageJsonPending.get(message.request_id);
+    if (isCompleteImportMembersResponse(message)) {
+      this.#resolvePending(this.#completionPending, message);
+      return;
+    }
 
-        if (!pending) {
-          continue;
-        }
+    if (isFileSizeDocumentResponse(message)) {
+      this.#resolvePending(this.#fileSizeDocumentPending, message);
+      return;
+    }
 
-        if (isPackageJsonStreamingPartial(message)) {
-          pending.resetTimeout();
-          pending.onPartial?.(message);
-          this.emit("packageJsonPartial", message);
-          continue;
-        }
+    if (this.#routeRegistryHintRefreshResponse(message)) {
+      return;
+    }
 
-        this.#packageJsonPending.delete(message.request_id);
-        pending.resolve(message);
-        continue;
-      }
+    if (isWorkspaceReportResponse(message)) {
+      this.#resolvePending(this.#workspaceReportPending, message);
+      return;
+    }
 
-      if (isCompleteImportMembersResponse(message)) {
-        this.#resolvePending(this.#completionPending, message);
-        continue;
-      }
+    if (isRefreshedResultsResponse(message)) {
+      // Unsolicited SWR push — no pending request to resolve. Emit for the
+      // subscriber that owns the AnalysisStore to merge in place.
+      this.emit("refreshedResults", message);
+      return;
+    }
 
-      if (isFileSizeDocumentResponse(message)) {
-        this.#resolvePending(this.#fileSizeDocumentPending, message);
-        continue;
-      }
+    if (this.#routeAnalyzeDocumentOrSpecifiersResponse(message)) {
+      return;
+    }
 
-      if (isRefreshRegistryHintsResponse(message)) {
-        const pending = this.#registryHintRefreshPending.get(message.request_id);
-
-        if (!pending) {
-          continue;
-        }
-
-        if (isRegistryHintRefreshPartial(message)) {
-          pending.resetTimeout();
-          pending.onPartial?.(message);
-          continue;
-        }
-
-        this.#registryHintRefreshPending.delete(message.request_id);
-        pending.resolve(message);
-        continue;
-      }
-
-      if (isWorkspaceReportResponse(message)) {
-        this.#resolvePending(this.#workspaceReportPending, message);
-        continue;
-      }
-
-      if (isRefreshedResultsResponse(message)) {
-        // Unsolicited SWR push — no pending request to resolve. Emit for the
-        // subscriber that owns the AnalysisStore to merge in place.
-        this.emit("refreshedResults", message);
-        continue;
-      }
-
-      if (isAnalyzeDocumentResponse(message)) {
-        if (this.#resolvePending(this.#documentPending, message)) {
-          continue;
-        }
-
-        this.#resolvePending(this.#specifiersPending, message);
-        continue;
-      }
-
-      if (!isEnumerateExportsResponse(message)) {
-        continue;
-      }
-
+    if (isEnumerateExportsResponse(message)) {
       this.#resolvePending(this.#exportsPending, message);
     }
+  }
+
+  #routePackageJsonResponse(message: unknown): boolean {
+    if (!isAnalyzePackageJsonResponse(message)) {
+      return false;
+    }
+
+    const pending = this.#packageJsonPending.get(message.request_id);
+
+    if (!pending) {
+      return true;
+    }
+
+    if (isPackageJsonStreamingPartial(message)) {
+      pending.resetTimeout();
+      pending.onPartial?.(message);
+      this.emit("packageJsonPartial", message);
+      return true;
+    }
+
+    this.#packageJsonPending.delete(message.request_id);
+    pending.resolve(message);
+    return true;
+  }
+
+  #routeRegistryHintRefreshResponse(message: unknown): boolean {
+    if (!isRefreshRegistryHintsResponse(message)) {
+      return false;
+    }
+
+    const pending = this.#registryHintRefreshPending.get(message.request_id);
+
+    if (!pending) {
+      return true;
+    }
+
+    if (isRegistryHintRefreshPartial(message)) {
+      pending.resetTimeout();
+      pending.onPartial?.(message);
+      return true;
+    }
+
+    this.#registryHintRefreshPending.delete(message.request_id);
+    pending.resolve(message);
+    return true;
+  }
+
+  #routeAnalyzeDocumentOrSpecifiersResponse(message: unknown): boolean {
+    if (!isAnalyzeDocumentResponse(message)) {
+      return false;
+    }
+
+    if (this.#resolvePending(this.#documentPending, message)) {
+      return true;
+    }
+
+    this.#resolvePending(this.#specifiersPending, message);
+    return true;
   }
 
   #resolvePending<TResponse extends { request_id: number }>(
