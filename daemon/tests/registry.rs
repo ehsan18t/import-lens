@@ -820,6 +820,43 @@ impl RegistryHttpClient for GatedCountingRegistryClient {
     }
 }
 
+/// Lets one manual seed package fetch immediately, while every other package
+/// blocks on the shared gate. This isolates ForceRefresh cooldown behavior from
+/// the worker-pool queue.
+struct ManualSeedThenGatedRegistryClient {
+    calls: Arc<Mutex<Vec<String>>>,
+    gated_calls: Arc<AtomicUsize>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RegistryHttpClient for ManualSeedThenGatedRegistryClient {
+    fn get_package_metadata(&self, package_name: &str) -> Result<HttpRegistryResponse, String> {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push(package_name.to_owned());
+        if package_name == "manual-cached" {
+            return Ok(HttpRegistryResponse {
+                status: 200,
+                retry_after_ms: None,
+                body: r#"{"dist-tags":{"latest":"2.0.0"},"versions":{"1.0.0":{}}}"#.to_owned(),
+            });
+        }
+
+        self.gated_calls.fetch_add(1, Ordering::SeqCst);
+        let (open, ready) = &*self.gate;
+        let mut opened = open.lock().expect("gate lock");
+        while !*opened {
+            opened = ready.wait(opened).expect("gate wait");
+        }
+        Ok(HttpRegistryResponse {
+            status: 200,
+            retry_after_ms: None,
+            body: r#"{"dist-tags":{"latest":"1.0.0"},"versions":{}}"#.to_owned(),
+        })
+    }
+}
+
 fn bulk_targets(count: usize) -> Vec<RegistryHintTarget> {
     (0..count)
         .map(|index| RegistryHintTarget {
@@ -827,6 +864,12 @@ fn bulk_targets(count: usize) -> Vec<RegistryHintTarget> {
             installed_version: Some("1.0.0".to_owned()),
         })
         .collect()
+}
+
+fn open_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
+    let (open, ready) = &**gate;
+    *open.lock().expect("gate lock") = true;
+    ready.notify_all();
 }
 
 #[test]
@@ -879,6 +922,160 @@ fn bulk_refresh_in_flight_is_bounded() {
 }
 
 #[test]
+fn bulk_refresh_streams_fresh_cached_targets_before_worker_pool_queue() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let cache = RegistryMetadataCache::empty();
+    cache
+        .write_metadata(
+            &format!("pkg-{}", REGISTRY_REFRESH_CONCURRENCY),
+            RegistryPackageMetadata {
+                latest_version: Some("2.0.0".to_owned()),
+                latest_published_at: None,
+                deprecated_versions: Vec::new(),
+            },
+            1_000,
+        )
+        .expect("cache write");
+    let registry = RegistryHintService::new(
+        cache,
+        Box::new(GatedCountingRegistryClient {
+            calls: Arc::clone(&calls),
+            gate: Arc::clone(&gate),
+        }),
+    );
+    let service = Arc::new(ImportLensService::new_with_registry_hints_for_tests(
+        registry,
+    ));
+
+    let target_count = REGISTRY_REFRESH_CONCURRENCY + 1;
+    let cached_index = REGISTRY_REFRESH_CONCURRENCY;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = mpsc::channel::<(usize, Option<String>, Option<String>)>();
+    service.spawn_registry_refresh_block(
+        bulk_targets(target_count),
+        ProtocolRegistryHintMode::RefreshStale,
+        1_000 + FRESH_HINT_TTL_MS / 2,
+        cancelled,
+        move |index, result| {
+            let origin = result
+                .as_ref()
+                .and_then(|result| result.origin.as_deref().map(str::to_owned));
+            let latest = result
+                .and_then(|result| result.hint)
+                .and_then(|hint| hint.latest_version);
+            let _ = done_tx.send((index, origin, latest));
+        },
+    );
+
+    while calls.load(Ordering::SeqCst) < REGISTRY_REFRESH_CONCURRENCY {
+        thread::yield_now();
+    }
+    let early = done_rx.recv_timeout(Duration::from_millis(100));
+    open_gate(&gate);
+    for _ in 1..target_count {
+        let _ = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("remaining registry refresh result should arrive after opening the gate");
+    }
+
+    let (index, origin, latest) =
+        early.expect("fresh cached target should stream before queued network workers finish");
+    assert_eq!(index, cached_index);
+    assert_eq!(origin.as_deref(), Some("cache"));
+    assert_eq!(latest.as_deref(), Some("2.0.0"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        REGISTRY_REFRESH_CONCURRENCY,
+        "the cached target must not consume a network worker"
+    );
+}
+
+#[test]
+fn bulk_force_refresh_streams_manual_cooldown_cache_before_worker_pool_queue() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let gated_calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let registry = RegistryHintService::new(
+        RegistryMetadataCache::empty(),
+        Box::new(ManualSeedThenGatedRegistryClient {
+            calls: Arc::clone(&calls),
+            gated_calls: Arc::clone(&gated_calls),
+            gate: Arc::clone(&gate),
+        }),
+    );
+    let service = Arc::new(ImportLensService::new_with_registry_hints_for_tests(
+        registry,
+    ));
+    let manual_target = RegistryHintTarget {
+        name: "manual-cached".to_owned(),
+        installed_version: Some("1.0.0".to_owned()),
+    };
+    let seeded = service.refresh_registry_hint_target(
+        manual_target.clone(),
+        ProtocolRegistryHintMode::ForceRefresh,
+        1_000,
+    );
+    assert_eq!(seeded.origin.as_deref(), Some("network"));
+
+    let mut targets = bulk_targets(REGISTRY_REFRESH_CONCURRENCY);
+    targets.push(manual_target);
+    let cached_index = REGISTRY_REFRESH_CONCURRENCY;
+    let target_count = targets.len();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (done_tx, done_rx) = mpsc::channel::<(usize, Option<String>, Option<String>)>();
+    service.spawn_registry_refresh_block(
+        targets,
+        ProtocolRegistryHintMode::ForceRefresh,
+        1_100,
+        cancelled,
+        move |index, result| {
+            let origin = result
+                .as_ref()
+                .and_then(|result| result.origin.as_deref().map(str::to_owned));
+            let latest = result
+                .and_then(|result| result.hint)
+                .and_then(|hint| hint.latest_version);
+            let _ = done_tx.send((index, origin, latest));
+        },
+    );
+
+    while gated_calls.load(Ordering::SeqCst) < REGISTRY_REFRESH_CONCURRENCY {
+        thread::yield_now();
+    }
+    let early = done_rx.recv_timeout(Duration::from_millis(100));
+    open_gate(&gate);
+    for _ in 1..target_count {
+        let _ = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("remaining registry refresh result should arrive after opening the gate");
+    }
+
+    let (index, origin, latest) =
+        early.expect("manual cooldown cached target should stream before queued workers finish");
+    assert_eq!(index, cached_index);
+    assert_eq!(origin.as_deref(), Some("cache"));
+    assert_eq!(latest.as_deref(), Some("2.0.0"));
+    let calls = calls.lock().expect("calls lock").clone();
+    assert_eq!(calls.first().map(String::as_str), Some("manual-cached"));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|name| name.as_str() == "manual-cached")
+            .count(),
+        1,
+        "the cooldown target must not refetch during the bulk ForceRefresh"
+    );
+    assert_eq!(calls.len(), REGISTRY_REFRESH_CONCURRENCY + 1);
+    for index in 0..REGISTRY_REFRESH_CONCURRENCY {
+        assert!(
+            calls.contains(&format!("pkg-{index}")),
+            "missing gated worker fetch for pkg-{index}: {calls:?}"
+        );
+    }
+}
+
+#[test]
 fn bulk_refresh_stops_after_cancel() {
     let calls = Arc::new(AtomicUsize::new(0));
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -918,11 +1115,7 @@ fn bulk_refresh_stops_after_cancel() {
     // now returns and picks up a remaining target observes the cancel flag and
     // skips its fetch, so no further network call is made.
     cancelled.store(true, Ordering::Release);
-    {
-        let (open, ready) = &*gate;
-        *open.lock().expect("gate lock") = true;
-        ready.notify_all();
-    }
+    open_gate(&gate);
 
     let mut ran = 0;
     for _ in 0..target_count {

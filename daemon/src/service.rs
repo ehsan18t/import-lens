@@ -111,6 +111,38 @@ fn try_begin_cache_maintenance() -> Option<MaintenanceGuard> {
         .then_some(MaintenanceGuard)
 }
 
+fn registry_hint_service_mode(
+    mode: ProtocolRegistryHintMode,
+) -> crate::registry::service::RegistryHintMode {
+    match mode {
+        ProtocolRegistryHintMode::RefreshStale => {
+            crate::registry::service::RegistryHintMode::RefreshStale
+        }
+        ProtocolRegistryHintMode::ForceRefresh => {
+            crate::registry::service::RegistryHintMode::ForceRefresh
+        }
+        ProtocolRegistryHintMode::Off | ProtocolRegistryHintMode::Cached => {
+            crate::registry::service::RegistryHintMode::Cached
+        }
+    }
+}
+
+fn registry_hint_result_from_lookup(
+    target: RegistryHintTarget,
+    lookup: crate::registry::types::RegistryHintLookup,
+) -> RegistryHintResult {
+    let origin = match lookup.origin {
+        crate::registry::types::RegistryHintOrigin::Cache => "cache",
+        crate::registry::types::RegistryHintOrigin::Network => "network",
+    };
+    RegistryHintResult {
+        target,
+        hint: lookup.hint,
+        error: lookup.error,
+        origin: Some(origin.to_owned()),
+    }
+}
+
 // `RegistryHintService` and `RegistryRefreshExecutor` hold trait objects and a
 // thread pool respectively, so `ImportLensService` no longer derives `Debug`.
 pub struct ImportLensService {
@@ -254,39 +286,34 @@ impl ImportLensService {
         mode: ProtocolRegistryHintMode,
         now_ms: u64,
     ) -> RegistryHintResult {
-        let service_mode = match mode {
-            ProtocolRegistryHintMode::RefreshStale => {
-                crate::registry::service::RegistryHintMode::RefreshStale
-            }
-            ProtocolRegistryHintMode::ForceRefresh => {
-                crate::registry::service::RegistryHintMode::ForceRefresh
-            }
-            ProtocolRegistryHintMode::Off | ProtocolRegistryHintMode::Cached => {
-                crate::registry::service::RegistryHintMode::Cached
-            }
-        };
-
         let lookup = self.registry_hints.hint_for(
             &target.name,
             target.installed_version.as_deref(),
-            service_mode,
+            registry_hint_service_mode(mode),
             now_ms,
         );
 
-        let origin = match lookup.origin {
-            crate::registry::types::RegistryHintOrigin::Cache => "cache",
-            crate::registry::types::RegistryHintOrigin::Network => "network",
-        };
-        RegistryHintResult {
-            target,
-            hint: lookup.hint,
-            error: lookup.error,
-            origin: Some(origin.to_owned()),
-        }
+        registry_hint_result_from_lookup(target, lookup)
     }
 
     pub fn spawn_registry_refresh(&self, job: impl FnOnce() + Send + 'static) {
         self.registry_executor.spawn(job);
+    }
+
+    fn cached_registry_hint_target(
+        &self,
+        target: &RegistryHintTarget,
+        mode: ProtocolRegistryHintMode,
+        now_ms: u64,
+    ) -> Option<RegistryHintResult> {
+        self.registry_hints
+            .cached_lookup_for_mode(
+                &target.name,
+                target.installed_version.as_deref(),
+                registry_hint_service_mode(mode),
+                now_ms,
+            )
+            .map(|lookup| registry_hint_result_from_lookup(target.clone(), lookup))
     }
 
     /// Fans a bulk "refresh dependency block" onto the isolated registry pool
@@ -319,9 +346,18 @@ impl ImportLensService {
         F: Fn(usize, Option<RegistryHintResult>) + Send + Clone + 'static,
     {
         for (index, target) in targets.into_iter().enumerate() {
+            let on_result = on_result.clone();
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                on_result(index, None);
+                continue;
+            }
+            if let Some(result) = self.cached_registry_hint_target(&target, mode, now_ms) {
+                on_result(index, Some(result));
+                continue;
+            }
+
             let svc = std::sync::Arc::clone(self);
             let cancelled = std::sync::Arc::clone(&cancelled);
-            let on_result = on_result.clone();
             self.spawn_registry_refresh(move || {
                 // Per-job pre-fetch cancellation check: a superseded/abandoned
                 // block skips its remaining network fetches. Acquire pairs with

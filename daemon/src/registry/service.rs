@@ -279,51 +279,13 @@ impl RegistryHintService {
         mode: RegistryHintMode,
         now_ms: u64,
     ) -> RegistryHintLookup {
-        if mode == RegistryHintMode::Off {
-            return RegistryHintLookup {
-                hint: None,
-                error: None,
-                origin: RegistryHintOrigin::Cache,
-            };
-        }
-
-        let cached = self.cache.get(package_name);
-        if mode == RegistryHintMode::Cached {
-            return cached
-                .as_ref()
-                .map(|entry| lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache))
-                .unwrap_or(RegistryHintLookup {
-                    hint: None,
-                    error: None,
-                    origin: RegistryHintOrigin::Cache,
-                });
-        }
-        if mode != RegistryHintMode::ForceRefresh
-            && let Some(entry) = cached.as_ref()
+        if let Some(lookup) =
+            self.cached_lookup_for_mode(package_name, installed_version, mode, now_ms)
         {
-            if mode == RegistryHintMode::RefreshStale && is_usable_without_fetch(entry, now_ms) {
-                return lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache);
-            }
-            if entry
-                .retry_after
-                .is_some_and(|retry_after| retry_after > now_ms)
-            {
-                return lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache);
-            }
+            return lookup;
         }
 
-        // D5: a manual re-click within the cooldown coalesces to the value the
-        // previous manual fetch just cached — no new request, no error. Ordered
-        // before single-flight and the rate limiter so an accidental double-click
-        // is a pure no-op returning the cached entry.
         let manual = mode == RegistryHintMode::ForceRefresh;
-        if manual
-            && let Some(entry) = cached.as_ref()
-            && self.manual_cooldown_active(package_name)
-        {
-            return lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache);
-        }
-
         let entry = self.fetch_package_singleflight(package_name, now_ms, manual);
         // Record the cooldown only on a definitive success (200/404 -> no error),
         // so a failed manual fetch stays retryable while the global backoff and
@@ -332,6 +294,66 @@ impl RegistryHintService {
             self.record_manual_fetch(package_name);
         }
         lookup_from_entry(&entry, installed_version, RegistryHintOrigin::Network)
+    }
+
+    pub(crate) fn cached_lookup_for_mode(
+        &self,
+        package_name: &str,
+        installed_version: Option<&str>,
+        mode: RegistryHintMode,
+        now_ms: u64,
+    ) -> Option<RegistryHintLookup> {
+        if mode == RegistryHintMode::Off {
+            return Some(RegistryHintLookup {
+                hint: None,
+                error: None,
+                origin: RegistryHintOrigin::Cache,
+            });
+        }
+
+        let cached = self.cache.get(package_name);
+        if mode == RegistryHintMode::Cached {
+            return Some(
+                cached
+                    .as_ref()
+                    .map(|entry| {
+                        lookup_from_entry(entry, installed_version, RegistryHintOrigin::Cache)
+                    })
+                    .unwrap_or(RegistryHintLookup {
+                        hint: None,
+                        error: None,
+                        origin: RegistryHintOrigin::Cache,
+                    }),
+            );
+        }
+
+        let entry = cached.as_ref()?;
+        if mode == RegistryHintMode::RefreshStale
+            && (is_usable_without_fetch(entry, now_ms)
+                || entry
+                    .retry_after
+                    .is_some_and(|retry_after| retry_after > now_ms))
+        {
+            return Some(lookup_from_entry(
+                entry,
+                installed_version,
+                RegistryHintOrigin::Cache,
+            ));
+        }
+
+        // D5: a manual re-click within the cooldown coalesces to the value the
+        // previous manual fetch just cached — no new request, no error. Ordered
+        // before single-flight and the rate limiter so an accidental double-click
+        // is a pure no-op returning the cached entry.
+        if mode == RegistryHintMode::ForceRefresh && self.manual_cooldown_active(package_name) {
+            return Some(lookup_from_entry(
+                entry,
+                installed_version,
+                RegistryHintOrigin::Cache,
+            ));
+        }
+
+        None
     }
 
     /// Whether package `P` had a successful manual fetch within the last
