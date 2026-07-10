@@ -38,6 +38,11 @@ export const parseUpdateArgs = (argv) => {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
+    // npm requires `--` to forward flags to the script; pnpm passes it through
+    // verbatim. Accept it from either so one documented command works in both.
+    if (arg === "--") {
+      continue;
+    }
     if (arg === "--dry-run") {
       parsed.dryRun = true;
       continue;
@@ -182,7 +187,7 @@ const defaultFetchJson = async (url) => {
 };
 
 const printHelp = () => {
-  process.stdout.write(`Usage: pnpm deps:update:oxc -- [options]
+  process.stdout.write(`Usage: pnpm deps:update:oxc [options]
 
 Options:
   --oxc <version>       Target OXC monorepo version. Defaults to latest oxc_parser crate.

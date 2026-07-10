@@ -7,6 +7,26 @@ import { oxcStackConfig } from "../oxc-stack.config.mjs";
 import { replaceKnownVersions } from "../oxc-stack-helpers.mjs";
 import { parseUpdateArgs, updateOxcStack } from "../update-oxc-stack.mjs";
 
+// The fixtures below stand in for a repo sitting on the CURRENT pins, because
+// `replaceKnownVersions` looks for exactly those versions when it rewrites the SRS.
+// Derive them from oxc-stack.config.mjs -- the single source of truth -- instead of
+// typing them out, or every OXC upgrade silently breaks this file.
+const currentOxc = oxcStackConfig.currentOxcVersion;
+const currentResolver = oxcStackConfig.currentResolverVersion;
+
+// A synthetic upgrade target, always one minor ahead of whatever is pinned today, so
+// it can never coincide with the current version and let "nothing changed" pass for a
+// successful upgrade.
+const nextMinor = (version) => {
+  const [major, minor] = version.split(".").map(Number);
+  return `${major}.${minor + 1}.0`;
+};
+const targetOxc = nextMinor(currentOxc);
+const targetResolver = nextMinor(currentResolver);
+
+// Versions are digits and dots; only the dots need escaping to embed one in a regex.
+const escapeVersion = (version) => version.replaceAll(".", "\\.");
+
 const tempRepo = async ({
   cargoToml = cargoTomlFixture(),
   manifest = manifestFixture(),
@@ -66,6 +86,20 @@ test("parseUpdateArgs supports explicit versions and dry-run", () => {
   });
 });
 
+test("parseUpdateArgs ignores a bare -- separator", () => {
+  // npm needs `--` to forward flags to the script; pnpm forwards the `--` itself.
+  // Both invocations must parse identically, or the documented command fails.
+  assert.deepEqual(parseUpdateArgs(["--", "--oxc", "0.139.0", "--dry-run"]), {
+    dryRun: true,
+    oxcVersion: "0.139.0",
+    resolverVersion: undefined,
+  });
+});
+
+test("parseUpdateArgs still rejects an unknown option", () => {
+  assert.throws(() => parseUpdateArgs(["--nope"]), /Unknown option: --nope/u);
+});
+
 test("updateOxcStack dry-run reports planned edits without writing files or lockfiles", async () => {
   const repo = await tempRepo();
   const writes = [];
@@ -75,15 +109,15 @@ test("updateOxcStack dry-run reports planned edits without writing files or lock
     rootDir: repo.root,
     paths: repo.paths,
     dryRun: true,
-    oxcVersion: "0.139.0",
-    resolverVersion: "11.22.0",
+    oxcVersion: targetOxc,
+    resolverVersion: currentResolver,
     fetchJson: availableVersions(),
     writeFile: async (...args) => writes.push(args),
     execFile: async (...args) => execs.push(args),
   });
 
-  assert.equal(result.oxcVersion, "0.139.0");
-  assert.equal(result.resolverVersion, "11.22.0");
+  assert.equal(result.oxcVersion, targetOxc);
+  assert.equal(result.resolverVersion, currentResolver);
   assert.deepEqual(
     result.changedFiles.sort(),
     [repo.paths.cargoToml, repo.paths.config, repo.paths.manifest, repo.paths.srs].sort(),
@@ -92,7 +126,7 @@ test("updateOxcStack dry-run reports planned edits without writing files or lock
   assert.deepEqual(execs, []);
   assert.match(
     await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8"),
-    /oxc_parser = "~0\.138\.0"/,
+    new RegExp(`oxc_parser = "~${escapeVersion(currentOxc)}"`, "u"),
   );
 });
 
@@ -103,8 +137,8 @@ test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () =>
   await updateOxcStack({
     rootDir: repo.root,
     paths: repo.paths,
-    oxcVersion: "0.139.0",
-    resolverVersion: "11.22.0",
+    oxcVersion: targetOxc,
+    resolverVersion: currentResolver,
     fetchJson: availableVersions(),
     platform: "linux",
     execFile: async (command, args) => execs.push([command, args]),
@@ -116,21 +150,27 @@ test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () =>
   const config = await readFile(path.join(repo.root, repo.paths.config), "utf8");
 
   for (const crate of oxcStackConfig.oxcCrates) {
-    assert.match(cargoToml, new RegExp(`^${crate} = "~0\\.139\\.0"$`, "mu"));
+    assert.match(cargoToml, new RegExp(`^${crate} = "~${escapeVersion(targetOxc)}"$`, "mu"));
   }
 
-  assert.match(cargoToml, /^oxc_resolver = "~11\.22\.0"$/mu);
+  assert.match(
+    cargoToml,
+    new RegExp(`^oxc_resolver = "~${escapeVersion(currentResolver)}"$`, "mu"),
+  );
   assert.equal(manifest.dependencies["oxc-parser"], undefined);
-  assert.match(srs, /0\.139\.0/);
-  assert.match(srs, /11\.22\.0/);
-  assert.match(config, /currentOxcVersion: "0\.139\.0"/);
-  assert.match(config, /currentResolverVersion: "11\.22\.0"/);
+  assert.match(srs, new RegExp(escapeVersion(targetOxc), "u"));
+  assert.match(srs, new RegExp(escapeVersion(currentResolver), "u"));
+  assert.match(config, new RegExp(`currentOxcVersion: "${escapeVersion(targetOxc)}"`, "u"));
+  assert.match(
+    config,
+    new RegExp(`currentResolverVersion: "${escapeVersion(currentResolver)}"`, "u"),
+  );
   assert.deepEqual(execs, [
     ["pnpm", ["install", "--lockfile-only"]],
-    ["cargo", ["update", "-p", "oxc_resolver", "--precise", "11.22.0"]],
+    ["cargo", ["update", "-p", "oxc_resolver", "--precise", currentResolver]],
     ...oxcStackConfig.oxcCrates.map((crate) => [
       "cargo",
-      ["update", "-p", crate, "--precise", "0.139.0"],
+      ["update", "-p", crate, "--precise", targetOxc],
     ]),
   ]);
 });
@@ -142,8 +182,8 @@ test("updateOxcStack launches pnpm through a shell on Windows for the lockfile u
   await updateOxcStack({
     rootDir: repo.root,
     paths: repo.paths,
-    oxcVersion: "0.139.0",
-    resolverVersion: "11.22.0",
+    oxcVersion: targetOxc,
+    resolverVersion: currentResolver,
     fetchJson: availableVersions(),
     platform: "win32",
     execFile: async (...args) => execs.push(args),
@@ -152,7 +192,10 @@ test("updateOxcStack launches pnpm through a shell on Windows for the lockfile u
   // pnpm resolves to pnpm.CMD on Windows; it must go through the shell.
   assert.deepEqual(execs[0], ["pnpm install --lockfile-only", { shell: true }]);
   // cargo is a real executable and stays on execFile without a shell.
-  assert.deepEqual(execs[1], ["cargo", ["update", "-p", "oxc_resolver", "--precise", "11.22.0"]]);
+  assert.deepEqual(execs[1], [
+    "cargo",
+    ["update", "-p", "oxc_resolver", "--precise", currentResolver],
+  ]);
 });
 
 test("updateOxcStack resolves latest versions before editing", async () => {
@@ -164,17 +207,17 @@ test("updateOxcStack resolves latest versions before editing", async () => {
     dryRun: true,
     fetchJson: async (url) => {
       if (url.endsWith("/oxc_parser")) {
-        return { crate: { max_stable_version: "0.136.0" }, versions: [] };
+        return { crate: { max_stable_version: currentOxc }, versions: [] };
       }
       if (url.endsWith("/oxc_resolver")) {
-        return { crate: { max_stable_version: "11.23.0" }, versions: [] };
+        return { crate: { max_stable_version: targetResolver }, versions: [] };
       }
       return availableVersionPayload(url);
     },
   });
 
-  assert.equal(result.oxcVersion, "0.136.0");
-  assert.equal(result.resolverVersion, "11.23.0");
+  assert.equal(result.oxcVersion, currentOxc);
+  assert.equal(result.resolverVersion, targetResolver);
 });
 
 test("updateOxcStack reports no changed files when target versions and scripts already match", async () => {
@@ -189,18 +232,9 @@ test("updateOxcStack reports no changed files when target versions and scripts a
     rootDir: repo.root,
     paths: repo.paths,
     dryRun: true,
-    oxcVersion: "0.138.0",
-    resolverVersion: "11.22.0",
-    fetchJson: async (url) => {
-      if (url.endsWith("/oxc_resolver/11.22.0")) {
-        return { version: { num: "11.22.0" } };
-      }
-      const crate = oxcStackConfig.oxcCrates.find((crate) => url.endsWith(`/${crate}/0.138.0`));
-      if (crate) {
-        return { version: { num: "0.138.0" } };
-      }
-      throw new Error(`unexpected fetch: ${url}`);
-    },
+    oxcVersion: currentOxc,
+    resolverVersion: currentResolver,
+    fetchJson: availableVersions(),
   });
 
   assert.deepEqual(result.changedFiles, []);
@@ -215,7 +249,7 @@ test("updateOxcStack rejects invalid or unavailable versions before edits", asyn
       rootDir: repo.root,
       paths: repo.paths,
       oxcVersion: "latest",
-      resolverVersion: "11.22.0",
+      resolverVersion: currentResolver,
       fetchJson: availableVersions(),
     }),
     /Invalid OXC version/,
@@ -226,7 +260,7 @@ test("updateOxcStack rejects invalid or unavailable versions before edits", asyn
       rootDir: repo.root,
       paths: repo.paths,
       oxcVersion: "0.999.0",
-      resolverVersion: "11.22.0",
+      resolverVersion: currentResolver,
       fetchJson: availableVersions(),
     }),
     /Unavailable OXC crate/,
@@ -237,18 +271,18 @@ test("updateOxcStack rejects invalid or unavailable versions before edits", asyn
 
 test("updateOxcStack rejects non-coordinated current OXC crates and oxc_mangler before edits", async () => {
   const nonCoordinated = await tempRepo({
-    cargoToml: cargoTomlFixture().replace('oxc_ast = "~0.138.0"', 'oxc_ast = "~0.137.0"'),
+    cargoToml: cargoTomlFixture().replace(`oxc_ast = "~${currentOxc}"`, 'oxc_ast = "~0.0.1"'),
   });
   const withMangler = await tempRepo({
-    cargoToml: `${cargoTomlFixture()}oxc_mangler = "~0.138.0"\n`,
+    cargoToml: `${cargoTomlFixture()}oxc_mangler = "~${currentOxc}"\n`,
   });
 
   await assert.rejects(
     updateOxcStack({
       rootDir: nonCoordinated.root,
       paths: nonCoordinated.paths,
-      oxcVersion: "0.139.0",
-      resolverVersion: "11.22.0",
+      oxcVersion: targetOxc,
+      resolverVersion: currentResolver,
       fetchJson: availableVersions(),
     }),
     /Current OXC crate versions are not coordinated/,
@@ -258,8 +292,8 @@ test("updateOxcStack rejects non-coordinated current OXC crates and oxc_mangler 
     updateOxcStack({
       rootDir: withMangler.root,
       paths: withMangler.paths,
-      oxcVersion: "0.139.0",
-      resolverVersion: "11.22.0",
+      oxcVersion: targetOxc,
+      resolverVersion: currentResolver,
       fetchJson: availableVersions(),
     }),
     /oxc_mangler must not be present/,
@@ -271,35 +305,33 @@ const availableVersions = () => async (url) => availableVersionPayload(url);
 const availableVersionPayload = (url) => {
   if (url.endsWith("/oxc_parser")) {
     return {
-      crate: { max_stable_version: "0.139.0" },
-      versions: [{ num: "0.139.0" }, { num: "0.136.0" }],
+      crate: { max_stable_version: targetOxc },
+      versions: [{ num: targetOxc }, { num: currentOxc }],
     };
   }
   if (url.endsWith("/oxc_resolver")) {
     return {
-      crate: { max_stable_version: "11.22.0" },
-      versions: [{ num: "11.22.0" }, { num: "11.23.0" }],
+      crate: { max_stable_version: currentResolver },
+      versions: [{ num: currentResolver }, { num: targetResolver }],
     };
   }
-  if (url.endsWith("/oxc_resolver/11.22.0")) {
-    return { version: { num: "11.22.0" } };
+  for (const version of [currentResolver, targetResolver]) {
+    if (url.endsWith(`/oxc_resolver/${version}`)) {
+      return { version: { num: version } };
+    }
   }
-  if (url.endsWith("/oxc_resolver/11.23.0")) {
-    return { version: { num: "11.23.0" } };
-  }
-  const crate = oxcStackConfig.oxcCrates.find(
-    (crate) => url.endsWith(`/${crate}/0.139.0`) || url.endsWith(`/${crate}/0.136.0`),
-  );
-  if (crate) {
-    return { version: { num: url.endsWith("0.136.0") ? "0.136.0" : "0.139.0" } };
+  for (const version of [currentOxc, targetOxc]) {
+    if (oxcStackConfig.oxcCrates.some((crate) => url.endsWith(`/${crate}/${version}`))) {
+      return { version: { num: version } };
+    }
   }
   throw new Error(`unexpected fetch: ${url}`);
 };
 
 const cargoTomlFixture = () => `[dependencies]
 brotli = "^8"
-${oxcStackConfig.oxcCrates.map((crate) => `${crate} = "~0.138.0"`).join("\n")}
-oxc_resolver = "~11.22.0"
+${oxcStackConfig.oxcCrates.map((crate) => `${crate} = "~${currentOxc}"`).join("\n")}
+oxc_resolver = "~${currentResolver}"
 zstd = "^0.13"
 `;
 
@@ -314,15 +346,15 @@ const manifestFixture = () => ({
   },
 });
 
-const srsFixture = () => `| \`oxc_parser\`      | 0.138.0 |
-| \`oxc_resolver\`    | 11.22.0 |
-currently resolved to 0.138.0
-Currently resolved to 11.22.0
-baseline v0.138.0
+const srsFixture = () => `| \`oxc_parser\`      | ${currentOxc} |
+| \`oxc_resolver\`    | ${currentResolver} |
+currently resolved to ${currentOxc}
+Currently resolved to ${currentResolver}
+baseline v${currentOxc}
 `;
 
 const configFixture = () => `export const oxcStackConfig = {
-  currentOxcVersion: "0.138.0",
-  currentResolverVersion: "11.22.0",
+  currentOxcVersion: "${currentOxc}",
+  currentResolverVersion: "${currentResolver}",
 };
 `;
