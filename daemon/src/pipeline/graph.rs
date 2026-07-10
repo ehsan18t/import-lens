@@ -95,6 +95,12 @@ pub struct ModuleRecord {
     pub star_exports: Vec<StarExportRecord>,
     pub local_bindings: Vec<String>,
     pub binding_dependencies: Vec<BindingDependencyRecord>,
+    /// Root-scope bindings referenced by top-level statements that declare
+    /// nothing (`setup(dep);`). The rewriter keeps such statements verbatim and
+    /// the minifier cannot prove them side-effect free, so the names they read
+    /// are retention roots: prune them and the bundle references an undeclared
+    /// binding.
+    pub side_effect_references: Vec<String>,
     // Root-scope symbol declaration + reference spans, computed once here so the
     // bundle rewriter does not re-parse and re-run semantic analysis per request.
     pub root_symbol_spans: Vec<RootSymbolSpans>,
@@ -768,6 +774,7 @@ impl ModuleGraphBuilder {
             shorthand_spans: parsed.shorthand_spans,
             local_bindings: parsed.local_bindings,
             binding_dependencies: parsed.binding_dependencies,
+            side_effect_references: parsed.side_effect_references,
         });
 
         for next_path in next_paths {
@@ -790,6 +797,7 @@ struct ParsedModule {
     star_exports: Vec<StarExportRecord>,
     local_bindings: Vec<String>,
     binding_dependencies: Vec<BindingDependencyRecord>,
+    side_effect_references: Vec<String>,
     root_symbol_spans: Vec<RootSymbolSpans>,
     shorthand_spans: Vec<(usize, usize)>,
 }
@@ -1061,6 +1069,7 @@ fn parse_module(
         star_exports: star_export_records(path, &parsed.module_record, resolver_context)?,
         local_bindings: local_bindings(&parsed.program),
         binding_dependencies: analysis.dependencies,
+        side_effect_references: analysis.side_effect_references,
         root_symbol_spans: analysis.symbol_spans,
         shorthand_spans: shorthand_identifier_spans(&parsed.program)
             .into_iter()
@@ -1364,6 +1373,7 @@ struct StatementBindingRange {
 
 struct RootScopeAnalysis {
     dependencies: Vec<BindingDependencyRecord>,
+    side_effect_references: Vec<String>,
     symbol_spans: Vec<RootSymbolSpans>,
 }
 
@@ -1377,6 +1387,7 @@ fn root_scope_analysis(program: &Program<'_>) -> RootScopeAnalysis {
     if semantic.diagnostics.has_errors() {
         return RootScopeAnalysis {
             dependencies: Vec::new(),
+            side_effect_references: Vec::new(),
             symbol_spans: Vec::new(),
         };
     }
@@ -1403,8 +1414,68 @@ fn root_scope_analysis(program: &Program<'_>) -> RootScopeAnalysis {
 
     RootScopeAnalysis {
         dependencies: binding_dependencies_from(&statement_binding_ranges(program), &references),
+        side_effect_references: side_effect_reference_names(
+            &side_effect_statement_ranges(program),
+            &references,
+        ),
         symbol_spans,
     }
+}
+
+/// Spans of top-level statements the rewriter keeps verbatim and that bind
+/// nothing -- `setup(dep);`, `globalThis.x = dep;`. Import and export
+/// declarations are excluded because the rewriter rewrites or removes them, and
+/// statements that do declare a binding are already covered by
+/// `binding_dependencies_from`. Source-ordered and non-overlapping.
+fn side_effect_statement_ranges(program: &Program<'_>) -> Vec<(usize, usize)> {
+    program
+        .body
+        .iter()
+        .filter_map(|statement| {
+            if matches!(
+                statement,
+                Statement::ImportDeclaration(_)
+                    | Statement::ExportNamedDeclaration(_)
+                    | Statement::ExportAllDeclaration(_)
+                    | Statement::ExportDefaultDeclaration(_)
+            ) {
+                return None;
+            }
+
+            let mut bindings = Vec::new();
+            collect_statement_bindings(statement, &mut bindings);
+            if !bindings.is_empty() {
+                return None;
+            }
+
+            let span = statement.span();
+            Some((span_start(span), span_end(span)))
+        })
+        .collect()
+}
+
+fn side_effect_reference_names(
+    statement_ranges: &[(usize, usize)],
+    references: &[(Span, String)],
+) -> Vec<String> {
+    if statement_ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut names = references
+        .iter()
+        .filter(|(span, _)| {
+            // Ranges are source-ordered and non-overlapping, so the only range
+            // that can contain this reference is the last one starting at or
+            // before it.
+            let index = statement_ranges.partition_point(|(start, _)| *start <= span_start(*span));
+            index > 0 && span_end(*span) <= statement_ranges[index - 1].1
+        })
+        .map(|(_, name)| name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn binding_dependencies_from(

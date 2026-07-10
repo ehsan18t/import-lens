@@ -771,6 +771,53 @@ export { b } from "./bb.js";
 }
 
 #[test]
+fn bundle_keeps_import_referenced_only_by_top_level_side_effect_statement() {
+    // `sideEffect(foo)` binds nothing, so it is not a binding dependency of any
+    // export, yet the rewriter keeps it and the minifier cannot drop it. Its
+    // import must survive in both a re-export barrel and a local-export module,
+    // or the bundle references an undeclared `foo`.
+    for (label, hub_source) in [
+        (
+            "barrel",
+            r#"import { foo } from "./other.js";
+export { x } from "./leaf.js";
+sideEffect(foo);
+"#,
+        ),
+        (
+            "local export",
+            r#"import { foo } from "./other.js";
+export const x = 1;
+sideEffect(foo);
+"#,
+        ),
+    ] {
+        let root = temp_workspace();
+        write_source(&root, "entry.js", "export { x } from \"./hub.js\";\n");
+        write_source(&root, "hub.js", hub_source);
+        write_source(&root, "other.js", "export const foo = 'F';\n");
+        write_source(&root, "leaf.js", "export const x = 1;\n");
+
+        let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+        let reachable = reachable_exports(&graph, &["x".to_owned()], false);
+        let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+            .expect("reachable modules should bundle");
+        let files = contribution_basenames(&bundled);
+        let source = bundled.source.clone();
+
+        fs::remove_dir_all(root).expect("cleanup");
+        assert!(
+            files.contains(&"other.js".to_owned()),
+            "{label}: import read by a side-effect statement was pruned: {files:?}\n{source}"
+        );
+        assert!(
+            source.contains("sideEffect("),
+            "{label}: side-effect statement should survive: {source}"
+        );
+    }
+}
+
+#[test]
 fn bundle_keeps_all_imports_of_side_effect_only_module() {
     // Guard for the conservative fallback: a module reached purely for side
     // effects has no reachable symbols, so all of its static imports stay.

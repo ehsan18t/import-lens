@@ -333,6 +333,11 @@ fn retained_binding_names(module: &ModuleRecord, reachable: &ReachableExports) -
         .filter(|export| reachable.contains_module_symbol(&module.path, &export.exported_name))
         .map(|export| export.local_name.clone())
         .collect::<HashSet<_>>();
+    // A top-level statement that binds nothing (`setup(dep);`) survives
+    // rewriting and the minifier cannot prove it side-effect free, so whatever
+    // it reads is a retention root. Otherwise an import used only by such a
+    // statement is pruned and the bundle references an undeclared binding.
+    retained.extend(module.side_effect_references.iter().cloned());
     let mut pending = retained.iter().cloned().collect::<Vec<_>>();
 
     while let Some(binding_name) = pending.pop() {

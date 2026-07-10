@@ -1454,6 +1454,10 @@ fn mark_export(module, export_name):
 
 fn include_module_with_imports(module, reachable):
   retained_bindings = retained local names for reachable exports in this module
+  // A top-level statement that declares no binding (`setup(dep);`) is kept
+  // verbatim by the rewriter and cannot be proven side-effect free by the
+  // minifier, so every root-scope name it reads is a retention root as well.
+  retained_bindings += names referenced by binding-less top-level statements
   // "has a reachable export" is asked of reachability by module path, so it is
   // true when ANY export of the module is reachable -- local export, named
   // re-export, or star pass-through. Only a module reached purely for side
