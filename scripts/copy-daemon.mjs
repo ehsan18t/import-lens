@@ -18,7 +18,7 @@ const source = artifactPathForTarget(repoRoot, target);
 
 if (!existsSync(source)) {
   console.error(`Daemon binary not found: ${source}`);
-  console.error(`Run pnpm build:daemon:${target} first.`);
+  console.error(`Run node scripts/build-daemon.mjs ${target} first.`);
   process.exit(1);
 }
 

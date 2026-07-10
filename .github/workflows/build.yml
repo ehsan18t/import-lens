@@ -23,9 +23,6 @@ concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
 
-env:
-  PNPM_VERSION: 11.10.0
-
 jobs:
   # Resolve the version once and run the full release-gate validation (perf +
   # coverage on top of the shared checks). Its output feeds every package job.
@@ -36,32 +33,29 @@ jobs:
       run_performance: true
       run_coverage: true
 
+  # The target list, their runners and their Rust triples all live in
+  # scripts/targets.mjs and scripts/ci-matrix.mjs. Adding a target is a one-line
+  # change there, not a four-place edit.
+  targets:
+    name: Resolve target matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Resolve matrix
+        id: resolve
+        run: echo "matrix=$(node scripts/ci-matrix.mjs)" >> "$GITHUB_OUTPUT"
+
   package:
     name: Package ${{ matrix.target }}
-    needs: validate
+    needs: [validate, targets]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: win32-x64
-            runner: windows-latest
-            rust-target: x86_64-pc-windows-msvc
-          - target: win32-arm64
-            runner: windows-latest
-            rust-target: aarch64-pc-windows-msvc
-          - target: linux-x64
-            runner: ubuntu-24.04
-            rust-target: x86_64-unknown-linux-gnu
-          - target: linux-arm64
-            runner: ubuntu-24.04-arm
-            rust-target: aarch64-unknown-linux-gnu
-          - target: darwin-x64
-            runner: macos-latest
-            rust-target: x86_64-apple-darwin
-          - target: darwin-arm64
-            runner: macos-latest
-            rust-target: aarch64-apple-darwin
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
 
     env:
       VSIX_PATH: dist/vsix/import-lens-${{ matrix.target }}-${{ needs.validate.outputs.version }}.vsix
@@ -84,11 +78,10 @@ jobs:
 
       # Everything below only runs when we actually need to build this target
       # (cache miss, or force). On a cache hit the restored VSIX is uploaded as-is.
+      # No version input: pnpm/action-setup reads packageManager from package.json.
       - name: Install pnpm
         if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}
         uses: pnpm/action-setup@v6.0.9
-        with:
-          version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
         if: ${{ inputs.force || steps.cache.outputs.cache-hit != 'true' }}

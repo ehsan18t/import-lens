@@ -7,33 +7,17 @@ import {
   cargoXwinArgsForTarget,
   cargoXwinEnvForTarget,
   cargoZigbuildArgsForTarget,
-  platformTargets,
+  crossCompilerForTarget,
   targetInfo,
   vsixNameForTarget,
 } from "../targets.mjs";
 
-test("platformTargets lists every supported native VSIX target", () => {
-  assert.deepEqual(platformTargets, [
-    "win32-x64",
-    "win32-arm64",
-    "linux-x64",
-    "linux-arm64",
-    "darwin-x64",
-    "darwin-arm64",
-  ]);
-});
+// The target table itself is data; asserting it equals a copy of itself would
+// only fail when someone edits it. What is tested here is the logic layered on
+// top: lookup failure, path composition, and the per-target argument branching.
 
-test("targetInfo maps VSIX targets to Rust targets and binaries", () => {
-  assert.deepEqual(targetInfo("win32-arm64"), {
-    platformTarget: "win32-arm64",
-    rustTarget: "aarch64-pc-windows-msvc",
-    binaryName: "import-lens-daemon.exe",
-  });
-  assert.deepEqual(targetInfo("linux-arm64"), {
-    platformTarget: "linux-arm64",
-    rustTarget: "aarch64-unknown-linux-gnu",
-    binaryName: "import-lens-daemon",
-  });
+test("targetInfo rejects an unsupported target", () => {
+  assert.throws(() => targetInfo("freebsd-x64"), /Unsupported VSIX target: freebsd-x64/u);
 });
 
 test("artifactPathForTarget points only at the target-specific Cargo artifact", () => {
@@ -43,29 +27,23 @@ test("artifactPathForTarget points only at the target-specific Cargo artifact", 
   );
 });
 
-test("cargoBuildArgsForTarget uses explicit Rust target triples", () => {
-  assert.deepEqual(cargoBuildArgsForTarget("darwin-x64"), [
-    "build",
-    "-p",
-    "import-lens-daemon",
-    "--release",
-    "--target",
-    "x86_64-apple-darwin",
-  ]);
-});
+for (const [name, buildArgs, subcommand] of [
+  ["cargoBuildArgsForTarget", cargoBuildArgsForTarget, "build"],
+  ["cargoZigbuildArgsForTarget", cargoZigbuildArgsForTarget, "zigbuild"],
+]) {
+  test(`${name} passes an explicit Rust target triple`, () => {
+    assert.deepEqual(buildArgs("darwin-x64"), [
+      subcommand,
+      "-p",
+      "import-lens-daemon",
+      "--release",
+      "--target",
+      "x86_64-apple-darwin",
+    ]);
+  });
+}
 
-test("cargoZigbuildArgsForTarget uses explicit Rust target triples", () => {
-  assert.deepEqual(cargoZigbuildArgsForTarget("linux-arm64"), [
-    "zigbuild",
-    "-p",
-    "import-lens-daemon",
-    "--release",
-    "--target",
-    "aarch64-unknown-linux-gnu",
-  ]);
-});
-
-test("cargoXwinArgsForTarget cross-compiles the MSVC target from Linux", () => {
+test("cargoXwinArgsForTarget selects the clang cross-compiler only for Windows ARM64", () => {
   assert.deepEqual(cargoXwinArgsForTarget("win32-x64"), [
     "xwin",
     "build",
@@ -105,4 +83,14 @@ test("vsixNameForTarget includes package name, platform target, and version", ()
     vsixNameForTarget({ name: "import-lens", version: "0.1.0" }, "win32-x64"),
     "dist/vsix/import-lens-win32-x64-0.1.0.vsix",
   );
+});
+
+test("crossCompilerForTarget routes the MSVC targets to xwin and the rest to zigbuild", () => {
+  // zig cannot emit the MSVC ABI. This is a property of the target, not of the
+  // caller, so the Docker entrypoint reads it here rather than hardcoding loops.
+  assert.equal(crossCompilerForTarget("win32-x64"), "xwin");
+  assert.equal(crossCompilerForTarget("win32-arm64"), "xwin");
+  assert.equal(crossCompilerForTarget("linux-x64"), "zigbuild");
+  assert.equal(crossCompilerForTarget("darwin-arm64"), "zigbuild");
+  assert.throws(() => crossCompilerForTarget("freebsd-x64"), /Unsupported VSIX target/u);
 });

@@ -8,23 +8,28 @@ pnpm check
 pnpm test
 pnpm test:performance
 
-# zig handles the unix targets; the MSVC ABI it cannot emit, so Windows takes
-# the cargo-xwin path instead. Together they cover the full six-target set.
-for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-  node scripts/package-target.mjs "$target" --zigbuild
-done
+# zig handles the unix targets; it cannot emit the MSVC ABI, so Windows takes the
+# cargo-xwin path. Which target needs which compiler is decided in targets.mjs,
+# so adding a target never touches this file.
+#
+# Both lists are captured into variables, NOT read from a process substitution:
+# `set -e` does not observe a process substitution's exit status, so a failing
+# generator would build nothing and then hand assert:vsix-size zero arguments --
+# whereupon it scans dist/vsix/ and happily passes on VSIXes left over from a
+# previous run in the mounted repo.
+build_plan="$(node scripts/print-targets.mjs --build-plan)"
+vsix_list="$(node scripts/print-targets.mjs --vsix)"
 
-for target in win32-x64 win32-arm64; do
-  node scripts/package-target.mjs "$target" --xwin
-done
+if [ -z "$build_plan" ] || [ -z "$vsix_list" ]; then
+  echo "print-targets.mjs produced an empty target list." >&2
+  exit 1
+fi
 
-version=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")
-pnpm assert:vsix-size \
-  "dist/vsix/import-lens-linux-x64-${version}.vsix" \
-  "dist/vsix/import-lens-linux-arm64-${version}.vsix" \
-  "dist/vsix/import-lens-darwin-x64-${version}.vsix" \
-  "dist/vsix/import-lens-darwin-arm64-${version}.vsix" \
-  "dist/vsix/import-lens-win32-x64-${version}.vsix" \
-  "dist/vsix/import-lens-win32-arm64-${version}.vsix"
+while read -r target cross_compiler_flag; do
+  node scripts/package-target.mjs "$target" "$cross_compiler_flag"
+done <<< "$build_plan"
+
+mapfile -t vsix_files <<< "$vsix_list"
+pnpm assert:vsix-size "${vsix_files[@]}"
 
 echo "Docker build completed successfully."

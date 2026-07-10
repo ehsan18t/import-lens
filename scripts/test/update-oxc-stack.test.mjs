@@ -19,8 +19,6 @@ const tempRepo = async ({
     `${JSON.stringify(manifest, null, 2)}\n`,
     "utf8",
   );
-  await writeFile(path.join(root, "dependency-policy.test.mjs"), dependencyPolicyFixture(), "utf8");
-  await writeFile(path.join(root, "package-vsix-manifest.test.mjs"), packageVsixFixture(), "utf8");
   await writeFile(path.join(root, "ImportLens-SRS.md"), srs, "utf8");
   await writeFile(path.join(root, "oxc-stack.config.mjs"), configFixture(), "utf8");
 
@@ -29,8 +27,6 @@ const tempRepo = async ({
     paths: {
       cargoToml: "daemon-Cargo.toml",
       manifest: "package.json",
-      dependencyPolicyTest: "dependency-policy.test.mjs",
-      packageVsixManifestTest: "package-vsix-manifest.test.mjs",
       srs: "ImportLens-SRS.md",
       config: "oxc-stack.config.mjs",
     },
@@ -116,10 +112,6 @@ test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () =>
 
   const cargoToml = await readFile(path.join(repo.root, repo.paths.cargoToml), "utf8");
   const manifest = JSON.parse(await readFile(path.join(repo.root, repo.paths.manifest), "utf8"));
-  const packageVsix = await readFile(
-    path.join(repo.root, repo.paths.packageVsixManifestTest),
-    "utf8",
-  );
   const srs = await readFile(path.join(repo.root, repo.paths.srs), "utf8");
   const config = await readFile(path.join(repo.root, repo.paths.config), "utf8");
 
@@ -129,7 +121,6 @@ test("updateOxcStack updates manifests, SRS, config, and lockfiles", async () =>
 
   assert.match(cargoToml, /^oxc_resolver = "~11\.22\.0"$/mu);
   assert.equal(manifest.dependencies["oxc-parser"], undefined);
-  assert.doesNotMatch(packageVsix, /oxc-parser/);
   assert.match(srs, /0\.139\.0/);
   assert.match(srs, /11\.22\.0/);
   assert.match(config, /currentOxcVersion: "0\.139\.0"/);
@@ -322,16 +313,6 @@ const manifestFixture = () => ({
     "@msgpack/msgpack": "3.1.3",
   },
 });
-
-const dependencyPolicyFixture = () => `assert.match(cargoToml, /^oxc_parser = "~0\\.138\\.0"$/mu);
-assert.match(cargoToml, /^oxc_resolver = "~11\\.22\\.0"$/mu);
-assert.equal(manifest.dependencies["oxc-parser"], undefined);
-`;
-
-const packageVsixFixture =
-  () => `const manifest = { dependencies: { "@msgpack/msgpack": "3.1.3" } };
-assert.deepEqual(staged.dependencies, { "@msgpack/msgpack": "3.1.3" });
-`;
 
 const srsFixture = () => `| \`oxc_parser\`      | 0.138.0 |
 | \`oxc_resolver\`    | 11.22.0 |

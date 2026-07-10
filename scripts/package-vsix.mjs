@@ -5,14 +5,8 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createStagedManifest } from "./package-vsix-manifest.mjs";
-import {
-  daemonRoot,
-  extensionBundle,
-  stagingDir,
-  targetInfo,
-  vsixNameForTarget,
-} from "./targets.mjs";
+import { createStagedManifest, stagedPackageLayout } from "./package-vsix-manifest.mjs";
+import { stagingDir, targetInfo, vsixNameForTarget } from "./targets.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -91,20 +85,14 @@ run(
   stagingRoot,
 );
 
-copyPath(path.join(repoRoot, "README.md"), path.join(stagingRoot, "README.md"));
-copyPath(path.join(repoRoot, "LICENSE"), path.join(stagingRoot, "LICENSE"));
-copyPath(path.join(repoRoot, "cli"), path.join(stagingRoot, "cli"));
-copyPath(path.join(repoRoot, extensionBundle), path.join(stagingRoot, extensionBundle));
-copyPath(path.join(repoRoot, daemonRoot, target), path.join(stagingRoot, daemonRoot, target));
+for (const { source, destination } of stagedPackageLayout({ manifest, target }).copies) {
+  const sourcePath = path.join(repoRoot, source);
 
-if (manifest.icon) {
-  const iconPath = path.join(repoRoot, manifest.icon);
-
-  if (!existsSync(iconPath)) {
-    fail(`Extension icon is declared at ${manifest.icon}, but the file does not exist.`);
+  if (!existsSync(sourcePath)) {
+    fail(`Cannot stage ${source} into the VSIX: the path does not exist.`);
   }
 
-  copyPath(iconPath, path.join(stagingRoot, manifest.icon));
+  copyPath(sourcePath, path.join(stagingRoot, destination));
 }
 
 const result = spawnSync(

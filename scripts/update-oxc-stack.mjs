@@ -20,11 +20,11 @@ import {
 
 const execFilePromise = promisify(execFileCallback);
 
+// Tests never carry oxc version literals -- they derive from oxc-stack.config.mjs,
+// which is the sole source of truth. Rewriting them here was always a no-op.
 const defaultPaths = {
   cargoToml: "daemon/Cargo.toml",
   manifest: "package.json",
-  dependencyPolicyTest: "scripts/test/dependency-policy.test.mjs",
-  packageVsixManifestTest: "scripts/test/package-vsix-manifest.test.mjs",
   srs: "docs/ImportLens-SRS.md",
   config: "scripts/oxc-stack.config.mjs",
 };
@@ -96,16 +96,6 @@ export const updateOxcStack = async ({
   const nextFiles = {
     cargoToml: updateCargoToml(files.cargoToml, targetOxcVersion, targetResolverVersion),
     manifest: updateManifest(files.manifestJson, targetOxcVersion),
-    dependencyPolicyTest: replaceKnownVersions(
-      files.dependencyPolicyTest,
-      targetOxcVersion,
-      targetResolverVersion,
-    ),
-    packageVsixManifestTest: replaceKnownVersions(
-      files.packageVsixManifestTest,
-      targetOxcVersion,
-      targetResolverVersion,
-    ),
     srs: replaceKnownVersions(files.srs, targetOxcVersion, targetResolverVersion),
     config: updateConfig(files.config, targetOxcVersion, targetResolverVersion),
   };
@@ -140,8 +130,6 @@ const readFiles = async (absolutePaths, readFile) => {
     cargoToml: await readText(readFile, absolutePaths.cargoToml),
     manifest,
     manifestJson: JSON.parse(manifest),
-    dependencyPolicyTest: await readText(readFile, absolutePaths.dependencyPolicyTest),
-    packageVsixManifestTest: await readText(readFile, absolutePaths.packageVsixManifestTest),
     srs: await readText(readFile, absolutePaths.srs),
     config: await readText(readFile, absolutePaths.config),
   };

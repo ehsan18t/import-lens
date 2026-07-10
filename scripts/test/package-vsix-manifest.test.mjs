@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
-import { createStagedManifest } from "../package-vsix-manifest.mjs";
-
-const packageVsixScript = readFileSync(new URL("../package-vsix.mjs", import.meta.url), "utf8");
+import { createStagedManifest, stagedPackageLayout } from "../package-vsix-manifest.mjs";
 
 const manifest = {
   name: "import-lens",
@@ -20,6 +17,8 @@ const manifest = {
   },
 };
 
+const { icon: _icon, ...manifestWithoutIcon } = manifest;
+
 test("createStagedManifest includes the repository license in packaged files", () => {
   const staged = createStagedManifest({ manifest });
 
@@ -35,9 +34,42 @@ test("createStagedManifest keeps production dependencies and strips development-
   assert.equal(staged.scripts, undefined);
 });
 
-test("package-vsix copies every non-generated manifest directory", () => {
-  assert.match(
-    packageVsixScript,
-    /copyPath\(path\.join\(repoRoot, "cli"\), path\.join\(stagingRoot, "cli"\)\)/,
-  );
+test("stagedPackageLayout stages only the daemon directory for the requested target", () => {
+  const { copies } = stagedPackageLayout({ manifest, target: "win32-arm64" });
+  const daemonCopies = copies.filter(({ source }) => source.startsWith("dist/bin"));
+
+  assert.deepEqual(daemonCopies, [
+    { source: "dist/bin/win32-arm64", destination: "dist/bin/win32-arm64" },
+  ]);
+});
+
+test("stagedPackageLayout copies every non-generated entry in the manifest allowlist", () => {
+  // package.json is written by createStagedManifest, never copied. Everything
+  // else the manifest promises to ship must actually be staged.
+  const { manifestFiles, copies } = stagedPackageLayout({ manifest, target: "win32-x64" });
+  const copied = new Set(copies.map(({ destination }) => destination));
+
+  for (const entry of manifestFiles) {
+    if (entry === "package.json") {
+      continue;
+    }
+
+    const normalized = entry.replace(/\/$/u, "");
+    const staged = [...copied].some(
+      (destination) => destination === normalized || destination.startsWith(`${normalized}/`),
+    );
+
+    assert.ok(staged, `manifest promises ${entry} but nothing copies it`);
+  }
+});
+
+test("stagedPackageLayout includes the icon only when the manifest declares one", () => {
+  const withIcon = stagedPackageLayout({ manifest, target: "linux-x64" });
+  const withoutIcon = stagedPackageLayout({ manifest: manifestWithoutIcon, target: "linux-x64" });
+
+  assert.ok(withIcon.copies.some(({ source }) => source === "media/icon.png"));
+  assert.ok(withIcon.manifestFiles.includes("media/icon.png"));
+
+  assert.ok(!withoutIcon.copies.some(({ source }) => source === "media/icon.png"));
+  assert.ok(!withoutIcon.manifestFiles.includes("media/icon.png"));
 });

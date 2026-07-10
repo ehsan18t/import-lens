@@ -138,6 +138,14 @@ export const cargoXwinEnvForTarget = (platformTarget, baseEnv = process.env) => 
   };
 };
 
+// zig cannot emit the MSVC ABI, so Windows cross-compiles with cargo-xwin while
+// the unix targets go through cargo-zigbuild. Which compiler a target needs is a
+// property of the target; callers read it here instead of hardcoding the split.
+export const crossCompilerForTarget = (platformTarget) => {
+  targetInfo(platformTarget);
+  return platformTarget.startsWith("win32") ? "xwin" : "zigbuild";
+};
+
 // All build artifacts live under dist/ (target/ is the one Rust-convention
 // exception). These relative segments are the single source for every script.
 export const vsixDir = "dist/vsix";
