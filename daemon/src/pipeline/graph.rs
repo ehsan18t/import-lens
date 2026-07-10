@@ -1833,6 +1833,65 @@ pub fn is_node_builtin_specifier(specifier: &str) -> bool {
     )
 }
 
+/// Every name `module_id` exports, transitively through re-exports and star
+/// exports. `include_default` is false for star-export recursion because
+/// `export *` never forwards `default`. Sorted and deduplicated so callers get
+/// a stable order.
+pub fn module_exported_names(
+    graph: &ModuleGraph,
+    module_id: ModuleId,
+    include_default: bool,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_module_exports(
+        graph,
+        module_id,
+        include_default,
+        &mut HashSet::new(),
+        &mut names,
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_module_exports(
+    graph: &ModuleGraph,
+    module_id: ModuleId,
+    include_default: bool,
+    visited: &mut HashSet<ModuleId>,
+    exports: &mut Vec<String>,
+) {
+    if !visited.insert(module_id) {
+        return;
+    }
+
+    let Some(module) = graph.module_by_id(module_id) else {
+        return;
+    };
+
+    exports.extend(
+        module
+            .exports
+            .iter()
+            .filter(|export| include_default || export.exported_name != "default")
+            .map(|export| export.exported_name.clone()),
+    );
+    exports.extend(
+        module
+            .reexports
+            .iter()
+            .filter(|reexport| include_default || reexport.exported_name != "default")
+            .map(|reexport| reexport.exported_name.clone()),
+    );
+
+    for star_export in &module.star_exports {
+        if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path) {
+            collect_module_exports(graph, target_id, false, visited, exports);
+        }
+    }
+}
+
 pub fn module_provides_export(
     graph: &ModuleGraph,
     module_id: ModuleId,

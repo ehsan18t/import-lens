@@ -28,8 +28,8 @@ use crate::{
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import_with_graph},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
     pipeline::graph::{
-        ModuleGraph, ModuleId, build_module_graph_cached, clear_module_graph_cache,
-        invalidate_module_graph_cache_for_package,
+        ModuleGraph, build_module_graph_cached, clear_module_graph_cache,
+        invalidate_module_graph_cache_for_package, module_exported_names,
     },
     pipeline::resolver::{ResolvedPackage, find_package_root, resolve_package_entry},
 };
@@ -1622,9 +1622,7 @@ impl ImportLensService {
             }
         };
 
-        let mut exports = enumerate_graph_exports(&graph);
-        exports.sort();
-        exports.dedup();
+        let exports = module_exported_names(&graph, graph.entry_id, true);
 
         EnumerateExportsResponse {
             version: request.version,
@@ -2585,55 +2583,6 @@ pub fn protocol_error_file_size_response(
             message,
             details: Vec::new(),
         }],
-    }
-}
-
-fn enumerate_graph_exports(graph: &ModuleGraph) -> Vec<String> {
-    let mut exports = Vec::new();
-    collect_module_exports(
-        graph,
-        graph.entry_id,
-        true,
-        &mut HashSet::new(),
-        &mut exports,
-    );
-    exports
-}
-
-fn collect_module_exports(
-    graph: &ModuleGraph,
-    module_id: ModuleId,
-    include_default: bool,
-    visited: &mut HashSet<ModuleId>,
-    exports: &mut Vec<String>,
-) {
-    if !visited.insert(module_id) {
-        return;
-    }
-
-    let Some(module) = graph.module_by_id(module_id) else {
-        return;
-    };
-
-    exports.extend(
-        module
-            .exports
-            .iter()
-            .filter(|export| include_default || export.exported_name != "default")
-            .map(|export| export.exported_name.clone()),
-    );
-    exports.extend(
-        module
-            .reexports
-            .iter()
-            .filter(|reexport| include_default || reexport.exported_name != "default")
-            .map(|reexport| reexport.exported_name.clone()),
-    );
-
-    for star_export in &module.star_exports {
-        if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path) {
-            collect_module_exports(graph, target_id, false, visited, exports);
-        }
     }
 }
 
