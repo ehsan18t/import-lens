@@ -1,5 +1,5 @@
 use import_lens_daemon::pipeline::{
-    bundle::{bundle_reachable_modules, bundle_reachable_modules_with_metadata},
+    bundle::{BundledModules, bundle_reachable_modules, bundle_reachable_modules_with_metadata},
     graph::build_module_graph,
     minify::{minify_source, minify_source_with_markers},
     reachability::reachable_exports,
@@ -34,6 +34,20 @@ fn assert_parseable(source: &str) {
         !parsed.panicked && !parsed.diagnostics.has_errors(),
         "generated source should parse cleanly: {source}"
     );
+}
+
+fn contribution_basenames(bundled: &BundledModules) -> Vec<String> {
+    bundled
+        .contributions
+        .iter()
+        .map(|contribution| {
+            Path::new(&contribution.path)
+                .file_name()
+                .expect("contribution path should have a file name")
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect()
 }
 
 fn assert_semantic_valid(source: &str) {
@@ -600,4 +614,196 @@ fn bundle_distinguishes_non_ascii_identifiers_that_sanitize_alike() {
 
     fs::remove_dir_all(root).expect("cleanup");
     assert!(!minified.is_empty());
+}
+
+#[test]
+fn bundle_indirect_reexport_does_not_drag_unrelated_imports() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import { small } from "./small.js";
+import { huge } from "./huge.js";
+export const used = small;
+export const unusedBranch = huge;
+export { typed } from "./leaf.js";
+"#,
+    );
+    write_source(&root, "small.js", "export const small = 'S';\n");
+    write_source(&root, "huge.js", "export const huge = 'H';\n");
+    write_source(&root, "leaf.js", "export const typed = 2;\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["typed".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let files = contribution_basenames(&bundled);
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        files.contains(&"leaf.js".to_owned()),
+        "re-export source must be bundled: {files:?}"
+    );
+    assert!(
+        !files.contains(&"huge.js".to_owned()),
+        "unreachable import was bundled: {files:?}"
+    );
+    assert!(
+        !files.contains(&"small.js".to_owned()),
+        "unreachable import was bundled: {files:?}"
+    );
+}
+
+#[test]
+fn bundle_star_export_does_not_drag_unrelated_imports() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import { noise } from "./noise.js";
+export const localNoise = noise;
+export * from "./leaf.js";
+"#,
+    );
+    write_source(&root, "noise.js", "export const noise = 'N';\n");
+    write_source(&root, "leaf.js", "export const typed = 2;\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["typed".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let files = contribution_basenames(&bundled);
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        files.contains(&"leaf.js".to_owned()),
+        "star-export source must be bundled: {files:?}"
+    );
+    assert!(
+        !files.contains(&"noise.js".to_owned()),
+        "unreachable import was bundled: {files:?}"
+    );
+}
+
+#[test]
+fn bundle_follows_reexport_chain_behind_named_import() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import { typed } from "./mid.js";
+export const wrapped = typed;
+"#,
+    );
+    write_source(
+        &root,
+        "mid.js",
+        r#"import { noise } from "./noise.js";
+export const midNoise = noise;
+export { typed } from "./leaf.js";
+"#,
+    );
+    write_source(&root, "noise.js", "export const noise = 'N';\n");
+    write_source(&root, "leaf.js", "export const typed = 2;\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["wrapped".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let files = contribution_basenames(&bundled);
+
+    fs::remove_dir_all(root).expect("cleanup");
+    // Dropping leaf.js here is an *under*-count: the bundle would reference a
+    // binding that no included module defines.
+    assert!(
+        files.contains(&"leaf.js".to_owned()),
+        "re-export source behind a named import must be bundled: {files:?}"
+    );
+    assert!(
+        !files.contains(&"noise.js".to_owned()),
+        "unreachable import was bundled: {files:?}"
+    );
+    assert_semantic_valid(&bundled.source);
+}
+
+#[test]
+fn bundle_follows_reexport_chains_marked_by_separate_imports() {
+    // Two import statements hit hub.js one after the other, each making a
+    // different re-exported name reachable. The second visit arrives when the
+    // module was already processed, so this locks the re-visit change
+    // detection: a newly reachable symbol must still get its chain followed.
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import { a } from "./hub.js";
+import { b } from "./hub.js";
+export const outA = a;
+export const outB = b;
+"#,
+    );
+    write_source(
+        &root,
+        "hub.js",
+        r#"export { a } from "./aa.js";
+export { b } from "./bb.js";
+"#,
+    );
+    write_source(&root, "aa.js", "export const a = 'A';\n");
+    write_source(&root, "bb.js", "export const b = 'B';\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["outA".to_owned(), "outB".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let files = contribution_basenames(&bundled);
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        files.contains(&"aa.js".to_owned()),
+        "first re-export chain must be bundled: {files:?}"
+    );
+    assert!(
+        files.contains(&"bb.js".to_owned()),
+        "second re-export chain must be bundled: {files:?}"
+    );
+    assert_semantic_valid(&bundled.source);
+}
+
+#[test]
+fn bundle_keeps_all_imports_of_side_effect_only_module() {
+    // Guard for the conservative fallback: a module reached purely for side
+    // effects has no reachable symbols, so all of its static imports stay.
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import "./effect.js";
+export const used = 1;
+"#,
+    );
+    write_source(
+        &root,
+        "effect.js",
+        r#"import { dep } from "./dep.js";
+globalThis.__importLensEffect = dep;
+"#,
+    );
+    write_source(&root, "dep.js", "export const dep = 'D';\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let files = contribution_basenames(&bundled);
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        files.contains(&"effect.js".to_owned()),
+        "side-effect module must be bundled: {files:?}"
+    );
+    assert!(
+        files.contains(&"dep.js".to_owned()),
+        "side-effect module's import must be bundled: {files:?}"
+    );
 }

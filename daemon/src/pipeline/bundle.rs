@@ -1,7 +1,7 @@
 use crate::{
     ipc::protocol::ModuleContribution,
     pipeline::{
-        graph::{ExternalImportEdge, ModuleGraph, ModuleId, ModuleRecord},
+        graph::{ExternalImportEdge, ModuleGraph, ModuleId, ModuleRecord, module_provides_export},
         reachability::ReachableExports,
         replacements::{Replacement, apply_replacements, span_overlaps_replacements},
         util::{is_identifier_continue, is_identifier_start},
@@ -198,13 +198,12 @@ fn include_module_with_imports(
     };
 
     let retained_bindings = retained_binding_names(module, reachable);
+    // A newly reachable re-export adds no local binding, so keying the re-visit
+    // guard on bindings alone would early-return and never follow its chain.
+    let mut change_key = retained_bindings.clone();
+    change_key.extend(reachable.module_symbol_names(&module.path));
     if previous_keep_all == Some(next_keep_all)
-        && !retained_bindings_changed(
-            module_id,
-            next_keep_all,
-            &retained_bindings,
-            processed_bindings,
-        )
+        && !retained_bindings_changed(module_id, next_keep_all, &change_key, processed_bindings)
     {
         return;
     }
@@ -245,30 +244,68 @@ fn include_module_with_imports(
         }
     }
 
-    if next_keep_all {
-        for reexport in &module.reexports {
-            if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path) {
-                include_module_with_imports(
-                    graph,
-                    target_id,
-                    true,
-                    reachable,
-                    included,
-                    processed_bindings,
-                );
+    // Re-export and star edges carry a reachable symbol to the module that
+    // defines it. Following them only under `next_keep_all` would drop that
+    // definition whenever the symbol arrives through a plain named import.
+    for reexport in &module.reexports {
+        let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path) else {
+            continue;
+        };
+        if !next_keep_all
+            && !reachable.contains_module_symbol(&module.path, &reexport.exported_name)
+        {
+            continue;
+        }
+        let target_keep_all = next_keep_all || reexport.imported_name == "*";
+        if let Some(target) = graph.module_by_id(target_id) {
+            if target_keep_all {
+                reachable.mark_full_module(target.path.clone());
+            } else {
+                reachable.mark_module_symbol(target.path.clone(), reexport.imported_name.clone());
             }
         }
-        for star_export in &module.star_exports {
-            if let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path) {
-                include_module_with_imports(
-                    graph,
-                    target_id,
-                    true,
-                    reachable,
-                    included,
-                    processed_bindings,
-                );
+        include_module_with_imports(
+            graph,
+            target_id,
+            target_keep_all,
+            reachable,
+            included,
+            processed_bindings,
+        );
+    }
+    for star_export in &module.star_exports {
+        let Some(target_id) = graph.module_id_by_path(&star_export.resolved_path) else {
+            continue;
+        };
+        if next_keep_all {
+            include_module_with_imports(
+                graph,
+                target_id,
+                true,
+                reachable,
+                included,
+                processed_bindings,
+            );
+            continue;
+        }
+        let mut followed_any = false;
+        for name in reachable.module_symbol_names(&module.path) {
+            if module_provides_export(graph, target_id, &name, &mut HashSet::new()) {
+                if let Some(target) = graph.module_by_id(target_id) {
+                    reachable.mark_module_symbol(target.path.clone(), name.clone());
+                }
+                followed_any = true;
             }
+        }
+        if followed_any {
+            include_module_with_imports(
+                graph,
+                target_id,
+                false,
+                reachable,
+                included,
+                processed_bindings,
+            );
         }
     }
 }
@@ -276,7 +313,7 @@ fn include_module_with_imports(
 fn retained_bindings_changed(
     module_id: ModuleId,
     keep_all_exports: bool,
-    retained_bindings: &HashSet<String>,
+    change_key: &HashSet<String>,
     processed_bindings: &mut HashMap<ModuleId, HashSet<String>>,
 ) -> bool {
     if keep_all_exports {
@@ -284,10 +321,8 @@ fn retained_bindings_changed(
     }
 
     let processed = processed_bindings.entry(module_id).or_default();
-    let changed = retained_bindings
-        .iter()
-        .any(|binding| !processed.contains(binding));
-    processed.extend(retained_bindings.iter().cloned());
+    let changed = change_key.iter().any(|name| !processed.contains(name));
+    processed.extend(change_key.iter().cloned());
     changed
 }
 
@@ -315,11 +350,14 @@ fn retained_binding_names(module: &ModuleRecord, reachable: &ReachableExports) -
     retained
 }
 
+/// Whether this module contributes any reachable export. Reachability records
+/// re-exported and star-passed names against the re-exporting module's own
+/// path, so asking by path covers local exports, named re-exports and star
+/// pass-throughs alike. A module reached purely for side effects never gets a
+/// symbol, so it keeps the conservative "I cannot tell which imports matter,
+/// keep them all" fallback.
 fn module_has_reachable_export(module: &ModuleRecord, reachable: &ReachableExports) -> bool {
-    module
-        .exports
-        .iter()
-        .any(|export| reachable.contains_module_symbol(&module.path, &export.exported_name))
+    reachable.has_module_symbols(&module.path)
 }
 
 fn retained_import_names(

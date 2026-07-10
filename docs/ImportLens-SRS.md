@@ -1454,6 +1454,10 @@ fn mark_export(module, export_name):
 
 fn include_module_with_imports(module, reachable):
   retained_bindings = retained local names for reachable exports in this module
+  // "has a reachable export" is asked of reachability by module path, so it is
+  // true when ANY export of the module is reachable -- local export, named
+  // re-export, or star pass-through. Only a module reached purely for side
+  // effects has no reachable symbol and takes the conservative branch.
   if reachable marks module as full, or module is reachable without a reachable export:
     retained_bindings = all local and imported binding names in the module
 
@@ -1471,9 +1475,35 @@ fn include_module_with_imports(module, reachable):
       if imported_binding.local_name in retained_bindings:
         reachable.add_symbol(import_edge.target, imported_binding.imported_name)
         include_module_with_imports(import_edge.target, reachable)
+
+  // Re-export and star edges carry a reachable symbol to the module that
+  // defines it. They must be followed whenever the re-exported name is
+  // reachable, not only when the whole module is kept: otherwise a plain named
+  // import that resolves to a re-export inside the target drops the defining
+  // module and the concatenated bundle references an undeclared binding.
+  for reexport in module.reexports:
+    if module is full, or reachable.has_symbol(module.path, reexport.exported_name):
+      if module is full or reexport imports "*":
+        mark_module_full(reexport.target)
+        include_module_with_imports(reexport.target, reachable)
+      else:
+        reachable.add_symbol(reexport.target, reexport.imported_name)
+        include_module_with_imports(reexport.target, reachable)
+
+  for star_export in module.star_exports:
+    if module is full:
+      mark_module_full(star_export.target)
+      include_module_with_imports(star_export.target, reachable)
+    else:
+      for name in reachable symbols of module.path where star_export.target provides name:
+        reachable.add_symbol(star_export.target, name)
+      if any such name existed:
+        include_module_with_imports(star_export.target, reachable)
 ```
 
-Named/default import analysis must not recurse into every static import of an included module. It follows only side-effect-only imports, full-module conservative inclusion, explicit `sideEffects` array matches, and imported bindings reached from the retained export/local dependency closure. This prevents a dead export such as `export const unused = huge` from pulling in `huge.js` when the user imported only `used`.
+Named/default import analysis must not recurse into every static import of an included module. It follows only side-effect-only imports, full-module conservative inclusion, explicit `sideEffects` array matches, imported bindings reached from the retained export/local dependency closure, and re-export/star edges whose re-exported name is itself reachable. This prevents a dead export such as `export const unused = huge` from pulling in `huge.js` when the user imported only `used`, while still bundling the module that actually defines a re-exported symbol.
+
+Because the bundler walk marks symbols as it descends, a module already visited may later gain a newly reachable symbol. Re-visit change detection must therefore key on the union of the module's retained bindings and its reachable symbol names; keying on bindings alone would early-return and leave a re-export chain unexpanded, since a re-export contributes no local binding.
 
 **Scope renaming before concatenation**
 
