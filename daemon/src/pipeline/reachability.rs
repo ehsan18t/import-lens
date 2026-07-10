@@ -3,13 +3,13 @@ use crate::{
     pipeline::graph::{ModuleGraph, ModuleId, module_provides_export},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
 #[derive(Debug, Default, Clone)]
 pub struct ReachableExports {
-    symbols: HashSet<(PathBuf, String)>,
+    symbols: HashMap<PathBuf, HashSet<String>>,
     modules: HashSet<PathBuf>,
     full_modules: HashSet<PathBuf>,
 }
@@ -17,7 +17,25 @@ pub struct ReachableExports {
 impl ReachableExports {
     pub fn contains_module_symbol(&self, path: &Path, exported_name: &str) -> bool {
         self.symbols
-            .contains(&(path.to_path_buf(), exported_name.to_owned()))
+            .get(path)
+            .is_some_and(|names| names.contains(exported_name))
+    }
+
+    /// True when any export of this module is reachable, whatever vector it
+    /// lives in. Named re-exports and star pass-throughs are recorded against
+    /// the re-exporting module's own path, so this covers all three export
+    /// kinds; a module reached purely for side effects has no symbols at all.
+    pub fn has_module_symbols(&self, path: &Path) -> bool {
+        self.symbols
+            .get(path)
+            .is_some_and(|names| !names.is_empty())
+    }
+
+    pub fn module_symbol_names(&self, path: &Path) -> Vec<String> {
+        self.symbols
+            .get(path)
+            .map(|names| names.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn contains_module(&self, path: &Path) -> bool {
@@ -29,7 +47,12 @@ impl ReachableExports {
     }
 
     pub fn merge_from(&mut self, other: &ReachableExports) {
-        self.symbols.extend(other.symbols.iter().cloned());
+        for (path, names) in &other.symbols {
+            self.symbols
+                .entry(path.clone())
+                .or_default()
+                .extend(names.iter().cloned());
+        }
         self.modules.extend(other.modules.iter().cloned());
         self.full_modules.extend(other.full_modules.iter().cloned());
     }
@@ -45,7 +68,7 @@ impl ReachableExports {
 
     pub fn mark_module_symbol(&mut self, path: PathBuf, exported_name: String) {
         self.modules.insert(path.clone());
-        self.symbols.insert((path, exported_name));
+        self.symbols.entry(path).or_default().insert(exported_name);
     }
 }
 
@@ -119,7 +142,9 @@ impl ReachabilityMarker<'_> {
         {
             self.reachable
                 .symbols
-                .insert((module.path.clone(), exported_name.to_owned()));
+                .entry(module.path.clone())
+                .or_default()
+                .insert(exported_name.to_owned());
         }
 
         for reexport in module
@@ -129,7 +154,9 @@ impl ReachabilityMarker<'_> {
         {
             self.reachable
                 .symbols
-                .insert((module.path.clone(), exported_name.to_owned()));
+                .entry(module.path.clone())
+                .or_default()
+                .insert(exported_name.to_owned());
 
             if let Some(target_id) = self.graph.module_id_by_path(&reexport.resolved_path) {
                 if reexport.imported_name == "*" {
@@ -147,7 +174,9 @@ impl ReachabilityMarker<'_> {
             if module_provides_export(self.graph, target_id, exported_name, &mut HashSet::new()) {
                 self.reachable
                     .symbols
-                    .insert((module.path.clone(), exported_name.to_owned()));
+                    .entry(module.path.clone())
+                    .or_default()
+                    .insert(exported_name.to_owned());
                 self.mark_export(target_id, exported_name);
             }
         }
@@ -174,13 +203,17 @@ impl ReachabilityMarker<'_> {
         for export in &module.exports {
             self.reachable
                 .symbols
-                .insert((module.path.clone(), export.exported_name.clone()));
+                .entry(module.path.clone())
+                .or_default()
+                .insert(export.exported_name.clone());
         }
 
         for reexport in &module.reexports {
             self.reachable
                 .symbols
-                .insert((module.path.clone(), reexport.exported_name.clone()));
+                .entry(module.path.clone())
+                .or_default()
+                .insert(reexport.exported_name.clone());
             if let Some(target_id) = self.graph.module_id_by_path(&reexport.resolved_path) {
                 if reexport.imported_name == "*" {
                     self.mark_module_full(target_id);
