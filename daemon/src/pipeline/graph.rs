@@ -895,7 +895,11 @@ fn transform_module_source_as(
     }
 
     let mut program = parsed.program;
-    let semantic = SemanticBuilder::new().build(&program);
+    // `with_enum_eval(true)` is a hard requirement of `Transformer`, not a tuning knob:
+    // lowering `enum E { A = 1 }` needs each member's evaluated value, and the
+    // transformer panics rather than guess when the scoping was built without it.
+    // Only this call site transforms TypeScript, so only it needs the flag.
+    let semantic = SemanticBuilder::new().with_enum_eval(true).build(&program);
     if semantic.diagnostics.has_errors() {
         return Err(format!(
             "semantic validation failed before transform {}; errors: {}",

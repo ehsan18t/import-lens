@@ -45,6 +45,45 @@ fn graph_from_sources<const N: usize>(
     (root, entry_path, graph)
 }
 
+/// Lowering an enum needs each member's evaluated value, which only lands in `Scoping`
+/// when the semantic builder is configured with `with_enum_eval(true)`.
+///
+/// Assert on the emitted code, not just on "it did not panic". The transformer's guard
+/// is a `debug_assert!`, so it is compiled out of the release daemon we ship: without
+/// the flag a release build does not crash, it silently emits
+/// `Level["High"] = 1 + Level["Low"]` where it should emit `Level["High"] = 1`. That is
+/// a larger bundle for the same program, which is exactly the thing this tool measures.
+/// `High` is left implicit on purpose — an explicit `= 1` is folded either way and
+/// would hide the bug.
+#[test]
+fn typescript_enum_member_values_are_folded_not_recomputed() {
+    let (root, _entry_path, graph) = graph_from_sources([
+        ("entry.js", "export { label } from \"./level.ts\";\n"),
+        (
+            "level.ts",
+            "export enum Level {\n  Low = 0,\n  High,\n}\nexport const label = Level[Level.High];\n",
+        ),
+    ]);
+
+    let module = graph
+        .modules
+        .iter()
+        .find(|module| module.path.ends_with("level.ts"))
+        .map(|module| module.source.clone());
+
+    fs::remove_dir_all(root).expect("temp graph workspace should be removed");
+
+    let source = module.expect("the TypeScript module should be resolved into the graph");
+    assert!(
+        source.contains("Level[\"High\"] = 1]") || source.contains("Level[\"High\"] = 1;"),
+        "implicit enum member should be folded to its constant value: {source}"
+    );
+    assert!(
+        !source.contains("+ Level[\"Low\"]"),
+        "enum member value was recomputed at runtime instead of folded: {source}"
+    );
+}
+
 #[test]
 fn binding_dependencies_track_top_level_references() {
     let (root, _entry_path, graph) = graph_from_sources([(
