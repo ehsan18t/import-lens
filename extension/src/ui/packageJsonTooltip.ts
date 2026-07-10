@@ -123,7 +123,7 @@ export const packageJsonDependencyTooltipMarkdown = (
       }
     }
   } else if (state.status === "ready" && state.result?.error) {
-    parts.push("ImportLens could not compute this dependency size.");
+    parts.push("Import Lens could not compute this dependency size.");
     parts.push(state.result.error);
   } else if (state.message) {
     parts.push(state.message);
@@ -193,7 +193,7 @@ export const packageJsonSectionSummaryTooltipMarkdown = (
   config: PackageJsonRegistryTooltipConfig,
   options: PackageJsonSectionSummaryTooltipOptions = {},
 ): string => {
-  const parts = ["**ImportLens dependency summary**", label];
+  const parts = ["**Import Lens dependency summary**", label];
 
   if (config.enableRegistryHints) {
     parts.push(sectionFetchedAtMarkdown(states, options));

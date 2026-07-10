@@ -1,4 +1,4 @@
-# ImportLens - clippy configuration
+# Import Lens - clippy configuration
 
 too-many-lines-threshold = 650
 cognitive-complexity-threshold = 120

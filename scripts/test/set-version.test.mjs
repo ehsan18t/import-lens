@@ -3,7 +3,7 @@ import test from "node:test";
 import { applyVersion } from "../set-version.mjs";
 
 const manifest = (version) =>
-  `${JSON.stringify({ name: "import-lens", version, publisher: "importlens" }, null, 2)}\n`;
+  `${JSON.stringify({ name: "import-lens", version, publisher: "ehsan18t" }, null, 2)}\n`;
 
 test("applyVersion rewrites the version and reports the change", () => {
   const { changed, content } = applyVersion(manifest("0.1.0"), "0.2.0");

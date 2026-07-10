@@ -1,9 +1,9 @@
 {
   "name": "import-lens",
-  "displayName": "ImportLens",
+  "displayName": "Import Lens",
   "description": "VS Code import size analyzer backed by a native Rust daemon.",
   "version": "0.1.0",
-  "publisher": "importlens",
+  "publisher": "ehsan18t",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -39,57 +39,57 @@
     "commands": [
       {
         "command": "importLens.clearCache",
-        "title": "ImportLens: Clear Current Project Cache",
-        "category": "ImportLens"
+        "title": "Import Lens: Clear Current Project Cache",
+        "category": "Import Lens"
       },
       {
         "command": "importLens.clearAllCaches",
-        "title": "ImportLens: Clear All Caches",
-        "category": "ImportLens"
+        "title": "Import Lens: Clear All Caches",
+        "category": "Import Lens"
       },
       {
         "command": "importLens.manageCache",
-        "title": "ImportLens: Manage Cache",
-        "category": "ImportLens"
+        "title": "Import Lens: Manage Cache",
+        "category": "Import Lens"
       },
       {
         "command": "importLens.showLogs",
-        "title": "ImportLens: Show Logs",
-        "category": "ImportLens"
+        "title": "Import Lens: Show Logs",
+        "category": "Import Lens"
       },
       {
         "command": "importLens.showCurrentFileSize",
-        "title": "ImportLens: Show Current File Size",
-        "category": "ImportLens"
+        "title": "Import Lens: Show Current File Size",
+        "category": "Import Lens"
       },
       {
         "command": "importLens.showBundleImpactHistory",
-        "title": "ImportLens: Show Bundle Impact History",
-        "category": "ImportLens"
+        "title": "Import Lens: Show Bundle Impact History",
+        "category": "Import Lens"
       },
       {
         "command": "importLens.showReport",
-        "title": "ImportLens: Show Report",
-        "category": "ImportLens"
+        "title": "Import Lens: Show Report",
+        "category": "Import Lens"
       },
       {
         "command": "importLens.compareImports",
-        "title": "ImportLens: Compare Imports",
-        "category": "ImportLens"
+        "title": "Import Lens: Compare Imports",
+        "category": "Import Lens"
       },
       {
         "command": "importLens.copyImportDiagnostics",
-        "title": "ImportLens: Copy Import Diagnostics",
-        "category": "ImportLens"
+        "title": "Import Lens: Copy Import Diagnostics",
+        "category": "Import Lens"
       }
     ],
     "configuration": {
-      "title": "ImportLens",
+      "title": "Import Lens",
       "properties": {
         "importLens.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Toggle ImportLens on or off."
+          "description": "Toggle Import Lens on or off."
         },
         "importLens.display": {
           "type": "string",
@@ -137,7 +137,7 @@
         "importLens.budgets": {
           "type": "object",
           "default": {},
-          "description": "Bundle budget thresholds in bytes. ImportLens currently supports perImportBrotliBytes and perFileBrotliBytes.",
+          "description": "Bundle budget thresholds in bytes. Import Lens currently supports perImportBrotliBytes and perFileBrotliBytes.",
           "properties": {
             "perImportBrotliBytes": {
               "type": "number",
@@ -160,13 +160,13 @@
         "importLens.enableDiskCache": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Persist computed sizes to disk across editor restarts. Use the `ImportLens: Manage Cache` command to inspect or clean cached data."
+          "markdownDescription": "Persist computed sizes to disk across editor restarts. Use the `Import Lens: Manage Cache` command to inspect or clean cached data."
         },
         "importLens.cacheMaxSizeMB": {
           "type": "number",
           "default": 512,
           "minimum": 64,
-          "description": "Global disk-byte budget in megabytes for ImportLens project caches. When the total across all projects exceeds this, the least-recently-used cache entries are evicted (entry-granular, across projects) down to ~90% of the budget."
+          "description": "Global disk-byte budget in megabytes for Import Lens project caches. When the total across all projects exceeds this, the least-recently-used cache entries are evicted (entry-granular, across projects) down to ~90% of the budget."
         },
         "importLens.registryCacheMaxSizeMB": {
           "type": "number",
@@ -193,7 +193,7 @@
             "debug"
           ],
           "default": "info",
-          "description": "Logging verbosity for the ImportLens output channel."
+          "description": "Logging verbosity for the Import Lens output channel."
         }
       }
     }

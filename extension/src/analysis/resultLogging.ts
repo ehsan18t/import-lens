@@ -26,7 +26,7 @@ export const debugMessageForImportResult = (result: ImportResult): string | null
     return null;
   }
 
-  const lines = [`ImportLens diagnostics for ${result.specifier}`];
+  const lines = [`Import Lens diagnostics for ${result.specifier}`];
 
   if (result.error) {
     lines.push(`Error: ${result.error}`);

@@ -36,7 +36,7 @@ export class BudgetDiagnosticsController implements vscode.Disposable {
           violation.message,
           vscode.DiagnosticSeverity.Warning,
         );
-        diagnostic.source = "ImportLens";
+        diagnostic.source = "Import Lens";
         diagnostic.code = violation.kind === "file" ? "file-budget" : "import-budget";
         return diagnostic;
       },

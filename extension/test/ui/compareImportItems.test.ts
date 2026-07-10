@@ -45,10 +45,10 @@ test("compareImportItemsForResults sorts successful imports by Brotli size", () 
 test("compareImportItemsForResults reports no daemon and all-error results", () => {
   assert.deepEqual(compareImportItemsForResults(null), {
     items: [],
-    warning: "ImportLens daemon did not return comparison results.",
+    warning: "Import Lens daemon did not return comparison results.",
   });
   assert.deepEqual(compareImportItemsForResults([result("broken-lib", 0, "failed")]), {
     items: [],
-    warning: "ImportLens could not compute any comparison results.",
+    warning: "Import Lens could not compute any comparison results.",
   });
 });

@@ -37,24 +37,24 @@ export const showCacheManager = async (
   const status = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Loading cache status",
+      title: "Import Lens: Loading cache status",
     },
     () => daemon.cacheStatus(cacheStatusRequest(nextIpcRequestId(), workspaceRoot)),
   );
 
   if (!status) {
-    await vscode.window.showWarningMessage("ImportLens cache status is unavailable.");
+    await vscode.window.showWarningMessage("Import Lens cache status is unavailable.");
     return;
   }
 
   if (status.error) {
     logger.warn(`Cache status failed: ${status.error}`);
-    await vscode.window.showWarningMessage(`ImportLens cache status failed: ${status.error}`);
+    await vscode.window.showWarningMessage(`Import Lens cache status failed: ${status.error}`);
     return;
   }
 
   const selected = await vscode.window.showQuickPick(cacheManagerActionItems(status), {
-    title: "ImportLens Cache",
+    title: "Import Lens Cache",
     placeHolder: "Review cache status, then choose what to clear",
   });
 
@@ -94,7 +94,7 @@ export const clearCurrentProjectCache = async (
   }
 
   const confirmed = await vscode.window.showWarningMessage(
-    "Clear the ImportLens cache for the current project?",
+    "Clear the Import Lens cache for the current project?",
     { modal: true },
     "Clear Cache",
   );
@@ -106,7 +106,7 @@ export const clearCurrentProjectCache = async (
   const response = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Clearing current project cache",
+      title: "Import Lens: Clearing current project cache",
     },
     () => daemon.removeCache(cacheRemoveCurrentProjectRequest(nextIpcRequestId(), workspaceRoot)),
   );
@@ -133,31 +133,31 @@ const clearAllProjectsCache = async (
   const list = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Loading project caches",
+      title: "Import Lens: Loading project caches",
     },
     () => daemon.listCache(cacheListRequest(nextIpcRequestId())),
   );
 
   if (!list) {
-    await vscode.window.showWarningMessage("ImportLens project cache list is unavailable.");
+    await vscode.window.showWarningMessage("Import Lens project cache list is unavailable.");
     return;
   }
 
   if (list.error) {
     logger.warn(`Cache list failed: ${list.error}`);
-    await vscode.window.showWarningMessage(`ImportLens cache list failed: ${list.error}`);
+    await vscode.window.showWarningMessage(`Import Lens cache list failed: ${list.error}`);
     return;
   }
 
   const shardIds = list.shards.map((shard) => shard.shard_id);
 
   if (shardIds.length === 0) {
-    await vscode.window.showInformationMessage("ImportLens has no project caches to clear.");
+    await vscode.window.showInformationMessage("Import Lens has no project caches to clear.");
     return;
   }
 
   const confirmed = await vscode.window.showWarningMessage(
-    `Clear ImportLens bundle caches for all ${shardIds.length} project${
+    `Clear Import Lens bundle caches for all ${shardIds.length} project${
       shardIds.length === 1 ? "" : "s"
     }? Registry metadata is kept.`,
     { modal: true },
@@ -171,7 +171,7 @@ const clearAllProjectsCache = async (
   const response = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Clearing all project caches",
+      title: "Import Lens: Clearing all project caches",
     },
     () => daemon.removeCache(cacheRemoveSelectedRequest(nextIpcRequestId(), shardIds)),
   );
@@ -196,7 +196,7 @@ const clearOrphanedCaches = async (
   }
 
   const confirmed = await vscode.window.showWarningMessage(
-    "Remove ImportLens caches for moved or deleted projects? Caches for projects that still exist are kept.",
+    "Remove Import Lens caches for moved or deleted projects? Caches for projects that still exist are kept.",
     { modal: true },
     "Remove Orphaned",
   );
@@ -208,7 +208,7 @@ const clearOrphanedCaches = async (
   const response = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Removing orphaned caches",
+      title: "Import Lens: Removing orphaned caches",
     },
     () => daemon.removeCache(cacheRemoveOrphansRequest(nextIpcRequestId())),
   );
@@ -229,7 +229,7 @@ const clearRegistryCache = async (
   }
 
   const confirmed = await vscode.window.showWarningMessage(
-    "Clear ImportLens registry metadata (npm hints)?",
+    "Clear Import Lens registry metadata (npm hints)?",
     { modal: true },
     "Clear Registry",
   );
@@ -241,7 +241,7 @@ const clearRegistryCache = async (
   const response = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Clearing registry metadata",
+      title: "Import Lens: Clearing registry metadata",
     },
     () => daemon.removeCache(cacheRemoveRegistryRequest(nextIpcRequestId())),
   );
@@ -265,7 +265,7 @@ export const clearAllCaches = async (
   }
 
   const confirmed = await vscode.window.showWarningMessage(
-    "Clear everything? This removes all ImportLens project caches, registry metadata, and derived state.",
+    "Clear everything? This removes all Import Lens project caches, registry metadata, and derived state.",
     { modal: true },
     "Clear Everything",
   );
@@ -277,7 +277,7 @@ export const clearAllCaches = async (
   const response = await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: "ImportLens: Clearing all caches",
+      title: "Import Lens: Clearing all caches",
     },
     () => daemon.removeCache(cacheRemoveAllRequest(nextIpcRequestId())),
   );
@@ -291,7 +291,7 @@ const requireWorkspaceRoot = async (): Promise<string | null> => {
 
   if (!workspaceRoot) {
     await vscode.window.showWarningMessage(
-      "Open a workspace or local file before managing ImportLens cache.",
+      "Open a workspace or local file before managing Import Lens cache.",
     );
   }
 
@@ -317,7 +317,7 @@ const ensureDaemonReady = async (
     return true;
   }
 
-  await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
+  await vscode.window.showWarningMessage("Import Lens daemon is unavailable.");
   return false;
 };
 
@@ -327,13 +327,13 @@ const reportRemoveResponse = async (
   response: CacheRemoveResponse | null,
 ): Promise<void> => {
   if (!response) {
-    await vscode.window.showWarningMessage("ImportLens cache removal did not return a result.");
+    await vscode.window.showWarningMessage("Import Lens cache removal did not return a result.");
     return;
   }
 
   if (response.error) {
     logger.warn(`Cache removal failed for ${scope}: ${response.error}`);
-    await vscode.window.showWarningMessage(`ImportLens cache removal failed: ${response.error}`);
+    await vscode.window.showWarningMessage(`Import Lens cache removal failed: ${response.error}`);
     return;
   }
 

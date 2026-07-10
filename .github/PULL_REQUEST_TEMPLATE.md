@@ -1,5 +1,5 @@
 <!--
-Thanks for contributing to ImportLens! Please fill out the sections below.
+Thanks for contributing to Import Lens! Please fill out the sections below.
 Keep the PR focused on a single logical change where possible.
 -->
 

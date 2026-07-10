@@ -21,7 +21,7 @@ export const compareImports = async (
   }
 
   const input = await vscode.window.showInputBox({
-    title: "ImportLens: Compare Imports",
+    title: "Import Lens: Compare Imports",
     prompt: "Enter package imports separated by commas",
     value: initialSpecifier ?? "",
   });
@@ -42,7 +42,7 @@ export const compareImports = async (
   );
 
   if (daemon.state !== "ready" && (await daemon.start(workspaceRoot)) !== "ready") {
-    await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
+    await vscode.window.showWarningMessage("Import Lens daemon is unavailable.");
     return;
   }
 
@@ -63,7 +63,7 @@ export const compareImports = async (
     logger.warn(
       `Import comparison failed: ${error instanceof Error ? error.message : String(error)}`,
     );
-    await vscode.window.showWarningMessage("ImportLens import comparison failed.");
+    await vscode.window.showWarningMessage("Import Lens import comparison failed.");
     return;
   }
 
@@ -77,7 +77,7 @@ export const compareImports = async (
   }
 
   await vscode.window.showQuickPick(items, {
-    title: "ImportLens Import Comparison",
+    title: "Import Lens Import Comparison",
     placeHolder: "Imports sorted by Brotli size",
   });
 };

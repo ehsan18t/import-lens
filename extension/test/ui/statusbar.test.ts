@@ -21,9 +21,9 @@ test("statusBarText shows Unavailable on daemon/error", () => {
 test("statusBarTooltip uses colon-based app copy", () => {
   assert.equal(
     statusBarTooltip({ kind: "size", label: "12.3 kB gzip" }),
-    "ImportLens: Current file bundle size (12.3 kB gzip)",
+    "Import Lens: Current file bundle size (12.3 kB gzip)",
   );
-  assert.equal(statusBarTooltip({ kind: "ready" }), "ImportLens: Ready");
-  assert.equal(statusBarTooltip({ kind: "computing" }), "ImportLens: Computing current file size");
-  assert.equal(statusBarTooltip({ kind: "unavailable" }), "ImportLens: Daemon unavailable");
+  assert.equal(statusBarTooltip({ kind: "ready" }), "Import Lens: Ready");
+  assert.equal(statusBarTooltip({ kind: "computing" }), "Import Lens: Computing current file size");
+  assert.equal(statusBarTooltip({ kind: "unavailable" }), "Import Lens: Daemon unavailable");
 });

@@ -83,7 +83,7 @@ export const budgetViolationsForStates = (
         actualBytes,
         limitBytes: importLimit,
         range: state.detected.statementRange,
-        message: `ImportLens budget exceeded: ${state.detected.specifier} is ${formatBytes(actualBytes)} br, over ${formatBytes(importLimit)} br.`,
+        message: `Import Lens budget exceeded: ${state.detected.specifier} is ${formatBytes(actualBytes)} br, over ${formatBytes(importLimit)} br.`,
       });
     }
   }
@@ -94,7 +94,7 @@ export const budgetViolationsForStates = (
       actualBytes: fileBrotliBytes,
       limitBytes: fileLimit,
       range: firstMeasuredRange,
-      message: `ImportLens file budget exceeded: analyzed imports total ${formatBytes(fileBrotliBytes)} br, over ${formatBytes(fileLimit)} br.`,
+      message: `Import Lens file budget exceeded: analyzed imports total ${formatBytes(fileBrotliBytes)} br, over ${formatBytes(fileLimit)} br.`,
     });
   }
 

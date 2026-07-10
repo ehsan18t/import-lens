@@ -16,12 +16,12 @@ export const showReport = async (
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
   if (!workspaceRoot) {
-    await vscode.window.showWarningMessage("ImportLens report requires an open workspace folder.");
+    await vscode.window.showWarningMessage("Import Lens report requires an open workspace folder.");
     return;
   }
 
   if (daemon.state !== "ready" && (await daemon.start(workspaceRoot)) !== "ready") {
-    await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
+    await vscode.window.showWarningMessage("Import Lens daemon is unavailable.");
     return;
   }
 
@@ -30,7 +30,7 @@ export const showReport = async (
     const response = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: "ImportLens: Building workspace report",
+        title: "Import Lens: Building workspace report",
       },
       () =>
         daemon.requestWorkspaceReport({
@@ -44,7 +44,7 @@ export const showReport = async (
 
     if (!response || response.error) {
       await vscode.window.showWarningMessage(
-        `ImportLens report unavailable${response?.error ? `: ${response.error}` : "."}`,
+        `Import Lens report unavailable${response?.error ? `: ${response.error}` : "."}`,
       );
       return;
     }
@@ -54,7 +54,7 @@ export const showReport = async (
     const summary = response.summary;
     const panel = vscode.window.createWebviewPanel(
       "importLensReport",
-      "ImportLens Report",
+      "Import Lens Report",
       vscode.ViewColumn.Beside,
       {
         enableScripts: false,
@@ -131,7 +131,7 @@ th{font-weight:600}
 </style>
 </head>
 <body>
-<h1>ImportLens Workspace Report</h1>
+<h1>Import Lens Workspace Report</h1>
 <section class="summary">
 <div class="metric">Imports<strong>${summary.importCount}</strong></div>
 <div class="metric">Total Brotli<strong>${formatBytes(summary.totalBrotliBytes)}</strong></div>
@@ -165,7 +165,7 @@ th{font-weight:600}
       `Workspace report request failed: ${error instanceof Error ? error.message : String(error)}`,
     );
     await vscode.window.showWarningMessage(
-      `ImportLens report request failed: ${error instanceof Error ? error.message : String(error)}`,
+      `Import Lens report request failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 };

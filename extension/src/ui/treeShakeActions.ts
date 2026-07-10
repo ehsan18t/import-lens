@@ -38,22 +38,22 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
 
     if (reason) {
       const inspect = new vscode.CodeAction(
-        `Inspect ImportLens tree-shaking: ${reason}`,
+        `Inspect Import Lens tree-shaking: ${reason}`,
         vscode.CodeActionKind.Refactor,
       );
       inspect.command = {
         command: "importLens.showImportDetails",
-        title: "Inspect ImportLens tree-shaking diagnostics",
+        title: "Inspect Import Lens tree-shaking diagnostics",
         arguments: [state.result, state.detected.runtime],
       };
 
       const copy = new vscode.CodeAction(
-        "Copy ImportLens tree-shaking diagnostics",
+        "Copy Import Lens tree-shaking diagnostics",
         vscode.CodeActionKind.Refactor,
       );
       copy.command = {
         command: copyImportDiagnosticsCommand,
-        title: "Copy ImportLens tree-shaking diagnostics",
+        title: "Copy Import Lens tree-shaking diagnostics",
         arguments: [state.result],
       };
 
@@ -62,12 +62,12 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
 
     if (shouldOfferNamedExportCandidates(state)) {
       const namedExports = new vscode.CodeAction(
-        "Show ImportLens named export candidates",
+        "Show Import Lens named export candidates",
         vscode.CodeActionKind.QuickFix,
       );
       namedExports.command = {
         command: showNamedExportCandidatesCommand,
-        title: "Show ImportLens named export candidates",
+        title: "Show Import Lens named export candidates",
         arguments: [document.uri, state.detected],
       };
       actions.push(namedExports);
@@ -78,12 +78,12 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
       state.detected.packageName,
     )) {
       const action = new vscode.CodeAction(
-        `Copy ImportLens alternative: ${suggestion.packageName}`,
+        `Copy Import Lens alternative: ${suggestion.packageName}`,
         vscode.CodeActionKind.Refactor,
       );
       action.command = {
         command: "importLens.copySubstitutionSuggestion",
-        title: "Copy ImportLens import alternative",
+        title: "Copy Import Lens import alternative",
         arguments: [state.detected.specifier, suggestion.packageName, suggestion.reason],
       };
       actions.push(action);

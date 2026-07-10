@@ -107,5 +107,5 @@ test("ImportResultLogTracker deduplicates partial and final warning/debug logs",
     "sonner: daemon response did not include a matching result",
   ]);
   assert.equal(debug.length, 1);
-  assert.match(debug[0] ?? "", /ImportLens diagnostics for sonner/u);
+  assert.match(debug[0] ?? "", /Import Lens diagnostics for sonner/u);
 });

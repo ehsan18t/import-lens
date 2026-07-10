@@ -177,7 +177,7 @@ jobs:
         if: ${{ inputs.dry_run }}
         run: |
           {
-            echo "## Dry run for ImportLens v${RELEASE_VERSION}"
+            echo "## Dry run for Import Lens v${RELEASE_VERSION}"
             echo ""
             echo "All 6 VSIX artifacts present and within the size budget. Nothing was created or published."
             echo ""
@@ -199,7 +199,7 @@ jobs:
           gh release create "$RELEASE_TAG" dist/vsix/*.vsix \
             --draft \
             --target "$GITHUB_SHA" \
-            --title "ImportLens $RELEASE_VERSION" \
+            --title "Import Lens $RELEASE_VERSION" \
             --notes-file notes.md
 
       - name: Publish VSIXs to Visual Studio Marketplace

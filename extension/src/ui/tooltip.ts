@@ -33,11 +33,11 @@ export const tooltipForAnalysisState = (
   state: ImportAnalysisState,
 ): vscode.MarkdownString | undefined => {
   if (state.status === "missing") {
-    return tooltipForMessage("ImportLens", state.message ?? "Package not found");
+    return tooltipForMessage("Import Lens", state.message ?? "Package not found");
   }
 
   if (state.status === "unavailable") {
-    return tooltipForMessage("ImportLens", state.message ?? "Daemon unavailable");
+    return tooltipForMessage("Import Lens", state.message ?? "Daemon unavailable");
   }
 
   if (state.status === "ready" && state.result) {

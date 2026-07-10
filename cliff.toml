@@ -1,4 +1,4 @@
-# git-cliff configuration — deterministic release notes for ImportLens.
+# git-cliff configuration — deterministic release notes for Import Lens.
 # Used by scripts/generate-changelog.mjs when AI_API_KEY is not set (or the AI call fails).
 # Renders grouped, conventional-commit-based notes with no top-level header, so the output
 # slots directly under a GitHub release title.

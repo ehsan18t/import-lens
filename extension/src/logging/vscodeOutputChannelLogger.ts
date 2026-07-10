@@ -20,7 +20,7 @@ export class VscodeOutputChannelLogger implements Logger, vscode.Disposable {
   ) {
     this.#levelRef = levelRef ?? { value: level };
     this.#context = context;
-    this.#channel = channel ?? vscode.window.createOutputChannel("ImportLens");
+    this.#channel = channel ?? vscode.window.createOutputChannel("Import Lens");
     this.#ownsChannel = ownsChannel;
     this.#writeLine = writeLine ?? ((line) => this.#channel.appendLine(line));
 

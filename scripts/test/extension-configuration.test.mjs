@@ -5,29 +5,29 @@ import test from "node:test";
 const manifest = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
 const tsconfig = JSON.parse(readFileSync(new URL("../../tsconfig.json", import.meta.url), "utf8"));
 
-test("ImportLens log level defaults to info for visible output-channel diagnostics", () => {
+test("Import Lens log level defaults to info for visible output-channel diagnostics", () => {
   assert.equal(
     manifest.contributes.configuration.properties["importLens.logLevel"].default,
     "info",
   );
 });
 
-test("ImportLens colored inline renderer is the default with native available", () => {
+test("Import Lens colored inline renderer is the default with native available", () => {
   const setting = manifest.contributes.configuration.properties["importLens.inlineRenderer"];
 
   assert.equal(setting.default, "colored");
   assert.deepEqual(setting.enum, ["native", "colored"]);
 });
 
-test("ImportLens keeps the VS Code engine aligned with the fork-compatible API baseline", () => {
+test("Import Lens keeps the VS Code engine aligned with the fork-compatible API baseline", () => {
   assert.equal(manifest.engines.vscode, "^1.90.0");
 });
 
-test("ImportLens TypeScript config targets the SRS baseline", () => {
+test("Import Lens TypeScript config targets the SRS baseline", () => {
   assert.equal(tsconfig.compilerOptions.target, "es2025");
 });
 
-test("ImportLens budgets expose per-import and per-file Brotli thresholds", () => {
+test("Import Lens budgets expose per-import and per-file Brotli thresholds", () => {
   const setting = manifest.contributes.configuration.properties["importLens.budgets"];
 
   assert.deepEqual(setting.default, {});
@@ -36,14 +36,14 @@ test("ImportLens budgets expose per-import and per-file Brotli thresholds", () =
   assert.equal(setting.additionalProperties, false);
 });
 
-test("ImportLens registry hints default on", () => {
+test("Import Lens registry hints default on", () => {
   assert.equal(
     manifest.contributes.configuration.properties["importLens.enableRegistryHints"].default,
     true,
   );
 });
 
-test("ImportLens exposes cache retention policy settings", () => {
+test("Import Lens exposes cache retention policy settings", () => {
   const maxSize = manifest.contributes.configuration.properties["importLens.cacheMaxSizeMB"];
   const registryMaxSize =
     manifest.contributes.configuration.properties["importLens.registryCacheMaxSizeMB"];
@@ -54,7 +54,7 @@ test("ImportLens exposes cache retention policy settings", () => {
   assert.equal(registryMaxSize.minimum, 1);
 });
 
-test("ImportLens compare workflow is contributed and package.json can activate the extension", () => {
+test("Import Lens compare workflow is contributed and package.json can activate the extension", () => {
   assert.ok(manifest.activationEvents.includes("onLanguage:json"));
   assert.ok(manifest.activationEvents.includes("onLanguage:jsonc"));
   assert.ok(
@@ -64,16 +64,16 @@ test("ImportLens compare workflow is contributed and package.json can activate t
   );
 });
 
-test("ImportLens contributes cache management commands", () => {
+test("Import Lens contributes cache management commands", () => {
   const commands = new Map(
     manifest.contributes.commands.map((command) => [command.command, command.title]),
   );
 
-  assert.equal(commands.get("importLens.manageCache"), "ImportLens: Manage Cache");
-  assert.equal(commands.get("importLens.clearCache"), "ImportLens: Clear Current Project Cache");
-  assert.equal(commands.get("importLens.clearAllCaches"), "ImportLens: Clear All Caches");
+  assert.equal(commands.get("importLens.manageCache"), "Import Lens: Manage Cache");
+  assert.equal(commands.get("importLens.clearCache"), "Import Lens: Clear Current Project Cache");
+  assert.equal(commands.get("importLens.clearAllCaches"), "Import Lens: Clear All Caches");
 });
 
-test("ImportLens activates for Vue component files", () => {
+test("Import Lens activates for Vue component files", () => {
   assert.ok(manifest.activationEvents.includes("onLanguage:vue"));
 });

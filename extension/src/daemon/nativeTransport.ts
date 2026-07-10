@@ -149,10 +149,10 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#setState("unavailable");
       return this.#state;
     }
-    this.#logger.info(`Starting ImportLens daemon for workspace ${workspaceRoot}.`);
+    this.#logger.info(`Starting Import Lens daemon for workspace ${workspaceRoot}.`);
 
     if (await this.#recycleGuard.shouldEnterDegradedMode()) {
-      this.#logger.warn("Daemon recycle loop detected. ImportLens is entering unavailable mode.");
+      this.#logger.warn("Daemon recycle loop detected. Import Lens is entering unavailable mode.");
       this.#setState("unavailable");
       return this.#state;
     }
@@ -194,7 +194,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       storagePaths.lifecycleStoragePath,
     ]);
     this.#process = childProcess;
-    this.#logger.info(`Spawned ImportLens daemon process ${childProcess.pid ?? "unknown"}.`);
+    this.#logger.info(`Spawned Import Lens daemon process ${childProcess.pid ?? "unknown"}.`);
     pipeDaemonProcessLogs(childProcess, this.#logger);
 
     childProcess.once("exit", (code, signal) => {
@@ -218,7 +218,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       }
 
       this.#client = client;
-      this.#logger.info("Connected to ImportLens daemon IPC.");
+      this.#logger.info("Connected to Import Lens daemon IPC.");
     } catch (error) {
       this.#logger.warn(
         `Failed to connect to daemon: ${error instanceof Error ? error.message : String(error)}`,
@@ -270,7 +270,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#setState("ready");
     this.#armStabilityReset();
     this.#armCleanRecycleReset();
-    this.#logger.info("ImportLens daemon is ready.");
+    this.#logger.info("Import Lens daemon is ready.");
 
     return this.#state;
   }
@@ -322,7 +322,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
     if (shouldEnterCrashDegradedMode(this.#crashTimes, now)) {
       this.#logger.error(
-        "Daemon crashed three times within 60 seconds. ImportLens is entering unavailable mode.",
+        "Daemon crashed three times within 60 seconds. Import Lens is entering unavailable mode.",
       );
       this.#setState("unavailable");
       return;
@@ -575,12 +575,12 @@ export class NativeDaemonTransport implements AnalysisTransport {
   }
 
   invalidatePackage(packageName: string): void {
-    this.#logger.info(`Invalidating ImportLens cache for ${packageName}.`);
+    this.#logger.info(`Invalidating Import Lens cache for ${packageName}.`);
     this.#client?.send({ type: "cache_invalidate", package: packageName });
   }
 
   invalidateAll(): void {
-    this.#logger.info("Invalidating entire ImportLens cache.");
+    this.#logger.info("Invalidating entire Import Lens cache.");
     this.#client?.send({ type: "cache_invalidate_all" });
   }
 

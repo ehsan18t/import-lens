@@ -93,7 +93,7 @@ const analysisMarkdown = (
 const errorDiagnosticsMarkdown = (result: ImportResult, confidenceBadge: string): string => {
   const rows = [
     "**Diagnostics**",
-    "ImportLens could not compute this import size.",
+    "Import Lens could not compute this import size.",
     `- Error: ${result.error}`,
     `- Confidence: **${confidenceBadge}**`,
     ...result.confidence_reasons.map((reason) => `- ${reason}`),

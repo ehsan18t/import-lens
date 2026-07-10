@@ -310,7 +310,7 @@ test("tooltipForResultMarkdown renders compact diagnostics for errored results",
   );
 
   assert.match(markdown, /\*\*Diagnostics\*\*/u);
-  assert.match(markdown, /ImportLens could not compute this import size\./u);
+  assert.match(markdown, /Import Lens could not compute this import size\./u);
   assert.match(markdown, /- Error: failed to resolve package/u);
   assert.match(markdown, /- Confidence: \*\*Low\*\*/u);
   assert.match(markdown, /- Resolver returned no entry\./u);

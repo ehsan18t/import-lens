@@ -87,7 +87,7 @@ export const createNodeModulesInvalidationBuffer = (
     if (decision.kind === "all") {
       sink.invalidateAll();
       options.logger?.info(
-        `Queued ${decision.count} node_modules package.json invalidation(s); invalidating all ImportLens caches.`,
+        `Queued ${decision.count} node_modules package.json invalidation(s); invalidating all Import Lens caches.`,
       );
       options.onInvalidated?.();
       return;

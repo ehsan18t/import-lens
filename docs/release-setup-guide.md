@@ -1,6 +1,6 @@
 # Release Setup Guide
 
-A step-by-step guide to configuring and running ImportLens releases. It assumes **no prior knowledge** of the publishing tokens or the workflows — if you can open the GitHub repo settings, you can follow this.
+A step-by-step guide to configuring and running Import Lens releases. It assumes **no prior knowledge** of the publishing tokens or the workflows — if you can open the GitHub repo settings, you can follow this.
 
 This guide pairs with the design spec at
 [`docs/superpowers/specs/2026-07-03-release-workflow-revamp-design.md`](superpowers/specs/2026-07-03-release-workflow-revamp-design.md),
@@ -10,7 +10,7 @@ which explains *why* things are shaped this way. This document explains *what to
 
 ## 1. The big picture (read this first)
 
-Releasing ImportLens is **two separate GitHub Actions workflows** you run by hand from the **Actions** tab:
+Releasing Import Lens is **two separate GitHub Actions workflows** you run by hand from the **Actions** tab:
 
 1. **Build** (`.github/workflows/build.yml`) — compiles the extension for all 6 platforms
    (Windows x64/arm64, Linux x64/arm64, macOS x64/arm64) and stores each one as a downloadable
@@ -62,18 +62,18 @@ Each of the following subsections tells you how to obtain one value.
 
 ---
 
-### 2.1 Prerequisite: make sure the publisher IDs match
+### 2.1 Prerequisite: make sure the publisher ID and namespace match
 
 Two of the stores tie your uploads to a **publisher / namespace identity**. Both must equal the
 `publisher` field already set in `package.json`:
 
 ```jsonc
 // package.json
-"publisher": "importlens",
+"publisher": "ehsan18t",
 ```
 
-So the VS Code Marketplace **publisher ID** must be `importlens`, and the Open VSX **namespace**
-must be `importlens`. If they don't match, publishing is rejected. Keep this in mind for §2.2 and §2.3.
+So the VS Code Marketplace **publisher ID** must be `ehsan18t`, and the Open VSX **namespace**
+must be `ehsan18t`. If they don't match, publishing is rejected. Keep this in mind for §2.2 and §2.3.
 
 ---
 
@@ -84,7 +84,7 @@ Publishing to the official Marketplace uses a **Personal Access Token (PAT)** fr
 
 **Step A — create the publisher (once):**
 1. Go to <https://marketplace.visualstudio.com/manage> and sign in with a Microsoft account.
-2. Create a publisher. Set its **ID** to `importlens` (must match `package.json`).
+2. Create a publisher. Set its **ID** to `ehsan18t` (must match `package.json`).
 
 **Step B — create the token:**
 1. Go to <https://dev.azure.com/> and sign in with the **same** Microsoft account. If you have no
@@ -119,12 +119,12 @@ Open VSX is the registry used by VSCodium, Cursor, Windsurf, Gitpod, and other n
 2. Create a new token, give it a description, and **copy it now**.
 
 **Step C — create the namespace (once):**
-The namespace `importlens` must exist and be owned by you before you can publish under it. From a
+The namespace `ehsan18t` must exist and be owned by you before you can publish under it. From a
 terminal in the repo:
 
 ```bash
 # Uses the ovsx CLI (added as a dev dependency by this project).
-pnpm exec ovsx create-namespace importlens -p <YOUR_OVSX_TOKEN>
+pnpm exec ovsx create-namespace ehsan18t -p <YOUR_OVSX_TOKEN>
 ```
 
 (If it says the namespace already exists and is yours, you're fine.)
@@ -193,9 +193,9 @@ If your organization restricts Actions, make sure:
 
 Tick these off once. You only need the rows for the stores you actually want to publish to.
 
-- [ ] `package.json` `publisher` is `importlens`.
-- [ ] **VS Code Marketplace:** publisher `importlens` created; `VSCE_PAT` secret added.
-- [ ] **Open VSX:** agreement signed; namespace `importlens` created; `OVSX_PAT` secret added.
+- [ ] `package.json` `publisher` is `ehsan18t`.
+- [ ] **VS Code Marketplace:** publisher ID `ehsan18t` created; `VSCE_PAT` secret added.
+- [ ] **Open VSX:** agreement signed; namespace `ehsan18t` created; `OVSX_PAT` secret added.
 - [ ] **AI changelog (optional):** `GEMINI_API_KEY` and/or `GROQ_API_KEY` secret added (or the custom
       `AI_API_KEY` + `AI_BASE_URL` / `AI_MODEL` variables).
 - [ ] Actions are enabled and can request write permissions.
@@ -293,7 +293,7 @@ preflight check** with a clear message — before doing any work — so you neve
 | Release fails with "Missing VSIX artifacts" | Not all 6 platforms were built for this version, or the artifacts expired (they last 1 day) | Re-run the **Build** workflow for this version, then Release again |
 | Release can't find the build | The version Release resolved has no matching Build artifacts | Use the same version for Build and Release (leave both blank to use `package.json`) |
 | VS Code Marketplace publish rejected | Publisher ID mismatch, or `VSCE_PAT` lacks **Marketplace → Manage** scope, or token expired | Recreate the PAT per §2.2 (All accessible organizations + Manage scope) |
-| Open VSX publish rejected | Namespace `importlens` not created, or agreement unsigned | Do §2.3 Step A and Step C |
+| Open VSX publish rejected | Namespace `ehsan18t` not created, or agreement unsigned | Do §2.3 Step A and Step C |
 | Changelog is plain / not AI-written | No AI key set, or every configured provider failed and it fell back | Expected behavior — add/fix `GEMINI_API_KEY` (or `GROQ_API_KEY`) for AI notes; git-cliff notes are always fine to ship |
 | A build platform keeps failing | A genuine compile error for that target | Open the failed job's logs; fix the code; re-run Build (only that platform rebuilds) |
 | I need to rebuild everything cleanly | Stale/cached build for a version | Run Build with **force** checked |

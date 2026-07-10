@@ -29,7 +29,7 @@ const config = (overrides: Partial<ImportLensConfig> = {}): ImportLensConfig => 
   ...overrides,
 });
 
-test("display guards hide all ImportLens UI surfaces when disabled", () => {
+test("display guards hide all Import Lens UI surfaces when disabled", () => {
   const disabled = config({ enabled: false, display: "standard", useCodeLens: true });
 
   assert.equal(shouldShowInlayHints(disabled), false);

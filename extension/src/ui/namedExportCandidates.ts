@@ -22,7 +22,7 @@ export const showNamedExportCandidates = async (
   const workspaceRoot = await analysisRootForFile(uri.fsPath, workspaceFolder?.uri.fsPath);
 
   if (daemon.state !== "ready" && (await daemon.start(workspaceRoot)) !== "ready") {
-    await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
+    await vscode.window.showWarningMessage("Import Lens daemon is unavailable.");
     return;
   }
 
@@ -39,7 +39,7 @@ export const showNamedExportCandidates = async (
   )?.request;
 
   if (!request) {
-    await vscode.window.showWarningMessage(`ImportLens could not resolve ${detected.specifier}.`);
+    await vscode.window.showWarningMessage(`Import Lens could not resolve ${detected.specifier}.`);
     return;
   }
 
@@ -59,7 +59,7 @@ export const showNamedExportCandidates = async (
       `Named export candidates unavailable for ${detected.specifier}: ${response?.error ?? "no daemon response"}`,
     );
     await vscode.window.showWarningMessage(
-      `ImportLens could not enumerate exports for ${detected.specifier}.`,
+      `Import Lens could not enumerate exports for ${detected.specifier}.`,
     );
     return;
   }
@@ -70,7 +70,7 @@ export const showNamedExportCandidates = async (
 
   if (exports.length === 0) {
     await vscode.window.showInformationMessage(
-      `ImportLens found no named exports for ${detected.specifier}.`,
+      `Import Lens found no named exports for ${detected.specifier}.`,
     );
     return;
   }

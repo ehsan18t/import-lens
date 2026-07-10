@@ -1,6 +1,6 @@
 # Release Checklist
 
-A quick tick-box to run through for every ImportLens release. For the *how* and the *one-time
+A quick tick-box to run through for every Import Lens release. For the *how* and the *one-time
 setup*, see the [Release Setup Guide](release-setup-guide.md) — this page is just the gate.
 
 ## Before you start

@@ -1,15 +1,10 @@
----
-trigger: always_on
-glob: **/*
-description: Project instructions for agents working in this repository.
----
 # AGENTS.md
 
 Project instructions for agents working in this repository.
 
 ## Project Context
 
-- ImportLens is a VS Code extension with a TypeScript extension host and a Rust daemon.
+- Import Lens is a VS Code extension with a TypeScript extension host and a Rust daemon.
 - Use `pnpm` as the npm package manager. Do not use `npm` or `yarn` for project scripts or dependency changes.
 - Windows is the primary supported platform right now. Keep Windows compilation and packaging working before broadening to other targets.
 - The SRS is the source of truth for intended behavior: `docs/ImportLens-SRS.md`.

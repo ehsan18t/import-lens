@@ -88,7 +88,7 @@ test("runImportLensCheck passes when changed files are within budgets", async ()
   });
 
   assert.equal(exitCode, 0);
-  assert.deepEqual(output, ["ImportLens budgets passed for 1 changed file."]);
+  assert.deepEqual(output, ["Import Lens budgets passed for 1 changed file."]);
 });
 
 test("runImportLensCheck resolves changed files against resolveRoot but reports relative to cwd", async () => {

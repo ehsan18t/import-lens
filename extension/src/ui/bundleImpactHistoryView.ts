@@ -15,7 +15,7 @@ export const bundleImpactHistoryHtml = (history: readonly BundleImpactHistoryIte
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ImportLens Bundle Impact History</title>
+<title>Import Lens Bundle Impact History</title>
 <style>
 :root {
   color-scheme: light dark;

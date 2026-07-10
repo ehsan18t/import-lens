@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a bug or unexpected behavior in ImportLens.
+description: Report a bug or unexpected behavior in Import Lens.
 title: "[Bug]: "
 labels: ["bug"]
 body:
@@ -15,14 +15,14 @@ body:
       options:
         - label: I searched existing issues and this has not been reported yet.
           required: true
-        - label: I'm running the latest version of ImportLens.
+        - label: I'm running the latest version of Import Lens.
           required: false
   - type: textarea
     id: description
     attributes:
       label: What happened?
       description: A clear description of the bug, including what you expected to happen instead.
-      placeholder: ImportLens showed ... but I expected ...
+      placeholder: Import Lens showed ... but I expected ...
     validations:
       required: true
   - type: textarea
@@ -39,7 +39,7 @@ body:
   - type: input
     id: extension-version
     attributes:
-      label: ImportLens version
+      label: Import Lens version
       description: Find it in the Extensions view, or run `code --list-extensions --show-versions | grep importlens`.
       placeholder: 0.1.0
     validations:
@@ -66,7 +66,7 @@ body:
     id: arch
     attributes:
       label: CPU architecture
-      description: ImportLens ships a native daemon per platform, so this helps narrow down daemon-specific issues.
+      description: Import Lens ships a native daemon per platform, so this helps narrow down daemon-specific issues.
       options:
         - x64
         - arm64
@@ -76,9 +76,9 @@ body:
   - type: textarea
     id: logs
     attributes:
-      label: ImportLens logs
+      label: Import Lens logs
       description: >
-        Run the `ImportLens: Show Logs` command from the Command Palette and paste the
+        Run the `Import Lens: Show Logs` command from the Command Palette and paste the
         relevant output. Set `importLens.logLevel` to `debug` first for more detail.
       render: shell
     validations:

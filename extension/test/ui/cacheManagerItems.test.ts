@@ -99,44 +99,44 @@ test("cacheRemovalToast reports accurate, non-overclaiming copy per scope (X-23/
   // Registry-only clear must never claim shard removals.
   assert.equal(
     cacheRemovalToast("registry", 0, 0),
-    "Cleared ImportLens registry metadata (npm hints).",
+    "Cleared Import Lens registry metadata (npm hints).",
   );
   assert.equal(
     cacheRemovalToast("currentProject", 1, 0),
-    "Cleared the current project's ImportLens cache.",
+    "Cleared the current project's Import Lens cache.",
   );
   assert.equal(
     cacheRemovalToast("currentProject", 0, 0),
-    "No ImportLens cache to clear for the current project.",
+    "No Import Lens cache to clear for the current project.",
   );
   assert.equal(
     cacheRemovalToast("allProjects", 3, 0),
-    "Cleared 3 ImportLens caches across all projects.",
+    "Cleared 3 Import Lens caches across all projects.",
   );
   // "Everything" states everything it cleared, not just the shards.
   assert.equal(
     cacheRemovalToast("everything", 3, 0),
-    "Cleared everything: 3 ImportLens caches plus registry metadata and derived caches.",
+    "Cleared everything: 3 Import Lens caches plus registry metadata and derived caches.",
   );
   // Partial failure surfaces both counts honestly.
   assert.equal(
     cacheRemovalToast("allProjects", 2, 1),
-    "Removed 2 ImportLens caches across all projects; 1 could not be removed.",
+    "Removed 2 Import Lens caches across all projects; 1 could not be removed.",
   );
   assert.equal(
     cacheRemovalToast("currentProject", 1, 0),
-    "Cleared the current project's ImportLens cache.",
+    "Cleared the current project's Import Lens cache.",
   );
   // Orphan reclaim (RB-17): reports what it reclaimed, and says so plainly when
   // nothing was orphaned.
   assert.equal(
     cacheRemovalToast("orphans", 2, 0),
-    "Reclaimed 2 ImportLens caches for moved or deleted projects.",
+    "Reclaimed 2 Import Lens caches for moved or deleted projects.",
   );
-  assert.equal(cacheRemovalToast("orphans", 0, 0), "No orphaned ImportLens caches to reclaim.");
+  assert.equal(cacheRemovalToast("orphans", 0, 0), "No orphaned Import Lens caches to reclaim.");
   assert.equal(
     cacheRemovalToast("orphans", 1, 1),
-    "Reclaimed 1 ImportLens cache for moved or deleted projects; 1 could not be removed.",
+    "Reclaimed 1 Import Lens cache for moved or deleted projects; 1 could not be removed.",
   );
 });
 

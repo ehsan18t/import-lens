@@ -17,7 +17,7 @@ export const compareImportItemsForResults = (
   if (!results) {
     return {
       items: [],
-      warning: "ImportLens daemon did not return comparison results.",
+      warning: "Import Lens daemon did not return comparison results.",
     };
   }
 
@@ -32,7 +32,7 @@ export const compareImportItemsForResults = (
   if (items.length === 0) {
     return {
       items,
-      warning: "ImportLens could not compute any comparison results.",
+      warning: "Import Lens could not compute any comparison results.",
     };
   }
 

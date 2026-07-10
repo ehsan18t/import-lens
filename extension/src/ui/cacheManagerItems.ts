@@ -101,7 +101,7 @@ export const cacheManagerActionItems = (
 
   return [
     {
-      label: "$(database) ImportLens cache",
+      label: "$(database) Import Lens cache",
       description: `${formatCacheBytes(totalBytes)} / ${formatCacheBytes(budgetBytes)}`,
       detail: `${formatCacheBytes(headroomBytes)} free - ${projects} - registry ${formatCacheBytes(registryBytes)}`,
       action: "summary",
@@ -152,10 +152,10 @@ export const cacheRemovalToast = (
 ): string => {
   if (scope === "registry") {
     // Registry clear returns no shard-level results; report exactly what it did.
-    return "Cleared ImportLens registry metadata (npm hints).";
+    return "Cleared Import Lens registry metadata (npm hints).";
   }
 
-  const caches = (count: number): string => `${count} ImportLens cache${count === 1 ? "" : "s"}`;
+  const caches = (count: number): string => `${count} Import Lens cache${count === 1 ? "" : "s"}`;
 
   if (scope === "orphans") {
     if (failed > 0) {
@@ -163,7 +163,7 @@ export const cacheRemovalToast = (
     }
     return removed > 0
       ? `Reclaimed ${caches(removed)} for moved or deleted projects.`
-      : "No orphaned ImportLens caches to reclaim.";
+      : "No orphaned Import Lens caches to reclaim.";
   }
 
   if (failed > 0) {
@@ -178,8 +178,8 @@ export const cacheRemovalToast = (
 
   if (scope === "currentProject") {
     return removed > 0
-      ? "Cleared the current project's ImportLens cache."
-      : "No ImportLens cache to clear for the current project.";
+      ? "Cleared the current project's Import Lens cache."
+      : "No Import Lens cache to clear for the current project.";
   }
   if (scope === "allProjects") {
     return `Cleared ${caches(removed)} across all projects.`;

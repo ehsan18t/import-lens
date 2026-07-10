@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest an idea or enhancement for ImportLens.
+description: Suggest an idea or enhancement for Import Lens.
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
@@ -27,7 +27,7 @@ body:
     id: solution
     attributes:
       label: Proposed solution
-      description: What would you like ImportLens to do?
+      description: What would you like Import Lens to do?
     validations:
       required: true
   - type: textarea

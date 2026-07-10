@@ -51,7 +51,7 @@ const main = async () => {
       process.stdout.write(
         [
           `${benchmark.label}:`,
-          `  ImportLens named import: ${importLens.brotliBytes} B br (${importLens.minifiedBytes} B minified)`,
+          `  Import Lens named import: ${importLens.brotliBytes} B br (${importLens.minifiedBytes} B minified)`,
           `  esbuild named import: ${esbuildSize.brotliBytes} B br (${esbuildSize.minifiedBytes} B minified)`,
           `  relative delta: ${(relativeDelta * 100).toFixed(1)}%`,
         ].join("\n"),
@@ -150,7 +150,7 @@ const importLensNamedSize = async (daemon, workspace, activeDocumentPath, named,
   const result = response.imports?.[0];
 
   if (!result || result.error) {
-    throw new Error(`ImportLens accuracy request failed: ${result?.error ?? "missing result"}`);
+    throw new Error(`Import Lens accuracy request failed: ${result?.error ?? "missing result"}`);
   }
 
   return {
@@ -275,7 +275,7 @@ const connectWithRetry = async (pipeName, timeoutMs, child, stderr) => {
   const stderrText = stderr.join("").trim();
   const suffix = stderrText ? `; daemon stderr: ${stderrText}` : "";
   throw new Error(
-    `failed to connect to ImportLens daemon: ${lastError?.message ?? "timeout"}${suffix}`,
+    `failed to connect to Import Lens daemon: ${lastError?.message ?? "timeout"}${suffix}`,
   );
 };
 
@@ -337,7 +337,7 @@ const daemonClient = (socket, { requestTimeoutMs = 60000 } = {}) => {
     }
   });
   socket.on("error", (error) => rejectAll(error));
-  socket.on("close", () => rejectAll(new Error("ImportLens daemon connection closed")));
+  socket.on("close", () => rejectAll(new Error("Import Lens daemon connection closed")));
 
   const send = (message) => {
     const payload = Buffer.from(encode(message));
@@ -354,7 +354,7 @@ const daemonClient = (socket, { requestTimeoutMs = 60000 } = {}) => {
         item.timer = setTimeout(
           () =>
             settle(item, () =>
-              reject(new Error(`ImportLens daemon request timed out after ${requestTimeoutMs}ms`)),
+              reject(new Error(`Import Lens daemon request timed out after ${requestTimeoutMs}ms`)),
             ),
           requestTimeoutMs,
         );

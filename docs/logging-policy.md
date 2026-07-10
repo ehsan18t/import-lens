@@ -1,4 +1,4 @@
-# ImportLens Logging Policy
+# Import Lens Logging Policy
 
 Normative rules for extension host and daemon logging. The VS Code output channel is the primary user-facing log surface (FR-040, FR-041).
 
@@ -36,7 +36,7 @@ Optional context segments: `[component]`, `req=<id>`, `uri=<path>`, `pkg=<name>`
 - **stdout**: `info`, `debug`
 - **stderr**: `warn`, `error`
 
-The extension host parses structured daemon lines and applies `importLens.logLevel` before writing to the ImportLens output channel. Unparsed stdout lines map to info; unparsed stderr lines map to warn (FR-015a compatibility).
+The extension host parses structured daemon lines and applies `importLens.logLevel` before writing to the Import Lens output channel. Unparsed stdout lines map to info; unparsed stderr lines map to warn (FR-015a compatibility).
 
 ## Configuration
 

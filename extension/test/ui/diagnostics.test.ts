@@ -35,7 +35,7 @@ const failedResult: ImportResult = {
 test("formatImportDiagnostics includes daemon error context without UI copy", () => {
   const formatted = formatImportDiagnostics(failedResult);
 
-  assert.match(formatted, /ImportLens diagnostics for @nestjs\/common/u);
+  assert.match(formatted, /Import Lens diagnostics for @nestjs\/common/u);
   assert.match(formatted, /Confidence: low/u);
   assert.match(formatted, /Entry resolution failed/u);
   assert.match(formatted, /\[entry_resolution\]/u);

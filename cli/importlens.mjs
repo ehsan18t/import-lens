@@ -87,7 +87,7 @@ export const runImportLensCheck = async ({
   writeLine = (line) => process.stdout.write(`${line}\n`),
 }) => {
   if (!hasBudgets(budgets)) {
-    writeLine("No ImportLens budgets configured.");
+    writeLine("No Import Lens budgets configured.");
     return 0;
   }
 
@@ -129,7 +129,7 @@ export const runImportLensCheck = async ({
   }
 
   writeLine(
-    `ImportLens budgets passed for ${files.length} changed ${files.length === 1 ? "file" : "files"}.`,
+    `Import Lens budgets passed for ${files.length} changed ${files.length === 1 ? "file" : "files"}.`,
   );
   return 0;
 };
@@ -215,7 +215,7 @@ const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
   });
 
   if (response.error) {
-    throw new Error(`ImportLens file-size request failed for ${filePath}: ${response.error}`);
+    throw new Error(`Import Lens file-size request failed for ${filePath}: ${response.error}`);
   }
 
   return {
@@ -235,7 +235,7 @@ const startDaemon = async (workspaceRoot) => {
   const binary = daemonBinaryPath({ platformTarget: target });
 
   if (!existsSync(binary)) {
-    throw new Error(`ImportLens daemon binary is unavailable at ${binary}`);
+    throw new Error(`Import Lens daemon binary is unavailable at ${binary}`);
   }
 
   const { cachePath, lifecyclePath } = resolveCliStoragePaths();
@@ -317,7 +317,9 @@ export const daemonBinaryPath = ({
   platformTarget: requestedTarget = platformTarget(),
 } = {}) => {
   if (!requestedTarget) {
-    throw new Error(`Unsupported platform for ImportLens daemon: ${process.platform}-${os.arch()}`);
+    throw new Error(
+      `Unsupported platform for Import Lens daemon: ${process.platform}-${os.arch()}`,
+    );
   }
 
   return path.join(packageRoot, DAEMON_ROOT, requestedTarget, daemonBinaryName(requestedTarget));
@@ -351,7 +353,7 @@ const connectWithRetry = async (pipeName, timeoutMs) => {
     }
   }
 
-  throw lastError ?? new Error("failed to connect to ImportLens daemon");
+  throw lastError ?? new Error("failed to connect to Import Lens daemon");
 };
 
 export const createDaemonClient = (socket) => {
@@ -496,7 +498,7 @@ const platformTarget = () => {
   const target = targets[key];
 
   if (!target) {
-    throw new Error(`Unsupported platform for ImportLens daemon: ${key}`);
+    throw new Error(`Unsupported platform for Import Lens daemon: ${key}`);
   }
 
   return target;

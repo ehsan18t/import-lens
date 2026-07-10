@@ -1,4 +1,4 @@
-# ImportLens - cargo-deny configuration
+# Import Lens - cargo-deny configuration
 # Audits dependencies for security vulnerabilities, license issues, and bans.
 # Run: cargo deny check
 # Install: cargo install cargo-deny

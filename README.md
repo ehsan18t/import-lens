@@ -1,12 +1,12 @@
 <div align="center">
-    <h1>ImportLens</h1>
+    <h1>Import Lens</h1>
     <strong>A blazingly fast Visual Studio Code extension that displays the real-world post-bundle cost of your npm imports directly inline as you type.</strong>
     <br>
     <br>
-    <img src="./media/import-lens_poster.png" alt="ImportLens Banner" width="512px" />
+    <img src="./media/import-lens_poster.png" alt="Import Lens Banner" width="512px" />
 </div>
 
-Unlike existing import cost calculators that spin up heavy Node.js bundlers, ImportLens offloads all computation to a highly optimized background Rust daemon powered by the **OXC** (Oxidation Compiler) toolchain. It performs real tree-shaking, minification, and compression in milliseconds without blocking your editor or consuming massive amounts of memory.
+Unlike existing import cost calculators that spin up heavy Node.js bundlers, Import Lens offloads all computation to a highly optimized background Rust daemon powered by the **OXC** (Oxidation Compiler) toolchain. It performs real tree-shaking, minification, and compression in milliseconds without blocking your editor or consuming massive amounts of memory.
 
 **Everything runs locally.** Your source code never leaves your machine. The only optional network access is a bounded npm registry lookup for `package.json` version hints, and you can turn that off with one setting.
 
@@ -36,7 +36,7 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 
 ## Quick Start
 
-1. **Install ImportLens** from the VS Code Extensions view, or install the `.vsix` directly (`Extensions: Install from VSIX…`).
+1. **Install Import Lens** from the VS Code Extensions view, or install the `.vsix` directly (`Extensions: Install from VSIX…`).
 2. **Check the requirements:** VS Code **1.90+** and a workspace (or loose file) whose parent tree contains a populated `node_modules` directory.
 3. **Open any supported file** and sizes appear inline next to each npm import within milliseconds:
 
@@ -47,36 +47,36 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 
 4. **Hover an import** for the full breakdown: minified/gzip/brotli/zstd sizes, confidence reasons, module contributions, shared-byte explanations, and copyable diagnostics.
 5. **Open `package.json`** to see per-dependency install cost and registry hints on every dependency row.
-6. **Explore the command palette** by typing `ImportLens:` to find reports, comparisons, history, and cache tools ([full list below](#commands)).
+6. **Explore the command palette** by typing `Import Lens:` to find reports, comparisons, history, and cache tools ([full list below](#commands)).
 
 ## Reading the Hints
 
 Every label is designed to be understood at a glance:
 
-| Label | Meaning |
-| --- | --- |
-| `12.4 kB br` | Post-tree-shake, minified, Brotli-compressed cost of this exact import. |
-| `~1.6 kB br` | Low-confidence estimate, marked with a leading `~`. Hover for the reasons. |
-| `+2.1 kB br` | Working-tree delta: this import was added/changed in your current Git diff. |
-| `over budget` | The import exceeds your configured Brotli budget. |
-| `types only` | Declaration-only package with zero runtime bytes. |
-| `checking…` | Analysis in progress (results stream in per import). |
+| Label         | Meaning                                                                      |
+| ------------- | ---------------------------------------------------------------------------- |
+| `12.4 kB br`  | Post-tree-shake, minified, Brotli-compressed cost of this exact import.      |
+| `~1.6 kB br`  | Low-confidence estimate, marked with a leading `~`. Hover for the reasons.   |
+| `+2.1 kB br`  | Working-tree delta: this import was added/changed in your current Git diff.  |
+| `over budget` | The import exceeds your configured Brotli budget.                            |
+| `types only`  | Declaration-only package with zero runtime bytes.                            |
+| `checking…`   | Analysis in progress (results stream in per import).                         |
 | `unavailable` | Size could not be determined. Hover and use **Copy diagnostics** to see why. |
 
 **Confidence colors** (default renderer): high confidence uses a muted success color, medium uses amber, low uses red. Prefer VS Code's screen-reader-accessible rendering? Set `importLens.inlineRenderer` to `native`.
 
 **Display modes** (`importLens.display`):
 
-| Mode | Shows |
-| --- | --- |
-| `inlayHint` *(default)* | Inline hint right after the import, colored or native. |
-| `minimal` | Compact end-of-line decoration with the primary compressed size. |
-| `standard` | Primary compressed size plus minified size. |
-| `verbose` | Brotli, gzip, zstd, and minified sizes together. |
+| Mode                    | Shows                                                            |
+| ----------------------- | ---------------------------------------------------------------- |
+| `inlayHint` *(default)* | Inline hint right after the import, colored or native.           |
+| `minimal`               | Compact end-of-line decoration with the primary compressed size. |
+| `standard`              | Primary compressed size plus minified size.                      |
+| `verbose`               | Brotli, gzip, zstd, and minified sizes together.                 |
 
 ## package.json Dependency Guidance
 
-Open any `package.json` and ImportLens annotates dependency blocks as results stream in:
+Open any `package.json` and Import Lens annotates dependency blocks as results stream in:
 
 - **Install cost** per dependency, measured with the same tree-shaking pipeline, plus per-block summaries.
 - **Version status** from the npm registry: `latest` when you're current, `update 19.0.0` when newer exists, `install 19.0.0` for missing packages, and a deprecation flag for deprecated versions.
@@ -86,7 +86,7 @@ Open any `package.json` and ImportLens annotates dependency blocks as results st
 
 ## Workspace Reports & Budgets
 
-- **`ImportLens: Show Report`** scans your workspace natively in the daemon (skipping `node_modules`, `dist`, `build`, `out`, `coverage`) and returns a report sorted by Brotli size with duplicate-import groups, shared vendored modules, budget violations, and an SVG treemap.
+- **`Import Lens: Show Report`** scans your workspace natively in the daemon (skipping `node_modules`, `dist`, `build`, `out`, `coverage`) and returns a report sorted by Brotli size with duplicate-import groups, shared vendored modules, budget violations, and an SVG treemap.
 - **Budgets** are set once and surface everywhere: editor diagnostics, inline `over budget` labels, hovers, report counts, and CI.
 
   ```jsonc
@@ -98,42 +98,42 @@ Open any `package.json` and ImportLens annotates dependency blocks as results st
   ```
 
 - **The CI gate**, `importlens check`, analyzes files changed in `git diff HEAD` against budgets from `.importlensrc.json` (`{ "budgets": { … } }`) or `package.json` (`{ "importLens": { "budgets": { … } } }`). It exits non-zero on violations and uses the same native daemon for real Brotli sizes.
-- **`ImportLens: Compare Imports`** compares comma-separated package imports side by side, sorted by Brotli size.
+- **`Import Lens: Compare Imports`** compares comma-separated package imports side by side, sorted by Brotli size.
 - **History** builds up automatically: `Show Current File Size` records deduplicated file totals, and `Show Bundle Impact History` charts them over time in a script-free SVG panel.
 
 ## Commands
 
-| Command | Description |
-| --- | --- |
-| `ImportLens: Show Current File Size` | Deduplicated total for runtime package imports in the active file; recorded into bundle impact history. |
-| `ImportLens: Show Bundle Impact History` | Script-free SVG history panel of recent current-file measurements. |
-| `ImportLens: Show Report` | Daemon-generated workspace report: sorted rows, duplicates, shared modules, budgets, treemap. |
-| `ImportLens: Compare Imports` | Compare comma-separated package imports by Brotli size. |
-| `ImportLens: Copy Import Diagnostics` | Copy the structured daemon diagnostics for an import to the clipboard. |
-| `ImportLens: Manage Cache` | Cache status, cleanup, and per-project removal actions. |
-| `ImportLens: Clear Current Project Cache` | Clear only the active project's cache shard, then reanalyze visible documents. |
-| `ImportLens: Clear All Caches` | Clear every ImportLens cache shard, then reanalyze visible documents. |
-| `ImportLens: Show Logs` | Open the ImportLens output channel. |
+| Command                                    | Description                                                                                             |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| `Import Lens: Show Current File Size`      | Deduplicated total for runtime package imports in the active file; recorded into bundle impact history. |
+| `Import Lens: Show Bundle Impact History`  | Script-free SVG history panel of recent current-file measurements.                                      |
+| `Import Lens: Show Report`                 | Daemon-generated workspace report: sorted rows, duplicates, shared modules, budgets, treemap.           |
+| `Import Lens: Compare Imports`             | Compare comma-separated package imports by Brotli size.                                                 |
+| `Import Lens: Copy Import Diagnostics`     | Copy the structured daemon diagnostics for an import to the clipboard.                                  |
+| `Import Lens: Manage Cache`                | Cache status, cleanup, and per-project removal actions.                                                 |
+| `Import Lens: Clear Current Project Cache` | Clear only the active project's cache shard, then reanalyze visible documents.                          |
+| `Import Lens: Clear All Caches`            | Clear every Import Lens cache shard, then reanalyze visible documents.                                  |
+| `Import Lens: Show Logs`                   | Open the Import Lens output channel.                                                                    |
 
 ## Configuration
 
 All settings live under `importLens.*` in your VS Code `settings.json`:
 
-| Setting | Default | Description |
-| --- | --- | --- |
-| `importLens.enabled` | `true` | Toggle ImportLens on or off. |
-| `importLens.display` | `"inlayHint"` | Display mode: `inlayHint`, `minimal`, `standard`, or `verbose`. |
-| `importLens.inlineRenderer` | `"colored"` | Renderer for `inlayHint` mode: `colored` (confidence colors) or `native` (accessible Inlay Hints API). |
-| `importLens.compression` | `"brotli"` | Primary size shown: `brotli`, `gzip`, `zstd`, or `all`. |
-| `importLens.debounceMs` | `300` | Delay after the last edit before reanalyzing. |
-| `importLens.budgets` | `{}` | `perImportBrotliBytes` / `perFileBrotliBytes` thresholds in bytes. |
-| `importLens.showWarnings` | `true` | Warning indicators for imports that may not tree-shake accurately. |
-| `importLens.useCodeLens` | `false` | CodeLens above the import instead of end-of-line decorations (ignored in `inlayHint` mode). |
-| `importLens.enableRegistryHints` | `true` | npm registry metadata hints for `package.json`, served from the daemon's local cache with bounded refreshes. |
-| `importLens.enableDiskCache` | `true` | Persist computed sizes to disk across editor restarts. |
-| `importLens.cacheMaxSizeMB` | `512` | Global disk-byte budget for project caches; least-recently-used entries are evicted across projects when exceeded. |
-| `importLens.cacheMaxAgeDays` | `30` | **Deprecated and ignored** — capacity is governed entirely by `cacheMaxSizeMB`. |
-| `importLens.logLevel` | `"info"` | Output channel verbosity: `error`, `warn`, `info`, or `debug`. |
+| Setting                          | Default       | Description                                                                                                        |
+| -------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `importLens.enabled`             | `true`        | Toggle Import Lens on or off.                                                                                      |
+| `importLens.display`             | `"inlayHint"` | Display mode: `inlayHint`, `minimal`, `standard`, or `verbose`.                                                    |
+| `importLens.inlineRenderer`      | `"colored"`   | Renderer for `inlayHint` mode: `colored` (confidence colors) or `native` (accessible Inlay Hints API).             |
+| `importLens.compression`         | `"brotli"`    | Primary size shown: `brotli`, `gzip`, `zstd`, or `all`.                                                            |
+| `importLens.debounceMs`          | `300`         | Delay after the last edit before reanalyzing.                                                                      |
+| `importLens.budgets`             | `{}`          | `perImportBrotliBytes` / `perFileBrotliBytes` thresholds in bytes.                                                 |
+| `importLens.showWarnings`        | `true`        | Warning indicators for imports that may not tree-shake accurately.                                                 |
+| `importLens.useCodeLens`         | `false`       | CodeLens above the import instead of end-of-line decorations (ignored in `inlayHint` mode).                        |
+| `importLens.enableRegistryHints` | `true`        | npm registry metadata hints for `package.json`, served from the daemon's local cache with bounded refreshes.       |
+| `importLens.enableDiskCache`     | `true`        | Persist computed sizes to disk across editor restarts.                                                             |
+| `importLens.cacheMaxSizeMB`      | `512`         | Global disk-byte budget for project caches; least-recently-used entries are evicted across projects when exceeded. |
+| `importLens.cacheMaxAgeDays`     | `30`          | **Deprecated and ignored** — capacity is governed entirely by `cacheMaxSizeMB`.                                    |
+| `importLens.logLevel`            | `"info"`      | Output channel verbosity: `error`, `warn`, `info`, or `debug`.                                                     |
 
 ## Ignoring Imports
 
@@ -149,35 +149,25 @@ Framework virtual modules and common app aliases (`astro:*`, `virtual:*`, `$app/
 
 ## How It Works
 
-ImportLens analyzes your import statements and resolves the exact package version installed in your local `node_modules`. It then constructs a virtual module graph, tree-shakes dead code using custom reachability analysis, minifies the output, and compresses it in parallel (Gzip, Brotli, Zstd).
+Import Lens analyzes your import statements and resolves the exact package version installed in your local `node_modules`. It then constructs a virtual module graph, tree-shakes dead code using custom reachability analysis, minifies the output, and compresses it in parallel (Gzip, Brotli, Zstd).
 
 All of this happens in a secure, self-contained background daemon that streams results back per import, so your editor stays responsive even in large files. Results are keyed by the active document path, so nested workspaces, pnpm layouts, and loose files opened outside a VS Code workspace still resolve from the nearest usable package tree.
 
 **Privacy & network:** size analysis makes **zero network requests** and reads only your local `node_modules`. The single permitted network path is the daemon's rate-limited, opt-out npm registry endpoint used for `package.json` version hints, and its results are cached on disk so repeat lookups stay local.
 
-ImportLens never rewrites your source files. Actions that suggest named imports or package substitutions copy a candidate to the clipboard so you stay in control.
+Import Lens never rewrites your source files. Actions that suggest named imports or package substitutions copy a candidate to the clipboard so you stay in control.
 
 ## Diagnostics & Troubleshooting
 
 - An import shows `unavailable`? Hover it (or the native inlay hint) and click **Copy diagnostics** to extract structured error context straight from the Rust daemon.
 - CommonJS-only packages, conservative `sideEffects` metadata, and non-tree-shakeable imports include confidence and diagnostic details in hovers, reports, and copied diagnostics.
-- `ImportLens: Show Logs` opens the output channel; raise `importLens.logLevel` to `debug` for IPC, cache, and fallback event detail. Warnings are reserved for daemon, IPC, startup, protocol, or no-result failures.
-- Cache acting oddly after big dependency changes? `ImportLens: Manage Cache` shows per-project shards and offers targeted cleanup.
+- `Import Lens: Show Logs` opens the output channel; raise `importLens.logLevel` to `debug` for IPC, cache, and fallback event detail. Warnings are reserved for daemon, IPC, startup, protocol, or no-result failures.
+- Cache acting oddly after big dependency changes? `Import Lens: Manage Cache` shows per-project shards and offers targeted cleanup.
 
 ## Requirements
 
 - VS Code **1.90.0** or higher.
 - A local workspace or loose file whose parent tree contains a populated `node_modules` directory.
-
-## Contributing
-
-Git hooks are managed by [lefthook](https://lefthook.dev/) and installed automatically by `pnpm install` (via the `prepare` script), which also sets the conventional-commit message template.
-
-- **pre-commit** — Biome formats and lints staged TypeScript/JS (auto-fixing and re-staging), TypeScript type-checks; for staged Rust it runs `cargo clippy` and `cargo deny check`.
-- **commit-msg** — enforces Conventional Commits with a mandatory body. Format: `type(scope)!: subject` then a blank line then a body explaining what and why. Types: `feat fix perf docs refactor style test chore ci build`.
-- **pre-push** — runs the full suite (`pnpm test`: build + TypeScript, script, and Rust tests).
-
-Run gates manually with `pnpm lint`, `pnpm format`, `cargo clippy --workspace --all-targets`, `cargo deny check`, and `pnpm test`. Bypass hooks only in a genuine emergency with `--no-verify`; CI enforces the same gates regardless.
 
 ---
 *Built with [OXC](https://oxc.rs/) for maximum performance.*

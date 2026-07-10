@@ -59,7 +59,7 @@ let daemon: DaemonManager | undefined;
 
 const copyImportDiagnostics = async (result: ImportResult): Promise<void> => {
   await vscode.env.clipboard.writeText(formatImportDiagnostics(result));
-  void vscode.window.showInformationMessage("ImportLens diagnostics copied.");
+  void vscode.window.showInformationMessage("Import Lens diagnostics copied.");
 };
 
 const copySubstitutionSuggestion = async (
@@ -69,7 +69,7 @@ const copySubstitutionSuggestion = async (
 ): Promise<void> => {
   await vscode.env.clipboard.writeText(`${currentSpecifier} -> ${replacementPackage}\n${reason}`);
   void vscode.window.showInformationMessage(
-    `ImportLens alternative copied: ${replacementPackage}.`,
+    `Import Lens alternative copied: ${replacementPackage}.`,
   );
 };
 
@@ -106,7 +106,7 @@ const packageJsonDependencySectionFromArg = (
 export const activate = async (context: vscode.ExtensionContext): Promise<void> => {
   const config = getImportLensConfig();
   const logger = new ImportLensLogger(config.logLevel);
-  logger.info("ImportLens activation started.");
+  logger.info("Import Lens activation started.");
   const store = new AnalysisStore();
   const statusBar = new StatusBarController();
   const decorations = new DecorationController(store);
@@ -297,7 +297,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       async (result: ImportResult, runtime: ImportRuntime = "component") => {
         if (result.error) {
           const action = await vscode.window.showWarningMessage(
-            "ImportLens could not compute this import size.",
+            "Import Lens could not compute this import size.",
             "Copy diagnostics",
           );
 
@@ -314,7 +314,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(copyImportDiagnosticsCommand, async (result?: ImportResult) => {
       if (!result) {
         void vscode.window.showWarningMessage(
-          "No ImportLens diagnostics are available for the active command context.",
+          "No Import Lens diagnostics are available for the active command context.",
         );
         return;
       }
@@ -336,7 +336,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       logger.setLevel(nextConfig.logLevel);
       const changeKind = classifyImportLensConfigChange(event);
       logger.info(
-        `ImportLens configuration changed (${changeKind}); refreshing visible documents.`,
+        `Import Lens configuration changed (${changeKind}); refreshing visible documents.`,
       );
 
       if (changeKind === "daemonRestart") {
@@ -383,7 +383,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     }),
   );
   const state = await daemon.start();
-  logger.info(`ImportLens daemon startup completed with state: ${state}.`);
+  logger.info(`Import Lens daemon startup completed with state: ${state}.`);
   statusBar.setState({ kind: state === "ready" ? "ready" : "unavailable" });
 
   if (vscode.window.activeTextEditor) {

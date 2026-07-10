@@ -395,7 +395,7 @@ fn is_truly_treeshakeable(
     }
 
     // To check if genuinely tree-shakeable, compare against the same post-minify
-    // size surface that users see in ImportLens.
+    // size surface that users see in Import Lens.
     let full_len = cached_full_minified_len
         .or_else(|| {
             graph.cached_full_bundle_minified_len_or_init(|| {

@@ -95,7 +95,7 @@ Produce a short impact table: change → PR → our file(s) → required/optiona
 
 ### 6. Apply
 - **First, capture the accuracy baseline — before touching anything.** Run
-  `pnpm test:accuracy` and record both the brotli and minified ImportLens byte counts
+  `pnpm test:accuracy` and record both the brotli and minified Import Lens byte counts
   it prints per benchmark. Fixtures are deterministic, so this is your before-picture
   (the suite's own pass/fail is only a coarse ~75% esbuild check with no baseline —
   the diff you take yourself in step 7 is what catches real drift).

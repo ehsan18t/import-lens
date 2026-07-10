@@ -3,7 +3,7 @@ import type { ImportResult } from "../ipc/protocol.js";
 export const copyImportDiagnosticsCommand = "importLens.copyImportDiagnostics";
 
 export const formatImportDiagnostics = (result: ImportResult): string => {
-  const lines = [`ImportLens diagnostics for ${result.specifier}`, ""];
+  const lines = [`Import Lens diagnostics for ${result.specifier}`, ""];
   lines.push(`Confidence: ${result.confidence}`, "");
 
   if (result.confidence_reasons.length > 0) {

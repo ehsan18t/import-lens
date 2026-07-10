@@ -51,7 +51,7 @@ test("start() after shutdown() re-attempts startup instead of latching disposed"
   }
 
   assert.ok(
-    lines.some((line) => line.includes("Starting ImportLens daemon")),
+    lines.some((line) => line.includes("Starting Import Lens daemon")),
     `start() after shutdown() must re-attempt startup, not bail at the disposal latch; captured logs:\n${lines.join("\n")}`,
   );
 });

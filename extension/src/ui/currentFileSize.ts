@@ -24,14 +24,14 @@ export const showCurrentFileSize = async (
   const editor = vscode.window.activeTextEditor;
 
   if (!editor) {
-    await vscode.window.showWarningMessage("No active editor is available for ImportLens sizing.");
+    await vscode.window.showWarningMessage("No active editor is available for Import Lens sizing.");
     return;
   }
 
   const { document } = editor;
   if (document.uri.scheme !== "file" || !supportedLanguageIds.has(document.languageId)) {
     await vscode.window.showWarningMessage(
-      "ImportLens current-file sizing supports local JavaScript and TypeScript files.",
+      "Import Lens current-file sizing supports local JavaScript and TypeScript files.",
     );
     return;
   }
@@ -41,7 +41,7 @@ export const showCurrentFileSize = async (
   const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
 
   if (daemon.state !== "ready" && (await daemon.start(workspaceRoot)) !== "ready") {
-    await vscode.window.showWarningMessage("ImportLens daemon is unavailable.");
+    await vscode.window.showWarningMessage("Import Lens daemon is unavailable.");
     return;
   }
 
@@ -49,7 +49,7 @@ export const showCurrentFileSize = async (
     const response = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: "ImportLens: Calculating current file size",
+        title: "Import Lens: Calculating current file size",
       },
       () =>
         daemon.requestFileSizeDocument({
@@ -64,14 +64,14 @@ export const showCurrentFileSize = async (
 
     if (!response) {
       await vscode.window.showWarningMessage(
-        "ImportLens daemon did not return a current-file size.",
+        "Import Lens daemon did not return a current-file size.",
       );
       return;
     }
 
     if (response.error) {
       await vscode.window.showWarningMessage(
-        `ImportLens current-file size unavailable: ${response.error}`,
+        `Import Lens current-file size unavailable: ${response.error}`,
       );
       return;
     }
@@ -83,7 +83,7 @@ export const showCurrentFileSize = async (
 
     if (response.imports.length === 0) {
       await vscode.window.showWarningMessage(
-        "ImportLens could not resolve any runtime package imports in the current file.",
+        "Import Lens could not resolve any runtime package imports in the current file.",
       );
       return;
     }
@@ -116,7 +116,7 @@ export const showCurrentFileSize = async (
     logger.warn(
       `Current-file size request failed: ${error instanceof Error ? error.message : String(error)}`,
     );
-    await vscode.window.showWarningMessage("ImportLens current-file size request failed.");
+    await vscode.window.showWarningMessage("Import Lens current-file size request failed.");
   }
 };
 
@@ -124,13 +124,13 @@ export const showBundleImpactHistory = async (context: vscode.ExtensionContext):
   const history = context.globalState.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []);
 
   if (history.length === 0) {
-    await vscode.window.showInformationMessage("ImportLens bundle impact history is empty.");
+    await vscode.window.showInformationMessage("Import Lens bundle impact history is empty.");
     return;
   }
 
   const panel = vscode.window.createWebviewPanel(
     "importLensBundleImpactHistory",
-    "ImportLens Bundle Impact History",
+    "Import Lens Bundle Impact History",
     vscode.ViewColumn.Beside,
     {
       enableScripts: false,
