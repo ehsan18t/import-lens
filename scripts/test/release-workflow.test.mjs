@@ -29,14 +29,32 @@ test("release workflow drafts GitHub releases and conditionally publishes to bot
   assert.match(source, /--notes-file notes\.md/u);
 
   assert.match(source, /VSCE_PAT/u);
-  assert.match(source, /pnpm exec vsce publish --packagePath/u);
+  assert.match(source, /publish-vsix\.mjs vsce dist\/vsix\/\*\.vsix/u);
   assert.match(source, /OVSX_PAT/u);
-  assert.match(source, /pnpm exec ovsx publish/u);
+  assert.match(source, /publish-vsix\.mjs ovsx dist\/vsix\/\*\.vsix/u);
 
   // Publishing is gated on explicit per-run selection, not just secret presence.
   assert.match(source, /inputs\.publish_vscode/u);
   assert.match(source, /inputs\.publish_openvsx/u);
   assert.match(source, /inputs\.dry_run/u);
+});
+
+test("release workflow is safe to re-run after a partially published release", () => {
+  const source = workflow();
+
+  // A tag that already has a release is refreshed, not recreated. Re-creating
+  // it fails with "release already exists" and strands the retry.
+  assert.match(source, /gh release view "\$RELEASE_TAG"/u);
+  assert.match(source, /gh release edit "\$RELEASE_TAG"/u);
+  assert.match(source, /gh release upload "\$RELEASE_TAG" dist\/vsix\/\*\.vsix --clobber/u);
+
+  // Store publishing goes through the script that passes --skip-duplicate and
+  // retries, never a bare loop that aborts on the first failing target.
+  assert.doesNotMatch(source, /pnpm exec (vsce|ovsx) publish/u);
+  assert.doesNotMatch(source, /for file in dist\/vsix/u);
+
+  // The PATs reach the CLIs through the environment, never through argv.
+  assert.doesNotMatch(source, /--pat/u);
 });
 
 test("release workflow fails fast in preflight on missing store secrets or no destination", () => {

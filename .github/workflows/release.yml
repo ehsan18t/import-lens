@@ -193,25 +193,33 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Dry run complete; see the job summary for the plan and changelog preview."
 
+      # Converge rather than fail when the tag already carries a release, so a
+      # run that died in a later publish step can simply be retried. The draft
+      # flag is only set on creation: never silently unpublish a live release.
       - name: Create draft GitHub release
         if: ${{ !inputs.dry_run && inputs.release_github }}
         run: |
-          gh release create "$RELEASE_TAG" dist/vsix/*.vsix \
-            --draft \
-            --target "$GITHUB_SHA" \
-            --title "Import Lens $RELEASE_VERSION" \
-            --notes-file notes.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG exists; refreshing its notes and assets."
+            gh release edit "$RELEASE_TAG" \
+              --title "Import Lens $RELEASE_VERSION" \
+              --notes-file notes.md
+            gh release upload "$RELEASE_TAG" dist/vsix/*.vsix --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/vsix/*.vsix \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "Import Lens $RELEASE_VERSION" \
+              --notes-file notes.md
+          fi
 
+      # publish-vsix.mjs publishes each target with --skip-duplicate, retries
+      # transient store failures, and keeps going past a bad target so one
+      # platform's outage cannot strand the rest. Re-running is always safe.
       - name: Publish VSIXs to Visual Studio Marketplace
         if: ${{ !inputs.dry_run && inputs.publish_vscode }}
-        run: |
-          for file in dist/vsix/*.vsix; do
-            pnpm exec vsce publish --packagePath "$file" --pat "$VSCE_PAT"
-          done
+        run: node scripts/publish-vsix.mjs vsce dist/vsix/*.vsix
 
       - name: Publish VSIXs to Open VSX
         if: ${{ !inputs.dry_run && inputs.publish_openvsx }}
-        run: |
-          for file in dist/vsix/*.vsix; do
-            pnpm exec ovsx publish "$file" --pat "$OVSX_PAT"
-          done
+        run: node scripts/publish-vsix.mjs ovsx dist/vsix/*.vsix
