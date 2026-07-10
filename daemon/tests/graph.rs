@@ -726,3 +726,66 @@ fn graph_still_fails_gracefully_on_flow_typed_js() {
     fs::remove_dir_all(root).expect("cleanup");
     assert!(result.is_err(), "Flow-typed .js should fail, not panic");
 }
+
+#[test]
+fn graph_records_static_member_accesses_but_not_computed_or_shadowed() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import * as ns from "./ns.js";
+const key = "alpha";
+export const a = ns.alpha;
+export const b = ns[key];
+export const c = (() => { const ns = { beta: 1 }; return ns.beta; })();
+"#,
+    );
+    write_source(&root, "ns.js", "export const alpha = 1;\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let entry = graph.module_by_id(graph.entry_id).expect("entry module");
+
+    let properties = entry
+        .static_member_accesses
+        .iter()
+        .map(|access| access.property.as_str())
+        .collect::<Vec<_>>();
+
+    // `ns.alpha` is recorded. `ns[key]` is a computed member expression, a
+    // different AST node, so it never reaches the collector. `ns.beta` IS
+    // recorded (the collector is span-based and does not resolve scopes), but
+    // its object span is not among the root-scope `ns` references, which is how
+    // the bundler discards shadowed uses.
+    assert!(properties.contains(&"alpha"), "{properties:?}");
+    assert!(!properties.contains(&"key"), "{properties:?}");
+
+    let root_ns_references = entry
+        .root_symbol_spans
+        .iter()
+        .find(|symbol| symbol.name == "ns")
+        .expect("root-scope ns binding")
+        .references
+        .clone();
+    let alpha_access = entry
+        .static_member_accesses
+        .iter()
+        .find(|access| access.property == "alpha")
+        .expect("ns.alpha access");
+    assert!(
+        root_ns_references.contains(&alpha_access.object),
+        "ns.alpha object span must match a root-scope reference"
+    );
+
+    if let Some(beta_access) = entry
+        .static_member_accesses
+        .iter()
+        .find(|access| access.property == "beta")
+    {
+        assert!(
+            !root_ns_references.contains(&beta_access.object),
+            "shadowed ns.beta must not match a root-scope reference"
+        );
+    }
+
+    fs::remove_dir_all(root).expect("cleanup");
+}

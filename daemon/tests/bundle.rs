@@ -50,6 +50,31 @@ fn contribution_basenames(bundled: &BundledModules) -> Vec<String> {
         .collect()
 }
 
+/// Every `__il_`-prefixed identifier the bundle reads must be declared by some
+/// included module. An unresolved one means the bundler pruned a definition it
+/// still references, which silently moves the size estimate.
+fn assert_no_dangling_il_bindings(source: &str) {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+    let semantic = SemanticBuilder::new().build(&parsed.program);
+
+    let mut dangling = semantic
+        .semantic
+        .scoping()
+        .root_unresolved_references()
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .filter(|name| name.starts_with("__il_"))
+        .collect::<Vec<_>>();
+    dangling.sort();
+    dangling.dedup();
+
+    assert!(
+        dangling.is_empty(),
+        "bundle references undeclared bindings {dangling:?}:\n{source}"
+    );
+}
+
 fn assert_semantic_valid(source: &str) {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
@@ -853,4 +878,110 @@ globalThis.__importLensEffect = dep;
         files.contains(&"dep.js".to_owned()),
         "side-effect module's import must be bundled: {files:?}"
     );
+}
+
+#[test]
+fn bundle_declares_namespace_object_for_escaping_namespace_import() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import * as helpers from "./helpers.js";
+export const used = Object.keys(helpers);
+"#,
+    );
+    write_source(
+        &root,
+        "helpers.js",
+        "export const alpha = 1;\nexport const beta = 2;\n",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let source = bundled.source.clone();
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        source.contains("__il_m1_namespace = {"),
+        "escaping namespace must be materialized: {source}"
+    );
+    assert!(
+        source.contains("alpha: __il_m1_alpha"),
+        "namespace object must expose alpha: {source}"
+    );
+    assert!(
+        source.contains("beta: __il_m1_beta"),
+        "escaping namespace keeps every export: {source}"
+    );
+    assert_no_dangling_il_bindings(&source);
+    assert_semantic_valid(&source);
+}
+
+#[test]
+fn bundle_declares_namespace_object_for_namespace_reexport_barrel() {
+    // `export * as Leaf from "./leaf.js"` exposes leaf's namespace under the
+    // name Leaf. There is no export literally called `*` to resolve, so the
+    // member is leaf's namespace object -- which must itself be declared.
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import * as nodes from "./barrel.js";
+export const used = Object.keys(nodes);
+"#,
+    );
+    write_source(&root, "barrel.js", "export * as Leaf from \"./leaf.js\";\n");
+    write_source(
+        &root,
+        "leaf.js",
+        "export const name = 'Leaf';\nexport const parse = () => 1;\n",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let source = bundled.source.clone();
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        source.contains("Leaf: __il_m2_namespace"),
+        "barrel member must be the leaf namespace object: {source}"
+    );
+    assert!(
+        source.contains("__il_m2_namespace = {"),
+        "the leaf namespace object must be declared: {source}"
+    );
+    assert_no_dangling_il_bindings(&source);
+    assert_semantic_valid(&source);
+}
+
+#[test]
+fn bundle_named_import_of_namespace_reexport_resolves_to_namespace_object() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import { Leaf } from "./barrel.js";
+export const used = Leaf;
+"#,
+    );
+    write_source(&root, "barrel.js", "export * as Leaf from \"./leaf.js\";\n");
+    write_source(&root, "leaf.js", "export const name = 'Leaf';\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let source = bundled.source.clone();
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        source.contains("__il_m0_used = __il_m2_namespace"),
+        "named import of a namespace re-export must bind the namespace: {source}"
+    );
+    assert_no_dangling_il_bindings(&source);
+    assert_semantic_valid(&source);
 }

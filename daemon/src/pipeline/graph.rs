@@ -9,6 +9,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     AssignmentTargetPropertyIdentifier, BindingPattern, BindingProperty, Declaration,
     ExportDefaultDeclarationKind, Expression, ObjectProperty, Program, Statement,
+    StaticMemberExpression,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_codegen::{Codegen, CodegenOptions};
@@ -66,7 +67,7 @@ impl Default for GraphLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModuleId(pub usize);
 
 #[derive(Debug, Clone)]
@@ -101,10 +102,25 @@ pub struct ModuleRecord {
     /// are retention roots: prune them and the bundle references an undeclared
     /// binding.
     pub side_effect_references: Vec<String>,
+    /// Every non-computed, non-optional `identifier.property` access in the
+    /// module. `object` is the identifier's own span so the bundler can match it
+    /// against `root_symbol_spans` and thereby ignore shadowed uses.
+    pub static_member_accesses: Vec<StaticMemberAccess>,
     // Root-scope symbol declaration + reference spans, computed once here so the
     // bundle rewriter does not re-parse and re-run semantic analysis per request.
     pub root_symbol_spans: Vec<RootSymbolSpans>,
     pub shorthand_spans: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticMemberAccess {
+    /// Span of the object identifier alone (`ns` in `ns.alpha`). Matches a span
+    /// in `RootSymbolSpans::references`.
+    pub object: (usize, usize),
+    /// Span of the whole member expression (`ns.alpha`), i.e. what a rewrite
+    /// replaces.
+    pub span: (usize, usize),
+    pub property: String,
 }
 
 #[derive(Debug, Clone)]
@@ -775,6 +791,7 @@ impl ModuleGraphBuilder {
             local_bindings: parsed.local_bindings,
             binding_dependencies: parsed.binding_dependencies,
             side_effect_references: parsed.side_effect_references,
+            static_member_accesses: parsed.static_member_accesses,
         });
 
         for next_path in next_paths {
@@ -798,6 +815,7 @@ struct ParsedModule {
     local_bindings: Vec<String>,
     binding_dependencies: Vec<BindingDependencyRecord>,
     side_effect_references: Vec<String>,
+    static_member_accesses: Vec<StaticMemberAccess>,
     root_symbol_spans: Vec<RootSymbolSpans>,
     shorthand_spans: Vec<(usize, usize)>,
 }
@@ -1070,6 +1088,7 @@ fn parse_module(
         local_bindings: local_bindings(&parsed.program),
         binding_dependencies: analysis.dependencies,
         side_effect_references: analysis.side_effect_references,
+        static_member_accesses: analysis.static_member_accesses,
         root_symbol_spans: analysis.symbol_spans,
         shorthand_spans: shorthand_identifier_spans(&parsed.program)
             .into_iter()
@@ -1374,6 +1393,7 @@ struct StatementBindingRange {
 struct RootScopeAnalysis {
     dependencies: Vec<BindingDependencyRecord>,
     side_effect_references: Vec<String>,
+    static_member_accesses: Vec<StaticMemberAccess>,
     symbol_spans: Vec<RootSymbolSpans>,
 }
 
@@ -1388,6 +1408,7 @@ fn root_scope_analysis(program: &Program<'_>) -> RootScopeAnalysis {
         return RootScopeAnalysis {
             dependencies: Vec::new(),
             side_effect_references: Vec::new(),
+            static_member_accesses: Vec::new(),
             symbol_spans: Vec::new(),
         };
     }
@@ -1418,7 +1439,39 @@ fn root_scope_analysis(program: &Program<'_>) -> RootScopeAnalysis {
             &side_effect_statement_ranges(program),
             &references,
         ),
+        static_member_accesses: static_member_accesses(program),
         symbol_spans,
+    }
+}
+
+fn static_member_accesses(program: &Program<'_>) -> Vec<StaticMemberAccess> {
+    let mut collector = StaticMemberAccessCollector::default();
+    collector.visit_program(program);
+    collector.accesses
+}
+
+#[derive(Default)]
+struct StaticMemberAccessCollector {
+    accesses: Vec<StaticMemberAccess>,
+}
+
+impl<'a> Visit<'a> for StaticMemberAccessCollector {
+    fn visit_static_member_expression(&mut self, expression: &StaticMemberExpression<'a>) {
+        // `ns?.alpha` is deliberately excluded: rewriting it to a bare binding
+        // would drop the nullish guard. A module namespace is never nullish, so
+        // the conservative escape path is the honest answer rather than a
+        // silent semantic change.
+        if !expression.optional
+            && let Expression::Identifier(identifier) = &expression.object
+        {
+            self.accesses.push(StaticMemberAccess {
+                object: span_bounds(identifier.span),
+                span: span_bounds(expression.span),
+                property: expression.property.name.as_str().to_owned(),
+            });
+        }
+
+        walk::walk_static_member_expression(self, expression);
     }
 }
 

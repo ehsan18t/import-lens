@@ -1,14 +1,17 @@
 use crate::{
     ipc::protocol::ModuleContribution,
     pipeline::{
-        graph::{ExternalImportEdge, ModuleGraph, ModuleId, ModuleRecord, module_provides_export},
+        graph::{
+            ExternalImportEdge, ModuleGraph, ModuleId, ModuleRecord, module_exported_names,
+            module_provides_export,
+        },
         reachability::ReachableExports,
         replacements::{Replacement, apply_replacements, span_overlaps_replacements},
         util::{is_identifier_continue, is_identifier_start},
     },
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt::Write as _,
 };
 
@@ -82,6 +85,23 @@ pub fn bundle_reachable_modules_with_metadata(
             }
             minifier_source.push('\n');
         }
+    }
+
+    // A namespace import renames its local binding to `__il_m<N>_namespace`;
+    // without this declaration the bundle reads an identifier no module defines.
+    for target_id in namespace_target_ids(graph, &included) {
+        let Some(declaration) = namespace_object_declaration(graph, target_id, &included) else {
+            continue;
+        };
+        let Some(target) = graph.module_by_id(target_id) else {
+            continue;
+        };
+        contributions.push(ModuleContribution {
+            path: target.path.to_string_lossy().to_string(),
+            bytes: declaration.len() as u64,
+        });
+        source.push_str(&declaration);
+        minifier_source.push_str(&declaration);
     }
 
     let mut synthetic_imports = String::new();
@@ -622,12 +642,123 @@ fn rename_map(
     Ok(renames)
 }
 
+/// Modules that some included module imports as `* as ns`. A `BTreeSet` keeps
+/// emission order deterministic, so bundle bytes never depend on `HashMap`
+/// iteration order.
+fn namespace_target_ids(
+    graph: &ModuleGraph,
+    included: &HashMap<ModuleId, bool>,
+) -> BTreeSet<ModuleId> {
+    let mut targets = BTreeSet::new();
+    for module in graph
+        .modules
+        .iter()
+        .filter(|module| included.contains_key(&module.id))
+    {
+        for import in &module.imports {
+            let Some(target_id) = graph.module_id_by_path(&import.resolved_path) else {
+                continue;
+            };
+            if !included.contains_key(&target_id) {
+                continue;
+            }
+            if import
+                .imported_bindings
+                .iter()
+                .any(|binding| binding.imported_name == "*")
+            {
+                targets.insert(target_id);
+            }
+        }
+
+        // `export * as X from "./x.js"` exposes x's namespace object as the
+        // member X, so x needs one too even though nothing imports it as `* as`.
+        for reexport in &module.reexports {
+            if reexport.imported_name != "*" {
+                continue;
+            }
+            let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path) else {
+                continue;
+            };
+            if included.contains_key(&target_id) {
+                targets.insert(target_id);
+            }
+        }
+    }
+    targets
+}
+
+/// `const __il_m1_namespace = { alpha: __il_m1_alpha, beta: __il_m1_beta };`
+///
+/// esbuild emits live getters through an `__export` helper. A plain object
+/// literal is a few bytes smaller and keeps every member binding alive for the
+/// minifier, which is all a size estimate needs -- the bundle is measured,
+/// never executed.
+fn namespace_object_declaration(
+    graph: &ModuleGraph,
+    target_id: ModuleId,
+    included: &HashMap<ModuleId, bool>,
+) -> Option<String> {
+    let members = module_exported_names(graph, target_id, true)
+        .iter()
+        .filter_map(|name| {
+            let (owner, binding) =
+                resolve_export_binding_owner(graph, target_id, name, &mut HashSet::new())?;
+            // Never name a binding from a module the bundle excluded: that would
+            // trade one dangling reference for another.
+            included
+                .contains_key(&owner)
+                .then(|| format!("{}: {binding}", namespace_member_key(name)))
+        })
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "const {} = {{ {} }};\n",
+        module_binding_name(target_id, "namespace"),
+        members.join(", ")
+    ))
+}
+
+/// An export name is not necessarily a bare identifier -- `export { x as "a-b" }`
+/// and non-ASCII names are both legal -- so anything the ASCII identifier
+/// predicates reject is emitted as a quoted key rather than a syntax error.
+fn namespace_member_key(name: &str) -> String {
+    let mut bytes = name.bytes();
+    let is_identifier = bytes.next().is_some_and(is_identifier_start)
+        && bytes.all(is_identifier_continue)
+        && !name.is_empty();
+
+    if is_identifier {
+        return name.to_owned();
+    }
+
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 fn resolve_export_binding(
     graph: &ModuleGraph,
     module_id: ModuleId,
     exported_name: &str,
     visited: &mut HashSet<(ModuleId, String)>,
 ) -> Option<String> {
+    resolve_export_binding_owner(graph, module_id, exported_name, visited)
+        .map(|(_, binding)| binding)
+}
+
+/// Resolves an exported name to the module that declares its binding and the
+/// bundle-local name of that binding, following re-export and star-export
+/// chains. Callers that must know whether the declaring module is in the bundle
+/// use the `ModuleId`; the rest take only the name.
+fn resolve_export_binding_owner(
+    graph: &ModuleGraph,
+    module_id: ModuleId,
+    exported_name: &str,
+    visited: &mut HashSet<(ModuleId, String)>,
+) -> Option<(ModuleId, String)> {
     if !visited.insert((module_id, exported_name.to_owned())) {
         return None;
     }
@@ -638,7 +769,10 @@ fn resolve_export_binding(
         .iter()
         .find(|export| export.exported_name == exported_name)
     {
-        return Some(module_binding_name(module_id, &export.local_name));
+        return Some((
+            module_id,
+            module_binding_name(module_id, &export.local_name),
+        ));
     }
 
     for reexport in module
@@ -646,18 +780,31 @@ fn resolve_export_binding(
         .iter()
         .filter(|reexport| reexport.exported_name == exported_name)
     {
-        if let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path)
-            && let Some(binding) =
-                resolve_export_binding(graph, target_id, &reexport.imported_name, visited)
+        let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path) else {
+            continue;
+        };
+
+        // `export * as X from "./x.js"` re-exports x's whole namespace under the
+        // name X. There is no export literally called `*` to recurse into; the
+        // binding is x's namespace object, which `namespace_target_ids` makes
+        // sure gets declared.
+        if reexport.imported_name == "*" {
+            return Some((target_id, module_binding_name(target_id, "namespace")));
+        }
+
+        if let Some(resolved) =
+            resolve_export_binding_owner(graph, target_id, &reexport.imported_name, visited)
         {
-            return Some(binding);
+            return Some(resolved);
         }
     }
 
     for star_export in &module.star_exports {
         let target_id = graph.module_id_by_path(&star_export.resolved_path)?;
-        if let Some(binding) = resolve_export_binding(graph, target_id, exported_name, visited) {
-            return Some(binding);
+        if let Some(resolved) =
+            resolve_export_binding_owner(graph, target_id, exported_name, visited)
+        {
+            return Some(resolved);
         }
     }
 
