@@ -1,8 +1,25 @@
 #!/usr/bin/env node
 
+// Fixture coverage, stated plainly so nobody mistakes a green run for more than it is:
+//
+//   synthetic (offline, deterministic)
+//     - flat / branchy: tree-shaking behavior, incl. the only assertion that an
+//       unreachable module is EXCLUDED from the breakdown.
+//     - typescript package: the `graph.rs` TypeScript transform path, the only place
+//       the daemon transforms real TS. A lowered `enum` and `namespace` both codegen
+//       as IIFEs, so this doubles as coverage of the minifier's unused-IIFE analysis.
+//   real packages (downloaded on demand, lockfile-pinned)
+//     - css-tree: deep ESM graph with transitive dependencies.
+//     - date-fns: deep zero-dependency ESM graph.
+//     - lodash:   the CommonJS path -- `SourceType::cjs()` and the `;(() => {…})();`
+//                 wrapper that `pipeline/cjs.rs` builds.
+//
+// NOT covered: the `.js`-containing-JSX retry path (`graph.rs`), which is a
+// parse-failure fallback; and the mangler's exported-destructuring handling, which
+// `pipeline/bundle.rs` puts out of reach by stripping `export ` before minification.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -13,37 +30,64 @@ import * as esbuild from "esbuild";
 
 const protocolVersion = 6;
 const packageName = "importlens-accuracy-fixture";
+const typedPackageName = "importlens-accuracy-ts-fixture";
 const tolerance = Number(process.env.IMPORT_LENS_ACCURACY_TOLERANCE ?? "0.75");
+// Local runs may be offline; CI and upgrade baselines must never silently measure
+// nothing. `validate.yml` sets this, and so must any pre/post-upgrade baseline run.
+const requireFixtures = process.env.IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES === "1";
+const fixturesDir = fileURLToPath(new URL("accuracy-fixtures/", import.meta.url));
+const installTimeoutMs = 300_000;
+
+/// Real-world packages, each present for one reason. `named` is the export whose
+/// import cost we measure. Versions come from the fixture manifest so there is a
+/// single source of truth for them.
+const realFixtures = [
+  { package: "css-tree", named: "parse", label: "css-tree (deep ESM graph, transitive deps)" },
+  { package: "date-fns", named: "format", label: "date-fns (deep zero-dependency ESM graph)" },
+  { package: "lodash", named: "debounce", label: "lodash (CommonJS wrapper path)" },
+];
 
 const main = async () => {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "importlens-accuracy-"));
   let daemon;
 
   try {
+    // Install first: `pnpm` owns `node_modules`, and the synthetic fixture is written
+    // into it afterwards so the install cannot prune it.
+    const realFixtureState = await installRealFixtures(workspace);
     const fixture = await writeFixture(workspace);
-    daemon = await startDaemon(workspace);
     const benchmarks = [
       {
         label: "same-module unused export",
         activeDocumentPath: fixture.flatActiveDocumentPath,
+        package: packageName,
+        version: "1.0.0",
         named: "light",
       },
       {
         label: "branchy unused export dependency",
         activeDocumentPath: fixture.branchyActiveDocumentPath,
+        package: packageName,
+        version: "1.0.0",
         named: "used",
         excludedModule: "/huge.js",
       },
+      {
+        label: "typescript enum and namespace transform",
+        activeDocumentPath: fixture.typedActiveDocumentPath,
+        package: typedPackageName,
+        version: "1.0.0",
+        named: "typed",
+      },
+      ...(realFixtureState.installed
+        ? await writeRealFixtureEntries(workspace, realFixtureState.versions)
+        : []),
     ];
 
+    daemon = await startDaemon(workspace);
+
     for (const [index, benchmark] of benchmarks.entries()) {
-      const importLens = await importLensNamedSize(
-        daemon,
-        workspace,
-        benchmark.activeDocumentPath,
-        benchmark.named,
-        index + 1,
-      );
+      const importLens = await importLensNamedSize(daemon, workspace, benchmark, index + 1);
       const esbuildSize = await esbuildNamedSize(workspace, benchmark.activeDocumentPath);
       const delta = Math.abs(importLens.brotliBytes - esbuildSize.brotliBytes);
       const relativeDelta = delta / Math.max(esbuildSize.brotliBytes, 1);
@@ -73,10 +117,169 @@ const main = async () => {
         throw new Error(`${benchmark.label} unexpectedly included ${benchmark.excludedModule}`);
       }
     }
+
+    if (!realFixtureState.installed) {
+      warnRealFixturesSkipped(realFixtureState.reason);
+    }
   } finally {
     await daemon?.shutdown();
     await rm(workspace, { recursive: true, force: true });
   }
+};
+
+/// Copy the pinned manifest plus its lockfile into the workspace and install them.
+/// `--frozen-lockfile` is what makes the byte counts reproducible: css-tree depends
+/// on source-map-js through a caret range, so exact direct versions alone would let
+/// a transitive patch move the numbers we diff across an upgrade.
+const installRealFixtures = async (workspace) => {
+  try {
+    await copyFile(path.join(fixturesDir, "package.json"), path.join(workspace, "package.json"));
+    await copyFile(
+      path.join(fixturesDir, "pnpm-lock.yaml"),
+      path.join(workspace, "pnpm-lock.yaml"),
+    );
+    await writeFile(path.join(workspace, ".npmrc"), fixtureNpmrc(), "utf8");
+    await runPnpmInstall(workspace);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (requireFixtures) {
+      throw new Error(`real accuracy fixtures are required but could not be installed: ${reason}`);
+    }
+    return { installed: false, reason };
+  }
+
+  // The install succeeded, so a precondition failure here is a broken fixture, not an
+  // offline laptop. It must never degrade to a skip, in either mode.
+  return { installed: true, versions: await assertRealFixturePreconditions(workspace) };
+};
+
+/// `--frozen-lockfile` refuses to run when a setting recorded in the lockfile disagrees
+/// with the effective pnpm config (ERR_PNPM_LOCKFILE_CONFIG_MISMATCH). Those settings
+/// would otherwise come from the machine's global pnpm config, so a developer with
+/// `auto-install-peers=false` could not install the fixtures at all. Pin every setting
+/// the lockfile records, and keep this in step with `accuracy-fixtures/pnpm-lock.yaml`.
+const fixtureNpmrc = () =>
+  [
+    // The hoisted linker gives a real `node_modules/<pkg>` tree, which is what
+    // `find_package_root` walks and what a user's project actually looks like. It also
+    // sidesteps junction canonicalization on Windows. Not a lockfile-validated setting.
+    "node-linker=hoisted",
+    "auto-install-peers=true",
+    "exclude-links-from-lockfile=false",
+    "",
+  ].join("\n");
+
+const runPnpmInstall = (cwd) =>
+  new Promise((resolve, reject) => {
+    const args = [
+      "install",
+      "--frozen-lockfile",
+      "--ignore-workspace",
+      "--ignore-scripts",
+      "--prefer-offline",
+    ];
+    // On Windows `pnpm` resolves to `pnpm.CMD`, which CreateProcess cannot launch
+    // directly; run it through the shell, mirroring `update-oxc-stack.mjs`.
+    const child =
+      process.platform === "win32"
+        ? spawn(`pnpm ${args.join(" ")}`, { cwd, shell: true, stdio: ["ignore", "ignore", "pipe"] })
+        : spawn("pnpm", args, { cwd, stdio: ["ignore", "ignore", "pipe"] });
+
+    const stderr = [];
+    child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
+
+    // Bound the install the way the daemon connect and request paths are bounded. A
+    // wedged pnpm would otherwise hang until the CI job's own timeout, with no clue why.
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`pnpm install timed out after ${installTimeoutMs}ms`));
+    }, installTimeoutMs);
+
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`pnpm install exited with code ${code}: ${stderr.join("").trim()}`));
+    });
+  });
+
+/// Guard the properties each fixture was chosen for. Without these a future version
+/// bump could silently stop exercising the path the benchmark exists to cover, and
+/// the suite would keep reporting green.
+const assertRealFixturePreconditions = async (workspace) => {
+  const versions = {};
+  const manifests = {};
+
+  for (const fixture of realFixtures) {
+    const manifestPath = path.join(workspace, "node_modules", fixture.package, "package.json");
+    try {
+      manifests[fixture.package] = JSON.parse(await readFile(manifestPath, "utf8"));
+    } catch (error) {
+      throw new Error(
+        `accuracy fixture ${fixture.package} is missing after a frozen install; ` +
+          `expected ${manifestPath} (${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
+    versions[fixture.package] = manifests[fixture.package].version;
+  }
+
+  if (manifests.lodash.module !== undefined) {
+    throw new Error(
+      "lodash fixture declares a `module` field, so it now resolves to an ESM entry; " +
+        "the CommonJS wrapper path is no longer covered by any benchmark",
+    );
+  }
+
+  return versions;
+};
+
+const writeRealFixtureEntries = async (workspace, versions) => {
+  const sourceRoot = path.join(workspace, "src");
+  const benchmarks = [];
+
+  for (const fixture of realFixtures) {
+    const activeDocumentPath = path.join(sourceRoot, `real-${fixture.package}-entry.js`);
+    await writeFile(
+      activeDocumentPath,
+      `export { ${fixture.named} } from "${fixture.package}";\n`,
+      "utf8",
+    );
+    benchmarks.push({
+      label: fixture.label,
+      activeDocumentPath,
+      package: fixture.package,
+      version: versions[fixture.package],
+      named: fixture.named,
+    });
+  }
+
+  return benchmarks;
+};
+
+const warnRealFixturesSkipped = (reason) => {
+  const rule = "!".repeat(78);
+  process.stderr.write(
+    [
+      "",
+      rule,
+      "!! REAL-PACKAGE BENCHMARKS DID NOT RUN. THIS RUN MEASURED LESS THAN IT LOOKS.",
+      `!! reason: ${reason}`,
+      ...realFixtures.map((fixture) => `!! skipped: ${fixture.label}`),
+      "!!",
+      "!! The synthetic benchmarks above still ran, but nothing here exercised the",
+      "!! CommonJS path or any real-world module graph. Do NOT use this run as an",
+      "!! OXC upgrade baseline. Set IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES=1 to turn",
+      "!! a failed fixture install into a hard error.",
+      rule,
+      "",
+    ].join("\n"),
+  );
 };
 
 const writeFixture = async (workspace) => {
@@ -127,21 +330,93 @@ const writeFixture = async (workspace) => {
   const branchyActiveDocumentPath = path.join(sourceRoot, "branchy-entry.js");
   await writeFile(flatActiveDocumentPath, `export { light } from "${packageName}";\n`, "utf8");
   await writeFile(branchyActiveDocumentPath, `export { used } from "${packageName}";\n`, "utf8");
-  return { flatActiveDocumentPath, branchyActiveDocumentPath };
+
+  const typedActiveDocumentPath = await writeTypedFixture(workspace, sourceRoot);
+  return { flatActiveDocumentPath, branchyActiveDocumentPath, typedActiveDocumentPath };
 };
 
-const importLensNamedSize = async (daemon, workspace, activeDocumentPath, named, requestId) => {
+/// The only TypeScript in the suite, and therefore the only thing that reaches the
+/// `graph.rs` transform. A lowered `enum` and `namespace` each codegen as an IIFE,
+/// so this also exercises the minifier's unused-IIFE analysis.
+///
+/// It gets its own package, and the package entry *is* the TypeScript module, so the
+/// benchmark measures the transform and nothing else. Hanging it off the shared
+/// fixture's index.js instead made the entry re-export it indirectly, which drags
+/// that module's unrelated static imports into the bundle and buried the signal under
+/// 180 KB of unrelated payload.
+///
+/// `Level` and `Meta` are read *dynamically* on purpose. `Level.High` alone folds to
+/// a constant and the enum object is then dead-code-eliminated, which would quietly
+/// delete the coverage this fixture exists to provide.
+const writeTypedFixture = async (workspace, sourceRoot) => {
+  const packageRoot = path.join(workspace, "node_modules", typedPackageName);
+  await mkdir(packageRoot, { recursive: true });
+
+  await writeFile(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify(
+      {
+        name: typedPackageName,
+        version: "1.0.0",
+        type: "module",
+        module: "index.ts",
+        sideEffects: false,
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "index.ts"),
+    [
+      `export enum Level {`,
+      `  Low = 0,`,
+      `  High = 1,`,
+      `}`,
+      ``,
+      `export namespace Meta {`,
+      `  export const label = "typed";`,
+      `  export const width = 3;`,
+      `}`,
+      ``,
+      `export interface Shape {`,
+      `  kind: string;`,
+      `  size: number;`,
+      `  body: string;`,
+      `}`,
+      ``,
+      `export const typed: Shape = {`,
+      `  kind: Level[Level.High],`,
+      `  size: Object.keys(Meta).length,`,
+      `  body: ${JSON.stringify(deterministicPayload(12_000))},`,
+      `};`,
+      ``,
+    ].join("\n"),
+    "utf8",
+  );
+
+  const typedActiveDocumentPath = path.join(sourceRoot, "typed-entry.js");
+  await writeFile(
+    typedActiveDocumentPath,
+    `export { typed } from "${typedPackageName}";\n`,
+    "utf8",
+  );
+  return typedActiveDocumentPath;
+};
+
+const importLensNamedSize = async (daemon, workspace, benchmark, requestId) => {
   const response = await daemon.request({
     version: protocolVersion,
     request_id: requestId,
     workspace_root: workspace,
-    active_document_path: activeDocumentPath,
+    active_document_path: benchmark.activeDocumentPath,
     imports: [
       {
-        specifier: packageName,
-        package: packageName,
-        version: "1.0.0",
-        named: [named],
+        specifier: benchmark.package,
+        package: benchmark.package,
+        version: benchmark.version,
+        named: [benchmark.named],
         import_kind: "named",
         runtime: "component",
       },
@@ -150,7 +425,9 @@ const importLensNamedSize = async (daemon, workspace, activeDocumentPath, named,
   const result = response.imports?.[0];
 
   if (!result || result.error) {
-    throw new Error(`Import Lens accuracy request failed: ${result?.error ?? "missing result"}`);
+    throw new Error(
+      `Import Lens accuracy request failed for ${benchmark.label}: ${result?.error ?? "missing result"}`,
+    );
   }
 
   return {

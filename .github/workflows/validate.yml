@@ -118,6 +118,12 @@ jobs:
 
       - name: Run accuracy tests
         if: ${{ inputs.run_accuracy }}
+        env:
+          # The suite skips its real-package benchmarks when they cannot be
+          # downloaded. That is right for an offline laptop and wrong here: a
+          # registry blip would turn the only minifier-drift gate into a no-op
+          # while the job still went green.
+          IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES: "1"
         run: pnpm test:accuracy
 
       - name: Check Rust coverage

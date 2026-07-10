@@ -1,0 +1,11 @@
+{
+  "name": "importlens-accuracy-real-fixtures",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned real-world packages the accuracy suite installs on demand. Exact direct versions are not enough on their own: css-tree depends on source-map-js through a caret range, so the committed pnpm-lock.yaml is what keeps before/after byte counts comparable across an OXC upgrade.",
+  "dependencies": {
+    "css-tree": "3.2.1",
+    "date-fns": "4.1.0",
+    "lodash": "4.17.21"
+  }
+}
