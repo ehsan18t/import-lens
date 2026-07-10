@@ -68,7 +68,13 @@ pub fn bundle_reachable_modules_with_metadata(
 
         let keep_all_exports = included.get(&module.id).copied().unwrap_or(false);
         let renames = rename_map(graph, module, &external_indexes)?;
-        let rewritten = rewrite_module(module, &expanded_reachable, keep_all_exports, &renames)?;
+        let rewritten = rewrite_module(
+            graph,
+            module,
+            &expanded_reachable,
+            keep_all_exports,
+            &renames,
+        )?;
         if !rewritten.trim().is_empty() {
             contributions.push(ModuleContribution {
                 path: module.path.to_string_lossy().to_string(),
@@ -96,10 +102,18 @@ pub fn bundle_reachable_modules_with_metadata(
         let Some(target) = graph.module_by_id(target_id) else {
             continue;
         };
-        contributions.push(ModuleContribution {
-            path: target.path.to_string_lossy().to_string(),
-            bytes: declaration.len() as u64,
-        });
+        // The target usually already contributed its rewritten source. Fold the
+        // declaration into that row: a second row for the same path would make
+        // the module breakdown list one file twice and evict a real entry.
+        let path = target.path.to_string_lossy().to_string();
+        let bytes = declaration.len() as u64;
+        match contributions
+            .iter_mut()
+            .find(|contribution| contribution.path == path)
+        {
+            Some(contribution) => contribution.bytes += bytes,
+            None => contributions.push(ModuleContribution { path, bytes }),
+        }
         source.push_str(&declaration);
         minifier_source.push_str(&declaration);
     }
@@ -239,8 +253,14 @@ fn include_module_with_imports(
         next_keep_all || !module_has_reachable_export(module, reachable);
     for import in &module.imports {
         if let Some(target_id) = graph.module_id_by_path(&import.resolved_path) {
-            let retained_import_names =
-                retained_import_names(import, include_all_static_imports, &retained_bindings);
+            let retained_import_names = retained_import_names(
+                graph,
+                module,
+                import,
+                target_id,
+                include_all_static_imports,
+                &retained_bindings,
+            );
             if retained_import_names.is_empty() && !import.imported_names.is_empty() {
                 continue;
             }
@@ -386,7 +406,10 @@ fn module_has_reachable_export(module: &ModuleRecord, reachable: &ReachableExpor
 }
 
 fn retained_import_names(
+    graph: &ModuleGraph,
+    module: &ModuleRecord,
     import: &crate::pipeline::graph::ImportEdge,
+    target_id: ModuleId,
     include_all_static_imports: bool,
     retained_bindings: &HashSet<String>,
 ) -> Vec<String> {
@@ -397,12 +420,21 @@ fn retained_import_names(
         return import.imported_names.clone();
     }
 
-    let mut names = import
-        .imported_bindings
-        .iter()
-        .filter(|binding| retained_bindings.contains(&binding.local_name))
-        .map(|binding| binding.imported_name.clone())
-        .collect::<Vec<_>>();
+    let mut names = Vec::new();
+    for binding in &import.imported_bindings {
+        if binding.imported_name == "*" {
+            // A namespace read only through `ns.prop` retains just those props;
+            // "*" would force the whole target into the bundle.
+            match classify_namespace_use(graph, module, &binding.local_name, target_id) {
+                NamespaceUse::Inlined(properties) => names.extend(properties),
+                NamespaceUse::Escaping => names.push("*".to_owned()),
+            }
+            continue;
+        }
+        if retained_bindings.contains(&binding.local_name) {
+            names.push(binding.imported_name.clone());
+        }
+    }
     names.sort();
     names.dedup();
     names
@@ -431,6 +463,7 @@ fn mark_reachable_import_target(
 }
 
 fn rewrite_module(
+    graph: &ModuleGraph,
     module: &ModuleRecord,
     reachable: &ReachableExports,
     keep_all_exports: bool,
@@ -489,6 +522,11 @@ fn rewrite_module(
             ));
         }
     }
+
+    // Must precede the rename pass: each `ns.alpha` span contains the `ns`
+    // identifier span, and `semantic_rename_replacements` skips any rename that
+    // overlaps an already-planned replacement.
+    replacements.extend(namespace_member_replacements(graph, module));
 
     let rename_replacements = semantic_rename_replacements(module, renames, &replacements)?;
     replacements.extend(rename_replacements);
@@ -621,10 +659,18 @@ fn rename_map(
         };
         for binding in &import.imported_bindings {
             if binding.imported_name == "*" {
-                renames.insert(
-                    binding.local_name.clone(),
-                    module_binding_name(target_id, "namespace"),
-                );
+                // An inlined namespace has no binding of its own: every
+                // `ns.prop` is replaced whole by `namespace_member_replacements`,
+                // and those spans shield the inner `ns` from being renamed.
+                if matches!(
+                    classify_namespace_use(graph, module, &binding.local_name, target_id),
+                    NamespaceUse::Escaping
+                ) {
+                    renames.insert(
+                        binding.local_name.clone(),
+                        module_binding_name(target_id, "namespace"),
+                    );
+                }
                 continue;
             }
 
@@ -642,14 +688,69 @@ fn rename_map(
     Ok(renames)
 }
 
-/// Modules that some included module imports as `* as ns`. A `BTreeSet` keeps
-/// emission order deterministic, so bundle bytes never depend on `HashMap`
-/// iteration order.
+/// How a single `* as ns` binding is used inside one module.
+enum NamespaceUse {
+    /// Every root-scope reference to `ns` is the object of a static member
+    /// access whose property resolves to an export of the target, so each
+    /// `ns.prop` can be rewritten to that export's binding and the rest of the
+    /// target tree-shakes. Carries the accessed names, sorted and deduplicated.
+    Inlined(Vec<String>),
+    /// `ns` is read as a value, accessed computedly, optionally chained, or
+    /// reads a name the target does not export. Keep the target whole and
+    /// materialize its namespace object.
+    Escaping,
+}
+
+fn classify_namespace_use(
+    graph: &ModuleGraph,
+    module: &ModuleRecord,
+    local_name: &str,
+    target_id: ModuleId,
+) -> NamespaceUse {
+    let Some(symbol) = module
+        .root_symbol_spans
+        .iter()
+        .find(|symbol| symbol.name == local_name)
+    else {
+        // No root-scope references at all: nothing reads the namespace, so
+        // there is nothing to inline and nothing to materialize.
+        return NamespaceUse::Inlined(Vec::new());
+    };
+
+    let accesses_by_object = module
+        .static_member_accesses
+        .iter()
+        .map(|access| (access.object, access))
+        .collect::<HashMap<_, _>>();
+
+    let mut properties = Vec::new();
+    for reference in &symbol.references {
+        // A reference that is not the object of a static access is the
+        // namespace itself escaping into a value position.
+        let Some(access) = accesses_by_object.get(reference) else {
+            return NamespaceUse::Escaping;
+        };
+        if resolve_export_binding(graph, target_id, &access.property, &mut HashSet::new()).is_none()
+        {
+            return NamespaceUse::Escaping;
+        }
+        properties.push(access.property.clone());
+    }
+
+    properties.sort();
+    properties.dedup();
+    NamespaceUse::Inlined(properties)
+}
+
+/// Modules that some included module imports as `* as ns` in a way that escapes.
+/// A `BTreeSet` keeps emission order deterministic, so bundle bytes never depend
+/// on `HashMap` iteration order.
 fn namespace_target_ids(
     graph: &ModuleGraph,
     included: &HashMap<ModuleId, bool>,
 ) -> BTreeSet<ModuleId> {
     let mut targets = BTreeSet::new();
+
     for module in graph
         .modules
         .iter()
@@ -662,30 +763,70 @@ fn namespace_target_ids(
             if !included.contains_key(&target_id) {
                 continue;
             }
-            if import
-                .imported_bindings
-                .iter()
-                .any(|binding| binding.imported_name == "*")
-            {
-                targets.insert(target_id);
-            }
-        }
+            for binding in &import.imported_bindings {
+                if binding.imported_name == "*" {
+                    match classify_namespace_use(graph, module, &binding.local_name, target_id) {
+                        NamespaceUse::Escaping => {
+                            targets.insert(target_id);
+                        }
+                        // An inlined `ns.AnPlusB` rewrites to AnPlusB's
+                        // namespace object when the barrel re-exports it as one.
+                        NamespaceUse::Inlined(properties) => {
+                            for property in properties {
+                                if let Some(owner) = namespace_owner(graph, target_id, &property)
+                                    && included.contains_key(&owner)
+                                {
+                                    targets.insert(owner);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
 
-        // `export * as X from "./x.js"` exposes x's namespace object as the
-        // member X, so x needs one too even though nothing imports it as `* as`.
-        for reexport in &module.reexports {
-            if reexport.imported_name != "*" {
-                continue;
-            }
-            let Some(target_id) = graph.module_id_by_path(&reexport.resolved_path) else {
-                continue;
-            };
-            if included.contains_key(&target_id) {
-                targets.insert(target_id);
+                // `import { X } from "./barrel.js"` where barrel says
+                // `export * as X from "./x.js"` binds X to x's namespace.
+                if let Some(owner) = namespace_owner(graph, target_id, &binding.imported_name)
+                    && included.contains_key(&owner)
+                {
+                    targets.insert(owner);
+                }
             }
         }
     }
+
+    // A materialized barrel's object literal names its children's namespaces, so
+    // those must be declared too. Walk exactly the members
+    // `namespace_object_declaration` will emit -- deriving them any other way
+    // (say, from `reexports` alone) misses a namespace re-export forwarded
+    // through `export *`, and the declaration then names an undeclared child.
+    // Seeding from demand rather than from every `export * as` in the graph also
+    // keeps a dead re-export from dragging a namespace and its members in.
+    let mut pending = targets.iter().copied().collect::<Vec<_>>();
+    while let Some(target_id) = pending.pop() {
+        for exported_name in module_exported_names(graph, target_id, true) {
+            if let Some(child_id) = namespace_owner(graph, target_id, &exported_name)
+                && included.contains_key(&child_id)
+                && targets.insert(child_id)
+            {
+                pending.push(child_id);
+            }
+        }
+    }
+
     targets
+}
+
+/// `Some(owner)` when `exported_name` resolves to a module namespace object
+/// rather than a plain binding, i.e. it arrives through `export * as`.
+fn namespace_owner(
+    graph: &ModuleGraph,
+    module_id: ModuleId,
+    exported_name: &str,
+) -> Option<ModuleId> {
+    let (owner, binding) =
+        resolve_export_binding_owner(graph, module_id, exported_name, &mut HashSet::new())?;
+    (binding == module_binding_name(owner, "namespace")).then_some(owner)
 }
 
 /// `const __il_m1_namespace = { alpha: __il_m1_alpha, beta: __il_m1_beta };`
@@ -809,6 +950,57 @@ fn resolve_export_binding_owner(
     }
 
     None
+}
+
+/// `ns.alpha` -> `__il_m1_alpha`, for namespace imports classified as `Inlined`.
+/// The returned spans cover the whole member expression, so feeding them to
+/// `semantic_rename_replacements` as protected spans is what stops the inner
+/// `ns` identifier from also being renamed.
+fn namespace_member_replacements(graph: &ModuleGraph, module: &ModuleRecord) -> Vec<Replacement> {
+    let mut replacements = Vec::new();
+    for import in &module.imports {
+        let Some(target_id) = graph.module_id_by_path(&import.resolved_path) else {
+            continue;
+        };
+        for binding in &import.imported_bindings {
+            if binding.imported_name != "*" {
+                continue;
+            }
+            if matches!(
+                classify_namespace_use(graph, module, &binding.local_name, target_id),
+                NamespaceUse::Escaping
+            ) {
+                continue;
+            }
+            let Some(symbol) = module
+                .root_symbol_spans
+                .iter()
+                .find(|symbol| symbol.name == binding.local_name)
+            else {
+                continue;
+            };
+            let references = symbol.references.iter().copied().collect::<HashSet<_>>();
+
+            for access in &module.static_member_accesses {
+                // Only accesses whose object is this root-scope binding; a
+                // shadowed `ns` in a nested scope has a different span.
+                if !references.contains(&access.object) {
+                    continue;
+                }
+                let Some(target_name) =
+                    resolve_export_binding(graph, target_id, &access.property, &mut HashSet::new())
+                else {
+                    continue;
+                };
+                replacements.push(Replacement::replace(
+                    access.span.0,
+                    access.span.1,
+                    target_name,
+                ));
+            }
+        }
+    }
+    replacements
 }
 
 fn semantic_rename_replacements(

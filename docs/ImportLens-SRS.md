@@ -1480,6 +1480,19 @@ fn include_module_with_imports(module, reachable):
         reachable.add_symbol(import_edge.target, imported_binding.imported_name)
         include_module_with_imports(import_edge.target, reachable)
 
+    // `import * as ns` retains only the exports it statically reads. If every
+    // root-scope reference to `ns` is the object of a non-computed,
+    // non-optional `ns.prop` whose prop resolves to an export of the target,
+    // each `ns.prop` span is rewritten to that export's binding and the rest of
+    // the target tree-shakes. Otherwise the namespace escapes -- read as a
+    // value, `ns[k]`, `ns?.p`, or a name the target does not export -- and the
+    // target is kept whole so its namespace object can be materialized.
+    for namespace_binding in import_edge.namespace_bindings:
+      if namespace_binding is inlined:
+        retained_import_names += the accessed property names
+      else:
+        retained_import_names += "*"   // keep_all
+
   // Re-export and star edges carry a reachable symbol to the module that
   // defines it. They must be followed whenever the re-exported name is
   // reachable, not only when the whole module is kept: otherwise a plain named
@@ -1508,6 +1521,24 @@ fn include_module_with_imports(module, reachable):
 Named/default import analysis must not recurse into every static import of an included module. It follows only side-effect-only imports, full-module conservative inclusion, explicit `sideEffects` array matches, imported bindings reached from the retained export/local dependency closure, and re-export/star edges whose re-exported name is itself reachable. This prevents a dead export such as `export const unused = huge` from pulling in `huge.js` when the user imported only `used`, while still bundling the module that actually defines a re-exported symbol.
 
 Because the bundler walk marks symbols as it descends, a module already visited may later gain a newly reachable symbol. Re-visit change detection must therefore key on the union of the module's retained bindings and its reachable symbol names; keying on bindings alone would early-return and leave a re-export chain unexpanded, since a re-export contributes no local binding.
+
+**Namespace objects**
+
+A namespace import whose binding escapes has no declaration in the concatenated bundle,
+because the import statement is stripped. For every included module that another included
+module needs as a namespace, the bundler must emit
+`const __m{N}_namespace = { <export>: <binding>, ... }`, listing that module's exports
+transitively through its re-exports and star exports. `export * as X from "./x.js"` binds
+`X` to x's namespace object rather than to any single export, so x must be materialized
+too; the same holds for a named import of such a re-export. The set of modules needing a
+namespace object is demand-driven -- seeded from escaping namespace imports, named imports
+that resolve to a namespace, and inlined member reads that resolve to a namespace, then
+closed over the seeds' own `export * as` children -- so an unreached `export * as` never
+drags a module and its exports into the bundle. A member is emitted only when the module
+declaring its binding is itself included, so materialization can never introduce a
+reference to a pruned definition. esbuild materializes live getters through an `__export`
+helper; an object literal is equivalent for size purposes because the bundle is measured,
+never executed.
 
 **Scope renaming before concatenation**
 

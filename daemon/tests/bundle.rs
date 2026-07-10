@@ -920,6 +920,129 @@ export const used = Object.keys(helpers);
 }
 
 #[test]
+fn bundle_inlines_static_namespace_member_access_and_shakes_the_rest() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import * as helpers from "./helpers.js";
+export const used = helpers.alpha(1);
+"#,
+    );
+    write_source(
+        &root,
+        "helpers.js",
+        r#"export const alpha = (n) => n + 1;
+export const beta = (n) => n + 2;
+export const HUGE = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+"#,
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let source = bundled.source.clone();
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        source.contains("__il_m1_alpha(1)"),
+        "ns.alpha must inline to the target binding: {source}"
+    );
+    assert!(
+        !source.contains("__il_m1_namespace"),
+        "a non-escaping namespace must not be materialized: {source}"
+    );
+    assert!(
+        !source.contains("__il_m1_beta"),
+        "unaccessed export must be shaken out: {source}"
+    );
+    assert!(
+        !source.contains("xxxxxxxx"),
+        "unaccessed payload must be shaken out: {source}"
+    );
+    assert_no_dangling_il_bindings(&source);
+    assert_semantic_valid(&source);
+}
+
+#[test]
+fn bundle_escapes_namespace_used_as_a_value_or_computed() {
+    for (label, entry_source) in [
+        ("value", "export const used = Object.keys(helpers);"),
+        (
+            "computed",
+            "const k = 'alpha';\nexport const used = helpers[k];",
+        ),
+        ("optional", "export const used = helpers?.alpha;"),
+        ("unknown property", "export const used = helpers.nope;"),
+    ] {
+        let root = temp_workspace();
+        write_source(
+            &root,
+            "entry.js",
+            &format!("import * as helpers from \"./helpers.js\";\n{entry_source}\n"),
+        );
+        write_source(
+            &root,
+            "helpers.js",
+            "export const alpha = 1;\nexport const beta = 2;\n",
+        );
+
+        let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+        let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+        let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+            .expect("reachable modules should bundle");
+        let source = bundled.source.clone();
+
+        fs::remove_dir_all(root).expect("cleanup");
+        assert!(
+            source.contains("__il_m1_namespace = {"),
+            "{label}: escaping namespace must be materialized: {source}"
+        );
+        assert!(
+            source.contains("__il_m1_beta"),
+            "{label}: escaping namespace keeps every export: {source}"
+        );
+        assert_no_dangling_il_bindings(&source);
+        assert_semantic_valid(&source);
+    }
+}
+
+#[test]
+fn bundle_inlines_namespace_member_reaching_through_a_reexport() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import * as ns from "./barrel.js";
+export const used = ns.alpha;
+"#,
+    );
+    write_source(&root, "barrel.js", "export { alpha } from \"./leaf.js\";\n");
+    write_source(
+        &root,
+        "leaf.js",
+        "export const alpha = 1;\nexport const beta = 2;\n",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let files = contribution_basenames(&bundled);
+    let source = bundled.source.clone();
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(files.contains(&"leaf.js".to_owned()), "{files:?}");
+    assert!(
+        !source.contains("__il_m2_beta"),
+        "re-export chain must still shake unaccessed names: {source}"
+    );
+    assert_no_dangling_il_bindings(&source);
+    assert_semantic_valid(&source);
+}
+
+#[test]
 fn bundle_declares_namespace_object_for_namespace_reexport_barrel() {
     // `export * as Leaf from "./leaf.js"` exposes leaf's namespace under the
     // name Leaf. There is no export literally called `*` to resolve, so the
@@ -953,6 +1076,116 @@ export const used = Object.keys(nodes);
     assert!(
         source.contains("__il_m2_namespace = {"),
         "the leaf namespace object must be declared: {source}"
+    );
+    assert_no_dangling_il_bindings(&source);
+    assert_semantic_valid(&source);
+}
+
+#[test]
+fn bundle_declares_namespace_reexport_forwarded_through_a_star_export() {
+    // a.js reaches `export * as X` only through `export *`. The namespace object
+    // for a.js names X, so x.js's namespace must be declared too -- deriving the
+    // child set from `reexports` alone silently misses this.
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import * as nsA from "./a.js";
+export const used = Object.keys(nsA);
+"#,
+    );
+    write_source(&root, "a.js", "export * from \"./barrel.js\";\n");
+    write_source(&root, "barrel.js", "export * as X from \"./x.js\";\n");
+    write_source(&root, "x.js", "export const v = 1;\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let source = bundled.source.clone();
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        source.contains("__il_m3_namespace = {"),
+        "star-forwarded namespace re-export must be declared: {source}"
+    );
+    assert_no_dangling_il_bindings(&source);
+    assert_semantic_valid(&source);
+}
+
+#[test]
+fn bundle_reports_one_contribution_row_per_module_path() {
+    // A materialized namespace target also emits its own rewritten source. Two
+    // rows for one path would list the file twice in the size breakdown.
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"import * as helpers from "./helpers.js";
+export const used = Object.keys(helpers);
+"#,
+    );
+    write_source(
+        &root,
+        "helpers.js",
+        "export const alpha = 1;\nexport const beta = 2;\n",
+    );
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let paths = bundled
+        .contributions
+        .iter()
+        .map(|contribution| contribution.path.clone())
+        .collect::<Vec<_>>();
+    let mut unique = paths.clone();
+    unique.sort();
+    unique.dedup();
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert_eq!(
+        paths.len(),
+        unique.len(),
+        "each module path must appear once in the breakdown: {paths:?}"
+    );
+}
+
+#[test]
+fn bundle_omits_namespace_object_for_unreached_namespace_reexport() {
+    // The entry re-exports `Dead` as a namespace but the request only reaches
+    // `used`. Materializing Dead's namespace would name every export of
+    // dead.js and keep the whole module alive for nothing.
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        r#"export * as Dead from "./dead.js";
+export { used } from "./live.js";
+"#,
+    );
+    write_source(
+        &root,
+        "dead.js",
+        "export const payload = 'zzzzzzzzzzzzzzzzzzzzzzzz';\n",
+    );
+    write_source(&root, "live.js", "export const used = 1;\n");
+
+    let graph = build_module_graph(&root.join("entry.js")).expect("graph should be built");
+    let reachable = reachable_exports(&graph, &["used".to_owned()], false);
+    let bundled = bundle_reachable_modules_with_metadata(&graph, &reachable)
+        .expect("reachable modules should bundle");
+    let source = bundled.source.clone();
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        !source.contains("_namespace = {"),
+        "unreached namespace re-export must not be materialized: {source}"
+    );
+    assert!(
+        !source.contains("zzzzzzzz"),
+        "unreached namespace re-export must not drag its payload: {source}"
     );
     assert_no_dangling_il_bindings(&source);
     assert_semantic_valid(&source);
