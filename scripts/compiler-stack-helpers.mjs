@@ -30,30 +30,15 @@ export const validateCurrentStack = (cargoToml) => {
     throw new Error("Missing exact pin (=) for oxc_resolver");
   }
 
+  // The engine is production (spec §11 Phase 2): the rolldown family is an
+  // unconditional exact-pinned dependency, like the OXC crates.
   for (const crate of rolldownFamilyCrates()) {
-    const linePattern = new RegExp(
-      `^${crate}\\s*=\\s*\\{\\s*version\\s*=\\s*"=[^"]+",\\s*optional\\s*=\\s*true\\s*\\}$`,
-      "mu",
-    );
-    if (!linePattern.test(cargoToml)) {
-      throw new Error(
-        `Missing exact optional dependency (${crate} = { version = "=x.y.z", optional = true })`,
-      );
+    if (!exactPin(crate, cargoToml)) {
+      throw new Error(`Missing exact pin (=) for ${crate}`);
     }
   }
-  const featureDeps = rolldownFamilyCrates()
-    .map((crate) => `"dep:${crate}"`)
-    .join(",\\s*");
-  const featurePattern = new RegExp(
-    `^rolldown-candidate\\s*=\\s*\\[\\s*${featureDeps}\\s*\\]$`,
-    "mu",
-  );
-  if (!featurePattern.test(cargoToml)) {
-    throw new Error(
-      `Missing rolldown-candidate feature ([features] rolldown-candidate = [${rolldownFamilyCrates()
-        .map((crate) => `"dep:${crate}"`)
-        .join(", ")}])`,
-    );
+  if (/^\s*rolldown[^=]*=\s*\{[^}]*optional\s*=\s*true/mu.test(cargoToml)) {
+    throw new Error("rolldown-family dependencies must not regress to optional");
   }
 };
 
@@ -116,11 +101,8 @@ export const updateCargoToml = (cargoToml, { rolldownVersion, oxcVersion, resolv
   next = next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "=${resolverVersion}"`);
   for (const crate of rolldownFamilyCrates()) {
     next = next.replace(
-      new RegExp(
-        `^${crate}\\s*=\\s*\\{\\s*version\\s*=\\s*"[^"]+",\\s*optional\\s*=\\s*true\\s*\\}$`,
-        "gmu",
-      ),
-      `${crate} = { version = "=${rolldownVersion}", optional = true }`,
+      new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"),
+      `${crate} = "=${rolldownVersion}"`,
     );
   }
   return next;

@@ -28,7 +28,7 @@ use crate::{
     pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import_with_graph},
     pipeline::file_size::{annotate_shared_bytes, compute_file_size},
     pipeline::graph::{
-        ModuleGraph, build_module_graph_cached, clear_module_graph_cache,
+        build_module_graph_cached, clear_module_graph_cache,
         invalidate_module_graph_cache_for_package, module_exported_names,
     },
     pipeline::resolver::{ResolvedPackage, find_package_root, resolve_package_entry},
@@ -1604,6 +1604,37 @@ impl ImportLensService {
             }
         };
 
+        // Phase 2 selection seam (spec §8.4): the engine's chunk export list
+        // replaces the recursive graph walk once the Phase 3 cutover flips
+        // `USE_ROLLDOWN_ENGINE`.
+        if crate::engine::USE_ROLLDOWN_ENGINE {
+            return match crate::engine::boundary::enumerate_exports_sync(
+                resolved.entry_path.clone(),
+                import_request.runtime,
+            ) {
+                Ok(exports) => EnumerateExportsResponse {
+                    version: request.version,
+                    request_id: request.request_id,
+                    specifier: request.specifier,
+                    exports,
+                    error: None,
+                    diagnostics: Vec::new(),
+                },
+                Err(failure) => EnumerateExportsResponse {
+                    version: request.version,
+                    request_id: request.request_id,
+                    specifier: request.specifier,
+                    exports: Vec::new(),
+                    error: Some(failure.message.clone()),
+                    diagnostics: vec![ImportDiagnostic {
+                        stage: failure.stage,
+                        message: failure.message,
+                        details: Vec::new(),
+                    }],
+                },
+            };
+        }
+
         let graph = match build_module_graph_cached(&resolved.entry_path) {
             Ok(graph) => graph,
             Err(error) => {
@@ -2476,10 +2507,29 @@ fn has_request_specific_diagnostics(result: &ImportResult) -> bool {
 
 fn dependency_fingerprints(
     resolved: &ResolvedPackage,
-    graph: Option<&std::sync::Arc<ModuleGraph>>,
+    source: Option<&crate::pipeline::analyze::FingerprintSource>,
     runtime: crate::ipc::protocol::ImportRuntime,
 ) -> Vec<crate::cache::key::FileFingerprint> {
     use crate::cache::key::file_fingerprint_reading_hash;
+    use crate::pipeline::analyze::FingerprintSource;
+
+    // The Rolldown engine reports every loaded real path (manifest included,
+    // tree-shaken modules included — spec §8.3); each is read+hashed so the
+    // strict freshness gate content-verifies them.
+    if let Some(FingerprintSource::LoadedPaths(paths)) = source {
+        let mut fingerprints: Vec<crate::cache::key::FileFingerprint> = paths
+            .iter()
+            .cloned()
+            .filter_map(file_fingerprint_reading_hash)
+            .collect();
+        fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
+        fingerprints.dedup_by(|a, b| a.path == b.path);
+        return fingerprints;
+    }
+    let graph = match source {
+        Some(FingerprintSource::Graph(graph)) => Some(graph),
+        _ => None,
+    };
 
     // No analyzed graph (CJS, oversized entry, or static fallback): the result was
     // not computed from a module graph, so freshness is pinned to the manifest and

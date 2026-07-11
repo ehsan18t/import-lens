@@ -254,13 +254,7 @@ test("updateCompilerStack updates manifests, SRS, config, lockfiles, and the fin
   }
   assert.match(cargoToml, new RegExp(`^oxc_resolver = "=${escapeVersion(targetResolver)}"$`, "mu"));
   for (const crate of rolldownFamily) {
-    assert.match(
-      cargoToml,
-      new RegExp(
-        `^${crate} = \\{ version = "=${escapeVersion(targetRolldown)}", optional = true \\}$`,
-        "mu",
-      ),
-    );
+    assert.match(cargoToml, new RegExp(`^${crate} = "=${escapeVersion(targetRolldown)}"$`, "mu"));
   }
   assert.equal(manifest.scripts["deps:update:compiler"], "node scripts/update-compiler-stack.mjs");
   assert.equal(manifest.scripts["deps:update:safe"], "node scripts/deps-update-safe.mjs");
@@ -521,16 +515,13 @@ test("updateCompilerStack rejects a manifest without the coordinated shape befor
     cargoToml: `${cargoTomlFixture()}oxc_mangler = "=${currentOxc}"\n`,
   });
   const withoutRolldown = await tempRepo({
-    cargoToml: cargoTomlFixture().replace(
-      `rolldown = { version = "=${currentRolldown}", optional = true }\n`,
-      "",
-    ),
+    cargoToml: cargoTomlFixture().replace(`rolldown = "=${currentRolldown}"\n`, ""),
   });
 
   for (const [repo, message] of [
     [nonCoordinated, /Current OXC crate versions are not coordinated/u],
     [withMangler, /oxc_mangler must not be present/u],
-    [withoutRolldown, /Missing exact optional dependency \(rolldown /u],
+    [withoutRolldown, /Missing exact pin \(=\) for rolldown/u],
   ]) {
     await assert.rejects(
       updateCompilerStack({
@@ -718,13 +709,8 @@ const cargoTomlFixture = () => `[dependencies]
 brotli = "^8"
 ${compilerStackConfig.oxcCrates.map((crate) => `${crate} = "=${currentOxc}"`).join("\n")}
 oxc_resolver = "=${currentResolver}"
-${rolldownFamily
-  .map((crate) => `${crate} = { version = "=${currentRolldown}", optional = true }`)
-  .join("\n")}
+${rolldownFamily.map((crate) => `${crate} = "=${currentRolldown}"`).join("\n")}
 zstd = "^0.13"
-
-[features]
-rolldown-candidate = [${rolldownFamily.map((crate) => `"dep:${crate}"`).join(", ")}]
 `;
 
 const manifestFixture = () => ({

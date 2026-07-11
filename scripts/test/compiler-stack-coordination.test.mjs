@@ -53,7 +53,7 @@ test("oxc_resolver is exact-pinned at its own configured version", () => {
   );
 });
 
-test("the rolldown family is exact-pinned and optional behind rolldown-candidate", () => {
+test("the rolldown family is exact-pinned at the monorepo version", () => {
   const cargoToml = repoFile("daemon/Cargo.toml");
 
   const family = [compilerStackConfig.rolldownCrate, ...compilerStackConfig.rolldownSupportCrates];
@@ -61,20 +61,15 @@ test("the rolldown family is exact-pinned and optional behind rolldown-candidate
     assert.match(
       cargoToml,
       new RegExp(
-        `^${crate} = \\{ version = "=${escapeVersion(compilerStackConfig.currentRolldownVersion)}", optional = true \\}$`,
+        `^${crate} = "=${escapeVersion(compilerStackConfig.currentRolldownVersion)}"$`,
         "mu",
       ),
-      `${crate} must be pinned to =${compilerStackConfig.currentRolldownVersion} and optional`,
+      `${crate} must be pinned to =${compilerStackConfig.currentRolldownVersion}`,
     );
   }
-  // The candidate feature must stay non-default: the shipped binary never
-  // links rolldown.
-  const featureDeps = family.map((crate) => `"dep:${crate}"`).join(", ");
-  assert.ok(
-    cargoToml.includes(`rolldown-candidate = [${featureDeps}]`),
-    `rolldown-candidate feature must enable exactly: [${featureDeps}]`,
-  );
-  assert.doesNotMatch(cargoToml, /^default = .*rolldown/mu);
+  // Guard: the engine is production (spec §11 Phase 2) — regressing the
+  // family to an optional/feature-gated dependency would silently unship it.
+  assert.doesNotMatch(cargoToml, /^\s*rolldown[^=]*=\s*\{[^}]*optional\s*=\s*true/mu);
 });
 
 test("oxc_mangler stays out of the dependency graph", () => {

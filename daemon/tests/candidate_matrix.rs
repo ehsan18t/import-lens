@@ -1,9 +1,8 @@
 //! Qualification construct matrix for the Rolldown candidate engine
 //! (bundler redesign spec §10.2). Every row drives the engine through the
 //! Import Lens contract only; no test may reach into Rolldown types.
-#![cfg(feature = "rolldown-candidate")]
 
-use import_lens_daemon::candidate::{
+use import_lens_daemon::engine::{
     BundleArtifact, BundleEntry, BundleFailure, BundlePurpose, BundleRequest, BundleSelection,
     ImportRuntime, RolldownEngine, SideEffectsMode,
 };

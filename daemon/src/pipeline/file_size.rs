@@ -63,6 +63,13 @@ pub fn compute_file_size(
     context: &AnalysisContext,
     requests: &[ImportRequest],
 ) -> FileSizeComputation {
+    // Phase 2 selection seam (spec §6.3): one multi-entry engine request —
+    // never per-package concatenation — once the Phase 3 cutover flips
+    // `USE_ROLLDOWN_ENGINE`.
+    if crate::engine::USE_ROLLDOWN_ENGINE {
+        return compute_file_size_with_engine(context, requests);
+    }
+
     let mut combined_modules = Vec::new();
     let mut seen_paths = HashSet::new();
     let mut combined_reachable = ReachableExports::default();
@@ -211,6 +218,91 @@ pub fn compute_file_size(
 
     FileSizeComputation {
         raw_bytes: source.len() as u64,
+        minified_bytes: minified.len() as u64,
+        gzip_bytes: compressed.gzip_bytes,
+        brotli_bytes: compressed.brotli_bytes,
+        zstd_bytes: compressed.zstd_bytes,
+        error: None,
+        diagnostics,
+    }
+}
+
+/// Rolldown-backed combined sizing (spec §6.3): every resolvable import
+/// becomes one entry of a single multi-entry build, so shared transitive
+/// modules are counted once by the linker itself. Public because the Phase 2
+/// differential tests drive it directly while `USE_ROLLDOWN_ENGINE` keeps
+/// production on the legacy pipeline.
+pub fn compute_file_size_with_engine(
+    context: &AnalysisContext,
+    requests: &[ImportRequest],
+) -> FileSizeComputation {
+    use crate::engine::{BundleEntry, BundlePurpose, BundleRequest, boundary};
+    use crate::pipeline::analyze::engine_selection;
+    use crate::pipeline::minify::minify_source;
+
+    let mut diagnostics = Vec::new();
+    let mut entries = Vec::new();
+    // Imports inside one document share a runtime in practice; the first
+    // resolvable request's runtime conditions the whole combined build.
+    let mut runtime = None;
+    for request in requests {
+        match resolve_package_entry(&context.active_document_path, request) {
+            Ok(resolved) => {
+                runtime.get_or_insert(request.runtime);
+                entries.push(BundleEntry {
+                    entry_path: resolved.entry_path,
+                    package_root: resolved.package_root,
+                    selection: engine_selection(request),
+                    reported_side_effects: resolved.side_effects,
+                });
+            }
+            Err(error) => diagnostics.push(diagnostic(
+                "entry_resolution",
+                error,
+                vec![format!("specifier: {}", request.specifier)],
+            )),
+        }
+    }
+    if entries.is_empty() {
+        return FileSizeComputation {
+            diagnostics,
+            ..FileSizeComputation::default()
+        };
+    }
+
+    let artifact = match boundary::bundle_sync(BundleRequest {
+        entries,
+        runtime: runtime.unwrap_or_default(),
+        purpose: BundlePurpose::FileSize,
+    }) {
+        Ok(artifact) => artifact,
+        Err(failure) => {
+            diagnostics.extend(failure.diagnostics.iter().map(|item| ImportDiagnostic {
+                stage: item.stage.clone(),
+                message: item.message.clone(),
+                details: Vec::new(),
+            }));
+            let stage = failure.stage.clone();
+            return error_computation(&stage, failure.message, diagnostics);
+        }
+    };
+    diagnostics.extend(artifact.diagnostics.iter().map(|item| ImportDiagnostic {
+        stage: item.stage.clone(),
+        message: item.message.clone(),
+        details: Vec::new(),
+    }));
+
+    let minified = match minify_source(&artifact.code, false) {
+        Ok(minified) => minified,
+        Err(error) => return error_computation("minify", error, diagnostics),
+    };
+    let compressed = match compress_all(&minified) {
+        Ok(compressed) => compressed,
+        Err(error) => return error_computation("compression", error.to_string(), diagnostics),
+    };
+
+    FileSizeComputation {
+        raw_bytes: artifact.code.len() as u64,
         minified_bytes: minified.len() as u64,
         gzip_bytes: compressed.gzip_bytes,
         brotli_bytes: compressed.brotli_bytes,

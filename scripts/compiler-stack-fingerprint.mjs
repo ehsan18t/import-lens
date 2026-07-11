@@ -49,7 +49,6 @@ export const computeCompilerStackFingerprint = async ({
   execFile = promisify(execFileCallback),
   rootDir = process.cwd(),
   rootCrateName = "rolldown",
-  candidateFeature = "rolldown-candidate",
 } = {}) => {
   const { stdout } = await execFile(
     "cargo",
@@ -60,8 +59,6 @@ export const computeCompilerStackFingerprint = async ({
       "1",
       "--manifest-path",
       path.join(rootDir, "daemon/Cargo.toml"),
-      "--features",
-      candidateFeature,
     ],
     // cargo metadata for the full graph is tens of MB; the default 1 MiB
     // maxBuffer truncates it into a parse error.

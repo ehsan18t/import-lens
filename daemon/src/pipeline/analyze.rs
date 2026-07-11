@@ -31,8 +31,10 @@ pub struct AnalysisContext {
     pub active_document_path: PathBuf,
 }
 
+// Public only because `analyze_with_rolldown_engine`'s Phase 2 differential
+// entry point returns it; fields stay private to this module.
 #[derive(Debug, Clone)]
-struct AnalysisError {
+pub struct AnalysisError {
     stage: &'static str,
     message: String,
     details: Vec<String>,
@@ -53,20 +55,28 @@ pub fn analyze_resolved_import(
     analyze_resolved_import_with_graph(context, request, resolved).0
 }
 
-/// Like [`analyze_resolved_import`], but also returns the `Arc<ModuleGraph>` the
-/// result was computed from, when the OXC pipeline produced one. The cache path
-/// uses this to fingerprint the exact analyzed graph instead of re-fetching it
-/// by key: a re-fetch can rebuild against dependency bytes that changed during
-/// the analysis window, pairing a stale result with fresh-looking fingerprints
-/// that are then served `Fresh` (Finding 4). Returns `None` for the CJS,
-/// oversized-entry, and static-fallback branches, which have no module graph.
+/// What dependency fingerprints derive from (spec §8.3): the legacy pipeline
+/// exposes the exact analyzed module graph; the Rolldown engine exposes every
+/// loaded real path (manifest included, tree-shaken modules included).
+pub enum FingerprintSource {
+    Graph(Arc<ModuleGraph>),
+    LoadedPaths(Vec<PathBuf>),
+}
+
+/// Like [`analyze_resolved_import`], but also returns the fingerprint source
+/// the result was computed from. The cache path uses this to fingerprint the
+/// exact analyzed inputs instead of re-fetching them by key: a re-fetch can
+/// rebuild against dependency bytes that changed during the analysis window,
+/// pairing a stale result with fresh-looking fingerprints that are then
+/// served `Fresh` (Finding 4). Returns `None` for the CJS, oversized-entry,
+/// and static-fallback branches, which have neither a graph nor loaded paths.
 pub fn analyze_resolved_import_with_graph(
     context: &AnalysisContext,
     request: &ImportRequest,
     resolved: ResolvedPackage,
-) -> (ImportResult, Option<Arc<ModuleGraph>>) {
+) -> (ImportResult, Option<FingerprintSource>) {
     match analyze_import_inner_resolved(context, request, resolved) {
-        Ok((result, graph)) => (result, graph),
+        Ok((result, source)) => (result, source),
         Err(error) => (error_result(request, error), None),
     }
 }
@@ -126,9 +136,10 @@ fn analyze_import_inner_resolved(
     context: &AnalysisContext,
     request: &ImportRequest,
     resolved: ResolvedPackage,
-) -> Result<(ImportResult, Option<Arc<ModuleGraph>>), AnalysisError> {
+) -> Result<(ImportResult, Option<FingerprintSource>), AnalysisError> {
     let side_effects_mode = resolved.side_effects;
     let entry_path = resolved.entry_path;
+    let package_root = resolved.package_root;
     let is_cjs = resolved.is_cjs;
 
     let metadata = fs::metadata(&entry_path).map_err(|error| {
@@ -167,6 +178,27 @@ fn analyze_import_inner_resolved(
     }
 
     let mut fallback_diagnostics = Vec::new();
+    // Phase 2 selection seam (spec §11): the Rolldown path is fully wired
+    // but stays off in production until the Phase 3 cutover flips
+    // `USE_ROLLDOWN_ENGINE`. On engine failure control falls through to the
+    // remaining legacy arms (static fallback last), per the §12 table; after
+    // Phase 3 deletes those arms the static fallback follows directly.
+    if crate::engine::USE_ROLLDOWN_ENGINE {
+        match analyze_with_rolldown_engine(
+            context,
+            request,
+            &entry_path,
+            &package_root,
+            &side_effects_mode,
+            is_cjs,
+        ) {
+            Ok((result, loaded_paths)) => {
+                return Ok((result, Some(FingerprintSource::LoadedPaths(loaded_paths))));
+            }
+            Err(error) => fallback_diagnostics.push(engine_fallback_diagnostic(error)),
+        }
+    }
+
     if is_cjs {
         match analyze_with_cjs_graph(request, &entry_path) {
             Ok(result) => return Ok((result, None)),
@@ -176,7 +208,7 @@ fn analyze_import_inner_resolved(
 
     if !is_cjs {
         match analyze_with_oxc_pipeline(context, request, entry_path.clone(), &side_effects_mode) {
-            Ok((result, graph)) => return Ok((result, Some(graph))),
+            Ok((result, graph)) => return Ok((result, Some(FingerprintSource::Graph(graph)))),
             Err(error) => fallback_diagnostics.push(oxc_fallback_diagnostic(error)),
         }
     }
@@ -381,6 +413,199 @@ fn analyze_with_oxc_pipeline(
     // Return the exact graph the result was computed from so the cache path can
     // fingerprint it directly instead of re-fetching (and possibly rebuilding).
     Ok((result, graph))
+}
+
+/// Rolldown-backed analysis (spec §8): one engine build produces the raw
+/// chunk, OXC minifies it, and the existing compression pipeline runs over
+/// the minified string. Returns the loaded real paths (plus the package
+/// manifest) for §8.3 freshness fingerprints alongside the result.
+///
+/// Public because the Phase 2 differential tests drive this path directly
+/// while `USE_ROLLDOWN_ENGINE` keeps production on the legacy pipeline.
+pub fn analyze_with_rolldown_engine(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    entry_path: &Path,
+    package_root: &Path,
+    side_effects_mode: &SideEffectsMode,
+    is_cjs: bool,
+) -> Result<(ImportResult, Vec<PathBuf>), AnalysisError> {
+    use crate::engine::{BundleEntry, BundlePurpose, BundleRequest, BundleSelection, boundary};
+
+    let bundle_entry = |selection: BundleSelection| BundleEntry {
+        entry_path: entry_path.to_path_buf(),
+        package_root: package_root.to_path_buf(),
+        selection,
+        reported_side_effects: side_effects_mode.clone(),
+    };
+    let artifact = boundary::bundle_sync(BundleRequest {
+        entries: vec![bundle_entry(engine_selection(request))],
+        runtime: request.runtime,
+        purpose: BundlePurpose::ImportSize,
+    })
+    .map_err(|failure| engine_error(context, request, failure))?;
+
+    let minified = minify_source(&artifact.code, false).map_err(|error| {
+        error_with_context(
+            "minify",
+            format!("failed to minify engine chunk: {error}"),
+            context,
+            request,
+            vec![source_excerpt_detail(&artifact.code)],
+        )
+    })?;
+    let compressed = compress_all(&minified).map_err(|error| {
+        error_with_context(
+            "compression",
+            format!("failed to compress minified output: {error}"),
+            context,
+            request,
+            Vec::new(),
+        )
+    })?;
+
+    // §7.4/§14.5: with glob matching unavailable from public bundler
+    // metadata, an Array declaration reports conservatively as
+    // side-effectful (legacy ORs in glob matches over graph modules; the
+    // adapter's conservative-confidence diagnostic already flags this).
+    let side_effects = side_effects_mode.has_side_effects() || side_effects_mode.is_array();
+    let mut diagnostics: Vec<ImportDiagnostic> = artifact
+        .diagnostics
+        .iter()
+        .map(|diagnostic| ImportDiagnostic {
+            stage: diagnostic.stage.clone(),
+            message: diagnostic.message.clone(),
+            details: Vec::new(),
+        })
+        .collect();
+
+    // Full-package comparison (§8.4/§6.3): a second engine build measures the
+    // complete surface; failure degrades to "not treeshakeable", never an
+    // analysis error.
+    let mut truly_treeshakeable = false;
+    if !side_effects
+        && matches!(request.import_kind, ImportKind::Named)
+        && !request.named.is_empty()
+    {
+        match boundary::bundle_sync(BundleRequest {
+            entries: vec![bundle_entry(BundleSelection::Full)],
+            runtime: request.runtime,
+            purpose: BundlePurpose::FullPackageComparison,
+        }) {
+            Ok(full) => {
+                if let Ok(full_minified) = minify_source(&full.code, false) {
+                    let full_len = full_minified.len() as u64;
+                    if full_len > 0 {
+                        // Mirror the legacy predicate: within 5% of the full
+                        // size is not truly tree-shakeable.
+                        let ratio = (minified.len() as f64) / (full_len as f64);
+                        truly_treeshakeable = ratio <= 0.95;
+                    }
+                }
+            }
+            Err(failure) => diagnostics.push(ImportDiagnostic {
+                stage: "full_package_comparison".to_owned(),
+                message: format!(
+                    "full-package comparison build failed; treating as not tree-shakeable: {}",
+                    failure.message
+                ),
+                details: Vec::new(),
+            }),
+        }
+    }
+
+    let (confidence, confidence_reasons) = oxc_confidence(side_effects, &diagnostics);
+    let contributions: Vec<ModuleContribution> = artifact
+        .contributions
+        .iter()
+        .map(|contribution| ModuleContribution {
+            path: contribution.path.to_string_lossy().to_string(),
+            bytes: contribution.rendered_bytes as u64,
+        })
+        .collect();
+
+    // §8.3: manifests used for resolution/side-effect classification join
+    // the fingerprint inputs alongside every loaded source path.
+    let mut loaded_paths = artifact.loaded_paths;
+    loaded_paths.push(package_root.join("package.json"));
+
+    let result = ImportResult {
+        freshness: ResultFreshness::fresh(),
+        specifier: request.specifier.clone(),
+        raw_bytes: artifact.code.len() as u64,
+        minified_bytes: minified.len() as u64,
+        gzip_bytes: compressed.gzip_bytes,
+        brotli_bytes: compressed.brotli_bytes,
+        zstd_bytes: compressed.zstd_bytes,
+        cache_hit: false,
+        side_effects,
+        truly_treeshakeable,
+        is_cjs,
+        confidence,
+        confidence_reasons,
+        error: None,
+        diagnostics,
+        module_breakdown: Some(top_module_contributions(&contributions)),
+        shared_bytes: None,
+        internal_contributions: contributions,
+    };
+    Ok((result, loaded_paths))
+}
+
+pub(crate) fn engine_selection(request: &ImportRequest) -> crate::engine::BundleSelection {
+    use crate::engine::BundleSelection;
+    match request.import_kind {
+        ImportKind::Named if !request.named.is_empty() => {
+            BundleSelection::Named(request.named.clone())
+        }
+        // No requested names known: measure the full surface conservatively,
+        // matching the legacy empty-bundle fallback.
+        ImportKind::Named => BundleSelection::Full,
+        ImportKind::Default => BundleSelection::Default,
+        ImportKind::Namespace => BundleSelection::Namespace,
+        ImportKind::Dynamic => BundleSelection::Full,
+    }
+}
+
+fn engine_error(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    failure: crate::engine::BundleFailure,
+) -> AnalysisError {
+    // The contract's failure stages are a closed vocabulary; keep them
+    // verbatim so cache/diagnostic consumers see stable stage names.
+    let stage = match failure.stage.as_str() {
+        "resolve" => "resolve",
+        "parse" => "parse",
+        "link" => "link",
+        "output_shape" => "output_shape",
+        "module_graph_limit" => "module_graph_limit",
+        "missing_export" => "missing_export",
+        "ambiguous_export" => "ambiguous_export",
+        _ => "generate",
+    };
+    error_with_context(
+        stage,
+        failure.message,
+        context,
+        request,
+        failure
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.stage, diagnostic.message))
+            .collect(),
+    )
+}
+
+fn engine_fallback_diagnostic(error: AnalysisError) -> ImportDiagnostic {
+    ImportDiagnostic {
+        stage: "engine_fallback".to_owned(),
+        message: format!(
+            "Rolldown engine analysis failed; using static entry sizing: {}",
+            error.message
+        ),
+        details: error.details,
+    }
 }
 
 fn is_truly_treeshakeable(

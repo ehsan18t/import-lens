@@ -5,12 +5,11 @@
 //! ```text
 //! node scripts/prepare-candidate-fixtures.mjs
 //! # set IMPORT_LENS_FIXTURES_WORKSPACE to the directory it prints, then:
-//! cargo test -p import-lens-daemon --locked --features rolldown-candidate \
+//! cargo test -p import-lens-daemon --locked \
 //!     --test candidate_packages -- --ignored --nocapture
 //! ```
-#![cfg(feature = "rolldown-candidate")]
 
-use import_lens_daemon::candidate::{
+use import_lens_daemon::engine::{
     BundleArtifact, BundlePurpose, BundleRequest, ImportRuntime, RolldownEngine,
 };
 use std::collections::HashSet;
@@ -26,8 +25,8 @@ struct PackageCase {
 }
 
 async fn bundle_case(case: &PackageCase) -> BundleArtifact {
-    let workspace = common::candidate::fixtures_workspace();
-    let entry = common::candidate::resolve_fixture_entry(
+    let workspace = common::engine_fixtures::fixtures_workspace();
+    let entry = common::engine_fixtures::resolve_fixture_entry(
         &workspace,
         case.package,
         case.version,
@@ -86,7 +85,7 @@ async fn bundle_case(case: &PackageCase) -> BundleArtifact {
     }
 
     // Determinism gate (§10.6): an identical request is byte-identical.
-    let entry = common::candidate::resolve_fixture_entry(
+    let entry = common::engine_fixtures::resolve_fixture_entry(
         &workspace,
         case.package,
         case.version,

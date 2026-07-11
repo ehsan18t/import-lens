@@ -110,7 +110,7 @@ impl ImportLensPlugin {
 
 impl Plugin for ImportLensPlugin {
     fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("import-lens:candidate")
+        Cow::Borrowed("import-lens")
     }
 
     async fn resolve_id(

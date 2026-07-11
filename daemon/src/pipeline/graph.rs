@@ -870,8 +870,9 @@ fn prepare_module_source(path: &Path, source: String) -> Result<PreparedModuleSo
 }
 
 fn synthetic_json_module(path: &Path, source: &str) -> Result<String, String> {
-    let json = serde_json::from_str::<Value>(source)
+    let mut json = serde_json::from_str::<Value>(source)
         .map_err(|error| format!("failed to parse JSON module {}: {error}", path.display()))?;
+    canonicalize_json_numbers(&mut json);
     let literal = serde_json::to_string(&json)
         .map_err(|error| format!("failed to encode JSON module {}: {error}", path.display()))?;
     let mut generated =
@@ -893,6 +894,52 @@ fn synthetic_json_module(path: &Path, source: &str) -> Result<String, String> {
     }
 
     Ok(generated)
+}
+
+/// serde_json is compiled with `arbitrary_precision` (forced globally by
+/// rolldown_common's hard dependency), which would otherwise preserve the
+/// source's exponent/trailing-zero number formatting when re-serializing.
+/// Fold every number through the primitive forms so the emitted literal
+/// keeps the byte format this module produced before rolldown joined the
+/// graph. Out-of-range numbers (e.g. 1e400) stay in their raw form — those
+/// previously failed the parse entirely and took the static fallback.
+fn canonicalize_json_numbers(value: &mut Value) {
+    match value {
+        Value::Number(number) => {
+            let folded = number
+                .as_u64()
+                .map(serde_json::Number::from)
+                .or_else(|| number.as_i64().map(serde_json::Number::from))
+                .or_else(|| number.as_f64().and_then(serde_json::Number::from_f64));
+            if let Some(folded) = folded {
+                *number = folded;
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(canonicalize_json_numbers),
+        Value::Object(map) => map.values_mut().for_each(canonicalize_json_numbers),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod json_number_canonicalization_tests {
+    use super::*;
+
+    /// Guard for a global-feature interaction: rolldown_common forces
+    /// serde_json's `arbitrary_precision`, and without the fold the legacy
+    /// JSON-module path would re-serialize source formatting verbatim,
+    /// silently moving measured sizes.
+    #[test]
+    fn json_numbers_reserialize_in_primitive_form() {
+        let mut json: Value =
+            serde_json::from_str(r#"{"a":1e2,"b":1.50,"c":7,"d":90071992547409934567}"#)
+                .expect("fixture should parse");
+        canonicalize_json_numbers(&mut json);
+        assert_eq!(
+            serde_json::to_string(&json).expect("fixture should encode"),
+            r#"{"a":100.0,"b":1.5,"c":7,"d":9.007199254740994e+19}"#
+        );
+    }
 }
 
 fn transform_module_source(path: &Path, source: &str) -> Result<String, String> {

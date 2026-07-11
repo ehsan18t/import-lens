@@ -65,13 +65,15 @@ fn extract_fixture_archive(zip: &mut zip::ZipArchive<fs::File>, target: &Path) {
     }
 }
 
-/// Fixture plumbing shared by the candidate qualification suites
+/// Fixture plumbing shared by the qualification suites
 /// (candidate_packages.rs, candidate_performance.rs): both resolve real
 /// packages out of the workspace prepared by
-/// scripts/prepare-candidate-fixtures.mjs.
-#[cfg(feature = "rolldown-candidate")]
-pub mod candidate {
-    use import_lens_daemon::candidate::{BundleEntry, BundleSelection};
+/// scripts/prepare-candidate-fixtures.mjs. Each integration-test crate
+/// compiles this module independently, so crates that skip the suites see
+/// its items as dead code.
+#[allow(dead_code)]
+pub mod engine_fixtures {
+    use import_lens_daemon::engine::{BundleEntry, BundleSelection};
     use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
     use import_lens_daemon::pipeline::resolver::resolve_package_entry;
     use std::fs;

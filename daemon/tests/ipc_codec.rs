@@ -9,6 +9,51 @@ use tokio_util::codec::Decoder;
 
 const OVERSIZED_FRAME_BYTES: usize = MAX_FRAME_BYTES + 1;
 
+/// serde_json is compiled with `arbitrary_precision` (forced globally by
+/// rolldown_common's hard dependency), which makes `Value` numbers serialize
+/// as private marker maps — NOT the msgpack integers a real client sends.
+/// Mirror `json!` payloads through plain serde types before encoding.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum WireValue {
+    Null(()),
+    Bool(bool),
+    UInt(u64),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Array(Vec<WireValue>),
+    Map(std::collections::BTreeMap<String, WireValue>),
+}
+
+impl From<&serde_json::Value> for WireValue {
+    fn from(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => WireValue::Null(()),
+            serde_json::Value::Bool(flag) => WireValue::Bool(*flag),
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .map(WireValue::UInt)
+                .or_else(|| number.as_i64().map(WireValue::Int))
+                .or_else(|| number.as_f64().map(WireValue::Float))
+                .expect("test payload numbers should be representable"),
+            serde_json::Value::String(text) => WireValue::Str(text.clone()),
+            serde_json::Value::Array(items) => {
+                WireValue::Array(items.iter().map(WireValue::from).collect())
+            }
+            serde_json::Value::Object(map) => WireValue::Map(
+                map.iter()
+                    .map(|(key, item)| (key.clone(), WireValue::from(item)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+fn msgpack(value: &serde_json::Value) -> Vec<u8> {
+    rmp_serde::to_vec(&WireValue::from(value)).expect("test payload should encode")
+}
+
 #[test]
 fn encode_frame_writes_big_endian_payload_length() {
     let frame = encode_frame(&ShutdownMessage {
@@ -86,14 +131,13 @@ fn length_delimited_codec_rejects_oversized_frames_before_payload() {
 
 #[test]
 fn import_request_defaults_missing_runtime_to_component() {
-    let payload = rmp_serde::to_vec(&serde_json::json!({
+    let payload = msgpack(&serde_json::json!({
         "specifier": "tiny-lib",
         "package": "tiny-lib",
         "version": "1.0.0",
         "named": ["value"],
         "import_kind": "named"
-    }))
-    .expect("legacy request should encode");
+    }));
 
     let request: ImportRequest =
         rmp_serde::from_slice(&payload).expect("legacy request should decode");
@@ -263,6 +307,5 @@ fn client_message_decodes_cache_management_requests() {
 }
 
 fn decode_client_message(value: serde_json::Value) -> ClientMessage {
-    let payload = rmp_serde::to_vec(&value).expect("message should encode");
-    rmp_serde::from_slice(&payload).expect("message should decode")
+    rmp_serde::from_slice(&msgpack(&value)).expect("message should decode")
 }

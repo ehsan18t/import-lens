@@ -6,7 +6,7 @@
 //! node scripts/prepare-candidate-fixtures.mjs
 //! # set IMPORT_LENS_FIXTURES_WORKSPACE to the directory it prints, then:
 //! cargo test -p import-lens-daemon --release --locked \
-//!     --features rolldown-candidate --test candidate_performance -- \
+//!     --test candidate_performance -- \
 //!     --ignored --nocapture
 //! ```
 //!
@@ -15,9 +15,8 @@
 //! the default dependency graph was verified unchanged when the dependency
 //! landed, so those §10.6 gates are governed by the existing release
 //! baselines until Part C wires the engine into the service.
-#![cfg(feature = "rolldown-candidate")]
 
-use import_lens_daemon::candidate::{
+use import_lens_daemon::engine::{
     BundleEntry, BundlePurpose, BundleRequest, ImportRuntime, RolldownEngine,
 };
 use std::env;
@@ -92,9 +91,9 @@ async fn bundle_once(entry: BundleEntry) -> usize {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "release-only candidate measurement; requires installed fixtures (scripts/prepare-candidate-fixtures.mjs)"]
 async fn cold_single_import_p95_stays_under_release_threshold() {
-    let workspace = common::candidate::fixtures_workspace();
+    let workspace = common::engine_fixtures::fixtures_workspace();
     let resolve =
-        || common::candidate::resolve_fixture_entry(&workspace, "css-tree", "3.2.1", "parse");
+        || common::engine_fixtures::resolve_fixture_entry(&workspace, "css-tree", "3.2.1", "parse");
 
     for _ in 0..5 {
         bundle_once(resolve()).await;
@@ -183,12 +182,13 @@ async fn twenty_import_batch_peak_rss_stays_under_release_threshold() {
         ("uuid", "14.0.1", "validate"),
     ];
 
-    let workspace = common::candidate::fixtures_workspace();
+    let workspace = common::engine_fixtures::fixtures_workspace();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
     let batch_start = Instant::now();
     let mut handles = Vec::with_capacity(BATCH.len());
     for (package, version, export) in BATCH {
-        let entry = common::candidate::resolve_fixture_entry(&workspace, package, version, export);
+        let entry =
+            common::engine_fixtures::resolve_fixture_entry(&workspace, package, version, export);
         let permits = Arc::clone(&semaphore);
         handles.push(tokio::spawn(async move {
             let _permit = permits.acquire().await.expect("semaphore should stay open");
