@@ -819,34 +819,10 @@ async fn matrix_33_single_module_size_limit() {
 }
 
 // Row 34: total-source limit — a DISTINCT branch from row 33 (the
-// MAX_GRAPH_SOURCE_BYTES accumulator, not the per-module cap; each fixture
-// stays under 20 MiB so only the total can trip). Ignored by default purely
-// for the >100 MiB fixture-write cost; it is the ONLY coverage of this
-// branch, so run it explicitly before the §10.7 gate verdict.
-#[tokio::test]
-#[ignore = "writes >100 MiB of fixtures; sole coverage of the total-source branch — run explicitly before the gate verdict"]
-async fn matrix_34_total_source_limit() {
-    let root = temp_workspace();
-    let chunk = format!("export const p = \"{}\";", "A".repeat(18 * 1024 * 1024));
-    let mut entry = String::new();
-    for index in 0..6 {
-        entry.push_str(&format!("import './m{index}.js';\n"));
-        write_source(&root, &format!("m{index}.js"), &chunk);
-    }
-    entry.push_str("export const x = 1;");
-    write_source(&root, "entry.js", &entry);
-
-    let failure = run(&root, "entry.js", named(&["x"]))
-        .await
-        .expect_err("total source limit should fail");
-
-    assert_eq!(failure.stage, "module_graph_limit", "{failure:?}");
-    assert!(
-        failure.message.contains("total source limit"),
-        "{failure:?}"
-    );
-    fs::remove_dir_all(root).expect("temp workspace should be removed");
-}
+// MAX_GRAPH_SOURCE_BYTES accumulator, not the per-module cap). It lives in
+// `graph_source_limit.rs` rather than here: it shrinks the ceiling through an
+// environment override, which is process-wide, so it needs a test binary of its
+// own. It runs by default there — no fixture over a megabyte, nothing ignored.
 
 // Row 35: a transitive dynamic import inlines into the single chunk —
 // the code-splitting knob works (§6.2/§7.1).

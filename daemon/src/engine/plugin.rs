@@ -311,10 +311,11 @@ impl Plugin for ImportLensPlugin {
             .total_source_bytes
             .fetch_add(source_bytes, Ordering::Relaxed)
             + source_bytes;
-        if total_bytes > MAX_GRAPH_SOURCE_BYTES {
+        let max_graph_source_bytes = *MAX_GRAPH_SOURCE_BYTES;
+        if total_bytes > max_graph_source_bytes {
             return Err(self
                 .breach(format!(
-                    "module graph exceeds the {MAX_GRAPH_SOURCE_BYTES} byte total source limit"
+                    "module graph exceeds the {max_graph_source_bytes} byte total source limit"
                 ))
                 .into());
         }

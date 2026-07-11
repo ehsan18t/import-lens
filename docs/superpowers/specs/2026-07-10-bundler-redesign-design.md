@@ -842,7 +842,9 @@ Instruments: `daemon/tests/candidate_matrix.rs` (48 rows), `daemon/tests/candida
 the compiler-stack automation suites landed at `b2da0f4`.
 
 Correctness (§10.4): all gates pass. 45 matrix rows green; row 34 (total-source limit — the
-only coverage of the `MAX_GRAPH_SOURCE_BYTES` accumulator) green when run explicitly; the
+only coverage of the `MAX_GRAPH_SOURCE_BYTES` accumulator) green when run explicitly. *(Row 34
+has since moved to `daemon/tests/graph_source_limit.rs`, where an environment override shrinks
+the ceiling so the branch runs by default; nothing about it is ignored any more.)* The
 real-package suite is 7/7 with `css-tree/parse` emitting **zero** dangling `__il_` bindings
 (the four §2.2 danglers reach zero and `date-fns` stays at zero), `date-fns/format` loading
 304 paths while rendering 36 (tree-shaken freshness gate), and CJS `lodash/debounce` working
