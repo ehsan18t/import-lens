@@ -6,11 +6,12 @@ use super::{
 use crate::ipc::protocol::{DetectedImport, ImportKind, ImportSyntax};
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
+use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::Span;
 use oxc_syntax::module_record::{
     ExportEntry, ExportImportName, ImportEntry, ImportImportName, ModuleRecord as OxcModuleRecord,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn analyze_imports(filename: &str, source: &str) -> Result<Vec<DetectedImport>, String> {
     let mut imports = Vec::new();
@@ -51,12 +52,31 @@ fn imports_from_region(
         ));
     }
 
+    // TypeScript erases a binding used only in type positions, so it costs nothing at
+    // runtime and must not be sized as a runtime import (see `type_only_binding_spans`).
+    // Only build a `Semantic` when there is something it could possibly elide: this
+    // runs per script region on every document analysis, including the workspace
+    // report's sweep over every file.
+    let type_only_spans = if source_type.is_typescript()
+        && parsed
+            .module_record
+            .import_entries
+            .iter()
+            .any(|entry| !entry.is_type)
+    {
+        let semantic = SemanticBuilder::new().build(&parsed.program).semantic;
+        type_only_binding_spans(&semantic)
+    } else {
+        HashSet::new()
+    };
+
     let mut imports = Vec::new();
     imports.extend(imports_from_static_imports(
         document_source,
         line_index,
         region,
         &parsed.module_record,
+        &type_only_spans,
     ));
     imports.extend(imports_from_static_exports(
         document_source,
@@ -84,14 +104,57 @@ struct ImportGroup {
     named: Vec<String>,
 }
 
+/// Local binding spans of imports TypeScript will erase: those referenced *only* in
+/// type positions. `import type` / `{ type X }` are already marked `is_type` by the
+/// parser; this catches the legacy-elision form that omits the keyword, which is
+/// ordinary valid TypeScript:
+///
+/// ```ts
+/// import { ParseOptions } from "commander";   // erased — costs nothing at runtime
+/// const options: ParseOptions = {};
+/// ```
+///
+/// Sending that to the bundler as a runtime named import makes it correctly report a
+/// missing runtime export, which the analyzer turns into a hard zero-size error on
+/// code that compiles and runs.
+///
+/// A binding with NO references is deliberately NOT elided: under
+/// `verbatimModuleSyntax` / `isolatedModules` TypeScript preserves an unused value
+/// import, and it has real runtime cost. Eliding it would silently under-count, which
+/// is a worse failure than the one being fixed.
+fn type_only_binding_spans(semantic: &Semantic<'_>) -> HashSet<Span> {
+    let scoping = semantic.scoping();
+    scoping
+        .symbol_ids()
+        .filter(|symbol_id| {
+            let mut references = scoping.get_resolved_references(*symbol_id).peekable();
+            references.peek().is_some()
+                && references.all(|reference| {
+                    // OXC's own predicate for "TypeScript will delete this binding"
+                    // (`Scoping::delete_typescript_bindings`).
+                    let flags = reference.flags();
+                    (flags.is_type() && !flags.is_value()) || flags.is_value_as_type()
+                })
+        })
+        .map(|symbol_id| scoping.symbol_span(symbol_id))
+        .collect()
+}
+
 fn imports_from_static_imports(
     document_source: &str,
     line_index: &LineIndex,
     region: &ScriptRegion<'_>,
     module_record: &OxcModuleRecord<'_>,
+    type_only_spans: &HashSet<Span>,
 ) -> Vec<DetectedImport> {
     let mut groups = Vec::<ImportGroup>::new();
     let mut binding_imports = HashMap::<(String, u32, u32), usize>::new();
+    // Statements whose every binding was type-erased. The `requested_modules` loop
+    // below adds a NAMESPACE group for any statement it has not seen a binding for —
+    // that is how a bare `import "pkg"` is detected — so without this an elided
+    // statement would come back as a namespace import of the whole package, turning a
+    // zero-cost type import into the package's entire weight.
+    let mut elided_statements = HashSet::<(String, u32, u32)>::new();
 
     for entry in module_record
         .import_entries
@@ -108,6 +171,11 @@ fn imports_from_static_imports(
             entry.statement_span.start,
             entry.statement_span.end,
         );
+
+        if type_only_spans.contains(&entry.local_name.span) {
+            elided_statements.insert(key);
+            continue;
+        }
         let index = match binding_imports.get(&key) {
             Some(index) => *index,
             None => {
@@ -143,7 +211,10 @@ fn imports_from_static_imports(
                 request.statement_span.start,
                 request.statement_span.end,
             );
-            if binding_imports.contains_key(&key) {
+            // A statement with at least one surviving binding is already in
+            // `binding_imports`; one whose bindings were ALL type-erased is in
+            // `elided_statements`. Either way it must not become a namespace group.
+            if binding_imports.contains_key(&key) || elided_statements.contains(&key) {
                 continue;
             }
 

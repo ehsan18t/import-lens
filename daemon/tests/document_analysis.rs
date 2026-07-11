@@ -240,3 +240,128 @@ fn builtin_subpath_specifiers_are_not_runtime_packages() {
         "fs-extra"
     ));
 }
+
+// A TypeScript import whose binding is used only in a type position is erased by the
+// compiler, so it costs nothing at runtime. Sending it to the bundler as a runtime
+// named import makes the bundler correctly report a missing runtime export, which the
+// analyzer turns into a hard zero-size error on code that compiles and runs (spec W4).
+//
+// The three tests below pin the fix from both sides: it must elide the type-only
+// binding, and it must NOT elide anything else.
+
+#[test]
+fn type_position_only_named_import_is_elided_and_does_not_return_as_a_namespace() {
+    let source = r#"
+import { ParseOptions } from "commander";
+import { program } from "commander";
+const options: ParseOptions = {};
+program.parse();
+"#;
+
+    let imports = analyze_imports("sample.ts", source).expect("imports should parse");
+
+    assert!(
+        !imports
+            .iter()
+            .any(|item| item.named.iter().any(|name| name == "ParseOptions")),
+        "a type-position-only binding must not be sized as a runtime import: {imports:?}"
+    );
+
+    // The elided STATEMENT must be gone entirely. If it survives, the
+    // `requested_modules` pass re-adds it as a namespace import of the whole package —
+    // turning a zero-cost type import into commander's entire weight, which is worse
+    // than the bug being fixed. A namespace group carries no `named`, so asserting on
+    // `named` alone would pass while that shipped.
+    assert_eq!(
+        imports
+            .iter()
+            .filter(|item| item.specifier == "commander")
+            .count(),
+        1,
+        "the elided statement must not reappear as a second (namespace) import: {imports:?}"
+    );
+
+    let survivor = imports
+        .iter()
+        .find(|item| item.specifier == "commander")
+        .expect("the value import should survive");
+    assert_eq!(survivor.import_kind, ImportKind::Named);
+    assert_eq!(survivor.named, vec!["program".to_owned()]);
+}
+
+#[test]
+fn a_binding_used_as_both_type_and_value_is_not_elided() {
+    // A class is a type AND a value. Eliding it would silently under-count.
+    let source = r#"
+import { Thing } from "pkg-a";
+const t: Thing = new Thing();
+"#;
+
+    let imports = analyze_imports("sample.ts", source).expect("imports should parse");
+    let named: Vec<&str> = imports
+        .iter()
+        .flat_map(|item| item.named.iter().map(String::as_str))
+        .collect();
+
+    assert!(
+        named.contains(&"Thing"),
+        "a binding referenced as a value must never be elided: {imports:?}"
+    );
+}
+
+#[test]
+fn an_unused_import_is_still_a_runtime_import() {
+    // Under verbatimModuleSyntax / isolatedModules TypeScript PRESERVES an unused
+    // value import, and it has real runtime cost. Eliding it would under-count.
+    let source = r#"
+import { unused } from "pkg-b";
+export const x = 1;
+"#;
+
+    let imports = analyze_imports("sample.ts", source).expect("imports should parse");
+    let named: Vec<&str> = imports
+        .iter()
+        .flat_map(|item| item.named.iter().map(String::as_str))
+        .collect();
+
+    assert!(
+        named.contains(&"unused"),
+        "an unused VALUE import must not be elided: {imports:?}"
+    );
+}
+
+#[test]
+fn a_bare_side_effect_import_still_produces_a_group() {
+    // The `requested_modules` pass that would resurrect an elided statement is the
+    // same one that legitimately detects `import "pkg"`. Suppressing elided statements
+    // must not suppress these.
+    let imports = analyze_imports("sample.ts", r#"import "pkg-c";"#).expect("imports should parse");
+
+    assert_eq!(
+        imports.len(),
+        1,
+        "a bare side-effect import must still be detected: {imports:?}"
+    );
+    assert_eq!(imports[0].specifier, "pkg-c");
+}
+
+#[test]
+fn javascript_never_elides_imports() {
+    // A .js file has no type positions. Eliding there would be a straight under-count,
+    // so the semantic pass must not even run.
+    let source = r#"
+import { thing } from "pkg-d";
+export const x = 1;
+"#;
+
+    let imports = analyze_imports("sample.js", source).expect("imports should parse");
+    let named: Vec<&str> = imports
+        .iter()
+        .flat_map(|item| item.named.iter().map(String::as_str))
+        .collect();
+
+    assert!(
+        named.contains(&"thing"),
+        "a JavaScript import must never be elided: {imports:?}"
+    );
+}
