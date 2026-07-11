@@ -24,6 +24,7 @@ pub const ENGINE_PERMITS: usize = 2;
 static PERMITS: Semaphore = Semaphore::const_new(ENGINE_PERMITS);
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PEAK_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static STARTED: AtomicUsize = AtomicUsize::new(0);
 // Borrowing a static keeps the engine futures 'static for Runtime::spawn.
 static ENGINE: RolldownEngine = RolldownEngine;
 
@@ -47,6 +48,7 @@ async fn with_permit<T>(work: impl Future<Output = T>) -> T {
         .acquire()
         .await
         .expect("engine permit semaphore is never closed");
+    STARTED.fetch_add(1, Ordering::Relaxed);
     let current = IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
     PEAK_IN_FLIGHT.fetch_max(current, Ordering::Relaxed);
     let output = work.await;
@@ -88,4 +90,12 @@ pub fn enumerate_exports_sync(
 /// integration test asserts this never exceeds the permit count.
 pub fn peak_in_flight() -> usize {
     PEAK_IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+/// Total engine builds admitted through the permit pool since start. A build is
+/// the single most expensive thing the daemon does, so the count is the honest
+/// unit for "did that change actually stop doing work" — it is what the
+/// full-package memo's regression test measures.
+pub fn builds_started() -> usize {
+    STARTED.load(Ordering::Relaxed)
 }

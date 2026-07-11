@@ -7,6 +7,7 @@ use crate::{
     pipeline::{
         compress::compress_all,
         fallback::{approximate_directory_size, estimate_minified_source, source_excerpt_detail},
+        full_package,
         minify::minify_source,
         resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
         types_only::declaration_only_package_result,
@@ -98,6 +99,26 @@ fn first_party_manifests(context: &AnalysisContext, loaded_paths: &[PathBuf]) ->
     }
 
     manifests
+}
+
+/// Everything the full-package memo must expire against: the read-time fingerprints
+/// of every module the comparison build measured, plus the manifests that decide what
+/// it resolved. Mirrors the freshness set the import cache stores for the entry build
+/// itself — if the two ever diverge, the memo would outlive the size it describes.
+fn full_package_fingerprints(
+    context: &AnalysisContext,
+    package_root: &Path,
+    full: &crate::engine::BundleArtifact,
+) -> Vec<crate::cache::key::FileFingerprint> {
+    use crate::cache::key::file_fingerprint_reading_hash;
+
+    let mut fingerprints = full.read_time_fingerprints.clone();
+    fingerprints.extend(
+        std::iter::once(package_root.join("package.json"))
+            .chain(first_party_manifests(context, &full.loaded_paths))
+            .filter_map(file_fingerprint_reading_hash),
+    );
+    fingerprints
 }
 
 /// Freshness inputs for a successful engine build (§8.3).
@@ -308,35 +329,61 @@ pub(crate) fn analyze_with_rolldown_engine(
     // Full-package comparison (§8.4/§6.3): a second engine build measures the
     // complete surface; failure degrades to "not treeshakeable", never an
     // analysis error.
+    //
+    // The answer does not depend on *which* names were imported, but the import
+    // cache key does — so without the memo, N named variants of one entry cost N
+    // of these builds on top of their own. `full_package::lookup` re-checks the
+    // fingerprints of the exact bytes the stored length was measured from, so it
+    // expires precisely when the length it holds would have gone wrong.
     let mut truly_treeshakeable = false;
     if !side_effects
         && matches!(request.import_kind, ImportKind::Named)
         && !request.named.is_empty()
     {
-        match boundary::bundle_sync(BundleRequest {
-            entries: vec![bundle_entry(BundleSelection::Full)],
-            runtime: request.runtime,
-            purpose: BundlePurpose::FullPackageComparison,
-        }) {
-            Ok(full) => {
-                if let Ok(full_minified) = minify_source(&full.code, false) {
+        let memoized = full_package::lookup(entry_path, request.runtime);
+        let full_len = match memoized {
+            Some(full_len) => Some(full_len),
+            None => match boundary::bundle_sync(BundleRequest {
+                entries: vec![bundle_entry(BundleSelection::Full)],
+                runtime: request.runtime,
+                purpose: BundlePurpose::FullPackageComparison,
+            }) {
+                Ok(full) => minify_source(&full.code, false).ok().map(|full_minified| {
                     let full_len = full_minified.len() as u64;
-                    if full_len > 0 {
-                        // Mirror the legacy predicate: within 5% of the full
-                        // size is not truly tree-shakeable.
-                        let ratio = (minified.len() as f64) / (full_len as f64);
-                        truly_treeshakeable = ratio <= 0.95;
+                    // A graph carrying a module the plugin could not fingerprint as it
+                    // read it (a binary module) has no complete read-time record, so
+                    // there is nothing to expire the memo against: measure, use, discard.
+                    if full.unhashed_paths.is_empty() {
+                        full_package::store(
+                            entry_path,
+                            request.runtime,
+                            full_len,
+                            full_package_fingerprints(context, package_root, &full),
+                        );
                     }
+                    full_len
+                }),
+                Err(failure) => {
+                    diagnostics.push(ImportDiagnostic {
+                        stage: "full_package_comparison".to_owned(),
+                        message: format!(
+                            "full-package comparison build failed; treating as not tree-shakeable: {}",
+                            failure.message
+                        ),
+                        details: Vec::new(),
+                    });
+                    None
                 }
-            }
-            Err(failure) => diagnostics.push(ImportDiagnostic {
-                stage: "full_package_comparison".to_owned(),
-                message: format!(
-                    "full-package comparison build failed; treating as not tree-shakeable: {}",
-                    failure.message
-                ),
-                details: Vec::new(),
-            }),
+            },
+        };
+
+        if let Some(full_len) = full_len
+            && full_len > 0
+        {
+            // Mirror the legacy predicate: within 5% of the full size is not
+            // truly tree-shakeable.
+            let ratio = (minified.len() as f64) / (full_len as f64);
+            truly_treeshakeable = ratio <= 0.95;
         }
     }
 

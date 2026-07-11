@@ -3,6 +3,7 @@ pub mod compress;
 mod fallback;
 pub mod file_size;
 pub mod file_size_cache;
+mod full_package;
 pub mod minify;
 pub mod node_builtins;
 pub mod resolver;
