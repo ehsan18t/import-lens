@@ -428,9 +428,16 @@ fn engine_error(
     )
 }
 
+/// §12 requires each failure to surface under the stage it happened at — `parse`,
+/// `resolve`, `link`, `generate`, `output_shape`, `module_graph_limit`, or the OXC
+/// stage for a validation/minification failure. Overwriting every one of them with a
+/// single `engine_fallback` label collapsed the whole failure table into one bucket
+/// and left the real stage recoverable only by reading the message. The fallback is
+/// expressed by the message and the lowered confidence, not by erasing where the
+/// failure occurred.
 fn engine_fallback_diagnostic(error: AnalysisError) -> ImportDiagnostic {
     ImportDiagnostic {
-        stage: "engine_fallback".to_owned(),
+        stage: error.stage.to_owned(),
         message: format!(
             "Rolldown engine analysis failed; using static entry sizing: {}",
             error.message
@@ -610,8 +617,13 @@ fn engine_confidence(
 
     let mut reasons = Vec::new();
     if side_effects {
+        // The engine builds the same named-selection entry whether or not the package
+        // declares side effects; what changes is that an effectful package cannot be
+        // certified as fully tree-shakeable. The old text described the deleted
+        // engine, which really did switch to full-graph sizing here.
         reasons.push(
-            "Package side effects require full-graph sizing instead of named-export tree shaking."
+            "Package declares side effects, so modules it retains cannot be certified as \
+             tree-shaken away."
                 .to_owned(),
         );
     }
@@ -631,6 +643,18 @@ fn engine_confidence(
 
     if reasons.is_empty() {
         reasons.push("Engine pipeline completed with conservative assumptions.".to_owned());
+    }
+
+    // A glob `sideEffects` package on Windows is not merely imprecise: the bundler
+    // cannot match the globs there, so effectful modules are over-shaken and the size
+    // is undercounted by an amount we cannot bound. That is a weaker claim than the
+    // Medium the rest of this path reports.
+    if cfg!(windows)
+        && diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "side_effects")
+    {
+        return (ConfidenceLevel::Low, reasons);
     }
 
     (ConfidenceLevel::Medium, reasons)

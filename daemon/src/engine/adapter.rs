@@ -191,14 +191,25 @@ fn translate(
         .iter()
         .any(|entry| entry.reported_side_effects.is_array())
     {
-        // §7.4: matched side-effect paths would need Rolldown to expose its
-        // retention decisions, which its public output does not. Reporting
-        // stays conservative rather than re-implementing a matcher.
+        // §7.4: matched side-effect paths would need Rolldown to expose its retention
+        // decisions, which its public output does not. Reporting stays conservative
+        // rather than re-implementing a matcher.
+        //
+        // On Windows the bundler's own glob matching does not fire at all (it compares
+        // backslashed relative paths), so glob-declared effectful modules are
+        // over-shaken and the reported size is too SMALL. Saying only that "confidence
+        // is conservative" reads as an over-estimate — the opposite of the truth — so
+        // name the direction of the error on the platform where it happens.
+        let message = if cfg!(windows) {
+            "package sideEffects globs present; on Windows the bundler cannot match them, \
+             so effectful modules may be tree-shaken away and this size may be UNDERCOUNTED"
+        } else {
+            "package sideEffects globs present; matched paths are unavailable from public \
+             bundler metadata, so side-effect confidence is conservative"
+        };
         diagnostics.push(ImportDiagnostic {
             stage: "side_effects".to_owned(),
-            message: "package sideEffects globs present; matched paths are unavailable from \
-                      public bundler metadata, so side-effect confidence is conservative"
-                .to_owned(),
+            message: message.to_owned(),
         });
     }
 

@@ -643,7 +643,7 @@ fn analyze_versionless_package_json_returns_approximate_directory_size() {
 }
 
 #[test]
-fn analyze_namespace_import_reports_engine_fallback_diagnostic() {
+fn analyze_namespace_import_preserves_the_engine_failure_stage() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -674,7 +674,7 @@ fn analyze_namespace_import_reports_engine_fallback_diagnostic() {
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "engine_fallback"
+            .any(|diagnostic| diagnostic.stage == "parse"
                 && diagnostic.message.contains("static entry")),
         "{result:?}",
     );
@@ -713,7 +713,7 @@ fn analyze_named_import_falls_back_to_static_entry_after_engine_failure() {
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "engine_fallback"
+            .any(|diagnostic| diagnostic.stage == "parse"
                 && diagnostic.message.contains("static entry")),
         "{result:?}",
     );
@@ -756,7 +756,7 @@ fn analyze_invalid_semantic_module_falls_back_at_minify_boundary() {
     assert!(!result.truly_treeshakeable);
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "engine_fallback" && diagnostic.message.contains("static entry")
+            diagnostic.stage == "parse" && diagnostic.message.contains("static entry")
         }),
         "{result:?}",
     );
@@ -1955,5 +1955,95 @@ fn analyze_import_analyzes_typescript_scale_entries() {
             .iter()
             .any(|diagnostic| diagnostic.stage == "oversized_entry"),
         "{result:?}",
+    );
+}
+
+/// §12's failure table requires each failure to surface under the stage it happened
+/// at. Collapsing every fallback-eligible failure into one `engine_fallback` label
+/// erased the distinction between a parse error, a resolve error, a graph-limit
+/// breach and an OXC validation failure, leaving the real stage recoverable only by
+/// reading the message. This guard fails if that label is reintroduced.
+#[test]
+fn a_fallback_diagnostic_never_collapses_the_failure_stage() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "stage-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "export const value = ;\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "stage-lib",
+            "stage-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["value"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "engine_fallback"),
+        "the failure stage must be preserved, not replaced with a generic label: {result:?}"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "parse"),
+        "a source syntax error must surface under the `parse` stage: {result:?}"
+    );
+}
+
+/// §7.4 names the string form of `sideEffects` as a first-class case. Landing it in
+/// `Unknown` forced the package unconditionally side-effectful and suppressed the
+/// conservative glob diagnostic, while the size suffered the identical undercount an
+/// array form does.
+#[test]
+fn string_form_side_effects_is_treated_as_a_one_pattern_glob() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "string-effects-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":"./effects.js"}"#,
+        "export const used = 1;\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "string-effects-lib",
+            "string-effects-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["used"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(result.error, None, "{result:?}");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "side_effects"),
+        "a string `sideEffects` must raise the same conservative glob diagnostic an \
+         array does; landing in `Unknown` suppressed it entirely: {result:?}"
     );
 }

@@ -683,6 +683,14 @@ fn side_effects_mode(package_json: &Value, entry_path: &Path) -> SideEffectsMode
         Some(Value::Bool(false)) => SideEffectsMode::False,
         Some(Value::Bool(true)) => SideEffectsMode::True,
         Some(Value::Array(patterns)) => side_effects_array_mode(patterns, entry_path),
+        // A string is a single glob and is a first-class form in the spec (§7.4), not
+        // an invalid value. Landing it in `Unknown` forced the package
+        // unconditionally side-effectful and, worse, suppressed the conservative glob
+        // diagnostic — while the size suffered the identical undercount an array form
+        // does.
+        Some(pattern @ Value::String(_)) => {
+            side_effects_array_mode(std::slice::from_ref(pattern), entry_path)
+        }
         Some(_) => SideEffectsMode::Unknown,
         None => SideEffectsMode::Missing,
     }

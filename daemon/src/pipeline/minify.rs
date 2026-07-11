@@ -20,7 +20,10 @@ pub fn minify_source(source: &str, is_cjs: bool) -> Result<String, String> {
             parsed
                 .diagnostics
                 .errors()
-                .map(|error| format!("{error:?}"))
+                // §5.1: this string reaches the user. `Display` is the dependency's
+                // stable message; `Debug` leaks its internal representation and
+                // changes shape on any compiler-stack bump.
+                .map(|error| error.to_string())
                 .collect::<Vec<_>>()
                 .join("; ")
         ));
@@ -34,7 +37,7 @@ pub fn minify_source(source: &str, is_cjs: bool) -> Result<String, String> {
             semantic
                 .diagnostics
                 .errors()
-                .map(|error| format!("{error:?}"))
+                .map(|error| error.to_string())
                 .collect::<Vec<_>>()
                 .join("; ")
         ));

@@ -46,7 +46,7 @@ fn imports_from_region(
             parsed
                 .diagnostics
                 .errors()
-                .map(|error| format!("{error:?}"))
+                .map(|error| error.to_string())
                 .collect::<Vec<_>>()
                 .join("; ")
         ));
