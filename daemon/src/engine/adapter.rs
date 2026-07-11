@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use rolldown::plugin::Pluginable;
 use rolldown::{
-    Bundler, BundlerOptions, CodeSplittingMode, InputItem, IsExternal, OutputFormat, Platform,
-    PreserveEntrySignatures, RawMinifyOptions, ResolveOptions,
+    AttachDebugInfo, Bundler, BundlerOptions, CodeSplittingMode, ExperimentalOptions, InputItem,
+    IsExternal, OutputFormat, Platform, PreserveEntrySignatures, RawMinifyOptions, ResolveOptions,
 };
 use rolldown_common::{Output, OutputChunk};
 use rolldown_error::{BuildDiagnostic, EventKind};
@@ -109,6 +109,16 @@ fn build_options(input: InputItem, cwd: PathBuf, runtime: ImportRuntime) -> Bund
         // `Neutral` appends nothing, leaving the per-runtime condition list from the
         // shared resolver authoritative (§7.1).
         platform: Some(Platform::Neutral),
+        // Rolldown normalizes an UNSET attach_debug_info to `Simple`, which wraps
+        // every rendered module in `//#region <id>` / `//#endregion` comments. Those
+        // bytes land in `raw_bytes`, and `RenderedModule::rendered_length` sums every
+        // source in a module's vec — the wrappers included — so they are also charged
+        // inside the per-module contributions. Bundler metadata billed to the user as
+        // package cost (§8.1/§8.2).
+        experimental: Some(ExperimentalOptions {
+            attach_debug_info: Some(AttachDebugInfo::None),
+            ..ExperimentalOptions::default()
+        }),
         resolve: Some(mapped_resolve_options(runtime)),
         ..BundlerOptions::default()
     }
@@ -195,21 +205,18 @@ fn translate(
         // decisions, which its public output does not. Reporting stays conservative
         // rather than re-implementing a matcher.
         //
-        // On Windows the bundler's own glob matching does not fire at all (it compares
-        // backslashed relative paths), so glob-declared effectful modules are
-        // over-shaken and the reported size is too SMALL. Saying only that "confidence
-        // is conservative" reads as an over-estimate — the opposite of the truth — so
-        // name the direction of the error on the platform where it happens.
-        let message = if cfg!(windows) {
-            "package sideEffects globs present; on Windows the bundler cannot match them, \
-             so effectful modules may be tree-shaken away and this size may be UNDERCOUNTED"
-        } else {
-            "package sideEffects globs present; matched paths are unavailable from public \
-             bundler metadata, so side-effect confidence is conservative"
-        };
+        // Deliberately does NOT claim the size is undercounted on Windows. That claim
+        // came from matrix rows 42/43, whose `#[ignore]` blames "backslashed relative
+        // paths" — but Rolldown matches through `fast_glob`, which uses
+        // `std::path::is_separator` and accepts `\` for a pattern's `/` on Windows, and
+        // those fixtures' pattern (`fx.js`, at the package root) contains no separator
+        // at all. The rows fail for an unrelated reason. Do not assert a direction of
+        // error that has not been reproduced.
         diagnostics.push(ImportDiagnostic {
             stage: "side_effects".to_owned(),
-            message: message.to_owned(),
+            message: "package sideEffects globs present; matched paths are unavailable from \
+                      public bundler metadata, so side-effect confidence is conservative"
+                .to_owned(),
         });
     }
 

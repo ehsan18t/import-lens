@@ -24,7 +24,7 @@ use rolldown_common::{ModuleInfo, NormalModule};
 use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
 use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
 use crate::cache::key::{
-    FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime,
+    FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
 };
 
 /// Per-build state shared with the adapter, which reads it after the bundler
@@ -83,15 +83,23 @@ impl BuildState {
     /// mid-build) falls back to the resolver's form, matching the previous
     /// behavior.
     fn canonical_path(&self, path: &Path) -> PathBuf {
-        let mut memo = self
+        if let Some(canonical) = self
             .canonical
             .lock()
-            .expect("canonical-path memo should not be poisoned");
-        if let Some(canonical) = memo.get(path) {
+            .expect("canonical-path memo should not be poisoned")
+            .get(path)
+        {
             return canonical.clone();
         }
+
+        // Never hold the lock across the syscall: `canonicalize` opens a file handle on
+        // Windows, and these hooks run concurrently across modules, so holding it would
+        // serialize every module's canonicalization behind one mutex.
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        memo.insert(path.to_path_buf(), canonical.clone());
+        self.canonical
+            .lock()
+            .expect("canonical-path memo should not be poisoned")
+            .insert(path.to_path_buf(), canonical.clone());
         canonical
     }
 
@@ -234,6 +242,13 @@ impl Plugin for ImportLensPlugin {
                 .into());
         }
 
+        // Capture len+mtime from the stat taken BEFORE the read. Stat-after-read would
+        // pair the post-edit metadata with a hash of the pre-edit bytes, and the
+        // freshness fast path matches on len+mtime alone — so a file rewritten during
+        // the read would probe Fresh forever against bytes it was never measured from,
+        // which is the very failure this hook exists to prevent.
+        let (len, modified_millis) = read_time_len_mtime_of(&metadata);
+
         let Ok(bytes) = tokio::fs::read(path).await else {
             return Ok(None);
         };
@@ -243,7 +258,6 @@ impl Plugin for ImportLensPlugin {
             return Ok(None);
         };
 
-        let (len, modified_millis) = read_time_len_mtime(path);
         let canonical = self.state.canonical_path(path);
         self.state
             .read_time

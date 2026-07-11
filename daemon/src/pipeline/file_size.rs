@@ -167,12 +167,35 @@ pub fn compute_file_size(
 
         let minified = match minify_source(&artifact.code, false) {
             Ok(minified) => minified,
-            Err(error) => return error_computation("minify", error, diagnostics),
+            Err(error) => {
+                // Degrade only this runtime, exactly as a build failure does. Returning
+                // here would discard every other group's real totals and report zero
+                // for the whole file.
+                diagnostics.push(diagnostic(
+                    "minify",
+                    error,
+                    vec![
+                        "minification failed for this runtime; its totals are conservative \
+                         per-import sums without shared-module deduplication"
+                            .to_owned(),
+                    ],
+                ));
+                let fallback =
+                    per_import_totals(context, &group.resolved_requests, &mut diagnostics);
+                if fallback.sized_any {
+                    any_sized = true;
+                    totals.raw_bytes += fallback.raw_bytes;
+                    totals.minified_bytes += fallback.minified_bytes;
+                    totals.gzip_bytes += fallback.gzip_bytes;
+                    totals.brotli_bytes += fallback.brotli_bytes;
+                    totals.zstd_bytes += fallback.zstd_bytes;
+                }
+                continue;
+            }
         };
 
         any_sized = true;
         totals.raw_bytes += artifact.code.len() as u64;
-        totals.minified_bytes += minified.len() as u64;
         minified_parts.push(minified);
     }
 
@@ -190,6 +213,10 @@ pub fn compute_file_size(
             Ok(compressed) => compressed,
             Err(error) => return error_computation("compression", error.to_string(), diagnostics),
         };
+        // Measure `minified_bytes` on the same string the compressors saw, so the two
+        // numbers describe the same bytes (the join adds one separator per extra
+        // group).
+        totals.minified_bytes += minified.len() as u64;
         totals.gzip_bytes += compressed.gzip_bytes;
         totals.brotli_bytes += compressed.brotli_bytes;
         totals.zstd_bytes += compressed.zstd_bytes;

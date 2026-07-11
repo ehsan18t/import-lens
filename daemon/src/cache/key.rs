@@ -421,9 +421,21 @@ pub fn file_fingerprint_reading_hash(path: impl AsRef<Path>) -> Option<FileFinge
 /// hash still decides).
 pub fn read_time_len_mtime(path: impl AsRef<Path>) -> (u64, u64) {
     match fs::metadata(path.as_ref()) {
-        Ok(metadata) => (metadata.len(), modified_millis(&metadata)),
+        Ok(metadata) => read_time_len_mtime_of(&metadata),
         Err(_) => (0, 0),
     }
+}
+
+/// Same, from a stat the caller already took.
+///
+/// The stat MUST be the one taken *before* the bytes were read. Stat-after-read
+/// records the post-edit len+mtime against a hash of the pre-edit bytes, and
+/// `check_fingerprint` short-circuits to `Fresh` on a len+mtime match without
+/// hashing — so a file rewritten during the read would be served from the bytes
+/// that were replaced, forever. Stat-before-read fails safe: a mismatch merely
+/// falls through to the hash comparison, which is correct in both directions.
+pub fn read_time_len_mtime_of(metadata: &std::fs::Metadata) -> (u64, u64) {
+    (metadata.len(), modified_millis(metadata))
 }
 
 /// Build a fingerprint from values captured at analysis read-time (len+mtime from

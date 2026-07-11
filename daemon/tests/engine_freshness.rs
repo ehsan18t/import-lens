@@ -143,3 +143,35 @@ fn a_typescript_dependency_is_hashed_from_raw_disk_bytes_not_transformed_source(
         "the recorded length must be the on-disk length"
     );
 }
+
+/// Rolldown normalizes an unset `attach_debug_info` to `Simple`, which wraps every
+/// rendered module in `//#region <id>` / `//#endregion` comments. Those bytes land in
+/// `raw_bytes`, and `RenderedModule::rendered_length` sums every source in a module's
+/// vec — the wrappers included — so they are charged inside the per-module
+/// contributions too. That is bundler metadata billed to the user as package cost, on
+/// every build. This guard fails if debug attachment is ever re-enabled.
+#[test]
+fn a_production_chunk_carries_no_bundler_debug_metadata() {
+    let root = common::temp_workspace("import-lens-no-debug-info");
+    write_source(
+        &root,
+        "node_modules/pkg/package.json",
+        r#"{"name":"pkg","version":"1.0.0","module":"./index.js","sideEffects":false}"#,
+    );
+    write_source(
+        &root,
+        "node_modules/pkg/index.js",
+        "export { used } from \"./dep.js\";\n",
+    );
+    write_source(&root, "node_modules/pkg/dep.js", "export const used = 1;\n");
+
+    let package_root = root.join("node_modules/pkg");
+    let artifact = bundle(package_root.join("index.js"), package_root);
+
+    assert!(
+        !artifact.code.contains("//#region") && !artifact.code.contains("//#endregion"),
+        "the chunk must not contain Rolldown debug region comments; they are counted in \
+         raw_bytes and in module contributions as if they were package code:\n{}",
+        artifact.code
+    );
+}

@@ -61,6 +61,12 @@ pub fn analyze_resolved_import(
 fn first_party_manifests(context: &AnalysisContext, loaded_paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut manifests = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // Loaded paths are canonicalized (verbatim `\\?\C:\...` on Windows) while the
+    // workspace root arrives off the wire as the editor spelled it, so the two never
+    // compare equal unless the root is canonicalized too — and the walk below would
+    // not actually stop where this says it does.
+    let workspace_root = fs::canonicalize(&context.workspace_root)
+        .unwrap_or_else(|_| context.workspace_root.clone());
 
     for path in loaded_paths {
         if path
@@ -84,7 +90,7 @@ fn first_party_manifests(context: &AnalysisContext, loaded_paths: &[PathBuf]) ->
                 manifests.push(manifest);
                 break;
             }
-            if current == context.workspace_root {
+            if current == workspace_root {
                 break;
             }
             directory = current.parent();
@@ -643,18 +649,6 @@ fn engine_confidence(
 
     if reasons.is_empty() {
         reasons.push("Engine pipeline completed with conservative assumptions.".to_owned());
-    }
-
-    // A glob `sideEffects` package on Windows is not merely imprecise: the bundler
-    // cannot match the globs there, so effectful modules are over-shaken and the size
-    // is undercounted by an amount we cannot bound. That is a weaker claim than the
-    // Medium the rest of this path reports.
-    if cfg!(windows)
-        && diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "side_effects")
-    {
-        return (ConfidenceLevel::Low, reasons);
     }
 
     (ConfidenceLevel::Medium, reasons)
