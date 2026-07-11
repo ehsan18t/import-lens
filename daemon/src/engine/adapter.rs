@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use rolldown::plugin::Pluginable;
 use rolldown::{
-    Bundler, BundlerOptions, CodeSplittingMode, InputItem, IsExternal, OutputFormat,
+    Bundler, BundlerOptions, CodeSplittingMode, InputItem, IsExternal, OutputFormat, Platform,
     PreserveEntrySignatures, RawMinifyOptions, ResolveOptions,
 };
 use rolldown_common::{Output, OutputChunk};
@@ -100,6 +100,15 @@ fn build_options(input: InputItem, cwd: PathBuf, runtime: ImportRuntime) -> Bund
         // None is NOT off in 1.1.5 — it normalizes to dead-code-elimination
         // minification. The raw chunk must stay byte-faithful (§8.1).
         minify: Some(RawMinifyOptions::Bool(false)),
+        // An UNSET platform is derived from the format, and `Esm` derives
+        // `Platform::Browser` — which makes Rolldown append `browser` to the
+        // condition list on top of ours (rolldown_resolver::ResolverConfig::build)
+        // and inject a `process.env.NODE_ENV` define. Both corrupt measurement: the
+        // Server runtime would resolve a package's `browser` export condition, and
+        // the define would dead-code-eliminate branches the runtime keeps.
+        // `Neutral` appends nothing, leaving the per-runtime condition list from the
+        // shared resolver authoritative (§7.1).
+        platform: Some(Platform::Neutral),
         resolve: Some(mapped_resolve_options(runtime)),
         ..BundlerOptions::default()
     }
