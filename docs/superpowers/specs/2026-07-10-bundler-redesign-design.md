@@ -876,13 +876,28 @@ crates on top of it.
 
 Known divergences accepted into the record:
 
-1. **rolldown 1.1.5 never matches string/array `sideEffects` globs on Windows** — sugar_path's
-   `relative()` returns backslash-separated paths that the `/`-based glob matcher cannot
-   match, and the zero-directory `**/name` form also fails. Boolean `sideEffects` behave
-   correctly. Direction of error: over-shaking of glob-declared-effectful files (size
-   undercount) on Windows only. Not adapter-fixable inside §7.4's no-custom-matcher rule.
-   Matrix rows 42/43 assert the correct webpack-compatible semantics and are `#[ignore]`d
-   with this cause; they are re-attempted on every rolldown bump.
+1. ~~**rolldown 1.1.5 never matches string/array `sideEffects` globs on Windows**~~ —
+   **RETRACTED 2026-07-12. This divergence does not exist.** It was a misdiagnosis, and
+   both halves of the stated cause are refutable. Rolldown matches through `fast_glob`,
+   which uses `std::path::is_separator` and deliberately accepts `\` for a pattern's `/`
+   on Windows, so backslashes cannot be the cause; and the fixture's pattern resolved to
+   `fx.js` at the package root — a path containing no separator on any platform — so
+   neither the separator nor the zero-directory `**/name` form could be involved.
+
+   Rows 42/43 failed because the fixture never reached the matcher. Its `entry.js` did a
+   bare `import 'testpkg'`, and `index.js` is not in the `sideEffects` list, so the
+   package entry is side-effect-free, the import is legitimately dropped, and `fx.js` is
+   never resolved. The expectation was wrong, not the bundler.
+
+   With the package entry kept alive, glob `sideEffects` matching is **correct on
+   Windows**: `"./fx.js"`, `"fx.js"` and `"*.js"` all retain the matched effectful module
+   and drop the unmatched pure one. Rows 42/43 now assert exactly that and run by default.
+
+   Consequences for anything that cited this divergence: there is no Windows glob
+   `sideEffects` size undercount, and no user-facing diagnostic should claim one. The
+   product's own conservatism around array `sideEffects` (forcing `side_effects = true`
+   for any array form, so the package loses its "truly tree-shakeable" badge) is a
+   product-side choice, not a bundler defect, and is now unjustified by this record.
 2. **CJS export enumeration yields `default` only** through the chunk export list, even for
    statically plain `exports.x =` assignments; named CJS access works at link time via
    interop (the `lodash/debounce` case). Matrix row 27 pins the behavior per §8.4's

@@ -1053,59 +1053,60 @@ async fn matrix_41_side_effects_invalid() {
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
 
-// Row 42: a string sideEffects pattern keeps only matching files.
-//
-// Qualification finding (§10.7): rolldown 1.1.5 never matches string/array
-// sideEffects globs on Windows — sugar_path's `relative()` returns
-// backslash-separated paths that the `/`-based glob matcher cannot match,
-// and the root-level `**/name` zero-directory case fails as well — so
-// glob-declared-effectful files are over-shaken (boolean forms behave
-// correctly, rows 38-41). Not adapter-fixable: §7.4 forbids implementing
-// our own matcher. Re-attempt on every rolldown bump.
-#[tokio::test]
-#[ignore = "rolldown 1.1.5 sideEffects globs never match on Windows (backslashed relative paths); see spec §10.7"]
-async fn matrix_42_side_effects_string() {
-    let root = temp_workspace();
-    write_side_effect_package(&root, Some("\"./fx.js\""));
+/// Rows 42/43: a string / array `sideEffects` glob keeps matching files and drops
+/// the rest.
+///
+/// These rows were `#[ignore]`d with a recorded qualification finding that Rolldown
+/// "never matches sideEffects globs on Windows (backslashed relative paths)". That is
+/// false, and both halves of it are refutable: Rolldown matches through `fast_glob`,
+/// which uses `std::path::is_separator` and deliberately accepts `\` for a pattern's
+/// `/` on Windows; and the old fixture's pattern resolved to `fx.js` at the package
+/// root, a path with no separator in it on any platform.
+///
+/// The rows failed because the fixture never reached the matcher. Its `entry.js` did a
+/// bare `import 'testpkg'`, and `index.js` is not in the `sideEffects` list — so the
+/// entry is side-effect-free, the whole import is legitimately dropped, and `fx.js` is
+/// never even resolved. The expectation, not the bundler, was wrong.
+///
+/// Keeping the package entry alive makes the matcher run, and it is correct: `fx.js`
+/// (matched, effectful) is retained and `pure.js` (unmatched, pure) is dropped.
+fn write_live_side_effect_package(root: &Path, side_effects_field: &str) {
+    write_side_effect_package(root, Some(side_effects_field));
     write_source(
-        &root,
+        root,
         "node_modules/testpkg/index.js",
-        "import './fx.js';\nimport './pure.js';",
+        "import './fx.js';\nimport './pure.js';\nexport const y = 2;",
     );
-    write_source(&root, "node_modules/testpkg/fx.js", "globalThis.__fx = 1;");
+    write_source(root, "node_modules/testpkg/fx.js", "globalThis.__fx = 1;");
     write_source(
-        &root,
+        root,
         "node_modules/testpkg/pure.js",
         "globalThis.__pure = 1;",
     );
+    // Import a binding, so the entry cannot be tree-shaken away before the
+    // sideEffects globs are ever consulted.
+    write_source(root, "entry.js", "export { y } from 'testpkg';");
+}
 
-    let artifact = bundle_ok(&root, "entry.js", named(&["x"])).await;
+#[tokio::test]
+async fn matrix_42_side_effects_string() {
+    let root = temp_workspace();
+    write_live_side_effect_package(&root, "\"./fx.js\"");
+
+    let artifact = bundle_ok(&root, "entry.js", named(&["y"])).await;
 
     assert!(artifact.code.contains("__fx"), "{}", artifact.code);
     assert!(!artifact.code.contains("__pure"), "{}", artifact.code);
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
 
-// Row 43: an array of sideEffects patterns behaves like row 42 — including
-// the same Windows glob defect (see row 42's finding).
+// Row 43: an array of sideEffects patterns behaves like row 42.
 #[tokio::test]
-#[ignore = "rolldown 1.1.5 sideEffects globs never match on Windows (backslashed relative paths); see spec §10.7"]
 async fn matrix_43_side_effects_array() {
     let root = temp_workspace();
-    write_side_effect_package(&root, Some("[\"./fx.js\"]"));
-    write_source(
-        &root,
-        "node_modules/testpkg/index.js",
-        "import './fx.js';\nimport './pure.js';",
-    );
-    write_source(&root, "node_modules/testpkg/fx.js", "globalThis.__fx = 1;");
-    write_source(
-        &root,
-        "node_modules/testpkg/pure.js",
-        "globalThis.__pure = 1;",
-    );
+    write_live_side_effect_package(&root, "[\"./fx.js\"]");
 
-    let artifact = bundle_ok(&root, "entry.js", named(&["x"])).await;
+    let artifact = bundle_ok(&root, "entry.js", named(&["y"])).await;
 
     assert!(artifact.code.contains("__fx"), "{}", artifact.code);
     assert!(!artifact.code.contains("__pure"), "{}", artifact.code);
