@@ -37,6 +37,7 @@ for (const [name, buildArgs, subcommand] of [
       "-p",
       "import-lens-daemon",
       "--release",
+      "--locked",
       "--target",
       "x86_64-apple-darwin",
     ]);
@@ -50,6 +51,7 @@ test("cargoXwinArgsForTarget selects the clang cross-compiler only for Windows A
     "-p",
     "import-lens-daemon",
     "--release",
+    "--locked",
     "--target",
     "x86_64-pc-windows-msvc",
   ]);
@@ -61,6 +63,7 @@ test("cargoXwinArgsForTarget selects the clang cross-compiler only for Windows A
     "-p",
     "import-lens-daemon",
     "--release",
+    "--locked",
     "--target",
     "aarch64-pc-windows-msvc",
   ]);

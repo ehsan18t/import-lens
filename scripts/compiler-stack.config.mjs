@@ -1,6 +1,9 @@
-export const oxcStackConfig = {
+export const compilerStackConfig = {
+  currentRolldownVersion: "1.1.5",
   currentOxcVersion: "0.139.0",
   currentResolverVersion: "11.23.0",
+  rolldownCrate: "rolldown",
+  candidateFeature: "rolldown-candidate",
   oxcCrates: [
     "oxc_allocator",
     "oxc_ast",

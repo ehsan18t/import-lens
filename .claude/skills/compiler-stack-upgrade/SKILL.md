@@ -1,18 +1,21 @@
 ---
-name: oxc-upgrade
+name: compiler-stack-upgrade
 description: >-
-  Upgrade the OXC stack (oxc_parser/ast/semantic/transformer/minifier/codegen/…
+  Upgrade the coordinated compiler stack (the exact-pinned rolldown crate, the
+  OXC monorepo crates oxc_parser/ast/semantic/transformer/minifier/codegen/…,
   and the separately-versioned oxc_resolver) the RIGHT way — not just bumping
   version numbers until the build passes, but reading every release's changelog
-  from the current version up to the target, understanding the breaking changes,
-  new features, perf wins and bug fixes, deep-diving the PRs when needed, mapping
-  them against how THIS codebase uses OXC, and then making the necessary code
-  changes. Use this whenever asked to update/upgrade/bump OXC, oxc_parser,
-  oxc_resolver, or "the oxc stack", to move to a new oxc version, or to check
-  what a newer OXC offers us. Do NOT just run the version updater and stop.
+  from the current version up to the target for all three lines, understanding
+  the breaking changes, new features, perf wins and bug fixes, deep-diving the
+  PRs when needed, mapping them against how THIS codebase uses OXC and
+  Rolldown, and then making the necessary code changes. Use this whenever asked
+  to update/upgrade/bump OXC, oxc_parser, oxc_resolver, rolldown, "the oxc
+  stack", or "the compiler stack", to move to a new version of any of them, or
+  to check what a newer release offers us. Do NOT just run the version updater
+  and stop.
 ---
 
-# OXC Upgrade
+# Compiler-Stack Upgrade
 
 ## Why this is not a version bump
 
@@ -24,13 +27,18 @@ our usage, then apply both the bump and the code changes it implies.**
 
 ## What we depend on (the surface to check against)
 
-Two independently-versioned lines:
+Three independently-versioned lines, moved as ONE coordinated stack:
 
-- **OXC monorepo crates** (all pinned to one coordinated `~x.y.z`):
+- **`rolldown`** — exact-pinned (`=x.y.z`) optional dependency behind the
+  non-default `rolldown-candidate` feature. Its Rust API has NO semver
+  guarantee, and its caret requirements decide which OXC/resolver versions are
+  even reachable.
+- **OXC monorepo crates** (all pinned to one coordinated `=x.y.z`):
   `oxc_allocator, oxc_ast, oxc_ast_visit, oxc_codegen, oxc_minifier, oxc_parser,
   oxc_semantic, oxc_span, oxc_syntax, oxc_transformer` — the canonical list lives
-  in `scripts/oxc-stack.config.mjs`.
-- **`oxc_resolver`** — separate repo, separate version.
+  in `scripts/compiler-stack.config.mjs`.
+- **`oxc_resolver`** — separate repo, separate version (its range is declared by
+  the `rolldown_resolver` workspace crate, not by `rolldown` itself).
 
 Our OXC-using code (grep `use oxc_` under `daemon/src` to refresh this):
 `daemon/src/document/{imports,completion,script_regions}.rs` and
@@ -59,28 +67,39 @@ mis-scope the delta in both directions:
 - **We call exactly one `Scoping` iterator accessor**: `iter_bindings_in`, in
   `graph.rs`.
 
-Current versions: read `currentOxcVersion` and `currentResolverVersion` from
-`scripts/oxc-stack.config.mjs`.
+Current versions: read `currentRolldownVersion`, `currentOxcVersion`, and
+`currentResolverVersion` from `scripts/compiler-stack.config.mjs`.
 
 See `references/sources-and-surface.md` for the exact changelog URLs, the GitHub
 API calls, the release-note categorization, and per-crate/per-API gotchas.
 
 ## Workflow
 
-### 1. Establish the range
-- Read current versions from `scripts/oxc-stack.config.mjs`.
-- Determine targets. Default: latest stable for each line. If the user named a
-  version, use it. The two lines move independently — resolve each.
-- **Semver differs between the lines:** the OXC monorepo is pre-1.0, so a `0.MINOR`
-  bump is breaking; `oxc_resolver` uses real semver, so a MAJOR bump (e.g. `11→12`)
-  is the breaking signal — read its full CHANGELOG and consider landing it in its
-  own commit to isolate blast radius.
-- Stop only if **both** lines are already current — each moves on its own schedule.
+### 1. Establish the range — rolldown FIRST
+- Read current versions from `scripts/compiler-stack.config.mjs`.
+- Determine the target **rolldown** release first (default: latest stable crate;
+  if the user named one, use it) and read its release notes for the whole range
+  at `github.com/rolldown/rolldown/releases`. Rolldown's caret requirements cap
+  the OXC minor and resolver major, so the OXC/resolver targets are whatever
+  Cargo derives for that rolldown release — `pnpm deps:update:compiler
+  --rolldown <ver> --dry-run` prints them; explicit `--oxc`/`--resolver`
+  overrides must still resolve as one graph or the updater rejects them.
+- **Semver differs between the lines:** rolldown's Rust API has no semver
+  contract at all — treat EVERY bump as potentially breaking; the OXC monorepo
+  is pre-1.0, so a `0.MINOR` bump is breaking; `oxc_resolver` uses real semver,
+  so a MAJOR bump (e.g. `11→12`) is the breaking signal — read its full
+  CHANGELOG and consider landing it in its own commit to isolate blast radius.
+- Stop only if **all three** lines are already current — the stack moves on
+  rolldown's schedule.
 
 ### 2. Gather EVERY release in the range (not just the endpoints)
 Breaking changes accumulate across intermediate versions, so collect notes for
-each release in `(current, target]`, for both lines. See
+each release in `(current, target]`, for all three lines. See
 `references/sources-and-surface.md` for the exact API/URLs. In short:
+- Rolldown: enumerate versions from crates.io (`/api/v1/crates/rolldown`) and
+  read the release bodies at `rolldown/rolldown` tag `v X.Y.Z` — its Rust API
+  can move under any version number, so skim every release in range for crate
+  API and behavior changes, not just headline features.
 - Enumerate the versions that exist from **crates.io** (`/api/v1/crates/<crate>`) —
   no auth, no rate limit, and it is what the updater itself uses. Confirm the same
   version exists for all 10 crates while you are there.
@@ -153,23 +172,27 @@ Produce a short impact table: change → PR → our file(s) → required/optiona
   a snapshot of a third-party minifier's output is brittle and buys nothing once the
   upgrade lands.
 - Bump versions with the existing updater — do NOT hand-edit the pins:
-  `pnpm deps:update:oxc --oxc <ver> --resolver <ver>` (omit a flag to take latest; add
-  `--dry-run` first to preview, which prints the files it would touch). It considers
-  four text files — `daemon/Cargo.toml`, `docs/ImportLens-SRS.md`,
-  `scripts/oxc-stack.config.mjs`, and `package.json` — and writes only those that
-  actually change. `package.json` carries no oxc version; the updater merely re-asserts
-  its `deps:update:*` scripts, so normally it comes out byte-identical and is skipped,
-  leaving three. It then runs `pnpm install --lockfile-only` and
-  `cargo update -p <crate> --precise` for `oxc_resolver` and each of the ten crates,
-  which moves `Cargo.lock`. It touches **no test file** and does **not** rebuild the
-  daemon.
+  `pnpm deps:update:compiler --rolldown <ver> [--oxc <ver>] [--resolver <ver>]`
+  (omit `--rolldown` to take the latest stable; omit `--oxc`/`--resolver` to let
+  Cargo derive them from the rolldown release; add `--dry-run` first to preview,
+  which resolves the probe graph and prints the files it would touch). It
+  considers four text files — `daemon/Cargo.toml`, `docs/ImportLens-SRS.md`,
+  `scripts/compiler-stack.config.mjs`, and `package.json` — and writes only
+  those that actually change. `package.json` carries no stack version; the
+  updater merely re-asserts its `deps:update:*` scripts, so normally it comes
+  out byte-identical and is skipped. It then runs `pnpm install
+  --lockfile-only` and `cargo update -p <crate> --precise` for `rolldown`,
+  `oxc_resolver`, and each of the ten OXC crates, which moves `Cargo.lock`, and
+  finally regenerates `scripts/compiler-stack.fingerprint.json` from the locked
+  graph. It touches **no test file** and does **not** rebuild the daemon.
 - Make the code changes for every breaking item, and adopt the worthwhile features.
 - Keep the OXC monorepo crates on ONE coordinated version (the updater enforces this);
-  `oxc_resolver` moves independently.
+  `oxc_resolver` and `rolldown` are versioned independently but move only within
+  one Cargo-resolvable graph.
 
 ### 7. Verify
-- `cargo fmt --check` and `cargo clippy --workspace --all-targets` — must be clean
-  (clippy compiles, so it subsumes `cargo build`).
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets --locked` — must be
+  clean (clippy compiles, so it subsumes `cargo build`).
 - `pnpm check` (TypeScript) and `pnpm test` — full suite.
 - **Re-run the unchanged probe and diff it.** Every differing line must trace to a
   specific PR you identified in step 3. A diff that maps to none of them means stop.
@@ -198,8 +221,14 @@ features adopted vs deferred (with reasons), perf/accuracy impact observed in th
 accuracy suite, and any follow-ups.
 
 ## Guardrails
+- A rolldown bump is never routine: after the bundler-redesign cutover it moves the
+  semantic bundling engine, so rerun the spec's qualification gates (construct
+  matrix, real-package accuracy, performance, memory) before shipping and bump
+  `ANALYZER_REVISION` when measured output can change. During qualification the
+  candidate is feature-gated and unshipped, but the coordination tests and
+  fingerprint must still pass.
 - `oxc_mangler` is banned as a **direct** dependency of `daemon/Cargo.toml` — that is
-  all the ban means, and all `oxc-coordination.test.mjs` enforces. It is already a
+  all the ban means, and all `compiler-stack-coordination.test.mjs` enforces. It is already a
   non-optional transitive dependency of `oxc_minifier` and sits in `Cargo.lock`;
   seeing it there is expected. `MangleOptions` and `MangleOptionsKeepNames` are
   re-exported from `oxc_minifier`, so tuning mangling does not reintroduce the crate.

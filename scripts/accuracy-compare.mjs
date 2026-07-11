@@ -179,7 +179,7 @@ const runPnpmInstall = (cwd) =>
       "--prefer-offline",
     ];
     // On Windows `pnpm` resolves to `pnpm.CMD`, which CreateProcess cannot launch
-    // directly; run it through the shell, mirroring `update-oxc-stack.mjs`.
+    // directly; run it through the shell, mirroring `update-compiler-stack.mjs`.
     const child =
       process.platform === "win32"
         ? spawn(`pnpm ${args.join(" ")}`, { cwd, shell: true, stdio: ["ignore", "ignore", "pipe"] })
@@ -473,6 +473,7 @@ const startDaemon = async (workspace) => {
     [
       "run",
       "--quiet",
+      "--locked",
       "--bin",
       "import-lens-daemon",
       "--",

@@ -99,7 +99,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
 
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2.0.20

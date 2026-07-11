@@ -1,6 +1,16 @@
-# OXC Upgrade — Sources, API, and Our Surface
+# Compiler-Stack Upgrade — Sources, API, and Our Surface
 
 ## Where the changelogs live
+
+### rolldown (exact-pinned candidate bundler crate)
+- **Releases:** https://github.com/rolldown/rolldown/releases — tagged **`vX.Y.Z`**.
+  Read every release in range: the Rust crate API has no semver contract, so
+  breaking crate changes appear under any heading and any version number.
+- **Versions:** `https://crates.io/api/v1/crates/rolldown`.
+- **Rust-crate policy (no semver, no docs guarantee):** https://rolldown.rs/apis/rust-crates
+- The `oxc_resolver` range rides in the `rolldown_resolver` workspace crate
+  (`https://crates.io/api/v1/crates/rolldown_resolver/<ver>/dependencies`), not in
+  `rolldown` itself.
 
 ### OXC monorepo (parser/ast/semantic/transformer/minifier/codegen/…)
 - **Releases:** https://github.com/oxc-project/oxc/releases
@@ -120,8 +130,9 @@ break most often, and they flow straight into `pipeline/minify.rs` and
   `MangleOptions::reserved` in 0.139.0) breaks any construction that names every
   field. Prefer `..Default::default()`.
 - **Coordination + apply are updater-enforced** (details in SKILL.md step 6 +
-  guardrails): all monorepo crates share ONE version, `oxc_resolver` is independent,
-  `oxc_mangler` is banned as a *direct* dep only, and `pnpm deps:update:oxc` edits the
-  coordinated files — don't hand-edit pins. Invoke it as
-  `pnpm deps:update:oxc --oxc <ver> --resolver <ver>`; a bare `--` is tolerated but
-  unnecessary under pnpm.
+  guardrails): all monorepo crates share ONE version, `oxc_resolver` and `rolldown`
+  are independent but must resolve as one graph, `oxc_mangler` is banned as a
+  *direct* dep only, and `pnpm deps:update:compiler` edits the coordinated files and
+  regenerates the graph fingerprint — don't hand-edit pins. Invoke it as
+  `pnpm deps:update:compiler --rolldown <ver> [--oxc <ver>] [--resolver <ver>]`;
+  a bare `--` is tolerated but unnecessary under pnpm.

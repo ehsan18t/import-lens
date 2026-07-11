@@ -47,9 +47,9 @@ Anything else is an **Echo**: a copy of a config file that throws when the copy 
 Drift and Echo look identical from a distance — both read a config and assert something about it. The discriminator is where the expected value comes from:
 
 ```js
-// Drift: the expectation is derived. Bump the version in oxc-stack.config.mjs,
+// Drift: the expectation is derived. Bump the version in compiler-stack.config.mjs,
 // forget daemon/Cargo.toml, and this fails. It knows something the file doesn't.
-assert.match(cargoToml, new RegExp(`oxc_parser = "~${oxcStackConfig.currentOxcVersion}"`));
+assert.match(cargoToml, new RegExp(`oxc_parser = "=${compilerStackConfig.currentOxcVersion}"`));
 
 // Echo: the expectation is a literal. The only way to make this red is to edit
 // the Dockerfile, at which point you already know what you changed.
@@ -60,7 +60,7 @@ assert.match(dockerfile, /^FROM node:24-bookworm$/mu);
 
 **Prefer making drift impossible over testing for drift.** A Drift check is a consolation prize for two sources of truth you could not merge. Before writing one, try to delete the second source. Keep the check only where duplication is genuinely forced — `cli/importlens.mjs` and `extension/src/daemon/platform.ts` each redeclare `daemonRoot` because neither can import `scripts/targets.mjs` at runtime.
 
-**Never assert a dependency version in a test, except oxc coordination.** oxc is the only dependency where a version bump can silently break the app. Do not assert versions of GitHub Actions, pnpm, Node, the Rust toolchain, `@types/vscode`, or any dev tooling. A break there is caught by CI before it ships.
+**Never assert a dependency version in a test, except compiler-stack coordination.** The coordinated compiler stack (rolldown, the OXC monorepo crates, and oxc_resolver) is the only set of dependencies where a version bump can silently break the app. Do not assert versions of GitHub Actions, pnpm, Node, the Rust toolchain, `@types/vscode`, or any dev tooling. A break there is caught by CI before it ships.
 
 Do not:
 

@@ -216,9 +216,9 @@
     "test": "pnpm build && pnpm test:ts && pnpm test:scripts && pnpm test:rust",
     "test:ts": "node -e \"require('node:fs').rmSync('dist/test-dist', { recursive: true, force: true })\" && tsc -p tsconfig.test.json && node --test \"dist/test-dist/**/*.test.js\"",
     "test:scripts": "node --test \"scripts/**/*.test.mjs\"",
-    "test:rust": "cargo test --workspace",
+    "test:rust": "cargo test --workspace --locked",
     "test:accuracy": "node scripts/accuracy-compare.mjs",
-    "test:performance": "cargo test -p import-lens-daemon --release --test performance -- --ignored --nocapture",
+    "test:performance": "cargo test -p import-lens-daemon --release --locked --test performance -- --ignored --nocapture",
     "coverage:rust": "node scripts/check-coverage.mjs",
     "build:daemon": "node scripts/build-daemon.mjs",
     "build:daemon:win32-x64": "node scripts/build-daemon.mjs win32-x64",
@@ -245,8 +245,8 @@
     "package:all:zig": "pnpm package:linux-x64:zig && pnpm package:linux-arm64:zig && pnpm package:darwin-x64:zig && pnpm package:darwin-arm64:zig",
     "docker:build": "docker compose run --rm --build builder",
     "changelog": "node scripts/generate-changelog.mjs",
-    "deps:update:oxc": "node scripts/update-oxc-stack.mjs",
-    "deps:update:safe": "pnpm update && cargo update"
+    "deps:update:compiler": "node scripts/update-compiler-stack.mjs",
+    "deps:update:safe": "node scripts/deps-update-safe.mjs"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3"

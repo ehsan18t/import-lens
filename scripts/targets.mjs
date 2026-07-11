@@ -90,13 +90,29 @@ export const artifactPathForTarget = (repoRoot, platformTarget) => {
 export const cargoBuildArgsForTarget = (platformTarget) => {
   const info = targetInfo(platformTarget);
 
-  return ["build", "-p", "import-lens-daemon", "--release", "--target", info.rustTarget];
+  return [
+    "build",
+    "-p",
+    "import-lens-daemon",
+    "--release",
+    "--locked",
+    "--target",
+    info.rustTarget,
+  ];
 };
 
 export const cargoZigbuildArgsForTarget = (platformTarget) => {
   const info = targetInfo(platformTarget);
 
-  return ["zigbuild", "-p", "import-lens-daemon", "--release", "--target", info.rustTarget];
+  return [
+    "zigbuild",
+    "-p",
+    "import-lens-daemon",
+    "--release",
+    "--locked",
+    "--target",
+    info.rustTarget,
+  ];
 };
 
 const appendCFlag = (existingValue, flag) => (existingValue ? `${existingValue} ${flag}` : flag);
@@ -118,6 +134,7 @@ export const cargoXwinArgsForTarget = (platformTarget) => {
     "-p",
     "import-lens-daemon",
     "--release",
+    "--locked",
     "--target",
     info.rustTarget,
   ];
