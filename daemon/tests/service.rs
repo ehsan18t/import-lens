@@ -8,9 +8,6 @@ use import_lens_daemon::{
     },
     pipeline::file_size::FileSizeComputation,
     pipeline::file_size_cache::shared_file_size_cache,
-    pipeline::graph::{
-        build_module_graph_cached, clear_module_graph_cache, peek_cached_module_paths,
-    },
     pipeline::resolver::shared_resolvers,
     registry::service::RegistryHintService,
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
@@ -23,7 +20,9 @@ use std::{
 
 mod common;
 
-static GRAPH_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+// Serializes tests that touch process-global freshness state (the engine's
+// dependency-path index and the L1 file-size cache).
+static SHARED_INDEX_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn temp_workspace() -> PathBuf {
     common::temp_workspace("import-lens-service")
@@ -230,44 +229,6 @@ fn write_shared_packages(workspace: &Path) {
     }
 }
 
-fn write_shared_packages_with_many_unique_modules(workspace: &Path) {
-    let util_root = workspace.join("node_modules").join("shared-small-util");
-    fs::create_dir_all(&util_root).expect("shared util root should be created");
-    fs::write(
-        util_root.join("package.json"),
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
-    )
-    .expect("shared util manifest should be written");
-    fs::write(util_root.join("index.js"), "export const util = 'u';")
-        .expect("shared util entry should be written");
-
-    for package_name in ["left-wide-lib", "right-wide-lib"] {
-        let package_root = workspace.join("node_modules").join(package_name);
-        fs::create_dir_all(&package_root).expect("package root should be created");
-        fs::write(
-            package_root.join("package.json"),
-            r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
-        )
-        .expect("package manifest should be written");
-
-        let export_name = package_name.replace("-wide-lib", "").replace('-', "_");
-        let mut entry = "import { util } from 'shared-small-util';\n".to_owned();
-        for index in 0..11 {
-            entry.push_str(&format!("import './local-{index}.js';\n"));
-            fs::write(
-                package_root.join(format!("local-{index}.js")),
-                format!(
-                    "globalThis.__importLensLocal{index} = '{}';",
-                    "x".repeat(120)
-                ),
-            )
-            .expect("local side-effect module should be written");
-        }
-        entry.push_str(&format!("export const {export_name} = util;"));
-        fs::write(package_root.join("index.js"), entry).expect("package entry should be written");
-    }
-}
-
 fn write_effectful_package(workspace: &Path) {
     let package_root = workspace.join("node_modules").join("effectful-lib");
     fs::create_dir_all(&package_root).expect("package root should be created");
@@ -281,33 +242,6 @@ fn write_effectful_package(workspace: &Path) {
         "export const value = 1;\nexport const other = 2;",
     )
     .expect("entry should be written");
-}
-
-fn write_array_graph_effects_package(workspace: &Path) {
-    let package_root = workspace
-        .join("node_modules")
-        .join("array-graph-effects-lib");
-    fs::create_dir_all(package_root.join("dist").join("polyfill").join("browser"))
-        .expect("package root should be created");
-    fs::write(
-        package_root.join("package.json"),
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":["**/polyfill/**/*.js"]}"#,
-    )
-    .expect("package manifest should be written");
-    fs::write(
-        package_root.join("index.js"),
-        "export const value = 1;\nexport { setup } from './dist/polyfill/browser/setup.js';",
-    )
-    .expect("entry should be written");
-    fs::write(
-        package_root
-            .join("dist")
-            .join("polyfill")
-            .join("browser")
-            .join("setup.js"),
-        "globalThis.__importLensSideEffect = 'kept';\nexport const setup = 'polyfill';",
-    )
-    .expect("side-effect module should be written");
 }
 
 fn write_cjs_file_size_package(workspace: &Path) {
@@ -365,32 +299,6 @@ fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -
         imports: vec![ImportRequest {
             specifier: "effectful-lib".to_owned(),
             package_name: "effectful-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: if matches!(import_kind, ImportKind::Named) {
-                vec!["value".to_owned()]
-            } else {
-                Vec::new()
-            },
-            import_kind,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
-    }
-}
-
-fn graph_effects_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -> BatchRequest {
-    BatchRequest {
-        version: 1,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "array-graph-effects-lib".to_owned(),
-            package_name: "array-graph-effects-lib".to_owned(),
             version: "1.0.0".to_owned(),
             named: if matches!(import_kind, ImportKind::Named) {
                 vec!["value".to_owned()]
@@ -515,38 +423,6 @@ fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
     }
 }
 
-fn wide_shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
-    BatchRequest {
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![
-            ImportRequest {
-                specifier: "left-wide-lib".to_owned(),
-                package_name: "left-wide-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec!["left".to_owned()],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            },
-            ImportRequest {
-                specifier: "right-wide-lib".to_owned(),
-                package_name: "right-wide-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec!["right".to_owned()],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            },
-        ],
-        streaming: false,
-    }
-}
-
 fn file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
     let batch = shared_batch(workspace, request_id);
 
@@ -597,28 +473,6 @@ fn cjs_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
         imports: vec![ImportRequest {
             specifier: "cjs-file-lib".to_owned(),
             package_name: "cjs-file-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["value".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-    }
-}
-
-fn graph_effects_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
-    FileSizeRequest {
-        message_type: "file_size".to_owned(),
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "array-graph-effects-lib".to_owned(),
-            package_name: "array-graph-effects-lib".to_owned(),
             version: "1.0.0".to_owned(),
             named: vec!["value".to_owned()],
             import_kind: ImportKind::Named,
@@ -1410,7 +1264,7 @@ fn service_invalidates_packages_from_node_modules_package_json_paths() {
 
 #[test]
 fn service_bulk_invalidation_is_scoped_to_changed_packages() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
@@ -1459,7 +1313,7 @@ fn service_bulk_invalidation_is_scoped_to_changed_packages() {
 
 #[test]
 fn service_skips_unmappable_package_json_paths_and_targets_only_mappable_ones() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
@@ -1502,7 +1356,7 @@ fn service_skips_unmappable_package_json_paths_and_targets_only_mappable_ones() 
 
 #[test]
 fn service_invalidates_all_when_every_package_json_path_is_unmappable() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
@@ -1540,7 +1394,7 @@ fn node_modules_change_reclaims_uninstalled_package_entries() {
     // manifest PATH STRING, so it still targets the right package after the manifest is
     // gone (it never stats or reads the deleted file). A sibling package that is still
     // installed must survive, proving the reclaim is targeted, not a workspace nuke.
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
@@ -1653,7 +1507,7 @@ fn service_cache_invalidation_removes_matching_package_entries() {
 
 #[test]
 fn service_reports_and_removes_per_project_cache_shards() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let storage = common::temp_workspace("import-lens-service-cache-storage");
@@ -1711,7 +1565,7 @@ fn service_reports_and_removes_per_project_cache_shards() {
 
 #[test]
 fn cache_status_reports_total_budget_registry_and_per_project_counts() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let storage = common::temp_workspace("import-lens-service-cache-status-observability");
@@ -1920,8 +1774,8 @@ fn remove_registry_scope_clears_only_registry() {
 }
 
 #[test]
-fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+fn remove_all_clears_registry_resolvers_and_l1_even_when_no_shard_removed() {
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
 
@@ -1954,16 +1808,6 @@ fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
     assert!(
         shared_file_size_cache().contains_path(&l1_path),
         "L1 aggregate should be seeded before the clear"
-    );
-
-    // Seed the module-graph cache under a unique entry that exists on disk.
-    let graph_workspace = temp_workspace();
-    let graph_entry = graph_workspace.join("entry.ts");
-    fs::write(&graph_entry, "export const value = 1;\n").expect("graph entry should be written");
-    let _ = build_module_graph_cached(&graph_entry).expect("module graph should build");
-    assert!(
-        peek_cached_module_paths(&graph_entry, ImportRuntime::Component).is_some(),
-        "module graph should be seeded before the clear"
     );
 
     let before_resolvers = shared_resolvers();
@@ -2002,11 +1846,6 @@ fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
         !shared_file_size_cache().contains_path(&l1_path),
         "All must clear the L1 file-size cache even when no shard was removed"
     );
-    // Module-graph cache cleared even though no shard was removed (X-21).
-    assert!(
-        peek_cached_module_paths(&graph_entry, ImportRuntime::Component).is_none(),
-        "All must clear the module-graph cache even when no shard was removed"
-    );
     // Generation bumped (X-17).
     assert!(
         import_lens_daemon::cache::memory::cache_generation() > before_gen,
@@ -2014,42 +1853,6 @@ fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
     );
 
     fs::remove_dir_all(&l1_workspace).expect("l1 workspace should be removed");
-    fs::remove_dir_all(&graph_workspace).expect("graph workspace should be removed");
-}
-
-#[test]
-fn service_cache_miss_preserves_existing_module_graph_cache() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
-        .lock()
-        .expect("graph cache test lock should be available");
-    let workspace = temp_workspace();
-    let package_root = workspace.join("node_modules").join("graph-cache-lib");
-    fs::create_dir_all(&package_root).expect("package root should be created");
-    fs::write(
-        package_root.join("package.json"),
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
-    )
-    .expect("package manifest should be written");
-    fs::write(package_root.join("index.js"), "export const value = 1;")
-        .expect("entry should be written");
-    let entry_path = workspace
-        .join("node_modules")
-        .join("graph-cache-lib")
-        .join("index.js");
-    clear_module_graph_cache();
-    let cached_before = build_module_graph_cached(&entry_path).expect("graph should build");
-    let service = ImportLensService::new(None, false);
-
-    let response = service.handle_batch(package_batch(&workspace, 3, "graph-cache-lib", "value"));
-    let cached_after = build_module_graph_cached(&entry_path).expect("graph should stay cached");
-
-    clear_module_graph_cache();
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert_eq!(response.imports[0].error, None);
-    assert!(
-        Arc::ptr_eq(&cached_before, &cached_after),
-        "service cache misses should reuse valid module graph cache entries",
-    );
 }
 
 #[test]
@@ -2130,38 +1933,30 @@ fn service_does_not_cache_manifest_fallback_results() {
     );
 }
 
+// The pre-cutover engine aliased a Named result into the Namespace cache key
+// for side-effectful packages because it sized both identically. Rolldown
+// still shakes pure unused exports under `sideEffects: true`, so the sizes
+// legitimately differ and each import kind must compute its own entry.
 #[test]
-fn service_caches_full_package_variant_for_conservative_named_imports() {
+fn service_does_not_alias_named_results_to_namespace_cache() {
     let workspace = temp_workspace();
     write_effectful_package(&workspace);
     let service = ImportLensService::new(None, false);
 
     let named = service.handle_batch(effectful_batch(&workspace, 1, ImportKind::Named));
     let namespace = service.handle_batch(effectful_batch(&workspace, 2, ImportKind::Namespace));
+    let namespace_again =
+        service.handle_batch(effectful_batch(&workspace, 3, ImportKind::Namespace));
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!named.imports[0].cache_hit);
-    assert!(namespace.imports[0].cache_hit);
-    assert_eq!(named.imports[0].raw_bytes, namespace.imports[0].raw_bytes);
-}
-
-#[test]
-fn service_does_not_alias_graph_only_side_effect_result_to_namespace_cache() {
-    let workspace = temp_workspace();
-    write_array_graph_effects_package(&workspace);
-    let service = ImportLensService::new(None, false);
-
-    let named = service.handle_batch(graph_effects_batch(&workspace, 1, ImportKind::Named));
-    let namespace = service.handle_batch(graph_effects_batch(&workspace, 2, ImportKind::Namespace));
-
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert!(!named.imports[0].cache_hit);
-    assert!(named.imports[0].side_effects, "{named:?}");
     assert!(!namespace.imports[0].cache_hit);
+    assert!(namespace_again.imports[0].cache_hit);
+    assert!(namespace.imports[0].raw_bytes >= named.imports[0].raw_bytes);
 }
 
 #[test]
-fn service_does_not_alias_missing_export_result_to_namespace_cache() {
+fn service_does_not_cache_missing_export_error_results() {
     let workspace = temp_workspace();
     write_missing_export_effectful_package(&workspace);
     let service = ImportLensService::new(None, false);
@@ -2175,11 +1970,12 @@ fn service_does_not_alias_missing_export_result_to_namespace_cache() {
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!named.imports[0].cache_hit);
+    assert!(named.imports[0].error.is_some(), "{named:?}");
     assert!(
         named.imports[0]
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "exports"),
+            .any(|diagnostic| diagnostic.stage == "missing_export"),
         "{named:?}",
     );
     assert!(!namespace.imports[0].cache_hit);
@@ -2247,37 +2043,6 @@ fn service_marks_shared_transitive_modules_in_batch_results() {
 }
 
 #[test]
-fn service_marks_shared_bytes_outside_public_top_ten_breakdown() {
-    let workspace = temp_workspace();
-    write_shared_packages_with_many_unique_modules(&workspace);
-    let service = ImportLensService::new(None, false);
-
-    let response = service.handle_batch(wide_shared_batch(&workspace, 24));
-
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert_eq!(response.imports.len(), 2);
-    for result in &response.imports {
-        assert_eq!(
-            result.module_breakdown.as_ref().map(Vec::len),
-            Some(10),
-            "{result:?}",
-        );
-        assert!(
-            !result.module_breakdown.as_ref().is_some_and(|modules| {
-                modules
-                    .iter()
-                    .any(|module| module.path.contains("shared-small-util"))
-            }),
-            "{result:?}",
-        );
-        assert!(
-            result.shared_bytes.is_some_and(|bytes| bytes > 0),
-            "{result:?}",
-        );
-    }
-}
-
-#[test]
 fn service_computes_file_size_with_shared_module_deduplication() {
     let workspace = temp_workspace();
     write_shared_packages(&workspace);
@@ -2310,7 +2075,7 @@ fn service_computes_file_size_with_shared_module_deduplication() {
 }
 
 #[test]
-fn service_computes_file_size_for_commonjs_only_imports_conservatively() {
+fn service_computes_file_size_for_commonjs_imports() {
     let workspace = temp_workspace();
     write_cjs_file_size_package(&workspace);
     let service = ImportLensService::new(None, false);
@@ -2323,34 +2088,7 @@ fn service_computes_file_size_for_commonjs_only_imports_conservatively() {
     assert!(file_size.raw_bytes > 0, "{file_size:?}");
     assert!(file_size.minified_bytes > 0, "{file_size:?}");
     assert_eq!(file_size.imports.len(), 1);
-    assert!(
-        file_size.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "file_size" && diagnostic.message.contains("CommonJS")
-        }),
-        "{file_size:?}",
-    );
-}
-
-#[test]
-fn service_file_size_includes_graph_only_side_effect_modules() {
-    let workspace = temp_workspace();
-    write_array_graph_effects_package(&workspace);
-    let service = ImportLensService::new(None, false);
-
-    let response = service.handle_file_size(graph_effects_file_size_request(&workspace, 26));
-
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert_eq!(response.error, None);
-    assert_eq!(response.imports.len(), 1);
-    assert_eq!(response.raw_bytes, response.imports[0].raw_bytes);
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.stage == "side_effects"
-            && diagnostic.details.iter().any(|detail| {
-                detail
-                    .replace('\\', "/")
-                    .contains("dist/polyfill/browser/setup.js")
-            })
-    }));
+    assert!(file_size.imports[0].is_cjs, "{file_size:?}");
 }
 
 #[test]

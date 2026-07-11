@@ -18,7 +18,7 @@ use super::{
     BundleArtifact, BundleFailure, BundleRequest, ImportDiagnostic, ImportRuntime,
     ModuleContribution, entry,
 };
-use crate::pipeline::graph::NODE_BUILTIN_MODULES;
+use crate::pipeline::node_builtins::NODE_BUILTIN_MODULES;
 use crate::pipeline::resolver::resolve_options as shared_resolve_options;
 
 /// Stateless adapter; one Rolldown bundler is built per request and never
@@ -60,7 +60,7 @@ impl RolldownEngine {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let input = InputItem {
             name: None,
-            import: entry_path.to_string_lossy().into_owned(),
+            import: rolldown_entry_path(&entry_path),
         };
         let options = build_options(input, cwd, runtime);
         let plugin = ImportLensPlugin::passthrough();
@@ -69,6 +69,17 @@ impl RolldownEngine {
         let chunk = single_chunk(&output, &state)?;
         Ok(chunk.exports.iter().map(|name| name.to_string()).collect())
     }
+}
+
+fn rolldown_entry_path(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if let Some(unc) = normalized.strip_prefix("//?/UNC/") {
+        return format!("//{unc}");
+    }
+    normalized
+        .strip_prefix("//?/")
+        .unwrap_or(&normalized)
+        .to_owned()
 }
 
 /// Fixed build options (spec §7.1). Everything not set here intentionally

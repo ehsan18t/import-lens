@@ -229,8 +229,8 @@ On each daemon respawn, the extension host reads `<globalStoragePath>/importlens
 4. The daemon extracts parseable script regions for component files. Plain JS/TS and JSX/TSX files are parsed as one region; Svelte `<script>` blocks and Vue `<script>` / `<script setup>` blocks are parsed as component regions; Astro frontmatter is parsed as server runtime and processed Astro `<script>` blocks are parsed as client runtime.
 5. The daemon parses each script region with Rust `oxc_parser`, extracts ESM import information from module records, maps region-relative ranges back to absolute document positions, and applies `.importlensignore` plus package/specifier filtering.
 6. For each remaining import, the daemon resolves the installed package by reading `node_modules/<package>/package.json`. For scoped packages (e.g. `@babel/core`), the path includes the scope directory. If the package directory exists but the manifest is malformed or lacks a string `version`, the daemon uses an unknown-version sentinel so size analysis can return an approximate fallback instead of marking the import missing.
-7. The daemon checks its `papaya` map for each import's cache key. Cache hits are returned immediately. Cache misses are fanned out to a Rayon thread pool for parallel processing.
-8. For each miss, the daemon runs the OXC pipeline: (a) resolve the package entry point via `oxc_resolver`, (b) build the module graph by recursively parsing reachable relative and bare transitive imports with `oxc_parser`, (c) transform TypeScript and JSX modules with `oxc_transformer`, (d) use `oxc_semantic` for module-level binding dependency extraction and at compiler-boundary stages that require validated scoping, including TS/JSX transform scoping, bundle renaming, and pre-minification validation, (e) concatenate reachable code or a conservative parsed graph when side-effect metadata requires it, (f) run `oxc_minifier` for dead code elimination and mangling, (g) emit the minified string via `oxc_codegen` using the minifier-provided scoping and private-member mappings, and (h) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
+7. The daemon checks its `papaya` map for each import's cache key. Cache hits are returned immediately and never construct a bundler. Cache misses are scheduled onto the two-permit async engine boundary (FR-023) with input ordering preserved.
+8. For each miss, the daemon runs the engine pipeline: (a) resolve the package entry point via `oxc_resolver`, (b) build and link the transitive module graph with the embedded Rolldown bundler from a virtual entry (Rolldown owns resolution, ESM/CJS interop, side-effect interpretation, and tree-shaking, and emits one unminified ESM chunk under the Section 10.7 limits), (c) validate the linked chunk with `oxc_semantic`, (d) run `oxc_minifier` for dead code elimination and mangling, (e) emit the minified string via `oxc_codegen` using the minifier-provided scoping and private-member mappings, and (f) compress in parallel with `flate2`, `brotli`, and `zstd` using nested `rayon::join` calls.
 9. Results are written to `papaya` (memory) and `redb` (disk).
 10. The daemon serialises one full `AnalyzeDocumentResponse` over the socket. Legacy `BatchRequest`/`BatchResponse` remains available for protocol compatibility, but document analysis clients must prefer the daemon-first document endpoint.
 11. The extension host deserialises responses, discards stale `request_id` values, and updates decorations without regressing newer results.
@@ -245,13 +245,13 @@ This section documents the key architectural decisions made before implementatio
 
 ### 4.1 Bundler and Pipeline Selection
 
-**Evaluated:** Rspack, Rolldown, ESBuild, and OXC.
+**Evaluated:** Rspack, Rolldown, ESBuild, and OXC (original selection); re-evaluated Rolldown, esbuild, SWC bundler, Rspack, and Farm in the 2026 bundler redesign.
 
-**Rspack and Rolldown rejected:** Both are Rust-powered tools, but they expose Node.js APIs rather than embeddable Rust crates. Using either would require spawning an additional Node.js subprocess from within the Rust daemon, which eliminates the performance and isolation advantages of writing the daemon in Rust.
+**Original decision (superseded for linking/tree-shaking):** At initial design time, Rspack and Rolldown exposed Node.js APIs rather than embeddable Rust crates, and ESBuild is written in Go. OXC was selected for the full pipeline, with a custom module graph walker for tree-shaking because OXC does not provide a standalone tree-shaker.
 
-**ESBuild rejected:** ESBuild is written in Go and requires managing a separate WASM execution layer to use programmatically from Rust. This adds complexity and an additional binary dependency.
+**2026 revision — Rolldown adopted for linking and tree-shaking:** Rolldown now publishes an embeddable Rust crate (`rolldown` on crates.io). The custom module graph walker accumulated structural correctness defects (dangling generated bindings, dropped effectful initializers, silently merged ambiguous star exports, empty external re-export bundles), so the bundler-redesign design (`docs/superpowers/specs/2026-07-10-bundler-redesign-design.md`) qualified Rolldown 1.1.5 against a committed construct matrix, pinned real packages, and absolute performance gates. Every gate passed on 2026-07-11 (cold `css-tree/parse` p95 52.4 ms against a 500 ms gate; 20-import batch peak RSS 78 MB against a 400 MB gate; candidate ~1.9x faster than the legacy engine), and Rolldown replaced the custom walker as the only semantic bundler. Because Rolldown's Rust API carries no semver guarantee, it is exact-pinned as part of the coordinated compiler stack behind one narrow adapter (see C-003 and §10.7).
 
-**OXC selected:** OXC provides pure, embeddable Rust crates (`oxc_parser`, `oxc_resolver`, `oxc_transformer`, `oxc_minifier`) that compile into a single binary. All pipeline stages share the same in-memory AST, eliminating re-parsing between steps. OXC is the engine used internally by Rolldown and Vite 8.
+**OXC retained for everything around the bundler:** direct OXC crates (`oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`, `oxc_codegen`) parse the user's document, resolve the root package request, and validate and minify Rolldown's linked output. OXC is the compiler toolchain Rolldown itself is built on.
 
 ### 4.2 Minifier Selection
 
@@ -366,47 +366,44 @@ The extension must retain the detected import syntax category (`static`, `reexpo
 
 ### 5.4 Size Computation
 
-**FR-016** (Critical) - For each cache-miss import, the daemon must construct a virtual ESM entry file in memory using re-export semantics:
-- Named imports: `export { <namedExports> } from '<package>'`
-- Default imports: `export { default } from '<package>'`
-- Namespace imports: `export * from '<package>'`
-- Dynamic imports: resolve the package entry point directly without a virtual file
+**FR-016** (Critical) - For each cache-miss import, the daemon must construct a virtual ESM entry module in memory whose synthetic targets map to the pre-resolved package entry paths, using the alias forms specified in Section 10.3:
+- Named imports: one uniquely aliased string-literal re-export per requested name
+- Default imports: a uniquely aliased default re-export
+- Namespace, dynamic, and full-package requests: the escaping-namespace form (`import * as` then `export`), because `export * from` would drop the target's default export
 
-The virtual entry must never use `console.log` or any pattern that can be statically eliminated by a tree-shaker.
+Every requested surface must carry a unique entry alias so strict entry signatures keep it alive; the virtual entry must never use `console.log` or any pattern that can be statically eliminated by a tree-shaker, and user-controlled names must be serialized as escaped string literals, never interpolated raw.
 
-**FR-017** (Critical) - The daemon must use `oxc_resolver` to resolve the package entry point from `node_modules`. The resolver must use the following `exports` condition set, in priority order: `["module", "import", "default"]`. This selects the ESM path when available, which is required for accurate tree-shaking. The `"require"` condition must not be in the set; its presence would cause `oxc_resolver` to prefer CJS paths on packages that publish both. If no ESM entry can be resolved, the daemon falls back to the `"main"` field and sets `is_cjs: true` in the response. The resolver must also respect the `"browser"` field for packages that use it as an ESM entry alias. The `"module"` top-level field (used by older packages before the `exports` map existed) is respected as a lower-priority fallback after `exports` map resolution. During module graph construction, every relative and bare transitive ESM import must be resolved from the importing module's path with the same resolver semantics, including TypeScript source aliases for emitted `.js`, `.mjs`, `.cjs`, and `.jsx` specifiers when matching `.ts`, `.mts`, `.cts`, and `.tsx` source files exist. Node builtins, unresolved peers, and other externals must remain outside the graph and must produce structured diagnostics rather than failing the whole import when partial analysis can continue.
+**FR-017** (Critical) - The daemon must use `oxc_resolver` to resolve the package entry point from `node_modules`. The resolver must use the following `exports` condition set, in priority order: `["module", "import", "default"]`. This selects the ESM path when available, which is required for accurate tree-shaking. The `"require"` condition must not be in the set; its presence would cause `oxc_resolver` to prefer CJS paths on packages that publish both. If no ESM entry can be resolved, the daemon falls back to the `"main"` field and sets `is_cjs: true` in the response. The resolver must also respect the `"browser"` field for packages that use it as an ESM entry alias. The `"module"` top-level field (used by older packages before the `exports` map existed) is respected as a lower-priority fallback after `exports` map resolution. This direct root resolution happens before any bundler build so cache identity and fast cache hits never construct a bundler. Transitive imports are resolved exclusively by the Rolldown engine, whose resolve options (condition names, main fields) mirror the direct resolver's configuration per runtime so the two cannot disagree on entry semantics. Node builtins, unresolved peers, and other externals must remain external boundaries in the linked output and must produce structured diagnostics rather than failing the whole import when partial analysis can continue.
 
 **FR-017a** (High) - If package entry resolution fails but the installed package directory contains declaration files (`.d.ts`, `.d.mts`, or `.d.cts`) and no runtime JavaScript or TypeScript source files (`.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.tsx`, `.mts`, or `.cts`, excluding declaration files), the daemon must return a successful zero-byte `ImportResult` instead of marking the import unavailable. The result must set all byte fields to `0`, `side_effects: false`, `is_cjs: false`, and include a structured `types_only` diagnostic so the extension can label the import as declaration-only runtime cost.
 
-**FR-018** (Critical) - The daemon must perform tree-shaking using a custom module graph walker built on OXC primitives. The pipeline is:
-1. Construct a virtual ESM entry module (as defined in FR-016).
-2. Resolve the package entry point via `oxc_resolver`.
-3. Recursively parse all reachable modules using `oxc_parser`, building the module graph. Graph construction must enforce hard limits of 2,000 modules, 20 MiB per module source file, and 100 MiB total graph source bytes.
-4. Extract module-record edges, exports, re-exports, statement spans, local binding names, and per-module binding dependency records from the prepared parse. Binding dependencies must be derived from OXC semantic binding/reference spans, not text matching, so the bundler can tell which imported or local bindings are actually used by a retained export. The daemon also runs OXC semantic analysis at compiler-boundary stages that need validated scoping: before TS/JSX transform scoping, during binding-aware bundle renaming, and before minification. Semantic failures at those boundaries must fall back to conservative static entry sizing with structured diagnostics.
-5. Walk the module graph from the virtual entry's requested exports, then expand each included module through the retained local-binding closure before following imported bindings. Static imports used only by dead exports must not cause their target modules to be included.
-6. Concatenate only the reachable code into a single in-memory source.
-7. Before concatenating reachable code, the daemon must run `oxc_transformer` on TypeScript and JSX modules to strip TypeScript types and transform JSX. JSON modules are synthesized into ESM source. The graph and bundler then parse prepared source with an ESM source type so `.mts`/`.cts` and transformed modules share one ESM-like intermediate representation. This prepared representation is not a CommonJS conversion path; true CommonJS entries follow FR-024a. `oxc_transformer` does NOT perform tree-shaking; it only handles syntax lowering.
-8. When concatenating reachable modules into a single source, the daemon must apply scope renaming to prevent collisions between identically-named bindings in different module scopes (e.g. two modules both declaring `const x = ...`). Renaming must be based on semantic binding and reference spans, not ad hoc string replacement, and must preserve object shorthand, object destructuring, array destructuring, and rest binding semantics. See Section 10.7 for the module graph walk algorithm.
-9. Circular dependency edges must be detected during graph construction and reported as `circular_dependency` diagnostics on affected import results. Cycles must not cause infinite traversal or duplicate module inclusion.
+**FR-018** (Critical) - The daemon must perform module linking and tree-shaking through the embedded Rolldown bundler behind the engine contract in Section 10.7. The pipeline is:
+1. Construct a virtual ESM entry module (as defined in FR-016 and Section 10.3) whose synthetic targets map to the pre-resolved package entry paths from FR-017.
+2. Run one Rolldown build over the virtual entry. Rolldown exclusively owns transitive resolution, module loading, ESM/CJS linking, binding and namespace semantics, symbol deconfliction, TS/TSX/JSX/JSON handling, and statement/module retention (tree-shaking). The daemon must not re-implement, override, or post-correct any of those semantics.
+3. The engine's native plugin enforces hard limits of 2,000 internal modules, 20 MiB per module source file, and 100 MiB total module source bytes. A breached limit is a typed `module_graph_limit` failure, never a partial graph.
+4. The build must emit exactly one unminified ESM chunk and no other assets; any other output shape is a typed `output_shape` failure. Cycles link without duplicate module inclusion; dynamic imports inline into the single chunk (code splitting is disabled).
+5. The daemon validates the linked chunk with OXC semantic analysis and minifies it per FR-019. Engine or validation failures fall back to conservative static entry sizing with structured diagnostics per the failure policy in Section 10.7 — a failure must never fabricate a binding or measure partially linked code.
 
 **FR-019** (Critical) - The daemon must use `oxc_minifier` to perform dead code elimination, constant folding, and supported identifier mangling on the tree-shaken output, then use `oxc_codegen` (with `minify: true`) to emit the minified JavaScript string. Codegen must use the scoping and private-member mappings returned by `oxc_minifier::Minifier::minify`; the daemon must not run a second independent mangling pass over already-minified AST state.
 
 **FR-020** (Critical) - After minification, the daemon must compute three compressed sizes in parallel: gzip using `flate2` at level 6, Brotli using the `brotli` crate at level 4, and zstd using the `zstd` crate at level 3.
 
-**FR-021** (Critical) - The daemon must read the `sideEffects` field from the package's `package.json` before tree-shaking. The field is handled as follows:
-- If the field is `true` or absent: the response must set `side_effects: true`, include the full parsed graph for named/default imports, and set `truly_treeshakeable: false`.
-- If the field is `false`: aggressive module pruning is permitted; the response sets `side_effects: false`.
-- If the field is an array of glob patterns (e.g., `["*.css", "dist/polyfill.js"]`): the daemon must evaluate the patterns against the resolved package entry path and every analyzed graph module path using webpack-compatible `*`, `?`, `**`, and simple brace alternatives. If the entry matches, the response must set `side_effects: true`, include the full parsed graph, set `truly_treeshakeable: false`, and add a structured side-effect diagnostic. If only non-entry graph modules match, those modules must be marked conservatively reachable, the response must set `side_effects: true`, `truly_treeshakeable: false`, and diagnostics must list the matched paths. If neither the entry nor analyzed graph modules match, named/default ESM imports may be tree-shaken normally.
+**FR-021** (Critical) - Rolldown is the only semantic authority for `package.json#sideEffects`: it natively interprets boolean, string, and array forms plus nearest-transitive-package metadata, and the daemon must not override its retention decisions with a hook, a custom glob matcher, or an AST purity check. The daemon reads the root package's `sideEffects` field separately as **reporting metadata only**, which sets the response fields:
+- If the field is `true` or absent: the response sets `side_effects: true` and `truly_treeshakeable: false`.
+- If the field is `false`: the response sets `side_effects: false`.
+- If the field is an array of glob patterns (e.g., `["*.css", "dist/polyfill.js"]`): matched paths are not available from public bundler metadata, so the response reports conservatively — `side_effects: true`, `truly_treeshakeable: false`, and a structured `side_effects` diagnostic stating that side-effect confidence is conservative. Rolldown still applies the declared globs to actual retention.
 
-**FR-022** (High) - The daemon must detect when a package is not genuinely tree-shakeable by comparing the named-export minified size against the full-package minified size. If the named-export minified size is within 5% of the full-package minified size, `truly_treeshakeable` must be set to `false` in the response.
+Known upstream limitation (recorded in the bundler-redesign qualification): rolldown 1.1.5 does not match string/array `sideEffects` globs on Windows paths, so glob-declared-effectful files can over-shake there; boolean forms behave correctly. The conservative array reporting above keeps the confidence surface honest, and the construct matrix re-attempts the correct semantics on every rolldown bump.
 
-**FR-023** (High) - The daemon must process all imports in a single `BatchRequest` concurrently using a Rayon thread pool. The thread pool must be sized to `max(1, available_parallelism - 2)` to leave headroom for VS Code's renderer and extension host threads. This is configured via `rayon::ThreadPoolBuilder::new().num_threads(std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(1)).build_global()`. The `num_cpus` crate must not be used; `std::thread::available_parallelism()` (stable since Rust 1.59) is the stdlib replacement and correctly respects cgroup limits.
+**FR-022** (High) - The daemon must detect when a package is not genuinely tree-shakeable by comparing the named-export minified size against the full-package minified size. If the named-export minified size exceeds 95% of the full-package minified size, `truly_treeshakeable` must be set to `false` in the response.
+
+**FR-023** (High) - The daemon must process all imports in a single `BatchRequest` concurrently. Resolve-only work and cache classification remain on the global Rayon thread pool, which must be sized to `max(1, available_parallelism - 2)` to leave headroom for VS Code's renderer and extension host threads (`std::thread::available_parallelism()`; the `num_cpus` crate must not be used). Cache misses that require a bundler build must run as async work behind a daemon-wide two-permit execution boundary and must never be invoked from an outer global-Rayon parallel loop, because Rolldown owns its own internal Rayon parallelism and nesting the two oversubscribes the pool. Cache hits bypass the boundary and never construct a bundler. Batch and file-size responses must preserve input ordering even when misses complete out of order; streaming responses may emit in completion order with their existing indexes.
 
 **FR-024** (Critical) - The Rust daemon must operate exclusively via static AST analysis. It is prohibited from evaluating, executing, or interpreting any code found within third-party packages. No `eval`, subprocess execution, or dynamic code loading of any kind is permitted.
 
-**FR-024a** (High) - CommonJS support must be implemented through static analysis only. For CJS entry points, the daemon may scan literal relative `require()` calls and common export shapes such as `exports.foo`, `exports["foo"]`, `module.exports.foo`, `module.exports["foo"]`, `module.exports = { foo }`, and default-like `module.exports = function/class`. String, template, comment, and regex literal bodies must be masked before scanning so text that merely resembles `require()` is not treated as a dependency. Dynamic `require()`, unsupported export shapes, and unresolved CJS dependencies must fall back to conservative entry sizing with `cjs_fallback` or `cjs_resolution` diagnostics. File-level size requests that contain only CommonJS imports must return conservative non-deduped CJS totals with diagnostics instead of reporting zero bytes. The daemon must never use `oxc_transformer` as a CJS-to-ESM converter because the pinned OXC transformer does not provide that conversion path.
+**FR-024a** (High) - CommonJS support is provided by Rolldown's link-time ESM/CJS interop, which is static analysis (the FR-024 prohibition on evaluation holds; Rolldown never executes package code). Named access into a CJS module works through interop binding at link time; a CJS package without granular module boundaries retains its whole library, which is the correct measured cost. Export enumeration for CJS entries reads the linked chunk's export list and therefore may surface only `default` even when `exports.name =` assignments are statically visible — the daemon must not guess additional names (Section 10.7's never-guess rule). Engine failures on CJS entries fall back to conservative static entry sizing with structured diagnostics, and file-level size requests must return conservative totals with diagnostics instead of reporting zero bytes.
 
-**Implementation status note (Windows alpha):** The current Windows alpha runs the OXC graph pipeline for ESM entries and uses the CommonJS static analyzer described in FR-024a for CJS entries. When static graph analysis cannot safely proceed, the daemon returns conservative static-entry estimates with structured diagnostics instead of throwing away partial successful results.
+**Implementation status note:** The daemon runs the Rolldown engine for all size-producing paths (individual analysis, full-package comparison, export enumeration, prewarm, and combined file sizing). When the engine cannot safely produce a trustworthy bundle, the daemon returns conservative static-entry estimates with structured diagnostics instead of throwing away partial successful results.
 
 ### 5.5 Caching
 
@@ -686,11 +683,10 @@ The specific per-dependency policy for each crate and package is recorded in the
 
 | Component                  | Crate                        | Rationale                                                                                                                                                                                                                              |
 | -------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Module resolution          | `oxc_resolver` (v11.x)       | Production-ready, 30x faster than webpack's enhanced-resolve, used by Rolldown and Nuxt. Note: lives in a separate repository (`oxc-project/oxc-resolver`), versioned independently from the main OXC monorepo.                        |
+| Root module resolution     | `oxc_resolver` (v11.x)       | Production-ready, 30x faster than webpack's enhanced-resolve, used by Rolldown and Nuxt. Resolves the root package request before bundling so cache identity and fast hits never construct a bundler; the engine mirrors its condition/main-field configuration for transitive resolution. Note: lives in a separate repository (`oxc-project/oxc-resolver`), versioned independently from the main OXC monorepo. |
 | Parsing                    | `oxc_parser` (v0.139.x)      | ~3x faster parsing throughput than SWC on JS/TS input, arena-allocated AST, production-ready                                                                                                                                           |
-| Semantic analysis          | `oxc_semantic` (v0.139.x)    | Produces scope trees, symbol tables, and binding information for transform scoping, binding-aware bundle renaming, and generated-source validation boundaries.                                                                         |
-| Tree-shaking               | Custom module graph walker   | Built on `oxc_parser` + `oxc_resolver` + `oxc_semantic`. OXC does NOT provide a standalone tree-shaker; the daemon must implement module graph construction, cross-module reachability analysis, and side-effect tracking. See FR-018. |
-| TypeScript / JSX transform | `oxc_transformer` (v0.139.x) | Strips TypeScript types and transforms JSX before minification. Does NOT perform tree-shaking.                                                                                                                                         |
+| Semantic analysis          | `oxc_semantic` (v0.139.x)    | Produces scope trees, symbol tables, and binding information used to validate the linked chunk before minification.                                                                                                                    |
+| Linking and tree-shaking   | `rolldown` (v1.1.x)          | Embedded Rust bundler built on OXC. Owns transitive resolution, ESM/CJS linking, binding/namespace semantics, `sideEffects` interpretation, statement/module retention, symbol deconfliction, and TS/TSX/JSX/JSON handling. Wrapped behind one narrow adapter; no Rolldown type crosses the engine contract. See FR-018 and Section 10.7. |
 | Minification and mangling  | `oxc_minifier` (v0.139.x)    | Dead code elimination, constant folding, branch pruning, and supported mangling metadata for codegen. Stable 0.x release line; acceptable for size estimation within 1-2% variance.                                                    |
 | Code generation            | `oxc_codegen` (v0.139.x)     | Converts the minified AST back to a JavaScript string. Required because `oxc_minifier` operates on the AST, not on text. Supports `minify: true` for whitespace removal.                                                               |
 | Gzip compression           | `flate2`                     | Stable, widely used, level 6 default                                                                                                                                                                                                   |
@@ -705,7 +701,7 @@ The specific per-dependency policy for each crate and package is recorded in the
 
 ### 9.3 OXC Versioning Note
 
-OXC Rust crates use 0.x versions, but that does not mean they are alpha quality. OXC follows Rust package versioning before a 1.0 line while publishing production-ready crates. Import Lens pins the OXC analysis stack to one coordinated resolved version across Rust crates so parser, AST, semantic, transformer, minifier, and codegen APIs cannot drift independently. `daemon/Cargo.toml` must use Cargo's exact (`=`) requirement syntax (for example `=0.139.0`) for every OXC monorepo crate, for the independently versioned `oxc_resolver` crate, and for the `rolldown` crate family (`rolldown`, `rolldown_common`, `rolldown_error`), because the coordinated compiler stack moves only through its updater. Every version jump — patch included — is a coordinated, deliberate upgrade; nothing flows in through a general `cargo update`. Because even a patch bump can shift `oxc_minifier` output, the CI accuracy suite (`pnpm test:accuracy`, run on every push and pull request) is the safety net that catches drift the committed `Cargo.lock` lets through — the lock only moves on an intentional `cargo update`. That suite detects only the drift its fixtures can express, so the fixtures must reach the paths an OXC release can move: real npm packages pinned by a committed lockfile (`css-tree`, `date-fns`, and `lodash` — the last because it declares no `module` field and is therefore the only fixture that drives `SourceType::cjs()` and the CommonJS IIFE wrapper), plus a TypeScript package, the only fixture that reaches the `graph.rs` transform. Real fixtures are downloaded on demand; a failed download degrades to a warned skip locally and must be a hard failure under `IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES=1`, which CI sets. Coordinated minor/major OXC upgrades must be performed as an intentional batch with lockfile updates and the compiler-stack coordination test suite, capturing the accuracy byte counts before and after and tracing every difference to a specific upstream change; an unexplained difference blocks the upgrade. The repository must provide `pnpm deps:update:compiler` for targeted stack upgrades, supporting explicit versions, Cargo-derived latest resolution, and dry-run mode while updating `daemon/Cargo.toml`, `scripts/compiler-stack.config.mjs`, the generated `scripts/compiler-stack.fingerprint.json`, lockfiles, and this SRS together. Tests must never carry a stack version literal: `scripts/test/compiler-stack-coordination.test.mjs` derives its expectations from `scripts/compiler-stack.config.mjs`, which is the single source of truth for the resolved versions. The updater must fail before edits when requested versions are invalid, unavailable, or unsatisfiable as one Cargo-resolved graph, OXC monorepo crate versions are not coordinated, exact pins are missing, or `oxc_mangler` is reintroduced. `oxc_resolver` is versioned independently in a separate repository and is pinned separately. The Docker builder plus `rust-toolchain.toml` follow stable Rust so dependency MSRV bumps are picked up during deliberate upgrade runs. The Docker cross-build toolchain also follows latest stable Zig and latest `cargo-zigbuild` by default, with exact build-arg overrides available only for emergency bisects. Minifier output can differ from SWC by 1 to 2 percent; that variance is acceptable for inline size estimates. See constraint C-001 in Section 13.1.
+OXC Rust crates use 0.x versions, but that does not mean they are alpha quality. OXC follows Rust package versioning before a 1.0 line while publishing production-ready crates. Import Lens pins the OXC analysis stack to one coordinated resolved version across Rust crates so parser, semantic, minifier, and codegen APIs cannot drift independently. `daemon/Cargo.toml` must use Cargo's exact (`=`) requirement syntax (for example `=0.139.0`) for every OXC monorepo crate, for the independently versioned `oxc_resolver` crate, and for the `rolldown` crate family (`rolldown`, `rolldown_common`, `rolldown_error`), because the coordinated compiler stack moves only through its updater. Every version jump — patch included — is a coordinated, deliberate upgrade; nothing flows in through a general `cargo update`. Because even a patch bump can shift `oxc_minifier` output, the CI accuracy suite (`pnpm test:accuracy`, run on every push and pull request) is the safety net that catches drift the committed `Cargo.lock` lets through — the lock only moves on an intentional `cargo update`. That suite detects only the drift its fixtures can express, so the fixtures must reach the paths an OXC release can move: real npm packages pinned by a committed lockfile (`css-tree`, `date-fns`, and `lodash` — the last because it declares no `module` field and is therefore the only fixture that drives the engine's CJS link-time interop path), plus a TypeScript package, the only fixture that drives the engine's TypeScript transform path. Real fixtures are downloaded on demand; a failed download degrades to a warned skip locally and must be a hard failure under `IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES=1`, which CI sets. Coordinated minor/major OXC upgrades must be performed as an intentional batch with lockfile updates and the compiler-stack coordination test suite, capturing the accuracy byte counts before and after and tracing every difference to a specific upstream change; an unexplained difference blocks the upgrade. The repository must provide `pnpm deps:update:compiler` for targeted stack upgrades, supporting explicit versions, Cargo-derived latest resolution, and dry-run mode while updating `daemon/Cargo.toml`, `scripts/compiler-stack.config.mjs`, the generated `scripts/compiler-stack.fingerprint.json`, lockfiles, and this SRS together. Tests must never carry a stack version literal: `scripts/test/compiler-stack-coordination.test.mjs` derives its expectations from `scripts/compiler-stack.config.mjs`, which is the single source of truth for the resolved versions. The updater must fail before edits when requested versions are invalid, unavailable, or unsatisfiable as one Cargo-resolved graph, OXC monorepo crate versions are not coordinated, exact pins are missing, or `oxc_mangler` is reintroduced. `oxc_resolver` is versioned independently in a separate repository and is pinned separately. The Docker builder plus `rust-toolchain.toml` follow stable Rust so dependency MSRV bumps are picked up during deliberate upgrade runs. The Docker cross-build toolchain also follows latest stable Zig and latest `cargo-zigbuild` by default, with exact build-arg overrides available only for emergency bisects. Minifier output can differ from SWC by 1 to 2 percent; that variance is acceptable for inline size estimates. See constraint C-001 in Section 13.1.
 
 ### 9.4 Dependency Manifest (Current Resolved Versions)
 
@@ -717,14 +713,11 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 | ----------------- | ------------------------ | -------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `oxc_parser`      | 0.139.0                  | `=` exact pin  | ✅ Stable API    | OXC monorepo crate. Must be upgraded in lockstep with the other OXC monorepo crates.                                                                                                       |
 | `oxc_resolver`    | 11.23.0                  | `=` exact pin  | ✅ Stable        | Separate repo from OXC monorepo; versioned independently and upgraded separately.                                                                                                          |
-| `rolldown`        | 1.1.5                    | `=` exact pin  | ⚠️ No Rust-API semver | Unconditional dependency (with its `rolldown_common`/`rolldown_error` siblings at the same monorepo version) linked into the shipped binary since the bundler-redesign Phase 2 integration; production output still comes from the legacy pipeline until the Phase 3 cutover flips `USE_ROLLDOWN_ENGINE`. Coordinated with the OXC stack through `pnpm deps:update:compiler` and the generated graph fingerprint. |
+| `rolldown`        | 1.1.5                    | `=` exact pin  | ⚠️ No Rust-API semver | The production semantic bundler since the Phase 3 cutover (with its `rolldown_common`/`rolldown_error` siblings at the same monorepo version). Every size-producing path links and tree-shakes through it. Coordinated with the OXC stack through `pnpm deps:update:compiler` and the generated graph fingerprint; every version bump re-runs the bundler-redesign qualification gates. |
 | `oxc_semantic`    | 0.139.0                  | `=` exact pin  | ✅ Stable API    | Must match `oxc_parser` resolved version.                                                                                                                                                  |
-| `oxc_transformer` | 0.139.0                  | `=` exact pin  | ✅ Stable API    | TS/JSX stripping only. Does NOT tree-shake.                                                                                                                                                |
 | `oxc_minifier`    | 0.139.0                  | `=` exact pin  | ✅ Stable API    | Test every upgrade against the accuracy suite because minified output can shift across releases. The daemon uses the minifier result's scoping and private-member mappings for codegen.    |
 | `oxc_codegen`     | 0.139.0                  | `=` exact pin  | ✅ Stable API    | Required for AST -> string. Use `minify: true`.                                                                                                                                            |
-| `oxc_allocator`   | 0.139.0                  | `=` exact pin  | ✅ Stable        | Arena allocator. Must match parser resolved version.                                                                                                                                       |
-| `oxc_ast`         | 0.139.0                  | `=` exact pin  | ✅ Stable API    | Shared AST data structures. Must match parser resolved version.                                                                                                                            |
-| `oxc_ast_visit`   | 0.139.0                  | `=` exact pin  | ✅ Stable API    | AST visitor utilities used for syntax-aware bundle rewrite context such as object shorthand detection. Must match parser resolved version.                                                 |
+| `oxc_allocator`   | 0.139.0                  | `=` exact pin  | ✅ Stable        | Arena allocator. Must match parser resolved version.                                                                                                                                      |
 | `oxc_span`        | 0.139.0                  | `=` exact pin  | ✅ Stable        | Source locations. Must match parser resolved version.                                                                                                                                      |
 | `oxc_syntax`      | 0.139.0                  | `=` exact pin  | ✅ Stable API    | Syntax metadata used by the parser and downstream OXC stages. Must match parser resolved version.                                                                                          |
 | `papaya`          | 0.2.4                    | `~0.2`         | Pre-1.0         | Uses pinning API (`map.pin()`). Recycle triggers at 200,000 cached entries (NFR-004a). Watch for breaking changes.                                                                         |
@@ -1241,23 +1234,22 @@ Malformed or versionless manifest fallback results must not be persisted to `pap
 
 ### 10.3 Virtual Entry Module
 
-For each cache miss, the daemon constructs an in-memory virtual file. The pattern varies by import kind:
+For each cache miss, the daemon constructs an in-memory virtual entry that the engine's plugin serves under a synthetic module id. Each requested package maps to a synthetic target `import-lens:target/<index>` that resolves to the pre-resolved absolute entry path from FR-017, so the bundler never re-resolves the bare package. Every requested surface gets a unique positional alias so strict entry signatures keep it alive, and names are emitted as JSON-escaped string literals so user-controlled names are never interpolated raw:
 
 ```javascript
-// Named imports
-export { debounce, throttle } from 'lodash-es';
+// Named import (per requested name; string-literal names work identically)
+export { "debounce" as __il_entry_0_export_0 } from "import-lens:target/0";
 
 // Default import
-export { default } from 'react';
+export { default as __il_entry_0_default } from "import-lens:target/0";
 
-// Namespace import
-export * from 'lodash-es';
-
-// Dynamic import: the package entry point is resolved directly
-// and passed to the OXC pipeline without a virtual entry file
+// Namespace, dynamic, and full-package requests use the escaping-namespace
+// form, because `export * from` would drop the target's default export:
+import * as __il_entry_0_namespace from "import-lens:target/0";
+export { __il_entry_0_namespace };
 ```
 
-Re-exports are semantically unambiguous to tree-shakers. The bundler cannot drop a named export from an entry module regardless of how aggressive dead code elimination is.
+Dynamic-import sizing maps to the full-package form: the daemon measures the complete asynchronously loaded module cost, and code splitting is disabled so the measurement stays a single static chunk. Multi-import file sizing supplies all resolved requests as entries of one build (indexes 0..n) so shared dependencies are linked once and never double-counted.
 
 ### 10.4 Compression Pipeline
 
@@ -1314,244 +1306,44 @@ Extension activates
 After computing the requested named exports, the daemon computes the full-package variant through the same bundle and minifier path. If:
 
 ```
-named_export_minified_size / full_package_minified_size >= 0.95
+named_export_minified_size / full_package_minified_size > 0.95
 ```
 
-then `truly_treeshakeable` is set to `false`. The comparison uses minified bytes rather than raw source bytes because minified and compressed bytes are the primary user-facing size surfaces. This catches packages that declare `"sideEffects": false` in `package.json` but whose internal module graph does not actually support granular export isolation. The flag is also `false` when `sideEffects` is absent or `true` because the daemon must include the full parsed graph conservatively. For `sideEffects` arrays, the flag is false only when the resolved entry or included graph path matches a side-effect pattern; non-matching array entries may be tree-shaken normally.
+then `truly_treeshakeable` is set to `false`. The comparison uses minified bytes rather than raw source bytes because minified and compressed bytes are the primary user-facing size surfaces. This catches packages that declare `"sideEffects": false` in `package.json` but whose internal module graph does not actually support granular export isolation. The flag is also `false` when `sideEffects` is absent, `true`, or an array, because those forms report `side_effects: true` conservatively per FR-021 and the full-package comparison is only meaningful for side-effect-free named imports. The full-package variant is a second engine build; if it fails, the flag degrades to `false` with a diagnostic rather than failing the analysis.
 
-### 10.7 Module Graph Walk Algorithm
+### 10.7 Bundling Engine Contract
 
-This section specifies the algorithm that `graph.rs` and `reachability.rs` must implement. It exists to resolve ambiguities that FR-018 leaves open at the implementation level.
+Cross-module linking and tree-shaking are owned by the embedded Rolldown bundler. The daemon does not implement module-graph construction, reachability analysis, binding renaming, namespace materialization, side-effect glob matching, or ESM/CJS interop; the previous custom module graph walk algorithm was deleted at the bundler-redesign Phase 3 cutover (`ANALYZER_REVISION` moved to `rolldown1`). This section specifies the engine boundary (`daemon/src/engine/`) that isolates Rolldown behind Import Lens-owned types. The authoritative design, qualification record, and construct matrix live in `docs/superpowers/specs/2026-07-10-bundler-redesign-design.md` and `daemon/tests/candidate_matrix.rs`.
 
-**Data structures**
+**Contract.** Only the engine adapter and its native plugin may import Rolldown types; no public or persistent type contains one. Callers submit a `BundleRequest` (entries with pre-resolved `entry_path`, selection — named/default/namespace/full — and reported side-effects mode, plus the runtime profile and purpose) and receive either a `BundleArtifact` or a typed `BundleFailure`. Artifact invariants:
 
-```
-ModuleGraph {
-  modules: HashMap<AbsolutePath, Module>,
-  entry: AbsolutePath,
-  dependency_paths: Vec<AbsolutePath>,
-  diagnostics: Vec<GraphDiagnostic>,
-}
+- `code` is one complete, parseable, unminified ESM chunk.
+- `loaded_paths` contains every internal real file loaded during the scan — including modules later removed by tree-shaking — canonicalized, sorted, and deduplicated.
+- `contributions` contains only modules rendered into the output, using Rolldown's rendered module lengths; they are pre-minification approximations and are not required to sum to the final chunk length.
+- `exported_names` comes from the entry chunk's public export list, never from a custom export walker.
+- Diagnostics are plain strings with stage labels; they contain no Rolldown types or debug representations.
+- A failure never returns partially linked code for measurement, and a missing or ambiguous requested export is a typed `missing_export`/`ambiguous_export` failure with zero-size semantics — never a guessed binding.
 
-Module {
-  path: AbsolutePath,
-  source: String,           // prepared ESM-like source used by the bundler
-  original_source_bytes: u64,
-  imports: Vec<ModuleEdge>, // resolved import statements
-  external_imports: Vec<ExternalImportEdge>,
-  import_statement_spans: Vec<(usize, usize)>,
-  export_specifier_statement_spans: Vec<(usize, usize)>,
-  exports: Vec<ExportDef>,  // named, default, re-export
-  reexports: Vec<ReExportDef>,
-  star_exports: Vec<StarExportDef>,
-  local_bindings: Vec<String>,
-  binding_dependencies: Vec<BindingDependency>,
-}
+**Plugin responsibilities.** The native plugin does exactly three things: resolve and load the virtual entry (Section 10.3), map each synthetic target to its pre-resolved real entry path, and record resolved/loaded real paths while enforcing the hard limits (2,000 internal modules, 20 MiB per module source, 100 MiB total module source; a breach is a typed `module_graph_limit` failure, never a partial graph). All other resolution delegates to the plugin context resolver with self-skipping. The plugin never inspects ASTs, classifies `sideEffects`, matches globs, binds imports/exports, decides statement liveness, implements interop, renames symbols, or rewrites real module source.
 
-ModuleEdge {
-  specifier: String,        // raw specifier as written in source
-  resolved: AbsolutePath,   // result of oxc_resolver
-  imported_names: Vec<String>,
-  imported_bindings: Vec<ImportedBinding>,
-}
+**Fixed build options.** ESM output format; strict entry signatures; source maps disabled; code splitting disabled so dynamic imports inline into the single chunk; minification disabled; one virtual entry; resolve condition names and main fields mirrored from the direct resolver configuration per runtime; Node builtins and unresolved externals stay external with structured diagnostics. The build must produce exactly one JavaScript chunk and no other assets — any other shape is a typed `output_shape` failure.
 
-ImportedBinding {
-  imported_name: String,    // export name in the target module
-  local_name: String,       // binding name in this module
-}
+**Dependency fingerprints.** Freshness uses every real path the engine loaded (plus package manifests), not only rendered modules, because editing a tree-shaken module can change export resolution or future retention. A static/oversized fallback result carries no loaded paths and fingerprints the manifest and entry instead.
 
-ExternalImportEdge {
-  specifier: String,        // raw specifier for builtin, peer, or unresolved external
-  imported_name: String,
-  local_name: String,
-}
+**Execution boundary.** Engine builds run as async work behind the daemon-wide two-permit boundary described in FR-023; cache hits bypass it and never construct a bundler. Blocking cache, fingerprint, minifier, and compression work stays off the async I/O threads.
 
-BindingDependency {
-  binding_name: String,     // local binding whose declaration statement is retained
-  referenced_name: String,  // local or imported binding referenced by that statement
-}
-```
+**Failure policy.** Failures are typed by stage and take the conservative static fallback (or a structured error result) — never a fabricated symbol or a measurement of partially linked output:
 
-**Graph construction (graph.rs)**
-
-```
-fn build_graph(entry_path, resolver) -> ModuleGraph:
-  graph = ModuleGraph::new()
-  queue = [entry_path]
-  visited = HashSet::new()
-  active_stack = HashSet::new()
-  total_source_bytes = 0
-
-  while queue is not empty:
-    path = queue.pop()
-    if path in visited: continue      // handles circular dependencies
-    if graph.module_count == 2000: fail("module count limit exceeded")
-    visited.insert(path)
-    active_stack.insert(path)
-
-    source = fs::read(path)
-    if source.byte_length > 20 MiB: fail("module source size limit exceeded")
-    total_source_bytes += source.byte_length
-    if total_source_bytes > 100 MiB: fail("graph source size limit exceeded")
-    prepared_source = prepare_module_source(path, source)
-    ast = oxc_parser::parse(prepared_source, SourceType::mjs())
-    imports = collect_static_imports(ast.module_record)
-    exports = collect_exports(ast.module_record)
-    local_bindings = collect_local_bindings(ast.program)
-    binding_dependencies = collect_binding_dependencies(ast.program)
-
-    resolved_edges = []
-    for import in imports:
-      match resolver.resolve(import.specifier, from = path):
-        Ok(resolved_path) =>
-          resolved_edges.push(ModuleEdge { specifier, resolved: resolved_path })
-          if resolved_path in active_stack:
-            graph.diagnostics.push(circular_dependency(path, resolved_path))
-          else if resolved_path not in visited:
-            queue.push(resolved_path)
-        Err(e) =>
-          // Treat Node builtins, unresolved peers, and unsupported externals as external
-          // and keep a structured diagnostic instead of failing the whole import.
-          graph.diagnostics.push(external_resolution(import.specifier, path, e))
-
-    graph.insert(path, Module { path, imports: resolved_edges, binding_dependencies, ... })
-    active_stack.remove(path)
-
-  return graph
-```
-
-The visited-set check on every dequeue prevents infinite loops on circular dependencies. A module that is visited twice (A imports B imports A) will have its edges walked once; the back-edge is recorded as a `circular_dependency` diagnostic and the second encounter is a no-op. Shared diamond dependencies must not be reported as cycles.
-
-**Reachability walk (reachability.rs and bundle.rs)**
-
-```
-fn reachable_exports(graph, requested_exports, include_full_entry) -> ReachableExports:
-  reachable = ReachableExports::new()
-
-  if include_full_entry:
-    mark_module_full(graph.entry)
-  else:
-    mark_module_reachable(graph.entry)
-    for export_name in requested_exports:
-      mark_export(graph.entry, export_name)
-    include_side_effect_imports(graph.entry)
-
-  return reachable
-
-fn mark_export(module, export_name):
-  if module has local export named export_name:
-    reachable.add_symbol(module.path, export_name)
-
-  for matching re-export:
-    reachable.add_symbol(module.path, export_name)
-    if re-export imports "*": mark_module_full(target_module)
-    else: mark_export(target_module, imported_name)
-
-  for star export whose target exports export_name:
-    reachable.add_symbol(module.path, export_name)
-    mark_export(target_module, export_name)
-
-  include_side_effect_imports(module)
-
-fn include_module_with_imports(module, reachable):
-  retained_bindings = retained local names for reachable exports in this module
-  // A top-level statement that declares no binding (`setup(dep);`) is kept
-  // verbatim by the rewriter and cannot be proven side-effect free by the
-  // minifier, so every root-scope name it reads is a retention root as well.
-  retained_bindings += names referenced by binding-less top-level statements
-  // "has a reachable export" is asked of reachability by module path, so it is
-  // true when ANY export of the module is reachable -- local export, named
-  // re-export, or star pass-through. Only a module reached purely for side
-  // effects has no reachable symbol and takes the conservative branch.
-  if reachable marks module as full, or module is reachable without a reachable export:
-    retained_bindings = all local and imported binding names in the module
-
-  worklist = retained_bindings
-  while worklist is not empty:
-    binding = worklist.pop()
-    for dependency in module.binding_dependencies where dependency.binding_name == binding:
-      if retained_bindings.add(dependency.referenced_name):
-        worklist.push(dependency.referenced_name)
-
-  for import_edge in module.imports:
-    if import_edge has no imported bindings:
-      include_module_with_imports(import_edge.target, reachable) // side-effect-only import
-    for imported_binding in import_edge.imported_bindings:
-      if imported_binding.local_name in retained_bindings:
-        reachable.add_symbol(import_edge.target, imported_binding.imported_name)
-        include_module_with_imports(import_edge.target, reachable)
-
-    // `import * as ns` retains only the exports it statically reads. If every
-    // root-scope reference to `ns` is the object of a non-computed,
-    // non-optional `ns.prop` whose prop resolves to an export of the target,
-    // each `ns.prop` span is rewritten to that export's binding and the rest of
-    // the target tree-shakes. Otherwise the namespace escapes -- read as a
-    // value, `ns[k]`, `ns?.p`, or a name the target does not export -- and the
-    // target is kept whole so its namespace object can be materialized.
-    for namespace_binding in import_edge.namespace_bindings:
-      if namespace_binding is inlined:
-        retained_import_names += the accessed property names
-      else:
-        retained_import_names += "*"   // keep_all
-
-  // Re-export and star edges carry a reachable symbol to the module that
-  // defines it. They must be followed whenever the re-exported name is
-  // reachable, not only when the whole module is kept: otherwise a plain named
-  // import that resolves to a re-export inside the target drops the defining
-  // module and the concatenated bundle references an undeclared binding.
-  for reexport in module.reexports:
-    if module is full, or reachable.has_symbol(module.path, reexport.exported_name):
-      if module is full or reexport imports "*":
-        mark_module_full(reexport.target)
-        include_module_with_imports(reexport.target, reachable)
-      else:
-        reachable.add_symbol(reexport.target, reexport.imported_name)
-        include_module_with_imports(reexport.target, reachable)
-
-  for star_export in module.star_exports:
-    if module is full:
-      mark_module_full(star_export.target)
-      include_module_with_imports(star_export.target, reachable)
-    else:
-      for name in reachable symbols of module.path where star_export.target provides name:
-        reachable.add_symbol(star_export.target, name)
-      if any such name existed:
-        include_module_with_imports(star_export.target, reachable)
-```
-
-Named/default import analysis must not recurse into every static import of an included module. It follows only side-effect-only imports, full-module conservative inclusion, explicit `sideEffects` array matches, imported bindings reached from the retained export/local dependency closure, and re-export/star edges whose re-exported name is itself reachable. This prevents a dead export such as `export const unused = huge` from pulling in `huge.js` when the user imported only `used`, while still bundling the module that actually defines a re-exported symbol.
-
-Because the bundler walk marks symbols as it descends, a module already visited may later gain a newly reachable symbol. Re-visit change detection must therefore key on the union of the module's retained bindings and its reachable symbol names; keying on bindings alone would early-return and leave a re-export chain unexpanded, since a re-export contributes no local binding.
-
-**Namespace objects**
-
-A namespace import whose binding escapes has no declaration in the concatenated bundle,
-because the import statement is stripped. For every included module that another included
-module needs as a namespace, the bundler must emit
-`const __m{N}_namespace = { <export>: <binding>, ... }`, listing that module's exports
-transitively through its re-exports and star exports. `export * as X from "./x.js"` binds
-`X` to x's namespace object rather than to any single export, so x must be materialized
-too; the same holds for a named import of such a re-export. The set of modules needing a
-namespace object is demand-driven -- seeded from escaping namespace imports, named imports
-that resolve to a namespace, and inlined member reads that resolve to a namespace, then
-closed over the seeds' own `export * as` children -- so an unreached `export * as` never
-drags a module and its exports into the bundle. A member is emitted only when the module
-declaring its binding is itself included, so materialization can never introduce a
-reference to a pruned definition. esbuild materializes live getters through an `__export`
-helper; an object literal is equivalent for size purposes because the bundle is measured,
-never executed.
-
-**Scope renaming before concatenation**
-
-Before concatenating module sources, each module's local bindings must be renamed to a module-unique prefix to prevent collisions. The prefix is derived from the module's index in topological order: `__m{N}_{originalName}`. Renaming is applied to source slices using `oxc_semantic` binding and reference spans. The renamer must preserve UTF-8 boundaries, object shorthand, object destructuring, array destructuring, and rest binding semantics.
-
-**Side-effect handling**
-
-If `sideEffects: false` is set in the package's `package.json`, modules that contribute no reachable symbols or side-effect-only imports are excluded from concatenation entirely. If `sideEffects` is absent or `true`, all parsed modules are included in concatenation regardless of reachability, and only the minification step removes dead code. If `sideEffects` is an array, the daemon evaluates the resolved entry and graph module paths against the configured patterns: matching modules force conservative inclusion and side-effect diagnostics, while non-matching paths may still be pruned through normal reachability and retained-binding closure.
-
-**Graph cache**
-
-The daemon may keep parsed module graphs in a side in-memory cache keyed by canonical entry path and resolver/runtime profile. This cache is an optimization only: size results remain keyed by the structured v3 cache identity and persisted in `redb`; graph cache misses must not change user-visible results.
+| failure stage | behavior |
+| --- | --- |
+| root package cannot be resolved | existing package/type-only/static fallback behavior |
+| engine cannot resolve an internal import | legitimate external boundary preserved when possible; otherwise conservative static fallback |
+| `missing_export` / `ambiguous_export` | error result with zero size fields |
+| parse/link/generate failure | conservative static fallback with stage diagnostic |
+| `output_shape` | conservative static fallback |
+| `module_graph_limit` | conservative static fallback |
+| OXC validation/minification failure after linking | conservative static fallback with the OXC stage diagnostic |
+| compression failure | existing per-import computation error behavior |
 
 ---
 
@@ -1646,9 +1438,9 @@ strip = true
 
 **C-002:** The extension depends on a native Rust daemon for reusable analysis and therefore does not provide full analysis in browser-only VS Code environments. The deprecated `@oxc-parser/wasm` package must not be used due to its deprecated status. For VS Code for the Web, the extension enters degraded mode with no parsing or size-analysis capability.
 
-**C-003:** Rolldown now publishes an embeddable Rust crate (`rolldown` on crates.io), but its Rust API carries no semver or documentation guarantee. Every qualification gate in the bundler-redesign design (docs/superpowers/specs/2026-07-10-bundler-redesign-design.md) passed on 2026-07-11, so `rolldown` and its `rolldown_common`/`rolldown_error` siblings are exact-pinned unconditional dependencies and the engine is fully wired behind the `USE_ROLLDOWN_ENGINE` selection seam. The production engine remains the custom module graph walker built on OXC primitives until the Phase 3 atomic cutover flips that seam and deletes the legacy pipeline. See Appendix C: Technology Watch.
+**C-003:** Rolldown publishes an embeddable Rust crate (`rolldown` on crates.io), but its Rust API carries no semver or documentation guarantee. Every qualification gate in the bundler-redesign design (docs/superpowers/specs/2026-07-10-bundler-redesign-design.md) passed on 2026-07-11, and the Phase 3 atomic cutover made Rolldown the only semantic bundler: the custom module graph walker, reachability analysis, manual concatenation/renaming, and static CJS scanner were deleted, and `ANALYZER_REVISION` moved to `rolldown1`. The risk of the missing API guarantee is contained by exact pins on the `rolldown` family, the coordinated compiler-stack updater and generated graph fingerprint, one narrow adapter that no Rolldown type escapes, and mandatory requalification on every version bump. A consequence of Rolldown's caret ranges on OXC: the OXC upgrade cadence is now bounded by Rolldown releases, and the updater rejects any request that would split the stack. See Appendix C: Technology Watch.
 
-**C-004:** A WASM daemon fallback is deferred to v1.1 or later. The candidate target is `wasm32-wasip1-threads`, which is an experimental Rust/LLVM target. Thread support requires `SharedArrayBuffer` and cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`). Any future WASM binary must be compiled with an explicit `--max-memory` linker flag set to at least `67108864` (64 MB) to provide sufficient headroom for Rayon's thread stacks; larger values may be needed if the module graph walker exceeds this during deep dependency trees. VS Code for the Web remains degraded mode in v1.0 because browser `SharedArrayBuffer` availability and local `node_modules` access are not guaranteed. The `wasi-threads` proposal used by this target is considered legacy; the industry is transitioning toward the Component Model. See Appendix C: Technology Watch.
+**C-004:** A WASM daemon fallback is deferred to v1.1 or later. The candidate target is `wasm32-wasip1-threads`, which is an experimental Rust/LLVM target. Thread support requires `SharedArrayBuffer` and cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`). Any future WASM binary must be compiled with an explicit `--max-memory` linker flag set to at least `67108864` (64 MB) to provide sufficient headroom for Rayon's thread stacks; larger values may be needed if bundling exceeds this during deep dependency trees. VS Code for the Web remains degraded mode in v1.0 because browser `SharedArrayBuffer` availability and local `node_modules` access are not guaranteed. The `wasi-threads` proposal used by this target is considered legacy; the industry is transitioning toward the Component Model. See Appendix C: Technology Watch.
 
 ### 13.2 Out-of-Scope Decisions
 
@@ -1766,14 +1558,21 @@ import-lens/
 │       │   ├── codec.rs               # MessagePack length-prefix codec
 │       │   ├── server.rs              # Unix socket / named pipe listener
 │       │   └── protocol.rs            # Protocol v7 serde types
+│       ├── engine/
+│       │   ├── mod.rs                 # Import Lens-owned request/artifact/failure types
+│       │   ├── adapter.rs             # Rolldown build orchestration and output translation
+│       │   ├── plugin.rs              # Native plugin: virtual entry, target mapping, limits
+│       │   ├── entry.rs               # Virtual entry source generation
+│       │   ├── boundary.rs            # Two-permit async execution boundary
+│       │   ├── scheduling.rs          # Ordered miss scheduling helpers
+│       │   ├── dependency_paths.rs    # Loaded-path fingerprint sources
+│       │   └── limits.rs              # Hard module/source limits
 │       ├── pipeline/
 │       │   ├── mod.rs
-│       │   ├── resolver.rs            # oxc_resolver usage
-│       │   ├── graph.rs               # Module graph walker (oxc_parser + oxc_resolver + oxc_semantic)
-│       │   ├── reachability.rs        # Reachability analysis and dead code marking
-│       │   ├── bundle.rs              # UTF-8-safe module concatenation and renaming
-│       │   ├── cjs.rs                 # Static CommonJS graph analysis
+│       │   ├── resolver.rs            # oxc_resolver root resolution
+│       │   ├── node_builtins.rs       # Node builtin specifier detection
 │       │   ├── file_size.rs           # File-level shared import cost computation
+│       │   ├── fallback.rs            # Conservative static entry sizing
 │       │   ├── minify.rs              # oxc_minifier + oxc_codegen usage
 │       │   └── compress.rs            # flate2 + brotli + zstd (nested rayon::join)
 │       ├── cache/
@@ -1830,7 +1629,7 @@ import-lens/
 | ID    | Decision                                                                                  | Rationale                                                                                                                                                                                                                                                                                                                                                                                                                  | Alternatives Considered                                                                                                                                                                                                                          |
 | ----- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | D-001 | Separate daemon process over napi-rs native addon                                         | A panic in a native addon crashes the VS Code extension host. A separate process isolates failures completely.                                                                                                                                                                                                                                                                                                             | napi-rs native addon (rejected: crash risk to editor)                                                                                                                                                                                            |
-| D-002 | OXC for the full pipeline (parse, resolve, semantic, tree-shake, minify, mangle, codegen) | Single AST representation shared across all stages eliminates re-parsing overhead. All OXC crates are embeddable in Rust. OXC is used internally by Rolldown and Vite 8. Note: OXC does not provide a standalone tree-shaker; a custom module graph walker is required.                                                                                                                                                    | Rolldown Rust API (rejected: no stable embedding API); ESBuild (rejected: written in Go, requires separate WASM layer from Rust)                                                                                                                 |
+| D-002 | OXC for the full pipeline (parse, resolve, semantic, tree-shake, minify, mangle, codegen) | Single AST representation shared across all stages eliminates re-parsing overhead. All OXC crates are embeddable in Rust. OXC is used internally by Rolldown and Vite 8. Note: OXC does not provide a standalone tree-shaker; a custom module graph walker was initially required. **Partially superseded by D-017:** linking/tree-shaking moved to Rolldown; OXC remains the document parser, root resolver, validator, and final minifier. | Rolldown Rust API (rejected at the time: no stable embedding API — since published and adopted, see D-017); ESBuild (rejected: written in Go, requires separate WASM layer from Rust)                                                            |
 | D-003 | oxc_minifier over swc_core                                                                | SWC platform binaries are approximately 25 to 27 MB per target, violating the 20 MB VSIX limit. For size estimation, 1-2% accuracy variance is acceptable.                                                                                                                                                                                                                                                                 | swc_core (rejected: distribution size); Terser (rejected: requires Node.js subprocess)                                                                                                                                                           |
 | D-004 | MessagePack over JSON for IPC                                                             | Payloads typically 20-40% smaller than JSON. In the Rust rmp-serde path, deserialization is consistently faster. Meaningful for batch responses of 20+ imports.                                                                                                                                                                                                                                                            | JSON (rejected: performance); Protocol Buffers (rejected: schema overhead disproportionate for this local IPC protocol)                                                                                                                          |
 | D-005 | Rust `oxc_parser` in the daemon over extension-host parsing                               | Keeps reusable import/specifier/package analysis shared by VS Code, CLI, and future editors. Returns ESM import info directly from OXC module records without an extension-host AST walk or runtime parser dependency. The deprecated `@oxc-parser/wasm` package is not used.                                                                                                                                              | TypeScript Compiler API (rejected: heavy and editor-specific); Node `oxc-parser` (rejected: duplicates daemon logic); `@oxc-parser/wasm` (rejected: deprecated); Regex (rejected: fails on multi-line and complex syntax)                        |
@@ -1838,13 +1637,14 @@ import-lens/
 | D-007 | redb over sled for persistent cache                                                       | redb hit 1.0 stable with a committed stable file format. sled has never shipped 1.0 and its on-disk format remains unstable.                                                                                                                                                                                                                                                                                               | sled (rejected: not stable); rusqlite/SQLite (viable but adds a C FFI dependency)                                                                                                                                                                |
 | D-008 | Three compression formats (gzip, brotli, zstd)                                            | All three are in common production use as of 2026. CDNs serve all three. Running them in parallel with nested rayon::join adds negligible latency.                                                                                                                                                                                                                                                                         | Gzip only (rejected: brotli and zstd offer meaningfully better ratios); Brotli only (rejected: zstd is now mainstream)                                                                                                                           |
 | D-009 | Platform-specific VSIX distribution                                                       | Users download only the binary for their own platform. Each VSIX is 10-13 MB rather than a single 120+ MB universal package.                                                                                                                                                                                                                                                                                               | Universal VSIX (rejected: unacceptable total size); Runtime download of daemon binary (rejected: requires network at activation)                                                                                                                 |
-| D-010 | Custom module graph walker over Rolldown embedding                                        | Rolldown does not expose a stable Rust API (C-003). Building a custom walker from `oxc_parser` + `oxc_resolver` + `oxc_semantic` provides full control over reachability analysis and side-effect tracking.                                                                                                                                                                                                                | Rolldown Rust API (rejected: unstable); Skip tree-shaking (rejected: inaccurate sizes for named imports)                                                                                                                                         |
+| D-010 | Custom module graph walker over Rolldown embedding                                        | **Superseded by D-017.** At the time, Rolldown did not expose an embeddable Rust crate (C-003). The custom walker built from `oxc_parser` + `oxc_resolver` + `oxc_semantic` served until its structural correctness defects motivated the bundler redesign.                                                                                                                                                                | Rolldown Rust API (rejected at the time: unstable); Skip tree-shaking (rejected: inaccurate sizes for named imports)                                                                                                                             |
 | D-011 | Hybrid inline rendering                                                                   | VS Code native inlay hints are accessible, provide reliable size-label hovers, and integrate with editor controls, but the API cannot assign arbitrary colors per hint. Import Lens therefore defaults to decoration-backed colored inline hints through `importLens.inlineRenderer: "colored"` for confidence visibility, while keeping native inlay hints available for users who prioritize screen-reader accessibility. | Native InlayHints only (rejected: no per-hint confidence colors); colored decorations only (rejected: weaker accessibility); end-of-line decorations only (rejected: less inline and less accessible); CodeLens only (rejected: takes full line) |
 | D-012 | TypeScript 7.x over TypeScript 6.x                                                        | TS 7.0 is the native Go-based compiler and the current stable release. Import Lens adopted TS 6 as the deliberate bridge: modern tsconfig defaults, explicit ambient type inclusion (`types: ["node", "vscode"]`), and no legacy patterns. That bet paid off — moving to 7 needed only the `devDependency` bump, with `tsc --noEmit` clean and no source or `tsconfig.json` change.                                        | TypeScript 6.x (rejected: superseded; kept only as the migration bridge). TypeScript 5.x (rejected: legacy defaults, would require migrating through 6.x anyway)                                                                                 |
 | D-013 | `request_id` field in BatchRequest/BatchResponse for cancellation                         | Timing-based heuristics for discarding stale responses are fragile when two requests are fired within milliseconds of each other. An explicit monotonic ID makes the discard decision unambiguous at zero protocol cost.                                                                                                                                                                                                   | Timing-only approach (rejected: race condition on fast edits); sequence number on daemon side only (rejected: daemon has no state to track which request is current)                                                                             |
 | D-014 | `CacheInvalidateAll` as a distinct message type                                           | Sending one `CacheInvalidate` per package when `node_modules` is deleted would produce hundreds of IPC messages in a large project. A single bulk message is more efficient and avoids buffer pressure on the socket. The 20-package threshold is a pragmatic cutoff; below it, per-package messages give the daemon more granular invalidation information.                                                               | Always use bulk (rejected: loses granularity for small changes); always use per-package (rejected: floods socket on full reinstall)                                                                                                              |
 | D-015 | Extension-side insight enrichment over daemon protocol expansion                          | Git diff state, VS Code globalState history, and UI-only barrel warnings are editor-context features. Keeping them in the extension avoids changing the native protocol for data the daemon cannot independently know and keeps daemon cache identity stable.                                                                                                                                                              | Add fields to `ImportResult` for every insight (rejected: daemon lacks editor/Git context); compute all insights in the daemon (rejected: would require Git and VS Code storage access in Rust)                                                  |
 | D-016 | Clipboard named-import candidates over automatic namespace rewrites                       | Rewriting `import * as ns` safely requires semantic usage rewriting across the file, including property accesses and potential shadowing. The v1 feature enumerates exports and copies a candidate import while leaving code changes under user control.                                                                                                                                                                   | Automatic rewrite CodeAction (rejected: unsafe without full semantic transform); no action (rejected: misses a high-value tree-shaking improvement path)                                                                                         |
+| D-017 | Rolldown embedding over the custom module graph walker (2026 bundler redesign)            | Rolldown began publishing an embeddable Rust crate, and the custom walker had accumulated structural correctness defects (dangling generated bindings, dropped effectful initializers, silently merged ambiguous star exports, empty external re-export bundles) rooted in three hand-enumerated decisions that nothing forced to agree. Rolldown 1.1.5 passed every qualification gate (construct matrix, pinned real packages, absolute latency/memory/determinism) on 2026-07-11 and was ~1.9x faster than the legacy engine. Its unguaranteed Rust API is contained by exact pins, the coordinated compiler-stack updater with a generated graph fingerprint, one narrow adapter, and requalification on every bump. | Keep fixing the custom walker (rejected: each fix surfaced defects its predecessor masked); custom reference-closure/fixpoint redesign (rejected: permanently owns bundler semantics); esbuild (oracle only: no supported Rust embedding); SWC bundler (rejected: second compiler stack, caller-owned glue); Rspack/Farm (rejected: integration scope) |
 
 ---
 
@@ -1856,10 +1656,10 @@ This table tracks components that are currently used with known limitations, or 
 | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
 | `oxc_minifier`                            | Stable 0.x release line, currently resolved to 0.139.0. Produces 1-2% variance from SWC.                                                                       | New OXC releases; minifier API or output changes.                                                                                                  | Upgrade OXC crates as a coordinated batch; re-run integration suite to confirm no accuracy regressions.                                                                                                                           | Every OXC release     |
 | `oxc_resolver`                            | Currently resolved to 11.23.0. Separate repository (`oxc-project/oxc-resolver`), versioned independently from the OXC monorepo. Currently on major version 11. | Major version bump (e.g. 12.x); breaking changes to `ResolverOptions` or the `resolve()` API.                                                      | May require `Cargo.toml` update and code changes in `resolver.rs`. Upgrade separately from the OXC monorepo batch and run integration suite before merging.                                                                       | Each release          |
-| Rolldown Rust API (`rolldown_core`)       | No stable public API. Import Lens uses a custom module graph walker instead.                                                                                    | Stable embeddable Rust crate on crates.io with tree-shaking API.                                                                                   | Would replace the custom module graph and reachability code (`graph.rs` + `reachability.rs`), significantly reducing code and improving accuracy. This is the single highest-impact migration.                                    | Quarterly             |
+| Rolldown Rust API (`rolldown`)            | **Adopted.** v1.1.5 embedded as the only semantic bundler behind the engine adapter; the custom module graph walker and reachability code were deleted at the Phase 3 cutover, exactly as this row predicted. The Rust API still carries no semver guarantee.  | Upstream Rust-API changes on every release; the Windows `sideEffects`-glob matching defect (FR-021) being fixed; a published Rust-API stability commitment.                                                                                          | Every version bump re-runs the bundler-redesign qualification gates through `pnpm deps:update:compiler`; the OXC cadence is bounded by Rolldown releases (C-003).                                    | Every rolldown release |
 | `wasm32-wasip1-threads`                   | Experimental Rust/LLVM target. Deferred v1.1 candidate; not a v1.0 runtime path.                                                                               | WASI Preview 2 / Component Model threading (`wasm32-wasip2`). The `wasi-threads` proposal is legacy; `shared-everything-threads` is the successor. | May require retargeting before a future WASM fallback ships.                                                                                                                                                                      | Semi-annually         |
 | `@vscode/wasm-wasi-core`                  | Supports WASI Preview 1 with experimental thread support. Deferred v1.1 candidate dependency.                                                                  | WASI Preview 2 support, Component Model integration, improved `SharedArrayBuffer` ergonomics.                                                      | Better thread reliability and broader environment support, subject to VS Code Desktop and Web limitations.                                                                                                                        | Semi-annually         |
-| Rust `oxc_parser`                         | Stable 0.x release line, currently resolved to 0.139.0. Used by the daemon for document import extraction and module-graph parsing.                            | OXC module-record API changes; parser diagnostics or span behavior changes.                                                                        | Upgrade OXC crates as a coordinated batch and re-run daemon import parity, graph, and package analysis tests.                                                                                                                     | Every OXC release     |
+| Rust `oxc_parser`                         | Stable 0.x release line, currently resolved to 0.139.0. Used by the daemon for document import extraction and for parsing the engine's linked chunk before validation and minification. | OXC module-record API changes; parser diagnostics or span behavior changes.                                                                        | Upgrade OXC crates as a coordinated batch and re-run daemon import parity, engine, and package analysis tests.                                                                                                                     | Every OXC release     |
 | `papaya`                                  | v0.2.4. Pre-1.0 but actively maintained. Uses seize-based GC.                                                                                                  | 1.0 stable release; API changes to pinning semantics.                                                                                              | Minor migration effort if pinning API changes. Lock-free design is correct for the workload.                                                                                                                                      | Semi-annually         |
 | VS Code Inlay Hints API                   | Stable. Used as an optional display mode.                                                                                                                      | Enhanced styling support (colors, icons), positioning improvements.                                                                                | Richer size display within inlay hints. Currently limited to plain text.                                                                                                                                                          | With VS Code releases |
 | `redb`                                    | v4.x stable. ACID, pure Rust.                                                                                                                                  | Major version bumps; potential API changes.                                                                                                        | Migration effort proportional to API surface changes. File format is committed stable. Cache schema versioning (FR-026a) ensures seamless upgrades.                                                                               | Annually              |

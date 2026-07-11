@@ -22,7 +22,7 @@ use rolldown::plugin::{
 use rolldown_common::{ModuleInfo, NormalModule};
 
 use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
-use crate::pipeline::graph::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
+use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
 
 /// Per-build state shared with the adapter, which reads it after the bundler
 /// finishes. Limit state is monotonic and thread-safe (spec §7.3).

@@ -235,6 +235,30 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   only_within_the_same_source` (cross-source isolation + same-source supersede + drop-cancels-all)
   and extension `refresh sends the document key as the request source`.
 
+### D12 — Post-cutover fingerprints re-read loaded paths after analysis; the analysis-time-hash guarantee is retired with the graph · 2026-07-11
+- **Context:** The bundler-redesign Phase 3 cutover deleted the custom module graph, whose
+  analysis-time content hashes let `dependency_fingerprints` pair a result with the exact
+  bytes the analysis read (the old "Finding 4" TOCTOU guard and its
+  `analyze_and_cache_fetches_module_graph_once` test died with it). The Rolldown engine's
+  public output exposes loaded paths but not load-time content hashes, so fingerprints are
+  now computed by re-reading each loaded path *after* the build.
+- **Decision:** Accept the re-opened window (a dependency edited between engine load and
+  fingerprinting can pair a stale result with fresh-looking fingerprints) rather than
+  re-hashing inside the plugin's load path.
+- **Rationale:** the window is milliseconds-to-seconds per import and requires an edit to a
+  transitively loaded file exactly inside it; watched `node_modules` changes still invalidate
+  via the pre-analysis generation gate, and the L1/L2 re-verify TTLs bound residual staleness
+  to one window. Hashing in the plugin would double file reads on every build to close a
+  race that eviction already bounds. Related: the old first-party CJS cached-module-set
+  freshness (D6) is superseded, not lost — the engine failure fallback measures only the
+  entry file, so its manifest+entry fingerprints now cover exactly the inputs of the cached
+  computation.
+- **Consequences / status:** lands with the Phase 3 cutover commit. Also removed in the same
+  commit: the named→namespace cache alias (`cache_full_variant_alias`), whose premise —
+  side-effectful packages size identically for named and namespace imports — was only true of
+  the old engine's conservative full-graph inclusion; Rolldown shakes pure unused exports
+  under `sideEffects: true`, so each import kind now computes its own entry.
+
 ---
 
 ## Parked / deferred

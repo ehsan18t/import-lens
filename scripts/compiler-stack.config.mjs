@@ -9,17 +9,13 @@ export const compilerStackConfig = {
   // pinned in lockstep; the updater's probe rejects any release where the
   // shared-version invariant does not hold.
   rolldownSupportCrates: ["rolldown_common", "rolldown_error"],
-  candidateFeature: "rolldown-candidate",
   oxcCrates: [
     "oxc_allocator",
-    "oxc_ast",
-    "oxc_ast_visit",
     "oxc_codegen",
     "oxc_minifier",
     "oxc_parser",
     "oxc_semantic",
     "oxc_span",
     "oxc_syntax",
-    "oxc_transformer",
   ],
 };

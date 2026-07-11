@@ -509,7 +509,7 @@ test("updateCompilerStack rejects a probe graph that resolves a coordinated crat
 
 test("updateCompilerStack rejects a manifest without the coordinated shape before edits", async () => {
   const nonCoordinated = await tempRepo({
-    cargoToml: cargoTomlFixture().replace(`oxc_ast = "=${currentOxc}"`, 'oxc_ast = "=0.0.1"'),
+    cargoToml: cargoTomlFixture().replace(`oxc_parser = "=${currentOxc}"`, 'oxc_parser = "=0.0.1"'),
   });
   const withMangler = await tempRepo({
     cargoToml: `${cargoTomlFixture()}oxc_mangler = "=${currentOxc}"\n`,

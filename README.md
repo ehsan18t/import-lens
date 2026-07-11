@@ -6,7 +6,7 @@
     <img src="./media/import-lens_poster.png" alt="Import Lens Banner" width="512px" />
 </div>
 
-Unlike existing import cost calculators that spin up heavy Node.js bundlers, Import Lens offloads all computation to a highly optimized background Rust daemon powered by the **OXC** (Oxidation Compiler) toolchain. It performs real tree-shaking, minification, and compression in milliseconds without blocking your editor or consuming massive amounts of memory.
+Unlike existing import cost calculators that spin up heavy Node.js bundlers, Import Lens offloads all computation to a highly optimized background Rust daemon built on **Rolldown** and the **OXC** (Oxidation Compiler) toolchain. It performs real bundler-grade tree-shaking, minification, and compression in milliseconds without blocking your editor or consuming massive amounts of memory.
 
 **Everything runs locally.** Your source code never leaves your machine. The only optional network access is a bounded npm registry lookup for `package.json` version hints, and you can turn that off with one setting.
 
@@ -24,7 +24,7 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
 
 - ⚡ **Instant Feedback:** See post-tree-shake, minified, and compressed (Gzip, Brotli, Zstd) sizes inline as you type.
 - 🌳 **Real Tree-shaking:** Calculates sizes for named, default, namespace, dynamic imports, re-exports, and named export candidates, not naive whole-package estimates.
-- 🦀 **Rust Daemon Engine:** Built on `oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`, and parallel Rust compression. Long jobs like registry lookups and workspace reports run on isolated worker pools so typing feedback never waits in line.
+- 🦀 **Rust Daemon Engine:** [Rolldown](https://rolldown.rs/) (built on OXC) links and tree-shakes the module graph; direct OXC (`oxc_parser`, `oxc_resolver`, `oxc_semantic`, `oxc_minifier`) parses your document, resolves packages, validates, and minifies, with parallel Rust compression. Long jobs like registry lookups and workspace reports run on isolated worker pools so typing feedback never waits in line.
 - 🧩 **Multi-Framework Support:** JavaScript, TypeScript, JSX/TSX, `.mts`/`.cts`, Svelte (`<script>` blocks), Astro (frontmatter and client scripts), and Vue (`<script>` / `<script setup>` blocks).
 - 📦 **package.json Guidance:** Dependency rows show measured install cost plus npm registry hints (`latest`, `update 19.0.0`, `install 19.0.0`, deprecation flags), with clear stale-data indicators when the registry is unreachable.
 - 📈 **Impact Insights:** Confidence levels, working-tree import cost deltas (`+2.1 kB br` on changed lines), per-import history trends, current-file totals, shared dependency explanations, and barrel re-export warnings.
@@ -149,7 +149,7 @@ Framework virtual modules and common app aliases (`astro:*`, `virtual:*`, `$app/
 
 ## How It Works
 
-Import Lens analyzes your import statements and resolves the exact package version installed in your local `node_modules`. It then constructs a virtual module graph, tree-shakes dead code using custom reachability analysis, minifies the output, and compresses it in parallel (Gzip, Brotli, Zstd).
+Import Lens analyzes your import statements and resolves the exact package version installed in your local `node_modules`. It then links and tree-shakes the module graph with the embedded Rolldown bundler, validates and minifies the linked output with OXC, and compresses it in parallel (Gzip, Brotli, Zstd).
 
 All of this happens in a secure, self-contained background daemon that streams results back per import, so your editor stays responsive even in large files. Results are keyed by the active document path, so nested workspaces, pnpm layouts, and loose files opened outside a VS Code workspace still resolve from the nearest usable package tree.
 
@@ -170,4 +170,4 @@ Import Lens never rewrites your source files. Actions that suggest named imports
 - A local workspace or loose file whose parent tree contains a populated `node_modules` directory.
 
 ---
-*Built with [OXC](https://oxc.rs/) for maximum performance.*
+*Built with [Rolldown](https://rolldown.rs/) and [OXC](https://oxc.rs/) for maximum performance.*

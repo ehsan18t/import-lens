@@ -3,11 +3,9 @@
 //! engine through a dedicated runtime owned here. Cache hits never touch
 //! this module; only misses pay for a permit.
 //!
-//! Phase 3 note (plan C1 req 1-2): before `USE_ROLLDOWN_ENGINE` flips,
-//! miss execution must move OFF the outer global-Rayon `par_iter` loops —
-//! blocking N>2 rayon workers on the two permits would starve the global
-//! pool under batch load. The bridge below is correct for the Phase 2
-//! differential tests and the dedicated service threads.
+//! Size-producing service and prewarm loops feed this boundary through the
+//! two-worker scheduler, preserving final input order without parking the
+//! global Rayon pool.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

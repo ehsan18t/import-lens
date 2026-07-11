@@ -28,17 +28,6 @@ pub(crate) fn should_skip_package_directory(path: &Path) -> bool {
     )
 }
 
-/// Whether `byte` may begin a JavaScript identifier (ASCII subset: the pipeline
-/// only synthesizes and scans ASCII identifiers).
-pub(crate) fn is_identifier_start(byte: u8) -> bool {
-    byte == b'_' || byte == b'$' || byte.is_ascii_alphabetic()
-}
-
-/// Whether `byte` may continue a JavaScript identifier.
-pub(crate) fn is_identifier_continue(byte: u8) -> bool {
-    is_identifier_start(byte) || byte.is_ascii_digit()
-}
-
 /// Builds a staged import diagnostic from an owned message and details.
 pub(crate) fn diagnostic(stage: &str, message: String, details: Vec<String>) -> ImportDiagnostic {
     ImportDiagnostic {

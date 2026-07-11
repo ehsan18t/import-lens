@@ -1,5 +1,5 @@
 use import_lens_daemon::{
-    cache::key::{cache_key_for_resolved_import, decode_cache_identity},
+    cache::key::{ANALYZER_REVISION, cache_key_for_resolved_import, decode_cache_identity},
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::resolver::{ResolvedPackage, SideEffectsMode},
 };
@@ -36,8 +36,10 @@ fn cache_key_includes_analyzer_revision() {
 
     let identity = decode_cache_identity(&key).expect("key should decode");
     assert!(
-        identity.analyzer_version.ends_with("+graph2"),
-        "analyzer version should invalidate graph2 accuracy changes: {identity:?}",
+        identity
+            .analyzer_version
+            .ends_with(&format!("+{ANALYZER_REVISION}")),
+        "cache identity must carry the current analyzer revision: {identity:?}",
     );
 }
 

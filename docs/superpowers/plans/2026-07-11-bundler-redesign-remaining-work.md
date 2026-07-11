@@ -37,10 +37,10 @@
 
 **Files:** none committed — findings flow into B1–B3 code.
 
-- [ ] **Step 1:** Locate the vendored sources: `ls ~/.cargo/registry/src/index.crates.io-*/ | grep -E "rolldown|rolldown_common|rolldown_plugin"` (Git Bash). Optionally build local docs: `cargo doc -p rolldown --no-deps --features rolldown-candidate --locked`.
-- [ ] **Step 2:** From `rolldown-1.1.5/src` and `rolldown_common-1.1.5/src`, record the exact shapes of: `BundlerBuilder` (`with_options`, `with_plugins`, `build`), `Bundler::{scan,generate,write,close}` signatures and `BundleOutput` (chunks, warnings, errors); `BundlerOptions` fields for `input` (entry list type), `cwd`, `external` (`IsExternal`), `format`, `treeshake` (`TreeshakeOptions`), `preserve_entry_signatures` (`PreserveEntrySignatures` — pick the strict variant), `code_splitting` (`CodeSplittingMode` — pick the variant that inlines dynamic imports into one chunk; verify by reading how the chunk graph consumes it), `resolve` (`ResolveOptions.condition_names/main_fields/extensions/symlinks`), `minify` (leave off).
-- [ ] **Step 3:** From `rolldown_plugin-1.1.5/src`, record the plugin trait (name, `resolve_id`, `load`, `module_parsed` hook signatures and their `Hook*Output` types), the plugin context resolver (`ctx.resolve(...)` with self-skip), and `HookSideEffects` (never returned for real modules — spec §7.4).
-- [ ] **Step 4:** Confirm how output chunks expose `exports`, `modules` (path → `RenderedModule`), and `rendered_length()`; confirm the error/warning types are convertible to strings without Debug-formatting internals (spec §5.1 forbids Rolldown types in diagnostics).
+- [x] **Step 1:** Locate the vendored sources: `ls ~/.cargo/registry/src/index.crates.io-*/ | grep -E "rolldown|rolldown_common|rolldown_plugin"` (Git Bash). Optionally build local docs: `cargo doc -p rolldown --no-deps --features rolldown-candidate --locked`.
+- [x] **Step 2:** From `rolldown-1.1.5/src` and `rolldown_common-1.1.5/src`, record the exact shapes of: `BundlerBuilder` (`with_options`, `with_plugins`, `build`), `Bundler::{scan,generate,write,close}` signatures and `BundleOutput` (chunks, warnings, errors); `BundlerOptions` fields for `input` (entry list type), `cwd`, `external` (`IsExternal`), `format`, `treeshake` (`TreeshakeOptions`), `preserve_entry_signatures` (`PreserveEntrySignatures` — pick the strict variant), `code_splitting` (`CodeSplittingMode` — pick the variant that inlines dynamic imports into one chunk; verify by reading how the chunk graph consumes it), `resolve` (`ResolveOptions.condition_names/main_fields/extensions/symlinks`), `minify` (leave off).
+- [x] **Step 3:** From `rolldown_plugin-1.1.5/src`, record the plugin trait (name, `resolve_id`, `load`, `module_parsed` hook signatures and their `Hook*Output` types), the plugin context resolver (`ctx.resolve(...)` with self-skip), and `HookSideEffects` (never returned for real modules — spec §7.4).
+- [x] **Step 4:** Confirm how output chunks expose `exports`, `modules` (path → `RenderedModule`), and `rendered_length()`; confirm the error/warning types are convertible to strings without Debug-formatting internals (spec §5.1 forbids Rolldown types in diagnostics).
 
 ### Task B1: Candidate module skeleton and the engine contract
 
@@ -121,8 +121,8 @@ pub struct BundleFailure {
 
 `ImportRuntime` already exists in the pipeline (grep `ImportRuntime` under `daemon/src` and reuse; it carries the component/client/server condition context). Reuse limit constants from `crate::pipeline::graph::{MAX_GRAPH_MODULES, MAX_MODULE_SOURCE_BYTES, MAX_GRAPH_SOURCE_BYTES}` — in Part D those constants MOVE into `candidate` (rename module then) rather than being re-declared.
 
-- [ ] **Step 1:** Write `mod.rs` with the types above; `engine.rs`/`plugin.rs`/`entry.rs` as empty shells compiling under the feature.
-- [ ] **Step 2:** `cargo check -p import-lens-daemon --locked --features rolldown-candidate` — clean; `cargo check -p import-lens-daemon --locked` — clean (default build must not see the module).
+- [x] **Step 1:** Write `mod.rs` with the types above; `engine.rs`/`plugin.rs`/`entry.rs` as empty shells compiling under the feature.
+- [x] **Step 2:** `cargo check -p import-lens-daemon --locked --features rolldown-candidate` — clean; `cargo check -p import-lens-daemon --locked` — clean (default build must not see the module).
 
 ### Task B2: Virtual entry generation (pure, fully unit-tested)
 
@@ -172,8 +172,8 @@ pub fn virtual_entry_source(entries: &[super::BundleEntry]) -> String {
 
 Note the string-literal export form: `export { "a-b" as alias } from ...` — `js_string` already emits the quotes, so `Named(vec!["a-b"])` renders `export { "a-b" as __il_entry_0_export_0 } from "import-lens:target/0";` exactly as the spec shows. Plain identifiers also render quoted (`export { "parse" as ... }`) — valid ES2022 module syntax; the matrix asserts Rolldown accepts it (if 1.1.5's parser rejects quoted *identifier* exports anywhere, emit unquoted when the name is a valid identifier — decide from the B4 run, keep the quoted path for non-identifier names).
 
-- [ ] **Step 1:** Write the failing unit tests: named (incl. `"a-b"` string-literal name and two names → distinct aliases), default, namespace, full, multi-entry (indexes 0/1, shared nothing), and an adversarial name (`__il_entry_0_export_0` as the *requested* name must not collide — aliases are positional so it cannot).
-- [ ] **Step 2:** Implement (code above), `cargo test -p import-lens-daemon --locked --features rolldown-candidate candidate::entry` — green.
+- [x] **Step 1:** Write the failing unit tests: named (incl. `"a-b"` string-literal name and two names → distinct aliases), default, namespace, full, multi-entry (indexes 0/1, shared nothing), and an adversarial name (`__il_entry_0_export_0` as the *requested* name must not collide — aliases are positional so it cannot).
+- [x] **Step 2:** Implement (code above), `cargo test -p import-lens-daemon --locked --features rolldown-candidate candidate::entry` — green.
 
 ### Task B3: Engine adapter and native plugin
 
@@ -199,9 +199,9 @@ Behavioral requirements (each cites the spec section; the exact rolldown calls c
 4. **Output translation** (§5.1/§8): exactly one chunk and no extra assets or → `output_shape` failure; `code` = the chunk's unminified source; `exported_names` = chunk export list; `contributions` = rendered real modules only (exclude virtual entry, rolldown runtime modules, externals, zero-length), `rendered_bytes` = `rendered_length()`; diagnostics stringified without rolldown types. Missing/ambiguous requested export surfaces as a typed failure (`missing_export`/`ambiguous_export`) with zero-size semantics — never a guessed binding (§12).
 5. **Export enumeration** (§8.4): same engine, real entry as strict entry, read the chunk export list; forbid any call into `module_exported_names`/`module_provides_export`.
 
-- [ ] **Step 1:** Implement options mapping + plugin with the B0-recorded signatures; keep every rolldown import inside `engine.rs`/`plugin.rs`.
-- [ ] **Step 2:** Smoke integration test (temp workspace, one `export const x = 1` module, Named["x"]) proving: build succeeds, one chunk, `x` exported, loaded_paths contains the file. Run under `--features rolldown-candidate`.
-- [ ] **Step 3:** `cargo clippy --workspace --all-targets --locked --features rolldown-candidate` (note: workspace-level clippy won't enable the feature by default — run `cargo clippy -p import-lens-daemon --all-targets --locked --features rolldown-candidate` explicitly) and `cargo fmt`.
+- [x] **Step 1:** Implement options mapping + plugin with the B0-recorded signatures; keep every rolldown import inside `engine.rs`/`plugin.rs`.
+- [x] **Step 2:** Smoke integration test (temp workspace, one `export const x = 1` module, Named["x"]) proving: build succeeds, one chunk, `x` exported, loaded_paths contains the file. Run under `--features rolldown-candidate`.
+- [x] **Step 3:** `cargo clippy --workspace --all-targets --locked --features rolldown-candidate` (note: workspace-level clippy won't enable the feature by default — run `cargo clippy -p import-lens-daemon --all-targets --locked --features rolldown-candidate` explicitly) and `cargo fmt`.
 
 **Commit 1 [review]:** `feat(daemon): add feature-gated rolldown candidate engine` (B1+B2+B3; body: contract, plugin responsibilities, what is intentionally NOT implemented — no production path touched).
 
@@ -280,10 +280,10 @@ Required rows (spec §10.2 — every category; fixture sources are single-line J
 | 37 | multi-package request | two entries, shared transitive dep | shared dep contributions counted once (§6.3) |
 | 38–44 | `sideEffects` false / true / missing / invalid / string / array / nearest-transitive-package | package.json fixtures per §7.4 | retention matches Rolldown's native interpretation; `matched_side_effect_paths` populated only from public metadata; no hook override exists to assert against |
 
-- [ ] **Step 1:** Write the harness + rows 1–15; run; fix adapter translation issues they surface.
-- [ ] **Step 2:** Rows 16–29.
-- [ ] **Step 3:** Rows 30–44 (failure/limit/side-effect rows).
-- [ ] **Step 4:** Full run green: `cargo test -p import-lens-daemon --locked --features rolldown-candidate --test candidate_matrix`.
+- [x] **Step 1:** Write the harness + rows 1–15; run; fix adapter translation issues they surface.
+- [x] **Step 2:** Rows 16–29.
+- [x] **Step 3:** Rows 30–44 (failure/limit/side-effect rows).
+- [x] **Step 4:** Full run green: `cargo test -p import-lens-daemon --locked --features rolldown-candidate --test candidate_matrix`.
 
 ### Task B5: Real-package qualification fixtures
 
@@ -291,9 +291,9 @@ Required rows (spec §10.2 — every category; fixture sources are single-line J
 - Modify: `scripts/accuracy-fixtures/package.json` (+ regenerate its committed `pnpm-lock.yaml`)
 - Create: `daemon/tests/candidate_packages.rs` (`#![cfg(feature = "rolldown-candidate")]`, `#[ignore]`-gated like the performance suite so `pnpm test` stays hermetic; run explicitly during qualification)
 
-- [ ] **Step 1:** Add `lodash-es`, `zod`, `react`, `uuid` at the latest stable versions resolved at execution time (exact pins, like the existing three), `pnpm install --lockfile-only` inside the fixtures dir, commit the lockfile. Keep `css-tree` 3.2.1, `date-fns` 4.1.0, `lodash` 4.17.21.
-- [ ] **Step 2:** Test cases per spec §10.3/§10.4 over the installed fixtures (fixture install is a setup step; the test performs no network): for each (package, representative export — `css-tree/parse`, `date-fns/format`, `lodash-es/debounce`, `lodash/debounce`, `zod/z`, `react/useState`, `uuid/v4`): candidate build succeeds; output parses + passes OXC semantic validation; zero unresolved `__il_entry_*` AND zero unresolved identifiers overall for css-tree/date-fns (the dangling cases reach zero, §10.4); `loaded_paths` ⊇ rendered module paths and includes at least one tree-shaken (non-rendered) path for date-fns; contributions rendered-only; repeated identical runs byte-identical (determinism gate).
-- [ ] **Step 3:** Record raw/minified sizes vs the current engine and vs esbuild (reuse `scripts/accuracy-compare.mjs` fixtures/oracle where practical) — informational for §10.6's comparison set.
+- [x] **Step 1:** Add `lodash-es`, `zod`, `react`, `uuid` at the latest stable versions resolved at execution time (exact pins, like the existing three), `pnpm install --lockfile-only` inside the fixtures dir, commit the lockfile. Keep `css-tree` 3.2.1, `date-fns` 4.1.0, `lodash` 4.17.21.
+- [x] **Step 2:** Test cases per spec §10.3/§10.4 over the installed fixtures (fixture install is a setup step; the test performs no network): for each (package, representative export — `css-tree/parse`, `date-fns/format`, `lodash-es/debounce`, `lodash/debounce`, `zod/z`, `react/useState`, `uuid/v4`): candidate build succeeds; output parses + passes OXC semantic validation; zero unresolved `__il_entry_*` AND zero unresolved identifiers overall for css-tree/date-fns (the dangling cases reach zero, §10.4); `loaded_paths` ⊇ rendered module paths and includes at least one tree-shaken (non-rendered) path for date-fns; contributions rendered-only; repeated identical runs byte-identical (determinism gate).
+- [x] **Step 3:** Record raw/minified sizes vs the current engine and vs esbuild (reuse `scripts/accuracy-compare.mjs` fixtures/oracle where practical) — informational for §10.6's comparison set.
 
 **Commit 2 [review]:** `test(daemon): add rolldown qualification matrix and package fixtures` (B4+B5).
 
@@ -303,10 +303,10 @@ Required rows (spec §10.2 — every category; fixture sources are single-line J
 - Create: `daemon/tests/candidate_performance.rs` (`#![cfg(feature = "rolldown-candidate")]`, `#[ignore]`, mirroring `daemon/tests/performance.rs` patterns and its `IMPORT_LENS_PERF_MULTIPLIER` tolerance env)
 - Modify (results): `docs/superpowers/specs/2026-07-10-bundler-redesign-design.md` §10.7 + status header
 
-- [ ] **Step 1:** Measure per spec §10.6 in `--release` with 5 warm-ups + ≥30 runs: cold single import p95 (target fixture: css-tree/parse), 20-import batch latency, peak RSS (reuse whatever `performance.rs` uses for memory; on Windows fall back to `tasklist`-style probing only inside the ignored test), startup, cache-hit path untouched (assert unchanged code path). Record candidate binary size per target (informational).
-- [ ] **Step 2:** Determinism: run the full matrix + package suite twice; byte-compare size fields, loaded paths, contributions, failure stages.
-- [ ] **Step 3:** Six-target compile: `pnpm package:win32-x64` must stay green (default build unaffected); for the candidate graph run `cargo check -p import-lens-daemon --locked --features rolldown-candidate --target <triple>` for the six triples from `scripts/targets.mjs` (zig/xwin cross-checks via the existing docker builder if native check is impossible — compile proof only, no packaging of candidate binaries; they are never published, spec §10).
-- [ ] **Step 4:** Verdict per §10.7. PASS → update the spec: measured results table in §10.7, status header → **accepted**; update `bundler-redesign-work-state.md` memory. FAIL on an absolute gate → ONE bounded optimization pass (public options, adapter allocations, concurrency limit), re-measure; still failing → mark rejected in the spec and STOP (production unchanged; do NOT resurrect the fixpoint proposal — spec §10.7).
+- [x] **Step 1:** Measure per spec §10.6 in `--release` with 5 warm-ups + ≥30 runs: cold single import p95 (target fixture: css-tree/parse), 20-import batch latency, peak RSS (reuse whatever `performance.rs` uses for memory; on Windows fall back to `tasklist`-style probing only inside the ignored test), startup, cache-hit path untouched (assert unchanged code path). Record candidate binary size per target (informational).
+- [x] **Step 2:** Determinism: run the full matrix + package suite twice; byte-compare size fields, loaded paths, contributions, failure stages.
+- [x] **Step 3:** Six-target compile: `pnpm package:win32-x64` must stay green (default build unaffected); for the candidate graph run `cargo check -p import-lens-daemon --locked --features rolldown-candidate --target <triple>` for the six triples from `scripts/targets.mjs` (zig/xwin cross-checks via the existing docker builder if native check is impossible — compile proof only, no packaging of candidate binaries; they are never published, spec §10).
+- [x] **Step 4:** Verdict per §10.7. PASS → update the spec: measured results table in §10.7, status header → **accepted**; update `bundler-redesign-work-state.md` memory. FAIL on an absolute gate → ONE bounded optimization pass (public options, adapter allocations, concurrency limit), re-measure; still failing → mark rejected in the spec and STOP (production unchanged; do NOT resurrect the fixpoint proposal — spec §10.7).
 
 **Commit 3 [review]:** `test(daemon): add candidate measurement harness` + **Commit 4:** `docs(daemon): record rolldown qualification results` (or one commit if the harness lands with the results — prefer fewer).
 
@@ -328,7 +328,7 @@ Requirements (spec §9, §11 Phase 2):
 6. Old engine stays compiled and used ONLY by temporary differential tests (`daemon/tests/differential_engines.rs`: same fixture set through both engines; assert candidate output valid and record deltas — expectations are qualitative, not byte-equality; the values are EXPECTED to move).
 7. NO `ANALYZER_REVISION` bump yet — production still runs the old engine until D? **No** — Phase 2 integrates Rolldown as the runtime engine for misses… **Decision recorded in the spec (§11):** Phase 2 wires the engine but production selection flips in Phase 3 atomically with the revision bump. Keep a single boolean seam (`const USE_ROLLDOWN_ENGINE: bool = false` or cfg) so Phase 3's flip is one line + deletion; the differential tests exercise the wired path.
 
-- [ ] Steps: read the four integration seams; implement the boundary; port each size-producing path; add ordering + semaphore tests (start 3 concurrent misses, assert ≤2 rolldown builds in flight via a test-only counter); full gate.
+- [x] Steps: read the four integration seams; implement the boundary; port each size-producing path; add ordering + semaphore tests (start 3 concurrent misses, assert ≤2 rolldown builds in flight via a test-only counter); full gate.
 
 **Commit 5 [review]:** `feat(daemon): integrate the rolldown engine behind the async execution boundary` (body must state production output is still the old engine and why).
 

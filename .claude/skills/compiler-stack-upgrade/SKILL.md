@@ -2,8 +2,8 @@
 name: compiler-stack-upgrade
 description: >-
   Upgrade the coordinated compiler stack (the exact-pinned rolldown crate, the
-  OXC monorepo crates oxc_parser/ast/semantic/transformer/minifier/codegen/…,
-  and the separately-versioned oxc_resolver) the RIGHT way — not just bumping
+  OXC monorepo crates oxc_parser/semantic/minifier/codegen/…, and the
+  separately-versioned oxc_resolver) the RIGHT way — not just bumping
   version numbers until the build passes, but reading every release's changelog
   from the current version up to the target for all three lines, understanding
   the breaking changes, new features, perf wins and bug fixes, deep-diving the
@@ -29,43 +29,53 @@ our usage, then apply both the bump and the code changes it implies.**
 
 Three independently-versioned lines, moved as ONE coordinated stack:
 
-- **`rolldown`** — exact-pinned (`=x.y.z`) optional dependency behind the
-  non-default `rolldown-candidate` feature. Its Rust API has NO semver
-  guarantee, and its caret requirements decide which OXC/resolver versions are
-  even reachable.
+- **`rolldown`** — exact-pinned (`=x.y.z`) unconditional production dependency
+  (with its `rolldown_common`/`rolldown_error` siblings at the same monorepo
+  version). Since the bundler-redesign Phase 3 cutover it is THE semantic
+  bundler: every size number flows through its linking and tree-shaking. Its
+  Rust API has NO semver guarantee, and its caret requirements decide which
+  OXC/resolver versions are even reachable.
 - **OXC monorepo crates** (all pinned to one coordinated `=x.y.z`):
-  `oxc_allocator, oxc_ast, oxc_ast_visit, oxc_codegen, oxc_minifier, oxc_parser,
-  oxc_semantic, oxc_span, oxc_syntax, oxc_transformer` — the canonical list lives
-  in `scripts/compiler-stack.config.mjs`.
+  `oxc_allocator, oxc_codegen, oxc_minifier, oxc_parser, oxc_semantic,
+  oxc_span, oxc_syntax` — the canonical list lives in
+  `scripts/compiler-stack.config.mjs`. `oxc_ast`, `oxc_ast_visit`, and
+  `oxc_transformer` are NOT direct dependencies anymore (they died with the
+  custom bundler); they remain transitive via rolldown.
 - **`oxc_resolver`** — separate repo, separate version (its range is declared by
   the `rolldown_resolver` workspace crate, not by `rolldown` itself).
 
-Our OXC-using code (grep `use oxc_` under `daemon/src` to refresh this):
+Our direct OXC-using code (grep `use oxc_` under `daemon/src` to refresh this):
 `daemon/src/document/{imports,completion,script_regions}.rs` and
-`daemon/src/pipeline/{cjs,graph,minify,resolver}.rs`.
+`daemon/src/pipeline/{minify,resolver}.rs`. Rolldown types are confined to
+`daemon/src/engine/{adapter,plugin}.rs` (the engine contract in
+`engine/mod.rs` must never leak them).
 
 Five facts about that surface decide most impact calls. Get them wrong and you will
 mis-scope the delta in both directions:
 
-- **`graph.rs` transforms real TypeScript and JSX; `minify.rs` never does.**
-  `transform_module_source_as` runs `Transformer` over `.ts/.tsx/.mts/.cts/.jsx`
-  module sources. `minify.rs` always passes the literal path `import-lens-bundle.js`
-  with `SourceType::cjs()`/`mjs()`. So `transformer:` entries are live — via
-  `graph.rs` only.
-- **`TransformOptions::default()` leaves almost everything off.** It is
-  `#[derive(Default)]`, so `EnvOptions` selects no targets and every `env` pass is
-  disabled, and `DecoratorOptions::legacy` is `false`. Only the source-type-driven
-  TypeScript and JSX passes run. Changes to async-to-generator, class properties or
-  legacy decorators cannot reach us until someone enables them.
-- **`bundle.rs` strips the `export ` keyword before minification.** So mangler changes
-  about *exported* declarations (`export const { a, b } = x`) never reach the normal
-  bundle — only the raw/static-entry fallback in `analyze.rs`.
-- **The CommonJS IIFE wrapper `;(() => {…})();` exists twice**: `cjs.rs` (minified as
-  `SourceType::cjs()`) and the conservative fallback in `file_size.rs` (minified as
-  `mjs`). Both take no parameters, so `module`/`exports` are free globals the mangler
-  never renames.
-- **We call exactly one `Scoping` iterator accessor**: `iter_bindings_in`, in
-  `graph.rs`.
+- **Rolldown transforms real TypeScript/JSX/JSON during its build; our direct
+  OXC crates never see package source.** `minify.rs` parses only the one linked
+  ESM chunk rolldown emits (literal path `import-lens-bundle.js`,
+  `SourceType::mjs()`; the `cjs()` arm exists for conservative fallback
+  sizing). So `transformer:` changelog entries reach our output only through
+  rolldown's bundled transformer, not through any direct call.
+- **`document/` parses only the user's open document** (imports, completion
+  context, script regions) — parser/module-record changes hit it, but
+  minifier/codegen/transformer changes cannot.
+- **Retention decisions are rolldown's alone** (`sideEffects` interpretation,
+  statement liveness, interop, deconfliction). An `ecmascript`/`side_effects`
+  change in the OXC monorepo can move our sizes *via rolldown* even though we
+  do not depend on those crates directly.
+- **The virtual entry pins the requested surface**: unique `__il_entry_*`
+  aliases + strict entry signatures (`daemon/src/engine/entry.rs`). A rolldown
+  change to `preserve_entry_signatures`, chunk export lists,
+  `RenderedModule::rendered_length()`, or the one-chunk/no-code-splitting
+  shape breaks the adapter's output translation — check those APIs on every
+  bump.
+- **Known Windows defect we track**: rolldown 1.1.5 never matches string/array
+  `sideEffects` globs on Windows (backslash paths vs `/`-globs). Matrix rows
+  42/43 are `#[ignore]`d for it and MUST be re-attempted on every rolldown
+  bump — if they pass, remove the ignores and update FR-021's limitation note.
 
 Current versions: read `currentRolldownVersion`, `currentOxcVersion`, and
 `currentResolverVersion` from `scripts/compiler-stack.config.mjs`.
@@ -102,7 +112,7 @@ each release in `(current, target]`, for all three lines. See
   API and behavior changes, not just headline features.
 - Enumerate the versions that exist from **crates.io** (`/api/v1/crates/<crate>`) —
   no auth, no rate limit, and it is what the updater itself uses. Confirm the same
-  version exists for all 10 crates while you are there.
+  version exists for every configured OXC crate while you are there.
 - Read the notes from the GitHub release bodies: monorepo tag `crates_vX.Y.Z` at
   `oxc-project/oxc`, resolver tag `vX.Y.Z` at `oxc-project/oxc-resolver`. Send
   `Authorization: Bearer $GH_TOKEN` on the FIRST call — unauthenticated requests hit
@@ -125,12 +135,14 @@ don't drown:
   `mangler`, `codegen`, `transformer` and `ecmascript` scopes, read Features, Bug
   Fixes and Performance **in full**. Elsewhere, skim.
 - **Filter by scope, in two tiers.**
-  - *Direct* — our 10 crates: `allocator, ast, ast_visit, codegen, minifier, parser,
-    semantic, span, syntax, transformer`.
+  - *Direct* — our 7 crates: `allocator, codegen, minifier, parser, semantic,
+    span, syntax`.
   - *Transitive but observable* — not ours, but they reach our output or our types:
     `mangler` (run by `oxc_minifier`, which also re-exports `MangleOptions`),
-    `ecmascript` (its side-effect analysis drives minification), `traverse`,
-    `data_structures`, and bare `rust` (cross-cutting signature changes).
+    `ecmascript` (its side-effect analysis drives both rolldown's tree-shaking
+    and our minification), `transformer`/`ast`/`ast_visit` (rolldown transforms
+    package TS/JSX with them), `traverse`, `data_structures`, and bare `rust`
+    (cross-cutting signature changes).
   - *Ignorable* — `linter`/oxlint, `prettier`/formatter, `language_server`,
     `isolated_declarations`, `napi`, `wasm`, `react_compiler`, and anything scoped
     `examples`.
@@ -163,14 +175,17 @@ Produce a short impact table: change → PR → our file(s) → required/optiona
   Then run `IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES=1 pnpm test:accuracy` — enforcement
   ON, or a registry blip yields a baseline that measured nothing — and record the
   brotli and minified byte counts it prints per benchmark.
-- **Write a throwaway `minify_source` probe.** `daemon/tests/bundle.rs` already imports
-  `minify_source`, so a temporary `daemon/tests/oxc_minify_probe.rs` can print minified
-  output for one snippet per changed optimization (plus **both** CJS wrapper shapes —
-  `cjs.rs`'s with `is_cjs = true`, `file_size.rs`'s with `is_cjs = false`). Run it with
-  `--nocapture`, save the output, keep it unchanged through step 7, and delete it before
-  the final commit. `.gitignore` does not cover `daemon/tests/*.rs`. Do not commit it:
-  a snapshot of a third-party minifier's output is brittle and buys nothing once the
-  upgrade lands.
+- **Write a throwaway `minify_source` probe.** A temporary
+  `daemon/tests/oxc_minify_probe.rs` can call
+  `import_lens_daemon::pipeline::minify::minify_source` to print minified output
+  for one snippet per changed optimization. For rolldown-side changes, probe
+  through the engine instead: a scratch fixture through `RolldownEngine` (see
+  `daemon/tests/candidate_matrix.rs` for the harness shape) shows exactly what
+  the linked chunk looks like before and after. Run with `--nocapture`, save the
+  output, keep it unchanged through step 7, and delete it before the final
+  commit. `.gitignore` does not cover `daemon/tests/*.rs`. Do not commit it: a
+  snapshot of a third-party toolchain's output is brittle and buys nothing once
+  the upgrade lands.
 - Bump versions with the existing updater — do NOT hand-edit the pins:
   `pnpm deps:update:compiler --rolldown <ver> [--oxc <ver>] [--resolver <ver>]`
   (omit `--rolldown` to take the latest stable; omit `--oxc`/`--resolver` to let
@@ -181,10 +196,11 @@ Produce a short impact table: change → PR → our file(s) → required/optiona
   those that actually change. `package.json` carries no stack version; the
   updater merely re-asserts its `deps:update:*` scripts, so normally it comes
   out byte-identical and is skipped. It then runs `pnpm install
-  --lockfile-only` and `cargo update -p <crate> --precise` for `rolldown`,
-  `oxc_resolver`, and each of the ten OXC crates, which moves `Cargo.lock`, and
-  finally regenerates `scripts/compiler-stack.fingerprint.json` from the locked
-  graph. It touches **no test file** and does **not** rebuild the daemon.
+  --lockfile-only` and `cargo update -p <crate> --precise` for the `rolldown`
+  family, `oxc_resolver`, and each configured OXC crate, which moves
+  `Cargo.lock`, and finally regenerates
+  `scripts/compiler-stack.fingerprint.json` from the locked graph. It touches
+  **no test file** and does **not** rebuild the daemon.
 - Make the code changes for every breaking item, and adopt the worthwhile features.
 - Keep the OXC monorepo crates on ONE coordinated version (the updater enforces this);
   `oxc_resolver` and `rolldown` are versioned independently but move only within
@@ -221,12 +237,14 @@ features adopted vs deferred (with reasons), perf/accuracy impact observed in th
 accuracy suite, and any follow-ups.
 
 ## Guardrails
-- A rolldown bump is never routine: after the bundler-redesign cutover it moves the
-  semantic bundling engine, so rerun the spec's qualification gates (construct
-  matrix, real-package accuracy, performance, memory) before shipping and bump
-  `ANALYZER_REVISION` when measured output can change. During qualification the
-  candidate is feature-gated and unshipped, but the coordination tests and
-  fingerprint must still pass.
+- A rolldown bump is never routine: it moves the production semantic bundling
+  engine, so rerun the bundler-redesign qualification gates before shipping —
+  the construct matrix (`--test candidate_matrix`), the real-package suite
+  (`--test candidate_packages -- --ignored`), the performance gates
+  (`--release --test candidate_performance -- --ignored`), and the accuracy
+  suite — and bump `ANALYZER_REVISION` (`daemon/src/cache/key.rs`) when
+  measured output can change. Re-attempt the ignored Windows sideEffects-glob
+  matrix rows on every bump.
 - `oxc_mangler` is banned as a **direct** dependency of `daemon/Cargo.toml` — that is
   all the ban means, and all `compiler-stack-coordination.test.mjs` enforces. It is already a
   non-optional transitive dependency of `oxc_minifier` and sits in `Cargo.lock`;

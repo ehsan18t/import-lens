@@ -1,28 +1,20 @@
 use crate::{
+    engine::{dependency_paths::record_loaded_paths, limits::MAX_MODULE_SOURCE_BYTES},
     ipc::protocol::{
         ConfidenceLevel, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
         ModuleContribution, ResultFreshness,
     },
     pipeline::{
-        bundle::bundle_reachable_modules_with_metadata,
-        cjs::{CjsGraphAnalysis, analyze_cjs_graph_with_runtime},
         compress::compress_all,
         fallback::{approximate_directory_size, estimate_minified_source, source_excerpt_detail},
-        graph::{
-            MAX_MODULE_SOURCE_BYTES, ModuleGraph, build_module_graph_cached_with_runtime,
-            module_provides_export,
-        },
-        minify::{minify_source, minify_source_with_markers},
-        reachability::{reachable_exports, requested_exports},
+        minify::minify_source,
         resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
         types_only::declaration_only_package_result,
     },
 };
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 #[derive(Debug, Clone)]
@@ -31,8 +23,7 @@ pub struct AnalysisContext {
     pub active_document_path: PathBuf,
 }
 
-// Public only because `analyze_with_rolldown_engine`'s Phase 2 differential
-// entry point returns it; fields stay private to this module.
+// Internal structured error translated into the stable ImportResult surface.
 #[derive(Debug, Clone)]
 pub struct AnalysisError {
     stage: &'static str,
@@ -52,25 +43,16 @@ pub fn analyze_resolved_import(
     request: &ImportRequest,
     resolved: ResolvedPackage,
 ) -> ImportResult {
-    analyze_resolved_import_with_graph(context, request, resolved).0
+    analyze_resolved_import_with_dependencies(context, request, resolved).0
 }
 
-/// What dependency fingerprints derive from (spec §8.3): the legacy pipeline
-/// exposes the exact analyzed module graph; the Rolldown engine exposes every
-/// loaded real path (manifest included, tree-shaken modules included).
+/// Paths used to compute cache freshness for a successful engine build.
 pub enum FingerprintSource {
-    Graph(Arc<ModuleGraph>),
     LoadedPaths(Vec<PathBuf>),
 }
 
-/// Like [`analyze_resolved_import`], but also returns the fingerprint source
-/// the result was computed from. The cache path uses this to fingerprint the
-/// exact analyzed inputs instead of re-fetching them by key: a re-fetch can
-/// rebuild against dependency bytes that changed during the analysis window,
-/// pairing a stale result with fresh-looking fingerprints that are then
-/// served `Fresh` (Finding 4). Returns `None` for the CJS, oversized-entry,
-/// and static-fallback branches, which have neither a graph nor loaded paths.
-pub fn analyze_resolved_import_with_graph(
+/// Analyze a pre-resolved entry and return the exact real paths Rolldown loaded.
+pub fn analyze_resolved_import_with_dependencies(
     context: &AnalysisContext,
     request: &ImportRequest,
     resolved: ResolvedPackage,
@@ -155,8 +137,7 @@ fn analyze_import_inner_resolved(
         )
     })?;
 
-    let entry_size = metadata.len() as usize;
-    if entry_size > MAX_MODULE_SOURCE_BYTES {
+    if metadata.len() as usize > MAX_MODULE_SOURCE_BYTES {
         let entry_path_display = entry_path.display().to_string();
         let mut result =
             analyze_static_entry(context, request, entry_path, &side_effects_mode, is_cjs)?;
@@ -165,254 +146,38 @@ fn analyze_import_inner_resolved(
             ImportDiagnostic {
                 stage: "oversized_entry".to_owned(),
                 message: format!(
-                    "entry file exceeds {MAX_MODULE_SOURCE_BYTES} byte module source limit; skipped graph analysis and used static entry sizing"
+                    "entry file exceeds {MAX_MODULE_SOURCE_BYTES} byte module source limit; used static entry sizing"
                 ),
                 details: vec![format!("entry_path: {entry_path_display}")],
             },
         );
         result.confidence_reasons.insert(
             0,
-            "Entry exceeds module graph source limit; size is static entry fallback.".to_owned(),
+            "Entry exceeds the engine module source limit; size is a static fallback.".to_owned(),
         );
         return Ok((result, None));
     }
 
-    let mut fallback_diagnostics = Vec::new();
-    // Phase 2 selection seam (spec §11): the Rolldown path is fully wired
-    // but stays off in production until the Phase 3 cutover flips
-    // `USE_ROLLDOWN_ENGINE`. On engine failure control falls through to the
-    // remaining legacy arms (static fallback last), per the §12 table; after
-    // Phase 3 deletes those arms the static fallback follows directly.
-    if crate::engine::USE_ROLLDOWN_ENGINE {
-        match analyze_with_rolldown_engine(
-            context,
-            request,
-            &entry_path,
-            &package_root,
-            &side_effects_mode,
-            is_cjs,
-        ) {
-            Ok((result, loaded_paths)) => {
-                return Ok((result, Some(FingerprintSource::LoadedPaths(loaded_paths))));
-            }
-            Err(error) => fallback_diagnostics.push(engine_fallback_diagnostic(error)),
+    match analyze_with_rolldown_engine(
+        context,
+        request,
+        &entry_path,
+        &package_root,
+        &side_effects_mode,
+        is_cjs,
+    ) {
+        Ok((result, loaded_paths)) => {
+            record_loaded_paths(entry_path, request.runtime, loaded_paths.clone());
+            Ok((result, Some(FingerprintSource::LoadedPaths(loaded_paths))))
+        }
+        Err(error) if matches!(error.stage, "missing_export" | "ambiguous_export") => Err(error),
+        Err(error) => {
+            let mut result =
+                analyze_static_entry(context, request, entry_path, &side_effects_mode, is_cjs)?;
+            result.diagnostics.push(engine_fallback_diagnostic(error));
+            Ok((result, None))
         }
     }
-
-    if is_cjs {
-        match analyze_with_cjs_graph(request, &entry_path) {
-            Ok(result) => return Ok((result, None)),
-            Err(diagnostics) => fallback_diagnostics.extend(diagnostics),
-        }
-    }
-
-    if !is_cjs {
-        match analyze_with_oxc_pipeline(context, request, entry_path.clone(), &side_effects_mode) {
-            Ok((result, graph)) => return Ok((result, Some(FingerprintSource::Graph(graph)))),
-            Err(error) => fallback_diagnostics.push(oxc_fallback_diagnostic(error)),
-        }
-    }
-
-    let mut result =
-        analyze_static_entry(context, request, entry_path, &side_effects_mode, is_cjs)?;
-    result.diagnostics.extend(fallback_diagnostics);
-    Ok((result, None))
-}
-
-fn analyze_with_cjs_graph(
-    request: &ImportRequest,
-    entry_path: &Path,
-) -> Result<ImportResult, Vec<ImportDiagnostic>> {
-    let graph = analyze_cjs_graph_with_runtime(entry_path, request.runtime).map_err(|error| {
-        vec![ImportDiagnostic {
-            stage: "cjs_fallback".to_owned(),
-            message: format!("CommonJS static analysis failed; using static entry sizing: {error}"),
-            details: vec![format!("entry_path: {}", entry_path.display())],
-        }]
-    })?;
-
-    if graph.unsupported {
-        let mut diagnostics = graph.diagnostics;
-        diagnostics.push(cjs_fallback_diagnostic(
-            "unsupported dynamic CommonJS require; using static entry sizing".to_owned(),
-            entry_path,
-        ));
-        return Err(diagnostics);
-    }
-    if graph.exports.is_empty() {
-        let mut diagnostics = graph.diagnostics;
-        diagnostics.push(cjs_fallback_diagnostic(
-            "unsupported CommonJS export shape; using static entry sizing".to_owned(),
-            entry_path,
-        ));
-        return Err(diagnostics);
-    }
-
-    Ok(cjs_graph_result(request, graph))
-}
-
-fn cjs_graph_result(request: &ImportRequest, graph: CjsGraphAnalysis) -> ImportResult {
-    let minified = minify_source(&graph.source, true)
-        .unwrap_or_else(|_| estimate_minified_source(&graph.source));
-    let compressed = compress_all(&minified);
-    let mut diagnostics = graph.diagnostics;
-    diagnostics.extend(missing_cjs_export_diagnostics(request, &graph.exports));
-    let module_breakdown = top_module_contributions(&graph.module_breakdown);
-    let internal_contributions = graph.full_module_breakdown;
-
-    match compressed {
-        Ok(compressed) => ImportResult {
-            freshness: ResultFreshness::fresh(),
-            specifier: request.specifier.clone(),
-            raw_bytes: graph.source.len() as u64,
-            minified_bytes: minified.len() as u64,
-            gzip_bytes: compressed.gzip_bytes,
-            brotli_bytes: compressed.brotli_bytes,
-            zstd_bytes: compressed.zstd_bytes,
-            cache_hit: false,
-            side_effects: true,
-            truly_treeshakeable: false,
-            is_cjs: true,
-            confidence: ConfidenceLevel::Low,
-            confidence_reasons: vec![
-                "CommonJS static analysis is conservative and may miss dynamic require or runtime export behavior."
-                    .to_owned(),
-            ],
-            error: None,
-            diagnostics,
-            module_breakdown: Some(module_breakdown),
-            shared_bytes: None,
-            internal_contributions,
-        },
-        Err(error) => error_result(
-            request,
-            AnalysisError {
-                stage: "compression",
-                message: format!("failed to compress CommonJS graph: {error}"),
-                details: Vec::new(),
-            },
-        ),
-    }
-}
-
-fn analyze_with_oxc_pipeline(
-    context: &AnalysisContext,
-    request: &ImportRequest,
-    entry_path: PathBuf,
-    side_effects_mode: &SideEffectsMode,
-) -> Result<(ImportResult, Arc<ModuleGraph>), AnalysisError> {
-    let graph =
-        build_module_graph_cached_with_runtime(&entry_path, request.runtime).map_err(|error| {
-            error_with_context(
-                "module_graph",
-                format!("failed to build module graph: {error}"),
-                context,
-                request,
-                vec![format!("entry_path: {}", entry_path.display())],
-            )
-        })?;
-    let side_effect_matches =
-        side_effects_mode.matching_paths(graph.modules.iter().map(|module| module.path.as_path()));
-    let side_effects = side_effects_mode.has_side_effects() || !side_effect_matches.is_empty();
-    let include_full_entry = side_effects_mode.has_side_effects()
-        || matches!(
-            request.import_kind,
-            ImportKind::Namespace | ImportKind::Dynamic
-        );
-    let requested_exports = requested_exports(request);
-    let mut reachable = reachable_exports(&graph, &requested_exports, include_full_entry);
-    for path in &side_effect_matches {
-        reachable.mark_full_module(path.clone());
-    }
-    let mut bundled =
-        bundle_reachable_modules_with_metadata(&graph, &reachable).map_err(|error| {
-            error_with_context(
-                "bundle",
-                format!("failed to bundle reachable modules: {error}"),
-                context,
-                request,
-                vec![format!("entry_path: {}", entry_path.display())],
-            )
-        })?;
-    let mut fallback_full_bundle = false;
-    if bundled.source.trim().is_empty() && !include_full_entry {
-        reachable = reachable_exports(&graph, &[], true);
-        bundled = bundle_reachable_modules_with_metadata(&graph, &reachable).map_err(|error| {
-            error_with_context(
-                "bundle",
-                format!("failed to bundle fallback full module: {error}"),
-                context,
-                request,
-                vec![format!("entry_path: {}", entry_path.display())],
-            )
-        })?;
-        fallback_full_bundle = true;
-    }
-    let minified =
-        minify_source_with_markers(&bundled.minifier_source, false).map_err(|error| {
-            error_with_context(
-                "minify",
-                format!("failed to minify bundled modules: {error}"),
-                context,
-                request,
-                vec![
-                    format!("entry_path: {}", entry_path.display()),
-                    source_excerpt_detail(&bundled.minifier_source),
-                ],
-            )
-        })?;
-    if fallback_full_bundle {
-        graph.cache_full_bundle_minified_len(minified.len() as u64);
-    }
-    let compressed = compress_all(&minified).map_err(|error| {
-        error_with_context(
-            "compression",
-            format!("failed to compress minified output: {error}"),
-            context,
-            request,
-            Vec::new(),
-        )
-    })?;
-
-    let mut diagnostics =
-        side_effect_diagnostics(side_effects_mode, &entry_path, &side_effect_matches);
-    diagnostics.extend(graph.diagnostics.iter().map(|diagnostic| ImportDiagnostic {
-        stage: diagnostic.stage.clone(),
-        message: diagnostic.message.clone(),
-        details: diagnostic.details.clone(),
-    }));
-    diagnostics.extend(missing_export_diagnostics(request, &graph));
-    let (confidence, confidence_reasons) = oxc_confidence(side_effects, &diagnostics);
-
-    let result = ImportResult {
-        freshness: ResultFreshness::fresh(),
-        specifier: request.specifier.clone(),
-        raw_bytes: bundled.source.len() as u64,
-        minified_bytes: minified.len() as u64,
-        gzip_bytes: compressed.gzip_bytes,
-        brotli_bytes: compressed.brotli_bytes,
-        zstd_bytes: compressed.zstd_bytes,
-        cache_hit: false,
-        side_effects,
-        truly_treeshakeable: is_truly_treeshakeable(
-            request,
-            side_effects,
-            &graph,
-            minified.len() as u64,
-            fallback_full_bundle.then_some(minified.len() as u64),
-        ),
-        is_cjs: false,
-        confidence,
-        confidence_reasons,
-        error: None,
-        diagnostics,
-        module_breakdown: Some(top_module_contributions(&bundled.contributions)),
-        shared_bytes: None,
-        internal_contributions: bundled.contributions,
-    };
-    // Return the exact graph the result was computed from so the cache path can
-    // fingerprint it directly instead of re-fetching (and possibly rebuilding).
-    Ok((result, graph))
 }
 
 /// Rolldown-backed analysis (spec §8): one engine build produces the raw
@@ -420,9 +185,7 @@ fn analyze_with_oxc_pipeline(
 /// the minified string. Returns the loaded real paths (plus the package
 /// manifest) for §8.3 freshness fingerprints alongside the result.
 ///
-/// Public because the Phase 2 differential tests drive this path directly
-/// while `USE_ROLLDOWN_ENGINE` keeps production on the legacy pipeline.
-pub fn analyze_with_rolldown_engine(
+pub(crate) fn analyze_with_rolldown_engine(
     context: &AnalysisContext,
     request: &ImportRequest,
     entry_path: &Path,
@@ -514,7 +277,7 @@ pub fn analyze_with_rolldown_engine(
         }
     }
 
-    let (confidence, confidence_reasons) = oxc_confidence(side_effects, &diagnostics);
+    let (confidence, confidence_reasons) = engine_confidence(side_effects, &diagnostics);
     let contributions: Vec<ModuleContribution> = artifact
         .contributions
         .iter()
@@ -606,40 +369,6 @@ fn engine_fallback_diagnostic(error: AnalysisError) -> ImportDiagnostic {
         ),
         details: error.details,
     }
-}
-
-fn is_truly_treeshakeable(
-    request: &ImportRequest,
-    side_effects: bool,
-    graph: &crate::pipeline::graph::ModuleGraph,
-    minified_len: u64,
-    cached_full_minified_len: Option<u64>,
-) -> bool {
-    if side_effects || !matches!(request.import_kind, ImportKind::Named) {
-        return false;
-    }
-
-    // To check if genuinely tree-shakeable, compare against the same post-minify
-    // size surface that users see in Import Lens.
-    let full_len = cached_full_minified_len
-        .or_else(|| {
-            graph.cached_full_bundle_minified_len_or_init(|| {
-                let reachable_full = reachable_exports(graph, &[], true);
-                let bundled_full =
-                    bundle_reachable_modules_with_metadata(graph, &reachable_full).ok()?;
-                let minified_full =
-                    minify_source_with_markers(&bundled_full.minifier_source, false).ok()?;
-                Some(minified_full.len() as u64)
-            })
-        })
-        .unwrap_or_default();
-    if full_len == 0 {
-        return false;
-    }
-
-    // If the tree-shaken size is within 5% of the full size, it's not truly tree-shakeable
-    let ratio = (minified_len as f64) / (full_len as f64);
-    ratio <= 0.95
 }
 
 fn analyze_static_entry(
@@ -797,7 +526,7 @@ pub(crate) fn side_effect_diagnostics(
     }]
 }
 
-fn oxc_confidence(
+fn engine_confidence(
     side_effects: bool,
     diagnostics: &[ImportDiagnostic],
 ) -> (ConfidenceLevel, Vec<String>) {
@@ -805,7 +534,7 @@ fn oxc_confidence(
         return (
             ConfidenceLevel::High,
             vec![
-                "OXC module graph, transform, minify, and compression completed without precision warnings."
+                "Rolldown linking plus OXC validation, minification, and compression completed without precision warnings."
                     .to_owned(),
             ],
         );
@@ -833,112 +562,10 @@ fn oxc_confidence(
     }
 
     if reasons.is_empty() {
-        reasons.push("OXC pipeline completed with conservative assumptions.".to_owned());
+        reasons.push("Engine pipeline completed with conservative assumptions.".to_owned());
     }
 
     (ConfidenceLevel::Medium, reasons)
-}
-
-fn oxc_fallback_diagnostic(error: AnalysisError) -> ImportDiagnostic {
-    let mut details = vec![format!("failed_stage: {}", error.stage)];
-    details.extend(error.details);
-
-    ImportDiagnostic {
-        stage: "oxc_fallback".to_owned(),
-        message: format!(
-            "OXC pipeline failed; using static entry sizing: {}",
-            error.message
-        ),
-        details,
-    }
-}
-
-fn cjs_fallback_diagnostic(message: String, entry_path: &Path) -> ImportDiagnostic {
-    ImportDiagnostic {
-        stage: "cjs_fallback".to_owned(),
-        message,
-        details: vec![format!("entry_path: {}", entry_path.display())],
-    }
-}
-
-fn missing_export_diagnostics(
-    request: &ImportRequest,
-    graph: &ModuleGraph,
-) -> Vec<ImportDiagnostic> {
-    let Some(requested_exports) = diagnostic_requested_exports(request) else {
-        return Vec::new();
-    };
-
-    let missing = requested_exports
-        .iter()
-        .filter(|exported_name| {
-            !module_provides_export(graph, graph.entry_id, exported_name, &mut HashSet::new())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if missing.is_empty() {
-        return Vec::new();
-    }
-
-    vec![ImportDiagnostic {
-        stage: "exports".to_owned(),
-        message: missing_export_message(request, &missing),
-        details: vec![
-            format!("specifier: {}", request.specifier),
-            format!("missing_exports: {}", missing.join(", ")),
-        ],
-    }]
-}
-
-fn missing_cjs_export_diagnostics(
-    request: &ImportRequest,
-    exports: &[String],
-) -> Vec<ImportDiagnostic> {
-    let Some(requested_exports) = diagnostic_requested_exports(request) else {
-        return Vec::new();
-    };
-
-    let missing = requested_exports
-        .iter()
-        .filter(|name| !exports.contains(name))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if missing.is_empty() {
-        return Vec::new();
-    }
-
-    vec![ImportDiagnostic {
-        stage: "exports".to_owned(),
-        message: missing_cjs_export_message(request, &missing),
-        details: vec![
-            format!("specifier: {}", request.specifier),
-            format!("missing_exports: {}", missing.join(", ")),
-        ],
-    }]
-}
-
-fn diagnostic_requested_exports(request: &ImportRequest) -> Option<Vec<String>> {
-    match request.import_kind {
-        ImportKind::Named => Some(request.named.clone()),
-        ImportKind::Default => Some(vec!["default".to_owned()]),
-        ImportKind::Namespace | ImportKind::Dynamic => None,
-    }
-}
-
-fn missing_export_message(request: &ImportRequest, missing: &[String]) -> String {
-    match request.import_kind {
-        ImportKind::Default => "default export not found".to_owned(),
-        _ => format!("named export(s) not found: {}", missing.join(", ")),
-    }
-}
-
-fn missing_cjs_export_message(request: &ImportRequest, missing: &[String]) -> String {
-    match request.import_kind {
-        ImportKind::Default => "default CommonJS export not found".to_owned(),
-        _ => format!("named CommonJS export(s) not found: {}", missing.join(", ")),
-    }
 }
 
 fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {

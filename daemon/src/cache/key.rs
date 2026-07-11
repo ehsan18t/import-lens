@@ -21,8 +21,8 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
 /// (`v{N}:`) derives from this, so a schema bump is a one-line change here with
 /// no type renames.
 const CACHE_KEY_VERSION: u32 = 4;
-pub const ANALYZER_REVISION: &str = "graph2";
-pub const ANALYZER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+graph2");
+pub const ANALYZER_REVISION: &str = "rolldown1";
+pub const ANALYZER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+rolldown1");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {

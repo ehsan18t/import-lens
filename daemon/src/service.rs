@@ -26,12 +26,10 @@ use crate::{
         WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
         is_supported_protocol_version,
     },
-    pipeline::analyze::{AnalysisContext, analyze_import, analyze_resolved_import_with_graph},
-    pipeline::file_size::{annotate_shared_bytes, compute_file_size},
-    pipeline::graph::{
-        build_module_graph_cached, clear_module_graph_cache,
-        invalidate_module_graph_cache_for_package, module_exported_names,
+    pipeline::analyze::{
+        AnalysisContext, analyze_import, analyze_resolved_import_with_dependencies,
     },
+    pipeline::file_size::{annotate_shared_bytes, compute_file_size},
     pipeline::resolver::{ResolvedPackage, find_package_root, resolve_package_entry},
 };
 use rayon::prelude::*;
@@ -1587,72 +1585,30 @@ impl ImportLensService {
             }
         };
 
-        // Phase 2 selection seam (spec §8.4): the engine's chunk export list
-        // replaces the recursive graph walk once the Phase 3 cutover flips
-        // `USE_ROLLDOWN_ENGINE`.
-        if crate::engine::USE_ROLLDOWN_ENGINE {
-            return match crate::engine::boundary::enumerate_exports_sync(
-                resolved.entry_path.clone(),
-                import_request.runtime,
-            ) {
-                Ok(exports) => EnumerateExportsResponse {
-                    version: request.version,
-                    request_id: request.request_id,
-                    specifier: request.specifier,
-                    exports,
-                    error: None,
-                    diagnostics: Vec::new(),
-                },
-                Err(failure) => EnumerateExportsResponse {
-                    version: request.version,
-                    request_id: request.request_id,
-                    specifier: request.specifier,
-                    exports: Vec::new(),
-                    error: Some(failure.message.clone()),
-                    diagnostics: vec![ImportDiagnostic {
-                        stage: failure.stage,
-                        message: failure.message,
-                        details: Vec::new(),
-                    }],
-                },
-            };
-        }
-
-        let graph = match build_module_graph_cached(&resolved.entry_path) {
-            Ok(graph) => graph,
-            Err(error) => {
-                return EnumerateExportsResponse {
-                    version: request.version,
-                    request_id: request.request_id,
-                    specifier: request.specifier,
-                    exports: Vec::new(),
-                    error: Some(error.clone()),
-                    diagnostics: vec![ImportDiagnostic {
-                        stage: "module_graph".to_owned(),
-                        message: error,
-                        details: vec![format!("entry_path: {}", resolved.entry_path.display())],
-                    }],
-                };
-            }
-        };
-
-        let exports = module_exported_names(&graph, graph.entry_id, true);
-
-        EnumerateExportsResponse {
-            version: request.version,
-            request_id: request.request_id,
-            specifier: request.specifier,
-            exports,
-            error: None,
-            diagnostics: graph
-                .diagnostics
-                .iter()
-                .map(|diagnostic| ImportDiagnostic {
-                    stage: diagnostic.stage.clone(),
-                    message: diagnostic.message.clone(),
-                    details: diagnostic.details.clone(),
-                })
-                .collect(),
+        match crate::engine::boundary::enumerate_exports_sync(
+            resolved.entry_path,
+            import_request.runtime,
+        ) {
+            Ok(exports) => EnumerateExportsResponse {
+                version: request.version,
+                request_id: request.request_id,
+                specifier: request.specifier,
+                exports,
+                error: None,
+                diagnostics: Vec::new(),
+            },
+            Err(failure) => EnumerateExportsResponse {
+                version: request.version,
+                request_id: request.request_id,
+                specifier: request.specifier,
+                exports: Vec::new(),
+                error: Some(failure.message.clone()),
+                diagnostics: vec![ImportDiagnostic {
+                    stage: failure.stage,
+                    message: failure.message,
+                    details: Vec::new(),
+                }],
+            },
         }
     }
 
@@ -1800,8 +1756,7 @@ impl ImportLensService {
             // present) removes no shards, so the blanket clear below doesn't fire.
             // Drop the L1/graph entries whose paths are specifically gone.
             crate::pipeline::file_size_cache::shared_file_size_cache().purge_missing_paths();
-            crate::pipeline::graph::purge_missing_module_graphs();
-            crate::pipeline::cjs::purge_missing_cjs_module_sets();
+            crate::engine::dependency_paths::purge_missing();
         }
 
         // Drop the derived L1/graph caches when a store-clearing scope ran. `All`
@@ -1811,8 +1766,7 @@ impl ImportLensService {
         // shard removals still only pay this when they actually removed a shard;
         // the registry-only scope leaves these caches untouched.
         if matches!(request.scope, CacheRemoveScope::All) || !removed.is_empty() {
-            clear_module_graph_cache();
-            crate::pipeline::cjs::clear_cjs_module_cache();
+            crate::engine::dependency_paths::clear();
             // Drop L1 aggregate sizes too so the status-bar size recomputes fresh
             // after a cache clear (the memory-only L1 is not generation-bumped here).
             crate::pipeline::file_size_cache::shared_file_size_cache().clear();
@@ -1835,16 +1789,14 @@ impl ImportLensService {
 
     pub fn invalidate_package(&self, package_name: &str) {
         self.cache_registry.invalidate_package(package_name);
-        invalidate_module_graph_cache_for_package(package_name);
-        crate::pipeline::cjs::invalidate_cjs_module_cache_for_package(package_name);
+        crate::engine::dependency_paths::invalidate_package(package_name);
         crate::pipeline::resolver::invalidate_shared_resolvers();
         crate::cache::memory::bump_cache_generation();
     }
 
     pub fn invalidate_all(&self) {
         self.cache_registry.clear_all();
-        clear_module_graph_cache();
-        crate::pipeline::cjs::clear_cjs_module_cache();
+        crate::engine::dependency_paths::clear();
         crate::pipeline::resolver::invalidate_shared_resolvers();
         crate::cache::memory::bump_cache_generation();
     }
@@ -1916,8 +1868,7 @@ impl ImportLensService {
             .filter(|result| result.removed)
             .count();
         if orphans_removed > 0 {
-            clear_module_graph_cache();
-            crate::pipeline::cjs::clear_cjs_module_cache();
+            crate::engine::dependency_paths::clear();
             crate::pipeline::file_size_cache::shared_file_size_cache().clear();
             crate::cache::memory::bump_cache_generation();
             crate::logging::log_info(
@@ -2015,8 +1966,7 @@ impl ImportLensService {
         // graph/resolver/generation invalidations run once for the whole burst.
         self.cache_registry.invalidate_packages(&package_names);
         for package_name in &package_names {
-            invalidate_module_graph_cache_for_package(package_name);
-            crate::pipeline::cjs::invalidate_cjs_module_cache_for_package(package_name);
+            crate::engine::dependency_paths::invalidate_package(package_name);
         }
         crate::pipeline::resolver::invalidate_shared_resolvers();
         crate::cache::memory::bump_cache_generation();
@@ -2182,9 +2132,9 @@ impl ImportLensService {
             .analysis_flights
             .run_or_join(key.clone(), captured_generation, || {
                 let (result, analyzed_graph) =
-                    analyze_resolved_import_with_graph(context, request, resolved.clone());
+                    analyze_resolved_import_with_dependencies(context, request, resolved.clone());
                 let dependency_fingerprints = if should_cache_result(&result) {
-                    dependency_fingerprints(&resolved, analyzed_graph.as_ref(), request.runtime)
+                    dependency_fingerprints(&resolved, analyzed_graph.as_ref())
                 } else {
                     Vec::new()
                 };
@@ -2196,14 +2146,6 @@ impl ImportLensService {
             });
 
         if should_cache_result(&computed.result) && should_store() {
-            self.cache_full_variant_alias(
-                cache,
-                request,
-                &computed.result,
-                &resolved,
-                &computed.dependency_fingerprints,
-                captured_generation,
-            );
             cache.insert_with_fingerprints_at_generation(
                 key,
                 computed.result.clone(),
@@ -2213,46 +2155,6 @@ impl ImportLensService {
         }
 
         computed.result
-    }
-
-    fn cache_full_variant_alias(
-        &self,
-        cache: &ImportCache,
-        request: &ImportRequest,
-        result: &ImportResult,
-        resolved: &ResolvedPackage,
-        dependency_fingerprints: &[crate::cache::key::FileFingerprint],
-        verified_generation: u64,
-    ) {
-        if !resolved.side_effects.has_side_effects()
-            || result.is_cjs
-            || has_request_specific_diagnostics(result)
-            || matches!(
-                request.import_kind,
-                ImportKind::Namespace | ImportKind::Dynamic
-            )
-        {
-            return;
-        }
-
-        let mut namespace_request = request.clone();
-        namespace_request.import_kind = ImportKind::Namespace;
-        namespace_request.named.clear();
-        let namespace_key = cache_key_for_resolved_import(&namespace_request, resolved);
-
-        if cache.get(&namespace_key).is_some() {
-            return;
-        }
-
-        let mut namespace_result = result.clone();
-        namespace_result.cache_hit = false;
-        namespace_result.truly_treeshakeable = false;
-        cache.insert_with_fingerprints_at_generation(
-            namespace_key,
-            namespace_result,
-            dependency_fingerprints.to_vec(),
-            verified_generation,
-        );
     }
 }
 
@@ -2303,7 +2205,7 @@ fn effective_registry_hint_mode(
 }
 
 fn should_cache_result(result: &ImportResult) -> bool {
-    result.error.is_none() && !has_request_specific_diagnostics(result)
+    result.error.is_none()
 }
 
 fn cache_read_mode_label(serve_stale: bool, intent: ReadIntent) -> &'static str {
@@ -2473,94 +2375,30 @@ fn package_name_from_package_json_path(package_json_path: &str) -> Option<String
     Some(get_package_name(after_node_modules))
 }
 
-fn has_request_specific_diagnostics(result: &ImportResult) -> bool {
-    result
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.stage == "exports")
-}
-
-/// Analyze a slice with bounded parallelism, preserving input order in the
-/// returned Vec (spec §9, plan C1): Rolldown builds must never run inside
-/// the outer global-Rayon loops — N parked workers on the engine's two
-/// permits would starve unrelated pool work — so misses drain on a scoped
-/// worker set sized to the permit count. Cache hits stay cheap enough that
-/// the reduced parallelism is immaterial, and the closure runs on plain
-/// threads where the engine's blocking bridge is legal.
+/// Fingerprint the paths used by the successful engine result, or the
+/// conservative manifest+entry pair used by static fallback.
 fn dependency_fingerprints(
     resolved: &ResolvedPackage,
     source: Option<&crate::pipeline::analyze::FingerprintSource>,
-    runtime: crate::ipc::protocol::ImportRuntime,
 ) -> Vec<crate::cache::key::FileFingerprint> {
     use crate::cache::key::file_fingerprint_reading_hash;
     use crate::pipeline::analyze::FingerprintSource;
 
-    // The Rolldown engine reports every loaded real path (manifest included,
-    // tree-shaken modules included — spec §8.3); each is read+hashed so the
-    // strict freshness gate content-verifies them.
-    if let Some(FingerprintSource::LoadedPaths(paths)) = source {
-        let mut fingerprints: Vec<crate::cache::key::FileFingerprint> = paths
-            .iter()
-            .cloned()
-            .filter_map(file_fingerprint_reading_hash)
-            .collect();
-        fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
-        fingerprints.dedup_by(|a, b| a.path == b.path);
-        return fingerprints;
-    }
-    let graph = match source {
-        Some(FingerprintSource::Graph(graph)) => Some(graph),
-        _ => None,
-    };
-
-    // No analyzed graph (CJS, oversized entry, or static fallback): the result was
-    // not computed from a module graph, so freshness is pinned to the manifest and
-    // entry — read+hashed here (RB-2) so an equal-length, mtime-preserving edit is
-    // still detected rather than probing Fresh forever.
-    let Some(graph) = graph else {
-        let mut fingerprints: Vec<crate::cache::key::FileFingerprint> = [
+    let paths = match source {
+        Some(FingerprintSource::LoadedPaths(paths)) => paths.clone(),
+        None => vec![
             resolved.package_root.join("package.json"),
             resolved.entry_path.clone(),
-        ]
+        ],
+    };
+    let mut fingerprints = paths
         .into_iter()
         .filter_map(file_fingerprint_reading_hash)
-        .collect();
-
-        // A CJS package has no `ModuleGraph`, but the analyzer cached read-time
-        // fingerprints for every transitively `require()`d module (RB-5). Fold them in
-        // so a first-party CJS dep edit invalidates instead of probing Fresh against
-        // manifest+entry alone. The fingerprints carry read-time content hashes, so the
-        // strict per-get gate hash-verifies first-party CJS modules. (A CJS result that
-        // fell back to static-entry sizing may pull in a partial/unused module set —
-        // harmless over-coverage, never a stale-serve.)
-        if resolved.is_cjs
-            && let Some(cjs_fingerprints) =
-                crate::pipeline::cjs::cjs_module_fingerprints(&resolved.entry_path, runtime)
-        {
-            fingerprints.extend(cjs_fingerprints);
-        }
-        fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
-        fingerprints.dedup_by(|a, b| a.path == b.path);
-        return fingerprints;
-    };
-
-    let mut paths = vec![
-        // The manifest is not a graph module, so fingerprints_with_content_hashes
-        // read+hashes it (RB-2) rather than degrading to mtime+len — a same-content
-        // touch no longer re-verifies, and a same-length edit is still caught.
-        resolved.package_root.join("package.json"),
-        resolved.entry_path.clone(),
-    ];
-    paths.extend(graph.modules.iter().map(|module| module.path.clone()));
-    paths.extend(graph.dependency_paths.iter().cloned());
-    // Content hashes come from the EXACT graph instance the result was computed
-    // from (threaded out of analysis), so these fingerprints describe the
-    // analyzed bytes with no second fetch that could rebuild against a dependency
-    // that changed during the analysis window (Finding 4). The pre-analysis
-    // generation gate still backstops the node_modules-changed case.
-    crate::pipeline::graph::fingerprints_with_content_hashes(paths, graph)
+        .collect::<Vec<_>>();
+    fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
+    fingerprints.dedup_by(|left, right| left.path == right.path);
+    fingerprints
 }
-
 pub fn protocol_error_batch_response(request: &BatchRequest, message: String) -> BatchResponse {
     BatchResponse {
         version: request.version.min(PROTOCOL_VERSION),
@@ -2763,99 +2601,6 @@ mod task_lifecycle_tests {
             "an aggregation panic must yield an error response: {response:?}"
         );
         assert!(response.rows.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod analyze_and_cache_graph_reuse_tests {
-    use super::{ImportLensService, should_cache_result};
-    use crate::cache::key::cache_key_for_resolved_import;
-    use crate::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
-    use crate::pipeline::analyze::AnalysisContext;
-    use crate::pipeline::graph::graph_fetch_probe;
-    use crate::pipeline::resolver::{ResolvedPackage, SideEffectsMode};
-    use std::fs;
-
-    /// Finding 4 regression: `analyze_and_cache` must build content-hash
-    /// fingerprints from the SAME module graph instance it analyzed, never
-    /// re-fetch the graph by key. The probe counts
-    /// `build_module_graph_cached_with_runtime` calls for the analyzed entry:
-    /// the fix makes that exactly one (analysis only); the pre-fix code fetched
-    /// a second time inside `dependency_fingerprints`, which — if a dependency
-    /// changed during the analysis window — pairs a stale result with
-    /// fresh-looking fingerprints and serves it `Fresh`.
-    #[test]
-    fn analyze_and_cache_fetches_module_graph_once() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        let workspace =
-            std::env::temp_dir().join(format!("il-a4-graph-reuse-{}-{unique}", std::process::id()));
-        let package_root = workspace.join("node_modules").join("pkg-a4");
-        fs::create_dir_all(&package_root).expect("package root");
-        // ESM entry + one internal dependency so the OXC pipeline builds a real
-        // multi-module graph (`Some(graph)`), exercising the content-hash path.
-        fs::write(
-            package_root.join("index.mjs"),
-            "export { value } from './dep.mjs';\n",
-        )
-        .expect("entry");
-        fs::write(
-            package_root.join("dep.mjs"),
-            "export const value = 41;\nexport const spare = 7;\n",
-        )
-        .expect("dep");
-        fs::write(package_root.join("package.json"), "{\"name\":\"pkg-a4\"}").expect("manifest");
-
-        let entry_path = package_root.join("index.mjs");
-        let resolved = ResolvedPackage {
-            package_root: package_root.clone(),
-            package_json: serde_json::json!({ "name": "pkg-a4", "version": "1.0.0" }),
-            entry_path: entry_path.clone(),
-            is_cjs: false,
-            side_effects: SideEffectsMode::False,
-        };
-        let request = ImportRequest {
-            specifier: "pkg-a4".to_owned(),
-            package_name: "pkg-a4".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["value".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        };
-        let context = AnalysisContext {
-            workspace_root: workspace.clone(),
-            active_document_path: workspace.join("src").join("app.ts"),
-        };
-
-        // Arm the probe on the exact entry both analysis and (pre-fix)
-        // fingerprinting fetch. The path is unique to this test, so concurrent
-        // sibling tests building other graphs never perturb the count.
-        graph_fetch_probe::arm(entry_path.clone());
-
-        let service = ImportLensService::new(None, false);
-        let cache = service
-            .cache_registry
-            .cache_for_root(&context.workspace_root);
-        let key = cache_key_for_resolved_import(&request, &resolved);
-        let result =
-            service.analyze_and_cache(cache.as_ref(), &context, &request, key, resolved, || true);
-
-        let hits = graph_fetch_probe::hits();
-        graph_fetch_probe::disarm();
-        fs::remove_dir_all(&workspace).ok();
-
-        assert_eq!(result.error, None, "analysis should succeed: {result:?}");
-        assert!(
-            should_cache_result(&result),
-            "result must reach the fingerprint path or the fetch count is vacuous",
-        );
-        assert_eq!(
-            hits, 1,
-            "analyze_and_cache must reuse the analyzed graph for fingerprints \
-             (one fetch); a second fetch is the Finding 4 TOCTOU",
-        );
     }
 }
 

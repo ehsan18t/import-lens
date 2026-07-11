@@ -12,7 +12,7 @@ export default defineConfig({
   dts: false,
   deps: {
     alwaysBundle: ["@msgpack/msgpack"],
-    neverBundle: ["vscode", "oxc-parser"],
+    neverBundle: ["vscode"],
     onlyBundle: ["@msgpack/msgpack"],
   },
   outputOptions: {

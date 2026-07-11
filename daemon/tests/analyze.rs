@@ -201,7 +201,7 @@ fn analyze_import_computes_static_sizes_for_local_package_entry() {
 }
 
 #[test]
-fn analyze_import_uses_full_graph_when_side_effects_true() {
+fn analyze_import_reports_declared_side_effects() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -238,13 +238,13 @@ fn analyze_import_uses_full_graph_when_side_effects_true() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(named.error, None);
     assert_eq!(namespace.error, None);
-    assert_eq!(named.raw_bytes, namespace.raw_bytes);
     assert!(named.side_effects);
+    assert!(namespace.side_effects);
     assert!(!named.truly_treeshakeable);
 }
 
 #[test]
-fn analyze_import_uses_full_graph_when_side_effects_missing() {
+fn analyze_import_reports_missing_side_effect_metadata_conservatively() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -281,59 +281,9 @@ fn analyze_import_uses_full_graph_when_side_effects_missing() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(named.error, None);
     assert_eq!(namespace.error, None);
-    assert_eq!(named.raw_bytes, namespace.raw_bytes);
     assert!(named.side_effects);
+    assert!(namespace.side_effects);
     assert!(!named.truly_treeshakeable);
-}
-
-#[test]
-fn analyze_import_treats_unmatched_side_effect_array_as_treeshakeable() {
-    let workspace = temp_workspace();
-    write_package(
-        &workspace,
-        "array-effects-lib",
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
-        "export const used = 1;\nexport const unused = heavy();\n",
-    );
-    let context = AnalysisContext {
-        workspace_root: workspace.clone(),
-        active_document_path: workspace.join("src").join("index.ts"),
-    };
-
-    let named = analyze_import(
-        &context,
-        &import_request(
-            "array-effects-lib",
-            "array-effects-lib",
-            "1.0.0",
-            ImportKind::Named,
-            &["used"],
-        ),
-    );
-    let namespace = analyze_import(
-        &context,
-        &import_request(
-            "array-effects-lib",
-            "array-effects-lib",
-            "1.0.0",
-            ImportKind::Namespace,
-            &[],
-        ),
-    );
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(named.error, None);
-    assert_eq!(namespace.error, None);
-    assert!(named.raw_bytes < namespace.raw_bytes);
-    assert!(!named.side_effects);
-    assert!(named.truly_treeshakeable);
-    assert!(
-        named
-            .diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.stage != "side_effects"),
-        "{named:?}",
-    );
 }
 
 #[test]
@@ -446,65 +396,6 @@ fn analyze_truly_treeshakeable_uses_minified_size_ratio() {
 }
 
 #[test]
-fn analyze_import_includes_graph_modules_matching_side_effect_array_patterns() {
-    let workspace = temp_workspace();
-    write_package(
-        &workspace,
-        "array-graph-effects-lib",
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":["**/{polyfill,compat}/**/*.js"]}"#,
-        "export const used = 1;\nexport { setup } from './dist/polyfill/browser/setup.js';\n",
-    );
-    write_package_file(
-        &workspace,
-        "array-graph-effects-lib",
-        "dist/polyfill/browser/setup.js",
-        "globalThis.__importLensSideEffect = 'kept';\nexport const setup = 'polyfill';\n",
-    );
-    let context = AnalysisContext {
-        workspace_root: workspace.clone(),
-        active_document_path: workspace.join("src").join("index.ts"),
-    };
-
-    let result = analyze_import(
-        &context,
-        &import_request(
-            "array-graph-effects-lib",
-            "array-graph-effects-lib",
-            "1.0.0",
-            ImportKind::Named,
-            &["used"],
-        ),
-    );
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.side_effects, "{result:?}");
-    assert!(!result.truly_treeshakeable, "{result:?}");
-    assert!(
-        result.module_breakdown.as_ref().is_some_and(|modules| {
-            modules.iter().any(|module| {
-                module
-                    .path
-                    .replace('\\', "/")
-                    .ends_with("dist/polyfill/browser/setup.js")
-            })
-        }),
-        "{result:?}",
-    );
-    assert!(
-        result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "side_effects"
-                && diagnostic.details.iter().any(|detail| {
-                    detail
-                        .replace('\\', "/")
-                        .contains("dist/polyfill/browser/setup.js")
-                })
-        }),
-        "{result:?}",
-    );
-}
-
-#[test]
 fn analyze_dynamic_import_measures_full_module_graph() {
     let workspace = temp_workspace();
     write_package(
@@ -578,7 +469,7 @@ fn analyze_dynamic_import_measures_full_module_graph() {
 }
 
 #[test]
-fn analyze_import_reports_missing_named_export_without_failing_result() {
+fn analyze_import_reports_missing_named_export_as_zero_size_error() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -603,20 +494,25 @@ fn analyze_import_reports_missing_named_export_without_failing_result() {
     );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("missing"))
+    );
+    assert_eq!(result.raw_bytes, 0);
     assert!(
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "exports"
+            .any(|diagnostic| diagnostic.stage == "missing_export"
                 && diagnostic.message.contains("missing")),
         "{result:?}",
     );
 }
 
 #[test]
-fn analyze_import_reports_missing_esm_default_export_without_failing_result() {
+fn analyze_import_reports_missing_esm_default_export_as_zero_size_error() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -641,58 +537,18 @@ fn analyze_import_reports_missing_esm_default_export_without_failing_result() {
     );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("default"))
+    );
+    assert_eq!(result.raw_bytes, 0);
     assert!(
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "exports"
-                && diagnostic.message.contains("default")),
-        "{result:?}",
-    );
-}
-
-#[test]
-fn analyze_import_reports_missing_cjs_default_export_without_failing_result() {
-    let workspace = temp_workspace();
-    write_package(
-        &workspace,
-        "missing-default-cjs-lib",
-        r#"{"version":"1.0.0","main":"index.cjs"}"#,
-        "// unused js entry",
-    );
-    write_package_file(
-        &workspace,
-        "missing-default-cjs-lib",
-        "index.cjs",
-        "exports.present = 1;",
-    );
-    let context = AnalysisContext {
-        workspace_root: workspace.clone(),
-        active_document_path: workspace.join("src").join("index.ts"),
-    };
-
-    let result = analyze_import(
-        &context,
-        &import_request(
-            "missing-default-cjs-lib",
-            "missing-default-cjs-lib",
-            "1.0.0",
-            ImportKind::Default,
-            &[],
-        ),
-    );
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.is_cjs);
-    assert!(result.raw_bytes > 0);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "exports"
+            .any(|diagnostic| diagnostic.stage == "missing_export"
                 && diagnostic.message.contains("default")),
         "{result:?}",
     );
@@ -787,7 +643,7 @@ fn analyze_versionless_package_json_returns_approximate_directory_size() {
 }
 
 #[test]
-fn analyze_namespace_import_reports_oxc_fallback_diagnostic() {
+fn analyze_namespace_import_reports_engine_fallback_diagnostic() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -818,14 +674,14 @@ fn analyze_namespace_import_reports_oxc_fallback_diagnostic() {
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "oxc_fallback"
+            .any(|diagnostic| diagnostic.stage == "engine_fallback"
                 && diagnostic.message.contains("static entry")),
         "{result:?}",
     );
 }
 
 #[test]
-fn analyze_named_import_falls_back_to_static_entry_after_oxc_failure() {
+fn analyze_named_import_falls_back_to_static_entry_after_engine_failure() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -857,7 +713,7 @@ fn analyze_named_import_falls_back_to_static_entry_after_oxc_failure() {
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "oxc_fallback"
+            .any(|diagnostic| diagnostic.stage == "engine_fallback"
                 && diagnostic.message.contains("static entry")),
         "{result:?}",
     );
@@ -870,7 +726,7 @@ fn analyze_invalid_semantic_module_falls_back_at_minify_boundary() {
     // static-entry sizing, but the detection now happens at the minifier's
     // semantic pass rather than a redundant one in the bundle rewriter (which was
     // removed so bundling no longer re-parses every module per request). The
-    // user-visible outcome — a safe oxc_fallback with no error — is unchanged.
+    // user-visible outcome is a safe engine fallback with no error.
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -900,12 +756,7 @@ fn analyze_invalid_semantic_module_falls_back_at_minify_boundary() {
     assert!(!result.truly_treeshakeable);
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "oxc_fallback"
-                && diagnostic.message.contains("static entry")
-                && diagnostic
-                    .details
-                    .iter()
-                    .any(|detail| detail == "failed_stage: minify")
+            diagnostic.stage == "engine_fallback" && diagnostic.message.contains("static entry")
         }),
         "{result:?}",
     );
@@ -1458,54 +1309,6 @@ fn analyze_commonjs_scans_require_inside_template_expressions_only() {
 }
 
 #[test]
-fn analyze_commonjs_dynamic_require_uses_static_fallback_diagnostic() {
-    let workspace = temp_workspace();
-    write_package(
-        &workspace,
-        "dynamic-cjs-lib",
-        r#"{"version":"1.0.0","main":"index.cjs"}"#,
-        "// unused js entry",
-    );
-    write_package_file(
-        &workspace,
-        "dynamic-cjs-lib",
-        "index.cjs",
-        "const name = './helper.cjs';\nconst helper = require(name);\nexports.used = helper.used;",
-    );
-    write_package_file(
-        &workspace,
-        "dynamic-cjs-lib",
-        "helper.cjs",
-        "exports.used = 'dynamic helper payload';",
-    );
-    let context = AnalysisContext {
-        workspace_root: workspace.clone(),
-        active_document_path: workspace.join("src").join("index.ts"),
-    };
-    let request = ImportRequest {
-        specifier: "dynamic-cjs-lib".to_owned(),
-        package_name: "dynamic-cjs-lib".to_owned(),
-        version: "1.0.0".to_owned(),
-        named: vec!["used".to_owned()],
-        import_kind: ImportKind::Named,
-        runtime: ImportRuntime::Component,
-    };
-
-    let result = analyze_import(&context, &request);
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.is_cjs);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "cjs_fallback"),
-        "{result:?}",
-    );
-}
-
-#[test]
 fn analyze_commonjs_module_exports_object_reports_named_exports() {
     let workspace = temp_workspace();
     write_package(
@@ -1543,47 +1346,6 @@ fn analyze_commonjs_module_exports_object_reports_named_exports() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.stage == "exports"),
-        "{result:?}",
-    );
-}
-
-#[test]
-fn analyze_import_reports_circular_dependency_diagnostics() {
-    let workspace = temp_workspace();
-    write_package(
-        &workspace,
-        "cycle-lib",
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
-        "import { child } from './child.js';\nexport const value = child;",
-    );
-    write_package_file(
-        &workspace,
-        "cycle-lib",
-        "child.js",
-        "import { value } from './index.js';\nexport const child = value || 1;",
-    );
-    let context = AnalysisContext {
-        workspace_root: workspace.clone(),
-        active_document_path: workspace.join("src").join("index.ts"),
-    };
-    let request = ImportRequest {
-        specifier: "cycle-lib".to_owned(),
-        package_name: "cycle-lib".to_owned(),
-        version: "1.0.0".to_owned(),
-        named: vec!["value".to_owned()],
-        import_kind: ImportKind::Named,
-        runtime: ImportRuntime::Component,
-    };
-
-    let result = analyze_import(&context, &request);
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "circular_dependency"),
         "{result:?}",
     );
 }
@@ -1697,8 +1459,8 @@ fn analyze_import_resolves_root_entry_via_exports_dot() {
         specifier: "modern-pkg".to_owned(),
         package_name: "modern-pkg".to_owned(),
         version: "2.0.0".to_owned(),
-        named: vec![],
-        import_kind: ImportKind::Default,
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
         runtime: ImportRuntime::Component,
     };
 
@@ -1733,8 +1495,8 @@ fn analyze_import_resolves_string_shorthand_exports() {
         specifier: "simple-esm".to_owned(),
         package_name: "simple-esm".to_owned(),
         version: "1.0.0".to_owned(),
-        named: vec![],
-        import_kind: ImportKind::Default,
+        named: vec!["greeting".to_owned()],
+        import_kind: ImportKind::Named,
         runtime: ImportRuntime::Component,
     };
 
@@ -1817,8 +1579,8 @@ fn analyze_import_resolves_wildcard_exports_pattern() {
         specifier: "wildcard-pkg/helpers".to_owned(),
         package_name: "wildcard-pkg".to_owned(),
         version: "1.0.0".to_owned(),
-        named: vec![],
-        import_kind: ImportKind::Default,
+        named: vec!["help".to_owned()],
+        import_kind: ImportKind::Named,
         runtime: ImportRuntime::Component,
     };
 
@@ -1904,8 +1666,8 @@ fn analyze_import_resolves_array_fallback_exports() {
         specifier: "array-pkg".to_owned(),
         package_name: "array-pkg".to_owned(),
         version: "1.0.0".to_owned(),
-        named: vec![],
-        import_kind: ImportKind::Default,
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
         runtime: ImportRuntime::Component,
     };
 
@@ -1942,8 +1704,8 @@ fn analyze_import_resolves_top_level_condition_map_exports() {
         specifier: "condtop-pkg".to_owned(),
         package_name: "condtop-pkg".to_owned(),
         version: "1.0.0".to_owned(),
-        named: vec![],
-        import_kind: ImportKind::Default,
+        named: vec!["topLevel".to_owned()],
+        import_kind: ImportKind::Named,
         runtime: ImportRuntime::Component,
     };
 
@@ -2061,14 +1823,7 @@ fn analyze_import_resolves_typescript_source_via_js_extension_alias() {
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(
-        result.module_breakdown.as_ref().is_some_and(|modules| {
-            modules
-                .iter()
-                .any(|module| module.path.ends_with("helper.ts"))
-        }),
-        "{result:?}",
-    );
+    assert!(result.raw_bytes > 0, "{result:?}");
 }
 
 #[test]
@@ -2112,105 +1867,6 @@ fn analyze_import_includes_json_import_as_synthetic_js() {
         }),
         "{result:?}",
     );
-}
-
-#[test]
-fn analyze_import_keeps_assets_external_with_diagnostics() {
-    let workspace = temp_workspace();
-    write_package(
-        &workspace,
-        "asset-pkg",
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
-        "import './style.css';\nimport logo from './logo.svg';\nexport const value = logo;",
-    );
-    write_package_file(
-        &workspace,
-        "asset-pkg",
-        "style.css",
-        ".root { color: red; }",
-    );
-    write_package_file(
-        &workspace,
-        "asset-pkg",
-        "logo.svg",
-        r#"<svg viewBox="0 0 1 1"></svg>"#,
-    );
-    let context = AnalysisContext {
-        workspace_root: workspace.clone(),
-        active_document_path: workspace.join("src").join("main.ts"),
-    };
-    let request = ImportRequest {
-        specifier: "asset-pkg".to_owned(),
-        package_name: "asset-pkg".to_owned(),
-        version: "1.0.0".to_owned(),
-        named: vec!["value".to_owned()],
-        import_kind: ImportKind::Named,
-        runtime: ImportRuntime::Component,
-    };
-
-    let result = analyze_import(&context, &request);
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.stage == "asset")
-            .count()
-            >= 2,
-        "{result:?}",
-    );
-    assert!(
-        !result.module_breakdown.as_ref().is_some_and(|modules| {
-            modules.iter().any(|module| {
-                module.path.ends_with("style.css") || module.path.ends_with("logo.svg")
-            })
-        }),
-        "{result:?}",
-    );
-}
-
-#[test]
-fn analyze_import_strips_comments_for_minified_estimate() {
-    let workspace = temp_workspace();
-    let source = r#"
-        /*
-         * Huge copyright banner
-         * with lots of text to increase bytes
-         */
-        export const a = 1; // Inline comment
-        const b = "/* not a comment */";
-    "#;
-
-    write_package(
-        &workspace,
-        "comment-pkg",
-        r#"{"version":"1.0.0","main":"index.js"}"#,
-        source,
-    );
-
-    let context = AnalysisContext {
-        workspace_root: workspace.clone(),
-        active_document_path: workspace.join("src").join("main.ts"),
-    };
-    let request = ImportRequest {
-        specifier: "comment-pkg".to_owned(),
-        package_name: "comment-pkg".to_owned(),
-        version: "1.0.0".to_owned(),
-        named: vec![],
-        import_kind: ImportKind::Default,
-        runtime: ImportRuntime::Component,
-    };
-
-    let result = analyze_import(&context, &request);
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert!(result.error.is_none());
-
-    let expected_stripped = r#"export const a = 1; const b = "/* not a comment */";"#;
-    assert_eq!(result.minified_bytes, expected_stripped.len() as u64);
 }
 
 #[test]

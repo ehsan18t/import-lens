@@ -1,14 +1,16 @@
 # Rolldown Qualification and Bundler Replacement Design
 
-Status: **accepted** — the §10 qualification gates passed on 2026-07-11; measured results
-are recorded in §10.7. Previously: proposed 2026-07-10 after a validation pass against
-crates.io (rolldown 1.1.5, oxc 0.139.0, oxc_resolver 11.23.0), the published Rolldown 1.1.5
-API surface, and repo HEAD. This document replaces the custom reference-closure/fixpoint
-proposal after verifying that Rolldown now publishes an embeddable Rust crate.
-
-Acceptance authorizes production migration to begin at §11 Phase 2. Production behavior
-remains unchanged until Phase 3's atomic cutover: the shipped daemon does not compile the
-candidate feature, and the old engine is still the production bundler.
+Status: **cutover complete** — §11 Phase 3 landed on 2026-07-11: Rolldown is the only
+semantic bundler, the custom engine (`bundle.rs`/`reachability.rs`/`cjs.rs`/manual
+`graph.rs`) and its tests are deleted, `ANALYZER_REVISION` moved to `rolldown1`, direct
+`oxc_ast`/`oxc_ast_visit`/`oxc_transformer` dependencies are removed, and the
+README/SRS/skill describe the shipped architecture. Phase 4 (release re-baseline) is the
+remaining step. Previously: **accepted** — the §10 qualification gates passed on
+2026-07-11 with measured results recorded in §10.7; proposed 2026-07-10 after a
+validation pass against crates.io (rolldown 1.1.5, oxc 0.139.0, oxc_resolver 11.23.0),
+the published Rolldown 1.1.5 API surface, and repo HEAD. This document replaces the
+custom reference-closure/fixpoint proposal after verifying that Rolldown publishes an
+embeddable Rust crate.
 
 ## 1. Decision summary
 

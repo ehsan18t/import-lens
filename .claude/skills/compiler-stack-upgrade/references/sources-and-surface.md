@@ -19,8 +19,8 @@
     **ignore these**, they are not our crates. Keep only `^crates_v(\d+\.\d+\.\d+)$`.
 - **Which versions exist:** crates.io, not GitHub —
   `https://crates.io/api/v1/crates/<crate>` returns every version with publish dates.
-  No auth, no rate limit. Use it to enumerate the range *and* to confirm all ten
-  crates published the same version. The updater already uses it (`latestCrateVersion`).
+  No auth, no rate limit. Use it to enumerate the range *and* to confirm every
+  configured OXC crate published the same version. The updater already uses it (`latestCrateVersion`).
 - **Per-crate changelog:** `crates/oxc_<crate>/CHANGELOG.md` — note the directory is
   the full crate name (`crates/oxc_transformer/`, not `crates/transformer/`).
   **Do not rely on it.** It is generated when the release PR opens, so anything merged
@@ -85,21 +85,22 @@ sandbox, so prefer a direct fetch:
 
 | Crate | Where we use it (verify with grep) | What we call |
 |---|---|---|
-| `oxc_parser` | `document/{completion,imports}`, `pipeline/{graph,minify}` | `Parser::new(...).parse()`, `ParserReturn`, error recovery |
-| `oxc_allocator` | `document/{completion,imports}`, `pipeline/{graph,minify}` | arena `Allocator`, lifetimes bound to it |
-| `oxc_ast` | `pipeline/{graph,minify}` | AST node types |
-| `oxc_ast_visit` | `pipeline/graph.rs` | visitor traversal |
-| `oxc_semantic` | `pipeline/{graph,minify}` | scope tree, symbols, references |
-| `oxc_transformer` | `pipeline/{graph,minify}` | TS/JSX stripping (NOT tree-shaking). **`graph.rs` is the only one that sees real TS/JSX**; `minify.rs` always passes `import-lens-bundle.js` + `SourceType::cjs()`/`mjs()`. Both pass `TransformOptions::default()`, which leaves every `env` pass and legacy decorators OFF. |
+| `oxc_parser` | `document/{completion,imports}`, `pipeline/minify.rs` | `Parser::new(...).parse()`, `ParserReturn`, error recovery |
+| `oxc_allocator` | `document/{completion,imports}`, `pipeline/minify.rs` | arena `Allocator`, lifetimes bound to it |
+| `oxc_semantic` | `pipeline/minify.rs` | linked-chunk validation before minification |
 | `oxc_minifier` | `pipeline/minify.rs` | `Minifier`, `MinifierOptions`, mangling metadata |
-| `oxc_codegen` | `pipeline/{graph,minify}` | `Codegen::new().with_options(CodegenOptions::minify()).with_scoping(..).with_private_member_mappings(..).build()` |
-| `oxc_span` | `document/{completion,imports,script_regions}`, `pipeline/{graph,minify}` | `Span`, source ranges |
-| `oxc_syntax` | `document/{completion,imports}`, `pipeline/graph.rs` | syntax metadata |
-| `oxc_resolver` | `pipeline/{cjs,graph,resolver}` | `Resolver`, `ResolveOptions`, resolve from active doc path |
+| `oxc_codegen` | `pipeline/minify.rs` | `Codegen::new().with_options(CodegenOptions::minify()).with_scoping(..).with_private_member_mappings(..).build()` |
+| `oxc_span` | `document/{completion,imports,script_regions}`, `pipeline/minify.rs` | `Span`, source ranges, `SourceType` |
+| `oxc_syntax` | `document/{completion,imports}` | syntax metadata |
+| `oxc_resolver` | `pipeline/resolver.rs` | `Resolver`, `ResolveOptions`, root resolution from active doc path |
+| `rolldown` (+`rolldown_common`, `rolldown_error`) | `engine/{adapter,plugin}.rs` ONLY | `BundlerBuilder`/`BundlerOptions`/`generate()`, plugin hooks (`resolve_id`/`load`/`module_parsed`), `OutputChunk.exports`, `RenderedModule::rendered_length()`, `treeshake`, `preserve_entry_signatures`, `code_splitting`, `resolve.{condition_names,main_fields}` |
 
-The AST types (`oxc_ast`), builder, minifier, and codegen APIs are the ones that
-break most often, and they flow straight into `pipeline/minify.rs` and
-`pipeline/graph.rs` — check those hardest.
+`oxc_ast`, `oxc_ast_visit`, and `oxc_transformer` are no longer direct
+dependencies — they reach us only transitively through rolldown's build.
+
+The minifier and codegen APIs break most often and flow straight into
+`pipeline/minify.rs`; the rolldown plugin/output APIs flow into
+`engine/{adapter,plugin}.rs` — check those hardest.
 
 ## Known gotchas
 
@@ -110,17 +111,16 @@ break most often, and they flow straight into `pipeline/minify.rs` and
   a new variant there breaks the build.
 - **`AstBuilder` method signatures change** between minors — expect codegen/transform
   construction sites to need edits. (We currently construct no AST nodes.)
-- **`Transformer` `debug_assert!`s on its `Scoping`.** Lowering an enum needs each
-  member's evaluated value, so the scoping must come from
-  `SemanticBuilder::new().with_enum_eval(true)`. `new_compiler()` does **not** set it,
-  and only `graph.rs` transforms TypeScript, so only it needs the flag.
-  The trap is that the guard is a `debug_assert!` and `profile.release` sets no
-  `debug-assertions`: a debug build (tests, and the accuracy suite's `cargo run`
-  daemon) panics loudly, while the **shipped release daemon silently emits worse code**
-  — `Level["High"] = 1 + Level["Low"]` instead of `Level["High"] = 1`. Bigger bundle,
-  no error. Generalize the lesson: when an oxc guard is a `debug_assert!`, a test that
-  only asserts "it did not panic" proves nothing about the binary users run. Assert on
-  the emitted output instead.
+- **`debug_assert!` guards in OXC hide release-mode misbehavior.** Historical
+  example (from when we ran `oxc_transformer` directly): `Transformer`
+  `debug_assert!`ed that its `Scoping` came from
+  `SemanticBuilder::new().with_enum_eval(true)`; a debug build panicked loudly
+  while the **shipped release daemon silently emitted worse code** —
+  `Level["High"] = 1 + Level["Low"]` instead of `Level["High"] = 1`. Bigger
+  bundle, no error. The transformer now runs inside rolldown, but the lesson
+  generalizes: when an oxc guard is a `debug_assert!`, a test that only asserts
+  "it did not panic" proves nothing about the binary users run. Assert on the
+  emitted output instead.
 - **Minifier/codegen output shifts** across versions, silently changing our size
   numbers. `pnpm test:accuracy` alone is NOT a gate (coarse ~75% esbuild tolerance,
   no stored baseline) — the real check is the before/after byte-count baseline plus

@@ -3,11 +3,11 @@ use crate::{
         key::{cache_key_for_resolved_import, path_is_definitely_gone},
         memory::cache_generation,
     },
+    engine::dependency_paths::cached_loaded_paths,
     ipc::protocol::{ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
         file_size::FileSizeComputation,
-        graph::peek_cached_module_paths,
         resolver::{ResolvedPackage, resolve_package_entry},
     },
 };
@@ -24,18 +24,19 @@ use std::{
 
 // One aggregate-size entry per document path. Editing a file overwrites its
 // single slot in place, so repeated edits never accumulate orphaned entries.
-// Distinct files are bounded by LRU eviction, mirroring GRAPH_CACHE.
+// Distinct files are bounded by LRU eviction.
 const MAX_CACHED_FILE_SIZES: usize = 64;
 
 // Bound how long an aggregate is served without any freshness signal. Per import
 // the signature folds the package's manifest plus a content token: for node_modules
-// imports just the entry stat, for first-party imports a stat per cached-graph
-// module (see `resolved_import_token`). It never re-reads the transitive bundle. A
+// imports just the entry stat, for first-party imports a stat per cached loaded
+// path (see `resolved_import_token`). It never re-reads the transitive bundle. A
 // node_modules content change with no watcher event (e.g. a watcher-excluded
-// folder), or a first-party deep edit while that package's graph is not cached (the
-// fallback stats only the entry), is reflected in the L2 per-import cache after its
-// own re-verify window but would otherwise never reach L1. This TTL gives L1 the
-// same backstop as `memory::REVERIFY_TTL`, capping staleness to one window.
+// folder), or a first-party deep edit while that package's loaded paths are not
+// cached (the fallback stats only the entry), is reflected in the L2 per-import
+// cache after its own re-verify window but would otherwise never reach L1. This
+// TTL gives L1 the same backstop as `memory::REVERIFY_TTL`, capping staleness to
+// one window.
 const REVERIFY_TTL_MS: u64 = 30_000;
 
 #[derive(Debug)]
@@ -85,8 +86,8 @@ impl FileSizeCache {
         );
 
         // Bound files-opened-then-closed by evicting the least-recently-used
-        // entry, mirroring GRAPH_CACHE. Editing the same file never triggers
-        // this because it overwrites one slot rather than adding a new key.
+        // entry. Editing the same file never triggers this because it
+        // overwrites one slot rather than adding a new key.
         if pinned.len() > MAX_CACHED_FILE_SIZES
             && let Some(oldest) = pinned
                 .iter()
@@ -201,20 +202,17 @@ fn resolved_import_token(request: &ImportRequest, resolved: &ResolvedPackage) ->
     format!("{key}|{content_token}|{manifest_token}")
 }
 
-/// Stat token covering every first-party module reachable from `entry_path`. Peeks
-/// the cached module graph for the package's module path set — or, for a CommonJS
-/// package (which produces no ESM graph, RB-5), the cached CJS module set — and folds
-/// a `stat_token` per module, so a deep-module edit — which changes neither the cache
-/// key nor the entry stat — moves the L1 signature. Neither peek ever builds. Any
+/// Stat token covering every first-party path loaded by the latest engine build.
+/// A deep-module edit — which changes neither the cache key nor the entry stat — moves
+/// the L1 signature. This index lookup never builds. Any
 /// `node_modules` modules a first-party package pulls in are skipped: they invalidate
 /// via `cache_generation`, not mtime, and re-stat'ing them every poll is the cost the
 /// node_modules branch deliberately avoids. With nothing cached yet, falls back to the
-/// entry stat alone; a later poll, once L2 has populated a graph / CJS module set,
+/// entry stat alone; a later poll, once L2 has populated the dependency-path index,
 /// upgrades to full coverage. The tokens are sorted so the result is stable regardless
 /// of module order.
 fn first_party_module_token(entry_path: &Path, runtime: ImportRuntime) -> String {
-    let module_paths = peek_cached_module_paths(entry_path, runtime)
-        .or_else(|| crate::pipeline::cjs::peek_cjs_module_paths(entry_path, runtime));
+    let module_paths = cached_loaded_paths(entry_path, runtime);
     let Some(module_paths) = module_paths else {
         return stat_token(entry_path);
     };
@@ -446,7 +444,7 @@ mod tests {
 
     #[test]
     fn resolved_import_token_folds_first_party_deep_module_stat() {
-        use crate::pipeline::graph::build_module_graph_cached_with_runtime;
+        use crate::engine::dependency_paths::{clear, record_loaded_paths};
         use crate::pipeline::resolver::SideEffectsMode;
 
         // A first-party fixture lives OUTSIDE node_modules: entry imports a deep
@@ -488,23 +486,23 @@ mod tests {
             runtime: ImportRuntime::Component,
         };
 
-        // Cache the module graph so the first-party branch can peek its module set.
-        // Rebuilt immediately before each token so a concurrent LRU eviction/clear in
-        // the process-shared GRAPH_CACHE cannot drop it mid-test.
-        build_module_graph_cached_with_runtime(&entry_path, ImportRuntime::Component)
-            .expect("graph should build");
+        clear();
+        record_loaded_paths(
+            entry_path.clone(),
+            ImportRuntime::Component,
+            vec![entry_path.clone(), pkg.join("deep.js")],
+        );
         let token_before = resolved_import_token(&request, &resolved);
 
         // Edit the DEEP module only (not the entry, not the manifest): its len+mtime move.
         std::fs::write(pkg.join("deep.js"), "export const d = 22222222;\n").expect("deep v2");
-        build_module_graph_cached_with_runtime(&entry_path, ImportRuntime::Component)
-            .expect("graph should rebuild");
         let token_after = resolved_import_token(&request, &resolved);
 
         assert_ne!(
             token_before, token_after,
             "editing a deep first-party module must change the L1 token"
         );
+        clear();
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -1,10 +1,9 @@
 use crate::{
     cache::key::{CacheIdentity, decode_cache_identity},
-    engine::scheduling::drain_ordered,
+    engine::{boundary::enumerate_exports_sync, scheduling::drain_ordered},
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
-        graph::{cached_module_graph_with_runtime, module_provides_export},
         resolver::{ResolvedPackage, resolve_package_entry, resolved_from_cache_identity},
     },
     service::ImportLensService,
@@ -12,17 +11,23 @@ use crate::{
 use rayon::ThreadPoolBuilder;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 static PREWARM_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 const RECENT_PREWARM_LIMIT: usize = 20;
+const DEFAULT_EXPORT_MEMO_LIMIT: usize = 512;
+
+// entry_path -> (entry stat token, exposes default). Prewarm reruns on every
+// package.json event and export enumeration is an uncached engine build, so a
+// default-less dependency would otherwise cost one build per event forever.
+static DEFAULT_EXPORT_MEMO: OnceLock<Mutex<HashMap<PathBuf, (u64, bool)>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct PrewarmJob {
@@ -159,7 +164,7 @@ pub fn package_json_prewarm_requests(
     active_document_path: &Path,
 ) -> Result<Vec<ImportRequest>, String> {
     Ok(
-        package_json_prewarm_jobs(package_json_path, active_document_path)?
+        package_json_prewarm_jobs(package_json_path, active_document_path, &|| true)?
             .into_iter()
             .map(|job| job.request)
             .collect(),
@@ -169,6 +174,7 @@ pub fn package_json_prewarm_requests(
 fn package_json_prewarm_jobs(
     package_json_path: &Path,
     active_document_path: &Path,
+    should_continue: &dyn Fn() -> bool,
 ) -> Result<Vec<PrewarmJob>, String> {
     let contents = fs::read_to_string(package_json_path).map_err(|error| {
         format!(
@@ -179,6 +185,9 @@ fn package_json_prewarm_jobs(
     let mut requests = Vec::new();
 
     for package_name in package_json_dependency_names(&contents)? {
+        if !should_continue() {
+            return Ok(Vec::new());
+        }
         let Some(resolved) = installed_package(active_document_path, &package_name) else {
             continue;
         };
@@ -206,26 +215,47 @@ fn package_json_prewarm_jobs(
     Ok(requests)
 }
 
-// A `Default` prewarm job for a package with no `default` export emits an
-// "exports" diagnostic, so `should_cache_result` refuses to cache the result and
-// every prewarm trigger re-runs bundle+minify+compress for nothing. Suppress the
-// Default variant when the entry exposes no default export -- but only when the
-// module graph is ALREADY cached: building one here would serialize graph builds
-// during enumeration and thrash the bounded GRAPH_CACHE on large manifests. On a
-// cold cache this returns true (the Default job runs once, as before); a later
-// prewarm, after the Namespace job has warmed the graph, then suppresses it.
+// Avoid a guaranteed missing-export build. Enumeration uses the same engine
+// contract as completion; failure stays conservative and retains the Default job.
+// Memoized per entry path (keyed on the entry's stat token) because prewarm
+// reruns on every package.json event and enumeration is an uncached build.
 fn exposes_default_export(resolved: &ResolvedPackage) -> bool {
-    // CommonJS default interop always yields a usable default binding.
-    if resolved.is_cjs {
-        return true;
+    let token = entry_stat_token(&resolved.entry_path);
+    let memo = DEFAULT_EXPORT_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(memo) = memo.lock()
+        && let Some((cached_token, has_default)) = memo.get(&resolved.entry_path)
+        && *cached_token == token
+    {
+        return *has_default;
     }
-    match cached_module_graph_with_runtime(&resolved.entry_path, ImportRuntime::Component) {
-        Some(graph) => {
-            module_provides_export(&graph, graph.entry_id, "default", &mut HashSet::new())
+
+    let has_default = enumerate_exports_sync(resolved.entry_path.clone(), ImportRuntime::Component)
+        .map(|exports| exports.iter().any(|name| name == "default"))
+        .unwrap_or(true);
+
+    if let Ok(mut memo) = memo.lock() {
+        // Crude but sufficient bound: prewarm sweeps one dependency tree, so a
+        // rare full reset just re-probes on the next sweep.
+        if memo.len() >= DEFAULT_EXPORT_MEMO_LIMIT && !memo.contains_key(&resolved.entry_path) {
+            memo.clear();
         }
-        // Not cached yet -> don't suppress; the Default job runs this round.
-        None => true,
+        memo.insert(resolved.entry_path.clone(), (token, has_default));
     }
+    has_default
+}
+
+/// Cheap edit-sensitivity token (length + mtime) so an entry rewrite re-probes.
+fn entry_stat_token(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path) else {
+        return 0;
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    metadata.len() ^ modified.rotate_left(32)
 }
 
 fn run_prewarm_job(
@@ -239,7 +269,9 @@ fn run_prewarm_job(
         return;
     }
 
-    let Ok(jobs) = package_json_prewarm_jobs(&package_json_path, &active_document_path) else {
+    let Ok(jobs) = package_json_prewarm_jobs(&package_json_path, &active_document_path, &|| {
+        cancellation.is_current(generation)
+    }) else {
         return;
     };
 

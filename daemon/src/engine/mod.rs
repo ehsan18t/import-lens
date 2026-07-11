@@ -2,23 +2,14 @@
 //! Import Lens-owned: no Rolldown type may appear in any public field,
 //! argument, or return type, and only `adapter.rs`/`plugin.rs` may import
 //! the crate.
-//!
-//! Phase 2 (spec §11): the engine is fully wired but production output
-//! still comes from the legacy pipeline; [`USE_ROLLDOWN_ENGINE`] is the
-//! single selection seam the Phase 3 cutover flips.
 
 mod adapter;
 pub mod boundary;
+pub(crate) mod dependency_paths;
 mod entry;
+pub(crate) mod limits;
 mod plugin;
 pub(crate) mod scheduling;
-
-/// Production selection seam (spec §11 Phase 2/3). While `false`, every
-/// size-producing path keeps returning the legacy pipeline's output and the
-/// wired Rolldown path is exercised by the differential tests only. The
-/// Phase 3 cutover flips this to `true` atomically with the
-/// `ANALYZER_REVISION` bump, then deletes the legacy arm and this constant.
-pub const USE_ROLLDOWN_ENGINE: bool = false;
 
 use std::path::PathBuf;
 

@@ -114,36 +114,6 @@ async fn cold_single_import_p95_stays_under_release_threshold() {
          ({raw_bytes} raw bytes)"
     );
 
-    // Informational comparison with the current engine on the same fixture
-    // (spec §10.6): >15% regression triggers a note and one optional
-    // optimization pass, not rejection — the old engine can be faster
-    // precisely because it omits required code.
-    let entry_path = resolve().entry_path;
-    let mut old_durations = Vec::with_capacity(30);
-    for run in 0..35 {
-        let start = Instant::now();
-        let graph = import_lens_daemon::pipeline::graph::build_module_graph(&entry_path)
-            .expect("old engine graph should build");
-        let reachable = import_lens_daemon::pipeline::reachability::reachable_exports(
-            &graph,
-            &["parse".to_owned()],
-            false,
-        );
-        let bundled =
-            import_lens_daemon::pipeline::bundle::bundle_reachable_modules(&graph, &reachable)
-                .expect("old engine should bundle");
-        assert!(!bundled.is_empty());
-        if run >= 5 {
-            old_durations.push(start.elapsed());
-        }
-    }
-    let old_p95 = p95_of(&mut old_durations);
-    eprintln!(
-        "current engine cold css-tree/parse: p95 {old_p95:?} over 30 runs \
-         (candidate/current p95 ratio {:.2})",
-        p95.as_secs_f64() / old_p95.as_secs_f64()
-    );
-
     assert!(
         p95.as_millis() <= threshold_ms(500),
         "cold single import p95 exceeded the 500 ms gate: {}ms",
