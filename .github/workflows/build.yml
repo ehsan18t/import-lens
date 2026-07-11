@@ -32,6 +32,8 @@ jobs:
       requested_version: ${{ inputs.version }}
       run_performance: true
       run_coverage: true
+      # A release must not ship without the real-package correctness gates.
+      run_candidate_packages: true
 
   # The target list, their runners and their Rust triples all live in
   # scripts/targets.mjs and scripts/ci-matrix.mjs. Adding a target is a one-line

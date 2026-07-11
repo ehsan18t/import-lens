@@ -15,6 +15,11 @@ on:
         required: false
         default: false
         type: boolean
+      run_candidate_packages:
+        description: "Run the real-package qualification suite (installs the pinned fixtures)."
+        required: false
+        default: false
+        type: boolean
       run_performance:
         description: "Run the performance smoke test."
         required: false
@@ -109,6 +114,34 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+      # `daemon/tests/candidate_packages.rs` carries the correctness gates the
+      # bundler redesign exists for -- zero dangling `__il_` bindings on
+      # css-tree, tree-shaken modules present in `loaded_paths` on date-fns.
+      # Every row is `#[ignore]`d and needs installed fixtures, so `pnpm test`
+      # (`cargo test --workspace`, no `--ignored`) never reaches them. These two
+      # steps are the only place they run automatically.
+      - name: Install candidate fixtures
+        if: ${{ inputs.run_candidate_packages }}
+        run: |
+          # The default runner shell is `bash -e`, without pipefail: a failed
+          # install piped into `tail` would exit 0 and leave the gate running
+          # against a workspace that was never created.
+          set -o pipefail
+          # The script shells out to `pnpm install` with inherited stdio, so the
+          # workspace path is its LAST stdout line, not its only one. Network
+          # access is confined to this step; the Rust suite below is offline.
+          workspace="$(node scripts/prepare-candidate-fixtures.mjs "$RUNNER_TEMP/candidate-fixtures" | tail -n 1)"
+          if [ -z "$workspace" ]; then
+            echo "candidate fixture preparation printed no workspace path" >&2
+            exit 1
+          fi
+          echo "IMPORT_LENS_FIXTURES_WORKSPACE=$workspace" >> "$GITHUB_ENV"
+          echo "Candidate fixtures workspace: $workspace"
+
+      - name: Run real-package qualification tests
+        if: ${{ inputs.run_candidate_packages }}
+        run: cargo test -p import-lens-daemon --locked --test candidate_packages -- --ignored
 
       - name: Run performance smoke test
         if: ${{ inputs.run_performance }}

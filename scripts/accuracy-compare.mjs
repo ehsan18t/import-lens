@@ -31,16 +31,29 @@ import * as esbuild from "esbuild";
 const protocolVersion = 6;
 const packageName = "importlens-accuracy-fixture";
 const typedPackageName = "importlens-accuracy-ts-fixture";
-const tolerance = Number(process.env.IMPORT_LENS_ACCURACY_TOLERANCE ?? "0.75");
+// Maximum accepted brotli delta against the esbuild oracle, as a fraction.
+//
+// Derivation: the worst delta observed across every benchmark on the current
+// engine (2026-07-11 re-baseline) is 13.0%; the rest sit at 2.6-12%. 25% is
+// that worst case doubled and rounded down to a round number, so a legitimate
+// compiler-stack bump has ~2x the observed spread of headroom before it turns
+// CI red for a non-bug, while a real regression (a dangling binding dragging a
+// dead module into the bundle) still moves the number far past it. The former
+// 75% default could not fail on anything short of a catastrophe.
+//
+// Re-derive this the next time the observed worst case moves: keep it at
+// roughly twice the worst accepted delta, and never raise it to make a red run
+// green without first proving the delta is a codegen difference, not a bug.
+const tolerance = Number(process.env.IMPORT_LENS_ACCURACY_TOLERANCE ?? "0.25");
 // Local runs may be offline; CI and upgrade baselines must never silently measure
 // nothing. `validate.yml` sets this, and so must any pre/post-upgrade baseline run.
 const requireFixtures = process.env.IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES === "1";
 const fixturesDir = fileURLToPath(new URL("accuracy-fixtures/", import.meta.url));
 const installTimeoutMs = 300_000;
 
-/// Real-world packages, each present for one reason. `named` is the export whose
-/// import cost we measure. Versions come from the fixture manifest so there is a
-/// single source of truth for them.
+// Real-world packages, each present for one reason. `named` is the export whose
+// import cost we measure. Versions come from the fixture manifest so there is a
+// single source of truth for them.
 const realFixtures = [
   { package: "css-tree", named: "parse", label: "css-tree (deep ESM graph, transitive deps)" },
   { package: "date-fns", named: "format", label: "date-fns (deep zero-dependency ESM graph)" },
@@ -127,10 +140,10 @@ const main = async () => {
   }
 };
 
-/// Copy the pinned manifest plus its lockfile into the workspace and install them.
-/// `--frozen-lockfile` is what makes the byte counts reproducible: css-tree depends
-/// on source-map-js through a caret range, so exact direct versions alone would let
-/// a transitive patch move the numbers we diff across an upgrade.
+// Copy the pinned manifest plus its lockfile into the workspace and install them.
+// `--frozen-lockfile` is what makes the byte counts reproducible: css-tree depends
+// on source-map-js through a caret range, so exact direct versions alone would let
+// a transitive patch move the numbers we diff across an upgrade.
 const installRealFixtures = async (workspace) => {
   try {
     await copyFile(path.join(fixturesDir, "package.json"), path.join(workspace, "package.json"));
@@ -153,11 +166,11 @@ const installRealFixtures = async (workspace) => {
   return { installed: true, versions: await assertRealFixturePreconditions(workspace) };
 };
 
-/// `--frozen-lockfile` refuses to run when a setting recorded in the lockfile disagrees
-/// with the effective pnpm config (ERR_PNPM_LOCKFILE_CONFIG_MISMATCH). Those settings
-/// would otherwise come from the machine's global pnpm config, so a developer with
-/// `auto-install-peers=false` could not install the fixtures at all. Pin every setting
-/// the lockfile records, and keep this in step with `accuracy-fixtures/pnpm-lock.yaml`.
+// `--frozen-lockfile` refuses to run when a setting recorded in the lockfile disagrees
+// with the effective pnpm config (ERR_PNPM_LOCKFILE_CONFIG_MISMATCH). Those settings
+// would otherwise come from the machine's global pnpm config, so a developer with
+// `auto-install-peers=false` could not install the fixtures at all. Pin every setting
+// the lockfile records, and keep this in step with `accuracy-fixtures/pnpm-lock.yaml`.
 const fixtureNpmrc = () =>
   [
     // The hoisted linker gives a real `node_modules/<pkg>` tree, which is what
@@ -209,9 +222,9 @@ const runPnpmInstall = (cwd) =>
     });
   });
 
-/// Guard the properties each fixture was chosen for. Without these a future version
-/// bump could silently stop exercising the path the benchmark exists to cover, and
-/// the suite would keep reporting green.
+// Guard the properties each fixture was chosen for. Without these a future version
+// bump could silently stop exercising the path the benchmark exists to cover, and
+// the suite would keep reporting green.
 const assertRealFixturePreconditions = async (workspace) => {
   const versions = {};
   const manifests = {};
@@ -335,19 +348,19 @@ const writeFixture = async (workspace) => {
   return { flatActiveDocumentPath, branchyActiveDocumentPath, typedActiveDocumentPath };
 };
 
-/// The only TypeScript in the suite, and therefore the only thing that reaches the
-/// `graph.rs` transform. A lowered `enum` and `namespace` each codegen as an IIFE,
-/// so this also exercises the minifier's unused-IIFE analysis.
-///
-/// It gets its own package, and the package entry *is* the TypeScript module, so the
-/// benchmark measures the transform and nothing else. Hanging it off the shared
-/// fixture's index.js instead made the entry re-export it indirectly, which drags
-/// that module's unrelated static imports into the bundle and buried the signal under
-/// 180 KB of unrelated payload.
-///
-/// `Level` and `Meta` are read *dynamically* on purpose. `Level.High` alone folds to
-/// a constant and the enum object is then dead-code-eliminated, which would quietly
-/// delete the coverage this fixture exists to provide.
+// The only TypeScript in the suite, and therefore the only thing that reaches the
+// `graph.rs` transform. A lowered `enum` and `namespace` each codegen as an IIFE,
+// so this also exercises the minifier's unused-IIFE analysis.
+//
+// It gets its own package, and the package entry *is* the TypeScript module, so the
+// benchmark measures the transform and nothing else. Hanging it off the shared
+// fixture's index.js instead made the entry re-export it indirectly, which drags
+// that module's unrelated static imports into the bundle and buried the signal under
+// 180 KB of unrelated payload.
+//
+// `Level` and `Meta` are read *dynamically* on purpose. `Level.High` alone folds to
+// a constant and the enum object is then dead-code-eliminated, which would quietly
+// delete the coverage this fixture exists to provide.
 const writeTypedFixture = async (workspace, sourceRoot) => {
   const packageRoot = path.join(workspace, "node_modules", typedPackageName);
   await mkdir(packageRoot, { recursive: true });
