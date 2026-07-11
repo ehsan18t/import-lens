@@ -1013,6 +1013,10 @@ interface EnumerateExportsResponse {
 
 Used when the extension needs a file-level total that deduplicates modules shared by multiple imports in the same document. The daemon unions graph-backed ESM modules by canonical path, computes combined sizes once, and returns the original imports annotated with `shared_bytes` when possible.
 
+Imports are grouped by runtime and built once per runtime, not once per document. A bundle request carries a single runtime and the bundler resolves the whole transitive graph under it, while Server and Client resolve dependencies under materially different conditions (`browser` alias fields, `browser` vs `node` export conditions). A document may legitimately carry both — an Astro page emits Server imports from frontmatter and Client imports from processed `<script>` blocks — so sizing every entry under one import's runtime would resolve the other's dependencies against the wrong conditions, and such a build still succeeds, producing a silently wrong total. Shared-module deduplication is preserved *within* each runtime, which is the only place it is real: Server and Client code never share a chunk in the shipped output. A package imported under two runtimes is therefore counted once per runtime, because each runtime genuinely ships its own copy.
+
+Raw and minified totals are sums across runtime groups. Compressed totals (gzip/brotli/zstd) are computed once over the concatenated minified output of every group that built successfully, so they are a lower bound on what independent per-runtime bundles would compress to rather than a sum of them. When one runtime's build fails, only that runtime's entries degrade to conservative non-deduplicated per-import sums with diagnostics; the other groups keep their real deduplicated totals.
+
 ```typescript
 interface FileSizeRequest {
   type: "file_size";

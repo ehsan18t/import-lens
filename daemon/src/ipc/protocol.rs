@@ -16,7 +16,12 @@ pub enum ImportKind {
     Dynamic,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// `Ord` lets combined file sizing group entries by runtime in a stable order
+// (`file_size.rs`); the derived order is over the variants, not the wire form, so
+// it does not affect serialization.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportRuntime {
     #[default]
