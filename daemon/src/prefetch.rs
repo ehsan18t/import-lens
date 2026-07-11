@@ -1,5 +1,6 @@
 use crate::{
     cache::key::{CacheIdentity, decode_cache_identity},
+    engine::scheduling::drain_ordered,
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
@@ -8,7 +9,7 @@ use crate::{
     },
     service::ImportLensService,
 };
-use rayon::{ThreadPoolBuilder, prelude::*};
+use rayon::ThreadPoolBuilder;
 use serde_json::Value;
 use std::{
     collections::HashSet,
@@ -254,22 +255,13 @@ fn run_prewarm_job(
         active_document_path,
     };
 
-    let run = || {
-        jobs.par_iter().for_each(|job| {
-            if cancellation.is_current(generation) {
-                service.prewarm_resolved_import(
-                    &context,
-                    &job.request,
-                    job.resolved.clone(),
-                    || cancellation.is_current(generation),
-                );
-            }
-        });
-    };
-
-    if let Ok(pool) = prewarm_pool() {
-        pool.install(run);
-    }
+    drain_ordered(&jobs, |_, job| {
+        if cancellation.is_current(generation) {
+            service.prewarm_resolved_import(&context, &job.request, job.resolved.clone(), || {
+                cancellation.is_current(generation)
+            });
+        }
+    });
 }
 
 fn run_recent_prewarm_job(
@@ -305,22 +297,13 @@ fn run_recent_prewarm_job(
         workspace_root,
         active_document_path,
     };
-    let run = || {
-        jobs.par_iter().for_each(|job| {
-            if cancellation.is_current(generation) {
-                service.prewarm_resolved_import(
-                    &context,
-                    &job.request,
-                    job.resolved.clone(),
-                    || cancellation.is_current(generation),
-                );
-            }
-        });
-    };
-
-    if let Ok(pool) = prewarm_pool() {
-        pool.install(run);
-    }
+    drain_ordered(&jobs, |_, job| {
+        if cancellation.is_current(generation) {
+            service.prewarm_resolved_import(&context, &job.request, job.resolved.clone(), || {
+                cancellation.is_current(generation)
+            });
+        }
+    });
 }
 
 fn installed_package(active_document_path: &Path, package_name: &str) -> Option<ResolvedPackage> {

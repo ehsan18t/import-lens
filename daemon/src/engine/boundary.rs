@@ -19,8 +19,9 @@ use tokio::sync::Semaphore;
 use super::{BundleArtifact, BundleFailure, BundleRequest, ImportRuntime, RolldownEngine};
 
 /// Spec §9: two concurrent builds bound peak memory while keeping one slow
-/// build from serializing the daemon.
-const ENGINE_PERMITS: usize = 2;
+/// build from serializing the daemon. Public so miss-draining loops size
+/// their worker count to the permit count instead of parking extra threads.
+pub const ENGINE_PERMITS: usize = 2;
 
 static PERMITS: Semaphore = Semaphore::const_new(ENGINE_PERMITS);
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);

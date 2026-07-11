@@ -11,6 +11,7 @@ mod adapter;
 pub mod boundary;
 mod entry;
 mod plugin;
+pub(crate) mod scheduling;
 
 /// Production selection seam (spec §11 Phase 2/3). While `false`, every
 /// size-producing path keeps returning the legacy pipeline's output and the

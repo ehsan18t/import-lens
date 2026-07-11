@@ -1,3 +1,4 @@
+use crate::engine::scheduling::{drain_ordered, drain_ordered_owned};
 use crate::{
     analysis_flight::AnalysisFlightRegistry,
     cache::{
@@ -489,16 +490,16 @@ impl ImportLensService {
         // .importlensignore ancestor walk, while edits between reports are
         // re-read because each report constructs a fresh resolver.
         let ignore_resolver = IgnoreRuleResolver::default();
-        let items = files
-            .par_iter()
-            .flat_map(|source_path| {
-                let source = match fs::read_to_string(source_path) {
-                    Ok(source) => source,
-                    Err(_) => return Vec::new(),
-                };
-                self.analyze_report_source(source_path, &request, source, &ignore_resolver)
-            })
-            .collect::<Vec<_>>();
+        let items = drain_ordered(&files, |_, source_path| {
+            let source = match fs::read_to_string(source_path) {
+                Ok(source) => source,
+                Err(_) => return Vec::new(),
+            };
+            self.analyze_report_source(source_path, &request, source, &ignore_resolver)
+        })
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         let row_set = crate::report::model::build_report_rows(&items, &request.budgets);
         let summary = crate::report::model::build_report_summary(&row_set);
 
@@ -608,11 +609,9 @@ impl ImportLensService {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
-        let mut imports = request
-            .imports
-            .par_iter()
-            .map(|item| self.analyze_with_cache(&context, item, false, ReadIntent::Interactive))
-            .collect::<Vec<_>>();
+        let mut imports = drain_ordered(&request.imports, |_, item| {
+            self.analyze_with_cache(&context, item, false, ReadIntent::Interactive)
+        });
         annotate_shared_bytes(&mut imports);
 
         BatchResponse {
@@ -642,22 +641,16 @@ impl ImportLensService {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
-        let mut imports = request
-            .imports
-            .par_iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let result =
-                    self.analyze_with_cache(&context, item, false, ReadIntent::Interactive);
-                emit_partial(BatchResponse {
-                    version: request.version,
-                    request_id: request.request_id,
-                    imports: vec![result.clone()],
-                    indexes: Some(vec![index]),
-                });
-                result
-            })
-            .collect::<Vec<_>>();
+        let mut imports = drain_ordered(&request.imports, |index, item| {
+            let result = self.analyze_with_cache(&context, item, false, ReadIntent::Interactive);
+            emit_partial(BatchResponse {
+                version: request.version,
+                request_id: request.request_id,
+                imports: vec![result.clone()],
+                indexes: Some(vec![index]),
+            });
+            result
+        });
         annotate_shared_bytes(&mut imports);
 
         BatchResponse {
@@ -680,11 +673,9 @@ impl ImportLensService {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
-        let mut imports = request
-            .imports
-            .par_iter()
-            .map(|item| self.analyze_with_cache(&context, item, false, ReadIntent::Interactive))
-            .collect::<Vec<_>>();
+        let mut imports = drain_ordered(&request.imports, |_, item| {
+            self.analyze_with_cache(&context, item, false, ReadIntent::Interactive)
+        });
         annotate_shared_bytes(&mut imports);
         let file_size =
             self.file_size_with_cache(&context, &request.active_document_path, &request.imports);
@@ -1386,49 +1377,41 @@ impl ImportLensService {
         }
 
         let analysis_started_at = Instant::now();
-        let analyzed_results = pending_analysis
-            .into_par_iter()
-            .map(|(index, pending)| {
-                let result = match pending {
-                    PendingPackageJsonAnalysis::Resolved {
-                        import_request,
-                        resolved,
-                        cache_key,
-                    } => self.analyze_and_cache(
-                        package_cache.as_ref(),
-                        &context,
-                        &import_request,
-                        cache_key,
-                        resolved,
-                        || true,
-                    ),
-                    PendingPackageJsonAnalysis::Unresolved { import_request } => self
-                        .analyze_with_cache(
-                            &context,
-                            &import_request,
-                            false,
-                            ReadIntent::Interactive,
-                        ),
-                };
+        let analyzed_results = drain_ordered_owned(pending_analysis, |_, (index, pending)| {
+            let result = match pending {
+                PendingPackageJsonAnalysis::Resolved {
+                    import_request,
+                    resolved,
+                    cache_key,
+                } => self.analyze_and_cache(
+                    package_cache.as_ref(),
+                    &context,
+                    &import_request,
+                    cache_key,
+                    resolved,
+                    || true,
+                ),
+                PendingPackageJsonAnalysis::Unresolved { import_request } => self
+                    .analyze_with_cache(&context, &import_request, false, ReadIntent::Interactive),
+            };
 
-                if let Some(emit_partial) = emit_partial.as_ref() {
-                    let mut state = states[index].clone();
-                    state.status = ImportAnalysisStatus::Ready;
-                    state.result = Some(result.clone());
-                    emit_partial(AnalyzePackageJsonResponse {
-                        version: request.version,
-                        request_id: request.request_id,
-                        sections: Vec::new(),
-                        states: vec![state],
-                        indexes: Some(vec![index]),
-                        error: None,
-                        diagnostics: Vec::new(),
-                    });
-                }
+            if let Some(emit_partial) = emit_partial.as_ref() {
+                let mut state = states[index].clone();
+                state.status = ImportAnalysisStatus::Ready;
+                state.result = Some(result.clone());
+                emit_partial(AnalyzePackageJsonResponse {
+                    version: request.version,
+                    request_id: request.request_id,
+                    sections: Vec::new(),
+                    states: vec![state],
+                    indexes: Some(vec![index]),
+                    error: None,
+                    diagnostics: Vec::new(),
+                });
+            }
 
-                (index, result)
-            })
-            .collect::<Vec<_>>();
+            (index, result)
+        });
         let mut indexed_results = cached_indexed_results;
         indexed_results.extend(analyzed_results);
         indexed_results.sort_by_key(|(index, _)| *index);
@@ -2047,32 +2030,24 @@ impl ImportLensService {
         serve_stale: bool,
         intent: ReadIntent,
     ) -> Vec<ImportAnalysisItem> {
-        let mut items = detected
-            .into_par_iter()
-            .map(|detected| {
-                match import_request_for_detected(&context.active_document_path, &detected) {
-                    Ok(request) => ImportAnalysisItem {
-                        result: Some(self.analyze_with_cache(
-                            context,
-                            &request,
-                            serve_stale,
-                            intent,
-                        )),
-                        detected,
-                        status: ImportAnalysisStatus::Ready,
-                        message: None,
-                        request: Some(request),
-                    },
-                    Err(message) => ImportAnalysisItem {
-                        detected,
-                        status: ImportAnalysisStatus::Missing,
-                        message: Some(message),
-                        request: None,
-                        result: None,
-                    },
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut items = drain_ordered_owned(detected, |_, detected| {
+            match import_request_for_detected(&context.active_document_path, &detected) {
+                Ok(request) => ImportAnalysisItem {
+                    result: Some(self.analyze_with_cache(context, &request, serve_stale, intent)),
+                    detected,
+                    status: ImportAnalysisStatus::Ready,
+                    message: None,
+                    request: Some(request),
+                },
+                Err(message) => ImportAnalysisItem {
+                    detected,
+                    status: ImportAnalysisStatus::Missing,
+                    message: Some(message),
+                    request: None,
+                    result: None,
+                },
+            }
+        });
 
         let mut results = items
             .iter_mut()
@@ -2505,6 +2480,13 @@ fn has_request_specific_diagnostics(result: &ImportResult) -> bool {
         .any(|diagnostic| diagnostic.stage == "exports")
 }
 
+/// Analyze a slice with bounded parallelism, preserving input order in the
+/// returned Vec (spec §9, plan C1): Rolldown builds must never run inside
+/// the outer global-Rayon loops — N parked workers on the engine's two
+/// permits would starve unrelated pool work — so misses drain on a scoped
+/// worker set sized to the permit count. Cache hits stay cheap enough that
+/// the reduced parallelism is immaterial, and the closure runs on plain
+/// threads where the engine's blocking bridge is legal.
 fn dependency_fingerprints(
     resolved: &ResolvedPackage,
     source: Option<&crate::pipeline::analyze::FingerprintSource>,
