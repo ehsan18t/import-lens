@@ -1,12 +1,14 @@
 # Rolldown Qualification and Bundler Replacement Design
 
-Status: **proposed**, awaiting review. Updated 2026-07-10 after a validation pass against
+Status: **accepted** — the §10 qualification gates passed on 2026-07-11; measured results
+are recorded in §10.7. Previously: proposed 2026-07-10 after a validation pass against
 crates.io (rolldown 1.1.5, oxc 0.139.0, oxc_resolver 11.23.0), the published Rolldown 1.1.5
 API surface, and repo HEAD. This document replaces the custom reference-closure/fixpoint
 proposal after verifying that Rolldown now publishes an embeddable Rust crate.
 
-No SRS or production-code change is authorized by this document. The first implementation
-step, if this design is approved, is the qualification phase in §10.
+Acceptance authorizes production migration to begin at §11 Phase 2. Production behavior
+remains unchanged until Phase 3's atomic cutover: the shipped daemon does not compile the
+candidate feature, and the old engine is still the production bundler.
 
 ## 1. Decision summary
 
@@ -827,6 +829,67 @@ hard gates still fail, the candidate is rejected and production remains unchange
 
 Rejection does not silently reactivate the old custom fixpoint proposal. A custom engine would
 require a new reviewed design because it permanently accepts ownership of bundler semantics.
+
+#### Qualification record (2026-07-11, win32-x64) — PASS, candidate accepted
+
+Instruments: `daemon/tests/candidate_matrix.rs` (48 rows), `daemon/tests/candidate_packages.rs`
+(7 pinned real packages), `daemon/tests/candidate_performance.rs` (release measurements), and
+the compiler-stack automation suites landed at `b2da0f4`.
+
+Correctness (§10.4): all gates pass. 45 matrix rows green; row 34 (total-source limit — the
+only coverage of the `MAX_GRAPH_SOURCE_BYTES` accumulator) green when run explicitly; the
+real-package suite is 7/7 with `css-tree/parse` emitting **zero** dangling `__il_` bindings
+(the four §2.2 danglers reach zero and `date-fns` stays at zero), `date-fns/format` loading
+304 paths while rendering 36 (tree-shaken freshness gate), and CJS `lodash/debounce` working
+through link-time interop (489,076 raw bytes, whole-library retention as expected for CJS).
+
+Automation (§10.5): all gates pass via `scripts/test/update-compiler-stack.test.mjs` and
+`scripts/test/compiler-stack-coordination.test.mjs` — exact family pins (rolldown,
+rolldown_common, rolldown_error at one monorepo version), temp-manifest probe with sibling
+pins and split-stack rejection before any tracked edit, dry-run purity, fingerprint drift
+against `cargo metadata --locked`, `--locked` on every non-update entry point, and no direct
+rolldown/oxc-parser in the extension manifest.
+
+Performance and stability (§10.6, release build, 5 warm-ups + 30 recorded runs):
+
+| measurement | result | gate |
+| --- | --- | --- |
+| cold `css-tree/parse` p50 / p95 / max | 30.2 ms / 52.4 ms / 53.3 ms | p95 ≤ 500 ms |
+| current-engine p95 on the same fixture | 97.7 ms (candidate/current = 0.54) | ±15% note only |
+| 20-import batch (2 concurrent), wall | 605 ms | — |
+| 20-import batch peak RSS | 78 MB | < 400 MB |
+| determinism (per-package byte-compare of code, loaded paths, contributions, exports; stable failure stages across repeated matrix runs) | pass | required |
+
+The candidate is faster than the current engine, so the >15% regression clause is not in
+play. Startup, idle RSS, and the cache-hit path are unchanged by construction in Phase 1:
+the shipped binary does not compile the candidate feature and the default dependency graph
+was verified unmoved (the lockfile delta is two direct-dependency edges, no version moves).
+Platform scope: per owner direction (2026-07-11), the qualification compile proof covers
+win32-x64 — the primary supported platform — only; the remaining targets are exercised by
+the Part E release packaging of the default graph, and the candidate adds only pure-Rust
+crates on top of it.
+
+Known divergences accepted into the record:
+
+1. **rolldown 1.1.5 never matches string/array `sideEffects` globs on Windows** — sugar_path's
+   `relative()` returns backslash-separated paths that the `/`-based glob matcher cannot
+   match, and the zero-directory `**/name` form also fails. Boolean `sideEffects` behave
+   correctly. Direction of error: over-shaking of glob-declared-effectful files (size
+   undercount) on Windows only. Not adapter-fixable inside §7.4's no-custom-matcher rule.
+   Matrix rows 42/43 assert the correct webpack-compatible semantics and are `#[ignore]`d
+   with this cause; they are re-attempted on every rolldown bump.
+2. **CJS export enumeration yields `default` only** through the chunk export list, even for
+   statically plain `exports.x =` assignments; named CJS access works at link time via
+   interop (the `lodash/debounce` case). Matrix row 27 pins the behavior per §8.4's
+   never-guess rule.
+3. **Link-time constant inlining** renders trivial constants into their use sites, so such
+   modules legitimately contribute zero bytes (§8.2 already excludes zero-length
+   contributions); they remain in `loaded_paths` for freshness.
+4. **Unresolved imports externalize with a warning** rather than failing the build; the
+   boundary stays in the output with a structured diagnostic (matrix rows 24/25), which is
+   the §2.2-required non-empty-chunk behavior.
+5. **Internal ambiguous star exports** surface through the missing-export diagnostic with an
+   ambiguity message; the adapter classifies these as `ambiguous_export` (matrix row 7).
 
 ## 11. Production migration after a passing gate
 
