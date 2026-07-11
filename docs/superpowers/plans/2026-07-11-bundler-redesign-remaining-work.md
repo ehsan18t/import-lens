@@ -352,17 +352,17 @@ One commit. Everything below lands together; independent review is mandatory.
 - `docs/ImportLens-SRS.md` — the architecture rewrite (this is the moment production behavior changes, so CLAUDE.md's same-task rule fires): grep-driven sweep for `custom reachability|module graph walker|reference-closure|virtual module graph` plus §4.2 (bundler decision — record the Rolldown adoption + gate results), §9.2 component descriptions, C-003 final state, Appendix C technology-watch Rolldown row → "Adopted". Sizes/`truly_treeshakeable` movement documented as intended (spec §14.4).
 - `docs/superpowers/specs/2026-07-10-bundler-redesign-design.md` — status → cutover complete (Phase 3 done).
 
-- [ ] Steps: relocate helpers → flip selection → delete inventory → shrink deps/config/fingerprint → docs sweep → full gate (`pnpm check && pnpm test && cargo fmt --check`) → `pnpm test:accuracy` with enforcement (numbers WILL move — trace each fixture delta to a construct, spec §14.4) → **Commit 6 [review]:** `feat(daemon)!: make rolldown the only semantic bundler` (breaking `!` because measured outputs change; body covers the revision bump and deletion inventory).
+- [x] Steps: relocate helpers → flip selection → delete inventory → shrink deps/config/fingerprint → docs sweep → full gate (`pnpm check && pnpm test && cargo fmt --check`) → `pnpm test:accuracy` with enforcement (numbers WILL move — trace each fixture delta to a construct, spec §14.4) → **Commit 6 [review]:** `feat(daemon)!: make rolldown the only semantic bundler` (breaking `!` because measured outputs change; body covers the revision bump and deletion inventory). Landed `233c25d` (2026-07-11); the reviewed diff produced three confirmed fixes (namespace-alias removal, per-import file-size fallback, memoized prewarm default probe) recorded in the commit body and D12 of the cache-lifecycle decision log.
 
 ---
 
 ## Part E — Release re-baseline (Phase 4) and definition of done
 
-- [ ] Re-baseline accuracy + `truly_treeshakeable` against the new engine (`IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES=1 pnpm test:accuracy`); update stored baselines/thresholds wherever `scripts/accuracy-compare.mjs` keeps them.
-- [ ] `pnpm package:win32-x64` (daemon changed → repackage + `knownHashes.generated.ts` refresh is REQUIRED per CLAUDE.md); then the remaining five targets via the docker builder (`pnpm docker:build` / `package:all:zig` + xwin) and `pnpm assert:vsix-size` (NFR-007 — expect ample headroom; record the actual delta).
-- [ ] Run the §15 definition-of-done checklist in the spec top to bottom; fix anything unchecked.
-- [ ] Update memory: `bundler-redesign-work-state.md` → complete; `dependency-version-policy.md` unaffected; note the retained-crate shrink.
-- [ ] **Commit 7:** `build(release): re-baseline accuracy and daemon hashes for the rolldown engine` (plus any doc straggler).
+- [x] Re-baseline accuracy + `truly_treeshakeable` against the new engine (`IMPORT_LENS_ACCURACY_REQUIRE_FIXTURES=1 pnpm test:accuracy`) — green 2026-07-11 (deltas 2.6–13% vs esbuild; minified output smaller than esbuild on the real packages). `scripts/accuracy-compare.mjs` stores no baselines (live esbuild oracle + env tolerance), so there was nothing to rewrite.
+- [SKIPPED — owner direction 2026-07-11] `pnpm package:win32-x64` + remaining five targets + `pnpm assert:vsix-size`. Packaging, the `knownHashes.generated.ts` refresh, and the VSIX size check are deferred; they MUST run before any release because the daemon binary changed.
+- [x] Run the §15 definition-of-done checklist in the spec top to bottom — every item holds except the deferred packaging/hash item above.
+- [x] Update memory: `bundler-redesign-work-state.md` → complete except deferred packaging; `dependency-version-policy.md` unaffected; retained-crate shrink noted.
+- [x] **Commit 7:** docs straggler commit (plan/spec status); the packaging commit is deferred with the packaging itself.
 
 ## Verification quick-reference
 

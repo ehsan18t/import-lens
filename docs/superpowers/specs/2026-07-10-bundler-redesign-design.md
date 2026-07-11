@@ -1,11 +1,14 @@
 # Rolldown Qualification and Bundler Replacement Design
 
-Status: **cutover complete** — §11 Phase 3 landed on 2026-07-11: Rolldown is the only
-semantic bundler, the custom engine (`bundle.rs`/`reachability.rs`/`cjs.rs`/manual
+Status: **cutover complete** — §11 Phase 3 landed on 2026-07-11 (`233c25d`): Rolldown is
+the only semantic bundler, the custom engine (`bundle.rs`/`reachability.rs`/`cjs.rs`/manual
 `graph.rs`) and its tests are deleted, `ANALYZER_REVISION` moved to `rolldown1`, direct
 `oxc_ast`/`oxc_ast_visit`/`oxc_transformer` dependencies are removed, and the
-README/SRS/skill describe the shipped architecture. Phase 4 (release re-baseline) is the
-remaining step. Previously: **accepted** — the §10 qualification gates passed on
+README/SRS/skill describe the shipped architecture. Phase 4: the accuracy re-baseline is
+green (2026-07-11, enforced fixtures; deltas 2.6–13% vs the esbuild oracle) and the §15
+checklist holds, except that packaging, the daemon-hash refresh, and the VSIX size check
+are deferred by owner direction (2026-07-11) and MUST run before any release because the
+daemon binary changed. Previously: **accepted** — the §10 qualification gates passed on
 2026-07-11 with measured results recorded in §10.7; proposed 2026-07-10 after a
 validation pass against crates.io (rolldown 1.1.5, oxc 0.139.0, oxc_resolver 11.23.0),
 the published Rolldown 1.1.5 API surface, and repo HEAD. This document replaces the
