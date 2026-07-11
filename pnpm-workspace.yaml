@@ -3,3 +3,5 @@ allowBuilds:
   esbuild: true
   keytar: true
   lefthook: true
+minimumReleaseAgeExclude:
+  - tsdown@0.22.5
