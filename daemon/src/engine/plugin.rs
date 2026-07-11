@@ -5,8 +5,8 @@
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
-    path::PathBuf,
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -23,33 +23,76 @@ use rolldown_common::{ModuleInfo, NormalModule};
 
 use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
 use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
+use crate::cache::key::{
+    FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime,
+};
 
 /// Per-build state shared with the adapter, which reads it after the bundler
 /// finishes. Limit state is monotonic and thread-safe (spec §7.3).
 #[derive(Debug, Default)]
 pub(super) struct BuildState {
+    /// Canonical paths of every module the graph loaded.
     loaded_paths: Mutex<HashSet<PathBuf>>,
+    /// Fingerprints captured at the moment each module's bytes were read, keyed
+    /// by the same canonical path (§8.3). See `ImportLensPlugin::load`.
+    read_time: Mutex<HashMap<PathBuf, FileFingerprint>>,
+    /// `fs::canonicalize` is a file-handle open on Windows and both hooks need
+    /// the canonical form of the same paths; memoize so each path is resolved
+    /// once per build rather than once per consumer.
+    canonical: Mutex<HashMap<PathBuf, PathBuf>>,
     total_source_bytes: AtomicUsize,
     limit_breach: Mutex<Option<String>>,
 }
 
 impl BuildState {
-    /// Canonical form promised by the contract (§5.1): canonicalized to the
-    /// same identity form the production fingerprint pipeline uses
-    /// (`fs::canonicalize`), sorted, deduplicated. A path that no longer
-    /// resolves (deleted mid-build) falls back to the resolver's form.
+    /// Canonical form promised by the contract (§5.1), sorted and deduplicated.
+    /// Paths are canonicalized as they are recorded, so this only orders them.
     pub(super) fn sorted_loaded_paths(&self) -> Vec<PathBuf> {
         let paths = self
             .loaded_paths
             .lock()
             .expect("loaded-path set should not be poisoned");
-        let mut sorted: Vec<PathBuf> = paths
-            .iter()
-            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
-            .collect();
+        let mut sorted: Vec<PathBuf> = paths.iter().cloned().collect();
         sorted.sort();
         sorted.dedup();
         sorted
+    }
+
+    /// Read-time fingerprints, plus the loaded paths that have none — modules the
+    /// `load` hook handed back to Rolldown (non-UTF8 binary modules), which the
+    /// caller must fingerprint by reading them itself.
+    pub(super) fn read_time_fingerprints(&self) -> (Vec<FileFingerprint>, Vec<PathBuf>) {
+        let read_time = self
+            .read_time
+            .lock()
+            .expect("read-time fingerprint map should not be poisoned");
+
+        let mut fingerprints: Vec<FileFingerprint> = read_time.values().cloned().collect();
+        fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let unhashed = self
+            .sorted_loaded_paths()
+            .into_iter()
+            .filter(|path| !read_time.contains_key(path))
+            .collect();
+
+        (fingerprints, unhashed)
+    }
+
+    /// Canonicalize once per build. A path that no longer resolves (deleted
+    /// mid-build) falls back to the resolver's form, matching the previous
+    /// behavior.
+    fn canonical_path(&self, path: &Path) -> PathBuf {
+        let mut memo = self
+            .canonical
+            .lock()
+            .expect("canonical-path memo should not be poisoned");
+        if let Some(canonical) = memo.get(path) {
+            return canonical.clone();
+        }
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        memo.insert(path.to_path_buf(), canonical.clone());
+        canonical
     }
 
     pub(super) fn take_breach(&self) -> Option<String> {
@@ -142,6 +185,21 @@ impl Plugin for ImportLensPlugin {
         Ok(None)
     }
 
+    /// Reads real modules itself so their bytes can be fingerprinted at the moment
+    /// they are consumed (§8.3).
+    ///
+    /// The cache stores a size alongside fingerprints of the files it was computed
+    /// from. Fingerprinting them *after* the build — by re-reading from disk — means
+    /// a file edited during the analysis window is recorded with its NEW bytes
+    /// against a size measured from the OLD ones. The entry then never self-heals:
+    /// every later freshness probe re-reads the file, matches the stored hash, and
+    /// answers `Fresh`, serving the stale size until that file changes again.
+    /// Hashing here closes the window — the hash describes exactly the bytes that
+    /// were measured — and removes a whole second pass over the graph's bytes.
+    ///
+    /// The bytes are read raw and hashed before Rolldown transforms anything, so a
+    /// `.ts` module hashes to its on-disk content rather than its transformed output,
+    /// which is what a later probe will compare against.
     async fn load(&self, _ctx: SharedLoadPluginContext, args: &HookLoadArgs<'_>) -> HookLoadReturn {
         if args.id == VIRTUAL_ENTRY_ID {
             return Ok(Some(HookLoadOutput {
@@ -150,7 +208,63 @@ impl Plugin for ImportLensPlugin {
                 ..HookLoadOutput::default()
             }));
         }
-        Ok(None)
+
+        // Rolldown runtime helpers and other synthetic ids are not files. Real module
+        // ids are absolute paths; anything else is left to Rolldown.
+        let path = Path::new(args.id);
+        if !path.is_absolute() {
+            return Ok(None);
+        }
+
+        // §7.3: reject an oversized module BEFORE reading it. The limit exists to
+        // bound memory, so reading first would blow the very bound being enforced.
+        // `module_parsed` still enforces it on the transformed source, which also
+        // covers modules this hook hands back to Rolldown below.
+        let metadata = match tokio::fs::metadata(path).await {
+            Ok(metadata) => metadata,
+            // Not a readable file (or vanished): let Rolldown produce its own error.
+            Err(_) => return Ok(None),
+        };
+        if metadata.len() as usize > MAX_MODULE_SOURCE_BYTES {
+            return Err(self
+                .breach(format!(
+                    "module {} exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit",
+                    path.display()
+                ))
+                .into());
+        }
+
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            return Ok(None);
+        };
+        // Binary modules (wasm, assets) are not UTF-8. Rolldown handles those itself;
+        // the caller back-fills their fingerprints from `read_time_fingerprints`.
+        let Ok(source) = String::from_utf8(bytes.clone()) else {
+            return Ok(None);
+        };
+
+        let (len, modified_millis) = read_time_len_mtime(path);
+        let canonical = self.state.canonical_path(path);
+        self.state
+            .read_time
+            .lock()
+            .expect("read-time fingerprint map should not be poisoned")
+            .entry(canonical.clone())
+            .or_insert_with(|| {
+                file_fingerprint_from_read_time(
+                    &canonical,
+                    len,
+                    modified_millis,
+                    content_hash(&bytes),
+                )
+            });
+
+        Ok(Some(HookLoadOutput {
+            code: source.into(),
+            // Let Rolldown infer the module type from the extension, exactly as it
+            // does when it reads the file itself.
+            ..HookLoadOutput::default()
+        }))
     }
 
     async fn module_parsed(
@@ -191,13 +305,14 @@ impl Plugin for ImportLensPlugin {
                 .into());
         }
 
+        let canonical = self.state.canonical_path(path);
         let module_count = {
             let mut paths = self
                 .state
                 .loaded_paths
                 .lock()
                 .expect("loaded-path set should not be poisoned");
-            paths.insert(path.to_path_buf());
+            paths.insert(canonical);
             paths.len()
         };
         if module_count > MAX_GRAPH_MODULES {

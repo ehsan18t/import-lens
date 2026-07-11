@@ -2384,17 +2384,36 @@ fn dependency_fingerprints(
     use crate::cache::key::file_fingerprint_reading_hash;
     use crate::pipeline::analyze::FingerprintSource;
 
-    let paths = match source {
-        Some(FingerprintSource::LoadedPaths(paths)) => paths.clone(),
+    let mut fingerprints = match source {
+        // The engine captured a fingerprint as it read each module, so the stored hash
+        // describes the exact bytes the size was measured from. Only the manifest and
+        // any binary module the plugin did not read need hashing here.
+        Some(FingerprintSource::ReadTime {
+            fingerprints,
+            stat_paths,
+        }) => {
+            let mut all = fingerprints.clone();
+            all.extend(
+                stat_paths
+                    .iter()
+                    .cloned()
+                    .filter_map(file_fingerprint_reading_hash),
+            );
+            all
+        }
+        // Static fallback: no graph was built, so there is nothing that was measured
+        // for these to be inconsistent with.
         None => vec![
             resolved.package_root.join("package.json"),
             resolved.entry_path.clone(),
-        ],
-    };
-    let mut fingerprints = paths
+        ]
         .into_iter()
         .filter_map(file_fingerprint_reading_hash)
-        .collect::<Vec<_>>();
+        .collect(),
+    };
+
+    // Two ids can canonicalize to the same real path (a symlinked workspace dep), so
+    // dedup is load-bearing, not cosmetic.
     fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
     fingerprints.dedup_by(|left, right| left.path == right.path);
     fingerprints

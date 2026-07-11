@@ -67,6 +67,12 @@ pub struct BundleArtifact {
     /// Unminified source of the single output chunk.
     pub code: String,
     pub loaded_paths: Vec<PathBuf>,
+    /// Fingerprints captured when each module's bytes were read during this build,
+    /// so freshness describes the bytes the size was actually measured from (§8.3).
+    pub read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    /// Loaded paths with no read-time fingerprint — binary modules the plugin handed
+    /// back to Rolldown. The caller fingerprints these by reading them.
+    pub unhashed_paths: Vec<PathBuf>,
     pub contributions: Vec<ModuleContribution>,
     pub exported_names: Vec<String>,
     pub diagnostics: Vec<ImportDiagnostic>,

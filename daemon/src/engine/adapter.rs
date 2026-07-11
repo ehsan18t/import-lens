@@ -202,9 +202,13 @@ fn translate(
         });
     }
 
+    let (read_time_fingerprints, unhashed_paths) = state.read_time_fingerprints();
+
     Ok(BundleArtifact {
         code: chunk.code.clone(),
         loaded_paths: state.sorted_loaded_paths(),
+        read_time_fingerprints,
+        unhashed_paths,
         contributions,
         exported_names: chunk.exports.iter().map(|name| name.to_string()).collect(),
         diagnostics,

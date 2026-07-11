@@ -46,9 +46,66 @@ pub fn analyze_resolved_import(
     analyze_resolved_import_with_dependencies(context, request, resolved).0
 }
 
-/// Paths used to compute cache freshness for a successful engine build.
+/// Manifests of the first-party packages whose sources this build loaded (§8.3).
+///
+/// The plugin records graph *modules*, and a `package.json` is never one — but it
+/// drives resolution and side-effect classification, so editing a workspace
+/// dependency's `exports`, `type` or `sideEffects` changes what the bundler pulls in
+/// while no fingerprinted path moves, and a stale size is served as fresh. The dep's
+/// *source* files are fingerprinted, so editing its code is already caught; what is
+/// missed is editing its manifest.
+///
+/// Installed packages are excluded: their manifests cannot change without an install,
+/// which bumps the cache generation, and including them would balloon the fingerprint
+/// set for every build.
+fn first_party_manifests(context: &AnalysisContext, loaded_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut manifests = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for path in loaded_paths {
+        if path
+            .components()
+            .any(|component| component.as_os_str() == "node_modules")
+        {
+            continue;
+        }
+
+        // Nearest manifest at or above the module, bounded by the workspace root so a
+        // loose file outside the workspace cannot walk to the filesystem root.
+        let mut directory = path.parent();
+        while let Some(current) = directory {
+            if seen.contains(current) {
+                break;
+            }
+            seen.insert(current.to_path_buf());
+
+            let manifest = current.join("package.json");
+            if manifest.is_file() {
+                manifests.push(manifest);
+                break;
+            }
+            if current == context.workspace_root {
+                break;
+            }
+            directory = current.parent();
+        }
+    }
+
+    manifests
+}
+
+/// Freshness inputs for a successful engine build (§8.3).
+///
+/// `fingerprints` were captured as each module's bytes were read *during* the
+/// build, so they describe exactly the bytes the size was measured from. Anything
+/// that is not a graph module — the package manifest, and binary modules the plugin
+/// handed back to Rolldown — has no read-time capture and is listed in `stat_paths`
+/// for the caller to hash.
 pub enum FingerprintSource {
-    LoadedPaths(Vec<PathBuf>),
+    ReadTime {
+        fingerprints: Vec<crate::cache::key::FileFingerprint>,
+        stat_paths: Vec<PathBuf>,
+    },
 }
 
 /// Analyze a pre-resolved entry and return the exact real paths Rolldown loaded.
@@ -166,9 +223,9 @@ fn analyze_import_inner_resolved(
         &side_effects_mode,
         is_cjs,
     ) {
-        Ok((result, loaded_paths)) => {
-            record_loaded_paths(entry_path, request.runtime, loaded_paths.clone());
-            Ok((result, Some(FingerprintSource::LoadedPaths(loaded_paths))))
+        Ok((result, loaded_paths, freshness)) => {
+            record_loaded_paths(entry_path, request.runtime, loaded_paths);
+            Ok((result, Some(freshness)))
         }
         Err(error) if matches!(error.stage, "missing_export" | "ambiguous_export") => Err(error),
         Err(error) => {
@@ -192,7 +249,7 @@ pub(crate) fn analyze_with_rolldown_engine(
     package_root: &Path,
     side_effects_mode: &SideEffectsMode,
     is_cjs: bool,
-) -> Result<(ImportResult, Vec<PathBuf>), AnalysisError> {
+) -> Result<(ImportResult, Vec<PathBuf>, FingerprintSource), AnalysisError> {
     use crate::engine::{BundleEntry, BundlePurpose, BundleRequest, BundleSelection, boundary};
 
     let bundle_entry = |selection: BundleSelection| BundleEntry {
@@ -287,10 +344,21 @@ pub(crate) fn analyze_with_rolldown_engine(
         })
         .collect();
 
-    // §8.3: manifests used for resolution/side-effect classification join
-    // the fingerprint inputs alongside every loaded source path.
-    let mut loaded_paths = artifact.loaded_paths;
-    loaded_paths.push(package_root.join("package.json"));
+    // §8.3: freshness comes from the fingerprints the plugin captured as it read each
+    // module, so they describe the exact bytes this size was measured from. Two kinds
+    // of input have no read-time capture and must still be hashed: the package
+    // manifest, which drives resolution and side-effect classification but is not a
+    // graph module, and any binary module the plugin handed back to Rolldown. Hashing
+    // those after the build does not reopen the staleness window the read-time capture
+    // closes — a manifest is an input to resolution, not a source of measured bytes.
+    let mut stat_paths = artifact.unhashed_paths;
+    stat_paths.push(package_root.join("package.json"));
+    stat_paths.extend(first_party_manifests(context, &artifact.loaded_paths));
+    let freshness = FingerprintSource::ReadTime {
+        fingerprints: artifact.read_time_fingerprints,
+        stat_paths,
+    };
+    let loaded_paths = artifact.loaded_paths;
 
     let result = ImportResult {
         freshness: ResultFreshness::fresh(),
@@ -312,7 +380,7 @@ pub(crate) fn analyze_with_rolldown_engine(
         shared_bytes: None,
         internal_contributions: contributions,
     };
-    Ok((result, loaded_paths))
+    Ok((result, loaded_paths, freshness))
 }
 
 pub(crate) fn engine_selection(request: &ImportRequest) -> crate::engine::BundleSelection {
@@ -627,5 +695,62 @@ fn error_with_context(
         stage,
         message: message.into(),
         details: context_details,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Editing a first-party workspace dependency's manifest changes what the bundler
+    /// resolves and retains, while none of its source files move. Without the manifest
+    /// in the fingerprint set the cached size is served as fresh (spec R5).
+    ///
+    /// Loaded paths are canonicalized, so a workspace package linked into
+    /// `node_modules` (as pnpm does) resolves to its real path and is correctly seen
+    /// as first-party.
+    #[test]
+    fn first_party_manifests_are_fingerprint_inputs_and_installed_ones_are_not() {
+        let workspace = std::env::temp_dir().join(format!(
+            "import-lens-r5-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let ui = workspace.join("packages").join("ui");
+        std::fs::create_dir_all(ui.join("src")).expect("ui src");
+        std::fs::write(ui.join("package.json"), r#"{"name":"ui"}"#).expect("ui manifest");
+        std::fs::write(ui.join("src").join("index.ts"), "export const a = 1;\n")
+            .expect("ui source");
+
+        let installed = workspace.join("node_modules").join("left-pad");
+        std::fs::create_dir_all(&installed).expect("installed dir");
+        std::fs::write(installed.join("package.json"), r#"{"name":"left-pad"}"#)
+            .expect("installed manifest");
+        std::fs::write(installed.join("index.js"), "export const b = 2;\n")
+            .expect("installed source");
+
+        let context = AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("app.ts"),
+        };
+
+        let manifests = first_party_manifests(
+            &context,
+            &[
+                ui.join("src").join("index.ts"),
+                installed.join("index.js"),
+                // A second module in the same package must not duplicate the manifest.
+                ui.join("src").join("other.ts"),
+            ],
+        );
+
+        assert_eq!(
+            manifests,
+            vec![ui.join("package.json")],
+            "the first-party dependency's manifest is a freshness input; an installed \
+             package's is covered by the install generation and must not be"
+        );
+
+        std::fs::remove_dir_all(&workspace).ok();
     }
 }
