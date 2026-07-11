@@ -183,3 +183,14 @@ async fn date_fns_format_loads_tree_shaken_modules() {
         rendered.len()
     );
 }
+
+/// The css-tree row exists for exactly one assertion — zero dangling `__il_`
+/// bindings, the §2.2 defect the redesign was built to remove — and every other
+/// row leans on it too. If that assertion could not fire, the whole suite would
+/// stay green no matter what the engine emitted. This row needs no fixtures, so
+/// the gate stays honest even in a run where the real packages are absent.
+#[test]
+#[should_panic(expected = "bundle references undeclared bindings")]
+fn dangling_binding_gate_is_not_vacuous() {
+    common::assert_no_dangling_il_bindings("export const parse = __il_entry_0_export_0;\n");
+}
