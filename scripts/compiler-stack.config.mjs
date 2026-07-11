@@ -3,6 +3,12 @@ export const compilerStackConfig = {
   currentOxcVersion: "0.139.0",
   currentResolverVersion: "11.23.0",
   rolldownCrate: "rolldown",
+  // Rolldown monorepo siblings the adapter depends on directly (they carry
+  // the public output/diagnostic types the rolldown root does not
+  // re-export). Published at the same monorepo version as rolldown and
+  // pinned in lockstep; the updater's probe rejects any release where the
+  // shared-version invariant does not hold.
+  rolldownSupportCrates: ["rolldown_common", "rolldown_error"],
   candidateFeature: "rolldown-candidate",
   oxcCrates: [
     "oxc_allocator",

@@ -571,7 +571,9 @@ pub fn invalidate_shared_resolvers() {
     }
 }
 
-fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
+// Shared with the candidate engine so its resolution configuration cannot
+// drift from the direct resolver's.
+pub(crate) fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
     match runtime {
         ImportRuntime::Component | ImportRuntime::Client => ResolveOptions {
             alias_fields: vec![vec!["browser".to_owned()]],

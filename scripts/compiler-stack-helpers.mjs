@@ -30,19 +30,37 @@ export const validateCurrentStack = (cargoToml) => {
     throw new Error("Missing exact pin (=) for oxc_resolver");
   }
 
-  if (
-    !/^rolldown\s*=\s*\{\s*version\s*=\s*"=[^"]+",\s*optional\s*=\s*true\s*\}$/mu.test(cargoToml)
-  ) {
-    throw new Error(
-      'Missing exact optional rolldown dependency (rolldown = { version = "=x.y.z", optional = true })',
+  for (const crate of rolldownFamilyCrates()) {
+    const linePattern = new RegExp(
+      `^${crate}\\s*=\\s*\\{\\s*version\\s*=\\s*"=[^"]+",\\s*optional\\s*=\\s*true\\s*\\}$`,
+      "mu",
     );
+    if (!linePattern.test(cargoToml)) {
+      throw new Error(
+        `Missing exact optional dependency (${crate} = { version = "=x.y.z", optional = true })`,
+      );
+    }
   }
-  if (!/^rolldown-candidate\s*=\s*\[\s*"dep:rolldown"\s*\]$/mu.test(cargoToml)) {
+  const featureDeps = rolldownFamilyCrates()
+    .map((crate) => `"dep:${crate}"`)
+    .join(",\\s*");
+  const featurePattern = new RegExp(
+    `^rolldown-candidate\\s*=\\s*\\[\\s*${featureDeps}\\s*\\]$`,
+    "mu",
+  );
+  if (!featurePattern.test(cargoToml)) {
     throw new Error(
-      'Missing rolldown-candidate feature ([features] rolldown-candidate = ["dep:rolldown"])',
+      `Missing rolldown-candidate feature ([features] rolldown-candidate = [${rolldownFamilyCrates()
+        .map((crate) => `"dep:${crate}"`)
+        .join(", ")}])`,
     );
   }
 };
+
+export const rolldownFamilyCrates = () => [
+  compilerStackConfig.rolldownCrate,
+  ...compilerStackConfig.rolldownSupportCrates,
+];
 
 export const validateVersion = (label, version) => {
   if (!semverPattern.test(version)) {
@@ -54,10 +72,12 @@ export const validateAvailableVersions = async (
   fetchJson,
   { rolldownVersion, oxcVersion, resolverVersion },
 ) => {
-  await crateVersion(fetchJson, compilerStackConfig.rolldownCrate, rolldownVersion).catch(
-    (error) => {
-      throw new Error(`Unavailable rolldown version ${rolldownVersion}: ${error.message}`);
-    },
+  await Promise.all(
+    rolldownFamilyCrates().map((crate) =>
+      crateVersion(fetchJson, crate, rolldownVersion).catch((error) => {
+        throw new Error(`Unavailable ${crate} version ${rolldownVersion}: ${error.message}`);
+      }),
+    ),
   );
 
   // Cargo's probe resolution proves the umbrella graph, but not that every
@@ -94,10 +114,16 @@ export const updateCargoToml = (cargoToml, { rolldownVersion, oxcVersion, resolv
     );
   }
   next = next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "=${resolverVersion}"`);
-  return next.replace(
-    /^rolldown\s*=\s*\{\s*version\s*=\s*"[^"]+",\s*optional\s*=\s*true\s*\}$/gmu,
-    `rolldown = { version = "=${rolldownVersion}", optional = true }`,
-  );
+  for (const crate of rolldownFamilyCrates()) {
+    next = next.replace(
+      new RegExp(
+        `^${crate}\\s*=\\s*\\{\\s*version\\s*=\\s*"[^"]+",\\s*optional\\s*=\\s*true\\s*\\}$`,
+        "gmu",
+      ),
+      `${crate} = { version = "=${rolldownVersion}", optional = true }`,
+    );
+  }
+  return next;
 };
 
 export const updateManifest = (manifest) => {

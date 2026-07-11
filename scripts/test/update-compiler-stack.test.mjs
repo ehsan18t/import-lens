@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { compilerStackConfig } from "../compiler-stack.config.mjs";
 import { fingerprintFromMetadata, formatFingerprint } from "../compiler-stack-fingerprint.mjs";
-import { replaceKnownVersions } from "../compiler-stack-helpers.mjs";
+import { replaceKnownVersions, rolldownFamilyCrates } from "../compiler-stack-helpers.mjs";
 import { runSafeUpdate } from "../deps-update-safe.mjs";
 import { parseUpdateArgs, updateCompilerStack } from "../update-compiler-stack.mjs";
 
@@ -28,6 +28,7 @@ const nextMinor = (version) => {
 const targetRolldown = nextMinor(currentRolldown);
 const targetOxc = nextMinor(currentOxc);
 const targetResolver = nextMinor(currentResolver);
+const rolldownFamily = rolldownFamilyCrates();
 
 // Versions are digits and dots; only the dots need escaping to embed one in a regex.
 const escapeVersion = (version) => version.replaceAll(".", "\\.");
@@ -252,13 +253,15 @@ test("updateCompilerStack updates manifests, SRS, config, lockfiles, and the fin
     assert.match(cargoToml, new RegExp(`^${crate} = "=${escapeVersion(targetOxc)}"$`, "mu"));
   }
   assert.match(cargoToml, new RegExp(`^oxc_resolver = "=${escapeVersion(targetResolver)}"$`, "mu"));
-  assert.match(
-    cargoToml,
-    new RegExp(
-      `^rolldown = \\{ version = "=${escapeVersion(targetRolldown)}", optional = true \\}$`,
-      "mu",
-    ),
-  );
+  for (const crate of rolldownFamily) {
+    assert.match(
+      cargoToml,
+      new RegExp(
+        `^${crate} = \\{ version = "=${escapeVersion(targetRolldown)}", optional = true \\}$`,
+        "mu",
+      ),
+    );
+  }
   assert.equal(manifest.scripts["deps:update:compiler"], "node scripts/update-compiler-stack.mjs");
   assert.equal(manifest.scripts["deps:update:safe"], "node scripts/deps-update-safe.mjs");
   assert.match(srs, new RegExp(escapeVersion(targetRolldown), "u"));
@@ -271,21 +274,25 @@ test("updateCompilerStack updates manifests, SRS, config, lockfiles, and the fin
   assert.equal(fingerprint, formatFingerprint(fingerprintFromMetadata(metadata)));
   assert.ok(result.changedFiles.includes(repo.paths.fingerprint));
 
-  // Exec order: probe metadata, pnpm lockfile, precise pins (rolldown,
-  // resolver, every oxc crate), fingerprint metadata.
+  // Exec order: probe metadata, pnpm lockfile, precise pins (the rolldown
+  // family, resolver, every oxc crate), fingerprint metadata.
   assert.ok(isCargoMetadata(execs[0][0], execs[0][1]));
   assert.deepEqual(execs[1], ["pnpm", ["install", "--lockfile-only"], { cwd: repo.root }]);
-  assert.deepEqual(execs[2], [
-    "cargo",
-    ["update", "-p", "rolldown", "--precise", targetRolldown],
-    { cwd: repo.root },
-  ]);
-  assert.deepEqual(execs[3], [
+  assert.deepEqual(
+    execs.slice(2, 2 + rolldownFamily.length),
+    rolldownFamily.map((crate) => [
+      "cargo",
+      ["update", "-p", crate, "--precise", targetRolldown],
+      { cwd: repo.root },
+    ]),
+  );
+  assert.deepEqual(execs[2 + rolldownFamily.length], [
     "cargo",
     ["update", "-p", "oxc_resolver", "--precise", targetResolver],
     { cwd: repo.root },
   ]);
-  const crateUpdates = execs.slice(4, 4 + compilerStackConfig.oxcCrates.length);
+  const oxcOffset = 3 + rolldownFamily.length;
+  const crateUpdates = execs.slice(oxcOffset, oxcOffset + compilerStackConfig.oxcCrates.length);
   assert.deepEqual(
     crateUpdates,
     compilerStackConfig.oxcCrates.map((crate) => [
@@ -523,7 +530,7 @@ test("updateCompilerStack rejects a manifest without the coordinated shape befor
   for (const [repo, message] of [
     [nonCoordinated, /Current OXC crate versions are not coordinated/u],
     [withMangler, /oxc_mangler must not be present/u],
-    [withoutRolldown, /Missing exact optional rolldown dependency/u],
+    [withoutRolldown, /Missing exact optional dependency \(rolldown /u],
   ]) {
     await assert.rejects(
       updateCompilerStack({
@@ -540,6 +547,71 @@ test("updateCompilerStack rejects a manifest without the coordinated shape befor
       message,
     );
   }
+});
+
+test("the probe manifest pins every rolldown-family crate at the requested version", async () => {
+  // The probe is the gate that fails BEFORE any tracked edit when a rolldown
+  // release ships without its sibling crates at the same version; that only
+  // holds if the probe manifest actually constrains the siblings.
+  const repo = await tempRepo();
+  const probeWrites = [];
+  const probe = probeLifecycle();
+
+  await updateCompilerStack({
+    rootDir: repo.root,
+    paths: repo.paths,
+    rolldownVersion: targetRolldown,
+    dryRun: true,
+    fetchJson: availableVersions(),
+    platform: "linux",
+    execFile: cargoAwareExec(
+      [],
+      probeMetadata({ rolldown: targetRolldown, oxc: targetOxc, resolver: targetResolver }),
+    ),
+    ...probe,
+    probeWriteFile: async (file, content) => probeWrites.push([file, content]),
+  });
+
+  const manifest = probeWrites
+    .map(([, content]) => content)
+    .find((content) => typeof content === "string" && content.includes("[dependencies]"));
+  assert.ok(manifest, "the probe should write a Cargo.toml manifest");
+  for (const crate of rolldownFamily) {
+    assert.match(
+      manifest,
+      new RegExp(`^${crate} = "=${escapeVersion(targetRolldown)}"$`, "mu"),
+      `probe manifest must pin ${crate} at the requested rolldown version`,
+    );
+  }
+});
+
+test("updateCompilerStack rejects a rolldown release whose support crates are unavailable", async () => {
+  const repo = await tempRepo();
+  const writes = [];
+
+  await assert.rejects(
+    updateCompilerStack({
+      rootDir: repo.root,
+      paths: repo.paths,
+      rolldownVersion: targetRolldown,
+      fetchJson: async (url) => {
+        if (url.includes("/rolldown_common/")) {
+          throw new Error("404 Not Found");
+        }
+        return availableVersionPayload(url);
+      },
+      platform: "linux",
+      execFile: cargoAwareExec(
+        [],
+        probeMetadata({ rolldown: targetRolldown, oxc: targetOxc, resolver: targetResolver }),
+      ),
+      writeFile: async (...args) => writes.push(args),
+      ...probeLifecycle(),
+    }),
+    /Unavailable rolldown_common version/u,
+  );
+
+  assert.deepEqual(writes, []);
 });
 
 test("runSafeUpdate restores the stack and validates the fingerprint", async () => {
@@ -560,17 +632,24 @@ test("runSafeUpdate restores the stack and validates the fingerprint", async () 
 
   assert.deepEqual(execs[0], ["pnpm", ["update"], { cwd: "/repo" }]);
   assert.deepEqual(execs[1], ["cargo", ["update"], { cwd: "/repo" }]);
-  assert.deepEqual(execs[2], [
-    "cargo",
-    ["update", "-p", "rolldown", "--precise", currentRolldown],
-    { cwd: "/repo" },
-  ]);
-  assert.deepEqual(execs[3], [
+  assert.deepEqual(
+    execs.slice(2, 2 + rolldownFamily.length),
+    rolldownFamily.map((crate) => [
+      "cargo",
+      ["update", "-p", crate, "--precise", currentRolldown],
+      { cwd: "/repo" },
+    ]),
+  );
+  assert.deepEqual(execs[2 + rolldownFamily.length], [
     "cargo",
     ["update", "-p", "oxc_resolver", "--precise", currentResolver],
     { cwd: "/repo" },
   ]);
-  const crateRestores = execs.slice(4, 4 + compilerStackConfig.oxcCrates.length);
+  const restoreOffset = 3 + rolldownFamily.length;
+  const crateRestores = execs.slice(
+    restoreOffset,
+    restoreOffset + compilerStackConfig.oxcCrates.length,
+  );
   assert.deepEqual(
     crateRestores,
     compilerStackConfig.oxcCrates.map((crate) => [
@@ -609,9 +688,11 @@ test("runSafeUpdate fails when the restored graph no longer matches the fingerpr
 const availableVersions = () => async (url) => availableVersionPayload(url);
 
 const availableVersionPayload = (url) => {
-  for (const version of [currentRolldown, targetRolldown]) {
-    if (url.endsWith(`/rolldown/${version}`)) {
-      return { version: { num: version } };
+  for (const crate of rolldownFamily) {
+    for (const version of [currentRolldown, targetRolldown]) {
+      if (url.endsWith(`/${crate}/${version}`)) {
+        return { version: { num: version } };
+      }
     }
   }
   if (url.endsWith("/rolldown")) {
@@ -637,11 +718,13 @@ const cargoTomlFixture = () => `[dependencies]
 brotli = "^8"
 ${compilerStackConfig.oxcCrates.map((crate) => `${crate} = "=${currentOxc}"`).join("\n")}
 oxc_resolver = "=${currentResolver}"
-rolldown = { version = "=${currentRolldown}", optional = true }
+${rolldownFamily
+  .map((crate) => `${crate} = { version = "=${currentRolldown}", optional = true }`)
+  .join("\n")}
 zstd = "^0.13"
 
 [features]
-rolldown-candidate = ["dep:rolldown"]
+rolldown-candidate = [${rolldownFamily.map((crate) => `"dep:${crate}"`).join(", ")}]
 `;
 
 const manifestFixture = () => ({

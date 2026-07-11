@@ -1,5 +1,7 @@
 pub mod analysis_flight;
 pub mod cache;
+#[cfg(feature = "rolldown-candidate")]
+pub mod candidate;
 pub mod document;
 pub mod ipc;
 pub mod lifecycle;

@@ -20,6 +20,7 @@ import {
   formatCompilerUpdateResult,
   latestCrateVersion,
   replaceKnownVersions,
+  rolldownFamilyCrates,
   updateCargoToml,
   updateConfig,
   updateManifest,
@@ -220,7 +221,10 @@ const resolveProbeStack = async ({
         'path = "lib.rs"',
         "",
         "[dependencies]",
-        `rolldown = "=${rolldownVersion}"`,
+        // Mirror the real manifest's constraint shape: the support crates
+        // are pinned at rolldown's version, so a release where they did not
+        // ship at that version must fail HERE, before any tracked edit.
+        ...rolldownFamilyCrates().map((crate) => `${crate} = "=${rolldownVersion}"`),
         ...overrides,
         "",
       ].join("\n"),
@@ -265,7 +269,7 @@ const resolveProbeStack = async ({
 // "succeeds" as a split stack; reject that here, before any tracked edit.
 const assertSingleCoordinatedVersions = (metadata) => {
   const coordinated = new Set([
-    compilerStackConfig.rolldownCrate,
+    ...rolldownFamilyCrates(),
     "oxc",
     "oxc_resolver",
     ...compilerStackConfig.oxcCrates,
@@ -346,11 +350,11 @@ const updateLockfiles = async (
   } else {
     await execFile("pnpm", ["install", "--lockfile-only"], { cwd: rootDir });
   }
-  await execFile(
-    "cargo",
-    ["update", "-p", compilerStackConfig.rolldownCrate, "--precise", rolldownVersion],
-    { cwd: rootDir },
-  );
+  for (const crate of rolldownFamilyCrates()) {
+    await execFile("cargo", ["update", "-p", crate, "--precise", rolldownVersion], {
+      cwd: rootDir,
+    });
+  }
   await execFile("cargo", ["update", "-p", "oxc_resolver", "--precise", resolverVersion], {
     cwd: rootDir,
   });

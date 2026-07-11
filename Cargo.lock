@@ -936,6 +936,8 @@ dependencies = [
  "redb",
  "rmp-serde",
  "rolldown",
+ "rolldown_common",
+ "rolldown_error",
  "serde",
  "serde_json",
  "tokio",

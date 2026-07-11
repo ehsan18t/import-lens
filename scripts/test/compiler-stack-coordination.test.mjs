@@ -53,19 +53,27 @@ test("oxc_resolver is exact-pinned at its own configured version", () => {
   );
 });
 
-test("rolldown is an exact-pinned optional dependency behind rolldown-candidate", () => {
+test("the rolldown family is exact-pinned and optional behind rolldown-candidate", () => {
   const cargoToml = repoFile("daemon/Cargo.toml");
 
-  assert.match(
-    cargoToml,
-    new RegExp(
-      `^rolldown = \\{ version = "=${escapeVersion(compilerStackConfig.currentRolldownVersion)}", optional = true \\}$`,
-      "mu",
-    ),
-  );
+  const family = [compilerStackConfig.rolldownCrate, ...compilerStackConfig.rolldownSupportCrates];
+  for (const crate of family) {
+    assert.match(
+      cargoToml,
+      new RegExp(
+        `^${crate} = \\{ version = "=${escapeVersion(compilerStackConfig.currentRolldownVersion)}", optional = true \\}$`,
+        "mu",
+      ),
+      `${crate} must be pinned to =${compilerStackConfig.currentRolldownVersion} and optional`,
+    );
+  }
   // The candidate feature must stay non-default: the shipped binary never
   // links rolldown.
-  assert.match(cargoToml, /^rolldown-candidate = \["dep:rolldown"\]$/mu);
+  const featureDeps = family.map((crate) => `"dep:${crate}"`).join(", ");
+  assert.ok(
+    cargoToml.includes(`rolldown-candidate = [${featureDeps}]`),
+    `rolldown-candidate feature must enable exactly: [${featureDeps}]`,
+  );
   assert.doesNotMatch(cargoToml, /^default = .*rolldown/mu);
 });
 

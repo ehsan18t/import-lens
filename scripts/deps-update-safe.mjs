@@ -11,6 +11,7 @@ import {
   FINGERPRINT_PATH,
   formatFingerprint,
 } from "./compiler-stack-fingerprint.mjs";
+import { rolldownFamilyCrates } from "./compiler-stack-helpers.mjs";
 
 const execFilePromise = promisify(execFileCallback);
 
@@ -38,7 +39,7 @@ export const runSafeUpdate = async ({
   await execFile("cargo", ["update"], { cwd: rootDir });
 
   const pins = [
-    [compilerStackConfig.rolldownCrate, compilerStackConfig.currentRolldownVersion],
+    ...rolldownFamilyCrates().map((crate) => [crate, compilerStackConfig.currentRolldownVersion]),
     ["oxc_resolver", compilerStackConfig.currentResolverVersion],
     ...compilerStackConfig.oxcCrates.map((crate) => [crate, compilerStackConfig.currentOxcVersion]),
   ];

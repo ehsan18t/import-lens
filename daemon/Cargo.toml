@@ -30,6 +30,8 @@ rayon = "^1.12"
 redb = "^4"
 rmp-serde = "^1.3"
 rolldown = { version = "=1.1.5", optional = true }
+rolldown_common = { version = "=1.1.5", optional = true }
+rolldown_error = { version = "=1.1.5", optional = true }
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
 tokio = { version = "^1.52", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
@@ -40,8 +42,11 @@ zstd = "^0.13"
 
 [features]
 # Non-default qualification feature (bundler redesign spec §4.1): candidate
-# daemon builds only. The shipped binary never enables it.
-rolldown-candidate = ["dep:rolldown"]
+# daemon builds only. The shipped binary never enables it. rolldown_common
+# and rolldown_error are rolldown's own sibling crates, pinned at the same
+# monorepo version: they carry the public output/diagnostic types the
+# adapter translates, which the rolldown crate root does not re-export.
+rolldown-candidate = ["dep:rolldown", "dep:rolldown_common", "dep:rolldown_error"]
 
 [dev-dependencies]
 zip = "^2"

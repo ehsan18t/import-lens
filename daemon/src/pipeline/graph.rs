@@ -1828,62 +1828,82 @@ fn push_resolution_diagnostic(
     });
 }
 
+/// Sorted for binary search. Shared with the candidate engine, which hands
+/// Rolldown the same boundary as an exact-match external specifier list.
+pub const NODE_BUILTIN_MODULES: &[&str] = &[
+    "assert",
+    "assert/strict",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "dns/promises",
+    "domain",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "inspector/promises",
+    "module",
+    "net",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "readline/promises",
+    "repl",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "timers",
+    "timers/promises",
+    "tls",
+    "tty",
+    "url",
+    "util",
+    "util/types",
+    "v8",
+    "vm",
+    "worker_threads",
+    "zlib",
+];
+
 pub fn is_node_builtin_specifier(specifier: &str) -> bool {
     let bare = specifier.strip_prefix("node:").unwrap_or(specifier);
-    matches!(
-        bare,
-        "assert"
-            | "assert/strict"
-            | "async_hooks"
-            | "buffer"
-            | "child_process"
-            | "cluster"
-            | "console"
-            | "constants"
-            | "crypto"
-            | "dgram"
-            | "diagnostics_channel"
-            | "dns"
-            | "dns/promises"
-            | "domain"
-            | "events"
-            | "fs"
-            | "fs/promises"
-            | "http"
-            | "http2"
-            | "https"
-            | "inspector"
-            | "inspector/promises"
-            | "module"
-            | "net"
-            | "os"
-            | "path"
-            | "path/posix"
-            | "path/win32"
-            | "perf_hooks"
-            | "process"
-            | "punycode"
-            | "querystring"
-            | "readline"
-            | "readline/promises"
-            | "repl"
-            | "stream"
-            | "stream/consumers"
-            | "stream/promises"
-            | "stream/web"
-            | "string_decoder"
-            | "timers"
-            | "timers/promises"
-            | "tls"
-            | "tty"
-            | "url"
-            | "util"
-            | "util/types"
-            | "v8"
-            | "vm"
-            | "worker_threads"
-            | "zlib"
-    )
+    NODE_BUILTIN_MODULES.binary_search(&bare).is_ok()
+}
+
+#[cfg(test)]
+mod node_builtin_tests {
+    use super::NODE_BUILTIN_MODULES;
+
+    /// `is_node_builtin_specifier` binary-searches the list, so an entry
+    /// added out of order would silently stop matching.
+    #[test]
+    fn node_builtin_modules_stay_strictly_sorted() {
+        assert!(
+            NODE_BUILTIN_MODULES
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "NODE_BUILTIN_MODULES must stay strictly sorted for binary search"
+        );
+    }
 }
 
 /// Every name `module_id` exports, transitively through re-exports and star
