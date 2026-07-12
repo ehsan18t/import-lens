@@ -1000,7 +1000,18 @@ Known divergences accepted into the record:
   implementation: `pipeline/bundle.rs`, `pipeline/reachability.rs`, `pipeline/cjs.rs`, the
   manual module-graph construction in `pipeline/graph.rs`, the marker passes in `minify.rs`,
   `analyze.rs`, and `file_size.rs`, generated binding fabrication, namespace-object
-  construction, the package-side-effect matcher/override, and bundling-only graph records.
+  construction, ~~the package-side-effect matcher/override,~~ and bundling-only graph records.
+
+  **Amended 2026-07-12 (I9).** The package-side-effect matcher is **retained**, as an
+  explicit, recorded divergence. It does not survive as bundler semantics: it never reaches
+  Rolldown, and it cannot change what is retained or what size is reported. It survives only
+  as a *reporting* input on the **static-fallback** path — the path taken when the engine
+  fails — where it drives the `side_effects` flag and the matched-path diagnostic. Deleting
+  it outright would have been the cleaner gate, but §7.4 assumes matched paths are available
+  through public bundler metadata, and **Rolldown 1.1.5 does not expose its retention
+  decisions**, so the fallback would silently lose fidelity with nothing to replace it.
+  Retention-neutral and reporting-only is the honest characterization; the alternative was to
+  close the gate on paper by degrading a real diagnostic.
 - Delete the old engine's tests with it: `daemon/tests/bundle.rs`, the bundling coverage in
   `daemon/tests/graph.rs`, and every other test that asserts custom linking or tree-shaking
   internals. After cutover, no Import Lens test re-verifies Rolldown-owned semantics; that
@@ -1148,9 +1159,10 @@ The replacement is complete only when:
   pass;
 - `ANALYZER_REVISION` is bumped atomically with cutover;
 - the old manual semantic bundler, silent binding fabrication, custom reachability, namespace
-  construction, CJS linker, package-side-effect matcher/override, and marker-removal pass are
-  removed together with their dedicated test files, and no test outside the §10.2 construct
-  matrix asserts linking or tree-shaking semantics;
+  construction, CJS linker, and marker-removal pass are removed together with their dedicated
+  test files, and no test outside the §10.2 construct matrix asserts linking or tree-shaking
+  semantics. **The package-side-effect matcher is retained by the 2026-07-12 amendment above
+  (I9)** — reporting-only, retention-neutral, static-fallback path only;
 - direct `oxc_ast`, `oxc_ast_visit`, and `oxc_transformer` dependencies and the stale
   `oxc-parser` tsdown externalization are removed;
 - neither `rolldown` nor `oxc-parser` is a direct TypeScript runtime dependency, and tsdown's
