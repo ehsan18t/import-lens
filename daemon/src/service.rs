@@ -84,10 +84,24 @@ pub struct PendingImport {
     pending: Box<PendingBuild>,
 }
 
-/// A document analysis that did not wait for the engine: what the cache could answer now, and
-/// what is still to be built.
+/// One import a response already carried a real measurement for, addressed by the same identity a
+/// push uses.
+///
+/// The streamed builds need these: shared-module bytes are a property of the WHOLE document (which
+/// modules two imports both pull in), so the final annotation pass cannot see only the imports that
+/// arrived late.
+#[derive(Clone)]
+pub struct MeasuredImport {
+    pub result: ImportResult,
+    pub identity: RefreshedImportIdentity,
+}
+
+/// A document analysis that did not wait for the engine: what the cache could answer now, what is
+/// still to be built, and — for the shared-bytes pass that closes the document — the measurements
+/// the response already carried.
 pub struct StreamedDocumentAnalysis {
     pub response: AnalyzeDocumentResponse,
+    pub measured: Vec<MeasuredImport>,
     pub pending: Vec<PendingImport>,
 }
 
@@ -97,6 +111,7 @@ impl StreamedDocumentAnalysis {
     pub fn settled(response: AnalyzeDocumentResponse) -> Self {
         Self {
             response,
+            measured: Vec::new(),
             pending: Vec::new(),
         }
     }
@@ -106,6 +121,26 @@ impl StreamedDocumentAnalysis {
 struct CachedDocumentAnalysis {
     items: Vec<ImportAnalysisItem>,
     pending: Vec<PendingImport>,
+}
+
+impl CachedDocumentAnalysis {
+    /// The imports this classification could already measure, in the shape the streamed builds
+    /// need for their closing shared-bytes pass.
+    fn measured(&self) -> Vec<MeasuredImport> {
+        self.items
+            .iter()
+            .filter_map(|item| {
+                Some(MeasuredImport {
+                    result: item.result.clone()?,
+                    identity: RefreshedImportIdentity {
+                        specifier: item.detected.specifier.clone(),
+                        import_kind: item.detected.import_kind,
+                        named: item.detected.named.clone(),
+                    },
+                })
+            })
+            .collect()
+    }
 }
 
 const SLOW_CACHE_LOOKUP_LOG_THRESHOLD: Duration = Duration::from_millis(25);
@@ -870,6 +905,7 @@ impl ImportLensService {
         );
 
         StreamedDocumentAnalysis {
+            measured: cached.measured(),
             response: AnalyzeDocumentResponse {
                 version: request.version,
                 request_id: request.request_id,
@@ -2277,14 +2313,25 @@ impl ImportLensService {
     /// edited past buys nobody anything. Results still go through `analyze_and_cache`, so the
     /// single-flight registry collapses a build another request is already running for the same
     /// key rather than starting a second one.
+    ///
+    /// **Shared bytes close the document, not each import.** `shared_bytes` says how much of an
+    /// import's weight another import in the SAME file also pulls in, so it is not knowable until
+    /// every import of the file has been measured — and on a cold document that is only true once
+    /// the last push has landed. Each import is therefore delivered the moment it is measured (its
+    /// own number is what the user is waiting for), and one final push carries the imports whose
+    /// shared-byte figure the client does not yet have right. Without it, the shared-dependency
+    /// insight would silently never appear on a first analysis, because `annotate_ready_items` can
+    /// only annotate imports that already have a result and a cold document has none.
     pub fn complete_pending_imports(
         &self,
         context: &AnalysisContext,
+        measured: Vec<MeasuredImport>,
         pending: Vec<PendingImport>,
         should_continue: impl Fn() -> bool + Sync,
-        emit: impl Fn(ImportResult, RefreshedImportIdentity) + Sync,
+        emit: impl Fn(Vec<ImportResult>, Vec<RefreshedImportIdentity>) + Sync,
     ) {
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
+        let landed = std::sync::Mutex::new(Vec::<MeasuredImport>::new());
         drain_misses_owned(pending, |import| {
             if !should_continue() {
                 return;
@@ -2303,15 +2350,31 @@ impl ImportLensService {
                 return;
             }
 
-            emit(
-                result,
-                RefreshedImportIdentity {
-                    specifier: import.detected.specifier,
-                    import_kind: import.detected.import_kind,
-                    named: import.detected.named,
-                },
-            );
+            let identity = RefreshedImportIdentity {
+                specifier: import.detected.specifier,
+                import_kind: import.detected.import_kind,
+                named: import.detected.named,
+            };
+            emit(vec![result.clone()], vec![identity.clone()]);
+            landed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(MeasuredImport { result, identity });
         });
+
+        // A superseded document is not worth a closing pass: the client has already dropped
+        // everything this stream pushed it.
+        if !should_continue() {
+            return;
+        }
+        let landed = landed
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner());
+        let document = measured.into_iter().chain(landed).collect::<Vec<_>>();
+        let (results, identities) = shared_bytes_corrections(document);
+        if !results.is_empty() {
+            emit(results, identities);
+        }
     }
 
     fn analysis_items_for_detected(
@@ -2584,11 +2647,47 @@ fn effective_registry_hint_mode(
     }
 }
 
+/// Re-derive `shared_bytes` across a document's COMPLETE set of measurements and return only the
+/// imports whose figure the client does not already hold correctly.
+///
+/// Everything the client has was annotated against a PARTIAL set: an import answered from cache was
+/// annotated against the response's cache hits alone (`annotate_ready_items`), and an import that
+/// streamed in carried whatever its own build produced, which is no annotation at all. Neither can
+/// be right until the last import of the file has been measured — sharing is a relation between two
+/// imports of the same document.
+///
+/// A document with nothing shared produces nothing: an import whose shared bytes are zero reads the
+/// same to the client whether the field is `Some(0)` or absent (`insights.ts` and the tooltip both
+/// gate on `> 0`), so re-sending it would be a frame that changes nothing on screen.
+fn shared_bytes_corrections(
+    document: Vec<MeasuredImport>,
+) -> (Vec<ImportResult>, Vec<RefreshedImportIdentity>) {
+    let mut annotated = document
+        .iter()
+        .map(|import| import.result.clone())
+        .collect::<Vec<_>>();
+    annotate_shared_bytes(&mut annotated);
+
+    let mut results = Vec::new();
+    let mut identities = Vec::new();
+    for (import, result) in document.into_iter().zip(annotated) {
+        if import.result.shared_bytes.unwrap_or_default() == result.shared_bytes.unwrap_or_default()
+        {
+            continue;
+        }
+        results.push(result);
+        identities.push(import.identity);
+    }
+
+    (results, identities)
+}
+
 /// Shared-byte annotation across a document's *measured* imports.
 ///
 /// Imports still being measured contribute nothing: shared bytes are computed from module
-/// contributions, and an import with no result has none. The full analysis that follows the
-/// pushed results (any later read of this document) annotates the complete set.
+/// contributions, and an import with no result has none. `complete_pending_imports` re-derives the
+/// figure over the whole document once the last streamed import has landed, and pushes the
+/// corrections (`shared_bytes_corrections`).
 fn annotate_ready_items(items: &mut [ImportAnalysisItem]) {
     let mut results = items
         .iter_mut()
@@ -3192,6 +3291,10 @@ mod analyze_and_cache_single_flight_tests {
 
     #[test]
     fn analyze_and_cache_follower_keeps_own_cache_write_when_leader_does_not_store() {
+        // The follower re-reads the process-global cache generation inside `analyze_and_cache`. A
+        // sibling test that bumps it in between would make the follower its own leader, and this
+        // test would fail for a reason that has nothing to do with single-flight.
+        let _generation = crate::cache::memory::hold_cache_generation_steady();
         let service = Arc::new(ImportLensService::new(None, false));
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

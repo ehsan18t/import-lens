@@ -2042,6 +2042,81 @@ fn service_marks_shared_transitive_modules_in_batch_results() {
     );
 }
 
+/// On a cold document EVERY import arrives by push, so if the streamed builds do not annotate
+/// shared bytes, the shared-dependency insight silently never appears on a first analysis —
+/// exactly the documents the user just opened.
+///
+/// It cannot be annotated per push: `shared_bytes` is a relation between two imports of the same
+/// file, so it is not knowable until the last one has been measured. Each import is therefore
+/// delivered the moment its own number lands, and the stream closes with one correction push
+/// carrying the shared figures for the whole document.
+#[test]
+fn streamed_imports_get_their_shared_bytes_when_the_document_closes() {
+    use import_lens_daemon::document::IgnoreRuleResolver;
+    use import_lens_daemon::pipeline::analyze::AnalysisContext;
+    use std::collections::HashMap;
+
+    let workspace = temp_workspace();
+    write_shared_packages(&workspace);
+    let service = ImportLensService::new(None, false);
+    let source = "import { left } from 'left-lib';\nimport { right } from 'right-lib';";
+
+    let analysis = service.handle_analyze_document_streaming(
+        AnalyzeDocumentRequest {
+            message_type: "analyze_document".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 71,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            active_document_path: active_document_path(&workspace),
+            source: source.to_owned(),
+        },
+        &IgnoreRuleResolver::default(),
+    );
+    assert_eq!(
+        analysis.pending.len(),
+        2,
+        "a cold document defers every import"
+    );
+
+    let context = AnalysisContext {
+        workspace_root: PathBuf::from(workspace.to_string_lossy().to_string()),
+        active_document_path: PathBuf::from(active_document_path(&workspace)),
+    };
+    let pushed = Mutex::new(Vec::new());
+    service.complete_pending_imports(
+        &context,
+        analysis.measured,
+        analysis.pending,
+        || true,
+        |results, identities| {
+            pushed
+                .lock()
+                .expect("pushes")
+                .extend(identities.into_iter().zip(results));
+        },
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    // Later pushes supersede earlier ones for the same import, exactly as the client's merge does.
+    let delivered = pushed
+        .into_inner()
+        .expect("pushes")
+        .into_iter()
+        .map(|(identity, result)| (identity.specifier, result.shared_bytes))
+        .collect::<HashMap<_, _>>();
+
+    for specifier in ["left-lib", "right-lib"] {
+        assert!(
+            delivered
+                .get(specifier)
+                .copied()
+                .flatten()
+                .is_some_and(|bytes| bytes > 0),
+            "{specifier} must end up carrying the bytes it shares with its sibling: {delivered:?}"
+        );
+    }
+}
+
 #[test]
 fn service_computes_file_size_with_shared_module_deduplication() {
     let workspace = temp_workspace();

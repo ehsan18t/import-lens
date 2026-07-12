@@ -160,7 +160,9 @@ pub mod stage {
     /// healthy 17 KB package reports its 58-byte barrel for a whole cache generation.
     ///
     /// So every cache and memo the daemon writes gates on this: see
-    /// `service::should_cache_result` and `service::file_size_is_cacheable`.
+    /// `crate::service::should_cache_result` for the per-import caches, and
+    /// [`crate::pipeline::file_size::FileSizeComputation::is_cacheable`] for the L1 aggregate,
+    /// which must additionally refuse a total that summed an import nobody had measured yet.
     pub fn is_transient(stage: &str) -> bool {
         matches!(stage, TIMEOUT | PANIC | ENGINE_GONE)
     }

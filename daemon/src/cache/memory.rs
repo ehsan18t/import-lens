@@ -38,6 +38,23 @@ pub fn bump_cache_generation() {
     CACHE_GENERATION.fetch_add(1, Ordering::Release);
 }
 
+/// Serializes the lib tests that touch [`CACHE_GENERATION`] against the ones that assume it holds
+/// still while they run.
+///
+/// The generation is process-global and the test binary is multi-threaded, so a test that bumps it
+/// can slip between any other test's two reads of it — turning a single-flight follower into its
+/// own leader (`service::analyze_and_cache`, which re-reads the generation per call) or making two
+/// L1 signatures taken moments apart disagree. Neither is a product defect, and both are a coin
+/// flip that comes up tails only when the schedule happens to interleave them, which is the worst
+/// kind of red.
+#[cfg(test)]
+pub(crate) fn hold_cache_generation_steady() -> std::sync::MutexGuard<'static, ()> {
+    static GENERATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GENERATION_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 fn current_cache_generation() -> u64 {
     CACHE_GENERATION.load(Ordering::Acquire)
 }

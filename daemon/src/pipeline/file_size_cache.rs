@@ -260,6 +260,11 @@ mod tests {
     use crate::cache::memory::bump_cache_generation;
     use crate::ipc::protocol::{ImportKind, ImportRuntime};
 
+    /// `file_size_signature` folds the process-global cache generation, so every test here that
+    /// compares two signatures — and the one that deliberately bumps it — must serialize against
+    /// the rest of the binary. See `cache::memory::hold_cache_generation_steady`.
+    use crate::cache::memory::hold_cache_generation_steady as hold_generation_steady;
+
     fn computation(minified: u64) -> FileSizeComputation {
         FileSizeComputation {
             minified_bytes: minified,
@@ -385,6 +390,7 @@ mod tests {
 
     #[test]
     fn file_size_signature_changes_when_entry_bytes_change() {
+        let _generation = hold_generation_steady();
         // Real node_modules fixture so resolve_package_entry succeeds and the
         // Ok(resolved) arm folds in the entry+manifest fingerprint.
         let ws = std::env::temp_dir().join(format!("il-l1-sig-{}", std::process::id()));
@@ -425,6 +431,7 @@ mod tests {
 
     #[test]
     fn signature_is_order_independent() {
+        let _generation = hold_generation_steady();
         let ctx = unresolvable_context();
         let a = sized(named_request("alpha", &["x"]));
         let b = sized(named_request("beta", &["y"]));
@@ -436,6 +443,7 @@ mod tests {
 
     #[test]
     fn signature_changes_when_named_exports_change() {
+        let _generation = hold_generation_steady();
         let ctx = unresolvable_context();
         assert_ne!(
             file_size_signature(&ctx, &[sized(named_request("alpha", &["x"]))]),
@@ -445,6 +453,7 @@ mod tests {
 
     #[test]
     fn signature_changes_when_generation_bumps() {
+        let _generation = hold_generation_steady();
         let ctx = unresolvable_context();
         let imports = [sized(named_request("alpha", &["x"]))];
         let before = file_size_signature(&ctx, &imports);
