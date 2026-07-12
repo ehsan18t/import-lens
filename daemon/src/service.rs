@@ -1,4 +1,4 @@
-use crate::engine::scheduling::{drain_ordered, drain_ordered_owned};
+use crate::engine::scheduling::{drain_classified, drain_ordered_owned};
 use crate::{
     analysis_flight::AnalysisFlightRegistry,
     cache::{
@@ -51,6 +51,27 @@ use std::{
 enum ReadIntent {
     Interactive,
     Bulk,
+}
+
+/// The outcome of a cache lookup, before any engine build has been attempted.
+///
+/// Separating "did the cache answer this?" from "build it" is what lets a batch
+/// classify every import at pool width and hand only the misses to the two-permit
+/// engine drain. `Miss` carries the resolved package and cache key forward so the
+/// build half does not re-read the manifest.
+enum CacheProbe {
+    Hit(Box<ImportResult>),
+    /// Boxed: this rides in the `Err` arm of the classify closure for every import in
+    /// a batch, and `ResolvedPackage` dwarfs the discriminant.
+    Miss(Box<PendingBuild>),
+    /// The specifier did not resolve to a package; the static path handles it, and it
+    /// may still build, so it is not a hit.
+    Unresolved,
+}
+
+struct PendingBuild {
+    resolved: ResolvedPackage,
+    key: String,
 }
 
 const SLOW_CACHE_LOOKUP_LOG_THRESHOLD: Duration = Duration::from_millis(25);
@@ -488,16 +509,22 @@ impl ImportLensService {
         // .importlensignore ancestor walk, while edits between reports are
         // re-read because each report constructs a fresh resolver.
         let ignore_resolver = IgnoreRuleResolver::default();
-        let items = drain_ordered(&files, |_, source_path| {
-            let source = match fs::read_to_string(source_path) {
-                Ok(source) => source,
-                Err(_) => return Vec::new(),
-            };
-            self.analyze_report_source(source_path, &request, source, &ignore_resolver)
-        })
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        // Reading, parsing and import-detecting a file needs no engine permit, so this
+        // runs at the width of the report's own pool rather than the engine's build
+        // width — the engine drain lives one level down, around the misses only. The
+        // pool is dedicated to reports (`report_executor`), so widening here cannot
+        // starve interactive requests on the global pool.
+        let items = files
+            .par_iter()
+            .flat_map_iter(|source_path| {
+                let source = match fs::read_to_string(source_path) {
+                    Ok(source) => source,
+                    Err(_) => return Vec::new().into_iter(),
+                };
+                self.analyze_report_source(source_path, &request, source, &ignore_resolver)
+                    .into_iter()
+            })
+            .collect::<Vec<_>>();
         let row_set = crate::report::model::build_report_rows(&items, &request.budgets);
         let summary = crate::report::model::build_report_summary(&row_set);
 
@@ -607,9 +634,7 @@ impl ImportLensService {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
-        let mut imports = drain_ordered(&request.imports, |_, item| {
-            self.analyze_with_cache(&context, item, false, ReadIntent::Interactive)
-        });
+        let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
         annotate_shared_bytes(&mut imports);
 
         BatchResponse {
@@ -618,6 +643,32 @@ impl ImportLensService {
             imports,
             indexes: None,
         }
+    }
+
+    /// Cache hits are classified across the Rayon pool; only misses queue for the
+    /// two-permit engine drain. `emit` fires once per import as it settles, in
+    /// completion order, and carries the import's original index.
+    fn analyze_batch(
+        &self,
+        context: &AnalysisContext,
+        imports: &[ImportRequest],
+        emit: impl Fn(usize, &ImportResult) + Sync,
+    ) -> Vec<ImportResult> {
+        drain_classified(
+            imports,
+            |index, item| match self.probe_cache(context, item, false, ReadIntent::Interactive) {
+                CacheProbe::Hit(result) => {
+                    emit(index, &result);
+                    Ok(*result)
+                }
+                pending => Err(pending),
+            },
+            |index, item, pending| {
+                let result = self.complete_probe(context, item, pending);
+                emit(index, &result);
+                result
+            },
+        )
     }
 
     pub fn handle_batch_streaming<F>(&self, request: BatchRequest, emit_partial: F) -> BatchResponse
@@ -639,15 +690,13 @@ impl ImportLensService {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
-        let mut imports = drain_ordered(&request.imports, |index, item| {
-            let result = self.analyze_with_cache(&context, item, false, ReadIntent::Interactive);
+        let mut imports = self.analyze_batch(&context, &request.imports, |index, result| {
             emit_partial(BatchResponse {
                 version: request.version,
                 request_id: request.request_id,
                 imports: vec![result.clone()],
                 indexes: Some(vec![index]),
             });
-            result
         });
         annotate_shared_bytes(&mut imports);
 
@@ -671,9 +720,7 @@ impl ImportLensService {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
         };
-        let mut imports = drain_ordered(&request.imports, |_, item| {
-            self.analyze_with_cache(&context, item, false, ReadIntent::Interactive)
-        });
+        let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
         annotate_shared_bytes(&mut imports);
         let file_size =
             self.file_size_with_cache(&context, &request.active_document_path, &request.imports);
@@ -1980,24 +2027,46 @@ impl ImportLensService {
         serve_stale: bool,
         intent: ReadIntent,
     ) -> Vec<ImportAnalysisItem> {
-        let mut items = drain_ordered_owned(detected, |_, detected| {
-            match import_request_for_detected(&context.active_document_path, &detected) {
-                Ok(request) => ImportAnalysisItem {
-                    result: Some(self.analyze_with_cache(context, &request, serve_stale, intent)),
-                    detected,
-                    status: ImportAnalysisStatus::Ready,
-                    message: None,
-                    request: Some(request),
-                },
-                Err(message) => ImportAnalysisItem {
-                    detected,
-                    status: ImportAnalysisStatus::Missing,
-                    message: Some(message),
-                    request: None,
-                    result: None,
-                },
-            }
-        });
+        // Same split as the batch handlers: an import the cache can answer — or one
+        // that does not resolve at all — is settled at pool width; only a real miss
+        // queues for an engine permit. This path serves both interactive document
+        // analysis and every file of a workspace report.
+        let mut items = drain_classified(
+            &detected,
+            |_, detected| {
+                let request =
+                    match import_request_for_detected(&context.active_document_path, detected) {
+                        Ok(request) => request,
+                        Err(message) => {
+                            return Ok(ImportAnalysisItem {
+                                detected: detected.clone(),
+                                status: ImportAnalysisStatus::Missing,
+                                message: Some(message),
+                                request: None,
+                                result: None,
+                            });
+                        }
+                    };
+
+                match self.probe_cache(context, &request, serve_stale, intent) {
+                    CacheProbe::Hit(result) => Ok(ImportAnalysisItem {
+                        result: Some(*result),
+                        detected: detected.clone(),
+                        status: ImportAnalysisStatus::Ready,
+                        message: None,
+                        request: Some(request),
+                    }),
+                    pending => Err((request, pending)),
+                }
+            },
+            |_, detected, (request, pending)| ImportAnalysisItem {
+                result: Some(self.complete_probe(context, &request, pending)),
+                detected: detected.clone(),
+                status: ImportAnalysisStatus::Ready,
+                message: None,
+                request: Some(request),
+            },
+        );
 
         let mut results = items
             .iter_mut()
@@ -2045,30 +2114,29 @@ impl ImportLensService {
         serve_stale: bool,
         intent: ReadIntent,
     ) -> ImportResult {
-        match resolve_package_entry(&context.active_document_path, request) {
-            Ok(resolved) => {
-                self.analyze_resolved_with_cache(context, request, resolved, serve_stale, intent)
-            }
-            Err(_) => analyze_import(context, request),
-        }
+        let probe = self.probe_cache(context, request, serve_stale, intent);
+        self.complete_probe(context, request, probe)
     }
 
-    // Cache lookup + analysis for an already-resolved package. The package.json
-    // analysis path resolves each dependency once and reuses the ResolvedPackage
-    // here, avoiding a second resolve_package_entry (and its manifest read).
-    //
-    // `serve_stale` selects the read semantics: interactive size reads serve the
-    // last-known value instantly (flagged on the result's `freshness`) via
-    // stale-while-revalidate; batch/CI reads pass `false` so a changed dependency is
-    // recomputed synchronously and never served stale (spec §4.5).
-    fn analyze_resolved_with_cache(
+    /// The lookup half of `analyze_with_cache`, with the build half left undone.
+    ///
+    /// Splitting the two is what lets a batch classify every import pool-wide and
+    /// then feed only the misses to the two-permit engine drain. §9 bounds *builds*
+    /// at two; it says nothing about cache hits, and serving those two-at-a-time
+    /// throttled the overwhelmingly common case to the width of the rarest one.
+    ///
+    /// A miss carries its resolved package and cache key forward so `complete_probe`
+    /// does not resolve the manifest a second time.
+    fn probe_cache(
         &self,
         context: &AnalysisContext,
         request: &ImportRequest,
-        resolved: ResolvedPackage,
         serve_stale: bool,
         intent: ReadIntent,
-    ) -> ImportResult {
+    ) -> CacheProbe {
+        let Ok(resolved) = resolve_package_entry(&context.active_document_path, request) else {
+            return CacheProbe::Unresolved;
+        };
         let key = cache_key_for_resolved_import(request, &resolved);
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
@@ -2091,7 +2159,7 @@ impl ImportLensService {
                     Some(&result),
                     lookup_started_at.elapsed(),
                 );
-                return result;
+                return CacheProbe::Hit(Box::new(result));
             }
             log_cache_lookup_timing(
                 request,
@@ -2109,13 +2177,37 @@ impl ImportLensService {
             // reaches CI; we recompute synchronously below instead. This single gate
             // also removes the double dependency re-verification of the prior
             // memory-only `probe_freshness` + `get`.
-            let cached = fresh_cached_result_for_key(cache.as_ref(), request, &key, intent);
-            if let Some(result) = cached {
-                return result;
+            if let Some(result) = fresh_cached_result_for_key(cache.as_ref(), request, &key, intent)
+            {
+                return CacheProbe::Hit(Box::new(result));
             }
         }
 
-        self.analyze_and_cache(cache.as_ref(), context, request, key, resolved, || true)
+        CacheProbe::Miss(Box::new(PendingBuild { resolved, key }))
+    }
+
+    /// The build half. Only this may occupy an engine permit.
+    fn complete_probe(
+        &self,
+        context: &AnalysisContext,
+        request: &ImportRequest,
+        probe: CacheProbe,
+    ) -> ImportResult {
+        match probe {
+            CacheProbe::Hit(result) => *result,
+            CacheProbe::Unresolved => analyze_import(context, request),
+            CacheProbe::Miss(pending) => {
+                let cache = self.cache_registry.cache_for_root(&context.workspace_root);
+                self.analyze_and_cache(
+                    cache.as_ref(),
+                    context,
+                    request,
+                    pending.key,
+                    pending.resolved,
+                    || true,
+                )
+            }
+        }
     }
 
     fn analyze_and_cache(

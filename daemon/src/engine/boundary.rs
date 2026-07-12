@@ -28,14 +28,30 @@ static STARTED: AtomicUsize = AtomicUsize::new(0);
 // Borrowing a static keeps the engine futures 'static for Runtime::spawn.
 static ENGINE: RolldownEngine = RolldownEngine;
 
+/// Rolldown parallelizes *within* a build — parsing, transforming and rendering
+/// modules across the runtime's workers. Sizing the runtime to `ENGINE_PERMITS`
+/// conflated two unrelated bounds: the permits exist to cap how many builds run at
+/// once (and so peak memory), while the runtime width decides how fast each of those
+/// builds can go. Two workers meant every build was pinned to two threads no matter
+/// how many cores the machine had.
+///
+/// The permits still bound concurrency and memory; this only lets each admitted build
+/// use the machine. Capped at 8: past that the daemon would contend with the editor
+/// and the Rayon pool for cores it cannot productively use.
+fn engine_runtime_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().clamp(ENGINE_PERMITS, 8))
+        .unwrap_or(ENGINE_PERMITS)
+}
+
 /// The engine runtime is separate from the IPC runtime so `bundle_sync` can
 /// be called from rayon/service threads (which are never Tokio workers)
-/// without deadlocking the I/O executor. Two workers match the permit count.
+/// without deadlocking the I/O executor.
 fn engine_runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(ENGINE_PERMITS)
+            .worker_threads(engine_runtime_workers())
             .thread_name("il-engine")
             .enable_all()
             .build()
