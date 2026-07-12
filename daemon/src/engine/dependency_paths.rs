@@ -21,6 +21,27 @@ fn index() -> &'static RwLock<HashMap<DependencyKey, Vec<PathBuf>>> {
     DEPENDENCY_PATHS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Poison-tolerant, like every other shared map in the daemon (`analysis_flight`, the
+/// caches, `build_memo`).
+///
+/// The release build unwinds, precisely so a panicking file can be isolated and
+/// skipped. That means a panic *can* poison this lock — and an `.expect()` here would
+/// then turn one contained panic into a daemon that panics on every subsequent
+/// analysis, which is the exact failure the isolation exists to prevent. A poisoned
+/// index is not dangerous: the worst case is a stale or partial path set, which costs
+/// one re-record on the next build.
+fn read_index() -> std::sync::RwLockReadGuard<'static, HashMap<DependencyKey, Vec<PathBuf>>> {
+    index()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_index() -> std::sync::RwLockWriteGuard<'static, HashMap<DependencyKey, Vec<PathBuf>>> {
+    index()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn record_loaded_paths(
     entry_path: PathBuf,
     runtime: ImportRuntime,
@@ -29,9 +50,7 @@ pub(crate) fn record_loaded_paths(
     loaded_paths.sort();
     loaded_paths.dedup();
 
-    let mut index = index()
-        .write()
-        .expect("dependency path index should not be poisoned");
+    let mut index = write_index();
     // Bounded, not LRU: HashMap iteration order makes this an arbitrary
     // victim, which is acceptable because a dropped set only costs one
     // re-record on the next successful build.
@@ -48,37 +67,27 @@ pub(crate) fn cached_loaded_paths(
     entry_path: &Path,
     runtime: ImportRuntime,
 ) -> Option<Vec<PathBuf>> {
-    index()
-        .read()
-        .expect("dependency path index should not be poisoned")
+    read_index()
         .get(&(entry_path.to_path_buf(), runtime))
         .cloned()
 }
 
 pub(crate) fn clear() {
-    index()
-        .write()
-        .expect("dependency path index should not be poisoned")
-        .clear();
+    write_index().clear();
 }
 
 pub(crate) fn invalidate_package(package_name: &str) {
     let package_segment = format!("node_modules/{package_name}/");
-    index()
-        .write()
-        .expect("dependency path index should not be poisoned")
-        .retain(|(entry_path, _), _| {
-            !entry_path
-                .to_string_lossy()
-                .replace('\\', "/")
-                .contains(&package_segment)
-        });
+    write_index().retain(|(entry_path, _), _| {
+        !entry_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .contains(&package_segment)
+    });
 }
 
 pub(crate) fn purge_missing() -> usize {
-    let mut index = index()
-        .write()
-        .expect("dependency path index should not be poisoned");
+    let mut index = write_index();
     let before = index.len();
     index.retain(|(entry_path, _), _| !path_is_definitely_gone(entry_path));
     before - index.len()
