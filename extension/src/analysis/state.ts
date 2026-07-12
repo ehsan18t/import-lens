@@ -33,17 +33,25 @@ export class AnalysisStore implements vscode.Disposable {
   }
 
   /**
-   * Merge background-refreshed sizes (from the daemon's stale-while-revalidate
-   * push) into an existing document's states, matched by per-import identity, and
-   * fire onDidChange so decorations re-render in place. No-op if the document has
-   * no states (e.g. it was closed), nothing matched, or the batch was superseded
-   * (`options.isCurrent === false`). The caller supplies the identity/supersession
-   * options; see `mergeRefreshedResults`.
+   * Merge pushed import results (a background stale-while-revalidate refresh, or an
+   * import whose engine build landed after its analysis response) into an existing
+   * document's states, matched by per-import identity, and fire onDidChange so
+   * decorations re-render in place. No-op if the document has no states (e.g. it was
+   * closed), nothing matched, or the batch was superseded (`options.isCurrent ===
+   * false`). The caller supplies the identity/supersession options; see
+   * `mergeRefreshedResults`.
+   *
+   * `refine` runs on the merged states before they are stored, in the SAME update: a
+   * pushed size is a new number, and the insights that caption it (over budget, git
+   * delta, shared modules) are derived from it. Recomputing them in a second `set`
+   * would fire a second render and briefly show the number without its caption.
    */
   applyRefreshedResults(
     uri: vscode.Uri,
     results: ImportResult[],
-    options?: RefreshMergeOptions,
+    options?: RefreshMergeOptions & {
+      refine?: (states: ImportAnalysisState[]) => ImportAnalysisState[];
+    },
   ): void {
     const existing = this.#states.get(uri.toString());
 
@@ -54,7 +62,7 @@ export class AnalysisStore implements vscode.Disposable {
     const { next, changed } = mergeRefreshedResults(existing, results, options);
 
     if (changed) {
-      this.#states.set(uri.toString(), next);
+      this.#states.set(uri.toString(), options?.refine ? options.refine(next) : next);
       this.#onDidChange.fire(uri);
     }
   }

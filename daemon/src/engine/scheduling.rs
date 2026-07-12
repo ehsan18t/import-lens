@@ -131,6 +131,32 @@ where
         .collect()
 }
 
+/// Drain items that are ALL engine misses, at the miss-drain width, running `run` on each as it
+/// completes.
+///
+/// There is no result vector to reassemble: this is the streaming document path, where each
+/// completed import is pushed to the client on its own (`ipc::server`), so completion order *is*
+/// the delivery order and an import that finishes first is not held back by one that parks.
+pub(crate) fn drain_misses_owned<T, F>(items: Vec<T>, run: F)
+where
+    T: Send,
+    F: Fn(T) + Sync,
+{
+    let slots = items
+        .into_iter()
+        .map(|item| Mutex::new(Some(item)))
+        .collect::<Vec<_>>();
+
+    drain_bounded(&slots, MISS_DRAIN_WORKERS, |index, slot| {
+        let item = slot
+            .lock()
+            .expect("drain slot should not be poisoned")
+            .take()
+            .expect("each drain slot is taken exactly once");
+        (index, run(item))
+    });
+}
+
 pub(crate) fn drain_ordered_owned<T, R, F>(items: Vec<T>, run: F) -> Vec<R>
 where
     T: Send,
@@ -163,7 +189,9 @@ mod tests {
         time::Duration,
     };
 
-    use super::{ENGINE_PERMITS, drain_classified, drain_ordered, drain_ordered_owned};
+    use super::{
+        ENGINE_PERMITS, drain_classified, drain_misses_owned, drain_ordered, drain_ordered_owned,
+    };
 
     /// The classified drain reorders by construction: hits settle on the Rayon pool
     /// while misses queue for the engine, so the two halves finish interleaved and
@@ -268,5 +296,42 @@ mod tests {
     fn owned_drain_moves_each_item_exactly_once() {
         let output = drain_ordered_owned(vec!["a".to_owned(), "b".to_owned()], |_, item| item);
         assert_eq!(output, vec!["a", "b"]);
+    }
+
+    /// One import that parks the bundler must not hold back the imports beside it.
+    ///
+    /// This is the drain half of the streaming guarantee: the response already went out
+    /// (`service::handle_analyze_document_streaming` runs no builds), and each import that lands
+    /// is pushed to the client from here. If the drain emitted in input order — or waited for the
+    /// whole set before emitting — a single parked build would still take the document's other
+    /// imports down with it, which is the entire defect.
+    ///
+    /// The slow item is deliberately FIRST: an implementation that collected results and returned
+    /// them in order would pass a test where the slow one is last.
+    #[test]
+    fn a_slow_import_does_not_hold_back_the_ones_beside_it() {
+        let parked = Duration::from_millis(400);
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+
+        let observed = Arc::clone(&emitted);
+        drain_misses_owned(vec![0_usize, 1, 2, 3], move |item| {
+            if item == 0 {
+                thread::sleep(parked);
+            }
+            observed.lock().expect("emissions").push(item);
+        });
+
+        let emitted = emitted.lock().expect("emissions").clone();
+        assert_eq!(
+            emitted.len(),
+            4,
+            "every import must be delivered, the parked one included"
+        );
+        assert_eq!(
+            emitted.last(),
+            Some(&0),
+            "the parked import must be delivered LAST — the three beside it were not waiting on \
+             it: {emitted:?}"
+        );
     }
 }

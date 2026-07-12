@@ -4,14 +4,33 @@ use crate::{
         ImportDiagnostic, ImportRequest, ImportResult, ImportRuntime, ModuleContribution,
     },
     pipeline::{
-        analyze::{AnalysisContext, analyze_resolved_import, engine_selection},
+        analyze::{AnalysisContext, engine_selection},
         compress::compress_all,
         minify::minify_source,
-        resolver::{ResolvedPackage, resolve_package_entry},
+        resolver::resolve_package_entry,
         util::diagnostic,
     },
 };
 use std::collections::{BTreeMap, HashMap};
+
+/// One import a file-size computation must account for, together with whatever the caller has
+/// already measured for it.
+///
+/// `result` is `None` while that import's own build is still in flight — the streaming document
+/// handlers answer from cache and let the misses land later (`ipc::server`). Such an import is
+/// still an *entry* of the combined build (its bytes belong in the file's total), but it can
+/// contribute nothing to the conservative per-import fallback below, which is the honest thing:
+/// the fallback sums measurements, and there is not one yet.
+///
+/// Carrying the measurement in rather than re-deriving it is also what keeps the fallback out of
+/// the engine. It used to re-analyze every import of the failing runtime group from scratch, so
+/// one combined build that parked cost a build timeout and then N more — duplicating, on a second
+/// set of permits, the very builds the caller had already run or was already running.
+#[derive(Debug, Clone)]
+pub struct SizedImport {
+    pub request: ImportRequest,
+    pub result: Option<ImportResult>,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct FileSizeComputation {
@@ -22,6 +41,25 @@ pub struct FileSizeComputation {
     pub zstd_bytes: u64,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
+}
+
+impl FileSizeComputation {
+    /// Whether this aggregate is a measurement, and so may be written to the L1 file-size cache.
+    ///
+    /// A combined build that timed out, panicked, or lost the engine runtime degrades the file's
+    /// totals to a conservative per-import sum — a number that describes *this run of the
+    /// daemon*, not the file. Caching it would serve that number for the whole TTL of a document
+    /// whose real total is larger, which is the same defect that let one parked build teach the
+    /// import cache that a healthy package weighs 58 bytes. A deterministic failure
+    /// (`minify`, `entry_resolution`, an unresolvable import) is a property of the code and is
+    /// cached as before: re-running it changes nothing.
+    pub fn is_cacheable(&self) -> bool {
+        self.error.is_none()
+            && !self
+                .diagnostics
+                .iter()
+                .any(|item| crate::engine::stage::is_transient(&item.stage))
+    }
 }
 
 pub fn annotate_shared_bytes(results: &mut [ImportResult]) {
@@ -71,15 +109,16 @@ fn result_contributions(result: &ImportResult) -> &[ModuleContribution] {
 /// never share a chunk in the shipped product.
 pub fn compute_file_size(
     context: &AnalysisContext,
-    requests: &[ImportRequest],
+    imports: &[SizedImport],
 ) -> FileSizeComputation {
     let mut diagnostics = Vec::new();
-    // Entries and their originating requests, grouped by the runtime they must be
+    // Entries and their originating imports, grouped by the runtime they must be
     // built under. `BTreeMap` keeps the group order stable so identical input
     // produces identical output.
     let mut groups: BTreeMap<ImportRuntime, RuntimeGroup> = BTreeMap::new();
 
-    for request in requests {
+    for import in imports {
+        let request = &import.request;
         match resolve_package_entry(&context.active_document_path, request) {
             Ok(resolved) => {
                 let group = groups.entry(request.runtime).or_default();
@@ -89,7 +128,7 @@ pub fn compute_file_size(
                     selection: engine_selection(request),
                     reported_side_effects: resolved.side_effects.clone(),
                 });
-                group.resolved_requests.push((request.clone(), resolved));
+                group.sized.push(import.clone());
             }
             Err(error) => diagnostics.push(diagnostic(
                 "entry_resolution",
@@ -115,14 +154,11 @@ pub fn compute_file_size(
     let mut any_sized = false;
 
     for (runtime, group) in groups {
-        let artifact = match boundary::bundle_sync(
-            BundleRequest {
-                entries: group.entries,
-                runtime,
-                purpose: BundlePurpose::FileSize,
-            },
-            context.engine_budget,
-        ) {
+        let artifact = match boundary::bundle_sync(BundleRequest {
+            entries: group.entries,
+            runtime,
+            purpose: BundlePurpose::FileSize,
+        }) {
             Ok(artifact) => artifact,
             Err(failure) => {
                 // Only this runtime's entries degrade. The other groups keep their real,
@@ -142,8 +178,7 @@ pub fn compute_file_size(
                     ],
                 ));
 
-                let fallback =
-                    per_import_totals(context, &group.resolved_requests, &mut diagnostics);
+                let fallback = per_import_totals(&group.sized, &mut diagnostics);
                 if fallback.sized_any {
                     any_sized = true;
                     totals.raw_bytes += fallback.raw_bytes;
@@ -183,8 +218,7 @@ pub fn compute_file_size(
                             .to_owned(),
                     ],
                 ));
-                let fallback =
-                    per_import_totals(context, &group.resolved_requests, &mut diagnostics);
+                let fallback = per_import_totals(&group.sized, &mut diagnostics);
                 if fallback.sized_any {
                     any_sized = true;
                     totals.raw_bytes += fallback.raw_bytes;
@@ -235,7 +269,7 @@ pub fn compute_file_size(
 #[derive(Default)]
 struct RuntimeGroup {
     entries: Vec<BundleEntry>,
-    resolved_requests: Vec<(ImportRequest, ResolvedPackage)>,
+    sized: Vec<SizedImport>,
 }
 
 #[derive(Default)]
@@ -250,30 +284,41 @@ struct PerImportTotals {
 
 /// A file-level request must degrade to conservative non-deduped per-import totals
 /// instead of zeroing the aggregate when a package breaks the combined build (SRS
-/// FR-024a). Each per-import analysis applies its own static fallback on engine
-/// failure, so only imports that cannot be sized at all are dropped from the sum.
+/// FR-024a). Applied per runtime group, so a failure under one runtime never discards
+/// the other's real, deduplicated numbers.
 ///
-/// Applied per runtime group, so a failure under one runtime never discards the
-/// other's real, deduplicated numbers.
+/// It sums the measurements the caller already has, and **never enters the engine**. It used to
+/// re-analyze each import from scratch here, which is how one combined build that parked turned
+/// into a build timeout plus one more per import — the tail that the request budget existed to
+/// cut off, at the cost of fabricating the numbers it cut. Nothing here can park, so nothing
+/// needs cutting off.
 ///
-/// These re-analyses go through the engine again on the same `AnalysisContext`, so they spend
-/// the *same* request budget the combined build already spent (§9). When that build failed by
-/// parking, the budget is what stops the fallback from re-parking once per import: whatever is
-/// left is shared out, and the imports it does not cover degrade to static sizing.
+/// Two imports contribute nothing: one that failed to size at all (`error`), and one whose own
+/// build has not landed yet (`result: None` — the streaming handlers answer from cache). Both
+/// are named in the diagnostics, because the total is then a lower bound and the user is owed
+/// that fact.
 fn per_import_totals(
-    context: &AnalysisContext,
-    resolved_requests: &[(ImportRequest, ResolvedPackage)],
+    sized: &[SizedImport],
     diagnostics: &mut Vec<ImportDiagnostic>,
 ) -> PerImportTotals {
     let mut totals = PerImportTotals::default();
 
-    for (request, resolved) in resolved_requests {
-        let result = analyze_resolved_import(context, request, resolved.clone());
-        if let Some(error) = result.error {
+    for import in sized {
+        let Some(result) = import.result.as_ref() else {
             diagnostics.push(diagnostic(
                 "file_size_fallback",
-                error,
-                vec![format!("specifier: {}", request.specifier)],
+                "import size is still being measured, so it is not counted in this file's \
+                 conservative total"
+                    .to_owned(),
+                vec![format!("specifier: {}", import.request.specifier)],
+            ));
+            continue;
+        };
+        if let Some(error) = result.error.as_ref() {
+            diagnostics.push(diagnostic(
+                "file_size_fallback",
+                error.clone(),
+                vec![format!("specifier: {}", import.request.specifier)],
             ));
             continue;
         }

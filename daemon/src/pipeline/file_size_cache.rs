@@ -7,7 +7,7 @@ use crate::{
     ipc::protocol::{ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
-        file_size::FileSizeComputation,
+        file_size::{FileSizeComputation, SizedImport},
         resolver::{ResolvedPackage, resolve_package_entry},
     },
 };
@@ -147,9 +147,10 @@ pub fn shared_file_size_cache() -> &'static FileSizeCache {
 /// requests contribute a stable request-shape token. Sorting makes it
 /// order-independent, matching `compute_file_size` which combines all imports
 /// regardless of order.
-pub fn file_size_signature(context: &AnalysisContext, requests: &[ImportRequest]) -> u64 {
-    let mut tokens = requests
+pub fn file_size_signature(context: &AnalysisContext, imports: &[SizedImport]) -> u64 {
+    let mut tokens = imports
         .iter()
+        .map(|import| &import.request)
         .map(
             |request| match resolve_package_entry(&context.active_document_path, request) {
                 Ok(resolved) => resolved_import_token(request, &resolved),
@@ -257,13 +258,21 @@ fn stat_token(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::cache::memory::bump_cache_generation;
-    use crate::engine::EngineBudget;
     use crate::ipc::protocol::{ImportKind, ImportRuntime};
 
     fn computation(minified: u64) -> FileSizeComputation {
         FileSizeComputation {
             minified_bytes: minified,
             ..FileSizeComputation::default()
+        }
+    }
+
+    /// An import whose own size the caller already knows nothing about; the signature only
+    /// reads the request, so the measurement is irrelevant here.
+    fn sized(request: ImportRequest) -> SizedImport {
+        SizedImport {
+            request,
+            result: None,
         }
     }
 
@@ -360,7 +369,6 @@ mod tests {
         AnalysisContext {
             workspace_root: PathBuf::from("/does/not/exist"),
             active_document_path: PathBuf::from("/does/not/exist/src/index.ts"),
-            engine_budget: EngineBudget::interactive(),
         }
     }
 
@@ -392,22 +400,21 @@ mod tests {
         let context = AnalysisContext {
             workspace_root: ws.clone(),
             active_document_path: ws.join("src").join("index.ts"),
-            engine_budget: EngineBudget::interactive(),
         };
-        let requests = vec![ImportRequest {
+        let imports = vec![sized(ImportRequest {
             specifier: "l1-lib".to_owned(),
             package_name: "l1-lib".to_owned(),
             version: "1.0.0".to_owned(),
             named: Vec::new(),
             import_kind: ImportKind::Namespace,
             runtime: ImportRuntime::Component,
-        }];
+        })];
 
-        let sig1 = file_size_signature(&context, &requests);
+        let sig1 = file_size_signature(&context, &imports);
         // Change the entry's content+length; the signature must change even though
         // the cache key no longer carries entry fingerprints.
         std::fs::write(pkg.join("index.js"), "export const a = 222222;").expect("entry v2");
-        let sig2 = file_size_signature(&context, &requests);
+        let sig2 = file_size_signature(&context, &imports);
 
         assert_ne!(
             sig1, sig2,
@@ -419,8 +426,8 @@ mod tests {
     #[test]
     fn signature_is_order_independent() {
         let ctx = unresolvable_context();
-        let a = named_request("alpha", &["x"]);
-        let b = named_request("beta", &["y"]);
+        let a = sized(named_request("alpha", &["x"]));
+        let b = sized(named_request("beta", &["y"]));
         assert_eq!(
             file_size_signature(&ctx, &[a.clone(), b.clone()]),
             file_size_signature(&ctx, &[b, a])
@@ -431,18 +438,18 @@ mod tests {
     fn signature_changes_when_named_exports_change() {
         let ctx = unresolvable_context();
         assert_ne!(
-            file_size_signature(&ctx, &[named_request("alpha", &["x"])]),
-            file_size_signature(&ctx, &[named_request("alpha", &["x", "y"])])
+            file_size_signature(&ctx, &[sized(named_request("alpha", &["x"]))]),
+            file_size_signature(&ctx, &[sized(named_request("alpha", &["x", "y"]))])
         );
     }
 
     #[test]
     fn signature_changes_when_generation_bumps() {
         let ctx = unresolvable_context();
-        let reqs = [named_request("alpha", &["x"])];
-        let before = file_size_signature(&ctx, &reqs);
+        let imports = [sized(named_request("alpha", &["x"]))];
+        let before = file_size_signature(&ctx, &imports);
         bump_cache_generation();
-        assert_ne!(before, file_size_signature(&ctx, &reqs));
+        assert_ne!(before, file_size_signature(&ctx, &imports));
     }
 
     #[test]

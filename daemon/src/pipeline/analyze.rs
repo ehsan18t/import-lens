@@ -1,7 +1,5 @@
 use crate::{
-    engine::{
-        EngineBudget, dependency_paths::record_loaded_paths, limits::MAX_MODULE_SOURCE_BYTES,
-    },
+    engine::{dependency_paths::record_loaded_paths, limits::MAX_MODULE_SOURCE_BYTES},
     ipc::protocol::{
         ConfidenceLevel, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
         ModuleContribution, ResultFreshness,
@@ -20,21 +18,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Where an analysis runs, and nothing else.
+///
+/// It used to carry an engine deadline too, because the response an import rode in was atomic:
+/// one build that parked pushed a whole document's results past the client's patience, so the
+/// request had to be able to abandon builds. It no longer is — a request answers from cache and
+/// each build is pushed to the client as it lands (`ipc::server`) — so no build has a deadline
+/// to be measured against, and none is passed one.
 #[derive(Debug, Clone)]
 pub struct AnalysisContext {
     pub workspace_root: PathBuf,
     pub active_document_path: PathBuf,
-    /// How much engine time the request that opened this analysis may still spend (§9).
-    ///
-    /// Stamped once when the request arrives and shared by every build it triggers — the entry
-    /// build, the full-package comparison, the combined file-size build, and the per-import
-    /// fallback each of those degrades into. That sharing is the point: the bound belongs to the
-    /// *request*, so imports whose builds cannot start inside the client's deadline degrade to
-    /// static sizing instead of queueing behind builds that will not finish (see
-    /// [`crate::engine::budget`]). Every construction site must therefore choose the budget that
-    /// matches the deadline its client is actually waiting on, which is why this field has no
-    /// default.
-    pub engine_budget: EngineBudget,
 }
 
 // Internal structured error translated into the stable ImportResult surface.
@@ -298,14 +292,11 @@ pub(crate) fn analyze_with_rolldown_engine(
         selection,
         reported_side_effects: side_effects_mode.clone(),
     };
-    let artifact = boundary::bundle_sync(
-        BundleRequest {
-            entries: vec![bundle_entry(engine_selection(request))],
-            runtime: request.runtime,
-            purpose: BundlePurpose::ImportSize,
-        },
-        context.engine_budget,
-    )
+    let artifact = boundary::bundle_sync(BundleRequest {
+        entries: vec![bundle_entry(engine_selection(request))],
+        runtime: request.runtime,
+        purpose: BundlePurpose::ImportSize,
+    })
     .map_err(|failure| engine_error(context, request, failure))?;
 
     let minified = minify_source(&artifact.code, false).map_err(|error| {
@@ -361,20 +352,22 @@ pub(crate) fn analyze_with_rolldown_engine(
             // is in flight must not be stamped onto a length measured from the bytes it
             // invalidated.
             let generation = crate::cache::memory::cache_generation();
-            // The comparison build shares the request's budget with the entry build above, so a
-            // document cannot pay twice the engine time just because its imports are named ones.
-            let full = match boundary::bundle_sync(
-                BundleRequest {
-                    entries: vec![bundle_entry(BundleSelection::Full)],
-                    runtime: request.runtime,
-                    purpose: BundlePurpose::FullPackageComparison,
-                },
-                context.engine_budget,
-            ) {
+            let full = match boundary::bundle_sync(BundleRequest {
+                entries: vec![bundle_entry(BundleSelection::Full)],
+                runtime: request.runtime,
+                purpose: BundlePurpose::FullPackageComparison,
+            }) {
                 Ok(full) => full,
                 Err(failure) => {
+                    // Reported under the stage the comparison build actually failed at, not
+                    // under a label invented here (§12, same rule as `engine_fallback_diagnostic`
+                    // — the fallback is expressed by the message, not by erasing where it broke).
+                    // That is also what lets `should_cache_result` see a TRANSIENT failure here:
+                    // `truly_treeshakeable: false` is a fabricated fact when the build that would
+                    // have disproved it merely timed out, and caching it would mark a healthy
+                    // package "not tree-shakeable" for a whole cache generation.
                     diagnostics.push(ImportDiagnostic {
-                        stage: "full_package_comparison".to_owned(),
+                        stage: contract_stage(&failure.stage).to_owned(),
                         message: format!(
                             "full-package comparison build failed; treating as not tree-shakeable: {}",
                             failure.message
@@ -827,7 +820,6 @@ mod tests {
         let context = AnalysisContext {
             workspace_root: workspace.clone(),
             active_document_path: workspace.join("src").join("app.ts"),
-            engine_budget: EngineBudget::interactive(),
         };
 
         let manifests = first_party_manifests(

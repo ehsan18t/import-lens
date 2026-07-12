@@ -20,10 +20,9 @@
 //! `Platform::Neutral` appends nothing, leaving the per-runtime condition list from
 //! the shared resolver authoritative (spec §7.1).
 
-use import_lens_daemon::engine::EngineBudget;
 use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
 use import_lens_daemon::pipeline::analyze::AnalysisContext;
-use import_lens_daemon::pipeline::file_size::compute_file_size;
+use import_lens_daemon::pipeline::file_size::{SizedImport, compute_file_size};
 use std::{fs, path::Path, path::PathBuf};
 
 mod common;
@@ -36,18 +35,20 @@ fn context(workspace: &Path) -> AnalysisContext {
     AnalysisContext {
         workspace_root: workspace.to_path_buf(),
         active_document_path: workspace.join("src").join("page.astro"),
-        engine_budget: EngineBudget::interactive(),
     }
 }
 
-fn request(package: &str, export: &str, runtime: ImportRuntime) -> ImportRequest {
-    ImportRequest {
-        specifier: package.to_owned(),
-        package_name: package.to_owned(),
-        version: "1.0.0".to_owned(),
-        named: vec![export.to_owned()],
-        import_kind: ImportKind::Named,
-        runtime,
+fn request(package: &str, export: &str, runtime: ImportRuntime) -> SizedImport {
+    SizedImport {
+        request: ImportRequest {
+            specifier: package.to_owned(),
+            package_name: package.to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec![export.to_owned()],
+            import_kind: ImportKind::Named,
+            runtime,
+        },
+        result: None,
     }
 }
 

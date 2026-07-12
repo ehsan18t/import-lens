@@ -1346,7 +1346,7 @@ all three are part of I16's vocabulary:
 | stage | meaning |
 | --- | --- |
 | `panic` | a Rolldown/OXC panic unwound into the boundary's `catch_unwind`; Unmeasured for this import only |
-| `timeout` | the build did not complete within its limit — `BUILD_TIMEOUT` (8s) or whatever remained of the request's engine budget, whichever was shorter — and was cancelled; **or** it was never started at all, because the request's budget was already spent when it reached the permit |
+| `timeout` | the build did not finish within `BUILD_TIMEOUT` (8s) and was cancelled. That is its whole meaning: one build, its own clock. It says nothing about how long a request took, because no request waits for a build |
 | `engine_gone` | the engine runtime was torn down without replying — not a panic, and must not be counted as one |
 
 `timeout` is not a slowness policy; it is the *only* containment for the panic class that matters.
@@ -1359,14 +1359,26 @@ never released, and two such packages exhaust the permit pool and wedge every su
 the daemon restarts. Cancelling the future on timeout is what releases them. At ~120x the §10.6
 cold-p95 gate the bound cannot fire on a legitimate build.
 
-That bounds a *build*. It cannot bound a *request*: a permit is acquired outside the timeout, so
-parked builds queue rather than merely run late, and a build admitted once they are cancelled would
-start a fresh timeout of its own — enough of them serialize one document past the client's deadline,
-which rejects the whole response and loses even the imports already answered from cache. The request
-therefore carries an engine **budget**: a deadline stamped on arrival and sized under the deadline of
-the client waiting for it. Every build is capped at the shorter of `BUILD_TIMEOUT` and the budget's
-remainder, and re-checks the budget *after* acquiring its permit — so a build that queued behind
-parked ones abandons rather than starting over, and reports `timeout` without ever having run.
+That bounds a *build*, and a build is all it needs to bound.
+
+It cannot bound a *request* — a permit is acquired outside the timeout, so parked builds queue
+rather than merely run late — and for one round it was made to try: each request carried an engine
+**budget**, a deadline stamped on arrival, and a build admitted with nothing left of it abandoned
+without running. That bounded the wall clock and paid for it in fabricated numbers: an import whose
+build was abandoned reported the static fallback, which is not its size, and that number went into
+the cache.
+
+The bound belonged in the wrong place because the *response* was in the wrong shape. An interactive
+document response was atomic — every import or none — so a single parked build pushed the whole
+thing past the client's 10s deadline and the extension threw the document away, cached hits
+included. Nothing about a build timeout can fix that; only not waiting can.
+
+So the response no longer waits. `AnalyzeDocument` answers with what the cache holds plus a
+`loading` placeholder per miss, and each miss is built off the response path and pushed to the
+client as it lands (`RefreshedResults`). A parked build now delays one import's number and nothing
+else — the budget's whole purpose, at none of its cost. It is deleted, and `BUILD_TIMEOUT` is the
+one timeout left: it exists so a parked build cannot hold a permit forever, which is the only thing
+it was ever able to promise.
 
 ## 13. Expected blast radius
 

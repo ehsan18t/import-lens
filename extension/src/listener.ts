@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { importAnalysisStateFromDaemon } from "./analysis/daemonState.js";
 import { DebouncedDocumentScheduler } from "./analysis/debouncedDocumentScheduler.js";
 import { AnalysisFreshnessTracker } from "./analysis/freshness.js";
 import { changedLinesForFile } from "./analysis/gitDiff.js";
@@ -13,12 +14,11 @@ import {
   importCostHistoryItemsForStates,
 } from "./analysis/insights.js";
 import { ImportResultLogTracker } from "./analysis/resultLogging.js";
-import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
+import type { AnalysisStore } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
 import {
   type FileSizeDocumentResponse,
-  type ImportAnalysisItem,
   type ImportResult,
   protocolVersion,
   type RefreshedImportIdentity,
@@ -38,6 +38,10 @@ export class DocumentAnalysisController implements vscode.Disposable {
   readonly #statusBar: StatusBarController;
   readonly #scheduler = new DebouncedDocumentScheduler();
   readonly #freshness = new AnalysisFreshnessTracker();
+  // Working-tree changed lines per document, kept from the analysis that opened the
+  // current generation so a pushed import can be captioned with its git delta without
+  // shelling out to `git diff` once per import. Dropped when the document closes.
+  readonly #changedLines = new Map<string, ReadonlySet<number>>();
 
   constructor(
     context: vscode.ExtensionContext,
@@ -83,13 +87,22 @@ export class DocumentAnalysisController implements vscode.Disposable {
   }
 
   /**
-   * Apply the daemon's background stale-while-revalidate refresh push to a
-   * document's states. Gated by the SAME freshness generation that guards
-   * `updateFileSize`: if a newer analysis has superseded the generation this batch
-   * was computed for (the user edited after the size read that triggered it), the
-   * push is dropped rather than overwriting the current (post-edit) states. Both
-   * `identities` and `generation` are optional so an older daemon still merges
+   * Apply a daemon push carrying import results the analysis response did not have:
+   * an import whose engine build landed after the response went out, or a background
+   * stale-while-revalidate refresh. Both merge the same way.
+   *
+   * Gated by the SAME freshness generation that guards `updateFileSize`: if a newer
+   * analysis has superseded the generation this batch was computed for (the user
+   * edited past it), the push is dropped rather than overwriting the current states.
+   * Both `identities` and `generation` are optional so an older daemon still merges
    * (specifier-keyed, ungated).
+   *
+   * The insights are recomputed over the merged states, because a pushed size is a
+   * number nobody has captioned yet: a cold document's imports ALL arrive this way, so
+   * without this they would show a size with no "over budget", no git delta and no
+   * shared-module note until the next edit. The git diff is not re-run — it is the one
+   * expensive input, it belongs to the document rather than the import, and the analysis
+   * that opened this generation already paid for it.
    */
   applyRefreshedResults(
     uri: vscode.Uri,
@@ -97,9 +110,40 @@ export class DocumentAnalysisController implements vscode.Disposable {
     identities?: RefreshedImportIdentity[],
     generation?: number,
   ): void {
+    const documentKey = uri.toString();
     const isCurrent =
-      generation === undefined ? true : this.#freshness.isCurrent(uri.toString(), generation);
-    this.#store.applyRefreshedResults(uri, results, { identities, isCurrent });
+      generation === undefined ? true : this.#freshness.isCurrent(documentKey, generation);
+    const config = getImportLensConfig();
+    const changedLines = this.#changedLines.get(documentKey);
+
+    this.#store.applyRefreshedResults(uri, results, {
+      identities,
+      isCurrent,
+      refine: (states) =>
+        applyImportAnalysisInsights(states, {
+          changedLines,
+          importCostHistory: this.#historyStore.get<ImportCostHistoryItem[]>(
+            importCostHistoryKey,
+            [],
+          ),
+          budgets: config.budgets,
+        }),
+    });
+
+    // A streamed import is the first time its size is ever known, so this is where its
+    // history row gets written — the trend insight on the next analysis reads it back.
+    // `recordImportCostHistory` serializes its writes and skips unchanged rows, so a push
+    // that merged nothing costs nothing.
+    if (isCurrent) {
+      void recordImportCostHistory(
+        this.#historyStore,
+        importCostHistoryItemsForStates(this.#store.get(uri)),
+      ).catch((error: unknown) => {
+        this.#logger.warn(
+          `Import history update failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }
   }
 
   async analyze(document: vscode.TextDocument): Promise<void> {
@@ -174,18 +218,39 @@ export class DocumentAnalysisController implements vscode.Disposable {
         }
       }
 
-      const history = this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
-      const nextStates = applyImportAnalysisInsights(responseStates, {
-        changedLines: await changedLinesPromise,
-        importCostHistory: history,
-        budgets: config.budgets,
-      });
+      // Store the response BEFORE awaiting anything else. The daemon answers a cold
+      // import `loading` and pushes its size the moment its build lands — which can be
+      // before the git diff below resolves. A push can only update a state that exists
+      // (`mergeRefreshedResults` maps over the states it is given), so a push that
+      // arrived while this method was still awaiting would have been dropped and that
+      // import would have sat at "Calculating..." for ever. It also paints the cache
+      // hits at once, which is the point of the whole exercise.
+      this.#store.set(document.uri, responseStates);
 
-      this.#store.set(document.uri, nextStates);
+      const history = this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
+      const changedLines = await changedLinesPromise;
+
+      if (!this.#freshness.isCurrent(documentKey, requestId)) {
+        return;
+      }
+      this.#changedLines.set(documentKey, changedLines ?? new Set());
+
+      // Read the states back rather than reusing `responseStates`: a pushed import may
+      // already have landed in them during the await above, and overwriting the store
+      // with the pre-push snapshot would undo it.
+      const currentStates = this.#store.get(document.uri);
+      this.#store.set(
+        document.uri,
+        applyImportAnalysisInsights(currentStates, {
+          changedLines,
+          importCostHistory: history,
+          budgets: config.budgets,
+        }),
+      );
       try {
         await recordImportCostHistory(
           this.#historyStore,
-          importCostHistoryItemsForStates(responseStates),
+          importCostHistoryItemsForStates(currentStates),
         );
       } catch (error) {
         this.#logger.warn(
@@ -240,7 +305,12 @@ export class DocumentAnalysisController implements vscode.Disposable {
       this.setStatusForActive(document, { kind: "ready" });
       return;
     }
-    if (response.imports.length === 0) {
+    // `states`, not `imports`: the daemon answers a cold import `loading` and `imports`
+    // carries only the ones it has measured, so on a cold document that list is empty
+    // while the file's own total — which comes from the combined build, not from the
+    // per-import measurements — is perfectly real. Gating the label on `imports` would
+    // hide the size of exactly the documents the user just opened.
+    if (response.states.length === 0) {
       this.setStatusForActive(document, { kind: "ready" });
       return;
     }
@@ -260,39 +330,13 @@ export class DocumentAnalysisController implements vscode.Disposable {
     const key = document.uri.toString();
     this.#scheduler.cancel(key);
     this.#freshness.forget(key);
+    this.#changedLines.delete(key);
     this.#store.clear(document.uri);
   }
 
   dispose(): void {
     this.#scheduler.dispose();
     this.#freshness.clear();
+    this.#changedLines.clear();
   }
 }
-
-const importAnalysisStateFromDaemon = (
-  item: ImportAnalysisItem,
-  logMissingResult: (specifier: string, reason: string) => void,
-): ImportAnalysisState => {
-  if (item.status === "ready" && item.result) {
-    return {
-      detected: item.detected,
-      status: "ready",
-      result: item.result,
-    };
-  }
-
-  if (item.status === "missing") {
-    logMissingResult(item.detected.specifier, item.message ?? "Package not found");
-    return {
-      detected: item.detected,
-      status: "missing",
-      message: item.message ?? "Package not found",
-    };
-  }
-
-  return {
-    detected: item.detected,
-    status: "unavailable",
-    message: item.message ?? "Daemon unavailable",
-  };
-};

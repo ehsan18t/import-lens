@@ -1,7 +1,7 @@
 //! Product-level execution-boundary coverage (spec §9).
 
 use import_lens_daemon::{
-    engine::{BundleEntry, BundlePurpose, BundleRequest, BundleSelection, EngineBudget, boundary},
+    engine::{BundleEntry, BundlePurpose, BundleRequest, BundleSelection, boundary},
     ipc::protocol::ImportRuntime,
     pipeline::resolver::SideEffectsMode,
 };
@@ -39,19 +39,16 @@ fn boundary_caps_concurrent_builds_at_two_permits() {
                 let entry_path = entry.clone();
                 let package_root = package_root.clone();
                 scope.spawn(move || {
-                    boundary::bundle_sync(
-                        BundleRequest {
-                            entries: vec![BundleEntry {
-                                entry_path,
-                                package_root,
-                                selection: BundleSelection::Named(vec![name.to_owned()]),
-                                reported_side_effects: SideEffectsMode::False,
-                            }],
-                            runtime: ImportRuntime::Component,
-                            purpose: BundlePurpose::ImportSize,
-                        },
-                        EngineBudget::interactive(),
-                    )
+                    boundary::bundle_sync(BundleRequest {
+                        entries: vec![BundleEntry {
+                            entry_path,
+                            package_root,
+                            selection: BundleSelection::Named(vec![name.to_owned()]),
+                            reported_side_effects: SideEffectsMode::False,
+                        }],
+                        runtime: ImportRuntime::Component,
+                        purpose: BundlePurpose::ImportSize,
+                    })
                 })
             })
             .collect::<Vec<_>>();

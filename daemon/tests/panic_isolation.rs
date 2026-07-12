@@ -21,7 +21,6 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use import_lens_daemon::engine::EngineBudget;
 use import_lens_daemon::engine::boundary::{
     ENGINE_PERMITS, builds_started, bundle_sync_for_test_hang, bundle_sync_for_test_panic,
     peak_in_flight,
@@ -122,8 +121,8 @@ fn within_deadline<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static)
     });
 
     receiver.recv_timeout(Duration::from_secs(10)).expect(
-        "the boundary call never returned: a build that panicked, was cancelled, or was \
-         abandoned for want of budget leaked its permit, and the daemon is wedged",
+        "the boundary call never returned: a build that panicked or was cancelled leaked its \
+         permit, and the daemon is wedged",
     )
 }
 
@@ -131,37 +130,10 @@ fn within_deadline<T: Send + 'static>(call: impl FnOnce() -> T + Send + 'static)
 /// `BUILD_TIMEOUT`, so the tests play out in milliseconds what production plays out in seconds.
 const PARK_LIMIT: Duration = Duration::from_millis(300);
 
-fn park(budget: EngineBudget) -> String {
-    let failure = within_deadline(move || bundle_sync_for_test_hang(PARK_LIMIT, budget))
+fn park() -> String {
+    let failure = within_deadline(move || bundle_sync_for_test_hang(PARK_LIMIT))
         .expect_err("a build that never completes must return a failure, not park the caller");
     failure.stage
-}
-
-/// Submit `count` parked builds **at the same time**, on their own threads, all sharing one
-/// request's budget — the shape a real document produces.
-///
-/// Concurrency is the whole point. A document's misses are drained on `MISS_DRAIN_WORKERS`
-/// (= `ENGINE_PERMITS + 2`) scoped threads (`engine::scheduling`), so the builds past the permit
-/// count do not arrive *after* the earlier ones fail — they are already **queued on the
-/// semaphore** while those park. That queued state is where the defect lived, and a sequential
-/// submission loop cannot reach it: each of its calls returns before the next begins, so it only
-/// ever sees an interleaving production never produces. The previous covering test looped
-/// sequentially and was green against code that still lost the document.
-fn parked_document(count: usize, budget: EngineBudget) -> (Vec<String>, Duration, usize) {
-    let before = builds_started();
-    let started_at = Instant::now();
-
-    let stages = std::thread::scope(|scope| {
-        let handles = (0..count)
-            .map(|_| scope.spawn(move || park(budget)))
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("a boundary caller must not panic"))
-            .collect::<Vec<_>>()
-    });
-
-    (stages, started_at.elapsed(), builds_started() - before)
 }
 
 /// A panic inside a build must degrade that one build, not the caller. Before the
@@ -212,16 +184,16 @@ fn a_panicking_build_does_not_leak_the_in_flight_counter() {
 /// restart clears. So the load-bearing assertion here is the last one: that the daemon is
 /// still able to run a build after enough parked builds to have exhausted the pool.
 ///
-/// These builds carry a *background* budget — prewarm's — so nothing but the per-build limit can
-/// end them: the point here is that cancelling a parked build hands its permit back, and a budget
-/// that abandoned the later ones would test the wrong thing.
+/// This is the ONE bound the design keeps. It bounds a build, so that a permit is never held
+/// forever; it does not bound a request, and no longer needs to, because no request waits on a
+/// build (`service::handle_analyze_document_streaming`).
 #[test]
 fn a_parked_build_times_out_and_gives_its_permit_back() {
     let _guard = serialized();
 
     for _ in 0..ENGINE_PERMITS {
         assert_eq!(
-            park(EngineBudget::background()),
+            park(),
             "timeout",
             "a build that never completes must fail as a timeout"
         );
@@ -237,96 +209,57 @@ fn a_parked_build_times_out_and_gives_its_permit_back() {
     );
 }
 
-/// The defect the request budget exists to close, reproduced.
+/// A parked build must delay ITS OWN import and nothing else.
 ///
-/// `BUILD_TIMEOUT` bounds a build, and a permit is acquired *outside* it — so parked builds do
-/// not merely run late, they QUEUE. Three imports of one broken package fill both permits and
-/// park; the third sits blocked on the semaphore *inside* the boundary. When the first two are
-/// cancelled and release their permits, the third is admitted and starts a **fresh** build clock.
-/// Two build timeouts of engine time for one document, the extension gives up at 10s, and the
-/// rejected `AnalyzeDocumentResponse` takes every import in that document already answered from
-/// cache with it. The old per-entry circuit breaker could not see this: it was checked at
-/// submission, when nothing had parked yet, and never again.
+/// This is the half of the guarantee the boundary owns. The other half is
+/// `service::handle_analyze_document_streaming` starting no builds at all, so a response can
+/// never be behind one (`document_streaming.rs`); together they are what makes a parked package
+/// cost one import's number instead of a whole document's.
 ///
-/// So the third build re-checks the request's deadline **after** it acquires its permit and
-/// abandons without building. Both assertions matter and neither is sufficient alone:
-/// `builds_started()` is the honest count of builds that really reached the engine (it increments
-/// inside the permit, past the re-check), and the wall clock is what the client actually
-/// experiences — a fix that skipped the build but still waited would pass the first and fail the
-/// second.
+/// It is deliberately not a *request* bound: nothing here is cancelled, abandoned, or degraded on
+/// account of some other build being slow. The parked build runs out its own clock while a build
+/// beside it finishes on the second permit, undisturbed.
 #[test]
-fn a_build_queued_behind_parked_ones_abandons_instead_of_starting_a_fresh_clock() {
-    let _guard = serialized();
-
-    // Budget and per-build cap deliberately equal: the two builds that get permits spend the
-    // whole request budget, so the one that queued behind them has nothing left when it is
-    // admitted. (Production's 9s budget over an 8s cap leaves the third build a 1s remnant it
-    // may spend — still inside the deadline, which is all the budget promises.)
-    let (stages, elapsed, admitted) =
-        parked_document(ENGINE_PERMITS + 1, EngineBudget::expiring_in(PARK_LIMIT));
-
-    assert!(
-        stages.iter().all(|stage| stage == "timeout"),
-        "every import of a parked package must degrade with the typed timeout failure: {stages:?}"
-    );
-    assert_eq!(
-        admitted, ENGINE_PERMITS,
-        "only the builds that could start inside the request's budget may reach the engine; the \
-         one that queued on the semaphore while they parked must abandon on admission, not start \
-         a fresh build clock"
-    );
-    assert!(
-        elapsed < PARK_LIMIT * 2,
-        "the document must cost ONE build timeout of engine time, not two: {elapsed:?}"
-    );
-}
-
-/// The case a per-entry circuit breaker could never bound: a document naming MORE distinct broken
-/// packages than there are permits. Keyed by entry, the breaker had no record for a package that
-/// had not parked yet, so every distinct one bought another full build timeout and the document
-/// serialized past the deadline anyway.
-///
-/// The boundary now keys nothing by entry — it has no memory of what parked at all — so these six
-/// parked builds stand for six *different* broken packages exactly as well as for six imports of
-/// one. What bounds them is the budget they share, which is the request's.
-#[test]
-fn more_broken_packages_than_permits_still_cost_one_build_timeout() {
-    let _guard = serialized();
-
-    let (stages, elapsed, admitted) =
-        parked_document(ENGINE_PERMITS + 4, EngineBudget::expiring_in(PARK_LIMIT));
-
-    assert!(
-        stages.iter().all(|stage| stage == "timeout"),
-        "every import must degrade with the typed timeout failure: {stages:?}"
-    );
-    assert_eq!(
-        admitted, ENGINE_PERMITS,
-        "engine time is bounded by the request's budget, not by how many broken packages the \
-         document names"
-    );
-    assert!(
-        elapsed < PARK_LIMIT * 2,
-        "six parked builds on two permits must still cost ONE build timeout, not three waves of \
-         one: {elapsed:?}"
-    );
-}
-
-/// A request that has already spent its budget must not even queue for a permit: it returns the
-/// typed failure at once and the caller degrades to the static fallback (`analyze.rs`), which
-/// needs no engine.
-#[test]
-fn a_request_with_no_engine_time_left_never_enters_the_engine() {
+fn a_parked_build_does_not_delay_the_build_beside_it() {
     let _guard = serialized();
     let before = builds_started();
 
-    let stage = park(EngineBudget::expiring_in(Duration::ZERO));
+    // One build parks, holding one of the two permits for the whole of PARK_LIMIT.
+    let parked = std::thread::spawn(|| bundle_sync_for_test_hang(PARK_LIMIT));
+    // Wait until it is genuinely in flight: `builds_started` increments INSIDE the permit, so
+    // this is the point past which the permit is actually held. Without it the sibling below
+    // might run before the parked build has taken anything, and prove nothing.
+    let admitted_at = Instant::now();
+    while builds_started() == before {
+        assert!(
+            admitted_at.elapsed() < PARK_LIMIT,
+            "the parked build never acquired a permit"
+        );
+        std::thread::yield_now();
+    }
 
-    assert_eq!(stage, "timeout", "a spent budget reports the timeout stage");
+    let started_at = Instant::now();
+    let sibling = within_deadline(bundle_sync_for_test_panic)
+        .expect_err("the synthetic sibling build panics");
+    let elapsed = started_at.elapsed();
+
+    assert_eq!(sibling.stage, "panic", "the sibling build ran to its end");
+    assert!(
+        elapsed < PARK_LIMIT,
+        "a build beside a parked one must not wait for it: {elapsed:?}"
+    );
+    assert!(
+        !parked.is_finished(),
+        "the parked build must still be parked — otherwise this proved nothing"
+    );
     assert_eq!(
-        builds_started(),
-        before,
-        "a request with nothing left to spend must not start a build"
+        parked
+            .join()
+            .expect("a boundary caller must not panic")
+            .expect_err("a parked build cannot produce an artifact")
+            .stage,
+        "timeout",
+        "the parked build ends on its own clock, not on anybody else's"
     );
 }
 

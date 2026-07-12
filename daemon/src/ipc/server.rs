@@ -3,22 +3,24 @@ use crate::{
     ipc::{
         codec::{decode_payload, message_frame_codec, payload_bytes},
         protocol::{
-            AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
-            AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-            BatchResponse, CacheListRequest, CacheListResponse, CacheRemoveRequest,
-            CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest, CacheStatusResponse,
-            ClientMessage, CompleteImportMembersRequest, CompleteImportMembersResponse,
-            FileSizeDocumentRequest, FileSizeDocumentResponse, FreshnessKind, ImportDiagnostic,
-            PROTOCOL_VERSION, RefreshRegistryHintsResponse, RefreshedResultsResponse,
-            RegistryHintResult, WorkspaceReportRequest, WorkspaceReportResponse,
-            WorkspaceReportSummary, is_supported_protocol_version,
+            AnalyzeDocumentRequest, AnalyzePackageJsonRequest, AnalyzePackageJsonResponse,
+            AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse, BatchResponse, CacheListRequest,
+            CacheListResponse, CacheRemoveRequest, CacheRemoveResponse, CacheRemoveScope,
+            CacheStatusRequest, CacheStatusResponse, ClientMessage, CompleteImportMembersRequest,
+            CompleteImportMembersResponse, FreshnessKind, ImportDiagnostic, PROTOCOL_VERSION,
+            RefreshRegistryHintsResponse, RefreshedResultsResponse, RegistryHintResult,
+            WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
+            is_supported_protocol_version,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
     logging::{self, parse_log_level, set_log_level},
+    pipeline::analyze::AnalysisContext,
     prefetch::Prefetcher,
     service::{
-        ImportLensService, protocol_error_batch_response, protocol_error_exports_response,
+        ImportLensService, PendingImport, StreamedDocumentAnalysis,
+        protocol_error_analyze_document_response, protocol_error_batch_response,
+        protocol_error_exports_response, protocol_error_file_size_document_response,
         protocol_error_file_size_response,
     },
 };
@@ -61,7 +63,7 @@ impl Drop for AbortOnDrop {
 /// network fetch — a superseded/abandoned block skips its remaining fetches, with
 /// no error surfaced for the skipped work.
 ///
-/// Keying per source (mirroring `SwrRefreshLifecycle`, decision-log D9) is what
+/// Keying per source (mirroring `DocumentTaskLifecycle`, decision-log D9) is what
 /// keeps a cold-cache multi-manifest prewarm honest: refreshing `backend/
 /// package.json` must not cancel the still-in-flight `web/package.json` block,
 /// which would otherwise strand every not-yet-fetched target with a fabricated
@@ -103,11 +105,20 @@ impl Drop for RegistryRefreshLifecycle {
     }
 }
 
-struct SwrRefreshLifecycle {
+/// Per-document cancellation for background work a request left running: the SWR revalidation
+/// after a stale size read, and the pending-import builds a streamed document analysis handed
+/// off. A newer request for the SAME document flips the previous flag (the work is for a document
+/// state the user has already replaced); the connection ending flips all of them.
+///
+/// One instance per KIND of background work, never one shared between them: the extension sends
+/// `AnalyzeDocument` and then `FileSizeDocument` for the same document, so a shared instance
+/// would have the file-size request cancel the very builds the analysis had just handed off, and
+/// the document's imports would sit at "Calculating…" forever.
+struct DocumentTaskLifecycle {
     active_by_document: HashMap<String, Arc<AtomicBool>>,
 }
 
-impl SwrRefreshLifecycle {
+impl DocumentTaskLifecycle {
     fn new() -> Self {
         Self {
             active_by_document: HashMap::new(),
@@ -124,7 +135,7 @@ impl SwrRefreshLifecycle {
     }
 }
 
-impl Drop for SwrRefreshLifecycle {
+impl Drop for DocumentTaskLifecycle {
     fn drop(&mut self) {
         for active in self.active_by_document.values() {
             active.store(true, Ordering::Release);
@@ -286,7 +297,10 @@ where
     // Cancels the in-flight bulk registry-refresh block when a newer bulk
     // request supersedes it or when this connection ends (its `Drop`).
     let mut registry_refresh_lifecycle = RegistryRefreshLifecycle::new();
-    let mut swr_refresh_lifecycle = SwrRefreshLifecycle::new();
+    let mut swr_refresh_lifecycle = DocumentTaskLifecycle::new();
+    // Cancels the pending-import builds a superseded document analysis handed off. Separate from
+    // the SWR lifecycle on purpose — see `DocumentTaskLifecycle`.
+    let mut document_stream_lifecycle = DocumentTaskLifecycle::new();
     let lifecycle_storage_path = storage_path;
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerOutboundMessage>();
     let mut active_streams: Vec<JoinHandle<()>> = Vec::new();
@@ -526,21 +540,47 @@ where
             ClientMessage::AnalyzeDocument(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
+                // A newer analysis of the same document supersedes this one: its still-queued
+                // builds stop before they start. Keyed per document, like the SWR lifecycle, so
+                // analyzing one file never cancels another's pending imports.
+                let superseded = document_stream_lifecycle
+                    .start_document(&request.workspace_root, &request.active_document_path);
                 let svc = std::sync::Arc::clone(&service);
                 let request_for_error = request.clone();
-                let response_handle = tokio::task::spawn_blocking(move || {
-                    svc.handle_analyze_document(
+                let analysis_handle = tokio::task::spawn_blocking(move || {
+                    svc.handle_analyze_document_streaming(
                         request,
                         &crate::document::IgnoreRuleResolver::default(),
                     )
                 });
-                let response = response_from_join(
-                    response_handle,
-                    &request_for_error,
-                    protocol_error_analyze_document_response,
-                )
-                .await;
-                send_message!(response);
+                let analysis =
+                    response_from_join(analysis_handle, &request_for_error, |request, message| {
+                        StreamedDocumentAnalysis::settled(protocol_error_analyze_document_response(
+                            request, message,
+                        ))
+                    })
+                    .await;
+
+                // The response goes out FIRST, carrying every import the cache could answer and
+                // a `loading` placeholder for the rest. Only then do the misses build — off this
+                // loop, so one that parks for the full BUILD_TIMEOUT cannot hold up the imports
+                // that are ready, and cannot push the response past the client's deadline. That
+                // ordering is also what the client needs: a pushed result can only update an
+                // import state the response created.
+                send_message!(analysis.response);
+
+                if !analysis.pending.is_empty() {
+                    track_streaming_forwarder(
+                        &mut active_streams,
+                        spawn_pending_import_stream(
+                            &service,
+                            &outbound_tx,
+                            &request_for_error,
+                            analysis.pending,
+                            superseded,
+                        ),
+                    );
+                }
             }
             ClientMessage::AnalyzeDocument(request) => {
                 let response = protocol_error_analyze_document_response(
@@ -871,8 +911,13 @@ where
                     .start_document(&request.workspace_root, &request.active_document_path);
                 let svc = std::sync::Arc::clone(&service);
                 let request_for_error = request.clone();
-                let response_handle =
-                    tokio::task::spawn_blocking(move || svc.handle_file_size_document(request));
+                // Streaming: the file's own totals still come from a real combined build, but the
+                // per-import states are served from the cache and the misses come back `loading`.
+                // The `AnalyzeDocument` the extension sent first is already building them.
+                // A force-fresh request (CI) is served complete by this same call.
+                let response_handle = tokio::task::spawn_blocking(move || {
+                    svc.handle_file_size_document_streaming(request)
+                });
                 let response = response_from_join(
                     response_handle,
                     &request_for_error,
@@ -1000,6 +1045,51 @@ async fn wait_for_active_streams(active_streams: &mut Vec<JoinHandle<()>>) {
     }
 }
 
+/// Build the imports a streamed analysis answered `loading`, and push each one to the client the
+/// moment it lands (`RefreshedResults`, the same channel the SWR refresh rides).
+///
+/// Tracked by the caller, not detached: a client that disconnects mid-flight must not leave a
+/// build still writing to the cache after the shutdown flush.
+fn spawn_pending_import_stream(
+    service: &std::sync::Arc<ImportLensService>,
+    outbound_tx: &mpsc::UnboundedSender<ServerOutboundMessage>,
+    request: &AnalyzeDocumentRequest,
+    pending: Vec<PendingImport>,
+    superseded: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let service = std::sync::Arc::clone(service);
+    let outbound = outbound_tx.clone();
+    let request = request.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let context = AnalysisContext {
+            workspace_root: PathBuf::from(&request.workspace_root),
+            active_document_path: PathBuf::from(&request.active_document_path),
+        };
+        service.complete_pending_imports(
+            &context,
+            pending,
+            || !superseded.load(Ordering::Acquire),
+            |result, identity| {
+                let _ = outbound.send(ServerOutboundMessage::RefreshedResults(
+                    RefreshedResultsResponse {
+                        message_type: "refreshed_results".to_owned(),
+                        version: PROTOCOL_VERSION,
+                        workspace_root: request.workspace_root.clone(),
+                        document_path: request.active_document_path.clone(),
+                        results: vec![result],
+                        identities: vec![identity],
+                        // The analysis request id IS the client's freshness generation for this
+                        // document, so a push computed for a document the user has since edited is
+                        // dropped by the same guard that drops a superseded SWR refresh.
+                        generation: Some(request.request_id),
+                    },
+                ));
+            },
+        );
+    })
+}
+
 fn spawn_streaming_forwarder<T, R>(
     outbound_tx: &mpsc::UnboundedSender<ServerOutboundMessage>,
     mut partial_rx: mpsc::UnboundedReceiver<T>,
@@ -1045,19 +1135,6 @@ fn join_error_message(error: tokio::task::JoinError) -> String {
     format!("analysis worker failed: {error}")
 }
 
-fn protocol_error_analyze_document_response(
-    request: &AnalyzeDocumentRequest,
-    message: String,
-) -> AnalyzeDocumentResponse {
-    AnalyzeDocumentResponse {
-        version: request.version.min(PROTOCOL_VERSION),
-        request_id: request.request_id,
-        imports: Vec::new(),
-        error: Some(message.clone()),
-        diagnostics: protocol_diagnostics(message),
-    }
-}
-
 fn protocol_error_analyze_package_json_response(
     request: &AnalyzePackageJsonRequest,
     message: String,
@@ -1081,25 +1158,6 @@ fn protocol_error_analyze_specifiers_response(
         version: request.version.min(PROTOCOL_VERSION),
         request_id: request.request_id,
         imports: Vec::new(),
-        error: Some(message.clone()),
-        diagnostics: protocol_diagnostics(message),
-    }
-}
-
-fn protocol_error_file_size_document_response(
-    request: &FileSizeDocumentRequest,
-    message: String,
-) -> FileSizeDocumentResponse {
-    FileSizeDocumentResponse {
-        version: request.version.min(PROTOCOL_VERSION),
-        request_id: request.request_id,
-        raw_bytes: 0,
-        minified_bytes: 0,
-        gzip_bytes: 0,
-        brotli_bytes: 0,
-        zstd_bytes: 0,
-        imports: Vec::new(),
-        states: Vec::new(),
         error: Some(message.clone()),
         diagnostics: protocol_diagnostics(message),
     }

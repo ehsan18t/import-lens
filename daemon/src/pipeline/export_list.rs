@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use super::build_memo::BuildMemo;
-use crate::engine::{BundleFailure, EngineBudget, ExportEnumeration, boundary};
+use crate::engine::{BundleFailure, ExportEnumeration, boundary};
 use crate::ipc::protocol::ImportRuntime;
 
 static MEMO: LazyLock<BuildMemo<ExportEnumeration>> = LazyLock::new(BuildMemo::new);
@@ -20,13 +20,12 @@ static MEMO: LazyLock<BuildMemo<ExportEnumeration>> = LazyLock::new(BuildMemo::n
 /// Enumerate a package entry's exports, reusing a previous build's answer while every
 /// file it was derived from is unchanged.
 ///
-/// `budget` is the calling request's engine budget (§9): a memo hit costs nothing, but a miss is
-/// a full package-graph build, and the completion popup that asked for it is on the same 10s
-/// deadline as everything else the client waits for.
+/// A memo hit costs nothing; a miss is a full package-graph build, bounded — like every other
+/// build — by `boundary::BUILD_TIMEOUT`. Only a *successful* enumeration is memoized, so a build
+/// that timed out or panicked leaves nothing behind to be served as if it were an answer.
 pub fn enumerate_exports_cached(
     entry_path: &Path,
     runtime: ImportRuntime,
-    budget: EngineBudget,
 ) -> Result<ExportEnumeration, BundleFailure> {
     if let Some(cached) = MEMO.get(entry_path, runtime) {
         return Ok(cached);
@@ -35,7 +34,7 @@ pub fn enumerate_exports_cached(
     // Read before the build, not after: an invalidation landing while the build is in
     // flight must not be stamped onto a list derived from the bytes it invalidated.
     let generation = crate::cache::memory::cache_generation();
-    let enumeration = boundary::enumerate_exports_sync(entry_path.to_path_buf(), runtime, budget)?;
+    let enumeration = boundary::enumerate_exports_sync(entry_path.to_path_buf(), runtime)?;
 
     // A graph carrying a module the plugin could not fingerprint as it read it has no
     // complete read-time record, so there is nothing to expire a memo against.

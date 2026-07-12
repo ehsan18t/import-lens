@@ -14,10 +14,11 @@
 //!
 //! Spec: I15.
 
-use import_lens_daemon::engine::EngineBudget;
 use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
 use import_lens_daemon::pipeline::analyze::AnalysisContext;
-use import_lens_daemon::pipeline::file_size::{FileSizeComputation, compute_file_size};
+use import_lens_daemon::pipeline::file_size::{
+    FileSizeComputation, SizedImport, compute_file_size,
+};
 use std::{fs, path::Path, path::PathBuf};
 
 mod common;
@@ -30,22 +31,26 @@ fn context(workspace: &Path) -> AnalysisContext {
     AnalysisContext {
         workspace_root: workspace.to_path_buf(),
         active_document_path: workspace.join("src").join("page.astro"),
-        engine_budget: EngineBudget::interactive(),
     }
 }
 
-fn request(package: &str, export: &str, runtime: ImportRuntime) -> ImportRequest {
-    ImportRequest {
-        specifier: package.to_owned(),
-        package_name: package.to_owned(),
-        version: "1.0.0".to_owned(),
-        named: vec![export.to_owned()],
-        import_kind: ImportKind::Named,
-        runtime,
+fn request(package: &str, export: &str, runtime: ImportRuntime) -> SizedImport {
+    SizedImport {
+        request: ImportRequest {
+            specifier: package.to_owned(),
+            package_name: package.to_owned(),
+            version: "1.0.0".to_owned(),
+            named: vec![export.to_owned()],
+            import_kind: ImportKind::Named,
+            runtime,
+        },
+        // Nothing measured yet: these sizings exercise the combined build, which is what the
+        // file's totals come from — the per-import measurements only feed the fallback.
+        result: None,
     }
 }
 
-fn size(context: &AnalysisContext, requests: &[ImportRequest]) -> FileSizeComputation {
+fn size(context: &AnalysisContext, requests: &[SizedImport]) -> FileSizeComputation {
     let computed = compute_file_size(context, requests);
     assert_eq!(
         computed.error, None,

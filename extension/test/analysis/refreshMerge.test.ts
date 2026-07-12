@@ -83,6 +83,24 @@ test("mergeRefreshedResults promotes a loading state to ready", () => {
   assert.equal(outcome.next[0]?.result?.specifier, "alpha");
 });
 
+// The mirror image of "ignores errored refreshed results", and the reason that rule is
+// stated over the STATE rather than over the result. A `loading` import is one the daemon
+// answered without a size and is building off the response path; if its build genuinely
+// fails, the failure is the only answer it will ever get. Dropping it — the rule that
+// protects a good stale value from a failed revalidation — would leave that import reading
+// "Calculating..." for the rest of the session.
+test("mergeRefreshedResults lets an errored result settle an import that has no size yet", () => {
+  const existing = [state("alpha", { status: "loading", result: undefined })];
+
+  const outcome = mergeRefreshedResults(existing, [
+    result({ specifier: "alpha", error: "engine build panicked" }),
+  ]);
+
+  assert.equal(outcome.changed, true);
+  assert.equal(outcome.next[0]?.status, "ready");
+  assert.equal(outcome.next[0]?.result?.error, "engine build panicked");
+});
+
 test("mergeRefreshedResults drops insights computed against the stale result", () => {
   const existing = [
     state("alpha", { insights: [{ tooltip: "was 1.5 KB, budget commentary for the OLD value" }] }),

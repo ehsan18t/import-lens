@@ -5,7 +5,6 @@
 
 mod adapter;
 pub mod boundary;
-pub mod budget;
 pub(crate) mod dependency_paths;
 mod entry;
 pub(crate) mod limits;
@@ -17,7 +16,6 @@ use std::path::PathBuf;
 pub use crate::ipc::protocol::ImportRuntime;
 pub use crate::pipeline::resolver::SideEffectsMode;
 pub use adapter::RolldownEngine;
-pub use budget::EngineBudget;
 
 #[derive(Debug, Clone)]
 pub struct BundleRequest {
@@ -142,12 +140,29 @@ pub mod stage {
         AMBIGUOUS_EXPORT => "ambiguous_export",
         /// A build that unwound into the boundary's `catch_unwind`.
         PANIC => "panic",
-        /// A build that did not complete within its limit — `boundary::BUILD_TIMEOUT`, or what
-        /// was left of the request's engine budget, whichever was shorter — or one that was
-        /// never started at all because that budget was already spent (`engine::budget`).
+        /// A build that did not finish within `boundary::BUILD_TIMEOUT` and was cancelled.
+        /// That is the whole of its meaning: it says nothing about how long a *request* took,
+        /// because a request no longer waits for every build it triggers (§9).
         TIMEOUT => "timeout",
         /// The engine runtime dropped the build without replying.
         ENGINE_GONE => "engine_gone",
+    }
+
+    /// Whether a stage describes a failure of **this run of the daemon** rather than of the
+    /// package.
+    ///
+    /// A `parse`/`link`/`resolve`/`output_shape`/`module_graph_limit` failure is a property of
+    /// the code being measured: it will fail the same way next time, so the degraded result it
+    /// produces is worth caching. These three are not. A build that was cancelled at the
+    /// deadline, unwound, or lost its runtime tells us nothing about the package — and the
+    /// static fallback the pipeline substitutes carries `error: None` and a plausible-looking
+    /// byte count, which is exactly the shape a cache happily stores. Store it once and a
+    /// healthy 17 KB package reports its 58-byte barrel for a whole cache generation.
+    ///
+    /// So every cache and memo the daemon writes gates on this: see
+    /// `service::should_cache_result` and `service::file_size_is_cacheable`.
+    pub fn is_transient(stage: &str) -> bool {
+        matches!(stage, TIMEOUT | PANIC | ENGINE_GONE)
     }
 }
 

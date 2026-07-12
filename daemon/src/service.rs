@@ -1,4 +1,4 @@
-use crate::engine::scheduling::{drain_classified, drain_ordered_owned};
+use crate::engine::scheduling::{drain_classified, drain_misses_owned, drain_ordered_owned};
 use crate::{
     analysis_flight::AnalysisFlightRegistry,
     cache::{
@@ -11,7 +11,6 @@ use crate::{
         named_import_completion_context, package_json_dependency_entries,
         package_json_dependency_sections, should_ignore_import,
     },
-    engine::EngineBudget,
     ipc::protocol::{
         AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
         AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
@@ -30,7 +29,7 @@ use crate::{
     pipeline::analyze::{
         AnalysisContext, analyze_import, analyze_resolved_import_with_dependencies,
     },
-    pipeline::file_size::{annotate_shared_bytes, compute_file_size},
+    pipeline::file_size::{SizedImport, annotate_shared_bytes, compute_file_size},
     pipeline::resolver::{ResolvedPackage, find_package_root, resolve_package_entry},
 };
 use rayon::prelude::*;
@@ -73,6 +72,40 @@ enum CacheProbe {
 struct PendingBuild {
     resolved: ResolvedPackage,
     key: String,
+}
+
+/// One import a streamed response answered `Loading`: everything needed to build it after the
+/// response has already gone out, and to address the result back to the right import on the
+/// client (the identity — specifier alone is not unique, since two imports of one package differ
+/// by kind and named exports).
+pub struct PendingImport {
+    detected: DetectedImport,
+    request: ImportRequest,
+    pending: Box<PendingBuild>,
+}
+
+/// A document analysis that did not wait for the engine: what the cache could answer now, and
+/// what is still to be built.
+pub struct StreamedDocumentAnalysis {
+    pub response: AnalyzeDocumentResponse,
+    pub pending: Vec<PendingImport>,
+}
+
+impl StreamedDocumentAnalysis {
+    /// A response with nothing left to build (a protocol/parse error, or a document whose every
+    /// import the cache answered).
+    pub fn settled(response: AnalyzeDocumentResponse) -> Self {
+        Self {
+            response,
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// The cache-only classification of a document's imports, before any build runs.
+struct CachedDocumentAnalysis {
+    items: Vec<ImportAnalysisItem>,
+    pending: Vec<PendingImport>,
 }
 
 const SLOW_CACHE_LOOKUP_LOG_THRESHOLD: Duration = Duration::from_millis(25);
@@ -505,12 +538,6 @@ impl ImportLensService {
         }
 
         let workspace_root = PathBuf::from(&request.workspace_root);
-        // One engine budget for the whole report, stamped here and shared by every file below
-        // (§9). The client's deadline covers the entire scan, not each file, so this is the level
-        // the deadline has to be stamped at: once it is spent, the files still to come size their
-        // imports from the static fallback and the report still returns inside the deadline
-        // instead of being thrown away whole.
-        let budget = EngineBudget::long_running();
         let files = crate::report::scanner::scan_workspace_sources(&workspace_root);
         // One resolver per report run: files sharing a directory share a single
         // .importlensignore ancestor walk, while edits between reports are
@@ -528,7 +555,7 @@ impl ImportLensService {
                     Ok(source) => source,
                     Err(_) => return Vec::new().into_iter(),
                 };
-                self.analyze_report_source(source_path, &request, source, &ignore_resolver, budget)
+                self.analyze_report_source(source_path, &request, source, &ignore_resolver)
                     .into_iter()
             })
             .collect::<Vec<_>>();
@@ -551,7 +578,6 @@ impl ImportLensService {
         request: &WorkspaceReportRequest,
         source: String,
         ignore_resolver: &IgnoreRuleResolver,
-        budget: EngineBudget,
     ) -> Vec<crate::report::model::WorkspaceReportItem> {
         let document_request = AnalyzeDocumentRequest {
             message_type: "analyze_document".to_owned(),
@@ -581,11 +607,16 @@ impl ImportLensService {
 
             // WorkspaceReport is a full-workspace scan: read cache non-promoting so it
             // can't flood the recency signal and evict the user's warm set (§5.1).
+            //
+            // The report is the one caller that still WAITS for every build: its rows are a
+            // table, and a row that says "still measuring" is not a row. It therefore keeps the
+            // complete (blocking) analysis, and a workspace naming enough parked packages can
+            // still outlive the client's 300s — stated as such in the SRS rather than papered
+            // over with a fabricated size.
             self.handle_analyze_document_with_intent(
                 document_request,
                 ignore_resolver,
                 ReadIntent::Bulk,
-                budget,
             )
         }));
 
@@ -642,7 +673,6 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
-            engine_budget: EngineBudget::interactive(),
         };
         let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
         annotate_shared_bytes(&mut imports);
@@ -699,7 +729,6 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
-            engine_budget: EngineBudget::interactive(),
         };
         let mut imports = self.analyze_batch(&context, &request.imports, |index, result| {
             emit_partial(BatchResponse {
@@ -730,12 +759,23 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
-            engine_budget: EngineBudget::interactive(),
         };
         let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
         annotate_shared_bytes(&mut imports);
-        let file_size =
-            self.file_size_with_cache(&context, &request.active_document_path, &request.imports);
+        // Hand the per-import measurements to the aggregate: if its combined build fails, the
+        // conservative fallback sums THESE instead of re-analyzing every import through the
+        // engine a second time.
+        let sized = request
+            .imports
+            .iter()
+            .cloned()
+            .zip(imports.iter().cloned())
+            .map(|(request, result)| SizedImport {
+                request,
+                result: Some(result),
+            })
+            .collect::<Vec<_>>();
+        let file_size = self.file_size_with_cache(&context, &request.active_document_path, &sized);
 
         FileSizeResponse {
             version: request.version,
@@ -751,6 +791,13 @@ impl ImportLensService {
         }
     }
 
+    /// Analyze a document and WAIT for every miss to build.
+    ///
+    /// The complete answer, at the price of the client waiting for the slowest build in the
+    /// document. Only two callers want that trade: the workspace report (a table row cannot say
+    /// "still measuring") and `importlens check` through the force-fresh file-size path (CI must
+    /// judge the real number or fail loudly). The editor takes
+    /// [`Self::handle_analyze_document_streaming`] instead.
     pub fn handle_analyze_document(
         &self,
         request: AnalyzeDocumentRequest,
@@ -760,24 +807,85 @@ impl ImportLensService {
         // looking at) promotes recency. The bulk WorkspaceReport scan reuses this same
         // per-file analysis via `_with_intent(.., ReadIntent::Bulk)` so it does NOT
         // promote — a full-workspace pass can't flood the recency signal (§5.1).
-        self.handle_analyze_document_with_intent(
-            request,
-            ignore_resolver,
-            ReadIntent::Interactive,
-            EngineBudget::interactive(),
-        )
+        self.handle_analyze_document_with_intent(request, ignore_resolver, ReadIntent::Interactive)
     }
 
-    /// `budget` is passed in rather than derived from `intent` because the workspace report
-    /// stamps ONE budget for the whole scan and hands the same one to every file (§9). Deriving
-    /// it here would stamp a fresh 290s per file, which would bound a file and not the report —
-    /// the same mistake, one level up, as bounding a build instead of a request.
+    /// Analyze a document WITHOUT waiting for any engine build.
+    ///
+    /// This is the editor's path, and the whole point of the redesign. The response carries
+    /// every import the cache could answer, plus a `Loading` placeholder for each one whose
+    /// build has yet to run — and it is returned at once, because the response no longer waits
+    /// for the engine at all. The pending builds come back in
+    /// [`StreamedDocumentAnalysis::pending`]; the IPC server runs them and pushes each result to
+    /// the client as it lands (`RefreshedResults`).
+    ///
+    /// What that buys: one package that parks the bundler delays exactly one import's number.
+    /// It used to delay the whole `AnalyzeDocumentResponse` past the client's 10s deadline, and
+    /// the client threw the entire document away — every import in it already answered from
+    /// cache included.
+    ///
+    /// The placeholder is load-bearing, not cosmetic. An import ABSENT from the response is
+    /// dropped by the extension (`listener.ts` rebuilds the document's state array from
+    /// `response.imports`), and a later push can only UPDATE a state, never create one
+    /// (`refreshMerge.ts` maps over the states that exist). Omitting a still-building import
+    /// would therefore lose it permanently.
+    pub fn handle_analyze_document_streaming(
+        &self,
+        request: AnalyzeDocumentRequest,
+        ignore_resolver: &IgnoreRuleResolver,
+    ) -> StreamedDocumentAnalysis {
+        if !is_supported_protocol_version(request.version) {
+            return StreamedDocumentAnalysis::settled(protocol_error_analyze_document_response(
+                &request,
+                format!("unsupported protocol version {}", request.version),
+            ));
+        }
+
+        let context = AnalysisContext {
+            workspace_root: PathBuf::from(&request.workspace_root),
+            active_document_path: PathBuf::from(&request.active_document_path),
+        };
+        let detected = match detected_imports_for_document(
+            &request.active_document_path,
+            &request.source,
+            true,
+            ignore_resolver,
+        ) {
+            Ok(imports) => imports,
+            Err(error) => {
+                return StreamedDocumentAnalysis::settled(AnalyzeDocumentResponse {
+                    version: request.version,
+                    request_id: request.request_id,
+                    imports: Vec::new(),
+                    error: Some(error.clone()),
+                    diagnostics: vec![ImportDiagnostic::for_stage("document_parse", &error)],
+                });
+            }
+        };
+        let cached = self.cached_analysis_items_for_detected(
+            &context,
+            detected,
+            false,
+            ReadIntent::Interactive,
+        );
+
+        StreamedDocumentAnalysis {
+            response: AnalyzeDocumentResponse {
+                version: request.version,
+                request_id: request.request_id,
+                imports: cached.items,
+                error: None,
+                diagnostics: Vec::new(),
+            },
+            pending: cached.pending,
+        }
+    }
+
     fn handle_analyze_document_with_intent(
         &self,
         request: AnalyzeDocumentRequest,
         ignore_resolver: &IgnoreRuleResolver,
         intent: ReadIntent,
-        budget: EngineBudget,
     ) -> AnalyzeDocumentResponse {
         if !is_supported_protocol_version(request.version) {
             return AnalyzeDocumentResponse {
@@ -795,7 +903,6 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
-            engine_budget: budget,
         };
         let detected = match detected_imports_for_document(
             &request.active_document_path,
@@ -845,7 +952,6 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
-            engine_budget: EngineBudget::interactive(),
         };
         let detected = request
             .specifiers
@@ -865,57 +971,18 @@ impl ImportLensService {
         }
     }
 
+    /// Size a document and WAIT for every import's build.
+    ///
+    /// `importlens check` is the caller that needs this: it forces fresh, judges a byte budget,
+    /// and a partial answer would pass a budget it should have failed. The editor takes
+    /// [`Self::handle_file_size_document_streaming`].
     pub fn handle_file_size_document(
         &self,
         request: FileSizeDocumentRequest,
     ) -> FileSizeDocumentResponse {
-        if !(2..=PROTOCOL_VERSION).contains(&request.version) {
-            return FileSizeDocumentResponse {
-                version: request.version.min(PROTOCOL_VERSION),
-                request_id: request.request_id,
-                raw_bytes: 0,
-                minified_bytes: 0,
-                gzip_bytes: 0,
-                brotli_bytes: 0,
-                zstd_bytes: 0,
-                imports: Vec::new(),
-                states: Vec::new(),
-                error: Some(format!("unsupported protocol version {}", request.version)),
-                diagnostics: vec![ImportDiagnostic::for_stage(
-                    "protocol",
-                    "unsupported protocol version",
-                )],
-            };
-        }
-
-        let context = AnalysisContext {
-            workspace_root: PathBuf::from(&request.workspace_root),
-            active_document_path: PathBuf::from(&request.active_document_path),
-            engine_budget: EngineBudget::interactive(),
-        };
-        let ignore_resolver = IgnoreRuleResolver::default();
-        let detected = match detected_imports_for_document(
-            &request.active_document_path,
-            &request.source,
-            true,
-            &ignore_resolver,
-        ) {
-            Ok(imports) => imports,
-            Err(error) => {
-                return FileSizeDocumentResponse {
-                    version: request.version,
-                    request_id: request.request_id,
-                    raw_bytes: 0,
-                    minified_bytes: 0,
-                    gzip_bytes: 0,
-                    brotli_bytes: 0,
-                    zstd_bytes: 0,
-                    imports: Vec::new(),
-                    states: Vec::new(),
-                    error: Some(error.clone()),
-                    diagnostics: vec![ImportDiagnostic::for_stage("document_parse", &error)],
-                };
-            }
+        let (context, detected) = match file_size_document_prelude(&request) {
+            Ok(prelude) => prelude,
+            Err(response) => return *response,
         };
         // Interactive size read → serve stale (SWR) unless the client forces fresh
         // (CI / CLI budget checks). A stale serve here triggers the background
@@ -926,16 +993,66 @@ impl ImportLensService {
             !request.force_fresh,
             ReadIntent::Interactive,
         );
-        let requests = states
+
+        self.file_size_document_response(&request, &context, states)
+    }
+
+    /// Size a document without waiting for any per-import build.
+    ///
+    /// The file's own totals still come from a real build — ONE combined build per runtime,
+    /// bounded by `BUILD_TIMEOUT`, whose entries include the imports that are still being
+    /// measured individually (their bytes belong in the file's total whether or not their own
+    /// number has landed). What this no longer does is wait for those individual builds: their
+    /// states come back `Loading`, and `AnalyzeDocument`'s streaming pass — which the extension
+    /// always sends first, for the same document and the same generation — is what builds them
+    /// and pushes each one to the client.
+    ///
+    /// A force-fresh request (CI) is served by the blocking path instead: completeness is the
+    /// entire point of that flag.
+    pub fn handle_file_size_document_streaming(
+        &self,
+        request: FileSizeDocumentRequest,
+    ) -> FileSizeDocumentResponse {
+        if request.force_fresh {
+            return self.handle_file_size_document(request);
+        }
+
+        let (context, detected) = match file_size_document_prelude(&request) {
+            Ok(prelude) => prelude,
+            Err(response) => return *response,
+        };
+        let cached = self.cached_analysis_items_for_detected(
+            &context,
+            detected,
+            true,
+            ReadIntent::Interactive,
+        );
+
+        self.file_size_document_response(&request, &context, cached.items)
+    }
+
+    fn file_size_document_response(
+        &self,
+        request: &FileSizeDocumentRequest,
+        context: &AnalysisContext,
+        states: Vec<ImportAnalysisItem>,
+    ) -> FileSizeDocumentResponse {
+        // Every import that resolved is an entry of the combined build; the ones already
+        // measured also feed the conservative fallback if that build fails.
+        let sized = states
             .iter()
-            .filter_map(|state| state.request.clone())
+            .filter_map(|state| {
+                state.request.clone().map(|request| SizedImport {
+                    request,
+                    result: state.result.clone(),
+                })
+            })
             .collect::<Vec<_>>();
         let results = states
             .iter()
             .filter_map(|state| state.result.clone())
             .collect::<Vec<_>>();
-        let file_size =
-            self.file_size_with_cache(&context, &request.active_document_path, &requests);
+        let file_size = self.file_size_with_cache(context, &request.active_document_path, &sized);
 
         FileSizeDocumentResponse {
             version: request.version,
@@ -1000,10 +1117,6 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
-            // Background SWR revalidation: the client already has its (stale) answer and the
-            // refreshed one is pushed whenever it is ready, so no deadline is being missed by
-            // finishing the build. `BUILD_TIMEOUT` still caps each one.
-            engine_budget: EngineBudget::background(),
         };
         let ignore_resolver = IgnoreRuleResolver::default();
         let detected = detected_imports_for_document(
@@ -1167,9 +1280,6 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
-            // A manifest can name hundreds of dependencies and the extension waits 300s for it,
-            // so this request gets the long-running budget rather than the interactive one.
-            engine_budget: EngineBudget::long_running(),
         };
         let sections = package_json_dependency_sections(&request.source);
         let registry_hint_mode = effective_registry_hint_mode(&request);
@@ -1636,7 +1746,6 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
-            engine_budget: EngineBudget::interactive(),
         };
         let import_request = ImportRequest {
             specifier: request.specifier.clone(),
@@ -1668,7 +1777,6 @@ impl ImportLensService {
         match crate::pipeline::export_list::enumerate_exports_cached(
             &resolved.entry_path,
             import_request.runtime,
-            context.engine_budget,
         ) {
             Ok(enumeration) => EnumerateExportsResponse {
                 version: request.version,
@@ -2063,6 +2171,149 @@ impl ImportLensService {
         true
     }
 
+    /// Settle every import the daemon can answer **without an engine build**, and mark the rest
+    /// `Loading`.
+    ///
+    /// Three outcomes, none of which can park:
+    ///
+    /// - a cache hit → `Ready` with its result;
+    /// - an import that does not resolve to a package at all → settled here, because that path
+    ///   never reaches the engine: `analyze_import` falls through to the manifest approximation,
+    ///   the declaration-only result, or a typed error, all of which are filesystem work;
+    /// - a real miss → `Loading`, with the resolved package and cache key carried out in
+    ///   [`StreamedDocumentAnalysis::pending`] so the caller can build it off the response path.
+    ///
+    /// The `Loading` item keeps its `request`, so a caller that only needs the resolved package
+    /// identity (the extension's named-export candidates command) is unaffected by the fact that
+    /// its size has not landed.
+    fn cached_analysis_items_for_detected(
+        &self,
+        context: &AnalysisContext,
+        detected: Vec<DetectedImport>,
+        serve_stale: bool,
+        intent: ReadIntent,
+    ) -> CachedDocumentAnalysis {
+        let classified = detected
+            .into_par_iter()
+            .map(|detected| {
+                let request =
+                    match import_request_for_detected(&context.active_document_path, &detected) {
+                        Ok(request) => request,
+                        Err(message) => {
+                            return (
+                                ImportAnalysisItem {
+                                    detected,
+                                    status: ImportAnalysisStatus::Missing,
+                                    message: Some(message),
+                                    request: None,
+                                    result: None,
+                                },
+                                None,
+                            );
+                        }
+                    };
+
+                match self.probe_cache(context, &request, serve_stale, intent) {
+                    CacheProbe::Hit(result) => (
+                        ImportAnalysisItem {
+                            detected,
+                            status: ImportAnalysisStatus::Ready,
+                            message: None,
+                            request: Some(request),
+                            result: Some(*result),
+                        },
+                        None,
+                    ),
+                    CacheProbe::Unresolved => {
+                        let result = analyze_import(context, &request);
+                        (
+                            ImportAnalysisItem {
+                                detected,
+                                status: ImportAnalysisStatus::Ready,
+                                message: None,
+                                request: Some(request),
+                                result: Some(result),
+                            },
+                            None,
+                        )
+                    }
+                    CacheProbe::Miss(pending) => (
+                        ImportAnalysisItem {
+                            detected: detected.clone(),
+                            status: ImportAnalysisStatus::Loading,
+                            message: None,
+                            request: Some(request.clone()),
+                            result: None,
+                        },
+                        Some(PendingImport {
+                            detected,
+                            request,
+                            pending,
+                        }),
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut items = Vec::with_capacity(classified.len());
+        let mut pending = Vec::new();
+        for (item, work) in classified {
+            items.push(item);
+            if let Some(work) = work {
+                pending.push(work);
+            }
+        }
+        annotate_ready_items(&mut items);
+
+        CachedDocumentAnalysis { items, pending }
+    }
+
+    /// Build the imports a streamed response answered `Loading`, handing each result to `emit`
+    /// the moment it lands. Runs off the response path (the IPC server spawns it), so a build
+    /// that parks for the full `BUILD_TIMEOUT` delays nothing but its own import.
+    ///
+    /// `should_continue` is checked before each build: a newer analysis of the same document
+    /// supersedes this one, and finishing builds for a document state the user has already
+    /// edited past buys nobody anything. Results still go through `analyze_and_cache`, so the
+    /// single-flight registry collapses a build another request is already running for the same
+    /// key rather than starting a second one.
+    pub fn complete_pending_imports(
+        &self,
+        context: &AnalysisContext,
+        pending: Vec<PendingImport>,
+        should_continue: impl Fn() -> bool + Sync,
+        emit: impl Fn(ImportResult, RefreshedImportIdentity) + Sync,
+    ) {
+        let cache = self.cache_registry.cache_for_root(&context.workspace_root);
+        drain_misses_owned(pending, |import| {
+            if !should_continue() {
+                return;
+            }
+
+            let result = self.analyze_and_cache(
+                cache.as_ref(),
+                context,
+                &import.request,
+                import.pending.key,
+                import.pending.resolved,
+                || true,
+            );
+
+            if !should_continue() {
+                return;
+            }
+
+            emit(
+                result,
+                RefreshedImportIdentity {
+                    specifier: import.detected.specifier,
+                    import_kind: import.detected.import_kind,
+                    named: import.detected.named,
+                },
+            );
+        });
+    }
+
     fn analysis_items_for_detected(
         &self,
         context: &AnalysisContext,
@@ -2111,18 +2362,7 @@ impl ImportLensService {
             },
         );
 
-        let mut results = items
-            .iter_mut()
-            .filter_map(|item| item.result.take())
-            .collect::<Vec<_>>();
-        annotate_shared_bytes(&mut results);
-        let mut result_iter = results.into_iter();
-        for item in &mut items {
-            if item.status == ImportAnalysisStatus::Ready {
-                item.result = result_iter.next();
-            }
-        }
-
+        annotate_ready_items(&mut items);
         items
     }
 
@@ -2133,11 +2373,11 @@ impl ImportLensService {
         &self,
         context: &AnalysisContext,
         active_document_path: &str,
-        requests: &[ImportRequest],
+        imports: &[SizedImport],
     ) -> crate::pipeline::file_size::FileSizeComputation {
         let cache = crate::pipeline::file_size_cache::shared_file_size_cache();
         let path = PathBuf::from(active_document_path);
-        let signature = crate::pipeline::file_size_cache::file_size_signature(context, requests);
+        let signature = crate::pipeline::file_size_cache::file_size_signature(context, imports);
 
         if let Some(hit) = cache.get(&path, signature) {
             crate::logging::log_debug("file_size_cache", format!("hit: {}", path.display()));
@@ -2145,8 +2385,13 @@ impl ImportLensService {
         }
 
         crate::logging::log_debug("file_size_cache", format!("miss: {}", path.display()));
-        let computed = compute_file_size(context, requests);
-        cache.insert(path, signature, computed.clone());
+        let computed = compute_file_size(context, imports);
+        // The same gate the import cache applies (`should_cache_result`), one level up: a
+        // combined build that parked and degraded this file's totals to a conservative sum must
+        // not be served as the file's size for the next 30 seconds.
+        if computed.is_cacheable() {
+            cache.insert(path, signature, computed.clone());
+        }
         computed
     }
 
@@ -2339,8 +2584,87 @@ fn effective_registry_hint_mode(
     }
 }
 
+/// Shared-byte annotation across a document's *measured* imports.
+///
+/// Imports still being measured contribute nothing: shared bytes are computed from module
+/// contributions, and an import with no result has none. The full analysis that follows the
+/// pushed results (any later read of this document) annotates the complete set.
+fn annotate_ready_items(items: &mut [ImportAnalysisItem]) {
+    let mut results = items
+        .iter_mut()
+        .filter_map(|item| item.result.take())
+        .collect::<Vec<_>>();
+    annotate_shared_bytes(&mut results);
+    let mut result_iter = results.into_iter();
+    for item in items {
+        if item.status == ImportAnalysisStatus::Ready {
+            item.result = result_iter.next();
+        }
+    }
+}
+
+/// The version check and document parse both file-size document handlers share. The error arm is
+/// boxed: it is a whole response, and it is the rare path.
+fn file_size_document_prelude(
+    request: &FileSizeDocumentRequest,
+) -> Result<(AnalysisContext, Vec<DetectedImport>), Box<FileSizeDocumentResponse>> {
+    if !(2..=PROTOCOL_VERSION).contains(&request.version) {
+        return Err(Box::new(protocol_error_file_size_document_response(
+            request,
+            format!("unsupported protocol version {}", request.version),
+        )));
+    }
+
+    let context = AnalysisContext {
+        workspace_root: PathBuf::from(&request.workspace_root),
+        active_document_path: PathBuf::from(&request.active_document_path),
+    };
+    let ignore_resolver = IgnoreRuleResolver::default();
+    let detected = detected_imports_for_document(
+        &request.active_document_path,
+        &request.source,
+        true,
+        &ignore_resolver,
+    )
+    .map_err(|error| {
+        Box::new(FileSizeDocumentResponse {
+            version: request.version,
+            request_id: request.request_id,
+            raw_bytes: 0,
+            minified_bytes: 0,
+            gzip_bytes: 0,
+            brotli_bytes: 0,
+            zstd_bytes: 0,
+            imports: Vec::new(),
+            states: Vec::new(),
+            error: Some(error.clone()),
+            diagnostics: vec![ImportDiagnostic::for_stage("document_parse", &error)],
+        })
+    })?;
+
+    Ok((context, detected))
+}
+
+/// Whether a result is a measurement, and so may be written to the import cache.
+///
+/// Two things disqualify it. An `error` — as before: a failed analysis is not a size. And a
+/// **transient engine failure**, which is new, and is the defect that has bitten this design
+/// three times: a build that timed out, unwound, or lost its runtime degrades to a static entry
+/// size that carries `error: None` and a perfectly plausible byte count. Cache that once and a
+/// healthy 17,550-byte package reports 58 bytes for the rest of the cache generation — from a
+/// scheduling accident that says nothing whatever about the package.
+///
+/// The stage is the evidence: the static fallback records the failure's own stage in its
+/// diagnostics (`engine_fallback_diagnostic`), and so does the full-package comparison, whose
+/// `truly_treeshakeable: false` is just as fabricated when the build that would have disproved it
+/// merely parked. A DETERMINISTIC failure (`parse`, `link`, `module_graph_limit`, …) is still
+/// cached: it is a fact about the code, and re-running it costs a build to learn the same thing.
 fn should_cache_result(result: &ImportResult) -> bool {
     result.error.is_none()
+        && !result
+            .diagnostics
+            .iter()
+            .any(|item| crate::engine::stage::is_transient(&item.stage))
 }
 
 fn cache_read_mode_label(serve_stale: bool, intent: ReadIntent) -> &'static str {
@@ -2553,6 +2877,40 @@ fn dependency_fingerprints(
     fingerprints.dedup_by(|left, right| left.path == right.path);
     fingerprints
 }
+/// Lives here rather than in `ipc::server` because the streaming document handler builds one
+/// itself: a protocol error is a settled analysis with nothing left to build.
+pub fn protocol_error_analyze_document_response(
+    request: &AnalyzeDocumentRequest,
+    message: String,
+) -> AnalyzeDocumentResponse {
+    AnalyzeDocumentResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        imports: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: vec![ImportDiagnostic::for_stage("protocol", message)],
+    }
+}
+
+pub fn protocol_error_file_size_document_response(
+    request: &FileSizeDocumentRequest,
+    message: String,
+) -> FileSizeDocumentResponse {
+    FileSizeDocumentResponse {
+        version: request.version.min(PROTOCOL_VERSION),
+        request_id: request.request_id,
+        raw_bytes: 0,
+        minified_bytes: 0,
+        gzip_bytes: 0,
+        brotli_bytes: 0,
+        zstd_bytes: 0,
+        imports: Vec::new(),
+        states: Vec::new(),
+        error: Some(message.clone()),
+        diagnostics: vec![ImportDiagnostic::for_stage("protocol", message)],
+    }
+}
+
 pub fn protocol_error_batch_response(request: &BatchRequest, message: String) -> BatchResponse {
     BatchResponse {
         version: request.version.min(PROTOCOL_VERSION),
@@ -2669,7 +3027,6 @@ mod report_panic_isolation_tests {
             &request,
             "// __IMPORTLENS_FORCE_PANIC__\n".to_owned(),
             &IgnoreRuleResolver::default(),
-            crate::engine::EngineBudget::long_running(),
         );
 
         assert!(items.is_empty());
@@ -2763,7 +3120,6 @@ mod task_lifecycle_tests {
 mod analyze_and_cache_single_flight_tests {
     use super::{ComputedAnalysis, ImportLensService};
     use crate::cache::key::cache_key_for_resolved_import;
-    use crate::engine::EngineBudget;
     use crate::ipc::protocol::{
         ConfidenceLevel, ImportKind, ImportRequest, ImportResult, ImportRuntime, ResultFreshness,
     };
@@ -2848,7 +3204,6 @@ mod analyze_and_cache_single_flight_tests {
         let context = AnalysisContext {
             workspace_root: workspace.clone(),
             active_document_path: workspace.join("src").join("app.ts"),
-            engine_budget: EngineBudget::interactive(),
         };
         let request = request();
         let resolved = resolved(&workspace);
@@ -2907,5 +3262,103 @@ mod analyze_and_cache_single_flight_tests {
             cache.get(&key).is_some(),
             "a follower with should_store=true must keep its cache write even when the leader did not store",
         );
+    }
+}
+
+/// The defect that has bitten this design three rounds running: a build that failed for reasons
+/// that have nothing to do with the package still produces a result the cache is happy to store.
+#[cfg(test)]
+mod transient_failures_are_not_cacheable_tests {
+    use super::should_cache_result;
+    use crate::engine::stage;
+    use crate::ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportResult, ResultFreshness};
+    use crate::pipeline::file_size::FileSizeComputation;
+
+    /// The exact shape the pipeline produces when an engine build fails and it falls back to
+    /// sizing the entry file alone: a plausible byte count, `error: None`, low confidence, and a
+    /// diagnostic naming the stage it failed at.
+    fn static_fallback(stage: &str) -> ImportResult {
+        ImportResult {
+            specifier: "healthy-lib".to_owned(),
+            raw_bytes: 58,
+            minified_bytes: 58,
+            gzip_bytes: 58,
+            brotli_bytes: 58,
+            zstd_bytes: 58,
+            cache_hit: false,
+            side_effects: false,
+            truly_treeshakeable: false,
+            is_cjs: false,
+            confidence: ConfidenceLevel::Low,
+            confidence_reasons: vec!["Static entry sizing is a fallback.".to_owned()],
+            error: None,
+            diagnostics: vec![ImportDiagnostic {
+                stage: stage.to_owned(),
+                message: "Rolldown engine analysis failed; using static entry sizing".to_owned(),
+                details: Vec::new(),
+            }],
+            module_breakdown: None,
+            shared_bytes: None,
+            freshness: ResultFreshness::fresh(),
+            internal_contributions: Vec::new(),
+        }
+    }
+
+    /// A timeout says the daemon was busy or the bundler parked; a panic says the bundler broke;
+    /// `engine_gone` says the runtime went away. None of them says the package weighs 58 bytes.
+    /// Caching that number makes a scheduling accident permanent for a whole cache generation —
+    /// the failure the request budget's degraded results shipped last round.
+    #[test]
+    fn a_transiently_degraded_result_is_never_written_to_the_cache() {
+        for stage in [stage::TIMEOUT, stage::PANIC, stage::ENGINE_GONE] {
+            assert!(
+                !should_cache_result(&static_fallback(stage)),
+                "a `{stage}` fallback carries error: None and a fabricated size; caching it is \
+                 how a healthy package comes to report 58 bytes"
+            );
+        }
+    }
+
+    /// The other half, and the reason the gate reads the stage rather than the confidence: a
+    /// DETERMINISTIC failure is a fact about the code. Re-running it costs a full build to learn
+    /// exactly the same thing, so it is cached, exactly as before.
+    #[test]
+    fn a_deterministic_failure_is_still_cached() {
+        for stage in [
+            stage::PARSE,
+            stage::LINK,
+            stage::MODULE_GRAPH_LIMIT,
+            stage::OUTPUT_SHAPE,
+        ] {
+            assert!(
+                should_cache_result(&static_fallback(stage)),
+                "a `{stage}` failure will happen again next time; withholding it from the cache \
+                 buys a rebuild and no correctness"
+            );
+        }
+    }
+
+    /// A file's totals degrade the same way — a combined build that parked leaves a conservative
+    /// per-import sum, and the L1 file-size cache would serve it for the whole TTL.
+    #[test]
+    fn a_transiently_degraded_file_total_is_never_written_to_the_l1_cache() {
+        let degraded = |stage: &str| FileSizeComputation {
+            raw_bytes: 58,
+            error: None,
+            diagnostics: vec![ImportDiagnostic {
+                stage: stage.to_owned(),
+                message: "combined file-size build failed for this runtime".to_owned(),
+                details: Vec::new(),
+            }],
+            ..FileSizeComputation::default()
+        };
+
+        assert!(!degraded(stage::TIMEOUT).is_cacheable());
+        assert!(!degraded(stage::PANIC).is_cacheable());
+        assert!(
+            degraded("minify").is_cacheable(),
+            "a minify failure is deterministic; it is cached like any other real answer"
+        );
+        assert!(FileSizeComputation::default().is_cacheable());
     }
 }

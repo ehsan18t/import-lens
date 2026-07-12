@@ -17,10 +17,7 @@ use futures_util::FutureExt;
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
-use super::{
-    BundleArtifact, BundleFailure, BundleRequest, EngineBudget, ImportRuntime, RolldownEngine,
-    stage,
-};
+use super::{BundleArtifact, BundleFailure, BundleRequest, ImportRuntime, RolldownEngine, stage};
 
 /// Spec §9: two concurrent builds bound peak memory while keeping one slow
 /// build from serializing the daemon. Public so miss-draining loops size
@@ -40,37 +37,31 @@ pub const ENGINE_PERMITS: usize = 2;
 
 /// Upper bound on a single engine build.
 ///
-/// **It exists to bound a hang, not to police slowness.** `catch_unwind` only sees a panic
-/// that unwinds *to us*, and the panic that matters does not. Rolldown fans every module out
-/// onto its own `tokio::spawn`ed task (`module_loader.rs`), and a panic in one of those tasks
-/// is swallowed by Tokio: the task dies without sending its `*Done` message, the loader's
-/// `remaining` counter never reaches zero, and — because the loader itself holds a clone of
-/// the message sender — its `rx.recv()` never returns `None` either. The build future parks
-/// forever. Nothing unwinds, so nothing is caught; the permit and the in-flight guard are
+/// **It exists so a permit is never held forever, not to police slowness.** `catch_unwind` only
+/// sees a panic that unwinds *to us*, and the panic that matters does not. Rolldown fans every
+/// module out onto its own `tokio::spawn`ed task (`module_loader.rs`), and a panic in one of
+/// those tasks is swallowed by Tokio: the task dies without sending its `*Done` message, the
+/// loader's `remaining` counter never reaches zero, and — because the loader itself holds a
+/// clone of the message sender — its `rx.recv()` never returns `None` either. The build future
+/// parks forever. Nothing unwinds, so nothing is caught; the permit and the in-flight guard are
 /// never released, and `ENGINE_PERMITS` such packages wedge every later build in the daemon's
 /// lifetime. Dropping the timed-out future is the containment: it releases the permit and the
 /// `InFlight` guard, and the import degrades to one typed `timeout` failure.
 ///
-/// **This value MUST stay below the tightest client deadline it serves.** The extension's
-/// interactive requests give up after 10s (`extension/src/ipc/client.ts`, default
-/// `timeoutMs = 10000`) and none of the analyze/exports/completions/file-size callers raise
-/// it. A build timeout above that deadline contains nothing: the parked build still outlives
-/// the client's patience, and the extension rejects the *entire* `AnalyzeDocumentResponse` —
-/// including every import in that document already answered from cache.
-///
-/// **It bounds one build, and only one build.** A permit is acquired *outside* it, so parked
-/// builds queue rather than merely run late, and enough of them serialize a single request past
-/// its client deadline however short this value is. That bound belongs to the request, not to
-/// the build: see [`super::budget`], whose deadline every build here is also held to, and which
-/// is re-checked *after* the permit precisely because a build can sit in that queue for as long
-/// as the builds ahead of it park. This constant is the hard ceiling on a build that is admitted;
-/// the request's remaining budget can only make it shorter.
+/// **It bounds a BUILD, and nothing else.** It does not bound a request, and it no longer needs
+/// to: an interactive request does not wait for the builds its imports miss on. It answers with
+/// what the cache already holds, and each build is delivered to the client over the push channel
+/// as it lands (`ipc::server`, `RefreshedResults`). A parked build therefore delays exactly one
+/// import's number, and cannot touch the response the other imports ride in — which is what the
+/// request-scoped engine budget was invented to do, at the price of degrading healthy packages
+/// and writing those degraded numbers to the cache. Deleted; this is the one timeout the design
+/// genuinely needs.
 ///
 /// 8s is 16x the §10.6 cold-p95 gate (500 ms) and ~160x the measured cold p95 (52 ms): a build
 /// that reaches it is pathological by construction. The limit is deliberately flat and not
 /// varied by `BundlePurpose` — no purpose identifies a deadline (`ImportSize` serves both the
-/// 10s interactive path and the 300s workspace report), which is exactly why the deadline is
-/// threaded down from the IPC request layer, the only layer that knows it.
+/// interactive path and the workspace report), and with no client waiting on a build, none has
+/// any reason to be cut shorter than another.
 const BUILD_TIMEOUT: Duration = Duration::from_secs(8);
 
 static PERMITS: Semaphore = Semaphore::const_new(ENGINE_PERMITS);
@@ -133,11 +124,10 @@ impl Drop for InFlight {
     }
 }
 
-/// Everything that has to happen inside the permit: the deadline re-check, the in-flight
-/// guard, the build timeout, and the `catch_unwind`. However the build ends — value, unwind,
-/// or cancellation — the permit and the guard are released before this returns.
+/// Everything that has to happen inside the permit: the in-flight guard, the build timeout, and
+/// the `catch_unwind`. However the build ends — value, unwind, or cancellation — the permit and
+/// the guard are released before this returns.
 async fn with_permit<T>(
-    budget: EngineBudget,
     cap: Duration,
     work: impl Future<Output = Result<T, BundleFailure>>,
 ) -> Result<T, BundleFailure> {
@@ -146,22 +136,11 @@ async fn with_permit<T>(
         .await
         .expect("engine permit semaphore is never closed");
 
-    // The re-check, and the reason the budget exists at all. A build that waited here while the
-    // builds ahead of it parked has spent the request's time doing nothing, and admitting it now
-    // would start a FRESH `cap` clock — which is how one document used to serialize into two
-    // build timeouts and lose its whole response, cached hits included. It abandons instead.
-    //
-    // Before `InFlight::enter`, deliberately: a build that never ran must not be counted as
-    // started, or `builds_started()` stops being able to tell us whether this works.
-    let Some(limit) = budget.build_limit(cap) else {
-        return Err(budget_spent_failure());
-    };
-
     let _in_flight = InFlight::enter();
-    match tokio::time::timeout(limit, AssertUnwindSafe(work).catch_unwind()).await {
+    match tokio::time::timeout(cap, AssertUnwindSafe(work).catch_unwind()).await {
         Ok(Ok(result)) => result,
         Ok(Err(payload)) => Err(panic_failure(&payload)),
-        Err(_elapsed) => Err(timeout_failure(limit)),
+        Err(_elapsed) => Err(timeout_failure(cap)),
     }
 }
 
@@ -176,13 +155,12 @@ async fn with_permit<T>(
 /// The build limit covers the panic that never unwinds at all: one inside a module task
 /// Rolldown spawned, which parks the build forever. See `BUILD_TIMEOUT`.
 fn run_on_engine<T: Send + 'static>(
-    budget: EngineBudget,
     cap: Duration,
     work: impl Future<Output = Result<T, BundleFailure>> + Send + 'static,
 ) -> Result<T, BundleFailure> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     engine_runtime().spawn(async move {
-        let outcome = with_permit(budget, cap, work).await;
+        let outcome = with_permit(cap, work).await;
         let _ = sender.send(outcome);
     });
 
@@ -233,70 +211,23 @@ fn timeout_failure(limit: Duration) -> BundleFailure {
     }
 }
 
-/// A build that was never started because the request had no engine time left (`super::budget`).
+/// Run one bundle build behind the daemon-wide permit pool, from a synchronous caller.
 ///
-/// It reports the same `timeout` stage as a build that ran out of time, because from the caller's
-/// side these are one event: an engine build that could not produce a number inside the deadline
-/// the client is waiting on. Both degrade the same way.
-fn budget_spent_failure() -> BundleFailure {
-    BundleFailure {
-        stage: stage::TIMEOUT.to_owned(),
-        message: "this request had no engine time left, so the build was not started: earlier \
-                  builds in the same request did not complete within their limit, and running \
-                  another one would only push the response past the deadline the client is \
-                  waiting on"
-            .to_owned(),
-        diagnostics: Vec::new(),
-        loaded_paths: Vec::new(),
-    }
+/// The build limit is a property of this boundary, not of the request: §5 keeps `BundleRequest`
+/// a description of **what to build** — entries, runtime, purpose — which `adapter.rs` turns
+/// into an artifact. Admission control is owned here, and the engine has no business reading it.
+pub fn bundle_sync(request: BundleRequest) -> Result<BundleArtifact, BundleFailure> {
+    run_on_engine(BUILD_TIMEOUT, ENGINE.bundle(request))
 }
 
-/// The request's engine budget plus the permit pool: the whole path from a synchronous caller
-/// into the engine, so no caller can take one guard without the other.
-fn guarded<T: Send + 'static>(
-    budget: EngineBudget,
-    cap: Duration,
-    work: impl Future<Output = Result<T, BundleFailure>> + Send + 'static,
-) -> Result<T, BundleFailure> {
-    // Checked *before* queueing for a permit as well as after acquiring one. A request with
-    // nothing left to spend must not even join the queue: it returns now, and the caller falls
-    // back to static sizing, which needs no permit and no engine.
-    if budget.build_limit(cap).is_none() {
-        return Err(budget_spent_failure());
-    }
-
-    run_on_engine(budget, cap, work)
-}
-
-/// Run one bundle build behind the daemon-wide permit pool, from a synchronous caller, within
-/// what is left of the calling request's engine budget.
-///
-/// The budget is a *parameter* rather than a field of `BundleRequest` on purpose. §5 keeps
-/// `BundleRequest` a description of **what to build** — entries, runtime, purpose — which
-/// `adapter.rs` turns into an artifact. A deadline is not an input to a build; it is admission
-/// control, owned by this boundary, and the engine has no business reading it. Putting it in the
-/// request would push a scheduling concern through every engine-facing type and let a future
-/// adapter make a build's *result* depend on how long its caller had been waiting.
-pub fn bundle_sync(
-    request: BundleRequest,
-    budget: EngineBudget,
-) -> Result<BundleArtifact, BundleFailure> {
-    guarded(budget, BUILD_TIMEOUT, ENGINE.bundle(request))
-}
-
-/// Synchronous export enumeration through the same permit pool and the same request budget
-/// (§8.4). An enumeration builds the same package graph as a size build, so it parks on exactly
-/// the same module task and must be held to exactly the same bound.
+/// Synchronous export enumeration through the same permit pool and the same build limit (§8.4).
+/// An enumeration builds the same package graph as a size build, so it parks on exactly the same
+/// module task and must be held to exactly the same bound.
 pub fn enumerate_exports_sync(
     entry_path: PathBuf,
     runtime: ImportRuntime,
-    budget: EngineBudget,
 ) -> Result<super::ExportEnumeration, BundleFailure> {
-    guarded(
-        budget,
-        BUILD_TIMEOUT,
-        ENGINE.enumerate_exports(entry_path, runtime),
-    )
+    run_on_engine(BUILD_TIMEOUT, ENGINE.enumerate_exports(entry_path, runtime))
 }
 
 /// Highest number of builds ever observed in flight; the boundary's
@@ -313,30 +244,23 @@ pub fn builds_started() -> usize {
     STARTED.load(Ordering::Relaxed)
 }
 
-/// Drives a build future that panics, through the real budget/permit/runtime path. Exists so
-/// the isolation guarantee is tested against the boundary that ships, not a mock.
+/// Drives a build future that panics, through the real permit/runtime path. Exists so the
+/// isolation guarantee is tested against the boundary that ships, not a mock.
 #[doc(hidden)]
 pub fn bundle_sync_for_test_panic() -> Result<BundleArtifact, BundleFailure> {
-    guarded(EngineBudget::interactive(), BUILD_TIMEOUT, async {
-        panic!("synthetic engine panic")
-    })
+    run_on_engine(BUILD_TIMEOUT, async { panic!("synthetic engine panic") })
 }
 
-/// Drives a build future that never completes, through the real budget/permit/runtime path.
-/// This is what a panic inside a Rolldown-spawned module task looks like from here: no unwind,
-/// no value, just a parked future holding a permit.
+/// Drives a build future that never completes, through the real permit/runtime path. This is
+/// what a panic inside a Rolldown-spawned module task looks like from here: no unwind, no value,
+/// just a parked future holding a permit.
 ///
-/// The caller supplies both limits so a test can play out in milliseconds what production plays
-/// out in seconds: `cap` stands in for `BUILD_TIMEOUT`, and `budget` for the deadline the request
-/// arrived with. The code path is otherwise identical to `bundle_sync` — same `guarded`, same
-/// pre-permit check, same post-permit re-check, same counters.
+/// The caller supplies the limit so a test can play out in milliseconds what production plays
+/// out in seconds: `cap` stands in for `BUILD_TIMEOUT`. The code path is otherwise identical to
+/// `bundle_sync` — same permit, same timeout, same counters.
 #[doc(hidden)]
-pub fn bundle_sync_for_test_hang(
-    cap: Duration,
-    budget: EngineBudget,
-) -> Result<BundleArtifact, BundleFailure> {
-    guarded(
-        budget,
+pub fn bundle_sync_for_test_hang(cap: Duration) -> Result<BundleArtifact, BundleFailure> {
+    run_on_engine(
         cap,
         std::future::pending::<Result<BundleArtifact, BundleFailure>>(),
     )

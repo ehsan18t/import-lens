@@ -13,7 +13,7 @@
 //! `module_graph_carries_content_hash_for_loaded_modules`).
 
 use import_lens_daemon::engine::{
-    BundleEntry, BundlePurpose, BundleRequest, BundleSelection, EngineBudget, boundary,
+    BundleEntry, BundlePurpose, BundleRequest, BundleSelection, boundary,
 };
 use import_lens_daemon::ipc::protocol::ImportRuntime;
 use import_lens_daemon::pipeline::resolver::SideEffectsMode;
@@ -32,19 +32,16 @@ fn bundle(
     entry_path: PathBuf,
     package_root: PathBuf,
 ) -> import_lens_daemon::engine::BundleArtifact {
-    boundary::bundle_sync(
-        BundleRequest {
-            entries: vec![BundleEntry {
-                entry_path,
-                package_root,
-                selection: BundleSelection::Named(vec!["used".to_owned()]),
-                reported_side_effects: SideEffectsMode::False,
-            }],
-            runtime: ImportRuntime::Component,
-            purpose: BundlePurpose::ImportSize,
-        },
-        EngineBudget::interactive(),
-    )
+    boundary::bundle_sync(BundleRequest {
+        entries: vec![BundleEntry {
+            entry_path,
+            package_root,
+            selection: BundleSelection::Named(vec!["used".to_owned()]),
+            reported_side_effects: SideEffectsMode::False,
+        }],
+        runtime: ImportRuntime::Component,
+        purpose: BundlePurpose::ImportSize,
+    })
     .expect("bundle should succeed")
 }
 

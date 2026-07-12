@@ -205,7 +205,6 @@ fn dangling_binding_gate_is_not_vacuous() {
 #[tokio::test]
 #[ignore = "requires installed fixtures (scripts/prepare-candidate-fixtures.mjs); qualification-only"]
 async fn the_parse_based_default_probe_agrees_with_engine_enumeration() {
-    use import_lens_daemon::engine::EngineBudget;
     use import_lens_daemon::engine::boundary::enumerate_exports_sync;
     use import_lens_daemon::prefetch::entry_exposes_default_export;
 
@@ -223,13 +222,9 @@ async fn the_parse_based_default_probe_agrees_with_engine_enumeration() {
     ] {
         let entry =
             common::engine_fixtures::resolve_fixture_entry(&workspace, package, version, "any");
-        let engine = enumerate_exports_sync(
-            entry.entry_path.clone(),
-            ImportRuntime::default(),
-            EngineBudget::interactive(),
-        )
-        .map(|enumeration| enumeration.names.iter().any(|name| name == "default"))
-        .unwrap_or(true);
+        let engine = enumerate_exports_sync(entry.entry_path.clone(), ImportRuntime::default())
+            .map(|enumeration| enumeration.names.iter().any(|name| name == "default"))
+            .unwrap_or(true);
         let parsed = entry_exposes_default_export(&entry.entry_path);
         if engine != parsed {
             disagreements.push(format!("{package}: engine={engine} parse={parsed}"));

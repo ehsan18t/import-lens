@@ -259,6 +259,38 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   the old engine's conservative full-graph inclusion; Rolldown shakes pure unused exports
   under `sideEffects: true`, so each import kind now computes its own entry.
 
+### D13 — A transiently-degraded result is never cached, but IS pushed · 2026-07-13
+- **Context:** the streaming redesign (`AnalyzeDocument` answers from cache and pushes each
+  import as its build lands) deleted the per-request engine budget. Both the budget's
+  abandoned builds and a real `BUILD_TIMEOUT` / `panic` / `engine_gone` leave the pipeline
+  with only the conservative static fallback — which carries `error: None` and a plausible
+  byte count, and so passed the old `should_cache_result` (`error.is_none()`) unchallenged.
+  That is how one parked build taught the cache that a healthy 17,550-byte package weighs 58
+  bytes, for a whole cache generation.
+- **Decision (cache):** every cache and memo gates on the failure STAGE, not merely on
+  `error`. `engine::stage::is_transient` (`timeout` | `panic` | `engine_gone`) is the single
+  source of truth; `should_cache_result` and `FileSizeComputation::is_cacheable` consult it,
+  covering L1 memory, L2 disk, and the L1 aggregate file-size cache. The full-package and
+  export-list build memos and the dependency-path index need no gate — they are written only
+  on the success path. A DETERMINISTIC failure (`parse`, `link`, `module_graph_limit`, a
+  minify failure) is still cached: it is a fact about the code, and re-deriving it costs a
+  full build to learn the same thing. The full-package comparison now reports its failure
+  under the stage it failed at rather than a `full_package_comparison` literal, which is both
+  what §12 asks for and what lets this gate see it — a `truly_treeshakeable: false` produced
+  by a build that merely parked is as fabricated as a fabricated size.
+- **Decision (push) — amends D8:** D8 coupled the SWR push to cacheability so display and
+  cache can never disagree. That coupling holds for SWR and is now strictly stronger (a
+  transiently-degraded revalidation is dropped, so a good stale size on screen survives a
+  parked rebuild). It deliberately does NOT hold for the streaming push: an import the
+  response answered `loading` has no previous value to protect, and withholding its result
+  would leave it reading "Calculating…" for the rest of the session. So the streaming push
+  delivers whatever the build produced, and the client-side merge carries the distinction
+  instead — an errored/degraded result may FILL a state with no result, and may never REPLACE
+  one that has (`mergeRefreshedResults`).
+- **Consequences / status:** the degraded value is displayed (low confidence, with its stage
+  diagnostic) but is not persisted, so the next read of that import recomputes rather than
+  serving the accident back. Lands with the streaming-redesign commit; SRS FR-026c.
+
 ---
 
 ## Parked / deferred

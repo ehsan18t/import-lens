@@ -12,7 +12,6 @@
 //! memo are process-global, so this test owns its binary: a neighbouring test
 //! bundling anything at all would corrupt the deltas.
 
-use import_lens_daemon::engine::EngineBudget;
 use import_lens_daemon::engine::boundary::builds_started;
 use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
 use import_lens_daemon::pipeline::analyze::{AnalysisContext, analyze_import};
@@ -63,7 +62,6 @@ fn analyze(workspace: &Path, name: &str) -> usize {
         &AnalysisContext {
             workspace_root: workspace.to_path_buf(),
             active_document_path: workspace.join("src").join("app.ts"),
-            engine_budget: EngineBudget::interactive(),
         },
         &ImportRequest {
             specifier: "pkg".to_owned(),

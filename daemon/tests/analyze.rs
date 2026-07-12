@@ -1,4 +1,3 @@
-use import_lens_daemon::engine::EngineBudget;
 use import_lens_daemon::ipc::protocol::{
     ConfidenceLevel, ImportKind, ImportRequest, ImportRuntime,
 };
@@ -57,7 +56,6 @@ fn fixture_context(fixture: &Path) -> AnalysisContext {
     AnalysisContext {
         workspace_root: fixture.to_path_buf(),
         active_document_path: fixture.join("src").join("app.ts"),
-        engine_budget: EngineBudget::interactive(),
     }
 }
 
@@ -173,7 +171,6 @@ fn analyze_import_computes_static_sizes_for_local_package_entry() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path,
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "tiny-lib".to_owned(),
@@ -215,7 +212,6 @@ fn analyze_import_reports_declared_side_effects() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let named = analyze_import(
@@ -259,7 +255,6 @@ fn analyze_import_reports_missing_side_effect_metadata_conservatively() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let named = analyze_import(
@@ -315,7 +310,6 @@ fn analyze_named_import_excludes_dependency_used_only_by_unreachable_export() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let named = analyze_import(
@@ -380,7 +374,6 @@ fn analyze_truly_treeshakeable_uses_minified_size_ratio() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -426,7 +419,6 @@ fn analyze_dynamic_import_measures_full_module_graph() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let named = analyze_import(
@@ -488,7 +480,6 @@ fn analyze_import_reports_missing_named_export_as_zero_size_error() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -532,7 +523,6 @@ fn analyze_import_reports_missing_esm_default_export_as_zero_size_error() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -582,7 +572,6 @@ fn analyze_invalid_package_json_returns_approximate_directory_size() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "invalid-manifest-lib".to_owned(),
@@ -629,7 +618,6 @@ fn analyze_versionless_package_json_returns_approximate_directory_size() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "versionless-lib".to_owned(),
@@ -666,7 +654,6 @@ fn analyze_namespace_import_preserves_the_engine_failure_stage() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -705,7 +692,6 @@ fn analyze_named_import_falls_back_to_static_entry_after_engine_failure() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -751,7 +737,6 @@ fn analyze_invalid_semantic_module_falls_back_at_minify_boundary() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -789,7 +774,6 @@ fn analyze_import_returns_partial_error_result_on_missing_entry() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "broken-lib".to_owned(),
@@ -840,7 +824,6 @@ fn analyze_declaration_only_package_returns_zero_runtime_cost() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "@types/demo".to_owned(),
@@ -890,7 +873,6 @@ fn analyze_declaration_only_detection_requires_declaration_files() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "empty-runtime-lib".to_owned(),
@@ -933,7 +915,6 @@ fn analyze_import_resolves_dotted_nestjs_style_subpath() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("app.module.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "@nestjs/common/interfaces/modules/dynamic-module.interface".to_owned(),
@@ -973,7 +954,6 @@ fn analyze_import_resolves_package_from_active_document_tree() {
     let context = AnalysisContext {
         workspace_root: frontend,
         active_document_path: backend.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "dayjs/plugin/utc".to_owned(),
@@ -1016,7 +996,6 @@ fn analyze_commonjs_literal_require_graph_includes_required_modules() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "cjs-graph-lib".to_owned(),
@@ -1076,7 +1055,6 @@ fn analyze_commonjs_graph_keeps_complete_internal_contribution_data() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "cjs-wide-graph-lib".to_owned(),
@@ -1130,7 +1108,6 @@ fn analyze_commonjs_literal_require_resolves_directory_package_manifest() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "cjs-dir-require-lib".to_owned(),
@@ -1187,7 +1164,6 @@ fn analyze_commonjs_bracket_exports_include_required_modules() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -1244,7 +1220,6 @@ fn analyze_commonjs_ignores_require_inside_regex_literal() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -1300,7 +1275,6 @@ fn analyze_commonjs_scans_require_inside_template_expressions_only() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -1352,7 +1326,6 @@ fn analyze_commonjs_module_exports_object_reports_named_exports() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "object-cjs-lib".to_owned(),
@@ -1394,7 +1367,6 @@ fn analyze_import_rejects_unsafe_package_names() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "../outside".to_owned(),
@@ -1440,7 +1412,6 @@ fn analyze_import_resolves_subpath_via_exports_map() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("App.svelte"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "svelte/transition".to_owned(),
@@ -1483,7 +1454,6 @@ fn analyze_import_resolves_root_entry_via_exports_dot() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "modern-pkg".to_owned(),
@@ -1520,7 +1490,6 @@ fn analyze_import_resolves_string_shorthand_exports() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("app.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "simple-esm".to_owned(),
@@ -1564,7 +1533,6 @@ fn analyze_import_resolves_conditional_exports_with_nested_conditions() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "cond-pkg/utils".to_owned(),
@@ -1606,7 +1574,6 @@ fn analyze_import_resolves_wildcard_exports_pattern() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "wildcard-pkg/helpers".to_owned(),
@@ -1648,7 +1615,6 @@ fn analyze_import_errors_on_unmapped_subpath_when_exports_present() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "strict-pkg/internal/secret".to_owned(),
@@ -1695,7 +1661,6 @@ fn analyze_import_resolves_array_fallback_exports() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("app.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "array-pkg".to_owned(),
@@ -1734,7 +1699,6 @@ fn analyze_import_resolves_top_level_condition_map_exports() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "condtop-pkg".to_owned(),
@@ -1789,7 +1753,6 @@ fn analyze_import_transforms_typescript_jsx_and_type_only_modules() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "ts-pkg".to_owned(),
@@ -1846,7 +1809,6 @@ fn analyze_import_resolves_typescript_source_via_js_extension_alias() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "alias-ts-pkg".to_owned(),
@@ -1882,7 +1844,6 @@ fn analyze_import_includes_json_import_as_synthetic_js() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "json-pkg".to_owned(),
@@ -1928,7 +1889,6 @@ fn analyze_import_falls_back_for_oversized_entries() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "huge-pkg".to_owned(),
@@ -1974,7 +1934,6 @@ fn analyze_import_analyzes_typescript_scale_entries() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("main.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
     let request = ImportRequest {
         specifier: "large-pkg".to_owned(),
@@ -2016,7 +1975,6 @@ fn a_fallback_diagnostic_never_collapses_the_failure_stage() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(
@@ -2064,7 +2022,6 @@ fn string_form_side_effects_is_treated_as_a_one_pattern_glob() {
     let context = AnalysisContext {
         workspace_root: workspace.clone(),
         active_document_path: workspace.join("src").join("index.ts"),
-        engine_budget: EngineBudget::interactive(),
     };
 
     let result = analyze_import(

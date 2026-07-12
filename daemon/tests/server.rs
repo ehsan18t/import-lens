@@ -2,12 +2,13 @@ use import_lens_daemon::{
     ipc::{
         codec::{FrameDecoder, decode_payload, encode_frame},
         protocol::{
-            AnalyzePackageJsonRequest, AnalyzePackageJsonResponse, BatchRequest, BatchResponse,
-            CacheStatusRequest, CacheStatusResponse, FileSizeDocumentRequest,
-            FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse, FreshnessKind,
-            HelloMessage, ImportAnalysisStatus, ImportKind, ImportRequest, ImportRuntime,
-            PROTOCOL_VERSION, RefreshRegistryHintsRequest, RefreshRegistryHintsResponse,
-            RefreshedResultsResponse, RegistryHintMode, RegistryHintTarget, ShutdownMessage,
+            AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
+            AnalyzePackageJsonResponse, BatchRequest, BatchResponse, CacheStatusRequest,
+            CacheStatusResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
+            FileSizeRequest, FileSizeResponse, FreshnessKind, HelloMessage, ImportAnalysisStatus,
+            ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION,
+            RefreshRegistryHintsRequest, RefreshRegistryHintsResponse, RefreshedResultsResponse,
+            RegistryHintMode, RegistryHintTarget, ShutdownMessage,
         },
         server::{handle_connection, response_from_join},
     },
@@ -797,6 +798,42 @@ impl RawFrameReader {
     }
 }
 
+fn analyze_document(
+    workspace: &Path,
+    document: &Path,
+    source: &str,
+    request_id: u64,
+) -> AnalyzeDocumentRequest {
+    AnalyzeDocumentRequest {
+        message_type: "analyze_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document.to_string_lossy().to_string(),
+        source: source.to_owned(),
+    }
+}
+
+/// Read `count` streamed import results, the way the extension does: the analysis response comes
+/// back with `loading` placeholders and each import arrives afterwards on its own push.
+async fn collect_streamed_imports(
+    reader: &mut RawFrameReader,
+    stream: &mut DuplexStream,
+    count: usize,
+) -> Vec<RefreshedResultsResponse> {
+    let mut pushes = Vec::new();
+    while pushes.len() < count {
+        let push: RefreshedResultsResponse = tokio::time::timeout(Duration::from_secs(10), async {
+            decode_payload(&reader.next_payload(stream).await)
+                .expect("a streamed import push should decode")
+        })
+        .await
+        .expect("every loading import must arrive on the push channel");
+        pushes.push(push);
+    }
+    pushes
+}
+
 fn file_size_document(
     workspace: &Path,
     document: &Path,
@@ -815,6 +852,117 @@ fn file_size_document(
         // resulting SWR push echoes it back for the client's supersession guard.
         analysis_generation: Some(request_id),
     }
+}
+
+/// The whole point of the redesign, end to end.
+///
+/// A cold document's imports are not in the cache, and the response does not wait for them: it
+/// comes back at once with a `loading` placeholder per import, and each import arrives afterwards
+/// on the push channel as its build lands. Before this, the response carried every import or
+/// none — so one package that parked the bundler pushed the response past the extension's 10s
+/// deadline and the client discarded the ENTIRE document, cached hits included.
+///
+/// The placeholders are what make the pushes deliverable: the client rebuilds a document's state
+/// from `imports`, and a push can only update a state that exists.
+#[tokio::test]
+async fn a_cold_document_answers_at_once_and_streams_each_import_as_it_lands() {
+    let workspace = temp_workspace();
+    write_tiny_package(&workspace);
+    write_heavy_package(&workspace);
+    let document = workspace.join("src").join("index.ts");
+    let source = "import { value } from 'tiny-stream-lib';\n\
+                  import * as heavy from 'heavy-stream-lib';\n\
+                  export const total = [value, heavy];\n";
+    fs::write(&document, source).expect("document should be written");
+
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new(None, false)),
+            Prefetcher::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = RawFrameReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+    client_stream
+        .write_all(
+            &encode_frame(&analyze_document(&workspace, &document, source, 7))
+                .expect("request should encode"),
+        )
+        .await
+        .expect("request should be written");
+
+    let response: AnalyzeDocumentResponse =
+        decode_payload(&reader.next_payload(&mut client_stream).await)
+            .expect("analysis response should decode");
+    assert_eq!(response.request_id, 7);
+    assert_eq!(response.error, None);
+    assert_eq!(response.imports.len(), 2);
+    assert!(
+        response
+            .imports
+            .iter()
+            .all(|item| item.status == ImportAnalysisStatus::Loading && item.result.is_none()),
+        "a cold document must answer with placeholders, not wait for the engine: {:?}",
+        response.imports
+    );
+    assert!(
+        response
+            .imports
+            .iter()
+            .all(|item| item.request.is_some() && item.message.is_none()),
+        "a loading import still carries its resolved request, and is not an error"
+    );
+
+    // Every one of them then arrives on the push channel, addressed by identity and stamped with
+    // the analysis generation the client uses to drop a superseded batch.
+    let pushes = collect_streamed_imports(&mut reader, &mut client_stream, 2).await;
+    let mut delivered = pushes
+        .iter()
+        .flat_map(|push| {
+            assert_eq!(push.message_type, "refreshed_results");
+            assert_eq!(push.document_path, document.to_string_lossy());
+            assert_eq!(push.generation, Some(7));
+            assert_eq!(push.results.len(), push.identities.len());
+            push.identities
+                .iter()
+                .zip(&push.results)
+                .map(|(identity, result)| {
+                    assert!(result.error.is_none(), "{result:?}");
+                    assert!(
+                        result.brotli_bytes > 0,
+                        "a streamed import carries a real size"
+                    );
+                    identity.specifier.clone()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    delivered.sort();
+    assert_eq!(delivered, vec!["heavy-stream-lib", "tiny-stream-lib"]);
+
+    client_stream
+        .write_all(
+            &encode_frame(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("shutdown should encode"),
+        )
+        .await
+        .expect("shutdown should be written");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should exit cleanly");
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
 #[tokio::test]
@@ -843,7 +991,20 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
         .await
         .expect("hello should be written");
 
-    // First request populates the cache with a Fresh entry.
+    // Seed the cache the way the editor does: the document analysis is what builds a document's
+    // imports (the file-size read only sizes the file), and its results land on the push channel.
+    client_stream
+        .write_all(
+            &encode_frame(&analyze_document(&workspace, &document, source, 0))
+                .expect("request should encode"),
+        )
+        .await
+        .expect("request should be written");
+    let _: AnalyzeDocumentResponse = decode_payload(&reader.next_payload(&mut client_stream).await)
+        .expect("analysis response should decode");
+    collect_streamed_imports(&mut reader, &mut client_stream, 1).await;
+
+    // The first size read now hits that warm cache with a Fresh entry.
     client_stream
         .write_all(
             &encode_frame(&file_size_document(&workspace, &document, source, 1))
@@ -855,6 +1016,11 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
         decode_payload(&reader.next_payload(&mut client_stream).await)
             .expect("first response should decode");
     assert_eq!(first.request_id, 1);
+    assert_eq!(
+        first.imports.len(),
+        1,
+        "the size read serves the import the analysis already built: {first:?}"
+    );
 
     // Change the resolved dependency so the cached entry is stale, and bump the cache
     // generation so the next read takes the slow (re-validating) path.

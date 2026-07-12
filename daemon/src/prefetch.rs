@@ -1,6 +1,6 @@
 use crate::{
     cache::key::{CacheIdentity, decode_cache_identity},
-    engine::{EngineBudget, scheduling::drain_ordered},
+    engine::scheduling::drain_ordered,
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
@@ -333,10 +333,6 @@ fn run_prewarm_job(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| active_document_path.clone()),
         active_document_path,
-        // Prewarm answers no request: nobody is waiting on a deadline, and abandoning a build
-        // here would only mean the user pays for it later, in the request that does wait. Each
-        // build is still capped by `BUILD_TIMEOUT`, so a parked one cannot hold a permit.
-        engine_budget: EngineBudget::background(),
     };
 
     drain_ordered(&jobs, |_, job| {
@@ -380,7 +376,6 @@ fn run_recent_prewarm_job(
     let context = AnalysisContext {
         workspace_root,
         active_document_path,
-        engine_budget: EngineBudget::background(),
     };
     drain_ordered(&jobs, |_, job| {
         if cancellation.is_current(generation) {
