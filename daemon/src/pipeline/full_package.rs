@@ -33,6 +33,23 @@ const MAX_ENTRIES: usize = 256;
 struct Memo {
     minified_len: u64,
     fingerprints: Vec<FileFingerprint>,
+    /// The cache generation this length was measured under.
+    ///
+    /// Fingerprints alone are not enough. `first_party_manifests` deliberately skips
+    /// anything under `node_modules`, because an installed manifest cannot change
+    /// without an install — and an install bumps the generation, which is what the
+    /// import cache leans on. A memo with no generation would not get that backstop:
+    /// `pnpm install` could repoint a dependency's `exports` at a different file
+    /// while leaving its sources byte-identical, and every fingerprint would still
+    /// hash clean over a length measured against the *old* resolution.
+    ///
+    /// This is also what makes the memo obey `invalidate_package` / `invalidate_all`
+    /// — the user's "clear the cache" escape hatch — without either having to know it
+    /// exists.
+    generation: u64,
+    /// Identifies this exact stored value, so a lookup that found it stale can drop
+    /// *it* rather than whatever a concurrent store may have put there since.
+    stamp: u64,
     used_at: u64,
 }
 
@@ -45,51 +62,84 @@ fn tick() -> u64 {
 }
 
 /// The memoized full-package minified length, if one was stored for this entry
-/// and every file it was measured from is still current. A stale or vanished
-/// dependency drops the memo, so the caller rebuilds.
+/// under the current cache generation and every file it was measured from is
+/// still current. Anything else rebuilds.
 pub(crate) fn lookup(entry_path: &Path, runtime: ImportRuntime) -> Option<u64> {
     let key = (entry_path.to_path_buf(), runtime);
-    let fingerprints = {
-        let memos = MEMOS
+    let generation = crate::cache::memory::cache_generation();
+
+    let (minified_len, fingerprints, stamp) = {
+        let mut memos = MEMOS
             .lock()
             .expect("full-package memo should not be poisoned");
-        memos.get(&key)?.fingerprints.clone()
+        let memo = memos.get(&key)?;
+        if memo.generation != generation {
+            memos.remove(&key);
+            return None;
+        }
+        (memo.minified_len, memo.fingerprints.clone(), memo.stamp)
     };
 
     // Never hold the lock across the freshness check: it stats, and may read and
     // hash, every module in the package graph.
-    if check_fingerprints_strict(&fingerprints) != Freshness::Fresh {
-        MEMOS
-            .lock()
-            .expect("full-package memo should not be poisoned")
-            .remove(&key);
-        return None;
+    match check_fingerprints_strict(&fingerprints) {
+        Freshness::Fresh => {}
+        // `Unknown` is a transient stat/read failure — a file locked by an antivirus
+        // scan, an offline mapped drive. The cache contract (see `cache::key`) is to
+        // KEEP such an entry rather than evict it; we simply decline to serve it, and
+        // rebuild. Evicting would throw away a still-good length and force a full
+        // build for as long as the condition lasted.
+        Freshness::Unknown => return None,
+        Freshness::Stale | Freshness::Gone => {
+            let mut memos = MEMOS
+                .lock()
+                .expect("full-package memo should not be poisoned");
+            // Drop the value we actually found stale, not whatever is there now: a
+            // concurrent lookup may already have rebuilt and stored one measured from
+            // the current bytes, and removing that would just buy another full build.
+            if memos.get(&key).is_some_and(|memo| memo.stamp == stamp) {
+                memos.remove(&key);
+            }
+            return None;
+        }
     }
 
-    let mut memos = MEMOS
+    if let Some(memo) = MEMOS
         .lock()
-        .expect("full-package memo should not be poisoned");
-    let memo = memos.get_mut(&key)?;
-    memo.used_at = tick();
-    Some(memo.minified_len)
+        .expect("full-package memo should not be poisoned")
+        .get_mut(&key)
+    {
+        memo.used_at = tick();
+    }
+    Some(minified_len)
 }
 
 /// Store a full-package length against the fingerprints of the exact bytes it was
 /// measured from. Storing nothing is always safe — the caller just rebuilds.
+///
+/// `generation` must be the cache generation observed *before* the build ran, not
+/// after — the same discipline `analyze_and_cache` uses. An invalidation that lands
+/// while the build is in flight must not be stamped onto a length measured from the
+/// bytes it invalidated.
 pub(crate) fn store(
     entry_path: &Path,
     runtime: ImportRuntime,
     minified_len: u64,
     fingerprints: Vec<FileFingerprint>,
+    generation: u64,
 ) {
     if fingerprints.is_empty() {
         return;
     }
 
+    let key = (entry_path.to_path_buf(), runtime);
     let mut memos = MEMOS
         .lock()
         .expect("full-package memo should not be poisoned");
-    if memos.len() >= MAX_ENTRIES {
+    // Only shed a victim when this insert actually grows the map. Re-storing a key
+    // that is already present would otherwise evict a live memo for nothing, and at
+    // a steady 256 entries every refresh would ratchet the map down by one.
+    if !memos.contains_key(&key) && memos.len() >= MAX_ENTRIES {
         let coldest = memos
             .iter()
             .min_by_key(|(_, memo)| memo.used_at)
@@ -99,10 +149,12 @@ pub(crate) fn store(
         }
     }
     memos.insert(
-        (entry_path.to_path_buf(), runtime),
+        key,
         Memo {
             minified_len,
             fingerprints,
+            generation,
+            stamp: tick(),
             used_at: tick(),
         },
     );

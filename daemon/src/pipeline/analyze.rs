@@ -340,29 +340,17 @@ pub(crate) fn analyze_with_rolldown_engine(
         && matches!(request.import_kind, ImportKind::Named)
         && !request.named.is_empty()
     {
-        let memoized = full_package::lookup(entry_path, request.runtime);
-        let full_len = match memoized {
-            Some(full_len) => Some(full_len),
-            None => match boundary::bundle_sync(BundleRequest {
+        let full_len = full_package::lookup(entry_path, request.runtime).or_else(|| {
+            // Read before the build, not after: an invalidation landing while this build
+            // is in flight must not be stamped onto a length measured from the bytes it
+            // invalidated.
+            let generation = crate::cache::memory::cache_generation();
+            let full = match boundary::bundle_sync(BundleRequest {
                 entries: vec![bundle_entry(BundleSelection::Full)],
                 runtime: request.runtime,
                 purpose: BundlePurpose::FullPackageComparison,
             }) {
-                Ok(full) => minify_source(&full.code, false).ok().map(|full_minified| {
-                    let full_len = full_minified.len() as u64;
-                    // A graph carrying a module the plugin could not fingerprint as it
-                    // read it (a binary module) has no complete read-time record, so
-                    // there is nothing to expire the memo against: measure, use, discard.
-                    if full.unhashed_paths.is_empty() {
-                        full_package::store(
-                            entry_path,
-                            request.runtime,
-                            full_len,
-                            full_package_fingerprints(context, package_root, &full),
-                        );
-                    }
-                    full_len
-                }),
+                Ok(full) => full,
                 Err(failure) => {
                     diagnostics.push(ImportDiagnostic {
                         stage: "full_package_comparison".to_owned(),
@@ -372,10 +360,25 @@ pub(crate) fn analyze_with_rolldown_engine(
                         ),
                         details: Vec::new(),
                     });
-                    None
+                    return None;
                 }
-            },
-        };
+            };
+
+            let full_len = minify_source(&full.code, false).ok()?.len() as u64;
+            // A graph carrying a module the plugin could not fingerprint as it read it
+            // (a binary module) has no complete read-time record, so there is nothing to
+            // expire a memo against: measure it, use it, and store nothing.
+            if full.unhashed_paths.is_empty() {
+                full_package::store(
+                    entry_path,
+                    request.runtime,
+                    full_len,
+                    full_package_fingerprints(context, package_root, &full),
+                    generation,
+                );
+            }
+            Some(full_len)
+        });
 
         if let Some(full_len) = full_len
             && full_len > 0

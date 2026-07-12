@@ -15,6 +15,7 @@
 use import_lens_daemon::engine::boundary::builds_started;
 use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
 use import_lens_daemon::pipeline::analyze::{AnalysisContext, analyze_import};
+use std::sync::Mutex;
 use std::{fs, path::Path, path::PathBuf};
 
 mod common;
@@ -43,6 +44,16 @@ fn write_alpha(workspace: &Path, body: &str) {
     let path = workspace.join("node_modules").join("pkg").join("alpha.js");
     fs::write(path, format!("export const alpha = () => '{body}';\n"))
         .expect("alpha should be written");
+}
+
+/// The build counter and the memo are process-global, and cargo runs the tests in
+/// one binary on parallel threads. Each test must own the process while it measures.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serialized() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn analyze(workspace: &Path, name: &str) -> usize {
@@ -79,6 +90,7 @@ fn temp_workspace() -> PathBuf {
 
 #[test]
 fn the_comparison_build_is_paid_once_per_entry_and_expires_on_edit() {
+    let _serial = serialized();
     let workspace = temp_workspace();
     write_package(&workspace);
 
@@ -105,6 +117,42 @@ fn the_comparison_build_is_paid_once_per_entry_and_expires_on_edit() {
         analyze(&workspace, "alpha"),
         2,
         "editing a module the comparison measured must expire the memo"
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+/// Fingerprints alone cannot make this memo safe, and a cache that only *usually*
+/// expires is worse than no cache: it puts a wrong number on screen.
+///
+/// `first_party_manifests` deliberately skips everything under `node_modules`,
+/// because an installed manifest cannot change without an install — and an install
+/// bumps the cache generation, which is the backstop the import cache leans on. A
+/// memo that ignored the generation would not get that backstop: `pnpm install`
+/// can repoint a dependency's `exports` at a different file while leaving its
+/// sources byte-identical, and every fingerprint the memo holds would still hash
+/// clean over a length measured against the *old* resolution. The same bump is
+/// what `invalidate_all` — the user's "clear the cache" escape hatch — relies on.
+///
+/// So: bump the generation and require the memo to rebuild, with no file touched.
+#[test]
+fn a_cache_generation_bump_expires_the_memo() {
+    let _serial = serialized();
+    let workspace = temp_workspace();
+    write_package(&workspace);
+
+    assert_eq!(analyze(&workspace, "alpha"), 2, "cold: entry + comparison");
+    assert_eq!(analyze(&workspace, "beta"), 1, "warm: comparison memoized");
+
+    // Exactly what invalidate_package / invalidate_all / node_modules_changed do.
+    import_lens_daemon::cache::memory::bump_cache_generation();
+
+    assert_eq!(
+        analyze(&workspace, "beta"),
+        2,
+        "a cache-generation bump must expire the memo even though no fingerprinted \
+         file changed — this is the only thing standing between a reinstall and a \
+         stale full-package length"
     );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
