@@ -897,7 +897,14 @@ where
                     // F3-B pre-recompute cancellation is scoped to this document:
                     // a newer size read for the same document supersedes the push,
                     // while unrelated prefetch/file-size work must not starve SWR.
-                    tokio::task::spawn_blocking(move || {
+                    //
+                    // Tracked, not detached. `SwrRefreshLifecycle`'s drop already tells a
+                    // revalidation to stop, but a task that is *past* that check still
+                    // recomputes and writes to the cache — and if that write lands after
+                    // the shutdown flush, it is simply lost. Registering the handle makes
+                    // the shutdown path wait for it, exactly as it does for streaming
+                    // analysis workers.
+                    let swr_handle = tokio::task::spawn_blocking(move || {
                         if let Some((workspace_root, document_path, results, identities)) = svc
                             .revalidate_document_sizes(
                                 &request_for_error,
@@ -920,6 +927,7 @@ where
                             ));
                         }
                     });
+                    track_streaming_forwarder(&mut active_streams, swr_handle);
                 }
             }
             ClientMessage::FileSizeDocument(request) => {
