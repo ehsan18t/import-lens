@@ -194,3 +194,45 @@ async fn date_fns_format_loads_tree_shaken_modules() {
 fn dangling_binding_gate_is_not_vacuous() {
     common::assert_no_dangling_il_bindings("export const parse = __il_entry_0_export_0;\n");
 }
+
+/// Prewarm decides whether to queue a Default job for each dependency. It used to
+/// answer that with a full engine build of the whole package graph, per dependency,
+/// serially, before any real prewarm work could start; it now parses the entry file
+/// alone. The two must agree, or prewarm silently stops warming the import the user
+/// is about to type — so this pins the fast path against the slow one it replaced,
+/// on real packages, where the interesting cases live (react's default arrives
+/// through CJS interop; css-tree and date-fns have no default at all).
+#[tokio::test]
+#[ignore = "requires installed fixtures (scripts/prepare-candidate-fixtures.mjs); qualification-only"]
+async fn the_parse_based_default_probe_agrees_with_engine_enumeration() {
+    use import_lens_daemon::engine::boundary::enumerate_exports_sync;
+    use import_lens_daemon::prefetch::entry_exposes_default_export;
+
+    let workspace = common::engine_fixtures::fixtures_workspace();
+    let mut disagreements = Vec::new();
+
+    for (package, version) in [
+        ("css-tree", "3.2.1"),
+        ("zod", "4.4.3"),
+        ("date-fns", "4.1.0"),
+        ("lodash-es", "4.18.1"),
+        ("lodash", "4.17.21"),
+        ("react", "19.2.7"),
+        ("uuid", "14.0.1"),
+    ] {
+        let entry =
+            common::engine_fixtures::resolve_fixture_entry(&workspace, package, version, "any");
+        let engine = enumerate_exports_sync(entry.entry_path.clone(), ImportRuntime::default())
+            .map(|exports| exports.iter().any(|name| name == "default"))
+            .unwrap_or(true);
+        let parsed = entry_exposes_default_export(&entry.entry_path);
+        if engine != parsed {
+            disagreements.push(format!("{package}: engine={engine} parse={parsed}"));
+        }
+    }
+
+    assert!(
+        disagreements.is_empty(),
+        "the parse probe must agree with engine enumeration: {disagreements:?}"
+    );
+}

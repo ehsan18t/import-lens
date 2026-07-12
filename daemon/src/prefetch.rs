@@ -1,6 +1,6 @@
 use crate::{
     cache::key::{CacheIdentity, decode_cache_identity},
-    engine::{boundary::enumerate_exports_sync, scheduling::drain_ordered},
+    engine::scheduling::drain_ordered,
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
@@ -8,6 +8,10 @@ use crate::{
     },
     service::ImportLensService,
 };
+use oxc_allocator::Allocator;
+use oxc_parser::Parser;
+use oxc_span::SourceType;
+use oxc_syntax::module_record::{ExportEntry, ExportExportName};
 use rayon::ThreadPoolBuilder;
 use serde_json::Value;
 use std::{
@@ -215,10 +219,13 @@ fn package_json_prewarm_jobs(
     Ok(requests)
 }
 
-// Avoid a guaranteed missing-export build. Enumeration uses the same engine
-// contract as completion; failure stays conservative and retains the Default job.
-// Memoized per entry path (keyed on the entry's stat token) because prewarm
-// reruns on every package.json event and enumeration is an uncached build.
+// Avoid a guaranteed missing-export build: a package with no default export must not
+// get a Default prewarm job. The question is only ever about the entry file's own
+// export statements, so it is answered by parsing that one file — it used to be
+// answered with a full `enumerate_exports_sync` engine build of the entire package
+// graph, once per dependency, serially, before any real prewarm work could start.
+//
+// Still memoized per entry stat token: prewarm reruns on every package.json event.
 fn exposes_default_export(resolved: &ResolvedPackage) -> bool {
     let token = entry_stat_token(&resolved.entry_path);
     let memo = DEFAULT_EXPORT_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
@@ -229,9 +236,7 @@ fn exposes_default_export(resolved: &ResolvedPackage) -> bool {
         return *has_default;
     }
 
-    let has_default = enumerate_exports_sync(resolved.entry_path.clone(), ImportRuntime::Component)
-        .map(|exports| exports.iter().any(|name| name == "default"))
-        .unwrap_or(true);
+    let has_default = entry_exposes_default_export(&resolved.entry_path);
 
     if let Ok(mut memo) = memo.lock() {
         // Crude but sufficient bound: prewarm sweeps one dependency tree, so a
@@ -242,6 +247,49 @@ fn exposes_default_export(resolved: &ResolvedPackage) -> bool {
         memo.insert(resolved.entry_path.clone(), (token, has_default));
     }
     has_default
+}
+
+/// Whether a package entry exposes a default export, without building anything.
+pub fn entry_exposes_default_export(entry_path: &Path) -> bool {
+    let Ok(source) = fs::read_to_string(entry_path) else {
+        return true; // unreadable: keep the job rather than silently drop it
+    };
+    let source_type = SourceType::from_path(entry_path).unwrap_or_else(|_| SourceType::mjs());
+    source_exposes_default(&source, source_type)
+}
+
+/// Whether an entry file exposes a default export.
+///
+/// Every answer defaults to `true` when unsure: a spurious Default job costs one
+/// wasted prewarm, while a wrongly-dropped one costs a cache miss on the exact
+/// import the user is about to type.
+fn source_exposes_default(source: &str, source_type: SourceType) -> bool {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if parsed.panicked {
+        return true;
+    }
+
+    let record = &parsed.module_record;
+    // No ESM syntax at all: CommonJS, where interop synthesizes a default from
+    // `module.exports`. Keep the job.
+    if !record.has_module_syntax {
+        return true;
+    }
+
+    let exports_default = |entry: &ExportEntry| match &entry.export_name {
+        ExportExportName::Default(_) => true,
+        ExportExportName::Name(name) => name.name == "default",
+        ExportExportName::Null => false,
+    };
+
+    // `export default …` and `export { x as default }` land in local entries;
+    // `export { default } from './x'` in indirect ones. A bare `export * from` does
+    // NOT re-export the default (the spec excludes it), but `export * as default
+    // from` does — and that is a star entry carrying the name.
+    record.local_export_entries.iter().any(exports_default)
+        || record.indirect_export_entries.iter().any(exports_default)
+        || record.star_export_entries.iter().any(exports_default)
 }
 
 /// Cheap edit-sensitivity token (length + mtime) so an entry rewrite re-probes.
@@ -409,5 +457,56 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "dispatch_prewarm should run the job on the bounded prewarm pool"
         );
+    }
+}
+
+#[cfg(test)]
+mod default_export_tests {
+    use super::source_exposes_default;
+    use oxc_span::SourceType;
+
+    fn exposes(source: &str) -> bool {
+        source_exposes_default(source, SourceType::mjs())
+    }
+
+    /// Answering this with a parse of the entry file replaced a full engine build of
+    /// the whole package graph, once per dependency. The predicate decides whether a
+    /// Default prewarm job exists at all, so every arm is pinned: a false negative
+    /// silently costs the user a cache miss on the import they are about to type.
+    #[test]
+    fn detects_every_shape_of_default_export() {
+        assert!(exposes("export default function go() {}\n"));
+        assert!(exposes("const go = 1;\nexport { go as default };\n"));
+        assert!(exposes("export { default } from './inner.js';\n"));
+        assert!(exposes("export { inner as default } from './inner.js';\n"));
+        assert!(exposes("export * as default from './inner.js';\n"));
+    }
+
+    #[test]
+    fn rejects_a_package_with_only_named_exports() {
+        assert!(!exposes(
+            "export const alpha = 1;\nexport function beta() {}\n"
+        ));
+        assert!(!exposes("const x = 1;\nexport { x };\n"));
+        assert!(!exposes("export { alpha, beta } from './inner.js';\n"));
+    }
+
+    /// A bare star re-export does NOT forward the default — the spec excludes it — so
+    /// claiming otherwise would queue a build guaranteed to fail on a missing export.
+    #[test]
+    fn a_bare_star_reexport_does_not_forward_the_default() {
+        assert!(!exposes("export * from './inner.js';\n"));
+    }
+
+    /// Unsure means yes: a spurious Default job wastes one prewarm; a wrongly dropped
+    /// one costs a miss on the exact import the user reaches for.
+    #[test]
+    fn stays_conservative_when_it_cannot_know() {
+        // CommonJS: interop synthesizes a default from `module.exports`.
+        assert!(exposes("module.exports = function go() {};\n"));
+        // No exports at all.
+        assert!(exposes("const unused = 1;\n"));
+        // Unparseable.
+        assert!(exposes("export default function ( {{{ \n"));
     }
 }
