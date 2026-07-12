@@ -2,7 +2,9 @@
 
 Status: **cutover complete** — §11 Phase 3 landed on 2026-07-11 (`233c25d`): Rolldown is
 the only semantic bundler, the custom engine (`bundle.rs`/`reachability.rs`/`cjs.rs`/manual
-`graph.rs`) and its tests are deleted, `ANALYZER_REVISION` moved to `rolldown1`, direct
+`graph.rs`) and its tests are deleted, `ANALYZER_REVISION` moved to `rolldown1` — and
+subsequently to **`rolldown2`** on 2026-07-12, when the post-cutover correctness fixes recorded
+in §10.7 moved real numbers — direct
 `oxc_ast`/`oxc_ast_visit`/`oxc_transformer` dependencies are removed, and the
 README/SRS/skill describe the shipped architecture. Phase 4: the accuracy re-baseline is
 green (2026-07-11, enforced fixtures; deltas 2.6–13% vs the esbuild oracle) and the §15
@@ -14,6 +16,26 @@ validation pass against crates.io (rolldown 1.1.5, oxc 0.139.0, oxc_resolver 11.
 the published Rolldown 1.1.5 API surface, and repo HEAD. This document replaces the
 custom reference-closure/fixpoint proposal after verifying that Rolldown publishes an
 embeddable Rust crate.
+
+**Release amendments (2026-07-12, I16–I23).** A design interview against the independent release
+review settled four decisions this document had never stated, and they overturn parts of it. Read the
+amendments in §5.1 (I19), §6.3 (I20), §7.4 (I17, I18), §8.2 (I21), §8.4 (I22), §10.6 (I23) and §12
+(I16) — **I20 supersedes an accepted consequence of I15, and I16 reverses §12's fallback
+mechanism**, so the unamended text of those sections is no longer binding. The governing decisions
+are recorded as ADRs, the vocabulary in the root `CONTEXT.md`, and the ordered work in
+`2026-07-12-bundler-redesign-release-plan.md`:
+
+- [ADR-0001](../../adr/0001-measure-a-neutral-build.md) — measure a neutral build (not production,
+  not development): our accuracy oracle is esbuild, which injects no `NODE_ENV` define either, so
+  neutrality is what keeps the two comparable.
+- [ADR-0002](../../adr/0002-upstream-owns-everything-it-can-answer.md) — Rolldown and OXC answer
+  everything they can; hand-written logic is the last resort.
+- [ADR-0003](../../adr/0003-no-size-without-a-build.md) — if Rolldown did not build it, we report no
+  size.
+- [ADR-0004](../../adr/0004-import-lens-measures-imports-not-bundles.md) — Import Lens measures
+  imports, not bundles.
+- [ADR-0005](../../adr/0005-a-runtime-is-an-artifact-boundary.md) — a runtime is an artifact
+  boundary.
 
 ## 1. Decision summary
 
@@ -465,6 +487,28 @@ contract must not change.
 - Diagnostics contain no Rolldown-owned types or unstable debug representations.
 - A failure never returns partially linked code for measurement.
 
+**Amended 2026-07-12 (I19) — an emitted asset is not a failure.** The adapter enforces "exactly one
+chunk **and no assets**" and fails the build otherwise. The single-*chunk* half is a real invariant:
+it is what stops code-splitting from silently under-reporting. The *no-assets* half was never an
+invariant, only an assumption that nothing but JavaScript exists. The load hook deliberately lets
+Rolldown infer module type from the extension, so a `.css` module becomes `ModuleType::Css`, Rolldown
+emits it as an asset, and **the build fails**. Every CSS-shipping package — `swiper`,
+`react-datepicker`, `react-toastify`, and most UI kits — is therefore unbuildable today. It has been
+masked because the failure degraded to the entry-file fallback and produced a plausible number; under
+the I16 amendment it would produce a blank row instead. The regression is created by I16, so the floor
+is part of the same release.
+
+The no-assets clause is dropped. The single-chunk guard stays. The JavaScript chunk is measured as
+before, and the build **emits a diagnostic naming the non-JavaScript bytes it did not count**.
+
+Folding those bytes into the Import Cost is the correct end state — CSS, wasm and fonts shipped by a
+package are real bytes in a real bundle, and a user comparing two datepickers is otherwise told the
+one shipping heavy CSS is the cheaper one. It is deferred, not declined: it changes this contract
+(`BundleArtifact` must carry assets), both pipelines, the module breakdown, and the esbuild oracle,
+and it moves numbers on a whole category of packages. Compression follows the I20 artifact rule — an
+asset is a separate artifact from the JavaScript chunk, so it is compressed on its own and summed.
+Until then the gap is **disclosed on the result**, never silently omitted.
+
 ## 6. Virtual entry design
 
 ### 6.1 Resolved targets
@@ -536,6 +580,64 @@ modules naturally.
 
 The adapter must not concatenate independently generated package bundles. That would duplicate
 shared dependencies, recreate symbol-boundary problems, and make `shared_bytes` unreliable.
+
+**Amended 2026-07-12 (I15) — one build per _runtime_, not one build per document.** The rule
+above is correct *within* a runtime and wrong *across* runtimes. A `BundleRequest` carries a
+single `ImportRuntime`, and Client and Server resolve dependencies under materially different
+conditions (different `condition_names`, `main_fields`, and `alias_fields`). A single Astro or
+Svelte file legitimately mixes both — frontmatter is Server, a processed `<script>` is Client —
+and forcing them into one graph would resolve one of the two under the wrong conditions, which
+is a correctness failure, not an optimization.
+
+The shipped behavior is therefore: group a document's resolved imports **by runtime**, issue one
+multi-entry `BundleRequest` per group, and sum the groups. Shared-module deduplication is real
+*within* a group, which is what the anti-concatenation rule above exists to protect. It does not
+apply *across* groups, and it should not: a package imported under two runtimes genuinely ships
+twice.
+
+Two consequences are accepted with this amendment:
+
+- **The compressed totals are a lower bound when a document mixes runtimes.** The groups'
+  minified outputs are concatenated before a single compression pass, so redundancy between the
+  Client and Server groups is compressed away exactly once, whereas the two bundles that really
+  ship would each pay for it. Compressing the groups separately and adding them would be a
+  different lie (compression is not additive), so neither figure is exact. The lower bound is the
+  honest choice; it must not be presented as the file's exact transfer cost.
+- **`shared_bytes` must be partitioned by runtime.** Reporting a module as "shared" across two
+  runtime groups claims a deduplication that this amendment explicitly says does not happen.
+
+**Amended 2026-07-12 (I20) — a runtime is an artifact boundary; compress each group and sum.** This
+*supersedes I15's first accepted consequence*, whose reasoning does not hold. I15 argued that summing
+separately-compressed groups "would be a different lie (compression is not additive)". Compression
+non-additivity is real, but it applies to parts that would in reality be compressed **together**.
+Two runtime groups are not such parts: they are two artifacts that genuinely ship, and each is
+genuinely compressed on its own. Summing their separately-compressed sizes therefore **models reality
+exactly**; it is the concatenation that distorts it, by compressing away redundancy between two
+payloads that never meet. I15 chose the one figure that corresponds to nothing.
+
+The rule, stated once and applied everywhere: **compressed bytes may be summed across an artifact
+boundary and never within one.** A runtime is such a boundary; so is a non-JavaScript asset (I19).
+Per-import figures within a runtime are not, which is why they may never be summed into a "total"
+(§8.2 aggregation rule).
+
+This is no longer only a reporting concern. The per-file budget gates on this number: it previously
+re-derived a file total by *summing per-import* bytes and so raised "budget exceeded" diagnostics on
+files that were inside budget, while the correctly-deduplicated figure sat on screen in the status
+bar. The budget now consumes the file-size result, so the file-size result must be right. See
+[ADR-0005](../../adr/0005-a-runtime-is-an-artifact-boundary.md) and
+[ADR-0004](../../adr/0004-import-lens-measures-imports-not-bundles.md).
+
+I15's second consequence — partitioning `shared_bytes` by runtime — was stated as a requirement and
+never implemented: sharing is still counted across every result with no runtime partition, and the
+extension renders it as a savings insight. A package imported from both Astro frontmatter and a
+client script is sold to the user as a shared dependency when each runtime ships its own copy. That
+lands with this amendment.
+
+**Amended 2026-07-12 (I14) — the combined build does not record `loaded_paths`.** The
+dependency-path index is keyed by `(entry_path, runtime)` and feeds per-entry freshness. The
+combined file-size build's `loaded_paths` is the *union* over every entry in the group, so writing
+it under each entry's key would clobber the accurate per-entry sets produced by the single-import
+path. The combined build therefore records nothing; the per-import path remains the sole writer.
 
 ## 7. Rolldown configuration and plugin responsibilities
 
@@ -611,6 +713,61 @@ Qualification covers `sideEffects` false, true, missing, invalid, string, arrays
 transitive package metadata so the public reporting contract is tested against the code
 Rolldown actually emits.
 
+**Amended 2026-07-12 (I17) — the entry module never reached Rolldown's nearest-package
+metadata.** The first paragraph above is false for the one module that matters most. The plugin
+returns `HookResolveIdOutput::from_id(target)` with no `package_json_path`, and for a
+plugin-resolved id Rolldown builds `ResolvedId.package_json` **only** from that field — so the entry
+gets `package_json: None` and its side-effect classification falls back to pure source analysis.
+Every *transitive* module is resolved by Rolldown itself and does get its metadata; the entry is the
+sole hole, and the entry is the file every measurement is rooted at. A package declaring
+`"sideEffects": false` whose entry has top-level statements source analysis cannot prove pure
+(`Object.freeze(...)`, a prototype patch, a self-registration call) keeps those statements and
+everything they reach; Rollup and webpack drop them, and the reported size is inflated.
+
+The fix is to supply `package_json_path = package_root/package.json` — **metadata supply, not a
+semantic override**, and therefore squarely permitted by this section and §14.6. `package_root` is
+already carried on `BundleEntry` and used only as `cwd`.
+
+This stayed invisible because every side-effects matrix row builds a **workspace-root `entry.js`**
+that does `import 'testpkg'`, making `testpkg` transitive and correctly metadata-bearing. Production
+is the opposite shape: the user imports `date-fns`, so the entry *is* `node_modules/date-fns/…`,
+resolved by the plugin — the exact path that loses its metadata. The rows proving "Rolldown owns
+`sideEffects`" all exercise the one code path production never takes. Qualification must carry a
+row whose `BundleEntry` points **into** a `node_modules` package.
+
+**Amended 2026-07-12 (I18) — `side_effects` is a property of the import, and the matcher is
+Rolldown's.** Two corrections:
+
+1. `analyze.rs` computed `has_side_effects() || is_array()`. `has_side_effects()` already answers
+   correctly for the array form — it consults the matched patterns — and the `|| is_array()`
+   overrode that correct answer with `true` unconditionally, which gated off the full-package
+   comparison and forced `truly_treeshakeable` to `false` **by construction**, then dropped
+   confidence to Medium. `"sideEffects": ["**/*.css"]` is an everyday declaration, so every such
+   package was reported side-effectful and never tree-shakeable even where Rolldown demonstrably
+   tree-shook it. The code justified this with "glob matching unavailable from public bundler
+   metadata" — the premise **retracted by §10.7 divergence 1**, which matrix rows 42/43 now
+   disprove. The override is removed. **Side-Effectful means: does the entry being measured match a
+   side-effect pattern.** For `["**/*.css"]` and a JavaScript entry that is `false`, and that is
+   true.
+2. This section forbids the plugin implementing "a glob matcher" and requires matched paths be
+   obtained "through Rolldown/`oxc_resolver` public package metadata behavior rather than its own
+   matcher" — yet `resolver.rs` carries ~80 hand-written lines of brace expansion and segment
+   matching, while `fast-glob` (the matcher Rolldown itself uses, via
+   `rolldown_utils::pattern_filter`) is already in `Cargo.lock`. The hand-written matcher is
+   replaced by `fast_glob::glob_match`, and `fast-glob` is **exact-pinned into the compiler stack and
+   its fingerprint**: its purpose is to agree with Rolldown, and a version skew would break that
+   agreement silently. See
+   [ADR-0002](../../adr/0002-upstream-owns-everything-it-can-answer.md).
+
+Rolldown cannot supply the badge itself: in 1.1.5 `ModuleInfo` — everything a plugin may learn about
+a module — carries no side-effect field, and `DeterminedSideEffects` reaches no output type. The
+retained reader is therefore reporting-only, as the I9 amendment already requires. If a future
+Rolldown exposes the classification, the reader is deleted, not kept.
+
+Swapping matchers is a **behaviour change, not a refactor** — the two engines disagree on some
+patterns, which is the reason for the swap. The real-package badge baseline (§10.6 amendment) must
+exist first.
+
 ## 8. Output measurement and metadata
 
 ### 8.1 Raw and minified code
@@ -648,6 +805,46 @@ breakdowns and cross-import shared-byte attribution but are not required to sum 
 the final chunk length because chunk glue and final minification are not attributable to one
 module.
 
+**Amended 2026-07-12 — aggregation rule.** This design specifies a *per-import* measurement and
+stops at `ImportResult`. It never stated how those results may be combined, and consumers
+(the workspace report's totals, the treemap denominator, the per-file budget check) filled the
+gap by **summing per-import compressed bytes**. That is invalid, for two independent reasons,
+and both over-count:
+
+1. **Shared dependencies are counted once per import site.** Fifty files importing `react` sum to
+   fifty Reacts; the bundle ships one.
+2. **Compressed sizes are not additive.** `brotli(A) + brotli(B) > brotli(A ∪ B)` — compression
+   exploits redundancy across the union that it cannot see when the parts are compressed
+   separately. This holds *even when the two imports share nothing*.
+
+The rule, binding on every consumer of `ImportResult`:
+
+> **A per-import `raw`/`minified`/`gzip`/`brotli`/`zstd` figure may never be summed with another.**
+> A truthful multi-import total comes from one engine build over the union of those imports —
+> which is exactly what §6.3 file sizing exists to produce and what any such consumer must use.
+> Where a union build is unavailable, the aggregate must be deduplicated by module contribution,
+> or labelled as what it is (a sum of independent import costs — valid for *ranking*, meaningless
+> as a bundle size) and never called a "total".
+
+**Amended 2026-07-12 (I21) — of the rule's two escapes, we take the second. Deduplicating the
+workspace total by module is *declined*, not deferred.** Import Lens measures **imports**, priced
+against an otherwise-empty application. It has no model of "what is already in the bundle" and never
+intended one; building the project-wide union that a deduplicated total requires is a different
+product, to be decided on its own merits rather than smuggled in as a bug fix.
+
+So the workspace report's headline keeps its arithmetic and loses its name. "Total Brotli" becomes
+**Combined Import Cost** — the sum of independent Import Costs, which counts a dependency shared
+across fifty files fifty times — and the report says so. It ranks and it apportions blame; it is not
+a size. Treemap percentages become a share of that figure. The duplicate-imports table becomes
+correct by label: `react` across fifty files genuinely *does* have a combined import cost of fifty
+Reacts, and that is the point of the panel. The report's `duplicate_imports` and `shared_modules`
+groups are therefore computed and deliberately **not** subtracted from the headline — that is
+correct, not an oversight.
+
+The per-file budget takes the *first* escape, because there a union build **is** available: it is
+the §6.3 file-size result, already fetched and already displayed in the status bar. See
+[ADR-0004](../../adr/0004-import-lens-measures-imports-not-bundles.md).
+
 ### 8.3 Dependency fingerprints
 
 Freshness uses every real path loaded by Rolldown, not only rendered modules. This is required
@@ -665,6 +862,31 @@ reads the output chunk's export list. It must not call the old recursive
 
 Ambiguous star exports, missing requested exports, and external-only exports follow Rolldown's
 resolution result and become structured diagnostics. They are never guessed.
+
+**Amended 2026-07-12 (I22) — enumeration must carry the import's runtime, and its memo must expire
+on manifests.** Two defects, both invisible because enumeration was hardcoded to a single runtime.
+
+1. **The runtime is hardcoded to `Component`.** Component and Client resolve with
+   `alias_fields = ["browser"]` and browser conditions; Server resolves with node conditions. In a
+   Server-context file (Astro frontmatter is Server for sizing), a package whose `exports` map
+   diverges across `node` and `browser` is enumerated under **browser** conditions while the *size*
+   of that same import is correctly computed under **Server** — so the completion list omits names
+   the file can import and offers names it cannot. Completions and sizing disagree by construction.
+
+   The runtime is **derived in the daemon, not passed in** — one classifier, not two
+   ([ADR-0002](../../adr/0002-upstream-owns-everything-it-can-answer.md)).
+   `CompleteImportMembersRequest` already carries `source` and `cursor_offset`, and the document
+   region classifier already maps an offset to a runtime, so it needs **no protocol change**;
+   `EnumerateExportsRequest` gains the offset it lacks. The enumeration memo is already keyed by
+   runtime, but production only ever wrote the `Component` key — that dimension comes alive here, so
+   enumerations cached before this change must not be trusted after it.
+
+2. **The memo ignores package manifests and has no TTL.** It stores only the enumeration's source-
+   module fingerprints, while the size path deliberately adds the root and first-party manifests per
+   §8.3. A first-party package under development whose `package.json` flips `"type": "module"` (or
+   edits `exports`/`sideEffects`) moves no source file and bumps no cache generation — so the
+   completion popup serves the **old export list indefinitely**. The manifests join the memo's
+   fingerprints, as §8.3 already requires of everything else.
 
 ## 9. Concurrency and lifecycle integration
 
@@ -839,6 +1061,33 @@ because it omits required code.
 The comparison set includes a small ESM package, a wide barrel, a deep re-export graph, a CJS
 package, a namespace/full request, 20 independent imports, 20 imports with shared dependencies,
 and repeated different exports from one package.
+
+**Amended 2026-07-12 (I23) — these gates have never run, and the claims they protect are not
+instrumented at all.** Three holes, all in the instruments rather than the engine.
+
+1. **The performance and memory gates above are dead code.** `candidate_performance.rs` is
+   `#[ignore]`d and requires a fixtures env var, and **nothing invokes it** — no workflow step, no
+   `package.json` script. The trap is that a perf gate *appears* to run: CI calls
+   `pnpm test:performance`, which is the pre-existing legacy suite over synthetic fixtures, a
+   different file entirely. So a Rolldown bump that doubles cold p95 or blows the 20-import RSS
+   ceiling passes `deps:update:compiler`, passes `candidate_packages` (which asserts correctness,
+   not timing), and ships green. The suite written precisely to prevent this has never executed.
+   The pattern to copy already exists: the real-package correctness job installs fixtures and runs
+   `-- --ignored`. `candidate_performance` joins it, gated on the absolute numbers above.
+
+2. **No real package's *claims* are baselined anywhere.** The accuracy oracle checks **bytes**;
+   nothing checks **badges**. Nothing in `scripts/` mentions `truly_treeshakeable`, and the
+   real-package harness works at engine level and never produces an `ImportResult`, so the flag that
+   moved most visibly at cutover has no ground truth. A pipeline-level harness over the pinned
+   packages must assert `side_effects`, `truly_treeshakeable` and confidence. This is required
+   **before** the I18 (side-effects semantics + `fast_glob`), I17 (entry manifest) and I20
+   (per-runtime compression) amendments land — each moves real-package numbers or badges, and today
+   nothing would detect a wrong move.
+
+3. **The §10.3 real-package set contains no CSS-shipping package**, which is exactly why the I19
+   asset defect survived qualification: every pinned fixture is pure JavaScript. A package that
+   imports CSS (`swiper`, `react-datepicker`, `react-toastify`) joins the set, and the construct
+   matrix gains a CSS row.
 
 ### 10.7 Gate outcome
 
@@ -1055,6 +1304,41 @@ Failures are typed by stage and surfaced through existing structured diagnostics
 
 No failure path may fabricate a symbol, measure partial linked code, or silently switch to an
 unvalidated result.
+
+**Amended 2026-07-12 (I16) — a failed build reports no size at all.** The "conservative static
+fallback" above fabricates a number wherever no build succeeded, and the number is not an Import
+Cost. Sizing the entry file alone understates by ignoring the entire graph it pulls in: a large UI
+kit that breaches the graph limit was reported at the few kilobytes of its barrel, when the true
+answer is megabytes. Sizing the package's directory understates nothing and overstates everything —
+it counts tests, source maps, and unused files, unminified and uncompressed. A confidence badge does
+not repair either; users read the byte count, and a number wrong by an order of magnitude while
+looking like a measurement is worse than no number, because it is actionable and the action is
+wrong.
+
+Every row above reading *conservative static fallback* becomes **Unmeasured**: no size, a typed
+stage, and the diagnostics that explain it. This is recorded as
+[ADR-0003](../../adr/0003-no-size-without-a-build.md) and is not a tightening of §12's spirit but a
+reversal of its mechanism — §12's own rule that no failure path may "silently switch to an
+unvalidated result" is precisely what the fallback did.
+
+Three consequences are accepted:
+
+- Coverage drops. Imports whose manifest cannot be parsed, whose entry exceeds
+  `MAX_MODULE_SOURCE_BYTES`, or whose build fails now report no size.
+- The hand-written estimators (`approximate_directory_size`, `estimate_minified_source`) are
+  deleted. If OXC cannot minify it, we do not guess — see
+  [ADR-0002](../../adr/0002-upstream-owns-everything-it-can-answer.md).
+- **The failure stage becomes the primary thing a user sees**, so it must be deterministic.
+  `adapter.rs` selects the first non-`link` diagnostic in a vector Rolldown accumulates from
+  concurrent module tasks, so identical inputs can report `parse` on one run and `resolve` on the
+  next — and the value is cached. Stages are ranked by pipeline order, earliest wins. An Unmeasured
+  import logs its **full diagnostic vector at `warn`**, not `debug`: after this amendment "error and
+  no size" is the entire failure path, and the diagnostics *are* the answer.
+
+An honest lower bound ("at least 4 MB; graph limit exceeded") is strictly better than either a
+fabrication or a blank, since a limit breach means much of the graph was loaded before we stopped.
+The engine currently discards the partial graph on failure, so this is the intended successor to
+I16, not a hypothetical.
 
 ## 13. Expected blast radius
 
