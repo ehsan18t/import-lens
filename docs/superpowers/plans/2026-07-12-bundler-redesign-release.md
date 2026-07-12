@@ -12,6 +12,51 @@
 
 ---
 
+## REVISION 2 — read this before executing anything below
+
+**Two things happened that this plan, as first written, did not know.**
+
+### 1. Task 1 became an architecture change, not a bounded fix
+
+The plan (and the review it came from) framed Task 1 as "wrap the build in `catch_unwind` — smallest diff, biggest risk retired." **That scope claim was wrong and nobody reproduced it.** Five successive fixes were each a workaround for a structural fact nobody had named: **the interactive response was atomic**, so one parked build could push the response past the extension's 10s deadline and the client would discard *the whole document* — including every import already answered from cache.
+
+What actually shipped:
+
+- **Rolldown `tokio::spawn`s each module task and Tokio SWALLOWS their panics.** The loader then waits forever for a `Done` message that never arrives, holding its own sender so the channel never closes. The build **parks**. `catch_unwind` cannot see that class at all.
+- So `BUILD_TIMEOUT` (8s) exists — **and it is the only timeout the design needs.** It bounds a *build*, so a parked one cannot hold an engine permit forever (`ENGINE_PERMITS` = 2).
+- Attempts to bound the *request* — a per-entry circuit breaker, then a per-request `EngineBudget` — were both **deleted**. The breaker durably condemned *healthy* packages; the budget's degraded results were **written to the cache**, so one transient scheduling accident made a healthy 17,550-byte package report **58 bytes** for a whole cache generation.
+- **Imports now stream.** `AnalyzeDocument` answers immediately with cache hits plus **`loading`** placeholders for misses, and each miss is pushed as it lands over the existing `RefreshedResults` channel. A parked build now delays *one import's number* instead of destroying nineteen.
+
+**Consequences every task below must respect:**
+
+- An import absent from an `AnalyzeDocumentResponse` is **dropped permanently** — `listener.ts` rebuilds the document's whole state array from the response, and `mergeRefreshedResults` can only *update* a state, never *create* one. Misses must ride in the response as `loading` placeholders.
+- **`loading` (no size *yet*) and `Unmeasured` (no size *ever*) are different states** and every consumer must distinguish them.
+- On a **cold** document, every import arrives by push. Anything that reads results at response time sees nothing.
+
+### 2. THE SIGNATURE DEFECT OF THIS CODEBASE
+
+> **A TRANSIENT condition producing a DURABLE wrong answer.**
+
+It has now appeared **four times, in four different places**:
+
+1. A circuit breaker condemned a *healthy* package to static sizing for a whole cache generation.
+2. A degraded 58-byte fallback was cached over a healthy 17,550-byte package — `should_cache_result` was `result.error.is_none()`, and a fallback carries `error: None` **plus a plausible size**.
+3. An incomplete file-size total (computed while imports were still `loading`) was cached for its 30s TTL.
+4. **Task 5, as originally written, creates the fourth** — see below.
+
+**Before implementing any task: ask what happens if this build fails *transiently*. Then check every cache, memo, and durable store it can reach** — the L1 memory cache, the **L2 disk cache** (it survives restarts), `full_package.rs`, `export_list.rs`, `build_memo.rs`, `file_size_cache.rs`, and the extension's `workspaceState` / `globalState` history.
+
+### 3. Tasks 5+6, 8 and 9 were traced end-to-end before implementation. All three were "right but incomplete."
+
+Seven Blockers were found that this plan would have walked into. **Tasks 5+6, 8 and 9 below are rewritten from those traces.** Two claims were also *refuted*, so do not spend steps on them:
+
+- **REFUTED:** the `#[serde(skip)]` / L2-disk `shared_bytes` concern (review improvement 12). `disk.rs` carries `full_contributions` explicitly. No fix needed.
+- **REFUTED:** the workspace report does **not** go through streaming, never sees `loading` imports, and `Option<u64>` does **not** break `model.rs`'s `.sum()` or the treemap denominator.
+
+**Line numbers throughout this plan are STALE** — Task 1's work moved them. Re-locate by symbol, not by line.
+
+---
+
 ## Global Constraints
 
 - **Branch:** all work lands on `bundler-redesign`. Never commit to `main`.
@@ -50,7 +95,9 @@ Task 14 (packaging) is last because every task above changes the daemon binary.
 
 ---
 
-## Task 1: Contain panics at the engine boundary
+## Task 1: Contain panics at the engine boundary — ✅ **DONE, and it became an architecture change**
+
+> **The steps below are the ORIGINAL task and are kept only as a record of what was attempted. Do not execute them.** What actually shipped: `catch_unwind` at the boundary; `BUILD_TIMEOUT` (8s) as the *only* timeout the design needs (a parked build must not hold an engine permit forever); **per-import streaming** (`AnalyzeDocument` answers at once with `loading` placeholders, misses are pushed over `RefreshedResults` as they land); and `engine::stage::is_transient` gating every cache so a transiently-degraded result is never stored. The per-entry circuit breaker and the per-request `EngineBudget` were both tried and **deleted** — do not reintroduce either. See **REVISION 2** at the top of this plan.
 
 **Files:**
 - Modify: `daemon/src/engine/boundary.rs`
@@ -662,7 +709,9 @@ Message: `fix(daemon)!: report array sideEffects against the entry, using Rolldo
 
 ---
 
-## Task 5: Unmeasured — no size without a build
+## Task 5: Unmeasured — no size without a build — ⚠️ **SUPERSEDED**
+
+> **Do not execute the steps below.** An end-to-end trace found **three Blockers** in them, including the *fourth instance of the signature defect*. The corrected task is **[Task 5 + 6 (Revision 2)](#task-5--6-revision-2--unmeasured-and-css-packages-that-cannot-build)** at the end of this plan. The section below is kept as a record of the original reasoning.
 
 **Files:**
 - Modify: `daemon/src/pipeline/analyze.rs:150-165, 220-245, 245-265`
@@ -971,7 +1020,9 @@ Message: `fix(daemon): rank failure stages deterministically` — body must expl
 
 ---
 
-## Task 8: The runtime partition
+## Task 8: The runtime partition — ⚠️ **SUPERSEDED**
+
+> **Do not execute the steps below.** A trace found **three Blockers**: the partition cannot be plumbed in the files this section lists (`MeasuredImport` has no runtime); the per-group compression failure arm would report **zero** for the whole file; and the push identity carries no runtime, so the two runtime variants of one Astro import statement **collide on a single key** — in the task whose entire reason for existing is Astro. The corrected task is **[Task 8 (Revision 2)](#task-8-revision-2--the-runtime-partition)** at the end of this plan.
 
 **Files:**
 - Modify: `daemon/src/pipeline/file_size.rs:27-46, 200-225`
@@ -1052,7 +1103,9 @@ Message: `fix(daemon): treat each runtime as its own artifact` — body must exp
 
 ---
 
-## Task 9: The aggregates
+## Task 9: The aggregates — ⚠️ **SUPERSEDED**
+
+> **Do not execute the steps below.** This section says "feed the budget check the `FileSizeDocument` result **the controller already has**." **No controller has it, and the budget checker cannot reach it** — an unverified scope claim copied from the review, which is the same class of mistake that sank Task 1. A trace also found a **second** per-file budget in the workspace report that this section never touches. The corrected task is **[Task 9 (Revision 2)](#task-9-revision-2--the-aggregates-split-9a--9b)** at the end of this plan.
 
 **Files:**
 - Modify: `extension/src/analysis/budgets.ts:60-99`, `extension/src/listener.ts` (pass the file-size result)
@@ -1313,6 +1366,104 @@ git add daemon/src/cache/key.rs extension/src/daemon/knownHashes.generated.ts do
 git commit
 ```
 Message: `chore(release): bump the analyzer revision and refresh the daemon hash` — body must list which changes moved numbers and why the cache must be invalidated.
+
+---
+
+# REVISION 2 TASKS — these supersede Tasks 5, 6, 8 and 9 above
+
+Written from end-to-end traces of the real system, not from the review's findings-list. **Line numbers are deliberately omitted — Task 1's work moved them. Locate by symbol.**
+
+---
+
+## Task 5 + 6 (Revision 2) — Unmeasured, and CSS packages that cannot build
+
+**ONE commit. They cannot be separated:** Task 5 turns every CSS-shipping package into a *blank row*, and Task 6 is what stops that.
+
+**Files:** `daemon/src/pipeline/{analyze.rs,fallback.rs,file_size.rs}`, `daemon/src/service.rs`, `daemon/src/ipc/protocol.rs`, `daemon/src/cache/disk.rs`, `daemon/src/engine/{mod.rs,adapter.rs}`, `daemon/src/report/model.rs`, `extension/src/analysis/insights.ts`, `extension/src/ui/{tooltipMarkdown.ts,currentFileSize.ts}`, `extension/src/ipc/protocol.ts`, `docs/ImportLens-SRS.md`.
+
+### The model — this is the task's real content, not a ripple
+
+The five size fields are a bare `u64` conflating **four** meanings: a real **measurement**; a **fabrication** (the three fallbacks); a **sentinel zero** (`error_result` already writes `0` with `error: Some(..)`); and a **genuine zero** (types-only, `error: None`, identified by its *diagnostic stage* — so `Some(0)` stays unambiguous). `Option<u64>` splits the fabrications and sentinels out. **The shape is right.**
+
+**But today `error: Some(..)` MEANS "deterministic"** — a *transient* failure (timeout/panic/engine_gone) never sets `error`; it degrades to the static fallback with `error: None` plus a transient diagnostic. That equivalence is load-bearing in `should_cache_result` **and** `per_import_totals`. **Task 5 deletes the fallback and silently falsifies it.** That is the fourth instance of the signature defect, and it lands *inside the code written to prevent the third*.
+
+- [ ] **Step 1 — Decide the caching rule FIRST.** Propagate `AnalysisError`'s `stage` onto `ImportResult` so a consumer can ask *why*, not just *whether*. Then make every cache and aggregate read **transience**, not `error`:
+  - `should_cache_result` — cache an Unmeasured result when its stage is **deterministic**; refuse when `engine::stage::is_transient`. **Without this, no failure is ever cached again**, so a package with a genuine parse error re-enters the engine on *every* analysis, forever, burning one of only two permits.
+  - `per_import_totals` — its `error` branch `continue`s **past** the transient scan, on the assumption that `error` ⇒ deterministic. It must set `missing_inputs = true` when the stage is transient. Delete the now-false comment above it.
+  - Regression test (Logic): an import failing with `stage::PANIC` leaves `FileSizeComputation::is_cacheable() == false`. **The existing `a_transiently_degraded_file_total_is_never_written_to_the_l1_cache` constructs the *fallback* shape and will keep passing after Task 5 while the real path breaks. Re-read it; do not re-baseline it.**
+
+- [ ] **Step 2 — `Option<u64>` with NO `#[serde(skip_serializing_if)]`.** **MEASURED:** the repo's dominant `Option` serde pattern **breaks the disk cache**. These fields sit mid-struct and the L2 encoding is *positional* (`rmp_serde::to_vec`, not `to_vec_named`) — `skip_serializing_if` shortens the array and decode fails (`invalid type: boolean \`false\`, expected u64`). Plain `Option` encodes a `nil` placeholder, preserves the array length, round-trips clean. **Add a Guard test** asserting an `ImportResult` with `None` sizes round-trips through `rmp_serde::to_vec` — it is the only thing standing between a future contributor and a silently unreadable cache.
+
+- [ ] **Step 3 — Bump `CURRENT_SCHEMA_VERSION` 7 → 8, and record the RIGHT reason.** **MEASURED:** an old entry does not fail to decode — it decodes **perfectly** into `Some(17550)`, **resurrecting a fabricated size as a genuine measurement**. (The original plan's stated reason, field corruption, was wrong.) The wipe is total, so the bump is sufficient.
+
+- [ ] **Step 4 — Delete the three fallback arms**, plus `analyze_static_entry`, `approximate_directory_size`, `estimate_minified_source`. `declaration_only_package_result` **stays**.
+
+- [ ] **Step 5 — Extend Unmeasured to the AGGREGATE (absent from the original plan).** `FileSizeResponse`'s five totals are still bare `u64` and now **silently omit every Unmeasured import** — a definite-looking number that is really a floor. Put `incomplete: bool` (already on `FileSizeComputation`) **on the wire**; render the total as a floor when set ("at least 40 kB — 3 imports could not be measured"); and **gate the durable `globalState` bundle-impact write on `!incomplete`** — it writes unconditionally today, which is how a transient failure becomes a permanent trend baseline.
+
+- [ ] **Step 6 — The extension fix is FOUR sites, not a sweep.** The main render path is already correct (`format.ts` → "Size unavailable" on `result.error`, covering CodeLens, inlay hints, hover primary; budgets, compareImports and the history recorder are already gated). Fix only: `insights.ts` **gitDeltaInsight** and **historyTrendInsight** (guard `!state.result` but not `result.error` → **measured: "NaN kB"**); `tooltipMarkdown.ts`'s `importResultSizeMarkdown` (ungated); and `report/model.rs`, whose row fields must **also** become `Option<u64>` — `.flatten().unwrap_or_default()` compiles and prints **"0 B"**, exactly the lie sentinel zeroes were rejected to prevent.
+
+- [ ] **Step 7 (Task 6) — Relax the asset guard.** Keep the single-**chunk** check; drop the no-assets clause. Add `UNCOUNTED_ASSETS` to **`engine::diagnostic_stage`** — a bare string literal is rejected by the engine's own Guard. Emit a diagnostic naming the uncounted non-JS bytes.
+
+- [ ] **Step 8 (Task 6) — Decide the confidence question, and write it down.** `engine_confidence` grants High only when `diagnostics.is_empty()`, so a *disclosure-only* `uncounted_assets` diagnostic **silently drops every CSS-shipping package to Medium** and stamps a `~` on a correctly-measured size, permanently. Either exempt disclosure-only diagnostics from the penalty, or declare CSS packages Medium by design — and make Task 2's `react-toastify` baseline assert whichever you pick.
+
+- [ ] **Step 9 — SRS + commit.** `fix!: report no size when a build fails, and stop failing on CSS`.
+
+---
+
+## Task 8 (Revision 2) — the runtime partition
+
+**Task 8 MUST precede Task 9.** Task 9 points the per-file budget at the file-size total; landing it first would gate the budget on the concatenation **lower bound** — **measured at ~36% under-report** on a shared-heavy two-runtime Astro file — silently passing budgets that should fail.
+
+**Files (the original list could not do the job):** `daemon/src/pipeline/file_size.rs`, **`daemon/src/service.rs`**, **`daemon/src/ipc/protocol.rs`**, **`extension/src/analysis/refreshMerge.ts`**, `extension/src/analysis/insights.ts`, `extension/src/ipc/protocol.ts`. Test: **`daemon/tests/file_size_runtime.rs`** — `daemon/tests/file_size.rs` **does not exist**.
+
+- [ ] **Step 1 — Failing tests.** `mixed_runtime_compression_sums_the_groups_not_their_concatenation`; `a_module_used_in_two_runtimes_is_not_shared`; **NEW** `a_compression_failure_in_one_runtime_does_not_zero_the_file`; **NEW (extension)** an Astro doc where module `M` is shared between two Server imports *and* present in a Client import — assert the tooltip does **not** name the Client specifier as a sharer.
+
+- [ ] **Step 2 — Compress per group.** Move `compress_all` inside the per-runtime loop; accumulate into `totals`; delete the join and the "lower bound" comment. **The `Err` arm MUST degrade to `per_import_totals` + `absorb_fallback` for that group and `continue`** — mirroring the existing minify arm. It must **not** `return error_computation(..)`: that discards every *other* group's real bytes and reports **zero** for the file. (The original plan was silent on the failure arm — this is the regression the naive fix introduces.)
+
+- [ ] **Step 3 — Plumb the runtime.** `annotate_shared_bytes` takes the runtime alongside each result and counts occurrences **within a runtime only**. **`MeasuredImport` has no runtime and it is discarded at both construction sites** — add it, populated from `item.detected.runtime` at each. One source of the partition; do not introduce a second.
+
+- [ ] **Step 4 — Fix the push identity.** Add `runtime` to `RefreshedImportIdentity` (additive, `#[serde(default)]` → no PROTOCOL_VERSION bump) and to `identityKey` in `refreshMerge.ts`. **Without this the two runtime variants of one Astro import statement collide on a single key and the client collapses them into one row.**
+
+- [ ] **Step 5 — Mark the floor on the wire.** `incomplete: bool` on the file-size responses, from `FileSizeComputation.incomplete`. Task 9 consumes it.
+
+- [ ] **Step 6 — Partition the extension's shared-module index** by `state.detected.runtime`, and in the `> 1` filter.
+
+- [ ] **Step 7 — Docs.** Repoint the `spec I15`/`I14` code comments at the design doc's §6.3 amendments (the findings doc they cite was deleted in `76ca304`). SRS: shared bytes are shared with another import **in the same file and the same runtime**; a mixed-runtime file's compressed size is the **sum** of its per-runtime bundles. Record that `Component` never co-occurs with Server/Client — that is *why* the sum cannot over-report.
+
+- [ ] **Step 8 — Do NOT** spend a step on the `#[serde(skip)]` / L2 `shared_bytes` concern (review improvement 12). **REFUTED.** Optionally add a Guard pinning it, since nothing does.
+
+**Commit:** `fix(daemon): treat each runtime as its own artifact`.
+
+---
+
+## Task 9 (Revision 2) — the aggregates, split 9a / 9b
+
+### Task 9a — one file budget, one number
+
+- [ ] **Step 1 — Put the honesty flag on the wire.** `#[serde(default)] pub incomplete: bool` on the file-size document response. Without it the extension cannot tell a real File Cost from a **degraded per-import sum**, and the budget silently gates on a transient.
+
+- [ ] **Step 2 — Kill the report's SECOND file budget.** `apply_file_budget_warnings` in `report/model.rs` *also* sums per-import brotli per source file. The original plan never touched it, so after the fix **the report would contradict both the editor and the CLI on the same file and the same budget.** Either give the report a real File Cost per file (`analyze_report_source` already holds every item with its request, and the report already blocks), **or delete the report's file-budget warning entirely** and record in the SRS that the file budget is enforced by the editor and `importlens check`. **Do not ship two answers to one budget.**
+
+- [ ] **Step 3 — Give the extension somewhere to PUT the File Cost.** A per-document `fileCost` slot on the analysis store, written by `listener.updateFileSize` (which *does* have the response) in the same update that fires `onDidChange`.
+
+- [ ] **Step 4 — Change the signature and state the semantics.** `budgetViolationsForStates(states, budgets, fileCost?: { brotliBytes, incomplete })`:
+  - present and `!incomplete` → gate on `fileCost.brotliBytes`; delete the `fileBrotliBytes += actualBytes` accumulation.
+  - **absent or `incomplete` → raise no violation AND claim no pass** ("not evaluated"). **A budget must never be judged against a number the daemon has already called a floor.**
+  - The per-import check is unchanged.
+
+- [ ] **Step 5 — Re-fetch the File Cost when the document finishes streaming**, or the diagnostic keeps a verdict computed while the document was cold.
+
+- [ ] **Step 6 — Tests (Logic).** Five shared-graph imports @40 kB with a 55 kB File Cost under a 60 kB budget → **no** violation; `incomplete` → no violation *and no pass*; absent → no violation; Rust: a document whose combined build fails degrades to a per-import sum, **sets `incomplete`, is not cached**, and the response carries the flag; Rust: the report's file-budget verdict **agrees** with `file_size_document` (or is gone).
+
+### Task 9b — labels and insights
+
+- [ ] **Step 1 — Relabel.** `total_brotli_bytes` → `combined_import_cost_brotli_bytes`. **This crosses the IPC wire** — `protocol.rs` (both `WorkspaceReportSummary` *and* `DuplicateImportGroup`), `protocol.ts`, `model.rs`, `report.ts`, and three tests. The metric reads **"Combined Import Cost"**, with a note stating **both** halves: a dependency imported in several files is counted at every site, **and a single `import React, { useState } from "react"` is two imports and is counted twice** — the more surprising half, and true.
+
+- [ ] **Step 2 — EXT-3, correctly.** Key the shared-module index by **result identity** (specifier + kind + named), not specifier — **and** name the sibling importer by that identity, or the React case renders `"…also appears in ;"` with an empty list, because both results carry the specifier `"react"`.
+
+- [ ] **Step 3 — KEEP the "outside the public top-module breakdown" branch.** It is **true** whenever the shared module falls outside the top-10 `module_breakdown` the wire carries. Only the specifier-collision case was a lie. Do not delete a message that is right half the time.
+
+- [ ] **Step 4 — Test against a COLD document** (results arriving by push). At HEAD, streamed pushes carried `shared_bytes: None`, so EXT-3 had **no data at all** on a cold document.
 
 ---
 
