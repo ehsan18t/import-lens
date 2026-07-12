@@ -21,8 +21,33 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
 /// (`v{N}:`) derives from this, so a schema bump is a one-line change here with
 /// no type renames.
 const CACHE_KEY_VERSION: u32 = 4;
-pub const ANALYZER_REVISION: &str = "rolldown1";
-pub const ANALYZER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+rolldown1");
+
+/// The analyzer revision, in ONE place.
+///
+/// `ANALYZER_VERSION` has to be built with `concat!`, which only accepts literals, so
+/// the revision used to be spelled twice — and bumping one without the other would
+/// leave half the cache accepting entries the other half rejects. A macro keeps the
+/// literal single: there is nothing left to keep in sync.
+///
+/// **Bump this whenever a change can alter a reported size.** Every cached entry
+/// records the revision it was computed under and is rejected when it differs, which
+/// is the only thing standing between a user and a size measured by the old code.
+///
+/// `rolldown2` (2026-07-12): post-cutover correctness fixes moved real numbers.
+/// Rolldown's `//#region` debug comments are no longer billed as package cost (N2);
+/// the platform is `Neutral`, so the Server runtime stopped resolving `browser`
+/// export conditions and no `NODE_ENV` define is injected (N3); mixed-runtime files
+/// are grouped per runtime, which was swinging a file's size by two orders of
+/// magnitude depending on import order (I15); and type-position-only TypeScript
+/// imports are elided (W4).
+macro_rules! analyzer_revision {
+    () => {
+        "rolldown2"
+    };
+}
+
+pub const ANALYZER_REVISION: &str = analyzer_revision!();
+pub const ANALYZER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", analyzer_revision!());
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {
