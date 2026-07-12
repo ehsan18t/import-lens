@@ -868,7 +868,29 @@ the ceiling so the branch runs by default; nothing about it is ignored any more.
 real-package suite is 7/7 with `css-tree/parse` emitting **zero** dangling `__il_` bindings
 (the four §2.2 danglers reach zero and `date-fns` stays at zero), `date-fns/format` loading
 304 paths while rendering 36 (tree-shaken freshness gate), and CJS `lodash/debounce` working
-through link-time interop (489,076 raw bytes, whole-library retention as expected for CJS).
+through link-time interop (whole-library retention as expected for CJS).
+
+##### Re-baseline (2026-07-12, `rolldown2`) — post-verification sizes
+
+The byte counts recorded on 2026-07-11 were measured by code that got them wrong. N2 was
+billing Rolldown's `//#region` debug comments to the package, and N3 left the platform unset,
+which made Rolldown append `browser` to every runtime's condition list and inject a
+`process.env.NODE_ENV` define. Both are fixed; these are the numbers the shipped analyzer
+now produces (`ANALYZER_REVISION = rolldown2`, which rejects every entry measured before them):
+
+| package/export | raw bytes | rendered modules | loaded paths |
+| --- | --- | --- | --- |
+| `css-tree/parse` | 320,455 | 123 | 128 |
+| `zod/z` | 450,089 | 78 | 79 |
+| `lodash/debounce` (CJS) | 488,868 | 1 | 1 |
+| `date-fns/format` | 75,898 | 36 | 304 |
+| `react/useState` | 53,711 | 3 | 3 |
+| `lodash-es/debounce` | 11,832 | 14 | 640 |
+| `uuid/v4` | 1,498 | 3 | 20 |
+
+Accuracy against esbuild (`pnpm test:accuracy`, brotli) is unchanged by the fixes — the
+minifier already stripped the debug comments, and none of the fixtures carries a `browser`
+condition — so the worst case stays `css-tree` at **13.0%**, inside the 25% tolerance.
 
 Automation (§10.5): all gates pass via `scripts/test/update-compiler-stack.test.mjs` and
 `scripts/test/compiler-stack-coordination.test.mjs` — exact family pins (rolldown,
@@ -886,6 +908,13 @@ Performance and stability (§10.6, release build, 5 warm-ups + 30 recorded runs)
 | 20-import batch (2 concurrent), wall | 605 ms | — |
 | 20-import batch peak RSS | 78 MB | < 400 MB |
 | determinism (per-package byte-compare of code, loaded paths, contributions, exports; stable failure stages across repeated matrix runs) | pass | required |
+
+**Caveat, resolved 2026-07-12.** These measurements were taken on a Tokio runtime sized to
+`num_cpus`, while the shipped daemon built its engine runtime with `worker_threads(ENGINE_PERMITS)`
+= 2 — so the table above did not describe production, and the "~2× faster per build" claim was
+measured on a runtime the user never had. The runtime is now sized to `available_parallelism`
+clamped to `[ENGINE_PERMITS, 8]`, with the permits (and so peak memory) untouched. Measured over
+four real-package cold builds: **median 299 ms → 181 ms**. The record and production now agree.
 
 The candidate is faster than the current engine, so the >15% regression clause is not in
 play. Startup, idle RSS, and the cache-hit path are unchanged by construction in Phase 1:
