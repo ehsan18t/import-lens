@@ -148,7 +148,7 @@ fn package_json_prewarm_requests_skip_default_for_packages_without_default_expor
         ImportRuntime::Component,
     )
     .expect("resolved entry export enumeration should succeed");
-    assert!(!exports.iter().any(|name| name == "default"));
+    assert!(!exports.names.iter().any(|name| name == "default"));
 
     let requests = package_json_prewarm_requests(&package_json_path, &active_document_path)
         .expect("prewarm requests should be created");

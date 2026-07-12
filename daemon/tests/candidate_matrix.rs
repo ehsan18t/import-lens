@@ -662,7 +662,7 @@ async fn matrix_27_cjs_export_shapes() {
     // assignments — named CJS surfaces come from link-time interop, not
     // enumeration. This is Rolldown's resolution result; it is never
     // augmented by guessing (§8.4).
-    assert_eq!(exported, vec!["default".to_owned()]);
+    assert_eq!(exported.names, vec!["default".to_owned()]);
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
 

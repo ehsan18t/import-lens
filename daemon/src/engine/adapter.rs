@@ -13,12 +13,13 @@ use rolldown::{
 use rolldown_common::{Output, OutputChunk};
 use rolldown_error::{BuildDiagnostic, EventKind};
 
+use super::ExportEnumeration;
 use super::plugin::{BuildState, ImportLensPlugin};
 use super::{
     BundleArtifact, BundleFailure, BundleRequest, ImportDiagnostic, ImportRuntime,
     ModuleContribution, entry,
 };
-use crate::pipeline::node_builtins::NODE_BUILTIN_MODULES;
+use crate::pipeline::node_builtins::{NODE_BUILTIN_MODULES, NODE_PREFIX_ONLY_MODULES};
 use crate::pipeline::resolver::resolve_options as shared_resolve_options;
 
 /// Stateless adapter; one Rolldown bundler is built per request and never
@@ -54,7 +55,7 @@ impl RolldownEngine {
         &self,
         entry_path: PathBuf,
         runtime: ImportRuntime,
-    ) -> Result<Vec<String>, BundleFailure> {
+    ) -> Result<ExportEnumeration, BundleFailure> {
         let cwd = entry_path
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -67,7 +68,15 @@ impl RolldownEngine {
         let state = plugin.state();
         let output = run_build(options, plugin, &state).await?;
         let chunk = single_chunk(&output, &state)?;
-        Ok(chunk.exports.iter().map(|name| name.to_string()).collect())
+        let (read_time_fingerprints, unhashed_paths) = state.read_time_fingerprints();
+
+        Ok(ExportEnumeration {
+            names: chunk.exports.iter().map(|name| name.to_string()).collect(),
+            // A successful build's warnings used to be dropped on the floor.
+            diagnostics: warning_diagnostics(&output.warnings),
+            read_time_fingerprints,
+            unhashed_paths,
+        })
     }
 }
 
@@ -127,10 +136,16 @@ fn build_options(input: InputItem, cwd: PathBuf, runtime: ImportRuntime) -> Bund
 /// Node builtins stay external (§7.1); Rolldown matches these against the
 /// raw specifier by exact string equality.
 fn builtin_external() -> IsExternal {
-    let mut specifiers = Vec::with_capacity(NODE_BUILTIN_MODULES.len() * 2);
+    let mut specifiers =
+        Vec::with_capacity(NODE_BUILTIN_MODULES.len() * 2 + NODE_PREFIX_ONLY_MODULES.len());
     for module in NODE_BUILTIN_MODULES {
         specifiers.push((*module).to_owned());
         specifiers.push(format!("node:{module}"));
+    }
+    // Prefix-only builtins carry their `node:` prefix already, and must NOT be added
+    // bare: the bare spelling belongs to whatever npm package owns that name.
+    for module in NODE_PREFIX_ONLY_MODULES {
+        specifiers.push((*module).to_owned());
     }
     IsExternal::from(specifiers)
 }

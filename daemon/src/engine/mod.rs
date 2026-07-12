@@ -74,9 +74,33 @@ pub struct BundleArtifact {
     /// back to Rolldown. The caller fingerprints these by reading them.
     pub unhashed_paths: Vec<PathBuf>,
     pub contributions: Vec<ModuleContribution>,
+    /// The chunk's public export list. Deliberately kept despite having no production
+    /// reader: it is how the qualification suites assert that every requested
+    /// `__il_entry_*` alias survived linking, which is the invariant the whole
+    /// selection mechanism rests on (§8.4). Removing it would cost one small
+    /// allocation per build and take that check with it.
     pub exported_names: Vec<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
     pub matched_side_effect_paths: Vec<PathBuf>,
+}
+
+/// The result of export enumeration (§8.4).
+///
+/// Carries diagnostics on the *success* path: Rolldown reports a missing or ambiguous
+/// export as an error, which already reaches the user, but a build that succeeds with
+/// warnings had those warnings silently dropped when this was a bare `Vec<String>`.
+///
+/// It also carries the build's read-time fingerprints, which is what lets the caller
+/// memoize the enumeration instead of running a full engine build of the whole package
+/// graph on every completion popup.
+#[derive(Debug, Clone)]
+pub struct ExportEnumeration {
+    pub names: Vec<String>,
+    pub diagnostics: Vec<ImportDiagnostic>,
+    pub read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    /// Loaded paths with no read-time fingerprint. A non-empty list means the
+    /// enumeration must not be memoized: there is nothing to expire it against.
+    pub unhashed_paths: Vec<PathBuf>,
 }
 
 /// `stage` is one of: "resolve" | "parse" | "link" | "generate" |

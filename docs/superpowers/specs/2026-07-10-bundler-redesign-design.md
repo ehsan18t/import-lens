@@ -423,9 +423,29 @@ trait BundlingEngine {
     async fn enumerate_exports(
         &self,
         request: ExportEnumerationRequest,
-    ) -> Result<Vec<String>, BundleFailure>;
+    ) -> Result<ExportEnumeration, BundleFailure>;
+}
+
+struct ExportEnumeration {
+    names: Vec<String>,
+    diagnostics: Vec<ImportDiagnostic>,
+    read_time_fingerprints: Vec<FileFingerprint>,
+    unhashed_paths: Vec<PathBuf>,
 }
 ```
+
+Enumeration returns a struct rather than a bare `Vec<String>` for two reasons, both
+found in post-cutover verification:
+
+- **Diagnostics on the success path.** §8.4 wants a successful enumeration's warnings
+  surfaced, but a `Vec<String>` had nowhere to put them, so they were dropped. (A
+  *missing* or *ambiguous* export is reported by Rolldown as an error and always
+  reached the user; only true warnings were lost.)
+- **Freshness inputs.** The read-time fingerprints let the caller memoize an
+  enumeration instead of running a full engine build of the whole package graph on
+  every completion popup, and expire it exactly when the files it was derived from
+  change. `unhashed_paths` being non-empty means the enumeration must not be cached —
+  there is nothing to expire it against.
 
 Exact Rust trait syntax may use boxed futures if required by object safety. The semantic
 contract must not change.

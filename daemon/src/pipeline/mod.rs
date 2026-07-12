@@ -1,5 +1,7 @@
 pub mod analyze;
+mod build_memo;
 pub mod compress;
+pub mod export_list;
 mod fallback;
 pub mod file_size;
 pub mod file_size_cache;

@@ -1632,17 +1632,26 @@ impl ImportLensService {
             }
         };
 
-        match crate::engine::boundary::enumerate_exports_sync(
-            resolved.entry_path,
+        match crate::pipeline::export_list::enumerate_exports_cached(
+            &resolved.entry_path,
             import_request.runtime,
         ) {
-            Ok(exports) => EnumerateExportsResponse {
+            Ok(enumeration) => EnumerateExportsResponse {
                 version: request.version,
                 request_id: request.request_id,
                 specifier: request.specifier,
-                exports,
+                exports: enumeration.names,
                 error: None,
-                diagnostics: Vec::new(),
+                // A successful enumeration's warnings used to be dropped here.
+                diagnostics: enumeration
+                    .diagnostics
+                    .into_iter()
+                    .map(|diagnostic| ImportDiagnostic {
+                        stage: diagnostic.stage,
+                        message: diagnostic.message,
+                        details: Vec::new(),
+                    })
+                    .collect(),
             },
             Err(failure) => EnumerateExportsResponse {
                 version: request.version,

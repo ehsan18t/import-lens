@@ -223,7 +223,7 @@ async fn the_parse_based_default_probe_agrees_with_engine_enumeration() {
         let entry =
             common::engine_fixtures::resolve_fixture_entry(&workspace, package, version, "any");
         let engine = enumerate_exports_sync(entry.entry_path.clone(), ImportRuntime::default())
-            .map(|exports| exports.iter().any(|name| name == "default"))
+            .map(|enumeration| enumeration.names.iter().any(|name| name == "default"))
             .unwrap_or(true);
         let parsed = entry_exposes_default_export(&entry.entry_path);
         if engine != parsed {

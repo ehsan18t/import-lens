@@ -98,7 +98,7 @@ pub fn bundle_sync(request: BundleRequest) -> Result<BundleArtifact, BundleFailu
 pub fn enumerate_exports_sync(
     entry_path: PathBuf,
     runtime: ImportRuntime,
-) -> Result<Vec<String>, BundleFailure> {
+) -> Result<super::ExportEnumeration, BundleFailure> {
     run_on_engine(ENGINE.enumerate_exports(entry_path, runtime))
 }
 
