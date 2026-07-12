@@ -10,7 +10,17 @@ license = "MIT"
 opt-level = "z"
 codegen-units = 1
 lto = true
-panic = "abort"
+# MUST stay "unwind" (the default). The daemon isolates panics with `catch_unwind` in
+# eight places — a panicking workspace file is skipped from the report, a panicking
+# analysis returns an error response, the registry and report workers survive — and
+# `catch_unwind` cannot catch anything under `panic = "abort"`: the panic runtime
+# aborts the process on the spot. With abort set, every one of those guards was dead
+# code in the shipped binary and a single bad file would take the user's daemon down.
+#
+# `cargo test` cannot catch this regression: Cargo ignores `panic = "abort"` for the
+# test profile, so the isolation tests pass either way. Do not "re-enable" this to
+# shave binary size.
+panic = "unwind"
 strip = true
 
 # The high-value groups (correctness/suspicious/style/complexity/perf, plus the
