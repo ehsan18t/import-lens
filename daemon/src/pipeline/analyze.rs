@@ -1,5 +1,7 @@
 use crate::{
-    engine::{dependency_paths::record_loaded_paths, limits::MAX_MODULE_SOURCE_BYTES},
+    engine::{
+        EngineBudget, dependency_paths::record_loaded_paths, limits::MAX_MODULE_SOURCE_BYTES,
+    },
     ipc::protocol::{
         ConfidenceLevel, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
         ModuleContribution, ResultFreshness,
@@ -22,6 +24,17 @@ use std::{
 pub struct AnalysisContext {
     pub workspace_root: PathBuf,
     pub active_document_path: PathBuf,
+    /// How much engine time the request that opened this analysis may still spend (§9).
+    ///
+    /// Stamped once when the request arrives and shared by every build it triggers — the entry
+    /// build, the full-package comparison, the combined file-size build, and the per-import
+    /// fallback each of those degrades into. That sharing is the point: the bound belongs to the
+    /// *request*, so imports whose builds cannot start inside the client's deadline degrade to
+    /// static sizing instead of queueing behind builds that will not finish (see
+    /// [`crate::engine::budget`]). Every construction site must therefore choose the budget that
+    /// matches the deadline its client is actually waiting on, which is why this field has no
+    /// default.
+    pub engine_budget: EngineBudget,
 }
 
 // Internal structured error translated into the stable ImportResult surface.
@@ -285,11 +298,14 @@ pub(crate) fn analyze_with_rolldown_engine(
         selection,
         reported_side_effects: side_effects_mode.clone(),
     };
-    let artifact = boundary::bundle_sync(BundleRequest {
-        entries: vec![bundle_entry(engine_selection(request))],
-        runtime: request.runtime,
-        purpose: BundlePurpose::ImportSize,
-    })
+    let artifact = boundary::bundle_sync(
+        BundleRequest {
+            entries: vec![bundle_entry(engine_selection(request))],
+            runtime: request.runtime,
+            purpose: BundlePurpose::ImportSize,
+        },
+        context.engine_budget,
+    )
     .map_err(|failure| engine_error(context, request, failure))?;
 
     let minified = minify_source(&artifact.code, false).map_err(|error| {
@@ -345,11 +361,16 @@ pub(crate) fn analyze_with_rolldown_engine(
             // is in flight must not be stamped onto a length measured from the bytes it
             // invalidated.
             let generation = crate::cache::memory::cache_generation();
-            let full = match boundary::bundle_sync(BundleRequest {
-                entries: vec![bundle_entry(BundleSelection::Full)],
-                runtime: request.runtime,
-                purpose: BundlePurpose::FullPackageComparison,
-            }) {
+            // The comparison build shares the request's budget with the entry build above, so a
+            // document cannot pay twice the engine time just because its imports are named ones.
+            let full = match boundary::bundle_sync(
+                BundleRequest {
+                    entries: vec![bundle_entry(BundleSelection::Full)],
+                    runtime: request.runtime,
+                    purpose: BundlePurpose::FullPackageComparison,
+                },
+                context.engine_budget,
+            ) {
                 Ok(full) => full,
                 Err(failure) => {
                     diagnostics.push(ImportDiagnostic {
@@ -454,25 +475,31 @@ pub(crate) fn engine_selection(request: &ImportRequest) -> crate::engine::Bundle
     }
 }
 
+/// The contract's failure stages are a closed vocabulary; keep the known ones verbatim so
+/// cache and diagnostic consumers see stable stage names, and collapse anything unknown to
+/// `generate` rather than inventing a label.
+///
+/// The vocabulary is *derived* from `engine::stage::ALL` rather than restated here. It used
+/// to be restated, and the restatement drifted: the boundary's `panic`, `timeout` and
+/// `engine_gone` were missing, so a daemon-side panic reached the user relabelled as an
+/// ordinary codegen failure — indistinguishable from one — while `file_size.rs` passed the
+/// same stage through untouched, giving one failure two names in two different responses.
+/// Deriving the list makes that class of drift impossible instead of merely testable.
+fn contract_stage(stage: &str) -> &'static str {
+    crate::engine::stage::ALL
+        .iter()
+        .copied()
+        .find(|known| *known == stage)
+        .unwrap_or(crate::engine::stage::GENERATE)
+}
+
 fn engine_error(
     context: &AnalysisContext,
     request: &ImportRequest,
     failure: crate::engine::BundleFailure,
 ) -> AnalysisError {
-    // The contract's failure stages are a closed vocabulary; keep them
-    // verbatim so cache/diagnostic consumers see stable stage names.
-    let stage = match failure.stage.as_str() {
-        "resolve" => "resolve",
-        "parse" => "parse",
-        "link" => "link",
-        "output_shape" => "output_shape",
-        "module_graph_limit" => "module_graph_limit",
-        "missing_export" => "missing_export",
-        "ambiguous_export" => "ambiguous_export",
-        _ => "generate",
-    };
     error_with_context(
-        stage,
+        contract_stage(&failure.stage),
         failure.message,
         context,
         request,
@@ -800,6 +827,7 @@ mod tests {
         let context = AnalysisContext {
             workspace_root: workspace.clone(),
             active_document_path: workspace.join("src").join("app.ts"),
+            engine_budget: EngineBudget::interactive(),
         };
 
         let manifests = first_party_manifests(
@@ -820,5 +848,23 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// The other half of `contract_stage`: a stage the vocabulary does not know collapses to
+    /// `generate` rather than reaching the client under an invented label.
+    ///
+    /// There is deliberately no companion test asserting that every stage in `stage::ALL`
+    /// survives the edge. `contract_stage` *searches* `ALL`, so such a test is identity over
+    /// `ALL` by construction and can never go red — it would only look like coverage. The
+    /// property it pretended to protect (a declared stage is in `ALL`) is now structural:
+    /// `engine::stage` emits the constants and `ALL` from one macro invocation, so a stage
+    /// that is missing from `ALL` cannot be written.
+    #[test]
+    fn an_unknown_stage_collapses_to_generate() {
+        assert_eq!(
+            contract_stage("something-nobody-defined"),
+            crate::engine::stage::GENERATE,
+            "an unrecognized stage collapses rather than inventing a label"
+        );
     }
 }

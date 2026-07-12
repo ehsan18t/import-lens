@@ -7,6 +7,7 @@
 //! Measured through the engine's own build counter, which is the honest unit. Both the
 //! counter and the memo are process-global, so this test owns its binary.
 
+use import_lens_daemon::engine::EngineBudget;
 use import_lens_daemon::engine::boundary::builds_started;
 use import_lens_daemon::ipc::protocol::ImportRuntime;
 use import_lens_daemon::pipeline::export_list::enumerate_exports_cached;
@@ -33,8 +34,9 @@ fn write_alpha(workspace: &Path, body: &str) {
 
 fn enumerate(entry: &Path) -> (Vec<String>, usize) {
     let before = builds_started();
-    let enumeration = enumerate_exports_cached(entry, ImportRuntime::Component)
-        .expect("enumeration should succeed");
+    let enumeration =
+        enumerate_exports_cached(entry, ImportRuntime::Component, EngineBudget::interactive())
+            .expect("enumeration should succeed");
     let mut names = enumeration.names;
     names.sort();
     (names, builds_started() - before)

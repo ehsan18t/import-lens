@@ -1340,6 +1340,34 @@ fabrication or a blank, since a limit breach means much of the graph was loaded 
 The engine currently discards the partial graph on failure, so this is the intended successor to
 I16, not a hypothetical.
 
+Because the stage is now the answer, the engine boundary contributes three stages of its own, and
+all three are part of I16's vocabulary:
+
+| stage | meaning |
+| --- | --- |
+| `panic` | a Rolldown/OXC panic unwound into the boundary's `catch_unwind`; Unmeasured for this import only |
+| `timeout` | the build did not complete within its limit — `BUILD_TIMEOUT` (8s) or whatever remained of the request's engine budget, whichever was shorter — and was cancelled; **or** it was never started at all, because the request's budget was already spent when it reached the permit |
+| `engine_gone` | the engine runtime was torn down without replying — not a panic, and must not be counted as one |
+
+`timeout` is not a slowness policy; it is the *only* containment for the panic class that matters.
+Rolldown loads each module on a task it `tokio::spawn`s and contains no `catch_unwind` anywhere, so
+a parse-path panic is swallowed by Tokio: the task never sends its completion message, the loader's
+outstanding-module count never reaches zero, and — because the loader holds its own clone of the
+message sender — its receive loop never sees a closed channel either. The build future parks
+forever. Nothing unwinds, so `catch_unwind` never fires; the permit and the in-flight guard are
+never released, and two such packages exhaust the permit pool and wedge every subsequent build until
+the daemon restarts. Cancelling the future on timeout is what releases them. At ~120x the §10.6
+cold-p95 gate the bound cannot fire on a legitimate build.
+
+That bounds a *build*. It cannot bound a *request*: a permit is acquired outside the timeout, so
+parked builds queue rather than merely run late, and a build admitted once they are cancelled would
+start a fresh timeout of its own — enough of them serialize one document past the client's deadline,
+which rejects the whole response and loses even the imports already answered from cache. The request
+therefore carries an engine **budget**: a deadline stamped on arrival and sized under the deadline of
+the client waiting for it. Every build is capped at the shorter of `BUILD_TIMEOUT` and the budget's
+remainder, and re-checks the budget *after* acquiring its permit — so a build that queued behind
+parked ones abandons rather than starting over, and reports `timeout` without ever having run.
+
 ## 13. Expected blast radius
 
 The initial diff is larger than the custom fixpoint because this design removes whole

@@ -1355,6 +1355,9 @@ This section specifies the engine boundary (`daemon/src/engine/`) that isolates 
 | parse/link/generate failure | conservative static fallback with stage diagnostic |
 | `output_shape` | conservative static fallback |
 | `module_graph_limit` | conservative static fallback |
+| `panic` (an engine build unwound into the boundary's `catch_unwind`) | conservative static fallback with stage diagnostic; the panic is contained to that one import, and every other import of the request — including every one already answered from cache — is unaffected |
+| `timeout` (an engine build did not complete within its limit, or was never started because the request had no engine time left) | conservative static fallback with stage diagnostic. Two things carry this stage, because from the client's side they are one event. (1) A build that did not finish within its limit and was cancelled — the containment for a build parked by a panic swallowed inside a bundler-spawned module task. (2) A build that was never started at all. A build timeout bounds a *build*; it cannot bound a *request*, because engine permits are acquired outside it, so builds that park do not merely run late — they queue, and a later one admitted after they are cancelled would start a fresh timeout of its own. Each request therefore carries an **engine budget**: a deadline stamped when the request arrives, sized under the deadline of the client waiting for it (9s under the extension's 10s interactive timeout; 290s under the 300s it allows a workspace report or a package.json analysis; background prewarm and revalidation carry none, as no client is waiting). Every build the request makes is capped at the shorter of the build timeout and what is left of that budget, and re-checks the budget *after* it acquires its permit — so a build that queued behind parked ones abandons instead of starting a fresh clock. Once the budget is spent, the request's remaining imports degrade to the static fallback without entering the engine at all, which needs no permit and is fast. A document's engine wall-clock is bounded by its budget however many broken packages it names, so the response is assembled inside the client's deadline with every cached hit intact. Changing a client timeout without changing the matching budget re-opens this. |
+| `engine_gone` (the engine runtime dropped the build without replying) | conservative static fallback with stage diagnostic |
 | OXC validation/minification failure after linking | conservative static fallback with the OXC stage diagnostic |
 | compression failure | existing per-import computation error behavior |
 
@@ -1577,6 +1580,7 @@ import-lens/
 │       │   ├── plugin.rs              # Native plugin: virtual entry, target mapping, limits
 │       │   ├── entry.rs               # Virtual entry source generation
 │       │   ├── boundary.rs            # Two-permit async execution boundary
+│       │   ├── budget.rs              # Per-request engine deadline, sized under the client's
 │       │   ├── scheduling.rs          # Ordered miss scheduling helpers
 │       │   ├── dependency_paths.rs    # Loaded-path fingerprint sources
 │       │   └── limits.rs              # Hard module/source limits

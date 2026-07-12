@@ -257,6 +257,7 @@ fn stat_token(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::cache::memory::bump_cache_generation;
+    use crate::engine::EngineBudget;
     use crate::ipc::protocol::{ImportKind, ImportRuntime};
 
     fn computation(minified: u64) -> FileSizeComputation {
@@ -359,6 +360,7 @@ mod tests {
         AnalysisContext {
             workspace_root: PathBuf::from("/does/not/exist"),
             active_document_path: PathBuf::from("/does/not/exist/src/index.ts"),
+            engine_budget: EngineBudget::interactive(),
         }
     }
 
@@ -390,6 +392,7 @@ mod tests {
         let context = AnalysisContext {
             workspace_root: ws.clone(),
             active_document_path: ws.join("src").join("index.ts"),
+            engine_budget: EngineBudget::interactive(),
         };
         let requests = vec![ImportRequest {
             specifier: "l1-lib".to_owned(),

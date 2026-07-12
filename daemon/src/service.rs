@@ -11,6 +11,7 @@ use crate::{
         named_import_completion_context, package_json_dependency_entries,
         package_json_dependency_sections, should_ignore_import,
     },
+    engine::EngineBudget,
     ipc::protocol::{
         AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
         AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
@@ -504,6 +505,12 @@ impl ImportLensService {
         }
 
         let workspace_root = PathBuf::from(&request.workspace_root);
+        // One engine budget for the whole report, stamped here and shared by every file below
+        // (§9). The client's deadline covers the entire scan, not each file, so this is the level
+        // the deadline has to be stamped at: once it is spent, the files still to come size their
+        // imports from the static fallback and the report still returns inside the deadline
+        // instead of being thrown away whole.
+        let budget = EngineBudget::long_running();
         let files = crate::report::scanner::scan_workspace_sources(&workspace_root);
         // One resolver per report run: files sharing a directory share a single
         // .importlensignore ancestor walk, while edits between reports are
@@ -521,7 +528,7 @@ impl ImportLensService {
                     Ok(source) => source,
                     Err(_) => return Vec::new().into_iter(),
                 };
-                self.analyze_report_source(source_path, &request, source, &ignore_resolver)
+                self.analyze_report_source(source_path, &request, source, &ignore_resolver, budget)
                     .into_iter()
             })
             .collect::<Vec<_>>();
@@ -544,6 +551,7 @@ impl ImportLensService {
         request: &WorkspaceReportRequest,
         source: String,
         ignore_resolver: &IgnoreRuleResolver,
+        budget: EngineBudget,
     ) -> Vec<crate::report::model::WorkspaceReportItem> {
         let document_request = AnalyzeDocumentRequest {
             message_type: "analyze_document".to_owned(),
@@ -577,6 +585,7 @@ impl ImportLensService {
                 document_request,
                 ignore_resolver,
                 ReadIntent::Bulk,
+                budget,
             )
         }));
 
@@ -633,6 +642,7 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            engine_budget: EngineBudget::interactive(),
         };
         let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
         annotate_shared_bytes(&mut imports);
@@ -689,6 +699,7 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            engine_budget: EngineBudget::interactive(),
         };
         let mut imports = self.analyze_batch(&context, &request.imports, |index, result| {
             emit_partial(BatchResponse {
@@ -719,6 +730,7 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            engine_budget: EngineBudget::interactive(),
         };
         let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
         annotate_shared_bytes(&mut imports);
@@ -748,14 +760,24 @@ impl ImportLensService {
         // looking at) promotes recency. The bulk WorkspaceReport scan reuses this same
         // per-file analysis via `_with_intent(.., ReadIntent::Bulk)` so it does NOT
         // promote — a full-workspace pass can't flood the recency signal (§5.1).
-        self.handle_analyze_document_with_intent(request, ignore_resolver, ReadIntent::Interactive)
+        self.handle_analyze_document_with_intent(
+            request,
+            ignore_resolver,
+            ReadIntent::Interactive,
+            EngineBudget::interactive(),
+        )
     }
 
+    /// `budget` is passed in rather than derived from `intent` because the workspace report
+    /// stamps ONE budget for the whole scan and hands the same one to every file (§9). Deriving
+    /// it here would stamp a fresh 290s per file, which would bound a file and not the report —
+    /// the same mistake, one level up, as bounding a build instead of a request.
     fn handle_analyze_document_with_intent(
         &self,
         request: AnalyzeDocumentRequest,
         ignore_resolver: &IgnoreRuleResolver,
         intent: ReadIntent,
+        budget: EngineBudget,
     ) -> AnalyzeDocumentResponse {
         if !is_supported_protocol_version(request.version) {
             return AnalyzeDocumentResponse {
@@ -773,6 +795,7 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            engine_budget: budget,
         };
         let detected = match detected_imports_for_document(
             &request.active_document_path,
@@ -822,6 +845,7 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            engine_budget: EngineBudget::interactive(),
         };
         let detected = request
             .specifiers
@@ -867,6 +891,7 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            engine_budget: EngineBudget::interactive(),
         };
         let ignore_resolver = IgnoreRuleResolver::default();
         let detected = match detected_imports_for_document(
@@ -975,6 +1000,10 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            // Background SWR revalidation: the client already has its (stale) answer and the
+            // refreshed one is pushed whenever it is ready, so no deadline is being missed by
+            // finishing the build. `BUILD_TIMEOUT` still caps each one.
+            engine_budget: EngineBudget::background(),
         };
         let ignore_resolver = IgnoreRuleResolver::default();
         let detected = detected_imports_for_document(
@@ -1138,6 +1167,9 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            // A manifest can name hundreds of dependencies and the extension waits 300s for it,
+            // so this request gets the long-running budget rather than the interactive one.
+            engine_budget: EngineBudget::long_running(),
         };
         let sections = package_json_dependency_sections(&request.source);
         let registry_hint_mode = effective_registry_hint_mode(&request);
@@ -1604,6 +1636,7 @@ impl ImportLensService {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
+            engine_budget: EngineBudget::interactive(),
         };
         let import_request = ImportRequest {
             specifier: request.specifier.clone(),
@@ -1635,6 +1668,7 @@ impl ImportLensService {
         match crate::pipeline::export_list::enumerate_exports_cached(
             &resolved.entry_path,
             import_request.runtime,
+            context.engine_budget,
         ) {
             Ok(enumeration) => EnumerateExportsResponse {
                 version: request.version,
@@ -2635,6 +2669,7 @@ mod report_panic_isolation_tests {
             &request,
             "// __IMPORTLENS_FORCE_PANIC__\n".to_owned(),
             &IgnoreRuleResolver::default(),
+            crate::engine::EngineBudget::long_running(),
         );
 
         assert!(items.is_empty());
@@ -2728,6 +2763,7 @@ mod task_lifecycle_tests {
 mod analyze_and_cache_single_flight_tests {
     use super::{ComputedAnalysis, ImportLensService};
     use crate::cache::key::cache_key_for_resolved_import;
+    use crate::engine::EngineBudget;
     use crate::ipc::protocol::{
         ConfidenceLevel, ImportKind, ImportRequest, ImportResult, ImportRuntime, ResultFreshness,
     };
@@ -2812,6 +2848,7 @@ mod analyze_and_cache_single_flight_tests {
         let context = AnalysisContext {
             workspace_root: workspace.clone(),
             active_document_path: workspace.join("src").join("app.ts"),
+            engine_budget: EngineBudget::interactive(),
         };
         let request = request();
         let resolved = resolved(&workspace);

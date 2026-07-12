@@ -146,6 +146,7 @@ fn package_json_prewarm_requests_skip_default_for_packages_without_default_expor
     let exports = import_lens_daemon::engine::boundary::enumerate_exports_sync(
         resolved.entry_path,
         ImportRuntime::Component,
+        import_lens_daemon::engine::EngineBudget::interactive(),
     )
     .expect("resolved entry export enumeration should succeed");
     assert!(!exports.names.iter().any(|name| name == "default"));

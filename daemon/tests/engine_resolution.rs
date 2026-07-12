@@ -20,6 +20,7 @@
 //! `Platform::Neutral` appends nothing, leaving the per-runtime condition list from
 //! the shared resolver authoritative (spec §7.1).
 
+use import_lens_daemon::engine::EngineBudget;
 use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
 use import_lens_daemon::pipeline::analyze::AnalysisContext;
 use import_lens_daemon::pipeline::file_size::compute_file_size;
@@ -35,6 +36,7 @@ fn context(workspace: &Path) -> AnalysisContext {
     AnalysisContext {
         workspace_root: workspace.to_path_buf(),
         active_document_path: workspace.join("src").join("page.astro"),
+        engine_budget: EngineBudget::interactive(),
     }
 }
 

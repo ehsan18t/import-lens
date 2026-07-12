@@ -17,7 +17,7 @@ use super::ExportEnumeration;
 use super::plugin::{BuildState, ImportLensPlugin};
 use super::{
     BundleArtifact, BundleFailure, BundleRequest, ImportDiagnostic, ImportRuntime,
-    ModuleContribution, entry,
+    ModuleContribution, diagnostic_stage, entry, stage,
 };
 use crate::pipeline::node_builtins::{NODE_BUILTIN_MODULES, NODE_PREFIX_ONLY_MODULES};
 use crate::pipeline::resolver::resolve_options as shared_resolve_options;
@@ -32,7 +32,7 @@ impl RolldownEngine {
     pub async fn bundle(&self, request: BundleRequest) -> Result<BundleArtifact, BundleFailure> {
         let Some(first_entry) = request.entries.first() else {
             return Err(BundleFailure {
-                stage: "generate".to_owned(),
+                stage: stage::GENERATE.to_owned(),
                 message: "bundle request contains no entries".to_owned(),
                 diagnostics: Vec::new(),
                 loaded_paths: Vec::new(),
@@ -207,7 +207,7 @@ fn translate(
     let mut diagnostics = warning_diagnostics(&output.warnings);
     for import in &chunk.imports {
         diagnostics.push(ImportDiagnostic {
-            stage: "external".to_owned(),
+            stage: diagnostic_stage::EXTERNAL.to_owned(),
             message: format!("external module kept as an import boundary: {import}"),
         });
     }
@@ -228,7 +228,7 @@ fn translate(
         // at all. The rows fail for an unrelated reason. Do not assert a direction of
         // error that has not been reproduced.
         diagnostics.push(ImportDiagnostic {
-            stage: "side_effects".to_owned(),
+            stage: diagnostic_stage::SIDE_EFFECTS.to_owned(),
             message: "package sideEffects globs present; matched paths are unavailable from \
                       public bundler metadata, so side-effect confidence is conservative"
                 .to_owned(),
@@ -265,7 +265,7 @@ fn single_chunk(
     }
     if chunks.len() != 1 || !asset_names.is_empty() {
         return Err(BundleFailure {
-            stage: "output_shape".to_owned(),
+            stage: stage::OUTPUT_SHAPE.to_owned(),
             message: format!(
                 "expected exactly one chunk and no assets, got {} chunk(s) and {} asset(s){}",
                 chunks.len(),
@@ -287,18 +287,18 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
     let loaded_paths = state.sorted_loaded_paths();
     if let Some(breach) = state.take_breach() {
         return BundleFailure {
-            stage: "module_graph_limit".to_owned(),
+            stage: stage::MODULE_GRAPH_LIMIT.to_owned(),
             message: breach,
             diagnostics: error_diagnostics(&diagnostics),
             loaded_paths,
         };
     }
 
-    let stage = diagnostics
+    let failure_stage = diagnostics
         .iter()
         .map(stage_for)
-        .find(|stage| *stage != "link")
-        .unwrap_or("link");
+        .find(|candidate| *candidate != stage::LINK)
+        .unwrap_or(stage::LINK);
     let message = if diagnostics.is_empty() {
         "rolldown build failed without diagnostics".to_owned()
     } else {
@@ -310,7 +310,7 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
     };
 
     BundleFailure {
-        stage: stage.to_owned(),
+        stage: failure_stage.to_owned(),
         message,
         diagnostics: error_diagnostics(&diagnostics),
         loaded_paths,
@@ -327,18 +327,20 @@ fn stage_for(diagnostic: &BuildDiagnostic) -> &'static str {
                 .to_ascii_lowercase()
                 .contains("ambiguous")
             {
-                "ambiguous_export"
+                stage::AMBIGUOUS_EXPORT
             } else {
-                "missing_export"
+                stage::MISSING_EXPORT
             }
         }
-        EventKind::AmbiguousExternalNamespaceError => "ambiguous_export",
-        EventKind::ParseError | EventKind::JsonParseError | EventKind::TransformError => "parse",
+        EventKind::AmbiguousExternalNamespaceError => stage::AMBIGUOUS_EXPORT,
+        EventKind::ParseError | EventKind::JsonParseError | EventKind::TransformError => {
+            stage::PARSE
+        }
         EventKind::UnresolvedEntry
         | EventKind::UnresolvedImport
         | EventKind::ResolveError
-        | EventKind::UnloadableDependencyError => "resolve",
-        _ => "link",
+        | EventKind::UnloadableDependencyError => stage::RESOLVE,
+        _ => stage::LINK,
     }
 }
 
@@ -359,7 +361,7 @@ fn warning_diagnostics(warnings: &[BuildDiagnostic]) -> Vec<ImportDiagnostic> {
     warnings
         .iter()
         .map(|warning| ImportDiagnostic {
-            stage: "generate".to_owned(),
+            stage: stage::GENERATE.to_owned(),
             message: format!("{}: {}", warning.kind(), warning),
         })
         .collect()

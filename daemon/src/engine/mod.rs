@@ -5,6 +5,7 @@
 
 mod adapter;
 pub mod boundary;
+pub mod budget;
 pub(crate) mod dependency_paths;
 mod entry;
 pub(crate) mod limits;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 pub use crate::ipc::protocol::ImportRuntime;
 pub use crate::pipeline::resolver::SideEffectsMode;
 pub use adapter::RolldownEngine;
+pub use budget::EngineBudget;
 
 #[derive(Debug, Clone)]
 pub struct BundleRequest {
@@ -103,9 +105,67 @@ pub struct ExportEnumeration {
     pub unhashed_paths: Vec<PathBuf>,
 }
 
-/// `stage` is one of: "resolve" | "parse" | "link" | "generate" |
-/// "output_shape" | "module_graph_limit" | "missing_export" |
-/// "ambiguous_export".
+/// The closed vocabulary of `BundleFailure::stage` (§12).
+///
+/// This module is the single source of truth. `pipeline::analyze::contract_stage` derives
+/// its mapping from [`stage::ALL`] rather than restating the list, so a stage cannot exist
+/// here and be silently relabelled `generate` on the way to the client. Every
+/// `BundleFailure` the daemon constructs takes its stage from one of these constants; a new
+/// stage that is added as a bare string literal at a construction site instead is exactly
+/// the drift this module exists to make impossible, and `daemon/src/engine` is guarded
+/// against it.
+pub mod stage {
+    /// Declares the vocabulary. Each constant and its membership in [`ALL`] are emitted from
+    /// the *same* line of the same invocation, so a stage that exists but is missing from
+    /// `ALL` — and is therefore relabelled `generate` at the contract edge while
+    /// `file_size.rs` passes it through untouched, one failure under two names — is not a
+    /// mistake you can make here. It is unrepresentable rather than merely tested for.
+    macro_rules! stages {
+        ($($(#[$attribute:meta])* $name:ident => $value:literal,)+) => {
+            $($(#[$attribute])* pub const $name: &str = $value;)+
+
+            /// Every stage declared above, in contract order. Anything absent from this list
+            /// would collapse to [`GENERATE`] at the contract edge — which is why the list is
+            /// generated from the declarations instead of restated beside them.
+            pub const ALL: &[&str] = &[$($name),+];
+        };
+    }
+
+    stages! {
+        RESOLVE => "resolve",
+        PARSE => "parse",
+        LINK => "link",
+        GENERATE => "generate",
+        OUTPUT_SHAPE => "output_shape",
+        MODULE_GRAPH_LIMIT => "module_graph_limit",
+        MISSING_EXPORT => "missing_export",
+        AMBIGUOUS_EXPORT => "ambiguous_export",
+        /// A build that unwound into the boundary's `catch_unwind`.
+        PANIC => "panic",
+        /// A build that did not complete within its limit — `boundary::BUILD_TIMEOUT`, or what
+        /// was left of the request's engine budget, whichever was shorter — or one that was
+        /// never started at all because that budget was already spent (`engine::budget`).
+        TIMEOUT => "timeout",
+        /// The engine runtime dropped the build without replying.
+        ENGINE_GONE => "engine_gone",
+    }
+}
+
+/// Stage names for the [`ImportDiagnostic`]s the engine emits on the *success* path.
+///
+/// A separate vocabulary from [`stage`]: these never become a `BundleFailure::stage` and so
+/// never pass through `contract_stage`. They are constants for the other reason the failure
+/// stages are — so the guard over `daemon/src/engine` can insist that no stage name anywhere
+/// in the engine is a bare string literal, with no exceptions to carve out.
+pub mod diagnostic_stage {
+    /// A module Rolldown kept as an import boundary instead of bundling.
+    pub const EXTERNAL: &str = "external";
+    /// The package declares `sideEffects` as an array and the matched paths are not
+    /// recoverable from public bundler metadata, so confidence stays conservative.
+    pub const SIDE_EFFECTS: &str = "side_effects";
+}
+
+/// `stage` is one of [`stage::ALL`].
 #[derive(Debug)]
 pub struct BundleFailure {
     pub stage: String,

@@ -115,11 +115,14 @@ pub fn compute_file_size(
     let mut any_sized = false;
 
     for (runtime, group) in groups {
-        let artifact = match boundary::bundle_sync(BundleRequest {
-            entries: group.entries,
-            runtime,
-            purpose: BundlePurpose::FileSize,
-        }) {
+        let artifact = match boundary::bundle_sync(
+            BundleRequest {
+                entries: group.entries,
+                runtime,
+                purpose: BundlePurpose::FileSize,
+            },
+            context.engine_budget,
+        ) {
             Ok(artifact) => artifact,
             Err(failure) => {
                 // Only this runtime's entries degrade. The other groups keep their real,
@@ -252,6 +255,11 @@ struct PerImportTotals {
 ///
 /// Applied per runtime group, so a failure under one runtime never discards the
 /// other's real, deduplicated numbers.
+///
+/// These re-analyses go through the engine again on the same `AnalysisContext`, so they spend
+/// the *same* request budget the combined build already spent (§9). When that build failed by
+/// parking, the budget is what stops the fallback from re-parking once per import: whatever is
+/// left is shared out, and the imports it does not cover degrade to static sizing.
 fn per_import_totals(
     context: &AnalysisContext,
     resolved_requests: &[(ImportRequest, ResolvedPackage)],

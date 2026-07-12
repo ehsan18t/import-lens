@@ -14,6 +14,7 @@
 //!
 //! Spec: I15.
 
+use import_lens_daemon::engine::EngineBudget;
 use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
 use import_lens_daemon::pipeline::analyze::AnalysisContext;
 use import_lens_daemon::pipeline::file_size::{FileSizeComputation, compute_file_size};
@@ -29,6 +30,7 @@ fn context(workspace: &Path) -> AnalysisContext {
     AnalysisContext {
         workspace_root: workspace.to_path_buf(),
         active_document_path: workspace.join("src").join("page.astro"),
+        engine_budget: EngineBudget::interactive(),
     }
 }
 
