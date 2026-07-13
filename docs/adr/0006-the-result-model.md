@@ -51,22 +51,30 @@ fabricated size, silently passing, so the regression merges.
    bytes, and the cache is already keyed by those bytes' fingerprints, so it expires exactly
    when the answer would change. Not caching it would re-enter the engine for a broken package
    on every analysis, forever, burning one of only two permits.
-4. **An aggregate is only as complete as its inputs, AND only as sound as its own build.**
-   - If any contributing import is Loading or Unmeasured, the total is a **floor**: flagged
-     `incomplete`, never cached, never persisted, never compared against a baseline.
-   - **And if the aggregate's own combined build failed — even with every contributor
-     Measured — the number it falls back to is not the aggregate at all.** A File Cost is one
-     bundle over all the file's imports, so a module reached by two of them is counted *once*.
-     When that build fails, what remains is a **sum of per-import costs** — which
-     [ADR-0004](0004-import-lens-measures-imports-not-bundles.md) says is a **different
-     quantity** (a Combined Import Cost) and must never be presented as a File Cost. It is an
-     *upper* bound, not a floor, and it is equally unusable: flag it, refuse to store it, and
-     draw no verdict from it.
+4. **An aggregate is only as sound as its own build, and — when it has no build — only as
+   complete as its inputs.**
 
-   The failure mode this closes: a combined build is strictly larger than any single import's
-   build, so it is the **likeliest thing in the system to hit the build timeout** — and when it
-   does, every contributor is still perfectly Measured, so a check that only inspects the
-   contributors sees nothing wrong.
+   A File Cost has **its own build**: one bundle over all the file's imports, so a module reached
+   by two of them is counted *once*. That build does **not** depend on the per-import builds. So:
+
+   - **If the combined build SUCCEEDS, the total is real** — even while every per-import result
+     is still Loading. On a cold document that is the normal case, and it is not a floor.
+     *(An earlier draft of this ADR said any Loading contributor made the total a floor. That was
+     wrong: it would flag every cold document, and taking it literally caused a regression.)*
+   - **If the combined build FAILS**, what remains is a **sum of per-import costs** — which
+     [ADR-0004](0004-import-lens-measures-imports-not-bundles.md) says is a **different quantity**
+     (a Combined Import Cost), because it counts a shared module twice. It must never be presented
+     as a File Cost. It is an *over*-count, not a floor, and it is **equally unusable**: flag it,
+     refuse it entry to every store, and draw **no verdict** from it — invariant 5 forbids a false
+     *fail* as firmly as a false *pass*.
+   - **In that fallback sum, any contributor that is Loading or Unmeasured makes it a floor too**
+     — the sum is then missing bytes on top of double-counting others. Flag it the same way.
+
+   Two failure modes this closes. A combined build is strictly larger than any single import's
+   build, so it is **the likeliest thing in the system to hit the build timeout** — and when it
+   does, every contributor is still perfectly Measured, so a check that inspects only the
+   contributors sees nothing wrong. And a **types-only** import resolves to "no entry" *by design*
+   and is **Measured** (a genuine zero); it is not a gap, and must not flag anything.
 5. **No verdict from a floor.** A budget is never judged against an incomplete number — not
    "pass", not "fail". *"Not evaluated."* And **a gate that cannot measure must never report
    success**: `importlens check` exits non-zero with a distinct code, so a flaky CI box is
