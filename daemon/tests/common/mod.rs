@@ -234,3 +234,22 @@ pub(crate) fn normalized_zip_entry_path(name: &str) -> Option<(PathBuf, bool)> {
 
     Some((path, is_dir))
 }
+
+/// The five sizes of a result the test expects to have been MEASURED.
+///
+/// Panics with the result's own failure stage when there is none, which is the whole point: a test
+/// that reaches for a size it did not get says so instead of comparing against a sentinel zero
+/// (ADR-0006).
+#[allow(dead_code)]
+pub fn measured_sizes(
+    result: &import_lens_daemon::ipc::protocol::ImportResult,
+) -> import_lens_daemon::ipc::protocol::MeasuredSizes {
+    result.sizes().unwrap_or_else(|| {
+        panic!(
+            "expected `{}` to be measured, but it is unmeasured (stage: {:?}, error: {:?})",
+            result.specifier,
+            result.unmeasured_stage(),
+            result.error
+        )
+    })
+}

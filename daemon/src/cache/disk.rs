@@ -41,6 +41,12 @@ const SUMMARY_MAX_SEQ: &str = "max_seq";
 // so ascending iteration is exactly ascending-by-seq order.
 const SEQ_INDEX_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("seq_index");
 
+// v8: `ImportResult`'s five size fields became `Option<u64>` (ADR-0006). A v7 row does NOT fail
+// to decode into the new struct — msgpack is happy to read the old `17550` as `Some(17550)` — and
+// that is exactly the danger: every fabricated size a v7 daemon wrote (a manifest fallback's
+// on-disk directory bytes, a timed-out build's entry file measured alone) would come back as a
+// GENUINE measurement, indistinguishable from one, with nothing left in the record to say it was
+// invented. The wipe is total, so it is sufficient: no fabricated size survives the upgrade.
 // v7: adds SUMMARY_TABLE (O(1) rollup) and SEQ_INDEX_TABLE (by-`last_seq`
 // secondary index), both maintained in the SAME write transaction as every
 // CACHE_TABLE mutation so a crash can't tear accounting from data.
@@ -50,7 +56,7 @@ const SEQ_INDEX_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("
 // existing recreate-on-mismatch path (v5 did the same for the identity-v4 key
 // change). The retired `cache_recents` table from pre-v5 builds is never
 // opened; it is harmless dead space reclaimed by the compactor.
-const CURRENT_SCHEMA_VERSION: u64 = 7;
+const CURRENT_SCHEMA_VERSION: u64 = 8;
 const INSERT_FLUSH_BATCH: usize = 64;
 /// Compact a shard when more than this fraction of its `.redb` file is
 /// reclaimable free space (redb reuses freed pages rather than shrinking).
@@ -313,6 +319,12 @@ impl DiskCache {
     /// snapshot and pass it here: a `clear()` landing between the snapshot and the
     /// enqueue then bumps the generation, and this entry — still carrying the old one —
     /// is dropped by `flush_pending_inserts` instead of resurrecting the wiped shard.
+    ///
+    /// **The transience gate is applied here too**, and not merely upstream in `ImportCache`
+    /// (ADR-0006, invariant 3). L2 is a store in its own right — it outlives the process, which is
+    /// the worst place for a scheduling accident to land — and "the caller already checked" is the
+    /// assumption that produced this defect six times. A refused insert is a no-op, not an error:
+    /// `Err` here marks the key dirty for a flush replay, which would defeat the refusal.
     pub fn insert_at_generation(
         &self,
         key: &str,
@@ -320,6 +332,16 @@ impl DiskCache {
         generation: u64,
     ) -> Result<(), String> {
         if self.db_read().is_none() {
+            return Ok(());
+        }
+        if !cached.result.is_durable() {
+            crate::logging::log_debug(
+                "cache",
+                format!(
+                    "refusing to persist a non-durable result for {key} (stage: {})",
+                    cached.result.unmeasured_stage().unwrap_or("none")
+                ),
+            );
             return Ok(());
         }
         #[cfg(test)]
@@ -1562,32 +1584,13 @@ fn cache_warn(message: String) {
 #[cfg(test)]
 mod tests {
     use super::{SEQ_PREFIX_LEN, compare_recent_keys, decode_cached_result, decode_last_seq};
+    use crate::cache::memory::CachedImport;
 
-    fn sample_cached(last_seq: u64) -> crate::cache::memory::CachedImport {
-        use crate::cache::memory::CachedImport;
+    fn cached_with(result: crate::ipc::protocol::ImportResult, last_seq: u64) -> CachedImport {
         use std::sync::{Arc, atomic::AtomicU64};
 
         CachedImport {
-            result: crate::ipc::protocol::ImportResult {
-                specifier: "react".to_owned(),
-                raw_bytes: 1,
-                minified_bytes: 1,
-                gzip_bytes: 1,
-                brotli_bytes: 1,
-                zstd_bytes: 1,
-                cache_hit: false,
-                side_effects: false,
-                truly_treeshakeable: true,
-                is_cjs: false,
-                confidence: Default::default(),
-                confidence_reasons: Vec::new(),
-                error: None,
-                diagnostics: Vec::new(),
-                module_breakdown: None,
-                shared_bytes: None,
-                freshness: crate::ipc::protocol::ResultFreshness::fresh(),
-                internal_contributions: Vec::new(),
-            },
+            result,
             dependency_fingerprints: Vec::new(),
             verified_generation: 0,
             verified_at: None,
@@ -1597,8 +1600,89 @@ mod tests {
         }
     }
 
+    fn sample_cached(last_seq: u64) -> CachedImport {
+        let mut result = crate::ipc::protocol::ImportResult::measured(
+            "react",
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 1,
+                minified_bytes: 1,
+                gzip_bytes: 1,
+                brotli_bytes: 1,
+                zstd_bytes: 1,
+            },
+        );
+        result.truly_treeshakeable = true;
+        cached_with(result, last_seq)
+    }
+
     fn value_bytes(last_seq: u64) -> Vec<u8> {
         super::encode_cache_value(sample_cached(last_seq)).expect("value should serialize")
+    }
+
+    /// **Guard.** The L2 envelope is encoded with `rmp_serde::to_vec` — *positional* msgpack, an
+    /// array with no field names. `ImportResult`'s size fields sit in the middle of that array, so
+    /// the crate's dominant `Option` idiom, `#[serde(default, skip_serializing_if =
+    /// "Option::is_none")]`, would omit them on an Unmeasured result, shorten the array, and every
+    /// field after them would decode off by one — measured, not theorised: it fails with
+    /// `invalid type: boolean \`false\`, expected u64`. A plain `Option` writes a `nil`
+    /// placeholder and keeps the array length.
+    ///
+    /// This test is the only thing standing between a future contributor "tidying up" those five
+    /// attributes and a silently unreadable disk cache for every user who has ever seen a package
+    /// the engine could not build.
+    #[test]
+    fn an_unmeasured_result_round_trips_through_the_positional_disk_encoding() {
+        let unmeasured = crate::ipc::protocol::ImportResult::unmeasured(
+            "swiper",
+            crate::engine::stage::PARSE,
+            "unexpected token",
+            vec!["entry_path: C:/ws/node_modules/swiper/swiper.mjs".to_owned()],
+        );
+        let encoded = super::encode_cache_value(cached_with(unmeasured.clone(), 9))
+            .expect("an unmeasured result must serialize");
+
+        let decoded = decode_cached_result(&encoded)
+            .expect("an unmeasured result must survive the positional msgpack round trip");
+
+        assert_eq!(
+            decoded.result.sizes(),
+            None,
+            "no size went in; none comes out"
+        );
+        assert_eq!(decoded.result, unmeasured);
+    }
+
+    /// **Guard**, and the shape the test above does NOT catch. The five sizes were the *only* fields
+    /// protected from the `skip_serializing_if` idiom, but `module_breakdown` and `shared_bytes` sit
+    /// mid-struct too — and the daemon really does build this exact pair: an Unmeasured result has
+    /// `module_breakdown: None` (skipped, under the old attributes) beside the `shared_bytes:
+    /// Some(0)` that `annotate_shared_bytes` stamps on **every** result, measured or not. The
+    /// skipped `None` shortened the array, `shared_bytes`'s `0` slid into its slot, and the decode
+    /// failed with `invalid type: integer, expected a sequence` — an unreadable disk entry for every
+    /// package the engine could not build.
+    ///
+    /// It was latent only because the annotation runs on the response, one call site away from the
+    /// value that is cached. Latent is not fixed.
+    #[test]
+    fn a_result_with_no_breakdown_but_a_shared_byte_count_round_trips() {
+        let mut result = crate::ipc::protocol::ImportResult::unmeasured(
+            "swiper",
+            crate::engine::stage::LINK,
+            "Bundling CSS is no longer supported",
+            Vec::new(),
+        );
+        assert_eq!(result.module_breakdown, None, "the premise: no breakdown");
+        result.shared_bytes = Some(0);
+
+        let encoded = super::encode_cache_value(cached_with(result.clone(), 3))
+            .expect("the shape must serialize");
+        let decoded = decode_cached_result(&encoded).expect(
+            "a None field mid-struct must write a nil placeholder, not shorten the array and slide \
+             every field after it one slot to the left",
+        );
+
+        assert_eq!(decoded.result, result);
+        assert_eq!(decoded.result.shared_bytes, Some(0));
     }
 
     #[test]

@@ -1,28 +1,24 @@
 import type { ImportResult } from "../ipc/protocol.js";
 import { LogDedupe } from "../logging/dedupe.js";
 import type { Logger } from "../logging/types.js";
+import { measuredSizes } from "../ui/format.js";
 
-const sizeFields = [
-  "raw_bytes",
-  "minified_bytes",
-  "gzip_bytes",
-  "brotli_bytes",
-  "zstd_bytes",
-] as const;
-
-const hasMeasuredSize = (result: ImportResult): boolean =>
-  sizeFields.some((field) => result[field] > 0);
-
+// Warn only about an import the user got NOTHING for — and ask that question first. The log exists
+// for the user staring at "Size unavailable" who wants to know why, so the SIZE is the predicate;
+// the error message is merely what the warning says.
 export const warningMessageForImportResult = (result: ImportResult): string | null => {
-  if (!result.error || hasMeasuredSize(result)) {
+  if (measuredSizes(result) !== null) {
     return null;
   }
 
-  return `${result.specifier}: ${result.error}`;
+  return result.error ? `${result.specifier}: ${result.error}` : null;
 };
 
 export const debugMessageForImportResult = (result: ImportResult): string | null => {
-  if (result.diagnostics.length === 0 && result.confidence_reasons.length === 0 && !result.error) {
+  const hasSomethingToReport =
+    result.diagnostics.length > 0 || result.confidence_reasons.length > 0 || result.error !== null;
+
+  if (!hasSomethingToReport) {
     return null;
   }
 

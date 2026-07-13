@@ -1,35 +1,67 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatCurrentFileSizeSummary } from "../../src/analysis/fileSize.js";
-import type { FileSizeResponse } from "../../src/ipc/protocol.js";
+import {
+  currentFileSizeReport,
+  formatCurrentFileSizeSummary,
+} from "../../src/analysis/fileSize.js";
+import { bundleImpactHistoryItemForResponse } from "../../src/analysis/history.js";
+import type {
+  FileSizeDocumentResponse,
+  ImportAnalysisItem,
+  ImportResult,
+} from "../../src/ipc/protocol.js";
+import { detectedImport } from "../helpers/detectedImport.js";
 
-const response = (imports = 2): FileSizeResponse => ({
-  version: 4,
+const result = (specifier: string): ImportResult => ({
+  specifier,
+  raw_bytes: 100,
+  minified_bytes: 80,
+  gzip_bytes: 70,
+  brotli_bytes: 60,
+  zstd_bytes: 65,
+  cache_hit: false,
+  side_effects: false,
+  truly_treeshakeable: true,
+  is_cjs: false,
+  confidence: "high",
+  confidence_reasons: ["test fixture confidence"],
+  error: null,
+  diagnostics: [],
+});
+
+const state = (specifier: string, status: ImportAnalysisItem["status"]): ImportAnalysisItem => ({
+  detected: detectedImport({ specifier, packageName: specifier }),
+  status,
+  result: status === "ready" ? result(specifier) : undefined,
+});
+
+const response = (overrides: Partial<FileSizeDocumentResponse> = {}): FileSizeDocumentResponse => ({
+  version: 7,
   request_id: 1,
   raw_bytes: 12000,
   minified_bytes: 5300,
   gzip_bytes: 1800,
   brotli_bytes: 1500,
   zstd_bytes: 1600,
-  imports: Array.from({ length: imports }, (_, index) => ({
-    specifier: `pkg-${index}`,
-    raw_bytes: 100,
-    minified_bytes: 80,
-    gzip_bytes: 70,
-    brotli_bytes: 60,
-    zstd_bytes: 65,
-    cache_hit: false,
-    side_effects: false,
-    truly_treeshakeable: true,
-    is_cjs: false,
-    confidence: "high",
-    confidence_reasons: ["test fixture confidence"],
-    error: null,
-    diagnostics: [],
-  })),
+  imports: [result("pkg-0"), result("pkg-1")],
+  states: [state("pkg-0", "ready"), state("pkg-1", "ready")],
   error: null,
   diagnostics: [],
+  ...overrides,
 });
+
+/**
+ * What the daemon answers for a document nobody has sized yet. The command's read is streaming (no
+ * `force_fresh`), so `imports` carries only the imports it has already MEASURED — none — while
+ * `states` carries every import it detected, and the file's own totals come from the combined build
+ * and are perfectly real.
+ */
+const coldResponse = (): FileSizeDocumentResponse =>
+  response({
+    imports: [],
+    states: [state("pkg-0", "loading"), state("pkg-1", "loading")],
+    incomplete: true,
+  });
 
 test("formatCurrentFileSizeSummary formats current file totals with selected compression", () => {
   assert.equal(
@@ -37,7 +69,64 @@ test("formatCurrentFileSizeSummary formats current file totals with selected com
     "Current file: 1.5 kB br · 5.3 kB min · 2 imports",
   );
   assert.equal(
-    formatCurrentFileSizeSummary(response(1), "gzip"),
+    formatCurrentFileSizeSummary(response({ states: [state("pkg-0", "ready")] }), "gzip"),
     "Current file: 1.8 kB gz · 5.3 kB min · 1 import",
   );
+});
+
+test("a file with no runtime package imports has nothing to report", () => {
+  assert.deepEqual(currentFileSizeReport(response({ imports: [], states: [] }), "brotli"), {
+    kind: "no-imports",
+  });
+});
+
+/**
+ * The cold document — the one the user just opened, and the one they are most likely to run the
+ * command on. Gating the report on `imports` told them the file "has no resolvable package imports"
+ * while the daemon was sizing it perfectly well: `imports` is empty until the per-import builds
+ * land, and `states` is what says whether the file HAS imports. `listener.ts` documents exactly this
+ * trap for the status bar; the command was left on `imports`.
+ */
+test("a cold document reports the size the daemon measured, flagged as an estimate", () => {
+  const cold = coldResponse();
+  const report = currentFileSizeReport(cold, "brotli", {
+    // A floor: never recorded, so never compared either.
+    current: bundleImpactHistoryItemForResponse(cold, "C:/app/src/index.ts"),
+  });
+
+  assert.deepEqual(report, {
+    kind: "summary",
+    message:
+      "Current file: 1.5 kB br · 5.3 kB min · 2 imports · estimate (some imports are not fully measured)",
+  });
+});
+
+/**
+ * `skipped` means "the daemon could not size this import", not "the daemon has not sized it YET".
+ * An import still building is not skipped — it is the reason the total is an estimate.
+ */
+test("only the imports the daemon could not size count as skipped", () => {
+  const warm = response({
+    states: [state("pkg-0", "ready"), state("pkg-1", "ready"), state("pkg-2", "missing")],
+  });
+  const current = bundleImpactHistoryItemForResponse(warm, "C:/app/src/index.ts");
+
+  assert.deepEqual(currentFileSizeReport(warm, "brotli", { current }), {
+    kind: "summary",
+    message: "Current file: 1.5 kB br · 5.3 kB min · 3 imports · 1 skipped",
+  });
+});
+
+test("a measured total is compared against the file's previous measurement", () => {
+  const measured = response();
+  const current = bundleImpactHistoryItemForResponse(measured, "C:/app/src/index.ts");
+  const previous = bundleImpactHistoryItemForResponse(
+    response({ brotli_bytes: 1200 }),
+    "C:/app/src/index.ts",
+  );
+
+  assert.deepEqual(currentFileSizeReport(measured, "brotli", { current, previous }), {
+    kind: "summary",
+    message: "Current file: 1.5 kB br · 5.3 kB min · 2 imports · +300 B br vs previous",
+  });
 });

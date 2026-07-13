@@ -231,9 +231,59 @@ fn document_key(workspace_root: &str, document_path: &str) -> String {
     format!("{workspace_root}\0{document_path}")
 }
 
+/// Every piece of background work one connection owns that can be ASKED to stop.
+///
+/// Grouped so the teardown cannot forget one of them: there is a single `cancel_all`, and the one
+/// function that ends a connection calls it. What cancellation cannot reach — a build already
+/// inside Rolldown — is what [`TASK_JOIN_TIMEOUT`] is for.
+struct ConnectionLifecycles {
+    /// Cancels the in-flight bulk registry-refresh block, per source manifest.
+    registry_refresh: RegistryRefreshLifecycle,
+    /// Cancels the pending-import builds a superseded document analysis handed off. Separate from
+    /// the SWR lifecycle on purpose — see [`DocumentTaskLifecycle`].
+    document_stream: DocumentTaskLifecycle,
+    /// Cancels the background revalidation a stale size read armed.
+    swr_refresh: DocumentTaskLifecycle,
+    /// Drops the combined file-size build of a size read a newer one has replaced.
+    size_builds: DocumentTaskLifecycle,
+}
+
+impl ConnectionLifecycles {
+    fn new() -> Self {
+        Self {
+            registry_refresh: RegistryRefreshLifecycle::new(),
+            document_stream: DocumentTaskLifecycle::new(),
+            swr_refresh: DocumentTaskLifecycle::new(),
+            size_builds: DocumentTaskLifecycle::new(),
+        }
+    }
+
+    /// Stop every background job this connection owns that CAN be stopped, before the connection
+    /// waits for the ones that cannot.
+    ///
+    /// Cancellation here is cooperative and cheap: a superseded/abandoned build, revalidation or
+    /// registry fetch checks its flag before it starts and skips. What it cannot reach is a build
+    /// already inside Rolldown — hence [`TASK_JOIN_TIMEOUT`] — and the prefetch jobs, which are
+    /// abandoned rather than joined (NFR-004c).
+    ///
+    /// `Drop` does this too, but `Drop` runs when the connection function RETURNS — which is after
+    /// the join it was supposed to shorten, making it useless exactly when it matters most.
+    fn cancel_all(&self, prefetcher: &Prefetcher) {
+        prefetcher.cancel();
+        self.registry_refresh.cancel_all();
+        self.document_stream.cancel_all();
+        self.swr_refresh.cancel_all();
+        self.size_builds.cancel_all();
+    }
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/ipc_server_swr.rs"]
 mod ipc_server_swr_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/ipc_server_teardown.rs"]
+mod ipc_server_teardown_tests;
 
 /// Schedules ONE cache-maintenance pass (byte-budget eviction + compaction +
 /// registry retention + orphan-shard sweep) a short delay after Hello, then
@@ -430,16 +480,12 @@ where
     // has no storage). Aborted on drop when the connection ends.
     let mut _maintenance_task: Option<AbortOnDrop> = None;
     let mut lifecycle = LifecycleState::new();
-    // Cancels the in-flight bulk registry-refresh block when a newer bulk
-    // request supersedes it or when this connection ends (its `Drop`).
-    let mut registry_refresh_lifecycle = RegistryRefreshLifecycle::new();
-    let mut swr_refresh_lifecycle = DocumentTaskLifecycle::new();
-    // Cancels the pending-import builds a superseded document analysis handed off. Separate from
-    // the SWR lifecycle on purpose — see `DocumentTaskLifecycle`.
-    let mut document_stream_lifecycle = DocumentTaskLifecycle::new();
+    // Every cancellable background job this connection owns, in one place so the teardown cannot
+    // miss one. Each is superseded per document / per source while the connection runs, and all of
+    // them are cancelled when it ends.
+    let mut lifecycles = ConnectionLifecycles::new();
     // Bounds the combined file-size build: one per document at a time (the gate), and a queued one
-    // a newer size read has replaced never runs at all (the lifecycle flag).
-    let mut size_build_lifecycle = DocumentTaskLifecycle::new();
+    // a newer size read has replaced never runs at all (the `size_builds` lifecycle flag).
     let mut size_build_gate = DocumentBuildGate::new();
     let lifecycle_storage_path = storage_path;
     // Unbounded on purpose, and bounded in practice. The loop is the socket's only writer, so a
@@ -463,14 +509,16 @@ where
                 if let Some(frame) = outbound
                     && let Err(error) = framed.send(frame).await
                 {
-                    cancel_background_work(
+                    // The socket failed under us. The client is not owed the rest of its queue, but
+                    // the cache is owed everything this session measured.
+                    close_connection(
+                        &service,
                         &prefetcher,
-                        &registry_refresh_lifecycle,
-                        &document_stream_lifecycle,
-                        &swr_refresh_lifecycle,
-                        &size_build_lifecycle,
-                    );
-                    wait_for_active_tasks(&mut active_tasks).await;
+                        &lifecycles,
+                        &mut active_tasks,
+                        &mut _maintenance_task,
+                    )
+                    .await;
                     return Err(Box::new(error));
                 }
                 continue;
@@ -478,14 +526,14 @@ where
             payload = framed.next() => match payload.transpose() {
                 Ok(payload) => payload,
                 Err(error) => {
-                    cancel_background_work(
+                    close_connection(
+                        &service,
                         &prefetcher,
-                        &registry_refresh_lifecycle,
-                        &document_stream_lifecycle,
-                        &swr_refresh_lifecycle,
-                        &size_build_lifecycle,
-                    );
-                    wait_for_active_tasks(&mut active_tasks).await;
+                        &lifecycles,
+                        &mut active_tasks,
+                        &mut _maintenance_task,
+                    )
+                    .await;
                     return Err(Box::new(error));
                 }
             },
@@ -508,15 +556,18 @@ where
                 continue;
             }
         };
+        // EOF: the client is gone — it closed the pipe, or the extension host crashed without ever
+        // sending `shutdown`. There is nobody left to answer, and every import this session
+        // measured is still owed to the cache.
         let Some(payload) = payload else {
-            cancel_background_work(
+            close_connection(
+                &service,
                 &prefetcher,
-                &registry_refresh_lifecycle,
-                &document_stream_lifecycle,
-                &swr_refresh_lifecycle,
-                &size_build_lifecycle,
-            );
-            wait_for_active_tasks(&mut active_tasks).await;
+                &lifecycles,
+                &mut active_tasks,
+                &mut _maintenance_task,
+            )
+            .await;
             break;
         };
 
@@ -703,7 +754,8 @@ where
                 // A newer analysis of the same document supersedes this one: its still-queued
                 // builds stop before they start. Keyed per document, like the SWR lifecycle, so
                 // analyzing one file never cancels another's pending imports.
-                let superseded = document_stream_lifecycle
+                let superseded = lifecycles
+                    .document_stream
                     .start_document(&request.workspace_root, &request.active_document_path);
                 track_active_task(
                     &mut active_tasks,
@@ -902,7 +954,7 @@ where
                 // Absent source (older client) → all share the empty-key bucket,
                 // preserving the pre-D10 connection-global supersede for them.
                 let source = request.source.clone().unwrap_or_default();
-                let cancelled = registry_refresh_lifecycle.start_new_block(&source);
+                let cancelled = lifecycles.registry_refresh.start_new_block(&source);
                 let final_targets = targets.clone();
                 let target_count = targets.len();
 
@@ -1079,14 +1131,16 @@ where
             ClientMessage::FileSizeDocument(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
-                let swr_cancelled = swr_refresh_lifecycle
+                let swr_cancelled = lifecycles
+                    .swr_refresh
                     .start_document(&request.workspace_root, &request.active_document_path);
                 // Only an interactive size read is bounded, and only those need to be: see
                 // `CombinedBuildBound`.
                 let combined_build = request.analysis_generation.map(|_| CombinedBuildBound {
                     gate: size_build_gate
                         .gate_for(&request.workspace_root, &request.active_document_path),
-                    superseded: size_build_lifecycle
+                    superseded: lifecycles
+                        .size_builds
                         .start_document(&request.workspace_root, &request.active_document_path),
                 });
                 track_active_task(
@@ -1131,35 +1185,19 @@ where
                 );
             }
             ClientMessage::Shutdown(_) => {
-                // Abort the pending maintenance pass first: it is scheduled, not started, and a
-                // pass that begins while we are flushing is compacting the shards the flush is
-                // writing to.
-                _maintenance_task = None;
-                cancel_background_work(
+                close_connection(
+                    &service,
                     &prefetcher,
-                    &registry_refresh_lifecycle,
-                    &document_stream_lifecycle,
-                    &swr_refresh_lifecycle,
-                    &size_build_lifecycle,
-                );
-                // Bounded (FR-004c): a build already inside Rolldown cannot be cancelled and runs
-                // to `BUILD_TIMEOUT`, which is LONGER than the extension's force-kill grace — so
-                // joining it without a bound is how a graceful shutdown loses its flush entirely.
-                wait_for_active_tasks(&mut active_tasks).await;
+                    &lifecycles,
+                    &mut active_tasks,
+                    &mut _maintenance_task,
+                )
+                .await;
                 // Anything those tasks queued on their way out — a response, a last streamed
-                // import — is still owed to the client, and the loop is no longer in the select
-                // that would have written it.
+                // import — is still owed to a client that asked us to stop on its own terms, and
+                // the loop is no longer in the select that would have written it. A client that
+                // vanished is owed nothing, so the paths above do not drain.
                 drain_outbound(&mut framed, &mut outbound_rx).await;
-                // Drain pending disk inserts (not just recency touches) so a clean shutdown never
-                // relies on Drop running before the process exits, mirroring the recycle path.
-                // Unconditional, even when a task outlived the join: whatever that task would have
-                // added is worth one rebuild, and everything already computed is worth the session.
-                if let Err(error) = service.flush_cache() {
-                    logging::log_warn(
-                        "lifecycle",
-                        format!("failed to flush cache on shutdown: {error}"),
-                    );
-                }
                 return Ok(());
             }
             ClientMessage::PrewarmPackageJson(_)
@@ -1227,25 +1265,40 @@ async fn wait_for_active_tasks(active_tasks: &mut Vec<JoinHandle<()>>) -> bool {
     finished
 }
 
-/// Stop every background job this connection owns that CAN be stopped, before the connection waits
-/// for the ones that cannot.
+/// The ONE way a connection stops serving, whichever end it comes to: the client's `shutdown`, the
+/// client vanishing (EOF), or the socket failing.
 ///
-/// Cancellation here is cooperative and cheap: a superseded/abandoned build, revalidation or
-/// registry fetch checks its flag before it starts and skips. What it cannot reach is a build
-/// already inside Rolldown — hence [`TASK_JOIN_TIMEOUT`] — and the prefetch jobs, which are
-/// abandoned rather than joined (NFR-004c).
-fn cancel_background_work(
+/// Cancel → join under a deadline → **flush the cache unconditionally** (SRS FR-004c). It is one
+/// function because it was three, and only one of them flushed: an extension host that crashed
+/// (no `shutdown` — the daemon just reads EOF) took every import that session had measured with it.
+/// The cache does not care WHY the connection ended.
+///
+/// Unconditional, even when a task outlived the join: whatever that task would have added is worth
+/// one rebuild, and everything already computed is worth the session. And it does not rely on `Drop`
+/// running before the process exits — `Drop` reaches only the entries already queued for the batched
+/// commit, never a dirty one whose insert failed, nor the recency a session's cache hits earned.
+async fn close_connection(
+    service: &ImportLensService,
     prefetcher: &Prefetcher,
-    registry_refresh: &RegistryRefreshLifecycle,
-    document_stream: &DocumentTaskLifecycle,
-    swr_refresh: &DocumentTaskLifecycle,
-    size_builds: &DocumentTaskLifecycle,
+    lifecycles: &ConnectionLifecycles,
+    active_tasks: &mut Vec<JoinHandle<()>>,
+    maintenance_task: &mut Option<AbortOnDrop>,
 ) {
-    prefetcher.cancel();
-    registry_refresh.cancel_all();
-    document_stream.cancel_all();
-    swr_refresh.cancel_all();
-    size_builds.cancel_all();
+    // Abort the pending maintenance pass first: it is scheduled, not started, and a pass that
+    // begins while we are flushing is compacting the shards the flush is writing to.
+    *maintenance_task = None;
+    lifecycles.cancel_all(prefetcher);
+    // Bounded: a build already inside Rolldown cannot be cancelled and runs to `BUILD_TIMEOUT`,
+    // which is LONGER than the extension's force-kill grace — so joining it without a bound is how
+    // a graceful shutdown loses its flush entirely.
+    wait_for_active_tasks(active_tasks).await;
+
+    if let Err(error) = service.flush_cache() {
+        logging::log_warn(
+            "lifecycle",
+            format!("failed to flush cache while closing the connection: {error}"),
+        );
+    }
 }
 
 /// Answer a document analysis from the cache, then build its misses and push each one as it lands.

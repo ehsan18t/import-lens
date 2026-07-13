@@ -1,6 +1,10 @@
 import * as vscode from "vscode";
 import type { DetectedImport, ImportResult } from "../ipc/protocol.js";
-import { DocumentAnalysisStates, type RefreshApplyOptions } from "./documentStates.js";
+import {
+  DocumentAnalysisStates,
+  type RefineStates,
+  type RefreshApplyOptions,
+} from "./documentStates.js";
 
 export type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
 
@@ -33,11 +37,19 @@ export class AnalysisStore implements vscode.Disposable {
    * not optional bookkeeping: it is what tells the core which held pushes belong to these states
    * and must be re-applied over them (see {@link DocumentAnalysisStates.set}).
    *
+   * `refine` is how THIS analysis captions a size, and the core uses it for the pushes it replays,
+   * so a pushed import is captioned from the same inputs as every other import in `states`.
+   *
    * To recompute over the states already stored — insights after a config change — use
    * {@link replace}, which claims no generation and holds no pushes to account for.
    */
-  set(uri: vscode.Uri, states: ImportAnalysisState[], generation: number): void {
-    this.#documents.set(uri.toString(), states, generation);
+  set(
+    uri: vscode.Uri,
+    states: ImportAnalysisState[],
+    generation: number,
+    refine?: RefineStates,
+  ): void {
+    this.#documents.set(uri.toString(), states, generation, refine);
     this.#onDidChange.fire(uri);
   }
 

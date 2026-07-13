@@ -1,32 +1,30 @@
 use super::ImportCache;
-use crate::ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportResult, ResultFreshness};
+use crate::ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportResult, MeasuredSizes};
 use std::collections::HashSet;
 
 fn result(specifier: &str) -> ImportResult {
-    ImportResult {
-        specifier: specifier.to_owned(),
-        raw_bytes: 1,
-        minified_bytes: 1,
-        gzip_bytes: 1,
-        brotli_bytes: 1,
-        zstd_bytes: 1,
-        cache_hit: false,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: ConfidenceLevel::High,
-        confidence_reasons: vec!["test fixture confidence".to_owned()],
-        error: None,
-        diagnostics: vec![ImportDiagnostic {
-            stage: "test".to_owned(),
-            message: "cached".to_owned(),
-            details: Vec::new(),
-        }],
-        module_breakdown: None,
-        shared_bytes: None,
-        freshness: ResultFreshness::fresh(),
-        internal_contributions: Vec::new(),
-    }
+    let mut result = ImportResult::measured(
+        specifier,
+        MeasuredSizes {
+            raw_bytes: 1,
+            minified_bytes: 1,
+            gzip_bytes: 1,
+            brotli_bytes: 1,
+            zstd_bytes: 1,
+        },
+    );
+    result.truly_treeshakeable = true;
+    result.confidence = ConfidenceLevel::High;
+    result.confidence_reasons = vec!["test fixture confidence".to_owned()];
+    result.diagnostics = vec![ImportDiagnostic {
+        // A real informational stage. A fabricated one ("test") is now REFUSED by every durable
+        // store — an unclassified stage is not durable (`pipeline::stage`) — so a fixture that used
+        // one was building a result the cache correctly declines to keep.
+        stage: crate::engine::diagnostic_stage::EXTERNAL.to_owned(),
+        message: "cached".to_owned(),
+        details: Vec::new(),
+    }];
+    result
 }
 
 #[test]

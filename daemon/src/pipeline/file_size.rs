@@ -40,16 +40,29 @@ pub struct FileSizeComputation {
     pub gzip_bytes: u64,
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
-    /// At least one import that belongs in these totals was not really measured: its own build had
-    /// not landed when the sum was taken, or the measurement it did have was fabricated by a
-    /// transient engine failure. The totals are then a LOWER BOUND on the file, not the file — safe
-    /// to show beside the diagnostics that say so (FR-024a: conservative totals, never zero), and
-    /// never safe to cache.
+    /// At least one import that belongs in these totals contributed **no bytes**, because it was
+    /// not Measured. The totals are then a LOWER BOUND on the file, not the file — safe to show
+    /// beside the diagnostics that say so (FR-024a: a floor beats a zero), and never safe to cache,
+    /// persist, or compare against a baseline (ADR-0006, invariant 4).
+    ///
+    /// **Any** non-Measured contributor sets it. All three kinds:
+    ///
+    /// * **Loading** — its own build had not landed when the sum was taken (`result: None`).
+    /// * **Unmeasured, transient** — timeout / panic / engine_gone. Says nothing about the package.
+    /// * **Unmeasured, deterministic** — parse / link / missing_export / … Says a great deal about
+    ///   the package, and *nothing at all about how many bytes it contributes*, which is the only
+    ///   question a total asks. This one was exempted, and the exemption is the seventh instance of
+    ///   the defect this model exists to end: a deterministic failure also KILLS the file's combined
+    ///   build, so the total collapses into an un-deduplicated per-import sum — a different number
+    ///   for every import that *was* measured — and with `incomplete: false` that number was cached,
+    ///   persisted as the file's permanent baseline, shown without an estimate label, and passed by
+    ///   `importlens check` with exit 0. "Deterministically unknown" is still unknown.
+    /// * and an import that could not be RESOLVED, which is not even an entry of the combined build,
+    ///   so its bytes are absent from these totals however well that build went.
     ///
     /// It exists because neither of the other two signals can see this. `error` is `None` — the sum
-    /// succeeded, it just summed less than the file. And the stage scan below sees only the
-    /// diagnostics the aggregate carries, which for a still-building import are not a failure of
-    /// any stage at all.
+    /// succeeded, it just summed less than the file. And the stage scan in [`Self::is_cacheable`]
+    /// sees only transient stages, while a still-building import has failed at no stage at all.
     pub incomplete: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
@@ -57,17 +70,18 @@ pub struct FileSizeComputation {
 
 impl FileSizeComputation {
     /// Whether this aggregate is a measurement of the file, and so may be written to the L1
-    /// file-size cache (SRS FR-026c).
+    /// file-size cache (SRS FR-026c). [`crate::pipeline::file_size_cache::FileSizeCache::insert`]
+    /// asks this itself; a caller cannot forget it.
     ///
-    /// Three ways it is not. It failed outright (`error`). It was degraded by a **transient**
-    /// engine failure — a combined build that timed out, panicked, or lost the runtime — which
-    /// describes *this run of the daemon*, not the file; caching it would serve that number for the
-    /// whole 30s TTL of a document whose real total is larger, the same defect that let one parked
-    /// build teach the import cache that a healthy package weighs 58 bytes. Or it is `incomplete`:
-    /// a conservative sum that is missing an input, which is a real number but not this file's.
+    /// Three ways it is not. It failed outright (`error`). It is [`Self::incomplete`] — a sum
+    /// missing an input, which is a real number but not this file's. Or a **transient** engine
+    /// failure degraded the combined build itself (timeout / panic / engine_gone) and the sum it
+    /// fell back to has no shared-module deduplication: caching that would serve a number the file
+    /// never had for the whole 30s TTL, on the strength of a scheduling accident.
     ///
-    /// A DETERMINISTIC failure (`minify`, `entry_resolution`, an unresolvable import) is a property
-    /// of the code and is cached as before: re-running it changes nothing.
+    /// The third check is not redundant with the second. A combined build can park while every one
+    /// of the file's imports is measured and cached — `incomplete` is then correctly `false`, and
+    /// the totals are still not the file's.
     pub fn is_cacheable(&self) -> bool {
         self.error.is_none()
             && !self.incomplete
@@ -151,6 +165,7 @@ pub fn compute_file_size(
     imports: &[SizedImport],
 ) -> FileSizeComputation {
     let mut diagnostics = Vec::new();
+    let mut totals = FileSizeComputation::default();
     // Entries and their originating imports, grouped by the runtime they must be
     // built under. `BTreeMap` keeps the group order stable so identical input
     // produces identical output.
@@ -169,22 +184,29 @@ pub fn compute_file_size(
                 });
                 group.sized.push(import.clone());
             }
-            Err(error) => diagnostics.push(diagnostic(
-                "entry_resolution",
-                error,
-                vec![format!("specifier: {}", request.specifier)],
-            )),
+            Err(error) => {
+                // This import is not an ENTRY of any group, so its bytes are missing from the
+                // totals however cleanly the combined builds go — the one non-Measured contributor
+                // a successful build cannot absorb. Floor (ADR-0006, invariant 4).
+                totals.incomplete = true;
+                diagnostics.push(diagnostic(
+                    crate::pipeline::stage::ENTRY_RESOLUTION,
+                    error,
+                    vec![format!("specifier: {}", request.specifier)],
+                ));
+            }
         }
     }
 
     if groups.is_empty() {
+        // Either the file has no imports (a complete, honest zero) or not one of them could be
+        // resolved (`incomplete`, and never cached as this file's size).
         return FileSizeComputation {
             diagnostics,
-            ..FileSizeComputation::default()
+            ..totals
         };
     }
 
-    let mut totals = FileSizeComputation::default();
     // Minified output of every group that built cleanly. Compression runs once over
     // the concatenation so a shared identifier across groups is not compressed twice
     // — which makes the compressed figures a lower bound on two independent bundles,
@@ -242,7 +264,7 @@ pub fn compute_file_size(
                 // here would discard every other group's real totals and report zero
                 // for the whole file.
                 diagnostics.push(diagnostic(
-                    "minify",
+                    crate::pipeline::stage::MINIFY,
                     error,
                     vec![
                         "minification failed for this runtime; its totals are conservative \
@@ -263,7 +285,7 @@ pub fn compute_file_size(
 
     if !any_sized {
         return error_computation(
-            "file_size_fallback",
+            crate::pipeline::stage::FILE_SIZE_FALLBACK,
             "no import could be sized conservatively".to_owned(),
             diagnostics,
         );
@@ -273,7 +295,13 @@ pub fn compute_file_size(
         let minified = minified_parts.join("\n");
         let compressed = match compress_all(&minified) {
             Ok(compressed) => compressed,
-            Err(error) => return error_computation("compression", error.to_string(), diagnostics),
+            Err(error) => {
+                return error_computation(
+                    crate::pipeline::stage::COMPRESSION,
+                    error.to_string(),
+                    diagnostics,
+                );
+            }
         };
         // Measure `minified_bytes` on the same string the compressors saw, so the two
         // numbers describe the same bytes (the join adds one separator per extra
@@ -305,9 +333,9 @@ struct RuntimeGroup {
 #[derive(Default)]
 struct PerImportTotals {
     sized_any: bool,
-    /// An import contributed no real measurement of its own: it is still being built (`result:
-    /// None`), or a transient engine failure fabricated the number it does carry. Either way this
-    /// sum is under the file's true size, or made of numbers that describe a scheduling accident.
+    /// An import that belongs in this sum contributed no bytes, because it was not Measured — it is
+    /// still being built (`result: None`), or its build failed, transiently or otherwise. This sum
+    /// is then under the file's true size by an amount the sum itself cannot know.
     missing_inputs: bool,
     raw_bytes: u64,
     minified_bytes: u64,
@@ -327,20 +355,28 @@ struct PerImportTotals {
 /// cut off, at the cost of fabricating the numbers it cut. Nothing here can park, so nothing
 /// needs cutting off.
 ///
-/// Three imports make the sum something other than the file's size, and every one of them is named
-/// in the diagnostics, because the user is owed the fact that the number is a floor:
+/// Only a **measured** import contributes bytes (ADR-0006: a size exists if and only if a build
+/// succeeded). Every other kind contributes exactly zero, and **every one of them therefore makes
+/// the sum a floor** — `missing_inputs`. That is invariant 4, stated without an exception, because
+/// the exception is where the seventh instance of this defect lived:
 ///
-/// * one whose own build has **not landed yet** (`result: None` — the streaming handlers answer
-///   from cache and let the misses arrive later). It contributes zero, so the sum is short by
-///   exactly its weight, and the group could even report zero bytes with `error: None`;
-/// * one a **transient engine failure** degraded. That result carries `error: None` and a
-///   fabricated static size, and the failure is recorded only in the result's OWN diagnostics — so
-///   without lifting it here the fabricated number would land in the file's total and be cached as
-///   the file's size. This is the 58-byte cache-poisoning defect, one level up. Its bytes are still
-///   counted (a floor beats a zero, FR-024a) but the total is marked and never cached;
-/// * one that failed to size at all (`error`). That one is *deterministic* — the same request will
-///   fail the same way — so it contributes zero and does NOT taint the total: it is cached exactly
-///   as `should_cache_result` caches a deterministic per-import failure.
+/// * **Loading** (`result: None` — the streaming handlers answer from cache and let the misses
+///   arrive later). The sum is short by exactly that import's weight.
+/// * **Unmeasured, transient** (`timeout` / `panic` / `engine_gone`). Its bytes are unknown *for
+///   this run only*; the very next attempt may measure it.
+/// * **Unmeasured, deterministic** (`parse`, `link`, `missing_export`, `oversized_entry`, …). Its
+///   bytes are unknown **forever** — which is not the same as *zero*, and a total is a question
+///   about bytes. This kind used to be exempted, on the reasoning that "the total is as complete as
+///   this file can ever be, so cache it". Two things are wrong with that. The number is not the
+///   file's: the same deterministic failure also kills the file's COMBINED build, so what gets
+///   cached is a per-import sum with no shared-module deduplication — every measured import's
+///   contribution changes. And the exemption then let that number through *every* downstream gate
+///   at once, since all of them read one flag: it was cached (L1), persisted to the no-TTL
+///   bundle-impact history as the file's baseline, shown without the estimate label, and passed by
+///   `importlens check` with **exit 0**. A floor is a floor whatever made it one.
+///
+/// Every one of them is named in the diagnostics either way: the user is owed the fact, and the
+/// transient ones are owed the extra sentence that says a retry may fix them.
 fn per_import_totals(
     sized: &[SizedImport],
     diagnostics: &mut Vec<ImportDiagnostic>,
@@ -352,7 +388,7 @@ fn per_import_totals(
         let Some(result) = import.result.as_ref() else {
             totals.missing_inputs = true;
             diagnostics.push(diagnostic(
-                "file_size_fallback",
+                crate::pipeline::stage::FILE_SIZE_FALLBACK,
                 "import size is still being measured, so it is not counted in this file's \
                  conservative total"
                     .to_owned(),
@@ -360,41 +396,60 @@ fn per_import_totals(
             ));
             continue;
         };
-        if let Some(error) = result.error.as_ref() {
+
+        let Some(sizes) = result.sizes() else {
+            // No size, so no bytes, so the sum is short — whatever the stage. The stage decides
+            // only what the user is told, never whether the total is a floor.
+            totals.missing_inputs = true;
+            let stage = result
+                .unmeasured_stage()
+                .unwrap_or(crate::pipeline::stage::FILE_SIZE_FALLBACK);
+            let mut details = vec![specifier];
+            details.push(if crate::engine::stage::is_transient(stage) {
+                "this import's own build failed transiently, so its bytes are unknown for this run \
+                 and the file's total is a floor"
+                    .to_owned()
+            } else {
+                "this import could not be measured, so its bytes are missing from the file's total, \
+                 which is a floor"
+                    .to_owned()
+            });
             diagnostics.push(diagnostic(
-                "file_size_fallback",
-                error.clone(),
-                vec![specifier],
+                stage,
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "import could not be measured".to_owned()),
+                details,
             ));
             continue;
-        }
-
-        for degraded in result
-            .diagnostics
-            .iter()
-            .filter(|item| crate::engine::stage::is_transient(&item.stage))
-        {
-            totals.missing_inputs = true;
-            diagnostics.push(diagnostic(
-                &degraded.stage,
-                degraded.message.clone(),
-                vec![
-                    specifier.clone(),
-                    "this import's own build failed transiently, so its size here is the static \
-                     fallback and the file's total is an estimate"
-                        .to_owned(),
-                ],
-            ));
-        }
+        };
 
         totals.sized_any = true;
-        totals.raw_bytes += result.raw_bytes;
-        totals.minified_bytes += result.minified_bytes;
-        totals.gzip_bytes += result.gzip_bytes;
-        totals.brotli_bytes += result.brotli_bytes;
-        totals.zstd_bytes += result.zstd_bytes;
+        totals.raw_bytes += sizes.raw_bytes;
+        totals.minified_bytes += sizes.minified_bytes;
+        totals.gzip_bytes += sizes.gzip_bytes;
+        totals.brotli_bytes += sizes.brotli_bytes;
+        totals.zstd_bytes += sizes.zstd_bytes;
     }
 
+    totals
+}
+
+/// The real conservative-fallback path — `per_import_totals` folded through `absorb_fallback` —
+/// as one call, for the crate's tests.
+///
+/// The caching gate has to be tested against the total the code actually BUILDS. A hand-assembled
+/// `FileSizeComputation` cannot fail when the fold is wrong, and the fold is where the defect
+/// ADR-0006 §4 names lives: it is what decides whether an import that was never measured leaves a
+/// mark on the total.
+#[cfg(test)]
+pub(crate) fn per_import_totals_for_test(sized: &[SizedImport]) -> FileSizeComputation {
+    let mut diagnostics = Vec::new();
+    let fallback = per_import_totals(sized, &mut diagnostics);
+    let mut totals = FileSizeComputation::default();
+    totals.absorb_fallback(fallback);
+    totals.diagnostics = diagnostics;
     totals
 }
 
@@ -416,7 +471,7 @@ fn error_computation(
 mod tests {
     use super::*;
     use crate::engine::stage;
-    use crate::ipc::protocol::{ConfidenceLevel, ImportKind, ResultFreshness};
+    use crate::ipc::protocol::{ImportKind, MeasuredSizes};
 
     fn request(specifier: &str) -> ImportRequest {
         ImportRequest {
@@ -430,39 +485,18 @@ mod tests {
     }
 
     fn result(specifier: &str, bytes: u64) -> ImportResult {
-        ImportResult {
-            specifier: specifier.to_owned(),
-            raw_bytes: bytes,
-            minified_bytes: bytes,
-            gzip_bytes: bytes,
-            brotli_bytes: bytes,
-            zstd_bytes: bytes,
-            cache_hit: false,
-            side_effects: false,
-            truly_treeshakeable: true,
-            is_cjs: false,
-            confidence: ConfidenceLevel::High,
-            confidence_reasons: Vec::new(),
-            error: None,
-            diagnostics: Vec::new(),
-            module_breakdown: None,
-            shared_bytes: None,
-            freshness: ResultFreshness::fresh(),
-            internal_contributions: Vec::new(),
-        }
-    }
-
-    /// The shape a TIMEOUT/PANIC leaves behind: `error: None`, a plausible byte count that is
-    /// actually the static entry fallback, and the failure recorded only in the result's own
-    /// diagnostics.
-    fn transiently_degraded(specifier: &str, bytes: u64) -> ImportResult {
-        ImportResult {
-            diagnostics: vec![ImportDiagnostic::for_stage(
-                stage::TIMEOUT,
-                "engine build did not complete within 8s",
-            )],
-            ..result(specifier, bytes)
-        }
+        let mut result = ImportResult::measured(
+            specifier,
+            MeasuredSizes {
+                raw_bytes: bytes,
+                minified_bytes: bytes,
+                gzip_bytes: bytes,
+                brotli_bytes: bytes,
+                zstd_bytes: bytes,
+            },
+        );
+        result.truly_treeshakeable = true;
+        result
     }
 
     fn measured(specifier: &str, bytes: u64) -> SizedImport {
@@ -472,13 +506,22 @@ mod tests {
         }
     }
 
+    /// The shape a TIMEOUT/PANIC leaves behind now: Unmeasured. No size at all — not the entry
+    /// file measured alone, not a zero.
+    fn unmeasured(specifier: &str, stage: &str) -> SizedImport {
+        SizedImport {
+            request: request(specifier),
+            result: Some(ImportResult::unmeasured(
+                specifier,
+                stage,
+                "engine build did not complete within 8s",
+                Vec::new(),
+            )),
+        }
+    }
+
     fn absorb(sized: &[SizedImport]) -> FileSizeComputation {
-        let mut diagnostics = Vec::new();
-        let fallback = per_import_totals(sized, &mut diagnostics);
-        let mut totals = FileSizeComputation::default();
-        totals.absorb_fallback(fallback);
-        totals.diagnostics = diagnostics;
-        totals
+        per_import_totals_for_test(sized)
     }
 
     #[test]
@@ -523,65 +566,90 @@ mod tests {
         );
     }
 
-    /// The 58-byte defect, one level up. A build that timed out or panicked degrades to a static
-    /// entry size that carries `error: None` — so the sum happily adds it, and nothing in the
-    /// aggregate's own diagnostics says where the number came from. Lift the transient stage out of
-    /// the result, or the fabricated total is written to the process-wide L1 cache.
+    /// The defect ADR-0006 §4 names, and the one the hand-built `FileSizeComputation` in
+    /// `service.rs` cannot see: with the static fallback deleted, a timed-out import arrives here
+    /// as an ordinary Unmeasured result — `error: Some`, no size — and the old code's `error`
+    /// branch `continue`d **past** the transient scan on the assumption that an error is always
+    /// deterministic. The file's total would then silently drop that import's bytes and be cached
+    /// as the file's size for the whole L1 TTL.
     #[test]
-    fn a_sum_of_a_transiently_degraded_import_carries_its_stage_and_is_never_cached() {
-        let mut diagnostics = Vec::new();
-        let fallback = per_import_totals(
-            &[
-                measured("alpha", 100),
-                SizedImport {
-                    request: request("beta"),
-                    result: Some(transiently_degraded("beta", 58)),
-                },
-            ],
-            &mut diagnostics,
-        );
-        let mut totals = FileSizeComputation::default();
-        totals.absorb_fallback(fallback);
-        totals.diagnostics = diagnostics;
+    fn a_transiently_unmeasured_import_makes_the_total_a_floor_and_is_never_cached() {
+        for transient in [stage::TIMEOUT, stage::PANIC, stage::ENGINE_GONE] {
+            let totals = absorb(&[measured("alpha", 100), unmeasured("beta", transient)]);
 
-        assert_eq!(
-            totals.raw_bytes, 158,
-            "a floor beats a zero (FR-024a): the fabricated size is still counted"
-        );
-        assert!(totals.incomplete);
-        assert!(
-            totals
-                .diagnostics
-                .iter()
-                .any(|item| stage::is_transient(&item.stage)),
-            "the import's transient failure must reach the aggregate: {:?}",
-            totals.diagnostics
-        );
-        assert!(
-            !totals.is_cacheable(),
-            "a total built on a fabricated size describes this run of the daemon, not the file"
-        );
+            assert_eq!(
+                totals.raw_bytes, 100,
+                "`{transient}`: the unmeasured import contributes NO bytes — there are none"
+            );
+            assert!(
+                totals.incomplete,
+                "`{transient}`: beta may well measure fine next time, so this total is a floor"
+            );
+            assert!(
+                totals
+                    .diagnostics
+                    .iter()
+                    .any(|item| stage::is_transient(&item.stage)),
+                "`{transient}`: the import's transient stage must reach the aggregate: {:?}",
+                totals.diagnostics
+            );
+            assert!(
+                !totals.is_cacheable(),
+                "`{transient}`: caching a floor serves it as the file's size for the whole TTL"
+            );
+        }
     }
 
-    /// The correction must not over-reach. An import that failed DETERMINISTICALLY has no size, and
-    /// re-running it would learn the same thing at the cost of another build — so it contributes
-    /// zero and the total is still cached, exactly as `should_cache_result` caches the per-import
-    /// failure itself.
+    /// **The seventh instance.** An import that failed DETERMINISTICALLY was exempted here: it
+    /// contributes zero, and the total was left `incomplete: false` on the reasoning that the
+    /// number is "as complete as this file can ever be".
+    ///
+    /// It is not. Deterministically-unknown bytes are still unknown, and the SAME failure also
+    /// killed the file's combined build — so the total on offer is an un-deduplicated per-import
+    /// sum, a number the file never had. With the flag clear it was cached (L1), persisted to the
+    /// no-TTL bundle-impact history as this file's baseline, shown with no estimate label, and
+    /// passed by `importlens check` with exit 0. ADR-0006 invariant 4 admits no exception, and now
+    /// neither does this.
     #[test]
-    fn a_deterministically_failed_import_contributes_zero_and_still_caches() {
-        let failed = ImportResult {
-            error: Some("no matching export".to_owned()),
-            ..result("beta", 0)
-        };
+    fn a_deterministically_unmeasured_import_makes_the_total_a_floor_and_is_never_cached() {
+        for deterministic in [stage::PARSE, stage::LINK, stage::MISSING_EXPORT] {
+            let totals = absorb(&[measured("alpha", 100), unmeasured("beta", deterministic)]);
+
+            assert_eq!(
+                totals.raw_bytes, 100,
+                "`{deterministic}`: the unmeasured import contributes NO bytes"
+            );
+            assert!(
+                totals.incomplete,
+                "`{deterministic}`: beta's bytes are unknown, and unknown-forever is still unknown"
+            );
+            assert!(
+                !totals.is_cacheable(),
+                "`{deterministic}`: caching a floor serves it as the file's size for the whole TTL"
+            );
+            assert!(
+                totals.diagnostics.iter().any(|item| item
+                    .details
+                    .iter()
+                    .any(|detail| detail == "specifier: beta")),
+                "the user is owed the specifier that is missing: {:?}",
+                totals.diagnostics
+            );
+        }
+    }
+
+    /// The floor rule is about MEASUREMENT, not about failure: a file whose every import really was
+    /// measured is complete, and must stay cacheable. Without this the fix above could be "made to
+    /// pass" by flagging everything.
+    #[test]
+    fn a_file_whose_every_import_was_measured_is_not_a_floor() {
         let totals = absorb(&[
             measured("alpha", 100),
-            SizedImport {
-                request: request("beta"),
-                result: Some(failed),
-            },
+            measured("beta", 20),
+            measured("gamma", 3),
         ]);
 
-        assert_eq!(totals.raw_bytes, 100);
+        assert_eq!(totals.raw_bytes, 123);
         assert!(!totals.incomplete);
         assert!(totals.is_cacheable());
     }

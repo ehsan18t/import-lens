@@ -59,13 +59,14 @@ test("warningMessageForImportResult warns when no usable size was produced", () 
   assert.equal(
     warningMessageForImportResult(
       result({
-        raw_bytes: 0,
-        minified_bytes: 0,
-        gzip_bytes: 0,
-        brotli_bytes: 0,
-        zstd_bytes: 0,
+        raw_bytes: null,
+        minified_bytes: null,
+        gzip_bytes: null,
+        brotli_bytes: null,
+        zstd_bytes: null,
         confidence: "low",
         error: "failed to resolve package entry",
+        unmeasured_stage: "entry_resolution",
       }),
     ),
     "sonner: failed to resolve package entry",
@@ -81,13 +82,14 @@ test("ImportResultLogTracker deduplicates partial and final warning/debug logs",
   };
   const tracker = new ImportResultLogTracker(logger, 7);
   const failed = result({
-    raw_bytes: 0,
-    minified_bytes: 0,
-    gzip_bytes: 0,
-    brotli_bytes: 0,
-    zstd_bytes: 0,
+    raw_bytes: null,
+    minified_bytes: null,
+    gzip_bytes: null,
+    brotli_bytes: null,
+    zstd_bytes: null,
     confidence: "low",
     error: "failed to resolve package entry",
+    unmeasured_stage: "entry_resolution",
     diagnostics: [
       {
         stage: "entry_resolution",

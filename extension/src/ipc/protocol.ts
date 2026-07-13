@@ -42,13 +42,27 @@ export interface ImportRequest {
   runtime: ImportRuntime;
 }
 
+/**
+ * One import's analysis, in exactly one of the two states a response can carry (ADR-0006).
+ * The third — Loading — is not an `ImportResult` at all: it is an `ImportAnalysisItem` with
+ * `status: "loading"` and no result.
+ *
+ * - **Measured**: every size is a `number`, `unmeasured_stage` is absent, `error` is `null`.
+ * - **Unmeasured**: every size is `null`, `unmeasured_stage` names the stage that could not
+ *   answer, and `error` carries its message.
+ *
+ * A size is `number | null` and NOT optional, because the question a consumer must ask is
+ * **"is there a size?"** — never "is there an error?". A degraded result used to carry
+ * `error: null` PLUS a fabricated size, so every `!result.error` check in this codebase waved it
+ * through; there is no size to misuse now. Use `measuredSizes()` in `ui/format.ts` to ask.
+ */
 export interface ImportResult {
   specifier: string;
-  raw_bytes: number;
-  minified_bytes: number;
-  gzip_bytes: number;
-  brotli_bytes: number;
-  zstd_bytes: number;
+  raw_bytes: number | null;
+  minified_bytes: number | null;
+  gzip_bytes: number | null;
+  brotli_bytes: number | null;
+  zstd_bytes: number | null;
   cache_hit: boolean;
   side_effects: boolean;
   truly_treeshakeable: boolean;
@@ -56,6 +70,10 @@ export interface ImportResult {
   confidence: ConfidenceLevel;
   confidence_reasons: string[];
   error: string | null;
+  // The stage that could not answer, when there is no size. `null` on a measurement. It is what
+  // tells a broken package (`parse` — a permanent fact) from a flaky daemon (`timeout` — a fact
+  // about nothing at all).
+  unmeasured_stage?: string | null;
   diagnostics: ImportDiagnostic[];
   module_breakdown?: ModuleContribution[];
   shared_bytes?: number;
@@ -495,10 +513,12 @@ export interface WorkspaceReportRow {
   sourceFile: string;
   line: number;
   runtime: string;
-  minifiedBytes: number;
-  gzipBytes: number;
-  brotliBytes: number;
-  zstdBytes: number;
+  // `null` when the import could not be measured. Not zero: an exported report that prints "0 B"
+  // for a package the engine could not build is the sentinel this model exists to abolish.
+  minifiedBytes: number | null;
+  gzipBytes: number | null;
+  brotliBytes: number | null;
+  zstdBytes: number | null;
   sharedBytes: number;
   confidence: ConfidenceLevel | "unknown";
   confidenceReasons: string;

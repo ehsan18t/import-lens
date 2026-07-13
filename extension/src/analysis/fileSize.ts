@@ -1,16 +1,41 @@
-import type { FileSizeResponse } from "../ipc/protocol.js";
+import type { FileSizeDocumentResponse, ImportAnalysisItem } from "../ipc/protocol.js";
 import {
   bytesForCompression,
   type CompressionFormat,
   formatBytes,
   labelForCompression,
 } from "../ui/format.js";
+import { type BundleImpactHistoryItem, bundleImpactHistoryDeltaLabel } from "./history.js";
+
+/**
+ * The imports of the file, as the file has them: every runtime package import the daemon DETECTED.
+ *
+ * `states`, not `imports`. An interactive size read is streamed — the daemon answers a cold import
+ * `loading` and puts only the ones it has already MEASURED in `imports` — so on a document nobody
+ * has sized yet that list is empty while the file's own totals, which come from the combined build
+ * rather than from the per-import measurements, are perfectly real. Counting `imports` reports "0
+ * imports" for a file that has three, and gating on it reports "no resolvable package imports" for
+ * a file the daemon sized fine. `listener.ts` carries the same warning for the status bar.
+ */
+const importCountFor = (response: Pick<FileSizeDocumentResponse, "states">): number =>
+  response.states.length;
+
+/**
+ * The imports the daemon could not size, and never will on this response: no manifest, no
+ * resolution, a build that could not answer. An import still being measured is NOT one of them — it
+ * is why the total is an estimate, which the summary says separately.
+ */
+const skippedCountFor = (response: Pick<FileSizeDocumentResponse, "states">): number =>
+  response.states.filter((state) => isUnsizable(state.status)).length;
+
+const isUnsizable = (status: ImportAnalysisItem["status"]): boolean =>
+  status === "missing" || status === "unavailable";
 
 export const formatCurrentFileSizeSummary = (
-  response: FileSizeResponse,
+  response: FileSizeDocumentResponse,
   compression: CompressionFormat,
 ): string => {
-  const importCount = response.imports.length;
+  const importCount = importCountFor(response);
   const importLabel = importCount === 1 ? "import" : "imports";
 
   return [
@@ -18,4 +43,50 @@ export const formatCurrentFileSizeSummary = (
     `${formatBytes(response.minified_bytes)} min`,
     `${importCount} ${importLabel}`,
   ].join(" · ");
+};
+
+/** What the "Show current file size" command can say about a size response. */
+export type CurrentFileSizeReport = { kind: "no-imports" } | { kind: "summary"; message: string };
+
+export interface CurrentFileSizeHistory {
+  /**
+   * The bundle-impact row this response contributes, or `undefined` when its totals are a FLOOR
+   * rather than the file's size (an import still being measured, or one a transient engine failure
+   * sized for us). A floor is worth SHOWING — it beats a blank — and must never be recorded or
+   * compared: the history has no TTL and keeps one row per file, so it would become that file's
+   * baseline and make the next honest sizing read as a regression.
+   */
+  current?: BundleImpactHistoryItem;
+  /** The file's previous MEASURED total, if it has one. */
+  previous?: BundleImpactHistoryItem;
+}
+
+/**
+ * The one decision the command makes about a size response, kept vscode-free so it is testable: a
+ * file with no runtime package imports has nothing to report, and every other file has a number —
+ * including the cold one, whose per-import builds have not landed yet.
+ */
+export const currentFileSizeReport = (
+  response: FileSizeDocumentResponse,
+  compression: CompressionFormat,
+  history: CurrentFileSizeHistory = {},
+): CurrentFileSizeReport => {
+  if (importCountFor(response) === 0) {
+    return { kind: "no-imports" };
+  }
+
+  const skipped = skippedCountFor(response);
+  const skippedSuffix = skipped > 0 ? ` · ${skipped} skipped` : "";
+  // No delta against a floor: the comparison would be arithmetic on a number the file never had,
+  // and would report a regression or a win that did not happen.
+  const diffSuffix =
+    history.previous && history.current
+      ? ` · ${bundleImpactHistoryDeltaLabel(history.current, history.previous)}`
+      : "";
+  const estimateSuffix = history.current ? "" : " · estimate (some imports are not fully measured)";
+
+  return {
+    kind: "summary",
+    message: `${formatCurrentFileSizeSummary(response, compression)}${skippedSuffix}${diffSuffix}${estimateSuffix}`,
+  };
 };

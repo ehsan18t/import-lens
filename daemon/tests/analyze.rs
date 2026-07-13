@@ -1,5 +1,5 @@
 use import_lens_daemon::ipc::protocol::{
-    ConfidenceLevel, ImportKind, ImportRequest, ImportRuntime,
+    ConfidenceLevel, ImportKind, ImportRequest, ImportRuntime, MeasuredSizes,
 };
 use import_lens_daemon::pipeline::analyze::{AnalysisContext, analyze_import};
 use std::{
@@ -91,10 +91,11 @@ fn assert_named_import_is_smaller_than_namespace_import(
 
     assert_eq!(named.error, None);
     assert_eq!(namespace.error, None);
-    assert!(named.brotli_bytes > 0);
-    assert!(namespace.brotli_bytes > 0);
+    assert!(common::measured_sizes(&named).brotli_bytes > 0);
+    assert!(common::measured_sizes(&namespace).brotli_bytes > 0);
     assert!(
-        named.brotli_bytes < namespace.brotli_bytes,
+        common::measured_sizes(&named).brotli_bytes
+            < common::measured_sizes(&namespace).brotli_bytes,
         "named import should be smaller than namespace import: named={named:?}, namespace={namespace:?}",
     );
 }
@@ -134,7 +135,7 @@ fn analyze_react_default_import_is_conservative_commonjs() {
     );
 
     assert_eq!(result.error, None);
-    assert!(result.brotli_bytes > 0);
+    assert!(common::measured_sizes(&result).brotli_bytes > 0);
     assert!(result.side_effects);
     assert!(!result.truly_treeshakeable);
     assert!(
@@ -153,8 +154,8 @@ fn analyze_zod_namespace_import_measures_full_module_entry() {
     );
 
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
-    assert!(result.brotli_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
+    assert!(common::measured_sizes(&result).brotli_bytes > 0);
     assert!(!result.truly_treeshakeable);
 }
 
@@ -186,9 +187,9 @@ fn analyze_import_computes_static_sizes_for_local_package_entry() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
     assert_eq!(result.confidence, ConfidenceLevel::High);
-    assert!(result.raw_bytes > 0);
-    assert!(result.minified_bytes > 0);
-    assert!(result.gzip_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
+    assert!(common::measured_sizes(&result).minified_bytes > 0);
+    assert!(common::measured_sizes(&result).gzip_bytes > 0);
     assert!(!result.side_effects);
     assert!(!result.is_cjs);
     assert!(
@@ -337,7 +338,7 @@ fn analyze_named_import_excludes_dependency_used_only_by_unreachable_export() {
     assert_eq!(named.error, None, "{named:?}");
     assert_eq!(namespace.error, None, "{namespace:?}");
     assert!(
-        named.raw_bytes * 4 < namespace.raw_bytes,
+        common::measured_sizes(&named).raw_bytes * 4 < common::measured_sizes(&namespace).raw_bytes,
         "named import should prune unused huge dependency: named={named:?}, namespace={namespace:?}",
     );
     assert!(
@@ -456,7 +457,10 @@ fn analyze_dynamic_import_measures_full_module_graph() {
     assert_eq!(named.error, None);
     assert_eq!(dynamic.error, None);
     assert_eq!(namespace.error, None);
-    assert_eq!(dynamic.raw_bytes, namespace.raw_bytes);
+    assert_eq!(
+        common::measured_sizes(&dynamic).raw_bytes,
+        common::measured_sizes(&namespace).raw_bytes
+    );
     assert!(
         dynamic.module_breakdown.as_ref().is_some_and(|modules| {
             modules
@@ -500,7 +504,11 @@ fn analyze_import_reports_missing_named_export_as_zero_size_error() {
             .as_deref()
             .is_some_and(|error| error.contains("missing"))
     );
-    assert_eq!(result.raw_bytes, 0);
+    assert_eq!(
+        result.sizes(),
+        None,
+        "a missing export is Unmeasured: no size, not a zero"
+    );
     assert!(
         result
             .diagnostics
@@ -543,7 +551,11 @@ fn analyze_import_reports_missing_esm_default_export_as_zero_size_error() {
             .as_deref()
             .is_some_and(|error| error.contains("default"))
     );
-    assert_eq!(result.raw_bytes, 0);
+    assert_eq!(
+        result.sizes(),
+        None,
+        "a missing export is Unmeasured: no size, not a zero"
+    );
     assert!(
         result
             .diagnostics
@@ -554,8 +566,13 @@ fn analyze_import_reports_missing_esm_default_export_as_zero_size_error() {
     );
 }
 
+/// The manifest fabricator, gone (ADR-0006 §1). An unreadable `package.json` used to be answered
+/// with the package directory's bytes ON DISK — and that one number was written to all five size
+/// fields, so this import's "brotli size" was an uncompressed directory that also counted its
+/// tests, source maps and `node_modules`. It is Unmeasured now: no size at all, and a stage
+/// (`package_manifest`) that says why.
 #[test]
-fn analyze_invalid_package_json_returns_approximate_directory_size() {
+fn analyze_invalid_package_json_is_unmeasured_not_approximated_from_the_directory() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -585,29 +602,20 @@ fn analyze_invalid_package_json_returns_approximate_directory_size() {
     let result = analyze_import(&context, &request);
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert_eq!(result.confidence, ConfidenceLevel::Low);
+    assert_eq!(result.sizes(), None, "{result:?}");
+    assert_eq!(result.unmeasured_stage(), Some("package_manifest"));
     assert!(
         result
-            .confidence_reasons
-            .iter()
-            .any(|reason| reason.contains("approximate")),
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("manifest")),
         "{result:?}",
     );
-    assert!(result.raw_bytes > 0, "{result:?}");
-    assert!(result.raw_bytes < 2048, "{result:?}");
-    assert_eq!(result.minified_bytes, result.raw_bytes);
-    assert_eq!(result.brotli_bytes, result.raw_bytes);
-    assert!(
-        result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "manifest_fallback" && diagnostic.message.contains("(approx)")
-        }),
-        "{result:?}",
-    );
+    assert_eq!(result.confidence, ConfidenceLevel::Low);
 }
 
 #[test]
-fn analyze_versionless_package_json_returns_approximate_directory_size() {
+fn analyze_versionless_package_json_is_unmeasured() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -631,19 +639,23 @@ fn analyze_versionless_package_json_returns_approximate_directory_size() {
     let result = analyze_import(&context, &request);
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0, "{result:?}");
-    assert_eq!(result.gzip_bytes, result.raw_bytes);
+    assert_eq!(result.sizes(), None, "{result:?}");
+    assert_eq!(result.unmeasured_stage(), Some("package_manifest"));
     assert!(
-        result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "manifest_fallback" && diagnostic.message.contains("version")
-        }),
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("version")),
         "{result:?}",
     );
 }
 
+/// The engine fabricator, gone. A package that cannot be parsed used to be sized from its entry
+/// file ALONE — the whole graph behind it uncounted — and served with `error: None`, which every
+/// `!result.error` check in the system waves through. The failure keeps the stage it happened at
+/// (§12); what it no longer keeps is a number.
 #[test]
-fn analyze_namespace_import_preserves_the_engine_failure_stage() {
+fn analyze_namespace_import_of_an_unparseable_package_is_unmeasured_under_its_stage() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -668,20 +680,20 @@ fn analyze_namespace_import_preserves_the_engine_failure_stage() {
     );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert_eq!(result.sizes(), None, "{result:?}");
+    assert_eq!(result.unmeasured_stage(), Some("parse"));
+    assert!(result.error.is_some(), "{result:?}");
     assert!(
         result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "parse"
-                && diagnostic.message.contains("static entry")),
+            .any(|diagnostic| diagnostic.stage == "parse"),
         "{result:?}",
     );
 }
 
 #[test]
-fn analyze_named_import_falls_back_to_static_entry_after_engine_failure() {
+fn analyze_named_import_of_an_unparseable_package_is_unmeasured() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -706,27 +718,17 @@ fn analyze_named_import_falls_back_to_static_entry_after_engine_failure() {
     );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert_eq!(result.sizes(), None, "{result:?}");
+    assert_eq!(result.unmeasured_stage(), Some("parse"));
     assert_eq!(result.confidence, ConfidenceLevel::Low);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "parse"
-                && diagnostic.message.contains("static entry")),
-        "{result:?}",
-    );
     assert!(!result.truly_treeshakeable);
 }
 
 #[test]
-fn analyze_invalid_semantic_module_falls_back_at_minify_boundary() {
-    // Semantically invalid modules (here a duplicate `const`) still fall back to
-    // static-entry sizing, but the detection now happens at the minifier's
-    // semantic pass rather than a redundant one in the bundle rewriter (which was
-    // removed so bundling no longer re-parses every module per request). The
-    // user-visible outcome is a safe engine fallback with no error.
+fn analyze_invalid_semantic_module_is_unmeasured_at_the_minify_boundary() {
+    // A semantically invalid module (here a duplicate `const`) is rejected at the minifier's
+    // semantic pass, and Rolldown reports it as a parse failure. It used to be sized from the
+    // entry file alone; there is no size now.
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -751,15 +753,9 @@ fn analyze_invalid_semantic_module_falls_back_at_minify_boundary() {
     );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert_eq!(result.sizes(), None, "{result:?}");
+    assert!(result.error.is_some(), "{result:?}");
     assert!(!result.truly_treeshakeable);
-    assert!(
-        result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "parse" && diagnostic.message.contains("static entry")
-        }),
-        "{result:?}",
-    );
 }
 
 #[test]
@@ -790,12 +786,11 @@ fn analyze_import_returns_partial_error_result_on_missing_entry() {
     assert!(
         result
             .error
+            .as_deref()
             .expect("missing entry should produce an error")
             .contains("entry")
     );
-    assert_eq!(result.raw_bytes, 0);
-    assert_eq!(result.minified_bytes, 0);
-    assert_eq!(result.gzip_bytes, 0);
+    assert_eq!(result.sizes(), None);
     assert_eq!(result.diagnostics.len(), 1);
     assert_eq!(result.diagnostics[0].stage, "entry_resolution");
     assert!(
@@ -838,11 +833,11 @@ fn analyze_declaration_only_package_returns_zero_runtime_cost() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None, "{result:?}");
-    assert_eq!(result.raw_bytes, 0);
-    assert_eq!(result.minified_bytes, 0);
-    assert_eq!(result.gzip_bytes, 0);
-    assert_eq!(result.brotli_bytes, 0);
-    assert_eq!(result.zstd_bytes, 0);
+    assert_eq!(
+        result.sizes(),
+        Some(MeasuredSizes::ZERO),
+        "a declarations-only package is MEASURED at zero, not Unmeasured: {result:?}",
+    );
     assert!(!result.side_effects);
     assert!(!result.is_cjs);
     assert!(
@@ -929,8 +924,8 @@ fn analyze_import_resolves_dotted_nestjs_style_subpath() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
-    assert!(result.gzip_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
+    assert!(common::measured_sizes(&result).gzip_bytes > 0);
 }
 
 #[test]
@@ -968,8 +963,8 @@ fn analyze_import_resolves_package_from_active_document_tree() {
 
     fs::remove_dir_all(&repo).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
-    assert!(result.gzip_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
+    assert!(common::measured_sizes(&result).gzip_bytes > 0);
 }
 
 #[test]
@@ -1011,7 +1006,7 @@ fn analyze_commonjs_literal_require_graph_includes_required_modules() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
     assert!(result.is_cjs);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
     assert!(
         result.module_breakdown.as_ref().is_some_and(|modules| {
             modules
@@ -1426,7 +1421,7 @@ fn analyze_import_resolves_subpath_via_exports_map() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
     assert!(!result.is_cjs);
 }
 
@@ -1468,7 +1463,7 @@ fn analyze_import_resolves_root_entry_via_exports_dot() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
     assert!(!result.is_cjs);
 }
 
@@ -1504,7 +1499,7 @@ fn analyze_import_resolves_string_shorthand_exports() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
 }
 
 #[test]
@@ -1547,7 +1542,7 @@ fn analyze_import_resolves_conditional_exports_with_nested_conditions() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
 }
 
 #[test]
@@ -1588,7 +1583,7 @@ fn analyze_import_resolves_wildcard_exports_pattern() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
 }
 
 #[test]
@@ -1675,7 +1670,7 @@ fn analyze_import_resolves_array_fallback_exports() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
 }
 
 #[test]
@@ -1713,7 +1708,7 @@ fn analyze_import_resolves_top_level_condition_map_exports() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
     assert!(!result.is_cjs);
 }
 
@@ -1767,7 +1762,7 @@ fn analyze_import_transforms_typescript_jsx_and_type_only_modules() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
     assert!(!result.is_cjs);
     assert!(
         result.module_breakdown.as_ref().is_some_and(|modules| {
@@ -1823,7 +1818,7 @@ fn analyze_import_resolves_typescript_source_via_js_extension_alias() {
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0, "{result:?}");
+    assert!(common::measured_sizes(&result).raw_bytes > 0, "{result:?}");
 }
 
 #[test]
@@ -1858,7 +1853,7 @@ fn analyze_import_includes_json_import_as_synthetic_js() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(result.error, None);
-    assert!(result.raw_bytes > 0);
+    assert!(common::measured_sizes(&result).raw_bytes > 0);
     assert!(
         result.module_breakdown.as_ref().is_some_and(|modules| {
             modules
@@ -1902,9 +1897,13 @@ fn analyze_import_falls_back_for_oversized_entries() {
     let result = analyze_import(&context, &request);
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert!(result.error.is_none(), "{result:?}");
+    // The entry-alone fabricator, gone. An entry over the module source limit used to be sized
+    // from that ONE file with the whole graph behind it uncounted, and served as the import's
+    // size. It is Unmeasured — deterministically so, which is why it is still cached.
+    assert_eq!(result.sizes(), None, "{result:?}");
+    assert_eq!(result.unmeasured_stage(), Some("oversized_entry"));
     assert_eq!(result.confidence, ConfidenceLevel::Low);
-    assert!(result.brotli_bytes > 0, "{result:?}");
+    assert!(result.error.is_some(), "{result:?}");
     assert!(
         result
             .diagnostics
@@ -1948,7 +1947,10 @@ fn analyze_import_analyzes_typescript_scale_entries() {
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(result.error.is_none(), "{result:?}");
-    assert!(result.brotli_bytes > 0, "{result:?}");
+    assert!(
+        common::measured_sizes(&result).brotli_bytes > 0,
+        "{result:?}"
+    );
     assert!(
         !result
             .diagnostics
@@ -2045,5 +2047,72 @@ fn string_form_side_effects_is_treated_as_a_one_pattern_glob() {
             .any(|diagnostic| diagnostic.stage == "side_effects"),
         "a string `sideEffects` must raise the same conservative glob diagnostic an \
          array does; landing in `Unknown` suppressed it entirely: {result:?}"
+    );
+}
+
+/// A CSS-shipping package builds, and says what it did not count.
+///
+/// Rolldown 1.1.5 cannot bundle CSS at all: a `.css` module reaching it fails the WHOLE build at the
+/// LINK stage (`UNSUPPORTED_FEATURE: Bundling CSS is no longer supported`) — it does not become an
+/// emitted asset, and no output-shape guard is involved. So every package that ships a stylesheet
+/// its entry imports (swiper, react-datepicker, react-toastify, most UI kits) was unmeasurable.
+/// Nobody noticed, because the pipeline caught the failure and fabricated a size for it; delete the
+/// fabricator without `plugin.rs` linking the stylesheet as an empty module and they all go BLANK.
+///
+/// The JS chunk is real and is measured exactly. The stylesheet's bytes are not in that number and
+/// do ship with the package, so they are disclosed — and they cost the result its High confidence,
+/// by design (see `engine::diagnostic_stage::UNCOUNTED_ASSETS`): a size that omits bytes the user's
+/// bundle will really carry is not a High-confidence measurement of that package's cost.
+#[test]
+fn analyze_a_css_shipping_package_measures_its_javascript_and_discloses_the_rest() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "styled-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "styled-lib",
+        "styles.css",
+        ".widget { color: rebeccapurple; display: flex; }\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "styled-lib",
+            "styled-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(
+        result.error, None,
+        "an emitted stylesheet is not an output-shape failure: {result:?}",
+    );
+    let sizes = common::measured_sizes(&result);
+    assert!(sizes.brotli_bytes > 0, "{result:?}");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"
+                && diagnostic.message.contains("styles.css")),
+        "the bytes this size does NOT include must be named: {result:?}",
+    );
+    assert_eq!(
+        result.confidence,
+        ConfidenceLevel::Medium,
+        "an asset-emitting package is Medium by design; High would claim a completeness the number \
+         does not have: {result:?}",
     );
 }

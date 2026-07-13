@@ -9,5 +9,6 @@ mod full_package;
 pub mod minify;
 pub mod node_builtins;
 pub mod resolver;
+pub mod stage;
 pub mod types_only;
 mod util;

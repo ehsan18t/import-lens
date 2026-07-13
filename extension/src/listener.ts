@@ -14,7 +14,7 @@ import {
   importCostHistoryItemsForStates,
 } from "./analysis/insights.js";
 import { ImportResultLogTracker } from "./analysis/resultLogging.js";
-import type { AnalysisStore } from "./analysis/state.js";
+import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
 import type { DaemonManager } from "./daemon/manager.js";
 import {
@@ -230,6 +230,10 @@ export class DocumentAnalysisController implements vscode.Disposable {
       // `DocumentAnalysisStates`); without it, on every re-analysis that import went back to
       // "Calculating..." and stayed there until the next edit. Storing early also paints the
       // cache hits at once, which is the point of the whole exercise.
+      //
+      // No refiner: this analysis has not run its `git diff` yet, so it has nothing to caption
+      // ANY of these states with — the cache hits in `responseStates` are uncaptioned too. The
+      // captions arrive together, below, when the inputs they are derived from do.
       this.#store.set(document.uri, responseStates, requestId);
 
       const history = this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
@@ -244,15 +248,18 @@ export class DocumentAnalysisController implements vscode.Disposable {
       // already have landed in them during the await above, and overwriting the store
       // with the pre-push snapshot would undo it.
       const currentStates = this.#store.get(document.uri);
-      this.#store.set(
-        document.uri,
-        applyImportAnalysisInsights(currentStates, {
+      // ONE refiner, for the states this analysis stores AND for the pushes the store replays
+      // over them: a pushed import is captioned from the same git diff, history and budgets as
+      // every other import in the document, and never from what a push happened to capture
+      // mid-analysis (which predates the diff, and would strip the working-tree badge off the
+      // whole document).
+      const refine = (states: ImportAnalysisState[]): ImportAnalysisState[] =>
+        applyImportAnalysisInsights(states, {
           changedLines,
           importCostHistory: history,
           budgets: config.budgets,
-        }),
-        requestId,
-      );
+        });
+      this.#store.set(document.uri, refine(currentStates), requestId, refine);
       try {
         await recordImportCostHistory(
           this.#historyStore,

@@ -42,6 +42,9 @@ pub(super) struct BuildState {
     canonical: Mutex<HashMap<PathBuf, PathBuf>>,
     total_source_bytes: AtomicUsize,
     limit_breach: Mutex<Option<String>>,
+    /// Non-JavaScript modules the graph imported, and their byte counts. See
+    /// [`ImportLensPlugin::load`] and [`super::diagnostic_stage::UNCOUNTED_ASSETS`].
+    uncounted_assets: Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl BuildState {
@@ -77,6 +80,22 @@ impl BuildState {
             .collect();
 
         (fingerprints, unhashed)
+    }
+
+    /// The non-JavaScript modules this build's graph imported, with their byte counts, sorted for
+    /// a stable diagnostic. Their bytes are NOT in the measured size — the size is the JS chunk —
+    /// and they DO ship with the package, so the adapter discloses them.
+    pub(super) fn sorted_uncounted_assets(&self) -> Vec<(PathBuf, u64)> {
+        let assets = self
+            .uncounted_assets
+            .lock()
+            .expect("uncounted-asset map should not be poisoned");
+        let mut sorted: Vec<(PathBuf, u64)> = assets
+            .iter()
+            .map(|(path, bytes)| (path.clone(), *bytes))
+            .collect();
+        sorted.sort();
+        sorted
     }
 
     /// Canonicalize once per build. A path that no longer resolves (deleted
@@ -273,6 +292,31 @@ impl Plugin for ImportLensPlugin {
                 )
             });
 
+        // A STYLESHEET the package's own entry imports. Rolldown 1.1.5 does not bundle CSS at all
+        // — it fails the whole build with `UNSUPPORTED_FEATURE: Bundling CSS is no longer
+        // supported` at the LINK stage — so every package whose ESM entry does `import
+        // './styles.css'` (most UI kits) could not be measured. Nobody saw it: the pipeline caught
+        // the failure and fabricated a size, and deleting that fabricator without this would send
+        // all of them to "Size unavailable".
+        //
+        // `ModuleType::Empty` makes the module link as nothing (and shims any binding imported from
+        // it, so `import styles from './x.css'` works too). The JS graph then measures exactly, and
+        // the stylesheet's bytes — real bytes, which really do ship — are recorded here and
+        // DISCLOSED rather than silently folded into the number or thrown away with it.
+        if is_stylesheet(path) {
+            self.state
+                .uncounted_assets
+                .lock()
+                .expect("uncounted-asset map should not be poisoned")
+                .insert(canonical, len);
+
+            return Ok(Some(HookLoadOutput {
+                code: String::new().into(),
+                module_type: Some(ModuleType::Empty),
+                ..HookLoadOutput::default()
+            }));
+        }
+
         Ok(Some(HookLoadOutput {
             code: source.into(),
             // Let Rolldown infer the module type from the extension, exactly as it
@@ -344,4 +388,23 @@ impl Plugin for ImportLensPlugin {
     fn register_hook_usage(&self) -> HookUsage {
         HookUsage::ResolveId | HookUsage::Load | HookUsage::ModuleParsed
     }
+}
+
+/// A stylesheet the JavaScript graph imports.
+///
+/// Rolldown 1.1.5 removed CSS bundling outright, so any of these reaching it as a graph module
+/// fails the ENTIRE build (`UNSUPPORTED_FEATURE`, at the link stage) rather than merely going
+/// uncounted. The list is deliberately narrow: only what a published package's JS entry plausibly
+/// imports. Anything else non-JS (a `.wasm` or an image) is not UTF-8, so `load` already hands it
+/// back to Rolldown untouched.
+fn is_stylesheet(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| {
+            matches!(
+                extension.as_str(),
+                "css" | "scss" | "sass" | "less" | "styl" | "stylus" | "pcss" | "postcss"
+            )
+        })
 }

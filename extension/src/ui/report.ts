@@ -5,7 +5,7 @@ import { protocolVersion, type WorkspaceReportSummary } from "../ipc/protocol.js
 import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { Logger } from "../logging/types.js";
 import { confidenceCssColor, confidenceVisualFor } from "./confidenceVisuals.js";
-import { formatBytes } from "./format.js";
+import { formatBytes, formatOptionalBytes } from "./format.js";
 
 export const showReport = async (
   context: vscode.ExtensionContext,
@@ -87,10 +87,10 @@ export const showReport = async (
 <td>${escapeHtml(row.sourceFile)}</td>
 <td>${row.line}</td>
 <td>${escapeHtml(row.runtime)}</td>
-<td>${formatBytes(row.minifiedBytes)}</td>
-<td>${formatBytes(row.gzipBytes)}</td>
-<td>${formatBytes(row.brotliBytes)}</td>
-<td>${formatBytes(row.zstdBytes)}</td>
+<td>${formatOptionalBytes(row.minifiedBytes)}</td>
+<td>${formatOptionalBytes(row.gzipBytes)}</td>
+<td>${formatOptionalBytes(row.brotliBytes)}</td>
+<td>${formatOptionalBytes(row.zstdBytes)}</td>
 <td>${formatBytes(row.sharedBytes)}</td>
 <td class="confidence ${confidenceVisualFor(row.confidence).cssClass}">${escapeHtml(row.confidence)}</td>
 <td>${escapeHtml(row.confidenceReasons)}</td>

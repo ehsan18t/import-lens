@@ -182,31 +182,24 @@ mod tests {
         time::Duration,
     };
 
-    use crate::ipc::protocol::{ConfidenceLevel, ImportResult, ResultFreshness};
+    use crate::ipc::protocol::{ConfidenceLevel, ImportResult, MeasuredSizes};
 
     use super::AnalysisFlightRegistry;
 
     fn result_for(specifier: &str, bytes: u64) -> ImportResult {
-        ImportResult {
-            specifier: specifier.to_owned(),
-            raw_bytes: bytes,
-            minified_bytes: bytes,
-            gzip_bytes: bytes,
-            brotli_bytes: bytes,
-            zstd_bytes: bytes,
-            cache_hit: false,
-            side_effects: false,
-            truly_treeshakeable: true,
-            is_cjs: false,
-            confidence: ConfidenceLevel::High,
-            confidence_reasons: Vec::new(),
-            error: None,
-            diagnostics: Vec::new(),
-            module_breakdown: None,
-            shared_bytes: None,
-            freshness: ResultFreshness::fresh(),
-            internal_contributions: Vec::new(),
-        }
+        let mut result = ImportResult::measured(
+            specifier,
+            MeasuredSizes {
+                raw_bytes: bytes,
+                minified_bytes: bytes,
+                gzip_bytes: bytes,
+                brotli_bytes: bytes,
+                zstd_bytes: bytes,
+            },
+        );
+        result.truly_treeshakeable = true;
+        result.confidence = ConfidenceLevel::High;
+        result
     }
 
     fn wait_until_released(pair: &(Mutex<bool>, Condvar)) {

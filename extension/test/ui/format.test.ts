@@ -50,7 +50,19 @@ test("formatImportSizePrimary supports minimal, standard, and verbose display mo
 test("formatImportSizePrimary shows unavailable and applies compression and confidence", () => {
   assert.equal(
     formatImportSizePrimary(
-      { ...result, error: "parse failed" },
+      // Unmeasured (ADR-0006): no size, and a stage that says why. The render path asks whether
+      // there is a size, not whether there is an error, so a hypothetical result that somehow had
+      // one without the other could not slip a number onto the screen.
+      {
+        ...result,
+        raw_bytes: null,
+        minified_bytes: null,
+        gzip_bytes: null,
+        brotli_bytes: null,
+        zstd_bytes: null,
+        error: "parse failed",
+        unmeasured_stage: "parse",
+      },
       { display: "standard", compression: "brotli", showWarnings: true },
     ),
     "Size unavailable",

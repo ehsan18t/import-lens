@@ -938,7 +938,7 @@ async fn a_cold_document_answers_at_once_and_streams_each_import_as_it_lands() {
                 .map(|(identity, result)| {
                     assert!(result.error.is_none(), "{result:?}");
                     assert!(
-                        result.brotli_bytes > 0,
+                        result.brotli_bytes().is_some_and(|bytes| bytes > 0),
                         "a streamed import carries a real size"
                     );
                     identity.specifier.clone()

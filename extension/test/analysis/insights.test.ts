@@ -54,6 +54,21 @@ const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
   ...overrides,
 });
 
+/**
+ * The history row for an import the test asserts IS measured. `importCostHistoryItem` returns
+ * `undefined` for one that is not — a row is five sizes, and there is no row without them — so a
+ * test that wants a row says so here rather than defaulting the absence away.
+ */
+const measuredHistoryItem = (
+  detectedImportValue: DetectedImport,
+  resultValue: ImportResult,
+  timestamp: number,
+): ImportCostHistoryItem => {
+  const item = importCostHistoryItem(detectedImportValue, resultValue, timestamp);
+  assert.ok(item, "the fixture result must be measured");
+  return item;
+};
+
 const readyState = (
   detectedOverrides: Partial<DetectedImport> = {},
   resultOverrides: Partial<ImportResult> = {},
@@ -138,10 +153,7 @@ test("applyImportAnalysisInsights warns about barrel re-export boundaries", () =
 });
 
 test("applyImportAnalysisInsights adds import cost history trends", () => {
-  const previous: ImportCostHistoryItem = {
-    ...importCostHistoryItem(detected(), result({ brotli_bytes: 1200 }), 1_700_000),
-    timestamp: 1_700_000,
-  };
+  const previous = measuredHistoryItem(detected(), result({ brotli_bytes: 1200 }), 1_700_000);
   const [state] = applyImportAnalysisInsights([readyState()], {
     importCostHistory: [previous],
   });
@@ -152,8 +164,8 @@ test("applyImportAnalysisInsights adds import cost history trends", () => {
 
 test("recordImportCostHistory skips unchanged consecutive import entries", async () => {
   const store = new MemoryStore();
-  const first = importCostHistoryItem(detected(), result(), 1_700_000);
-  const duplicate = importCostHistoryItem(detected(), result(), 1_800_000);
+  const first = measuredHistoryItem(detected(), result(), 1_700_000);
+  const duplicate = measuredHistoryItem(detected(), result(), 1_800_000);
 
   await recordImportCostHistory(store, [first]);
   await recordImportCostHistory(store, [duplicate]);

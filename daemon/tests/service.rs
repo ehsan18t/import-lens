@@ -889,8 +889,18 @@ fn revalidate_document_sizes_bails_when_superseded() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
+/// The SWR push and the cache write are gated by the SAME predicate (`should_cache_result`), and
+/// under ADR-0006 that predicate means one thing: **is this outcome durable?** So the push now
+/// carries exactly what the cache took.
+///
+/// A DETERMINISTIC failure is both. The import genuinely cannot be sized — it will fail the same
+/// way every time — so the daemon caches it, and the client is owed the fact: withholding the
+/// push would leave a stale number on screen for code that no longer produces one. It arrives with
+/// **no size**, which is what makes that safe; before this change the same push would have carried
+/// a fabricated one. (A TRANSIENT failure is neither cached nor pushed — the property test in
+/// `service.rs` quantifies that over every transient stage.)
 #[test]
-fn revalidate_document_sizes_omits_non_cacheable_results() {
+fn revalidate_document_sizes_pushes_a_deterministic_failure_carrying_no_size() {
     use std::collections::HashSet;
 
     let workspace = temp_workspace();
@@ -908,14 +918,18 @@ fn revalidate_document_sizes_omits_non_cacheable_results() {
     };
     let stale = HashSet::from(["missing-effectful-lib".to_owned()]);
 
-    assert!(
-        service
-            .revalidate_document_sizes(&request, &stale, || true)
-            .is_none(),
-        "SWR must not push request-specific diagnostics over a good stale value"
-    );
+    let (_, _, results, _) = service
+        .revalidate_document_sizes(&request, &stale, || true)
+        .expect("a deterministic failure is durable, so it is cached and pushed");
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].sizes(),
+        None,
+        "the push may not carry a size the engine never measured: {results:?}",
+    );
+    assert_eq!(results[0].unmeasured_stage(), Some("missing_export"));
 }
 
 #[test]
@@ -1473,7 +1487,7 @@ fn service_does_not_reuse_same_package_version_across_workspaces() {
     fs::remove_dir_all(right_workspace).expect("right workspace should be removed");
     assert!(!left.imports[0].cache_hit);
     assert!(!right.imports[0].cache_hit);
-    assert_ne!(left.imports[0].raw_bytes, right.imports[0].raw_bytes);
+    assert_ne!(left.imports[0].raw_bytes(), right.imports[0].raw_bytes());
 }
 
 #[test]
@@ -1488,7 +1502,10 @@ fn service_does_not_reuse_cache_across_runtime_profiles() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!component.imports[0].cache_hit);
     assert!(!server.imports[0].cache_hit);
-    assert_ne!(component.imports[0].raw_bytes, server.imports[0].raw_bytes);
+    assert_ne!(
+        component.imports[0].raw_bytes(),
+        server.imports[0].raw_bytes()
+    );
 }
 
 #[test]
@@ -1879,7 +1896,7 @@ fn service_revalidates_cache_when_relative_dependency_changes() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
     assert!(!second.imports[0].cache_hit);
-    assert_ne!(first.imports[0].raw_bytes, second.imports[0].raw_bytes);
+    assert_ne!(first.imports[0].raw_bytes(), second.imports[0].raw_bytes());
 }
 
 #[test]
@@ -1906,11 +1923,15 @@ fn service_revalidates_cache_when_transitive_package_dependency_changes() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
     assert!(!second.imports[0].cache_hit);
-    assert_ne!(first.imports[0].raw_bytes, second.imports[0].raw_bytes);
+    assert_ne!(first.imports[0].raw_bytes(), second.imports[0].raw_bytes());
 }
 
+/// A manifest the resolver cannot use leaves the import with no cache KEY — the key is derived
+/// from the resolved package — so it is re-analyzed every time and never cached. That has not
+/// changed. What has is the answer: it used to be the package directory's bytes on disk, dressed
+/// up as five compressed sizes. It is Unmeasured now (ADR-0006 §1).
 #[test]
-fn service_does_not_cache_manifest_fallback_results() {
+fn service_reports_an_unusable_manifest_as_unmeasured_and_caches_nothing() {
     let workspace = temp_workspace();
     write_versionless_package(&workspace);
     let service = ImportLensService::new(None, false);
@@ -1924,11 +1945,10 @@ fn service_does_not_cache_manifest_fallback_results() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
     assert!(!second.imports[0].cache_hit);
-    assert!(
-        first.imports[0]
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "manifest_fallback"),
+    assert_eq!(first.imports[0].sizes(), None, "{first:?}");
+    assert_eq!(
+        first.imports[0].unmeasured_stage(),
+        Some("package_manifest"),
         "{first:?}",
     );
 }
@@ -1952,33 +1972,35 @@ fn service_does_not_alias_named_results_to_namespace_cache() {
     assert!(!named.imports[0].cache_hit);
     assert!(!namespace.imports[0].cache_hit);
     assert!(namespace_again.imports[0].cache_hit);
-    assert!(namespace.imports[0].raw_bytes >= named.imports[0].raw_bytes);
+    assert!(namespace.imports[0].raw_bytes() >= named.imports[0].raw_bytes());
 }
 
 #[test]
-fn service_does_not_cache_missing_export_error_results() {
+fn service_caches_a_deterministic_missing_export_failure() {
     let workspace = temp_workspace();
     write_missing_export_effectful_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let named = service.handle_batch(missing_effectful_batch(&workspace, 1, ImportKind::Named));
-    let namespace = service.handle_batch(missing_effectful_batch(
-        &workspace,
-        2,
-        ImportKind::Namespace,
-    ));
+    let first = service.handle_batch(missing_effectful_batch(&workspace, 1, ImportKind::Named));
+    // The SAME request again. A `missing_export` failure is a property of the package's bytes: it
+    // will fail identically every time, so it is cached (ADR-0006, invariant 3) and this second
+    // request must be answered without re-entering the engine.
+    let second = service.handle_batch(missing_effectful_batch(&workspace, 2, ImportKind::Named));
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert!(!named.imports[0].cache_hit);
-    assert!(named.imports[0].error.is_some(), "{named:?}");
-    assert!(
-        named.imports[0]
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "missing_export"),
-        "{named:?}",
+    assert!(!first.imports[0].cache_hit);
+    assert_eq!(first.imports[0].sizes(), None, "{first:?}");
+    assert_eq!(
+        first.imports[0].unmeasured_stage(),
+        Some("missing_export"),
+        "{first:?}",
     );
-    assert!(!namespace.imports[0].cache_hit);
+    assert!(
+        second.imports[0].cache_hit,
+        "a deterministic failure is cached; refusing it would re-enter the engine for a broken \
+         package on every analysis, forever, on one of only two permits: {second:?}",
+    );
+    assert_eq!(second.imports[0].sizes(), None, "{second:?}");
 }
 
 #[test]
@@ -2130,7 +2152,7 @@ fn service_computes_file_size_with_shared_module_deduplication() {
     let summed_raw = batch
         .imports
         .iter()
-        .map(|result| result.raw_bytes)
+        .filter_map(|result| result.raw_bytes())
         .sum::<u64>();
     assert_eq!(file_size.request_id, 23);
     assert_eq!(file_size.error, None);
@@ -2198,7 +2220,11 @@ fn protocol_error_batch_response_rejects_all_imports_without_analysis() {
         Some("hello message not received")
     );
     assert_eq!(response.imports[0].diagnostics[0].stage, "protocol");
-    assert_eq!(response.imports[0].raw_bytes, 0);
+    assert_eq!(
+        response.imports[0].sizes(),
+        None,
+        "a request rejected before any build ran has no size — not a zero"
+    );
 }
 
 #[test]
@@ -2250,5 +2276,58 @@ fn package_json_analysis_includes_cached_registry_hints_when_requested() {
             .as_ref()
             .and_then(|hint| hint.latest_version.as_deref()),
         Some("1.1.0")
+    );
+}
+
+/// A cached DETERMINISTIC failure must expire against the bytes it was derived from — the whole
+/// graph, not just the entry the caller named.
+///
+/// ADR-0006 widened the cache to take a deterministic failure, on the reasoning that it is a
+/// property of the package's bytes and "the cache is keyed by those bytes' fingerprints, so it
+/// expires exactly when the answer would change". That promise is only true if the failure is
+/// fingerprinted against the graph. A first-party workspace package whose entry merely RE-EXPORTS
+/// the module that fails to parse would otherwise serve the cached failure forever after the user
+/// fixed it: nothing the cache was watching moved. The engine reports what it had loaded when it
+/// gave up, and that is what the failure is keyed on.
+#[test]
+fn a_cached_deterministic_failure_expires_when_the_module_that_caused_it_is_fixed() {
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("broken-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("manifest should be written");
+    // The entry is fine. The module it re-exports is not — so a fingerprint set built from the
+    // entry and the manifest alone would never notice the fix below.
+    fs::write(
+        package_root.join("index.js"),
+        "export { value } from './broken.js';\n",
+    )
+    .expect("entry should be written");
+    fs::write(package_root.join("broken.js"), "export const value = ;\n")
+        .expect("broken module should be written");
+
+    let service = ImportLensService::new(None, false);
+    let broken = service.handle_batch(package_batch(&workspace, 1, "broken-lib", "value"));
+
+    assert_eq!(
+        broken.imports[0].sizes(),
+        None,
+        "the premise: a package whose transitive module cannot be parsed has no size",
+    );
+    assert_eq!(broken.imports[0].unmeasured_stage(), Some("parse"));
+
+    // The user fixes the module the entry re-exports. The entry itself never changes.
+    fs::write(package_root.join("broken.js"), "export const value = 1;\n")
+        .expect("fixed module should be written");
+
+    let fixed = service.handle_batch(package_batch(&workspace, 2, "broken-lib", "value"));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(
+        fixed.imports[0].sizes().is_some(),
+        "the cached failure must expire against the module that caused it, not the entry: {fixed:?}",
     );
 }

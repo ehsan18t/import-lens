@@ -17,7 +17,7 @@ use super::ExportEnumeration;
 use super::plugin::{BuildState, ImportLensPlugin};
 use super::{
     BundleArtifact, BundleFailure, BundleRequest, ImportDiagnostic, ImportRuntime,
-    ModuleContribution, diagnostic_stage, entry, stage,
+    ModuleContribution, UncountedAsset, diagnostic_stage, entry, stage,
 };
 use crate::pipeline::node_builtins::{NODE_BUILTIN_MODULES, NODE_PREFIX_ONLY_MODULES};
 use crate::pipeline::resolver::resolve_options as shared_resolve_options;
@@ -36,6 +36,7 @@ impl RolldownEngine {
                 message: "bundle request contains no entries".to_owned(),
                 diagnostics: Vec::new(),
                 loaded_paths: Vec::new(),
+                read_time_fingerprints: Vec::new(),
             });
         };
         let input = InputItem {
@@ -204,7 +205,9 @@ fn translate(
         });
     }
 
+    let uncounted = uncounted_assets(&output, state);
     let mut diagnostics = warning_diagnostics(&output.warnings);
+    diagnostics.extend(uncounted_assets_diagnostic(&uncounted));
     for import in &chunk.imports {
         diagnostics.push(ImportDiagnostic {
             stage: diagnostic_stage::EXTERNAL.to_owned(),
@@ -246,51 +249,120 @@ fn translate(
         exported_names: chunk.exports.iter().map(|name| name.to_string()).collect(),
         diagnostics,
         matched_side_effect_paths: Vec::new(),
+        uncounted_assets: uncounted,
     })
 }
 
-/// The build must produce exactly one JavaScript chunk and nothing else; any
-/// other shape is a typed `output_shape` failure (§7.1).
+/// The build must produce exactly one JavaScript **chunk** (§7.1). More than one means Rolldown
+/// code-split the graph, and we measure a chunk — so a size taken from one of several would
+/// under-report the package by however much is in the others. That is a typed `output_shape`
+/// failure and stays one.
+///
+/// An emitted **asset** is not an output shape failure. The guard used to demand "one chunk and no
+/// assets", which is a rule with no upside: an asset beside the chunk does not make the chunk wrong,
+/// it makes it incomplete, and [`uncounted_assets_diagnostic`] says so without destroying the
+/// measurement. Rolldown 1.1.5 in fact emits no asset for a stylesheet — it fails the build at the
+/// LINK stage, and `plugin.rs` is what handles that (FR-018a) — so today this arm counts only what a
+/// future Rolldown, or a plugin, might emit. It stays because "no assets" is not the invariant; "one
+/// chunk" is.
 fn single_chunk(
     output: &rolldown::BundleOutput,
     state: &BuildState,
 ) -> Result<Arc<OutputChunk>, BundleFailure> {
     let mut chunks = Vec::new();
-    let mut asset_names = Vec::new();
     for item in &output.assets {
-        match item {
-            Output::Chunk(chunk) => chunks.push(Arc::clone(chunk)),
-            Output::Asset(asset) => asset_names.push(asset.filename.to_string()),
+        if let Output::Chunk(chunk) = item {
+            chunks.push(Arc::clone(chunk));
         }
     }
-    if chunks.len() != 1 || !asset_names.is_empty() {
+    if chunks.len() != 1 {
         return Err(BundleFailure {
             stage: stage::OUTPUT_SHAPE.to_owned(),
             message: format!(
-                "expected exactly one chunk and no assets, got {} chunk(s) and {} asset(s){}",
-                chunks.len(),
-                asset_names.len(),
-                if asset_names.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", asset_names.join(", "))
-                }
+                "expected exactly one JavaScript chunk, got {}; a split graph cannot be measured \
+                 from one chunk without under-reporting the rest",
+                chunks.len()
             ),
             diagnostics: warning_diagnostics(&output.warnings),
             loaded_paths: state.sorted_loaded_paths(),
+            read_time_fingerprints: Vec::new(),
         });
     }
     Ok(chunks.remove(0))
 }
 
+/// Every byte this build knows about and did NOT count, named and totalled.
+///
+/// Two sources, because there are two ways a non-JS byte can exist here. The stylesheets the graph
+/// imported, which the plugin linked as empty modules (Rolldown 1.1.5 cannot bundle CSS: left to
+/// it, the whole build fails at the LINK stage). And anything Rolldown itself emitted beside the
+/// chunk — **nothing does today**, CSS included, but the output-shape guard no longer treats one as
+/// fatal, so it must not be silent either.
+///
+/// These bytes ship with the package and are not in the reported size, so the user is owed the
+/// number. See [`diagnostic_stage::UNCOUNTED_ASSETS`] for why disclosing them costs the result its
+/// High confidence rather than being exempted.
+fn uncounted_assets(output: &rolldown::BundleOutput, state: &BuildState) -> Vec<UncountedAsset> {
+    let mut assets = state
+        .sorted_uncounted_assets()
+        .into_iter()
+        .map(|(path, bytes)| UncountedAsset { path, bytes })
+        .collect::<Vec<_>>();
+
+    assets.extend(output.assets.iter().filter_map(|item| match item {
+        Output::Asset(asset) => Some(UncountedAsset {
+            path: PathBuf::from(asset.filename.to_string()),
+            bytes: asset.source.as_bytes().len() as u64,
+        }),
+        Output::Chunk(_) => None,
+    }));
+
+    assets
+}
+
+fn uncounted_assets_diagnostic(assets: &[UncountedAsset]) -> Option<ImportDiagnostic> {
+    if assets.is_empty() {
+        return None;
+    }
+
+    let total_bytes: u64 = assets.iter().map(|asset| asset.bytes).sum();
+    let names = assets
+        .iter()
+        .map(|asset| {
+            asset
+                .path
+                .file_name()
+                .unwrap_or(asset.path.as_os_str())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Some(ImportDiagnostic {
+        stage: diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
+        message: format!(
+            "package ships {} non-JavaScript asset(s) totalling {total_bytes} bytes that this \
+             size does NOT include: {names}",
+            assets.len()
+        ),
+    })
+}
+
 fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> BundleFailure {
     let loaded_paths = state.sorted_loaded_paths();
+    // NOT `loaded_paths`. That set is recorded at `module_parsed`, so the one module it can never
+    // contain is the module that failed to parse — which is precisely the one a cached failure has
+    // to expire against. The read-time map is populated in `load`, before Rolldown parses anything,
+    // so it has every module whose bytes this build actually read.
+    let (read_time_fingerprints, _) = state.read_time_fingerprints();
     if let Some(breach) = state.take_breach() {
         return BundleFailure {
             stage: stage::MODULE_GRAPH_LIMIT.to_owned(),
             message: breach,
             diagnostics: error_diagnostics(&diagnostics),
             loaded_paths,
+            read_time_fingerprints,
         };
     }
 
@@ -314,6 +386,7 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
         message,
         diagnostics: error_diagnostics(&diagnostics),
         loaded_paths,
+        read_time_fingerprints,
     }
 }
 

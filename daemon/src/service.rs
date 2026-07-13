@@ -16,8 +16,8 @@ use crate::{
         AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
         BatchRequest, BatchResponse, CacheListRequest, CacheListResponse, CacheRemoveRequest,
         CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest, CacheStatusResponse,
-        CompleteImportMembersRequest, CompleteImportMembersResponse, ConfidenceLevel,
-        DetectedImport, EnumerateExportsRequest, EnumerateExportsResponse, FileSizeDocumentRequest,
+        CompleteImportMembersRequest, CompleteImportMembersResponse, DetectedImport,
+        EnumerateExportsRequest, EnumerateExportsResponse, FileSizeDocumentRequest,
         FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse, FreshnessKind,
         ImportAnalysisItem, ImportAnalysisStatus, ImportDiagnostic, ImportKind, ImportRequest,
         ImportResult, ImportRuntime, ImportSyntax, PROTOCOL_VERSION,
@@ -821,6 +821,7 @@ impl ImportLensService {
             brotli_bytes: file_size.brotli_bytes,
             zstd_bytes: file_size.zstd_bytes,
             imports,
+            incomplete: file_size.incomplete,
             error: file_size.error,
             diagnostics: file_size.diagnostics,
         }
@@ -2454,12 +2455,10 @@ impl ImportLensService {
 
         crate::logging::log_debug("file_size_cache", format!("miss: {}", path.display()));
         let computed = compute_file_size(context, imports);
-        // The same gate the import cache applies (`should_cache_result`), one level up: a
-        // combined build that parked and degraded this file's totals to a conservative sum must
-        // not be served as the file's size for the next 30 seconds.
-        if computed.is_cacheable() {
-            cache.insert(path, signature, computed.clone());
-        }
+        // Offered unconditionally: `FileSizeCache::insert` refuses a total that is not a
+        // measurement of the file (a floor, or one a parked combined build degraded). The gate is
+        // the store's, so it cannot be forgotten here or at the next call site added.
+        cache.insert(path, signature, computed.clone());
         computed
     }
 
@@ -2752,26 +2751,24 @@ fn file_size_document_prelude(
     Ok((context, detected))
 }
 
-/// Whether a result is a measurement, and so may be written to the import cache.
+/// Whether a result may be written to the import cache (ADR-0006, invariant 3).
 ///
-/// Two things disqualify it. An `error` — as before: a failed analysis is not a size. And a
-/// **transient engine failure**, which is new, and is the defect that has bitten this design
-/// three times: a build that timed out, unwound, or lost its runtime degrades to a static entry
-/// size that carries `error: None` and a perfectly plausible byte count. Cache that once and a
-/// healthy 17,550-byte package reports 58 bytes for the rest of the cache generation — from a
-/// scheduling accident that says nothing whatever about the package.
+/// A **pre-check**, not the gate. The gate is `ImportResult::is_durable`, and it lives inside the
+/// stores themselves (`ImportCache::insert*`, `DiskCache::insert*`) — because a predicate a caller
+/// must remember to call is exactly the shape of every defect this model exists to end. This
+/// function is here to spare the work a refused insert would waste (the dependency fingerprints),
+/// and it asks the store's own question so the two can never disagree.
 ///
-/// The stage is the evidence: the static fallback records the failure's own stage in its
-/// diagnostics (`engine_fallback_diagnostic`), and so does the full-package comparison, whose
-/// `truly_treeshakeable: false` is just as fabricated when the build that would have disproved it
-/// merely parked. A DETERMINISTIC failure (`parse`, `link`, `module_graph_limit`, …) is still
-/// cached: it is a fact about the code, and re-running it costs a build to learn the same thing.
+/// What is cached: a Measured result, and an Unmeasured one whose stage is a property of the
+/// package's **bytes** (`parse`, `link`, `oversized_entry`, an unreadable manifest, an unresolvable
+/// entry). The cache is keyed by those bytes' fingerprints, so such a fact expires exactly when it
+/// would change — and refusing it would re-enter the engine for a broken package on *every*
+/// analysis, forever, on one of only two permits.
+///
+/// What is not: a transient outcome, an IO condition (`entry_metadata`), and any stage nobody has
+/// classified. See `pipeline::stage::may_enter_a_durable_store`.
 fn should_cache_result(result: &ImportResult) -> bool {
-    result.error.is_none()
-        && !result
-            .diagnostics
-            .iter()
-            .any(|item| crate::engine::stage::is_transient(&item.stage))
+    result.is_durable()
 }
 
 fn cache_read_mode_label(serve_stale: bool, intent: ReadIntent) -> &'static str {
@@ -3067,9 +3064,11 @@ pub fn protocol_error_file_size_response(
             .iter()
             .map(|item| protocol_error(item, message.clone()))
             .collect(),
+        // Nothing was summed at all; `error` is the answer.
+        incomplete: false,
         error: Some(message.clone()),
         diagnostics: vec![ImportDiagnostic {
-            stage: "protocol".to_owned(),
+            stage: crate::pipeline::stage::PROTOCOL.to_owned(),
             message,
             details: Vec::new(),
         }],
@@ -3077,32 +3076,15 @@ pub fn protocol_error_file_size_response(
 }
 
 fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
-    ImportResult {
-        freshness: crate::ipc::protocol::ResultFreshness::fresh(),
-        specifier: request.specifier.clone(),
-        raw_bytes: 0,
-        minified_bytes: 0,
-        gzip_bytes: 0,
-        brotli_bytes: 0,
-        zstd_bytes: 0,
-        cache_hit: false,
-        side_effects: true,
-        truly_treeshakeable: false,
-        is_cjs: false,
-        confidence: ConfidenceLevel::Low,
-        confidence_reasons: vec![
-            "Protocol validation failed before a bundle size could be measured.".to_owned(),
-        ],
-        error: Some(message.clone()),
-        diagnostics: vec![ImportDiagnostic {
-            stage: "protocol".to_owned(),
-            message,
-            details: vec![format!("specifier: {}", request.specifier)],
-        }],
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    }
+    let mut result = ImportResult::unmeasured(
+        request.specifier.clone(),
+        crate::pipeline::stage::PROTOCOL,
+        message,
+        vec![format!("specifier: {}", request.specifier)],
+    );
+    result.confidence_reasons =
+        vec!["Protocol validation failed before a bundle size could be measured.".to_owned()];
+    result
 }
 
 #[cfg(test)]
@@ -3229,7 +3211,7 @@ mod analyze_and_cache_single_flight_tests {
     use super::{ComputedAnalysis, ImportLensService};
     use crate::cache::key::cache_key_for_resolved_import;
     use crate::ipc::protocol::{
-        ConfidenceLevel, ImportKind, ImportRequest, ImportResult, ImportRuntime, ResultFreshness,
+        ConfidenceLevel, ImportKind, ImportRequest, ImportResult, ImportRuntime, MeasuredSizes,
     };
     use crate::pipeline::analyze::AnalysisContext;
     use crate::pipeline::resolver::{ResolvedPackage, SideEffectsMode};
@@ -3240,26 +3222,19 @@ mod analyze_and_cache_single_flight_tests {
     };
 
     fn cacheable_result(specifier: &str) -> ImportResult {
-        ImportResult {
-            specifier: specifier.to_owned(),
-            raw_bytes: 42,
-            minified_bytes: 21,
-            gzip_bytes: 10,
-            brotli_bytes: 8,
-            zstd_bytes: 9,
-            cache_hit: false,
-            side_effects: true,
-            truly_treeshakeable: false,
-            is_cjs: false,
-            confidence: ConfidenceLevel::High,
-            confidence_reasons: Vec::new(),
-            error: None,
-            diagnostics: Vec::new(),
-            module_breakdown: None,
-            shared_bytes: None,
-            freshness: ResultFreshness::fresh(),
-            internal_contributions: Vec::new(),
-        }
+        let mut result = ImportResult::measured(
+            specifier,
+            MeasuredSizes {
+                raw_bytes: 42,
+                minified_bytes: 21,
+                gzip_bytes: 10,
+                brotli_bytes: 8,
+                zstd_bytes: 9,
+            },
+        );
+        result.side_effects = true;
+        result.confidence = ConfidenceLevel::High;
+        result
     }
 
     fn wait_until_released(pair: &(Mutex<bool>, Condvar)) {
@@ -3377,100 +3352,329 @@ mod analyze_and_cache_single_flight_tests {
     }
 }
 
-/// The defect that has bitten this design three rounds running: a build that failed for reasons
-/// that have nothing to do with the package still produces a result the cache is happy to store.
+/// **Property** over every durable store the daemon writes, quantified over **every** stage the
+/// daemon can produce that is not a property of the package's bytes.
+///
+/// It quantifies over the STORES: it hands each one a real result and then asks the store what it
+/// kept. The previous version quantified over two *predicates* (`should_cache_result`,
+/// `FileSizeComputation::is_cacheable`) — and the stores themselves had no gate at all:
+/// `ImportCache::insert`, `DiskCache::insert_at_generation` and `FileSizeCache::insert` took
+/// anything they were given. It proved that two functions returned `false`, not that a transient
+/// result could not be written down, and the next caller who forgot to consult them would have
+/// written one with nothing failing. The gate now lives in each store; this proves it is there.
+///
+/// The daemon's four *build-derived* stores — `pipeline::full_package`, `pipeline::export_list`,
+/// `pipeline::build_memo` and `engine::dependency_paths` — are absent on purpose: none of them can
+/// be handed an `ImportResult` at all. Their only input is a `BundleArtifact` / `ExportEnumeration`,
+/// which exists solely on the `Ok` side of a build, so a failure of any kind is unrepresentable
+/// there rather than merely refused. `scripts/test/result-model-guards.test.mjs` fails if anyone
+/// plumbs a result into one of them.
+///
+/// The extension's two persisted histories (`workspaceState` / `globalState`) are the same property
+/// in TypeScript: `extension/test/analysis/transience.test.ts`.
 #[cfg(test)]
-mod transient_failures_are_not_cacheable_tests {
+mod every_durable_store_rejects_a_non_durable_outcome {
     use super::should_cache_result;
+    use crate::cache::disk::DiskCache;
+    use crate::cache::key::FileFingerprint;
+    use crate::cache::memory::{CachedImport, ImportCache};
     use crate::engine::stage;
-    use crate::ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportResult, ResultFreshness};
-    use crate::pipeline::file_size::FileSizeComputation;
+    use crate::ipc::protocol::{
+        ImportDiagnostic, ImportKind, ImportRequest, ImportResult, ImportRuntime, MeasuredSizes,
+    };
+    use crate::pipeline::file_size::{
+        FileSizeComputation, SizedImport, per_import_totals_for_test,
+    };
+    use crate::pipeline::file_size_cache::FileSizeCache;
+    use crate::pipeline::stage as pipeline_stage;
+    use std::path::PathBuf;
 
-    /// The exact shape the pipeline produces when an engine build fails and it falls back to
-    /// sizing the entry file alone: a plausible byte count, `error: None`, low confidence, and a
-    /// diagnostic naming the stage it failed at.
-    fn static_fallback(stage: &str) -> ImportResult {
-        ImportResult {
-            specifier: "healthy-lib".to_owned(),
-            raw_bytes: 58,
-            minified_bytes: 58,
-            gzip_bytes: 58,
-            brotli_bytes: 58,
-            zstd_bytes: 58,
-            cache_hit: false,
-            side_effects: false,
-            truly_treeshakeable: false,
-            is_cjs: false,
-            confidence: ConfidenceLevel::Low,
-            confidence_reasons: vec!["Static entry sizing is a fallback.".to_owned()],
-            error: None,
-            diagnostics: vec![ImportDiagnostic {
-                stage: stage.to_owned(),
-                message: "Rolldown engine analysis failed; using static entry sizing".to_owned(),
-                details: Vec::new(),
-            }],
-            module_breakdown: None,
-            shared_bytes: None,
-            freshness: ResultFreshness::fresh(),
-            internal_contributions: Vec::new(),
+    /// Every stage a durable store must REFUSE: the three transient engine stages, plus the ones
+    /// that are transient in fact without being the engine's (`entry_metadata` — a bare
+    /// `fs::metadata` failure — and `compression`). DERIVED from the allowlist rather than restated
+    /// beside it, so a stage that changes classification changes this list with it.
+    fn non_durable_stages() -> Vec<&'static str> {
+        stage::ALL
+            .iter()
+            .chain(pipeline_stage::ALL.iter())
+            .copied()
+            .filter(|candidate| !pipeline_stage::may_enter_a_durable_store(candidate))
+            .collect()
+    }
+
+    /// The engine failure stages that ARE a property of the package's bytes.
+    fn durable_failure_stages() -> Vec<&'static str> {
+        stage::ALL
+            .iter()
+            .copied()
+            .filter(|candidate| pipeline_stage::may_enter_a_durable_store(candidate))
+            .collect()
+    }
+
+    fn measured(specifier: &str, bytes: u64) -> ImportResult {
+        ImportResult::measured(
+            specifier,
+            MeasuredSizes {
+                raw_bytes: bytes,
+                minified_bytes: bytes,
+                gzip_bytes: bytes,
+                brotli_bytes: bytes,
+                zstd_bytes: bytes,
+            },
+        )
+    }
+
+    fn request(specifier: &str) -> ImportRequest {
+        ImportRequest {
+            specifier: specifier.to_owned(),
+            package_name: specifier.to_owned(),
+            version: "1.0.0".to_owned(),
+            named: Vec::new(),
+            import_kind: ImportKind::Namespace,
+            runtime: ImportRuntime::Component,
         }
     }
 
-    /// A timeout says the daemon was busy or the bundler parked; a panic says the bundler broke;
-    /// `engine_gone` says the runtime went away. None of them says the package weighs 58 bytes.
-    /// Caching that number makes a scheduling accident permanent for a whole cache generation —
-    /// the failure the request budget's degraded results shipped last round.
+    /// The L2 envelope around a result, exactly as `ImportCache` builds one.
+    fn cached(result: ImportResult) -> CachedImport {
+        use std::sync::{Arc, atomic::AtomicU64};
+
+        CachedImport {
+            result,
+            dependency_fingerprints: Vec::new(),
+            verified_generation: 0,
+            verified_at: None,
+            first_party: false,
+            last_seq: Arc::new(AtomicU64::new(1)),
+            persisted_seq: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// The L1 file-size aggregate, built the way the real fallback builds it — from per-import
+    /// results — rather than hand-assembled. A hand-assembled `FileSizeComputation` cannot see the
+    /// defect ADR-0006 invariant 4 names, because the bug is in how a result is *turned into* a
+    /// total.
+    fn file_total(results: Vec<(&str, ImportResult)>) -> FileSizeComputation {
+        let sized = results
+            .into_iter()
+            .map(|(specifier, result)| SizedImport {
+                request: request(specifier),
+                result: Some(result),
+            })
+            .collect::<Vec<_>>();
+        per_import_totals_for_test(&sized)
+    }
+
+    /// **The L1 import cache.** Not "the predicate the caller should have used" — the store.
     #[test]
-    fn a_transiently_degraded_result_is_never_written_to_the_cache() {
-        for stage in [stage::TIMEOUT, stage::PANIC, stage::ENGINE_GONE] {
+    fn the_l1_import_cache_refuses_a_non_durable_result() {
+        for stage in non_durable_stages() {
+            let cache = ImportCache::new(None, false);
+            let key = format!("v4:healthy-lib:{stage}");
+            let result =
+                ImportResult::unmeasured("healthy-lib", stage, "build did not finish", vec![]);
+
             assert!(
-                !should_cache_result(&static_fallback(stage)),
-                "a `{stage}` fallback carries error: None and a fabricated size; caching it is \
-                 how a healthy package comes to report 58 bytes"
+                result.sizes().is_none(),
+                "`{stage}`: the premise — there is no size to store in the first place"
+            );
+            assert!(!should_cache_result(&result), "`{stage}`");
+
+            cache.insert(key.clone(), result);
+            assert!(
+                cache.get(&key).is_none(),
+                "`{stage}` says nothing about the package's bytes; the L1 store must keep nothing"
             );
         }
     }
 
-    /// The other half, and the reason the gate reads the stage rather than the confidence: a
-    /// DETERMINISTIC failure is a fact about the code. Re-running it costs a full build to learn
-    /// exactly the same thing, so it is cached, exactly as before.
+    /// **The L1 import cache, the other transient shape**: a build that SUCCEEDED, whose
+    /// full-package comparison build then failed transiently. Its sizes are real; its
+    /// `truly_treeshakeable: false` is fabricated by the same accident, and caching it marks a
+    /// healthy package "not tree-shakeable" for a whole cache generation.
+    ///
+    /// This shape is REPRESENTABLE — a real state, deliberately kept — so the STORE is what must
+    /// refuse it.
     #[test]
-    fn a_deterministic_failure_is_still_cached() {
-        for stage in [
+    fn the_l1_import_cache_refuses_a_measurement_whose_comparison_build_degraded_transiently() {
+        for stage in stage::ALL
+            .iter()
+            .copied()
+            .filter(|candidate| stage::is_transient(candidate))
+        {
+            let cache = ImportCache::new(None, false);
+            let key = format!("v4:healthy-lib:comparison:{stage}");
+            let mut result = measured("healthy-lib", 17_550);
+            result.diagnostics.push(ImportDiagnostic::for_stage(
+                stage,
+                "full-package comparison build failed; treating as not tree-shakeable",
+            ));
+
+            assert!(
+                result.sizes().is_some(),
+                "`{stage}`: the premise — this one really was measured"
+            );
+            assert!(!should_cache_result(&result), "`{stage}`");
+
+            cache.insert(key.clone(), result);
+            assert!(
+                cache.get(&key).is_none(),
+                "`{stage}`: real sizes, but a tree-shaking verdict that is a scheduling accident"
+            );
+        }
+    }
+
+    /// **The L2 disk cache.** A store in its own right, and the worst one to poison: it outlives the
+    /// process. Gated independently of the L1 cache in front of it, so "the caller already checked"
+    /// is load-bearing nowhere.
+    #[test]
+    fn the_l2_disk_cache_refuses_a_non_durable_result() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-durable-l2-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let disk = DiskCache::new(Some(dir.clone()), true);
+
+        for stage in non_durable_stages() {
+            let key = format!("v4:healthy-lib:{stage}");
+            let entry = cached(ImportResult::unmeasured(
+                "healthy-lib",
+                stage,
+                "build did not finish",
+                vec![],
+            ));
+
+            disk.insert(&key, &entry)
+                .expect("a refusal is a no-op, never an Err — an Err would mark the key dirty");
+            disk.flush_pending_inserts();
+
+            assert!(
+                disk.get(&key).is_none(),
+                "`{stage}`: L2 outlives the process; a scheduling accident must not"
+            );
+        }
+
+        // Control: the store is not simply broken. A deterministic failure IS persisted — it is a
+        // property of the package's bytes, and the entry expires with them.
+        let entry = cached(ImportResult::unmeasured(
+            "broken-lib",
             stage::PARSE,
-            stage::LINK,
-            stage::MODULE_GRAPH_LIMIT,
-            stage::OUTPUT_SHAPE,
-        ] {
-            assert!(
-                should_cache_result(&static_fallback(stage)),
-                "a `{stage}` failure will happen again next time; withholding it from the cache \
-                 buys a rebuild and no correctness"
-            );
-        }
+            "unexpected token",
+            vec![],
+        ));
+        disk.insert("v4:broken-lib:parse", &entry)
+            .expect("enqueue a deterministic failure");
+        disk.flush_pending_inserts();
+        assert!(
+            disk.get("v4:broken-lib:parse").is_some(),
+            "a deterministic failure is a fact about the package and IS persisted (invariant 3)"
+        );
+
+        drop(disk);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A file's totals degrade the same way — a combined build that parked leaves a conservative
-    /// per-import sum, and the L1 file-size cache would serve it for the whole TTL.
+    /// **The L1 file-size aggregate.** Quantified over every non-durable stage, over every DURABLE
+    /// one, and over the state no stage describes at all — an import still being measured — because
+    /// invariant 4 is about the total's INPUTS, not about anything having failed.
     #[test]
-    fn a_transiently_degraded_file_total_is_never_written_to_the_l1_cache() {
-        let degraded = |stage: &str| FileSizeComputation {
-            raw_bytes: 58,
-            error: None,
-            diagnostics: vec![ImportDiagnostic {
-                stage: stage.to_owned(),
-                message: "combined file-size build failed for this runtime".to_owned(),
-                details: Vec::new(),
-            }],
-            ..FileSizeComputation::default()
-        };
+    fn the_l1_file_size_cache_refuses_a_floor() {
+        let path = PathBuf::from("C:/ws/src/index.ts");
 
-        assert!(!degraded(stage::TIMEOUT).is_cacheable());
-        assert!(!degraded(stage::PANIC).is_cacheable());
+        for stage in non_durable_stages() {
+            let cache = FileSizeCache::new();
+            let total = file_total(vec![
+                ("alpha", measured("alpha", 100)),
+                (
+                    "beta",
+                    ImportResult::unmeasured("beta", stage, "no", vec![]),
+                ),
+            ]);
+
+            assert!(
+                total.incomplete,
+                "`{stage}`: an import contributed no bytes"
+            );
+            cache.insert(path.clone(), 1, total);
+            assert!(
+                cache.get(&path, 1).is_none(),
+                "`{stage}`: a floor served as the file's size for the whole 30s TTL"
+            );
+        }
+
+        // **The seventh instance.** A DETERMINISTIC failure is cached as a per-import fact
+        // (invariant 3) and STILL makes the file's total a floor (invariant 4). The two invariants
+        // are about different things, and conflating them is what this test was blind to: the total
+        // was cached, persisted as the file's permanent baseline, and passed by CI with exit 0.
+        for stage in durable_failure_stages() {
+            let cache = FileSizeCache::new();
+            let result = ImportResult::unmeasured("beta", stage, "no matching export", vec![]);
+            assert!(
+                should_cache_result(&result),
+                "`{stage}`: the per-import failure IS cached — it is a fact about the bytes"
+            );
+
+            let total = file_total(vec![("alpha", measured("alpha", 100)), ("beta", result)]);
+            assert!(
+                total.incomplete,
+                "`{stage}`: beta contributed no bytes, so the file's total is a FLOOR"
+            );
+            cache.insert(path.clone(), 1, total);
+            assert!(
+                cache.get(&path, 1).is_none(),
+                "`{stage}`: deterministically unknown is still unknown, and a floor is never cached"
+            );
+        }
+
+        // And the state no stage describes: an import whose own build has not landed yet.
+        let cache = FileSizeCache::new();
+        let loading = per_import_totals_for_test(&[
+            SizedImport {
+                request: request("alpha"),
+                result: Some(measured("alpha", 100)),
+            },
+            SizedImport {
+                request: request("beta"),
+                result: None,
+            },
+        ]);
+        assert!(loading.incomplete);
+        cache.insert(path.clone(), 1, loading);
+        assert!(cache.get(&path, 1).is_none());
+
+        // Control: every import measured — this really IS the file, and it must still cache.
+        let cache = FileSizeCache::new();
+        let complete = file_total(vec![
+            ("alpha", measured("alpha", 100)),
+            ("beta", measured("beta", 20)),
+        ]);
+        assert!(!complete.incomplete);
+        cache.insert(path.clone(), 1, complete);
         assert!(
-            degraded("minify").is_cacheable(),
-            "a minify failure is deterministic; it is cached like any other real answer"
+            cache.get(&path, 1).is_some(),
+            "a total whose every input was measured is the file's size, and is cached"
         );
-        assert!(FileSizeComputation::default().is_cacheable());
+    }
+
+    /// The other half, and the owner's decision: a DETERMINISTIC per-import outcome IS cached, sizes
+    /// or no sizes. It is a property of the package's bytes, the cache is keyed by those bytes'
+    /// fingerprints, and refusing it would re-enter the engine for a broken package on every
+    /// analysis, forever, on one of only two permits.
+    #[test]
+    fn the_l1_import_cache_still_keeps_every_deterministic_outcome() {
+        for stage in durable_failure_stages() {
+            let cache = ImportCache::new(None, false);
+            let key = format!("v4:broken-lib:{stage}");
+            let result =
+                ImportResult::unmeasured("broken-lib", stage, "no matching export", vec![]);
+
+            cache.insert_with_fingerprints(key.clone(), result, Vec::<FileFingerprint>::new());
+            assert!(
+                cache.get(&key).is_some(),
+                "`{stage}` will happen again next time; withholding it buys a rebuild and no \
+                 correctness"
+            );
+        }
     }
 }

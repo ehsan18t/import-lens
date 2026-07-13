@@ -56,6 +56,18 @@ pub struct ModuleContribution {
     pub rendered_bytes: usize,
 }
 
+/// A non-JavaScript module the graph imported: real bytes that ship with the package and are NOT
+/// in the measured size, because the measured size is the JavaScript chunk.
+///
+/// Almost always a stylesheet. Rolldown 1.1.5 cannot bundle CSS at all, so the plugin links it as
+/// an empty module and records it here; disclosing it is the honest alternative to counting bytes
+/// the bundler never rendered, or to failing the build and reporting nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncountedAsset {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportDiagnostic {
     pub stage: String,
@@ -82,6 +94,9 @@ pub struct BundleArtifact {
     pub exported_names: Vec<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
     pub matched_side_effect_paths: Vec<PathBuf>,
+    /// Bytes this size does NOT include (see [`UncountedAsset`]). Already summarized into a
+    /// `uncounted_assets` diagnostic; kept structured so a future surface can show them.
+    pub uncounted_assets: Vec<UncountedAsset>,
 }
 
 /// The result of export enumeration (§8.4).
@@ -154,15 +169,20 @@ pub mod stage {
     /// A `parse`/`link`/`resolve`/`output_shape`/`module_graph_limit` failure is a property of
     /// the code being measured: it will fail the same way next time, so the degraded result it
     /// produces is worth caching. These three are not. A build that was cancelled at the
-    /// deadline, unwound, or lost its runtime tells us nothing about the package — and the
-    /// static fallback the pipeline substitutes carries `error: None` and a plausible-looking
-    /// byte count, which is exactly the shape a cache happily stores. Store it once and a
-    /// healthy 17 KB package reports its 58-byte barrel for a whole cache generation.
+    /// deadline, unwound, or lost its runtime tells us nothing about the package, so storing what
+    /// it produced makes a scheduling accident durable — and durable is forever, next to a build
+    /// that would have succeeded on the retry nobody will now run.
     ///
-    /// So every cache and memo the daemon writes gates on this: see
-    /// `crate::service::should_cache_result` for the per-import caches, and
-    /// [`crate::pipeline::file_size::FileSizeComputation::is_cacheable`] for the L1 aggregate,
-    /// which must additionally refuse a total that summed an import nobody had measured yet.
+    /// This is the ENGINE's list, and it is not by itself the cache gate: a stage can be transient
+    /// in fact without being an engine stage at all (`pipeline::stage::ENTRY_METADATA` is
+    /// `fs::metadata` failing). The gate is the allowlist in
+    /// `crate::pipeline::stage::may_enter_a_durable_store`, which every store applies through
+    /// [`crate::ipc::protocol::ImportResult::is_durable`]; the L1 aggregate additionally refuses a
+    /// total that summed an import nobody had measured
+    /// ([`crate::pipeline::file_size::FileSizeComputation::is_cacheable`]).
+    ///
+    /// The list is mirrored in the extension and the CLI, which cannot import it, under a drift
+    /// check (`scripts/test/engine-stage-coordination.test.mjs`).
     pub fn is_transient(stage: &str) -> bool {
         matches!(stage, TIMEOUT | PANIC | ENGINE_GONE)
     }
@@ -180,6 +200,29 @@ pub mod diagnostic_stage {
     /// The package declares `sideEffects` as an array and the matched paths are not
     /// recoverable from public bundler metadata, so confidence stays conservative.
     pub const SIDE_EFFECTS: &str = "side_effects";
+    /// Bytes the graph pulled in that are NOT in the measured chunk — a stylesheet, almost always.
+    ///
+    /// The build **succeeds**. The size we report is the JS chunk, measured exactly; these bytes
+    /// ship with the package and are not in it.
+    ///
+    /// The mechanism is the **plugin**, not the output shape. Rolldown 1.1.5 does not emit a CSS
+    /// asset — it refuses the build outright at the LINK stage (`UNSUPPORTED_FEATURE: Bundling CSS
+    /// is no longer supported`), so every CSS-shipping package (swiper, react-datepicker,
+    /// react-toastify, most UI kits) was `unmeasured_stage: Some("link")` and nobody saw it,
+    /// because a failed build silently became a fabricated size. `plugin.rs` links the stylesheet
+    /// as `ModuleType::Empty` and records its bytes here instead. (The earlier account of this —
+    /// that a `.css` module became an emitted asset and the adapter's "no assets" guard then failed
+    /// the build — was wrong: neutering `is_stylesheet` and running the build produces a link
+    /// failure, never an asset.)
+    ///
+    /// **Confidence: an asset-emitting package is Medium by design.** It is not exempted as
+    /// "disclosure only". A number that omits bytes the user's bundle really will carry is not a
+    /// High-confidence measurement of that package's cost, and claiming otherwise is the same
+    /// overclaim — one order of magnitude smaller — that this whole model exists to stop. It is
+    /// also what the `external` diagnostic beside it already does for the same reason. Medium
+    /// carries no `~` prefix in the UI (that is reserved for Low), so a correctly-measured CSS
+    /// package reads as a plain number with a stated caveat, which is exactly what it is.
+    pub const UNCOUNTED_ASSETS: &str = "uncounted_assets";
 }
 
 /// `stage` is one of [`stage::ALL`].
@@ -188,5 +231,15 @@ pub struct BundleFailure {
     pub stage: String,
     pub message: String,
     pub diagnostics: Vec<ImportDiagnostic>,
+    /// Modules that PARSED before the build gave up. Recorded at `module_parsed`, which is why it
+    /// is not the right freshness set for a failure: the one module it can never contain is the one
+    /// that broke.
     pub loaded_paths: Vec<PathBuf>,
+    /// Fingerprints of every module whose bytes this build READ, captured in the plugin's `load`
+    /// hook — so unlike `loaded_paths` this DOES include the module that failed to parse.
+    ///
+    /// A deterministic failure is cached (ADR-0006, invariant 3), and a cached fact must expire
+    /// when the fact would change. These are the bytes the failure was derived from, so these are
+    /// what it expires against. Empty for a failure that never entered the engine.
+    pub read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
 }

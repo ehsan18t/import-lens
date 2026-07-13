@@ -72,7 +72,26 @@ impl FileSizeCache {
         Some(entry.computation.clone())
     }
 
+    /// Store a file's totals — **if they are the file's totals**.
+    ///
+    /// The gate is here, in the store (ADR-0006, invariants 3 and 4). A floor — a total missing an
+    /// import that was Loading or Unmeasured — is a real number and not this file's, and a 30-second
+    /// TTL is long enough for it to become the file's reported size, its persisted baseline, and its
+    /// CI verdict. Refusing at the insert means a future caller cannot reintroduce that by
+    /// forgetting a predicate.
     pub fn insert(&self, path: PathBuf, signature: u64, computation: FileSizeComputation) {
+        if !computation.is_cacheable() {
+            crate::logging::log_debug(
+                "file_size_cache",
+                format!(
+                    "refusing to cache a non-measurement for {} (incomplete: {})",
+                    path.display(),
+                    computation.incomplete
+                ),
+            );
+            return;
+        }
+
         let pinned = self.entries.pin();
         let now = crate::time::unix_millis_now();
         pinned.insert(

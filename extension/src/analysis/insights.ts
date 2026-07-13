@@ -1,5 +1,5 @@
 import path from "node:path";
-import { formatBytes } from "../ui/format.js";
+import { formatBytes, measuredSizes } from "../ui/format.js";
 import { budgetInsightForState, type ImportLensBudgets } from "./budgets.js";
 import {
   type ImportCostHistoryItem,
@@ -24,7 +24,9 @@ export const applyImportAnalysisInsights = (
   const sharedModules = sharedModuleIndex(states);
 
   return states.map((state) => {
-    if (state.status !== "ready" || !state.result || state.result.error) {
+    // Every insight below is a claim about a size — a delta, a budget, a trend, a share. An
+    // import with no size supports none of them, and the guard asks exactly that.
+    if (state.status !== "ready" || !measuredSizes(state.result)) {
       return state;
     }
 
@@ -65,11 +67,12 @@ export const insightLabelSuffix = (
 /**
  * The rows a document's states contribute to the PERSISTED import-cost history.
  *
- * `isDurableImportResult` is the whole reason this is a filter and not a map: a result a transient
- * engine failure degraded carries `error: null` and a plausible size, and the history keeps one row
- * per import identity with no TTL and no cache generation — so recording one does not go stale, it
- * overwrites that import's real baseline permanently, and every later trend ("was 17 KB, now 58 B")
- * is measured against a number that never happened.
+ * `isDurableImportResult` is the whole reason this is a filter and not a map. The history keeps one
+ * row per import identity, with no TTL and no cache generation, so a row that should not be there
+ * does not merely go stale — it overwrites that import's real baseline permanently, and every later
+ * trend ("was 17 KB, now 58 B") is measured against a number that never happened. Two results must
+ * be refused: one with no size (nothing to record), and one whose measurement was degraded by a
+ * transient failure of the daemon rather than a fact about the package.
  */
 export const importCostHistoryItemsForStates = (
   states: readonly ImportAnalysisState[],
@@ -82,13 +85,23 @@ export const importCostHistoryItemsForStates = (
       ): state is ImportAnalysisState & { result: NonNullable<ImportAnalysisState["result"]> } =>
         state.status === "ready" && isDurableImportResult(state.result),
     )
-    .map((state) => importCostHistoryItem(state.detected, state.result, now));
+    .map((state) => importCostHistoryItem(state.detected, state.result, now))
+    .filter((item): item is ImportCostHistoryItem => item !== undefined);
 
+/**
+ * "This import adds N bytes to your working-tree change."
+ *
+ * It guarded `!state.result` and not the SIZE, so an import with no size rendered
+ * **"+NaN kB br"** — `formatBytes(undefined)` all the way to the CodeLens. Now it simply does not
+ * claim a delta it cannot compute.
+ */
 const gitDeltaInsight = (
   state: ImportAnalysisState,
   changedLines: ReadonlySet<number> | undefined,
 ): ImportAnalysisInsight | null => {
-  if (!changedLines || changedLines.size === 0 || !state.result) {
+  const sizes = measuredSizes(state.result);
+
+  if (!changedLines || changedLines.size === 0 || !sizes) {
     return null;
   }
 
@@ -99,8 +112,8 @@ const gitDeltaInsight = (
   ) {
     if (changedLines.has(line)) {
       return {
-        label: `+${formatBytes(state.result.brotli_bytes)} br`,
-        tooltip: `Working-tree change: this import currently adds ${formatBytes(state.result.brotli_bytes)} brotli.`,
+        label: `+${formatBytes(sizes.brotli_bytes)} br`,
+        tooltip: `Working-tree change: this import currently adds ${formatBytes(sizes.brotli_bytes)} brotli.`,
       };
     }
   }
@@ -148,7 +161,7 @@ const sharedDependencyInsight = (
 };
 
 const barrelReexportInsight = (state: ImportAnalysisState): ImportAnalysisInsight | null => {
-  if (state.detected.syntax !== "star_reexport" || !state.result || state.result.error) {
+  if (state.detected.syntax !== "star_reexport" || !measuredSizes(state.result)) {
     return null;
   }
 
@@ -158,12 +171,22 @@ const barrelReexportInsight = (state: ImportAnalysisState): ImportAnalysisInsigh
   };
 };
 
+/**
+ * "This import was 17 kB last time; it is 2.5 kB now."
+ *
+ * Two bugs, one gate. It guarded `!state.result` and not the size, so it rendered
+ * **"was 17.5 kB br, now NaN kB br"**. And it computed a delta between a DURABLE baseline and a
+ * *degraded* current result — inventing a regression, or a win, that never happened. A trend is a
+ * comparison of two measurements, so it needs two (ADR-0006, invariant 4).
+ */
 const historyTrendInsight = (
   state: ImportAnalysisState,
   history: readonly ImportCostHistoryItem[],
   now: number | undefined,
 ): ImportAnalysisInsight | null => {
-  if (!state.result) {
+  const result = state.result;
+
+  if (!result || !measuredSizes(result)) {
     return null;
   }
 
@@ -172,7 +195,11 @@ const historyTrendInsight = (
     return null;
   }
 
-  const current = importCostHistoryItem(state.detected, state.result, now);
+  const current = importCostHistoryItem(state.detected, result, now);
+  if (!current) {
+    return null;
+  }
+
   const delta = current.brotliBytes - previous.brotliBytes;
 
   if (delta === 0) {
@@ -188,11 +215,11 @@ const sharedModuleIndex = (states: readonly ImportAnalysisState[]): Map<string, 
   const modules = new Map<string, Set<string>>();
 
   for (const state of states) {
-    if (state.status !== "ready" || !state.result || state.result.error) {
+    if (state.status !== "ready" || !measuredSizes(state.result)) {
       continue;
     }
 
-    for (const module of state.result.module_breakdown ?? []) {
+    for (const module of state.result?.module_breakdown ?? []) {
       const specifiers = modules.get(module.path) ?? new Set<string>();
       specifiers.add(state.detected.specifier);
       modules.set(module.path, specifiers);

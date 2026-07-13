@@ -1,15 +1,15 @@
 use crate::{
     engine::{dependency_paths::record_loaded_paths, limits::MAX_MODULE_SOURCE_BYTES},
     ipc::protocol::{
-        ConfidenceLevel, ImportDiagnostic, ImportKind, ImportRequest, ImportResult,
-        ModuleContribution, ResultFreshness,
+        ConfidenceLevel, ImportDiagnostic, ImportKind, ImportRequest, ImportResult, MeasuredSizes,
+        ModuleContribution,
     },
     pipeline::{
         compress::compress_all,
-        fallback::{approximate_directory_size, estimate_minified_source, source_excerpt_detail},
+        fallback::source_excerpt_detail,
         full_package,
         minify::minify_source,
-        resolver::{ResolvedPackage, SideEffectsMode, find_package_root, resolve_package_entry},
+        resolver::{ResolvedPackage, SideEffectsMode, resolve_package_entry},
         types_only::declaration_only_package_result,
     },
 };
@@ -37,6 +37,19 @@ pub struct AnalysisError {
     stage: &'static str,
     message: String,
     details: Vec<String>,
+    /// Fingerprints of every module the failing build READ — empty for a failure that never
+    /// entered the engine.
+    ///
+    /// A DETERMINISTIC failure is cached (ADR-0006, invariant 3), and a cached fact must expire
+    /// exactly when the fact would change. Fingerprinting only the entry and the manifest does not
+    /// promise that: a workspace package whose entry merely re-exports the module that fails to
+    /// parse would keep serving the cached failure after the user fixed it, because nothing the
+    /// cache watches moved. So the failure is fingerprinted against the bytes it was derived from,
+    /// exactly as a success is.
+    read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    /// The modules that parsed before the build gave up, used only to find the first-party
+    /// manifests that shaped the resolution.
+    loaded_paths: Vec<PathBuf>,
 }
 
 pub fn analyze_import(context: &AnalysisContext, request: &ImportRequest) -> ImportResult {
@@ -150,20 +163,60 @@ pub fn analyze_resolved_import_with_dependencies(
 ) -> (ImportResult, Option<FingerprintSource>) {
     match analyze_import_inner_resolved(context, request, resolved) {
         Ok((result, source)) => (result, source),
-        Err(error) => (error_result(request, error), None),
+        Err(error) => {
+            // A deterministic failure is CACHED (ADR-0006), so it must expire when the answer would
+            // change — which means fingerprinting the bytes the failure was derived from, not just
+            // the entry the caller happened to name. The engine reports what it had loaded when it
+            // gave up; those are those bytes.
+            let source = engine_failure_fingerprints(context, request, &error);
+            (error_result(request, error), source)
+        }
     }
+}
+
+/// Freshness inputs for a FAILED engine build: the bytes it read, plus the manifests that decided
+/// what it resolved. Mirrors the success path's set (`analyze_with_rolldown_engine`) exactly,
+/// because the requirement is exactly the same — the cached answer must expire when the bytes it
+/// was derived from change.
+///
+/// `None` for a failure that never reached the engine — an unreadable manifest, an unresolvable
+/// entry, an oversized entry. Those have no graph, and `service::dependency_fingerprints` falls
+/// back to the entry and the manifest, which for those three IS the set that would have to change
+/// for the answer to change.
+fn engine_failure_fingerprints(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    error: &AnalysisError,
+) -> Option<FingerprintSource> {
+    if error.read_time_fingerprints.is_empty() {
+        return None;
+    }
+
+    let mut stat_paths = Vec::new();
+    if let Ok(resolved) = resolve_package_entry(&context.active_document_path, request) {
+        stat_paths.push(resolved.package_root.join("package.json"));
+    }
+    stat_paths.extend(first_party_manifests(context, &error.loaded_paths));
+
+    Some(FingerprintSource::ReadTime {
+        fingerprints: error.read_time_fingerprints.clone(),
+        stat_paths,
+    })
 }
 
 fn analyze_import_inner(
     context: &AnalysisContext,
     request: &ImportRequest,
 ) -> Result<ImportResult, AnalysisError> {
+    // No arm here invents a size. A manifest that cannot be read used to be answered with the
+    // package directory's bytes ON DISK — unminified, uncompressed, tests, source maps and all —
+    // and that one number was assigned to all five size fields, so the "brotli" size of such an
+    // import was an uncompressed directory. It is Unmeasured now (ADR-0006).
     let resolved = match resolve_import_package(context, request) {
         Ok(resolved) => resolved,
-        Err(error) if error.stage == "package_manifest" => {
-            return approximate_manifest_fallback(context, request, error);
-        }
-        Err(error) if error.stage == "entry_resolution" => {
+        Err(error) if error.stage == crate::pipeline::stage::ENTRY_RESOLUTION => {
+            // A declarations-only package is MEASURED, not Unmeasured: it really does ship zero
+            // runtime bytes. Its diagnostic stage is what keeps `Some(0)` unambiguous.
             if let Some(result) =
                 declaration_only_package_result(&context.active_document_path, request)
             {
@@ -186,13 +239,13 @@ fn resolve_import_package(
 ) -> Result<ResolvedPackage, AnalysisError> {
     resolve_package_entry(&context.active_document_path, request).map_err(|message| {
         let stage = if message.contains("unsafe package name") {
-            "package_validation"
+            crate::pipeline::stage::PACKAGE_VALIDATION
         } else if message.contains("package manifest not found") {
-            "package_resolution"
+            crate::pipeline::stage::PACKAGE_RESOLUTION
         } else if is_manifest_fallback_error(&message) {
-            "package_manifest"
+            crate::pipeline::stage::PACKAGE_MANIFEST
         } else {
-            "entry_resolution"
+            crate::pipeline::stage::ENTRY_RESOLUTION
         };
         let details = resolver_details(&message);
         error_with_context(stage, message, context, request, details)
@@ -215,9 +268,12 @@ fn analyze_import_inner_resolved(
     let package_root = resolved.package_root;
     let is_cjs = resolved.is_cjs;
 
+    // A stat failure is an IO condition, not a fact about the package (a lock, a permission blip, a
+    // drive that blinked), so `entry_metadata` is NOT durable — see `pipeline::stage`. It used to be
+    // cached, and expired only when the package's manifest changed.
     let metadata = fs::metadata(&entry_path).map_err(|error| {
         error_with_context(
-            "entry_metadata",
+            crate::pipeline::stage::ENTRY_METADATA,
             format!(
                 "failed to stat package entry {}: {error}",
                 entry_path.display()
@@ -228,47 +284,36 @@ fn analyze_import_inner_resolved(
         )
     })?;
 
+    // An entry over the module source limit used to be sized from the entry file ALONE — the
+    // whole graph behind it uncounted — and that number was served as the import's size. It is a
+    // deterministic property of the package's bytes that the engine cannot answer, so it is
+    // Unmeasured: `oversized_entry` is not in `stage::ALL`, hence not transient, hence cached
+    // like any other fact about the code.
     if metadata.len() as usize > MAX_MODULE_SOURCE_BYTES {
-        let entry_path_display = entry_path.display().to_string();
-        let mut result =
-            analyze_static_entry(context, request, entry_path, &side_effects_mode, is_cjs)?;
-        result.diagnostics.insert(
-            0,
-            ImportDiagnostic {
-                stage: "oversized_entry".to_owned(),
-                message: format!(
-                    "entry file exceeds {MAX_MODULE_SOURCE_BYTES} byte module source limit; used static entry sizing"
-                ),
-                details: vec![format!("entry_path: {entry_path_display}")],
-            },
-        );
-        result.confidence_reasons.insert(
-            0,
-            "Entry exceeds the engine module source limit; size is a static fallback.".to_owned(),
-        );
-        return Ok((result, None));
+        return Err(error_with_context(
+            crate::pipeline::stage::OVERSIZED_ENTRY,
+            format!(
+                "entry file exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit, so no module graph could be built"
+            ),
+            context,
+            request,
+            vec![format!("entry_path: {}", entry_path.display())],
+        ));
     }
 
-    match analyze_with_rolldown_engine(
+    // A failed engine build is Unmeasured. It used to degrade to that same entry-file-alone
+    // sizing, which carried `error: None` plus a plausible byte count — the fabricated state
+    // every `!result.error` check in the system waves through.
+    let (result, loaded_paths, freshness) = analyze_with_rolldown_engine(
         context,
         request,
         &entry_path,
         &package_root,
         &side_effects_mode,
         is_cjs,
-    ) {
-        Ok((result, loaded_paths, freshness)) => {
-            record_loaded_paths(entry_path, request.runtime, loaded_paths);
-            Ok((result, Some(freshness)))
-        }
-        Err(error) if matches!(error.stage, "missing_export" | "ambiguous_export") => Err(error),
-        Err(error) => {
-            let mut result =
-                analyze_static_entry(context, request, entry_path, &side_effects_mode, is_cjs)?;
-            result.diagnostics.push(engine_fallback_diagnostic(error));
-            Ok((result, None))
-        }
-    }
+    )?;
+    record_loaded_paths(entry_path, request.runtime, loaded_paths);
+    Ok((result, Some(freshness)))
 }
 
 /// Rolldown-backed analysis (spec §8): one engine build produces the raw
@@ -301,7 +346,7 @@ pub(crate) fn analyze_with_rolldown_engine(
 
     let minified = minify_source(&artifact.code, false).map_err(|error| {
         error_with_context(
-            "minify",
+            crate::pipeline::stage::MINIFY,
             format!("failed to minify engine chunk: {error}"),
             context,
             request,
@@ -310,7 +355,7 @@ pub(crate) fn analyze_with_rolldown_engine(
     })?;
     let compressed = compress_all(&minified).map_err(|error| {
         error_with_context(
-            "compression",
+            crate::pipeline::stage::COMPRESSION,
             format!("failed to compress minified output: {error}"),
             context,
             request,
@@ -430,26 +475,25 @@ pub(crate) fn analyze_with_rolldown_engine(
     };
     let loaded_paths = artifact.loaded_paths;
 
-    let result = ImportResult {
-        freshness: ResultFreshness::fresh(),
-        specifier: request.specifier.clone(),
-        raw_bytes: artifact.code.len() as u64,
-        minified_bytes: minified.len() as u64,
-        gzip_bytes: compressed.gzip_bytes,
-        brotli_bytes: compressed.brotli_bytes,
-        zstd_bytes: compressed.zstd_bytes,
-        cache_hit: false,
-        side_effects,
-        truly_treeshakeable,
-        is_cjs,
-        confidence,
-        confidence_reasons,
-        error: None,
-        diagnostics,
-        module_breakdown: Some(top_module_contributions(&contributions)),
-        shared_bytes: None,
-        internal_contributions: contributions,
-    };
+    let mut result = ImportResult::measured(
+        request.specifier.clone(),
+        MeasuredSizes {
+            raw_bytes: artifact.code.len() as u64,
+            minified_bytes: minified.len() as u64,
+            gzip_bytes: compressed.gzip_bytes,
+            brotli_bytes: compressed.brotli_bytes,
+            zstd_bytes: compressed.zstd_bytes,
+        },
+    );
+    result.side_effects = side_effects;
+    result.truly_treeshakeable = truly_treeshakeable;
+    result.is_cjs = is_cjs;
+    result.confidence = confidence;
+    result.confidence_reasons = confidence_reasons;
+    result.diagnostics = diagnostics;
+    result.module_breakdown = Some(top_module_contributions(&contributions));
+    result.internal_contributions = contributions;
+
     Ok((result, loaded_paths, freshness))
 }
 
@@ -491,7 +535,7 @@ fn engine_error(
     request: &ImportRequest,
     failure: crate::engine::BundleFailure,
 ) -> AnalysisError {
-    error_with_context(
+    let mut error = error_with_context(
         contract_stage(&failure.stage),
         failure.message,
         context,
@@ -501,142 +545,12 @@ fn engine_error(
             .iter()
             .map(|diagnostic| format!("{}: {}", diagnostic.stage, diagnostic.message))
             .collect(),
-    )
-}
-
-/// §12 requires each failure to surface under the stage it happened at — `parse`,
-/// `resolve`, `link`, `generate`, `output_shape`, `module_graph_limit`, or the OXC
-/// stage for a validation/minification failure. Overwriting every one of them with a
-/// single `engine_fallback` label collapsed the whole failure table into one bucket
-/// and left the real stage recoverable only by reading the message. The fallback is
-/// expressed by the message and the lowered confidence, not by erasing where the
-/// failure occurred.
-fn engine_fallback_diagnostic(error: AnalysisError) -> ImportDiagnostic {
-    ImportDiagnostic {
-        stage: error.stage.to_owned(),
-        message: format!(
-            "Rolldown engine analysis failed; using static entry sizing: {}",
-            error.message
-        ),
-        details: error.details,
-    }
-}
-
-fn analyze_static_entry(
-    context: &AnalysisContext,
-    request: &ImportRequest,
-    entry_path: PathBuf,
-    side_effects_mode: &SideEffectsMode,
-    is_cjs: bool,
-) -> Result<ImportResult, AnalysisError> {
-    let side_effects = side_effects_mode.has_side_effects();
-    let side_effect_matches =
-        side_effects_mode.matching_paths(std::iter::once(entry_path.as_path()));
-    let source = fs::read_to_string(&entry_path).map_err(|error| {
-        error_with_context(
-            "entry_read",
-            format!(
-                "failed to read package entry {}: {error}",
-                entry_path.display()
-            ),
-            context,
-            request,
-            vec![format!("entry_path: {}", entry_path.display())],
-        )
-    })?;
-    let minified =
-        minify_source(&source, is_cjs).unwrap_or_else(|_| estimate_minified_source(&source));
-    let compressed = compress_all(&minified).map_err(|error| {
-        error_with_context(
-            "compression",
-            format!("failed to compress minified output: {error}"),
-            context,
-            request,
-            Vec::new(),
-        )
-    })?;
-    let raw_bytes = source.len() as u64;
-    let minified_bytes = minified.len() as u64;
-
-    Ok(ImportResult {
-        freshness: ResultFreshness::fresh(),
-        specifier: request.specifier.clone(),
-        raw_bytes,
-        minified_bytes,
-        gzip_bytes: compressed.gzip_bytes,
-        brotli_bytes: compressed.brotli_bytes,
-        zstd_bytes: compressed.zstd_bytes,
-        cache_hit: false,
-        side_effects,
-        truly_treeshakeable: false,
-        is_cjs,
-        confidence: ConfidenceLevel::Low,
-        confidence_reasons: vec![
-            "Static entry sizing is a fallback; it does not build a complete module graph."
-                .to_owned(),
-        ],
-        error: None,
-        diagnostics: side_effect_diagnostics(side_effects_mode, &entry_path, &side_effect_matches),
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    })
-}
-
-fn approximate_manifest_fallback(
-    context: &AnalysisContext,
-    request: &ImportRequest,
-    error: AnalysisError,
-) -> Result<ImportResult, AnalysisError> {
-    let package_root = find_package_root(&context.active_document_path, &request.package_name)
-        .map_err(|message| {
-            error_with_context("package_resolution", message, context, request, Vec::new())
-        })?;
-    let (raw_bytes, mut diagnostics) = approximate_directory_size(&package_root);
-    diagnostics.insert(
-        0,
-        ImportDiagnostic {
-            stage: "manifest_fallback".to_owned(),
-            message: format!(
-                "package manifest could not be used; computed approximate raw directory size (approx): {}",
-                error.message
-            ),
-            details: vec![
-                format!("package_root: {}", package_root.display()),
-                format!("failed_stage: {}", error.stage),
-            ],
-        },
     );
-
-    Ok(ImportResult {
-        freshness: ResultFreshness::fresh(),
-        specifier: request.specifier.clone(),
-        raw_bytes,
-        minified_bytes: raw_bytes,
-        gzip_bytes: raw_bytes,
-        brotli_bytes: raw_bytes,
-        zstd_bytes: raw_bytes,
-        cache_hit: false,
-        side_effects: true,
-        truly_treeshakeable: false,
-        is_cjs: false,
-        confidence: ConfidenceLevel::Low,
-        confidence_reasons: vec![
-            "Package manifest fallback uses approximate directory sizing because manifest resolution failed."
-                .to_owned(),
-        ],
-        error: None,
-        diagnostics,
-        module_breakdown: Some(vec![ModuleContribution {
-            path: package_root.to_string_lossy().to_string(),
-            bytes: raw_bytes,
-        }]),
-        shared_bytes: None,
-        internal_contributions: vec![ModuleContribution {
-            path: package_root.to_string_lossy().to_string(),
-            bytes: raw_bytes,
-        }],
-    })
+    // The bytes the build read before it gave up. A cached deterministic failure expires against
+    // exactly these (see `AnalysisError::read_time_fingerprints`).
+    error.read_time_fingerprints = failure.read_time_fingerprints;
+    error.loaded_paths = failure.loaded_paths;
+    error
 }
 
 fn top_module_contributions(contributions: &[ModuleContribution]) -> Vec<ModuleContribution> {
@@ -649,32 +563,6 @@ fn top_module_contributions(contributions: &[ModuleContribution]) -> Vec<ModuleC
     });
     contributions.truncate(10);
     contributions
-}
-
-pub(crate) fn side_effect_diagnostics(
-    side_effects_mode: &SideEffectsMode,
-    entry_path: &Path,
-    matched_paths: &[PathBuf],
-) -> Vec<ImportDiagnostic> {
-    if !side_effects_mode.is_array() || matched_paths.is_empty() {
-        return Vec::new();
-    }
-
-    let mut details = vec![
-        "sideEffects: array".to_owned(),
-        format!("entry_path: {}", entry_path.display()),
-    ];
-    details.extend(
-        matched_paths
-            .iter()
-            .map(|path| format!("matched_path: {}", path.display())),
-    );
-
-    vec![ImportDiagnostic {
-        stage: "side_effects".to_owned(),
-        message: "package sideEffects array matched analyzed module path(s); conservative inclusion applied".to_owned(),
-        details,
-    }]
 }
 
 fn engine_confidence(
@@ -724,33 +612,18 @@ fn engine_confidence(
     (ConfidenceLevel::Medium, reasons)
 }
 
+/// The Unmeasured result an analysis failure becomes.
+///
+/// It used to carry five **zero** sizes. That is the same lie as a fabricated one, told with a
+/// smaller number: `0 B` reads as "this import is free", and every consumer that summed or
+/// compared it did so. There is no size now, and the stage says why there is not.
 fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
-    ImportResult {
-        freshness: ResultFreshness::fresh(),
-        specifier: request.specifier.clone(),
-        raw_bytes: 0,
-        minified_bytes: 0,
-        gzip_bytes: 0,
-        brotli_bytes: 0,
-        zstd_bytes: 0,
-        cache_hit: false,
-        side_effects: true,
-        truly_treeshakeable: false,
-        is_cjs: false,
-        confidence: ConfidenceLevel::Low,
-        confidence_reasons: vec![
-            "Analysis failed before a bundle size could be measured.".to_owned(),
-        ],
-        error: Some(error.message.clone()),
-        diagnostics: vec![ImportDiagnostic {
-            stage: error.stage.to_owned(),
-            message: error.message,
-            details: error.details,
-        }],
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    }
+    ImportResult::unmeasured(
+        request.specifier.clone(),
+        error.stage,
+        error.message,
+        error.details,
+    )
 }
 
 fn resolver_details(message: &str) -> Vec<String> {
@@ -783,6 +656,8 @@ fn error_with_context(
         stage,
         message: message.into(),
         details: context_details,
+        read_time_fingerprints: Vec::new(),
+        loaded_paths: Vec::new(),
     }
 }
 

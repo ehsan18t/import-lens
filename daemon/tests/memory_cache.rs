@@ -1,27 +1,22 @@
 use import_lens_daemon::cache::memory::ImportCache;
-use import_lens_daemon::ipc::protocol::{ConfidenceLevel, ImportResult};
+use import_lens_daemon::ipc::protocol::{ConfidenceLevel, ImportResult, MeasuredSizes};
 
 fn result(specifier: &str, cache_hit: bool) -> ImportResult {
-    ImportResult {
-        freshness: import_lens_daemon::ipc::protocol::ResultFreshness::fresh(),
-        specifier: specifier.to_owned(),
-        raw_bytes: 10,
-        minified_bytes: 8,
-        gzip_bytes: 7,
-        brotli_bytes: 6,
-        zstd_bytes: 5,
-        cache_hit,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: ConfidenceLevel::High,
-        confidence_reasons: vec!["test fixture confidence".to_owned()],
-        error: None,
-        diagnostics: Vec::new(),
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    }
+    let mut result = ImportResult::measured(
+        specifier,
+        MeasuredSizes {
+            raw_bytes: 10,
+            minified_bytes: 8,
+            gzip_bytes: 7,
+            brotli_bytes: 6,
+            zstd_bytes: 5,
+        },
+    );
+    result.cache_hit = cache_hit;
+    result.truly_treeshakeable = true;
+    result.confidence = ConfidenceLevel::High;
+    result.confidence_reasons = vec!["test fixture confidence".to_owned()];
+    result
 }
 
 /// Reads a key's PERSISTED `last_seq` straight off disk via a standalone

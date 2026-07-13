@@ -6,11 +6,22 @@ import { encode } from "@msgpack/msgpack";
 import {
   createDaemonClient,
   daemonBinaryPath,
+  EXIT_BUDGET_EXCEEDED,
+  EXIT_COULD_NOT_MEASURE,
   loadBudgetConfig,
   parseCliArgs,
   resolveCliStoragePaths,
   runImportLensCheck,
 } from "../../cli/importlens.mjs";
+
+const analyzed = (overrides = {}) => ({
+  filePath: "/workspace/src/app.ts",
+  brotliBytes: 1200,
+  incomplete: false,
+  unmeasured: [],
+  imports: [{ specifier: "small-lib", brotliBytes: 900 }],
+  ...overrides,
+});
 
 class FakeSocket extends EventEmitter {
   writes = [];
@@ -55,18 +66,18 @@ test("runImportLensCheck exits non-zero on daemon-backed budget violations", asy
     cwd: "/workspace",
     budgets: { perImportBrotliBytes: 1000, perFileBrotliBytes: 2000 },
     changedFiles: async () => ["src/app.ts"],
-    analyzeFile: async () => ({
-      filePath: "/workspace/src/app.ts",
-      brotliBytes: 2500,
-      imports: [
-        { specifier: "large-lib", brotliBytes: 1500 },
-        { specifier: "small-lib", brotliBytes: 500 },
-      ],
-    }),
+    analyzeFile: async () =>
+      analyzed({
+        brotliBytes: 2500,
+        imports: [
+          { specifier: "large-lib", brotliBytes: 1500 },
+          { specifier: "small-lib", brotliBytes: 500 },
+        ],
+      }),
     writeLine: (line) => output.push(line),
   });
 
-  assert.equal(exitCode, 1);
+  assert.equal(exitCode, EXIT_BUDGET_EXCEEDED);
   assert.deepEqual(output, [
     "src/app.ts: file Brotli budget exceeded: 2.5 kB > 2.0 kB",
     "src/app.ts: large-lib Brotli budget exceeded: 1.5 kB > 1.0 kB",
@@ -79,16 +90,83 @@ test("runImportLensCheck passes when changed files are within budgets", async ()
     cwd: "/workspace",
     budgets: { perImportBrotliBytes: 2000, perFileBrotliBytes: 3000 },
     changedFiles: async () => ["src/app.ts"],
-    analyzeFile: async () => ({
-      filePath: "/workspace/src/app.ts",
-      brotliBytes: 1200,
-      imports: [{ specifier: "small-lib", brotliBytes: 900 }],
-    }),
+    analyzeFile: async () => analyzed(),
     writeLine: (line) => output.push(line),
   });
 
   assert.equal(exitCode, 0);
   assert.deepEqual(output, ["Import Lens budgets passed for 1 changed file."]);
+});
+
+// Defect #6, and the worst of the six: an import whose build timed out used to reach this gate
+// with `error: null` and a fabricated size, or vanish from the file total altogether — and CI went
+// GREEN, so the regression merged. A gate that cannot measure must never report success
+// (ADR-0006, invariant 5).
+test("runImportLensCheck refuses a verdict when an import could not be measured", async () => {
+  const output = [];
+  const exitCode = await runImportLensCheck({
+    cwd: "/workspace",
+    budgets: { perImportBrotliBytes: 2000, perFileBrotliBytes: 3000 },
+    changedFiles: async () => ["src/app.ts"],
+    analyzeFile: async () =>
+      analyzed({
+        // Everything the gate can see says PASS: the file total is under budget, and every import
+        // it has a size for is under budget too. The only evidence is the missing import.
+        incomplete: true,
+        unmeasured: [{ specifier: "lodash-es", stage: "timeout", transient: true }],
+      }),
+    writeLine: (line) => output.push(line),
+  });
+
+  assert.equal(
+    exitCode,
+    EXIT_COULD_NOT_MEASURE,
+    "a flaky CI box must be diagnosable, and must never be confused with a pass OR a regression",
+  );
+  assert.notEqual(EXIT_COULD_NOT_MEASURE, EXIT_BUDGET_EXCEEDED);
+  assert.deepEqual(output, [
+    "src/app.ts: could not measure 1 import (stage: timeout); file total is a floor - budget not evaluated",
+    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+  ]);
+});
+
+// **The seventh instance, at the CI gate.** A DETERMINISTIC failure has no size, so it contributes
+// nothing to its file's total — and the daemon now says so (`incomplete`, FR-024a), because the same
+// failure also kills the file's combined build and the sum that survives is not the file's size.
+// This gate used to be handed `incomplete: false` for exactly that file and reported PASS.
+//
+// Deterministically-unknown is still unknown. The verdict is "not evaluated" (exit 3), and — the
+// second half — a real violation found in a file that WAS measured is still printed, instead of
+// being swallowed by the exit code that outranks it.
+test("runImportLensCheck refuses a verdict for a deterministically unmeasurable file", async () => {
+  const output = [];
+  const exitCode = await runImportLensCheck({
+    cwd: "/workspace",
+    budgets: { perImportBrotliBytes: 1000 },
+    changedFiles: async () => ["src/app.ts", "src/measured.ts"],
+    analyzeFile: async (filePath) =>
+      filePath.endsWith("app.ts")
+        ? analyzed({
+            filePath,
+            // What the daemon now sends for this file: a parse failure means one import's bytes are
+            // missing from the total, so the total is a floor.
+            incomplete: true,
+            unmeasured: [{ specifier: "broken-lib", stage: "parse", transient: false }],
+          })
+        : analyzed({ filePath, imports: [{ specifier: "large-lib", brotliBytes: 1500 }] }),
+    writeLine: (line) => output.push(line),
+  });
+
+  assert.equal(
+    exitCode,
+    EXIT_COULD_NOT_MEASURE,
+    "a gate that cannot measure must never report success - not even when the reason is permanent",
+  );
+  assert.deepEqual(output, [
+    "src/measured.ts: large-lib Brotli budget exceeded: 1.5 kB > 1.0 kB",
+    "src/app.ts: an import that belongs in this file's total was not measured; file total is a floor - budget not evaluated",
+    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+  ]);
 });
 
 test("runImportLensCheck resolves changed files against resolveRoot but reports relative to cwd", async () => {
@@ -105,7 +183,7 @@ test("runImportLensCheck resolves changed files against resolveRoot but reports 
     changedFiles: async () => ["packages/app/src/index.ts"],
     analyzeFile: async (filePath) => {
       analyzedPaths.push(filePath);
-      return { filePath, brotliBytes: 2500, imports: [] };
+      return analyzed({ filePath, brotliBytes: 2500, imports: [] });
     },
     writeLine: (line) => output.push(line),
   });

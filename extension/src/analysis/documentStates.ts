@@ -2,26 +2,38 @@ import type { ImportResult } from "../ipc/protocol.js";
 import { mergeRefreshedResults, type RefreshMergeOptions } from "./refreshMerge.js";
 import type { ImportAnalysisState } from "./state.js";
 
+/**
+ * Recomputes the insights that caption a size — over budget, the git working-tree delta, the
+ * shared-module note — over the states they belong to, in the SAME update that installs the size.
+ * Recomputing them in a second store write would fire a second render and briefly show the number
+ * without its caption.
+ *
+ * A refiner is only as good as the inputs it closed over, and those inputs belong to an ANALYSIS
+ * (the git diff it ran for this document, the history it read, the budgets in force) — never to a
+ * push, which merely captures whatever the controller held when it landed.
+ */
+export type RefineStates = (states: ImportAnalysisState[]) => ImportAnalysisState[];
+
 export interface RefreshApplyOptions extends RefreshMergeOptions {
   /**
    * The analysis generation this push was computed for (the daemon echoes the analysis's
    * request id). It is what lets a push that raced its own response be replayed onto THAT
-   * response's states and no other — see {@link DocumentAnalysisStates.set}. Absent (older
-   * daemon) → the push is replayed onto whatever states land next, which is the behaviour that
-   * predates generations.
+   * response's states and no other — see {@link DocumentAnalysisStates.set}. Absent when the
+   * daemon had no generation to echo (the SWR refresh of a size read the extension did not tag,
+   * e.g. the "Show current file size" command's): such a push merges into the states on screen
+   * when it arrives, and is never held for replay, because there is no analysis it can be shown
+   * to belong to.
    */
   generation?: number;
-  /**
-   * Runs on the merged states before they are stored, in the SAME update: a pushed size
-   * is a new number, and the insights that caption it (over budget, git delta, shared
-   * modules) are derived from it. Recomputing them in a second store write would fire a
-   * second render and briefly show the number without its caption.
-   */
-  refine?: (states: ImportAnalysisState[]) => ImportAnalysisState[];
+  /** @see RefineStates — used for the live merge; a REPLAY is refined by {@link DocumentAnalysisStates.set}. */
+  refine?: RefineStates;
 }
 
+/** A push held for the {@link DocumentAnalysisStates.set} that closes the analysis it belongs to. */
 interface QueuedRefresh {
   results: readonly ImportResult[];
+  /** Not optional here: a push with no generation is never queued, so a queued one always has one. */
+  generation: number;
   options: RefreshApplyOptions;
 }
 
@@ -77,16 +89,28 @@ export class DocumentAnalysisStates {
    * They cannot be numerous — the listener drops a superseded push on arrival — but an analysis that
    * is abandoned mid-flight (its response overtaken) leaves its pushes behind, and this is where
    * they go.
+   *
+   * `refine` is the ANALYSIS's refiner, and a replayed push is captioned with it — never with the
+   * push's own. `states` arrive here already captioned from the analysis's real inputs; the push's
+   * closure captured the inputs of the moment it landed, which is mid-analysis, BEFORE the `git
+   * diff` this generation is captioned by has resolved. Running it over the merged states would
+   * recompute the insights of the WHOLE document from those stale inputs and take the working-tree
+   * badge off every import in it.
    */
-  set(key: string, states: ImportAnalysisState[], generation?: number): ImportAnalysisState[] {
+  set(
+    key: string,
+    states: ImportAnalysisState[],
+    generation: number,
+    refine?: RefineStates,
+  ): ImportAnalysisState[] {
     this.#states.set(key, states);
 
     const queued = this.#queued.get(key);
     this.#queued.delete(key);
 
     for (const push of queued ?? []) {
-      if (belongsToGeneration(push, generation)) {
-        this.#merge(key, push.results, push.options);
+      if (push.generation === generation) {
+        this.#merge(key, push.results, push.options, refine);
       }
     }
 
@@ -146,7 +170,16 @@ export class DocumentAnalysisStates {
     return [...this.#states.values()].flat();
   }
 
-  #merge(key: string, results: readonly ImportResult[], options: RefreshApplyOptions): boolean {
+  /**
+   * `refine` overrides the push's own: {@link set} passes the analysis's refiner when it replays a
+   * push, and the live merge (no override) uses the one the push arrived with.
+   */
+  #merge(
+    key: string,
+    results: readonly ImportResult[],
+    options: RefreshApplyOptions,
+    refine: RefineStates | undefined = options.refine,
+  ): boolean {
     const existing = this.#states.get(key);
 
     if (!existing) {
@@ -159,13 +192,26 @@ export class DocumentAnalysisStates {
       return false;
     }
 
-    this.#states.set(key, options.refine ? options.refine(next) : next);
+    this.#states.set(key, refine ? refine(next) : next);
     return true;
   }
 
+  /**
+   * Hold a push for the {@link set} that closes its analysis. A push with NO generation is not held:
+   * it belongs to no analysis, so no later `set` can be shown to be the one it was computed for, and
+   * replaying it onto whichever states land next is the resurrection {@link clear} exists to
+   * prevent. It has already merged into the states on screen if there were any, which is all an
+   * ungated push was ever owed.
+   */
   #queue(key: string, results: readonly ImportResult[], options: RefreshApplyOptions): void {
+    const { generation } = options;
+
+    if (generation === undefined) {
+      return;
+    }
+
     const queued = this.#queued.get(key) ?? [];
-    queued.push({ results, options });
+    queued.push({ results, generation, options });
 
     while (queued.length > maxQueuedRefreshBatches) {
       queued.shift();
@@ -174,10 +220,3 @@ export class DocumentAnalysisStates {
     this.#queued.set(key, queued);
   }
 }
-
-// An unstamped push (older daemon) has no generation to disagree with, and the merge is ungated for
-// it everywhere else too; an unstamped `set` is likewise a caller with no generation to enforce.
-const belongsToGeneration = (push: QueuedRefresh, generation: number | undefined): boolean =>
-  push.options.generation === undefined ||
-  generation === undefined ||
-  push.options.generation === generation;

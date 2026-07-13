@@ -17,6 +17,7 @@ const repoFile = (relativePath) =>
 
 const engineStages = repoFile("daemon/src/engine/mod.rs");
 const extensionTransience = repoFile("extension/src/analysis/transience.ts");
+const cli = repoFile("cli/importlens.mjs");
 
 /** The stage constants `stage::is_transient` matches on, resolved to their wire strings. */
 const daemonTransientStages = () => {
@@ -47,6 +48,14 @@ const extensionTransientStages = () => {
   return [...declaration[1].matchAll(/"([^"]+)"/gu)].map((match) => match[1]).sort();
 };
 
+/** The stage strings the CI gate refuses to reach a verdict from. */
+const cliTransientStages = () => {
+  const declaration = /const transientStages = new Set\(\[([^\]]*)\]\)/u.exec(cli);
+  assert.ok(declaration, "cli/importlens.mjs must still declare its transient stage set");
+
+  return [...declaration[1].matchAll(/"([^"]+)"/gu)].map((match) => match[1]).sort();
+};
+
 test("the extension refuses to persist exactly the stages the daemon calls transient", () => {
   const daemon = daemonTransientStages();
 
@@ -55,5 +64,19 @@ test("the extension refuses to persist exactly the stages the daemon calls trans
     extensionTransientStages(),
     daemon,
     "a stage the daemon will not cache must be a stage the extension will not persist",
+  );
+});
+
+// The CI gate is the third copy, and the one that costs the most when it drifts: a pass/fail
+// verdict is a durable store too (ADR-0006, invariant 3 — "or any pass/fail verdict"). A stage the
+// daemon adds to `is_transient` and the CLI does not know about is a stage `importlens check`
+// happily judges a budget from, or silently drops from a file total — which is defect #6, the one
+// that merges the regression. The CLI ships standalone and cannot import the daemon or the
+// extension, so the duplication is forced; this is what makes it safe.
+test("the CI gate refuses to judge a budget from exactly the stages the daemon calls transient", () => {
+  assert.deepEqual(
+    cliTransientStages(),
+    daemonTransientStages(),
+    "a stage the daemon will not cache must be a stage `importlens check` will not pass on",
   );
 });

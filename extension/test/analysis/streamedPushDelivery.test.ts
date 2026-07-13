@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DocumentAnalysisStates } from "../../src/analysis/documentStates.js";
+import { applyImportAnalysisInsights } from "../../src/analysis/insights.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import { IpcClient } from "../../src/ipc/client.js";
 import { encodeFrame } from "../../src/ipc/codec.js";
@@ -255,5 +256,71 @@ test("a queued push is dropped when the document is cleared before its states ar
     documents.get(documentKey)[0]?.status,
     "loading",
     "a push queued before the clear belongs to the abandoned analysis",
+  );
+});
+
+/**
+ * A push the daemon did not stamp with a generation (the SWR refresh of a size read that carried no
+ * `analysis_generation` — the "Show current file size" command's) belongs to NO analysis. It may
+ * still merge into the states on screen when it arrives, but it can never be shown to belong to the
+ * states an analysis stores LATER, so it must not be replayed onto them: that is the resurrection
+ * path `clear()` exists to prevent, reopened through the queue.
+ */
+test("an unstamped push is never replayed onto a later analysis's states", () => {
+  const documents = new DocumentAnalysisStates();
+
+  documents.applyRefreshedResults(documentKey, [measured], { isCurrent: true });
+  documents.set(documentKey, stateFor(loadingResponse(12)), 12);
+
+  assert.equal(
+    documents.get(documentKey)[0]?.status,
+    "loading",
+    "a push that belongs to no generation must not fill in a state of one",
+  );
+});
+
+/**
+ * The insights that caption a size — over budget, the git working-tree delta, the shared-module
+ * note — are derived from inputs the ANALYSIS owns: the git diff it ran for this document, the
+ * history it read, the budgets in force. A push carries none of them. Its `refine` closure captures
+ * whatever the controller happened to hold when the push landed, which for a document whose
+ * analysis is still awaiting its `git diff` is the PREVIOUS generation's changed lines — or, on a
+ * cold document, none at all.
+ *
+ * So `set` may not re-run the push's closure. It installs states the analysis has already captioned
+ * with its real inputs, and the pushes it replays over them must be captioned by the SAME inputs;
+ * re-running the push's closure recomputes insights for the WHOLE document from stale ones and
+ * wipes the working-tree badge off every import in it.
+ */
+test("`set` captions a replayed push with the analysis's insight inputs, not the push's", () => {
+  const documents = new DocumentAnalysisStates();
+  // The import's statement is a working-tree change, so the analysis captions it with its delta.
+  const analysisRefine = (states: ImportAnalysisState[]): ImportAnalysisState[] =>
+    applyImportAnalysisInsights(states, {
+      changedLines: new Set([0]),
+      importCostHistory: [],
+    });
+  // What the push captured: the analysis had not run its `git diff` yet when it landed.
+  const pushRefine = (states: ImportAnalysisState[]): ImportAnalysisState[] =>
+    applyImportAnalysisInsights(states, { importCostHistory: [] });
+
+  // The analysis stores its response's states...
+  documents.set(documentKey, stateFor(loadingResponse(12)), 12, analysisRefine);
+  // ...a streamed import lands while it is still awaiting the diff...
+  documents.applyRefreshedResults(documentKey, [measured], {
+    identities: [{ specifier: "lodash-es", import_kind: "named", named: ["debounce"] }],
+    isCurrent: true,
+    generation: 12,
+    refine: pushRefine,
+  });
+  // ...and the analysis closes by storing the states it has captioned with the diff it awaited.
+  documents.set(documentKey, analysisRefine(documents.get(documentKey)), 12, analysisRefine);
+
+  const [state] = documents.get(documentKey);
+  assert.equal(state?.result?.brotli_bytes, 1_500, "the pushed size survives the analysis");
+  assert.deepEqual(
+    (state?.insights ?? []).map((insight) => insight.label),
+    ["+1.5 kB br"],
+    "the replayed push must keep the working-tree caption the analysis computed",
   );
 });

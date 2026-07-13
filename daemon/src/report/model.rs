@@ -68,7 +68,9 @@ pub fn build_report_rows(
 
 pub fn build_report_summary(row_set: &WorkspaceReportRowSet) -> WorkspaceReportSummary {
     let rows = &row_set.rows;
-    let total_brotli_bytes = rows.iter().map(|row| row.brotli_bytes).sum::<u64>();
+    // Only a MEASURED row contributes. An unmeasured one has no bytes to add, and
+    // `.unwrap_or_default()` here would silently fold a fabricated zero into the workspace total.
+    let total_brotli_bytes = rows.iter().filter_map(|row| row.brotli_bytes).sum::<u64>();
     WorkspaceReportSummary {
         import_count: rows.len() as u64,
         total_brotli_bytes,
@@ -91,16 +93,22 @@ fn is_conservative_item(item: &WorkspaceReportItem) -> bool {
         .is_some_and(|result| result.is_cjs || result.side_effects || !result.truly_treeshakeable)
 }
 
-/// Mirrors the condition that pushes "Budget exceeded" into the row warning
-/// (TS: result present, no error, per-import limit set, brotli over limit).
+/// A budget is judged against a **size**, and only a measured import has one (ADR-0006, invariant
+/// 5: no verdict from a floor). This used to ask `result.error.is_none()` — the negative check —
+/// which a transiently-degraded result with a fabricated size passed, so the report claimed a
+/// violation, or absolved one, on a number that never happened.
 fn is_import_budget_violation(
     item: &WorkspaceReportItem,
     budgets: &WorkspaceReportBudgets,
 ) -> bool {
-    match (item.result.as_ref(), budgets.per_import_brotli_bytes) {
-        (Some(result), Some(limit)) => result.error.is_none() && result.brotli_bytes > limit,
+    match (measured_brotli(item), budgets.per_import_brotli_bytes) {
+        (Some(brotli_bytes), Some(limit)) => brotli_bytes > limit,
         _ => false,
     }
+}
+
+fn measured_brotli(item: &WorkspaceReportItem) -> Option<u64> {
+    item.result.as_ref().and_then(ImportResult::brotli_bytes)
 }
 
 fn row_for_item(
@@ -108,16 +116,18 @@ fn row_for_item(
     budgets: &WorkspaceReportBudgets,
 ) -> WorkspaceReportRow {
     let result = item.result.as_ref();
+    // `.and_then(...)`, never `.unwrap_or_default()`: an unmeasured import has NO size, and a
+    // zero here prints "0 B" in the exported report — the sentinel this model exists to abolish.
     WorkspaceReportRow {
         package_name: item.detected.package_name.clone(),
         specifier: item.detected.specifier.clone(),
         source_file: relative_source_file(&item.workspace_root, &item.source_file),
         line: item.detected.line + 1,
         runtime: item.detected.runtime.as_str().to_owned(),
-        minified_bytes: result.map(|item| item.minified_bytes).unwrap_or_default(),
-        gzip_bytes: result.map(|item| item.gzip_bytes).unwrap_or_default(),
-        brotli_bytes: result.map(|item| item.brotli_bytes).unwrap_or_default(),
-        zstd_bytes: result.map(|item| item.zstd_bytes).unwrap_or_default(),
+        minified_bytes: result.and_then(ImportResult::minified_bytes),
+        gzip_bytes: result.and_then(ImportResult::gzip_bytes),
+        brotli_bytes: result.and_then(ImportResult::brotli_bytes),
+        zstd_bytes: result.and_then(ImportResult::zstd_bytes),
         shared_bytes: result
             .and_then(|item| item.shared_bytes)
             .unwrap_or_default(),
@@ -185,11 +195,11 @@ fn warning_for_item(item: &WorkspaceReportItem, budgets: &WorkspaceReportBudgets
         ));
     }
     if is_import_budget_violation(item, budgets)
-        && let (Some(result), Some(limit)) = (item.result.as_ref(), budgets.per_import_brotli_bytes)
+        && let (Some(brotli_bytes), Some(limit)) =
+            (measured_brotli(item), budgets.per_import_brotli_bytes)
     {
         warnings.push(format!(
-            "Budget exceeded: {} B br > {} B br",
-            result.brotli_bytes, limit
+            "Budget exceeded: {brotli_bytes} B br > {limit} B br"
         ));
     }
     if is_conservative_item(item) {
@@ -225,8 +235,12 @@ fn apply_file_budget_warnings(
     };
     let mut totals = BTreeMap::<String, u64>::new();
     for row in rows.iter() {
-        if row.brotli_bytes > 0 {
-            *totals.entry(row.source_file.clone()).or_default() += row.brotli_bytes;
+        // A file's total is the sum of its MEASURED imports. An unmeasured one adds nothing —
+        // which makes the total a floor, and a floor can still exceed a budget (that verdict is
+        // sound: the real number is at least this large). It cannot *absolve* one, and it does not
+        // try to: an under-budget floor produces no warning either way.
+        if let Some(brotli_bytes) = row.brotli_bytes.filter(|bytes| *bytes > 0) {
+            *totals.entry(row.source_file.clone()).or_default() += brotli_bytes;
         }
     }
     let mut warned_files = BTreeSet::<String>::new();
@@ -271,7 +285,9 @@ fn build_duplicate_import_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateIm
                 source_files: Vec::new(),
             });
         group.count += 1;
-        group.total_brotli_bytes += row.brotli_bytes;
+        if let Some(brotli_bytes) = row.brotli_bytes {
+            group.total_brotli_bytes += brotli_bytes;
+        }
         group.source_files.push(row.source_file.clone());
     }
     let mut groups = groups
@@ -344,14 +360,20 @@ fn build_treemap(
     total_brotli_bytes: u64,
 ) -> Vec<WorkspaceReportTreemapItem> {
     rows.iter()
-        .filter(|row| row.brotli_bytes > 0)
+        // A treemap slices a whole into parts. An import with no size has no part to slice, so it
+        // is absent rather than drawn as a zero-width sliver.
+        .filter_map(|row| {
+            row.brotli_bytes
+                .filter(|bytes| *bytes > 0)
+                .map(|bytes| (row, bytes))
+        })
         .take(10)
-        .map(|row| WorkspaceReportTreemapItem {
+        .map(|(row, brotli_bytes)| WorkspaceReportTreemapItem {
             package_name: row.package_name.clone(),
             specifier: row.specifier.clone(),
             source_file: row.source_file.clone(),
-            brotli_bytes: row.brotli_bytes,
-            percentage: ((row.brotli_bytes * 100) + (total_brotli_bytes / 2))
+            brotli_bytes,
+            percentage: ((brotli_bytes * 100) + (total_brotli_bytes / 2))
                 .checked_div(total_brotli_bytes)
                 .unwrap_or(0),
             confidence: row.confidence.clone(),
@@ -407,26 +429,19 @@ mod tests {
     }
 
     fn ok_result(specifier: &str, brotli_bytes: u64) -> ImportResult {
-        ImportResult {
-            freshness: crate::ipc::protocol::ResultFreshness::fresh(),
-            specifier: specifier.to_owned(),
-            raw_bytes: brotli_bytes,
-            minified_bytes: brotli_bytes,
-            gzip_bytes: brotli_bytes,
-            brotli_bytes,
-            zstd_bytes: brotli_bytes,
-            cache_hit: false,
-            side_effects: false,
-            truly_treeshakeable: true,
-            is_cjs: false,
-            confidence: ConfidenceLevel::High,
-            confidence_reasons: Vec::new(),
-            error: None,
-            diagnostics: Vec::new(),
-            module_breakdown: None,
-            shared_bytes: None,
-            internal_contributions: Vec::new(),
-        }
+        let mut result = ImportResult::measured(
+            specifier,
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: brotli_bytes,
+                minified_bytes: brotli_bytes,
+                gzip_bytes: brotli_bytes,
+                brotli_bytes,
+                zstd_bytes: brotli_bytes,
+            },
+        );
+        result.truly_treeshakeable = true;
+        result.confidence = ConfidenceLevel::High;
+        result
     }
 
     fn report_item(
@@ -474,11 +489,19 @@ mod tests {
 
     #[test]
     fn summary_counts_per_import_budget_violations_structurally() {
-        let mut errored = ok_result("broken", 30);
-        errored.error = Some("Package not found".to_owned());
         let items = vec![
             report_item("big", 0, "src/a.ts", Some(ok_result("big", 20))),
-            report_item("broken", 1, "src/a.ts", Some(errored)),
+            report_item(
+                "broken",
+                1,
+                "src/a.ts",
+                Some(ImportResult::unmeasured(
+                    "broken",
+                    "parse",
+                    "Package not found",
+                    Vec::new(),
+                )),
+            ),
             report_item("small", 2, "src/a.ts", Some(ok_result("small", 5))),
         ];
         let budgets = WorkspaceReportBudgets {
@@ -489,8 +512,7 @@ mod tests {
         let row_set = build_report_rows(&items, &budgets);
         let summary = build_report_summary(&row_set);
 
-        // Errored results never count as budget violations (TS requires
-        // `!item.result.error`), even when their bytes exceed the limit.
+        // An unmeasured import has no size, so there is no verdict to reach about it.
         assert_eq!(summary.budget_violation_count, 1);
         let violating_row = row_set
             .rows
@@ -498,6 +520,51 @@ mod tests {
             .find(|row| row.specifier == "big")
             .expect("violating row");
         assert!(violating_row.warning.contains("Budget exceeded"));
+    }
+
+    /// ADR-0006 §6: `.flatten().unwrap_or_default()` on these fields compiles and prints **"0 B"**
+    /// in an exported, shared report — the sentinel zero the whole model exists to abolish. The row
+    /// carries no number at all, and no aggregate counts it.
+    #[test]
+    fn an_unmeasured_import_has_no_size_in_the_report_not_a_zero() {
+        let items = vec![
+            report_item("measured", 0, "src/a.ts", Some(ok_result("measured", 40))),
+            report_item(
+                "broken",
+                1,
+                "src/a.ts",
+                Some(ImportResult::unmeasured(
+                    "broken",
+                    "timeout",
+                    "engine build did not complete",
+                    Vec::new(),
+                )),
+            ),
+        ];
+
+        let row_set = build_report_rows(&items, &no_budgets());
+        let summary = build_report_summary(&row_set);
+        let broken = row_set
+            .rows
+            .iter()
+            .find(|row| row.specifier == "broken")
+            .expect("unmeasured row");
+
+        assert_eq!(broken.brotli_bytes, None);
+        assert_eq!(broken.minified_bytes, None);
+        assert_eq!(broken.gzip_bytes, None);
+        assert_eq!(broken.zstd_bytes, None);
+        assert_eq!(
+            summary.total_brotli_bytes, 40,
+            "the workspace total is the sum of what was measured, and nothing else"
+        );
+        assert!(
+            summary
+                .treemap
+                .iter()
+                .all(|item| item.specifier != "broken"),
+            "an import with no size has no slice of the treemap"
+        );
     }
 
     #[test]

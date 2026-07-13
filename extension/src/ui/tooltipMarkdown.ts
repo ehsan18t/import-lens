@@ -8,11 +8,14 @@ import {
   type CompressionFormat,
   formatBytes,
   labelForCompression,
+  type MeasuredSizes,
+  measuredSizes,
 } from "./format.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
+// "This size may include unused exports" is a caveat ABOUT a size, so it needs one.
 export const isConservativeEstimate = (result: ImportResult): boolean =>
-  !result.error && (result.side_effects || !result.truly_treeshakeable);
+  measuredSizes(result) !== null && (result.side_effects || !result.truly_treeshakeable);
 
 export const conservativeSizingMarkdown = (result: ImportResult): string | null =>
   isConservativeEstimate(result)
@@ -26,11 +29,11 @@ const compressionTitles: Record<Exclude<CompressionFormat, "all">, string> = {
 };
 
 const selectedCompressionSize = (
-  result: ImportResult,
+  sizes: MeasuredSizes,
   compression: CompressionFormat,
 ): { label: string; value: string } => ({
   label: compression === "all" ? "Brotli" : compressionTitles[compression],
-  value: `${formatBytes(bytesForCompression(result, compression))} ${labelForCompression(compression)}`,
+  value: `${formatBytes(bytesForCompression(sizes, compression))} ${labelForCompression(compression)}`,
 });
 
 export const copyDiagnosticsMarkdown = (result: ImportResult): string => {
@@ -41,20 +44,32 @@ export const copyDiagnosticsMarkdown = (result: ImportResult): string => {
 export const resultHasDiagnosticsLink = (result: ImportResult): boolean =>
   Boolean(result.error) || result.diagnostics.length > 0;
 
+/**
+ * The hover's size block — or the honest absence of one.
+ *
+ * It was ungated: an import with no size rendered five rows of **"NaN kB"** under a bold "Size"
+ * heading. The size block is the one thing a hover cannot fake.
+ */
 export const importResultSizeMarkdown = (
   result: ImportResult,
   compression: CompressionFormat,
 ): string => {
-  const selected = selectedCompressionSize(result, compression);
+  const sizes = measuredSizes(result);
+
+  if (!sizes) {
+    return ["**Size**", "- Size unavailable: this import could not be measured."].join("\n");
+  }
+
+  const selected = selectedCompressionSize(sizes, compression);
 
   return [
     "**Size**",
     `- Selected ${selected.label}: **${selected.value}**`,
-    `- Raw: ${formatBytes(result.raw_bytes)}`,
-    `- Minified: ${formatBytes(result.minified_bytes)}`,
-    `- Gzip: ${formatBytes(result.gzip_bytes)}`,
-    `- Brotli: ${formatBytes(result.brotli_bytes)}`,
-    `- Zstd: ${formatBytes(result.zstd_bytes)}`,
+    `- Raw: ${formatBytes(sizes.raw_bytes)}`,
+    `- Minified: ${formatBytes(sizes.minified_bytes)}`,
+    `- Gzip: ${formatBytes(sizes.gzip_bytes)}`,
+    `- Brotli: ${formatBytes(sizes.brotli_bytes)}`,
+    `- Zstd: ${formatBytes(sizes.zstd_bytes)}`,
   ].join("\n");
 };
 

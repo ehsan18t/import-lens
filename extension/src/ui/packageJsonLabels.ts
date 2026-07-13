@@ -1,7 +1,13 @@
 import type { ImportLensConfig } from "../config.js";
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 import type { PackageJsonDependencySectionName } from "../ipc/protocol.js";
-import { bytesForCompression, formatBytes, labelForCompression } from "./format.js";
+import {
+  bytesForCompression,
+  formatBytes,
+  labelForCompression,
+  type MeasuredSizes,
+  measuredSizes,
+} from "./format.js";
 import type { PackageJsonPrimaryTone, PackageJsonSuffixTone } from "./packageJsonHintVisuals.js";
 import { isTypesOnlyResult } from "./resultDiagnostics.js";
 
@@ -108,7 +114,11 @@ export const packageJsonDependencyHintParts = (
     };
   }
 
-  if (state.status === "unavailable" || !state.result || state.result.error) {
+  // "Is there a size?" — a dependency the engine could not measure reads "unavailable", which is
+  // what it is, rather than borrowing a number from somewhere else.
+  const sizes = measuredSizes(state.result);
+
+  if (state.status === "unavailable" || !state.result || !sizes) {
     return {
       primary: "unavailable",
       primaryTone: "unavailable",
@@ -125,7 +135,7 @@ export const packageJsonDependencyHintParts = (
   }
 
   const confidencePrefix = state.result.confidence === "low" ? "~" : "";
-  const primary = `${confidencePrefix}${formatBytes(bytesForCompression(state.result, config.compression))} ${labelForCompression(config.compression)}`;
+  const primary = `${confidencePrefix}${formatBytes(bytesForCompression(sizes, config.compression))} ${labelForCompression(config.compression)}`;
 
   return {
     primary,
@@ -154,21 +164,24 @@ export const packageJsonSectionSummaryLabel = (
     return null;
   }
 
-  const measuredStates = sectionStates.filter(
-    (
+  // "N/M measured" means exactly that now: a dependency with no size is not one of the N, and its
+  // bytes are not in the total. `!state.result?.error` counted a fabricated size as a measurement.
+  const measuredSections = sectionStates
+    .map((state): [PackageJsonDependencyHintState, MeasuredSizes | null] => [
       state,
-    ): state is PackageJsonDependencyHintState & {
-      result: NonNullable<PackageJsonDependencyHintState["result"]>;
-    } => state.status === "ready" && Boolean(state.result) && !state.result?.error,
-  );
-  const totalBytes = measuredStates.reduce(
-    (sum, state) => sum + bytesForCompression(state.result, config.compression),
+      state.status === "ready" ? measuredSizes(state.result) : null,
+    ])
+    .filter((pair): pair is [PackageJsonDependencyHintState, MeasuredSizes] => pair[1] !== null);
+  const measuredStates = measuredSections.map(([state]) => state);
+  const totalBytes = measuredSections.reduce(
+    (sum, [, sizes]) => sum + bytesForCompression(sizes, config.compression),
     0,
   );
   const missingCount = sectionStates.filter((state) => state.status === "missing").length;
   const unavailableCount = sectionStates.filter(
     (state) =>
-      state.status === "unavailable" || (state.status === "ready" && Boolean(state.result?.error)),
+      state.status === "unavailable" ||
+      (state.status === "ready" && measuredSizes(state.result) === null),
   ).length;
   const loadingCount = sectionStates.filter((state) => state.status === "loading").length;
 

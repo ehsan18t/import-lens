@@ -183,14 +183,73 @@ impl ResultFreshness {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImportResult {
-    pub specifier: String,
+/// The five sizes of a build that **succeeded**.
+///
+/// The only way to put a size on an [`ImportResult`] (ADR-0006, invariant 1: *a size exists if
+/// and only if a build succeeded*). A failing path cannot reach for one, because the constructor
+/// that takes it — [`ImportResult::measured`] — is the one that does not take a failure stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MeasuredSizes {
     pub raw_bytes: u64,
     pub minified_bytes: u64,
     pub gzip_bytes: u64,
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
+}
+
+impl MeasuredSizes {
+    /// A genuine zero. Reserved for a package that really does ship no runtime bytes — a
+    /// declarations-only package (`pipeline::types_only`), which is Measured, not Unmeasured:
+    /// the build did not fail, there was simply nothing to build.
+    pub const ZERO: Self = Self {
+        raw_bytes: 0,
+        minified_bytes: 0,
+        gzip_bytes: 0,
+        brotli_bytes: 0,
+        zstd_bytes: 0,
+    };
+}
+
+/// One import's analysis, in exactly one of the two states a *response* can carry (ADR-0006).
+/// The third — Loading — is not an `ImportResult` at all: it is
+/// [`ImportAnalysisItem`] with `status: Loading` and no result.
+///
+/// * **Measured** — the five sizes are `Some`, `unmeasured_stage` is `None`, `error` is `None`.
+/// * **Unmeasured** — the five sizes are `None`, `unmeasured_stage` names the stage that could
+///   not answer, and `error` carries its message.
+///
+/// The size fields are **private**, and the only two constructors are [`Self::measured`] and
+/// [`Self::unmeasured`]. That is what makes the **fabricated** state unrepresentable: there is no
+/// way to put a size on a result except by declaring that a build produced it, so a failing path
+/// cannot reach for one. Read a size back through [`Self::sizes`] or [`Self::brotli_bytes`] and the
+/// compiler asks the only question a consumer is allowed to ask: **is there a size?** — never "is
+/// there an error?".
+///
+/// What is **not** unrepresentable — and was claimed to be — is *a size together with a transient
+/// stage*. That shape is REAL: a measurement whose full-package comparison build timed out has
+/// genuine sizes and an untrustworthy `truly_treeshakeable` (`pipeline::analyze`). Deleting it to
+/// satisfy a slogan would delete the only evidence that the tree-shaking verdict is fabricated, and
+/// no type can stop it anyway — `diagnostics` is an open list of open structs whose `stage` is a
+/// `String`. So it is representable, it is named ([`Self::is_transient`]), and the invariant that
+/// keeps it out of every store is enforced **at the stores**, by [`Self::is_durable`], not by a
+/// convention at the call sites.
+///
+/// Serde note: the sizes are plain `Option<u64>` with **no** `skip_serializing_if` — and neither
+/// have `module_breakdown` or `shared_bytes`, for the same reason. The dominant `Option` pattern in
+/// this file breaks the disk cache for any field that sits mid-struct: the L2 encoding is positional
+/// (`rmp_serde::to_vec`), so a skipped field shortens the msgpack array and every field after it
+/// decodes off by one. An Unmeasured result carries `module_breakdown: None` beside a
+/// `shared_bytes: Some(0)` that `annotate_shared_bytes` stamps on every result, measured or not —
+/// exactly that shape. A plain `Option` writes a `nil` placeholder and keeps the array length.
+/// `cache::disk` guards this. Only `freshness`, which is the LAST serialized field, may skip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportResult {
+    pub specifier: String,
+    raw_bytes: Option<u64>,
+    minified_bytes: Option<u64>,
+    gzip_bytes: Option<u64>,
+    brotli_bytes: Option<u64>,
+    zstd_bytes: Option<u64>,
     pub cache_hit: bool,
     pub side_effects: bool,
     pub truly_treeshakeable: bool,
@@ -200,10 +259,22 @@ pub struct ImportResult {
     #[serde(default)]
     pub confidence_reasons: Vec<String>,
     pub error: Option<String>,
+    /// The stage that could not answer, when there is no size. `None` on a measurement.
+    ///
+    /// Present so a consumer can ask **why** there is no size, not merely whether — the CI gate
+    /// must tell a flaky box (`timeout`) apart from a broken package (`parse`), and
+    /// `should_cache_result` must cache the second and refuse the first. Plain `Option`, no
+    /// `skip_serializing_if`, for the positional-msgpack reason above.
+    #[serde(default)]
+    unmeasured_stage: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Plain `Option`, NO `skip_serializing_if`: mid-struct, and the L2 encoding is positional.
+    /// See the struct's serde note.
+    #[serde(default)]
     pub module_breakdown: Option<Vec<ModuleContribution>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Plain `Option`, NO `skip_serializing_if`: mid-struct, and the L2 encoding is positional.
+    /// See the struct's serde note.
+    #[serde(default)]
     pub shared_bytes: Option<u64>,
     /// Freshness of this served value. `#[serde(default)]` so old disk entries decode
     /// as `Fresh`; `skip_serializing_if = is_fresh` so the DISK (positional msgpack)
@@ -214,6 +285,158 @@ pub struct ImportResult {
     pub freshness: ResultFreshness,
     #[serde(default, skip)]
     pub internal_contributions: Vec<ModuleContribution>,
+}
+
+impl ImportResult {
+    /// **Measured**: a build succeeded and produced these bytes.
+    pub fn measured(specifier: impl Into<String>, sizes: MeasuredSizes) -> Self {
+        Self {
+            specifier: specifier.into(),
+            raw_bytes: Some(sizes.raw_bytes),
+            minified_bytes: Some(sizes.minified_bytes),
+            gzip_bytes: Some(sizes.gzip_bytes),
+            brotli_bytes: Some(sizes.brotli_bytes),
+            zstd_bytes: Some(sizes.zstd_bytes),
+            cache_hit: false,
+            side_effects: false,
+            truly_treeshakeable: false,
+            is_cjs: false,
+            confidence: ConfidenceLevel::Low,
+            confidence_reasons: Vec::new(),
+            error: None,
+            unmeasured_stage: None,
+            diagnostics: Vec::new(),
+            module_breakdown: None,
+            shared_bytes: None,
+            freshness: ResultFreshness::fresh(),
+            internal_contributions: Vec::new(),
+        }
+    }
+
+    /// **Unmeasured**: the build could not answer. No size, ever — not a zero, not an estimate of
+    /// the directory on disk, not the entry file measured alone. The stage says whether that is a
+    /// property of the package's bytes (deterministic: `parse`, `link`, `output_shape`, …) or of
+    /// this moment's scheduling (transient: `timeout`, `panic`, `engine_gone`).
+    pub fn unmeasured(
+        specifier: impl Into<String>,
+        stage: &str,
+        message: impl Into<String>,
+        details: Vec<String>,
+    ) -> Self {
+        let message = message.into();
+        Self {
+            specifier: specifier.into(),
+            raw_bytes: None,
+            minified_bytes: None,
+            gzip_bytes: None,
+            brotli_bytes: None,
+            zstd_bytes: None,
+            cache_hit: false,
+            // Nothing was linked, so nothing can be certified free of side effects or
+            // tree-shaken away. The conservative reading is the only honest one.
+            side_effects: true,
+            truly_treeshakeable: false,
+            is_cjs: false,
+            confidence: ConfidenceLevel::Low,
+            confidence_reasons: vec![
+                "Analysis failed before a bundle size could be measured.".to_owned(),
+            ],
+            error: Some(message.clone()),
+            unmeasured_stage: Some(stage.to_owned()),
+            diagnostics: vec![ImportDiagnostic {
+                stage: stage.to_owned(),
+                message,
+                details,
+            }],
+            module_breakdown: None,
+            shared_bytes: None,
+            freshness: ResultFreshness::fresh(),
+            internal_contributions: Vec::new(),
+        }
+    }
+
+    /// The sizes, if a build produced them. `None` is the whole point: it is the question every
+    /// consumer must ask, and the compiler will not let it be skipped.
+    pub fn sizes(&self) -> Option<MeasuredSizes> {
+        Some(MeasuredSizes {
+            raw_bytes: self.raw_bytes?,
+            minified_bytes: self.minified_bytes?,
+            gzip_bytes: self.gzip_bytes?,
+            brotli_bytes: self.brotli_bytes?,
+            zstd_bytes: self.zstd_bytes?,
+        })
+    }
+
+    pub fn raw_bytes(&self) -> Option<u64> {
+        self.raw_bytes
+    }
+
+    pub fn minified_bytes(&self) -> Option<u64> {
+        self.minified_bytes
+    }
+
+    pub fn gzip_bytes(&self) -> Option<u64> {
+        self.gzip_bytes
+    }
+
+    pub fn brotli_bytes(&self) -> Option<u64> {
+        self.brotli_bytes
+    }
+
+    pub fn zstd_bytes(&self) -> Option<u64> {
+        self.zstd_bytes
+    }
+
+    /// The stage that could not answer, on an Unmeasured result.
+    pub fn unmeasured_stage(&self) -> Option<&str> {
+        self.unmeasured_stage.as_deref()
+    }
+
+    /// This result describes **this run of the daemon** rather than the package: either the build
+    /// itself was cancelled/unwound/orphaned, or a secondary build (the full-package comparison)
+    /// was, which fabricates `truly_treeshakeable: false` on an otherwise sound measurement.
+    ///
+    /// Both are reasons no durable store may take it (ADR-0006, invariant 3) — but they are not the
+    /// only ones, so this is not the gate. [`Self::is_durable`] is.
+    pub fn is_transient(&self) -> bool {
+        self.unmeasured_stage
+            .as_deref()
+            .is_some_and(crate::engine::stage::is_transient)
+            || self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| crate::engine::stage::is_transient(&diagnostic.stage))
+    }
+
+    /// **The gate every durable store applies** (ADR-0006, invariant 3). A store that outlives the
+    /// request — the L1 memory cache, the L2 disk cache, the extension's histories — may take this
+    /// result only if this is true, and each of those stores asks *itself*, at the insert, rather
+    /// than trusting its callers to have asked.
+    ///
+    /// It is an ALLOWLIST over stages, not a denylist of the three transient ones
+    /// (`pipeline::stage::may_enter_a_durable_store` explains why: `entry_metadata` is a bare
+    /// `fs::metadata` failure — transient in fact, and absent from every list of the engine's
+    /// transient stages). Both places a stage can hide are checked:
+    ///
+    /// * the result's own `unmeasured_stage` — the build that could not answer;
+    /// * every diagnostic — which is how a **successful** measurement whose full-package comparison
+    ///   build merely parked is caught, since its `truly_treeshakeable: false` was fabricated by
+    ///   that park and would otherwise be cached as a fact about a healthy package.
+    ///
+    /// A Measured result with no failure diagnostics is durable, which is the overwhelmingly common
+    /// case and the one that must stay fast.
+    pub fn is_durable(&self) -> bool {
+        let stage_is_durable =
+            |stage: &str| crate::pipeline::stage::may_enter_a_durable_store(stage);
+
+        self.unmeasured_stage
+            .as_deref()
+            .is_none_or(&stage_is_durable)
+            && self
+                .diagnostics
+                .iter()
+                .all(|diagnostic| stage_is_durable(&diagnostic.stage))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,6 +733,11 @@ pub struct WorkspaceReportRequest {
     pub budgets: WorkspaceReportBudgets,
 }
 
+/// One row of the workspace report.
+///
+/// The four size fields are `Option` for the same reason [`ImportResult`]'s are: an import the
+/// engine could not measure has no size, and `.unwrap_or_default()` here would print **"0 B"** —
+/// the sentinel zero this model exists to abolish, in the one surface a user exports and shares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceReportRow {
@@ -518,10 +746,10 @@ pub struct WorkspaceReportRow {
     pub source_file: String,
     pub line: u32,
     pub runtime: String,
-    pub minified_bytes: u64,
-    pub gzip_bytes: u64,
-    pub brotli_bytes: u64,
-    pub zstd_bytes: u64,
+    pub minified_bytes: Option<u64>,
+    pub gzip_bytes: Option<u64>,
+    pub brotli_bytes: Option<u64>,
+    pub zstd_bytes: Option<u64>,
     pub shared_bytes: u64,
     pub confidence: String,
     pub confidence_reasons: String,
@@ -741,6 +969,16 @@ pub struct FileSizeResponse {
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
     pub imports: Vec<ImportResult>,
+    /// These totals are a **floor**, not the file's size — the same flag, and the same meaning, as
+    /// [`FileSizeDocumentResponse::incomplete`].
+    ///
+    /// It was missing here, which made this the one surface where a floor and a measurement are
+    /// indistinguishable: the legacy `file_size` request answers with the same
+    /// [`crate::pipeline::file_size::FileSizeComputation`] and simply dropped the one field that
+    /// says the number is short. Additive and `#[serde(default)]`, so an older client that ignores
+    /// it is no worse off than it was.
+    #[serde(default)]
+    pub incomplete: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }

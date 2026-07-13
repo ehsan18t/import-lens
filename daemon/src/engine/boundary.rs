@@ -174,6 +174,7 @@ fn run_on_engine<T: Send + 'static>(
             message: "the engine runtime dropped the build without replying".to_owned(),
             diagnostics: Vec::new(),
             loaded_paths: Vec::new(),
+            read_time_fingerprints: Vec::new(),
         })
     })
 }
@@ -192,6 +193,7 @@ fn panic_failure(payload: &(dyn std::any::Any + Send)) -> BundleFailure {
         message: format!("engine build panicked: {detail}"),
         diagnostics: Vec::new(),
         loaded_paths: Vec::new(),
+        read_time_fingerprints: Vec::new(),
     }
 }
 
@@ -208,6 +210,7 @@ fn timeout_failure(limit: Duration) -> BundleFailure {
         ),
         diagnostics: Vec::new(),
         loaded_paths: Vec::new(),
+        read_time_fingerprints: Vec::new(),
     }
 }
 

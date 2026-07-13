@@ -33,28 +33,20 @@ fn lock_generation_race_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn sample_result(specifier: &str) -> import_lens_daemon::ipc::protocol::ImportResult {
-    // Mirror the helper in tests/memory_cache.rs (full field set).
-    use import_lens_daemon::ipc::protocol::ImportResult;
-    ImportResult {
-        freshness: import_lens_daemon::ipc::protocol::ResultFreshness::fresh(),
-        specifier: specifier.to_owned(),
-        raw_bytes: 10,
-        minified_bytes: 8,
-        gzip_bytes: 6,
-        brotli_bytes: 5,
-        zstd_bytes: 5,
-        cache_hit: false,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: Default::default(),
-        confidence_reasons: Vec::new(),
-        error: None,
-        diagnostics: Vec::new(),
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    }
+    // Mirror the helper in tests/memory_cache.rs.
+    use import_lens_daemon::ipc::protocol::{ImportResult, MeasuredSizes};
+    let mut result = ImportResult::measured(
+        specifier,
+        MeasuredSizes {
+            raw_bytes: 10,
+            minified_bytes: 8,
+            gzip_bytes: 6,
+            brotli_bytes: 5,
+            zstd_bytes: 5,
+        },
+    );
+    result.truly_treeshakeable = true;
+    result
 }
 
 fn cached_import(

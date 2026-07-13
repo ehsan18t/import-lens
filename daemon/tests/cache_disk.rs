@@ -13,7 +13,7 @@ use std::{
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CURRENT_SCHEMA_VERSION: u64 = 7;
+const CURRENT_SCHEMA_VERSION: u64 = 8;
 
 mod common;
 
@@ -65,30 +65,28 @@ fn opening_a_stale_schema_db_recreates_it_empty() {
 }
 
 fn result(specifier: &str) -> ImportResult {
-    ImportResult {
-        freshness: import_lens_daemon::ipc::protocol::ResultFreshness::fresh(),
-        specifier: specifier.to_owned(),
-        raw_bytes: 10,
-        minified_bytes: 8,
-        gzip_bytes: 7,
-        brotli_bytes: 6,
-        zstd_bytes: 5,
-        cache_hit: false,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: ConfidenceLevel::High,
-        confidence_reasons: vec!["test fixture confidence".to_owned()],
-        error: None,
-        diagnostics: vec![ImportDiagnostic {
-            stage: "test".to_owned(),
-            message: "cached".to_owned(),
-            details: Vec::new(),
-        }],
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    }
+    let mut result = ImportResult::measured(
+        specifier,
+        import_lens_daemon::ipc::protocol::MeasuredSizes {
+            raw_bytes: 10,
+            minified_bytes: 8,
+            gzip_bytes: 7,
+            brotli_bytes: 6,
+            zstd_bytes: 5,
+        },
+    );
+    result.truly_treeshakeable = true;
+    result.confidence = ConfidenceLevel::High;
+    result.confidence_reasons = vec!["test fixture confidence".to_owned()];
+    result.diagnostics = vec![ImportDiagnostic {
+        // A real informational stage. A fabricated one ("test") is now REFUSED by every durable
+        // store — an unclassified stage is not durable (`pipeline::stage`) — so a fixture that used
+        // one was building a result the cache correctly declines to keep.
+        stage: import_lens_daemon::engine::diagnostic_stage::EXTERNAL.to_owned(),
+        message: "cached".to_owned(),
+        details: Vec::new(),
+    }];
+    result
 }
 
 fn read_schema_version(storage_path: &Path) -> u64 {
