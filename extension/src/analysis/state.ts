@@ -20,7 +20,7 @@ export interface ImportAnalysisState {
 /**
  * The vscode-facing wrapper around {@link DocumentAnalysisStates}: it owns the change event and
  * the `Uri` keying, and delegates every decision about what a document's states ARE — including
- * how a push that outran its response is held until the states exist — to the vscode-free core.
+ * how a push that raced its own response survives it — to the vscode-free core.
  */
 export class AnalysisStore implements vscode.Disposable {
   readonly #documents = new DocumentAnalysisStates();
@@ -28,8 +28,21 @@ export class AnalysisStore implements vscode.Disposable {
 
   readonly onDidChange: vscode.Event<vscode.Uri> = this.#onDidChange.event;
 
-  set(uri: vscode.Uri, states: ImportAnalysisState[]): void {
-    this.#documents.set(uri.toString(), states);
+  /**
+   * Store the states an analysis produced. `generation` is that analysis's request id, and it is
+   * not optional bookkeeping: it is what tells the core which held pushes belong to these states
+   * and must be re-applied over them (see {@link DocumentAnalysisStates.set}).
+   *
+   * To recompute over the states already stored — insights after a config change — use
+   * {@link replace}, which claims no generation and holds no pushes to account for.
+   */
+  set(uri: vscode.Uri, states: ImportAnalysisState[], generation: number): void {
+    this.#documents.set(uri.toString(), states, generation);
+    this.#onDidChange.fire(uri);
+  }
+
+  replace(uri: vscode.Uri, states: ImportAnalysisState[]): void {
+    this.#documents.replace(uri.toString(), states);
     this.#onDidChange.fire(uri);
   }
 
@@ -44,9 +57,8 @@ export class AnalysisStore implements vscode.Disposable {
    * decorations re-render in place. No-op if nothing matched or the batch was superseded
    * (`options.isCurrent === false`).
    *
-   * A push for a document whose states have not been stored yet is HELD, not dropped: the
-   * response frame and the first push routinely arrive in one socket read, and the push is
-   * dispatched before the awaited continuation that stores the response. See
+   * A push that arrives in the same socket chunk as the response it belongs to is also HELD, so
+   * that the `set` storing that response re-applies it rather than overwriting it. See
    * {@link DocumentAnalysisStates}.
    */
   applyRefreshedResults(

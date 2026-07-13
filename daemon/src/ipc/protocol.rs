@@ -346,6 +346,18 @@ pub struct FileSizeDocumentResponse {
     pub zstd_bytes: u64,
     pub imports: Vec<ImportResult>,
     pub states: Vec<ImportAnalysisItem>,
+    /// These totals are a **floor**, not the file's size: an import that belongs in them was not
+    /// measured — its own build had not landed when the sum was taken (`status: "loading"`), or a
+    /// transient engine failure fabricated the number it carries
+    /// ([`crate::pipeline::file_size::FileSizeComputation::incomplete`]).
+    ///
+    /// It is on the wire because the client has durable stores of its own (the bundle-impact
+    /// history), and neither of the other two fields can tell it this: `error` is `None` — the sum
+    /// succeeded, it just summed less than the file — and the diagnostics that DO name the missing
+    /// import are stage-tagged `file_size_fallback`, which a deterministic per-import failure (a
+    /// real, cacheable fact, and no reason to distrust the total) carries too. SRS FR-024a/FR-026c.
+    #[serde(default)]
+    pub incomplete: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }

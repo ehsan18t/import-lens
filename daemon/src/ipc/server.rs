@@ -46,6 +46,20 @@ const LIFECYCLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// cold-open analysis burst settle first (see `spawn_cache_maintenance`).
 const CACHE_MAINTENANCE_DELAY: Duration = Duration::from_secs(60);
 
+/// How long shutdown, an idle recycle, or a lost connection waits for the tasks it has already
+/// asked to stop (SRS FR-004c).
+///
+/// It has to be a *bound*, not a plain join, because one class of task cannot be asked to stop: a
+/// build already inside Rolldown runs until its own `BUILD_TIMEOUT` (8s) and nothing can cancel it.
+/// The extension force-kills the daemon 5s after sending `shutdown`
+/// (`extension/src/daemon/processLifecycle.ts`), so an unbounded join hands the process to the
+/// killer *before* `flush_cache` ever runs — and the flush is the whole point of a graceful
+/// shutdown. Waiting 2s and flushing anyway trades the one thing an abandoned build can cost (its
+/// own result is not persisted, so it is rebuilt next session — and a build that hit the timeout
+/// was never cacheable anyway, FR-026c) against the thing losing the flush costs: every entry the
+/// session computed.
+const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Aborts the wrapped task when dropped (connection end, or replacement by a
 /// post-Hello respawn).
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -94,22 +108,29 @@ impl RegistryRefreshLifecycle {
         }
         flag
     }
-}
 
-impl Drop for RegistryRefreshLifecycle {
-    fn drop(&mut self) {
-        // Connection ended (disconnect, idle recycle, shutdown): cancel every
-        // source's still-draining block so its queued jobs skip remaining fetches.
+    /// Cancel every source's block. `Drop` does this too, but `Drop` runs when the connection
+    /// function RETURNS — which on the shutdown path is after the join it was supposed to shorten.
+    fn cancel_all(&self) {
         for active in self.active_by_source.values() {
             active.store(true, Ordering::Release);
         }
     }
 }
 
-/// Per-document cancellation for background work a request left running: the SWR revalidation
-/// after a stale size read, and the pending-import builds a streamed document analysis handed
-/// off. A newer request for the SAME document flips the previous flag (the work is for a document
-/// state the user has already replaced); the connection ending flips all of them.
+impl Drop for RegistryRefreshLifecycle {
+    fn drop(&mut self) {
+        // Connection ended (disconnect, idle recycle, shutdown): cancel every
+        // source's still-draining block so its queued jobs skip remaining fetches.
+        self.cancel_all();
+    }
+}
+
+/// Per-document cancellation for work a request left running or has not started yet: the SWR
+/// revalidation after a stale size read, the pending-import builds a streamed document analysis
+/// handed off, and the combined file-size build a queued size read has not entered yet. A newer
+/// request for the SAME document flips the previous flag (the work is for a document state the
+/// user has already replaced); the connection ending flips all of them.
 ///
 /// One instance per KIND of background work, never one shared between them: the extension sends
 /// `AnalyzeDocument` and then `FileSizeDocument` for the same document, so a shared instance
@@ -127,24 +148,86 @@ impl DocumentTaskLifecycle {
     }
 
     fn start_document(&mut self, workspace_root: &str, document_path: &str) -> Arc<AtomicBool> {
-        let key = swr_document_key(workspace_root, document_path);
+        let key = document_key(workspace_root, document_path);
         let flag = Arc::new(AtomicBool::new(false));
         if let Some(previous) = self.active_by_document.insert(key, Arc::clone(&flag)) {
             previous.store(true, Ordering::Release);
         }
         flag
     }
-}
 
-impl Drop for DocumentTaskLifecycle {
-    fn drop(&mut self) {
+    /// Cancel every document's work. `Drop` does this too, but `Drop` runs when the connection
+    /// function RETURNS — which on the shutdown path is after the join it was supposed to shorten,
+    /// making it useless exactly when it matters most.
+    fn cancel_all(&self) {
         for active in self.active_by_document.values() {
             active.store(true, Ordering::Release);
         }
     }
 }
 
-fn swr_document_key(workspace_root: &str, document_path: &str) -> String {
+impl Drop for DocumentTaskLifecycle {
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
+/// At most ONE combined file-size build per document at a time.
+///
+/// The combined build (one Rolldown build per runtime, for the file's own totals) is the one piece
+/// of engine work with neither supersession nor single-flight of its own — `FileSizeDocument` is
+/// sent on every keystroke's analysis, and since the connection loop became a multiplexer those
+/// handlers run CONCURRENTLY. Nothing then stopped a user typing in an Astro file from stacking
+/// combined builds against the two-permit engine pool, each holding a permit for up to
+/// `BUILD_TIMEOUT`, while the per-import builds of every other document queued behind them.
+///
+/// The gate serializes them per document. Paired with the supersession flag it forms
+/// [`CombinedBuildBound`], which is what the interactive size reads run under, and which is where
+/// the whole bound is described.
+struct DocumentBuildGate {
+    gates: HashMap<String, Arc<tokio::sync::Semaphore>>,
+}
+
+impl DocumentBuildGate {
+    fn new() -> Self {
+        Self {
+            gates: HashMap::new(),
+        }
+    }
+
+    fn gate_for(
+        &mut self,
+        workspace_root: &str,
+        document_path: &str,
+    ) -> Arc<tokio::sync::Semaphore> {
+        // A gate nobody holds or waits on (`strong_count == 1`: only this map) is inert, so
+        // dropping it loses nothing and keeps the map the size of the documents actually in
+        // flight rather than of every document the session ever sized.
+        self.gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+
+        Arc::clone(
+            self.gates
+                .entry(document_key(workspace_root, document_path))
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1))),
+        )
+    }
+}
+
+/// The bound an INTERACTIVE combined file-size build runs under: wait for the document's in-flight
+/// one, then build only if a newer size read has not replaced this one in the meantime.
+///
+/// Only a size read tagged with the analysis generation it belongs to gets one, because only those
+/// can stack: the extension sends one per keystroke. The "Show current file size" command and
+/// `importlens check` send a size read that is the user's whole request — a human cannot stack them,
+/// nothing supersedes them, and making them queue behind a parked build (up to `BUILD_TIMEOUT`, on
+/// top of their own) would turn a slow answer into the client's request timeout, which is no answer
+/// at all.
+struct CombinedBuildBound {
+    gate: Arc<tokio::sync::Semaphore>,
+    superseded: Arc<AtomicBool>,
+}
+
+fn document_key(workspace_root: &str, document_path: &str) -> String {
     format!("{workspace_root}\0{document_path}")
 }
 
@@ -354,6 +437,10 @@ where
     // Cancels the pending-import builds a superseded document analysis handed off. Separate from
     // the SWR lifecycle on purpose — see `DocumentTaskLifecycle`.
     let mut document_stream_lifecycle = DocumentTaskLifecycle::new();
+    // Bounds the combined file-size build: one per document at a time (the gate), and a queued one
+    // a newer size read has replaced never runs at all (the lifecycle flag).
+    let mut size_build_lifecycle = DocumentTaskLifecycle::new();
+    let mut size_build_gate = DocumentBuildGate::new();
     let lifecycle_storage_path = storage_path;
     // Unbounded on purpose, and bounded in practice. The loop is the socket's only writer, so a
     // client that stops reading backs the write up in the outbound arm — and while the loop is
@@ -376,7 +463,13 @@ where
                 if let Some(frame) = outbound
                     && let Err(error) = framed.send(frame).await
                 {
-                    prefetcher.cancel();
+                    cancel_background_work(
+                        &prefetcher,
+                        &registry_refresh_lifecycle,
+                        &document_stream_lifecycle,
+                        &swr_refresh_lifecycle,
+                        &size_build_lifecycle,
+                    );
                     wait_for_active_tasks(&mut active_tasks).await;
                     return Err(Box::new(error));
                 }
@@ -385,7 +478,13 @@ where
             payload = framed.next() => match payload.transpose() {
                 Ok(payload) => payload,
                 Err(error) => {
-                    prefetcher.cancel();
+                    cancel_background_work(
+                        &prefetcher,
+                        &registry_refresh_lifecycle,
+                        &document_stream_lifecycle,
+                        &swr_refresh_lifecycle,
+                        &size_build_lifecycle,
+                    );
                     wait_for_active_tasks(&mut active_tasks).await;
                     return Err(Box::new(error));
                 }
@@ -399,6 +498,7 @@ where
                     &prefetcher,
                     &service,
                     &mut active_tasks,
+                    &mut _maintenance_task,
                 )
                 .await
                 {
@@ -409,7 +509,13 @@ where
             }
         };
         let Some(payload) = payload else {
-            prefetcher.cancel();
+            cancel_background_work(
+                &prefetcher,
+                &registry_refresh_lifecycle,
+                &document_stream_lifecycle,
+                &swr_refresh_lifecycle,
+                &size_build_lifecycle,
+            );
             wait_for_active_tasks(&mut active_tasks).await;
             break;
         };
@@ -528,6 +634,7 @@ where
                     &prefetcher,
                     &service,
                     &mut active_tasks,
+                    &mut _maintenance_task,
                 )
                 .await
                 {
@@ -573,6 +680,7 @@ where
                     &prefetcher,
                     &service,
                     &mut active_tasks,
+                    &mut _maintenance_task,
                 )
                 .await
                 {
@@ -813,7 +921,10 @@ where
                 );
                 let flush_service = std::sync::Arc::clone(&service);
 
-                tokio::spawn(async move {
+                // Tracked like every other task (FR-004c): it owns the client's response AND the
+                // registry snapshot flush, so a shutdown that did not join it could exit with the
+                // fetched metadata unwritten and the response unsent.
+                let forwarder = tokio::spawn(async move {
                     let mut ordered_results = vec![None; target_count];
                     while let Some((index, result)) = partial_rx.recv().await {
                         let mut indexes = vec![index];
@@ -868,6 +979,7 @@ where
                         },
                     );
                 });
+                track_active_task(&mut active_tasks, forwarder);
                 continue;
             }
             ClientMessage::RefreshRegistryHints(request) => {
@@ -891,7 +1003,8 @@ where
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 service.spawn_workspace_report(request, response_tx);
                 let outbound = outbound_tx.clone();
-                tokio::spawn(async move {
+                // Tracked like every other task (FR-004c).
+                let forwarder = tokio::spawn(async move {
                     let response = response_rx.await.unwrap_or_else(|_| {
                         workspace_report_protocol_error(
                             &request_for_error,
@@ -900,6 +1013,7 @@ where
                     });
                     queue_outbound(&outbound, &response);
                 });
+                track_active_task(&mut active_tasks, forwarder);
                 continue;
             }
             ClientMessage::WorkspaceReport(request) => {
@@ -967,9 +1081,23 @@ where
                 lifecycle.record_batch();
                 let swr_cancelled = swr_refresh_lifecycle
                     .start_document(&request.workspace_root, &request.active_document_path);
+                // Only an interactive size read is bounded, and only those need to be: see
+                // `CombinedBuildBound`.
+                let combined_build = request.analysis_generation.map(|_| CombinedBuildBound {
+                    gate: size_build_gate
+                        .gate_for(&request.workspace_root, &request.active_document_path),
+                    superseded: size_build_lifecycle
+                        .start_document(&request.workspace_root, &request.active_document_path),
+                });
                 track_active_task(
                     &mut active_tasks,
-                    spawn_file_size_document(&service, &outbound_tx, request, swr_cancelled),
+                    spawn_file_size_document(
+                        &service,
+                        &outbound_tx,
+                        request,
+                        swr_cancelled,
+                        combined_build,
+                    ),
                 );
             }
             ClientMessage::FileSizeDocument(request) => {
@@ -1003,15 +1131,29 @@ where
                 );
             }
             ClientMessage::Shutdown(_) => {
-                prefetcher.cancel();
+                // Abort the pending maintenance pass first: it is scheduled, not started, and a
+                // pass that begins while we are flushing is compacting the shards the flush is
+                // writing to.
+                _maintenance_task = None;
+                cancel_background_work(
+                    &prefetcher,
+                    &registry_refresh_lifecycle,
+                    &document_stream_lifecycle,
+                    &swr_refresh_lifecycle,
+                    &size_build_lifecycle,
+                );
+                // Bounded (FR-004c): a build already inside Rolldown cannot be cancelled and runs
+                // to `BUILD_TIMEOUT`, which is LONGER than the extension's force-kill grace — so
+                // joining it without a bound is how a graceful shutdown loses its flush entirely.
                 wait_for_active_tasks(&mut active_tasks).await;
                 // Anything those tasks queued on their way out — a response, a last streamed
                 // import — is still owed to the client, and the loop is no longer in the select
                 // that would have written it.
                 drain_outbound(&mut framed, &mut outbound_rx).await;
-                // Drain pending disk inserts (not just recency touches) so a
-                // clean shutdown never relies on Drop running before the process
-                // exits, mirroring the recycle path.
+                // Drain pending disk inserts (not just recency touches) so a clean shutdown never
+                // relies on Drop running before the process exits, mirroring the recycle path.
+                // Unconditional, even when a task outlived the join: whatever that task would have
+                // added is worth one rebuild, and everything already computed is worth the session.
                 if let Err(error) = service.flush_cache() {
                     logging::log_warn(
                         "lifecycle",
@@ -1033,16 +1175,77 @@ where
 /// Registers a task the connection owns. Finished handles are pruned on each push, so a long-lived
 /// connection does not accumulate them.
 fn track_active_task(active_tasks: &mut Vec<JoinHandle<()>>, handle: JoinHandle<()>) {
-    active_tasks.retain(|active| !active.is_finished());
+    reap_finished_tasks(active_tasks);
     active_tasks.push(handle);
 }
 
-async fn wait_for_active_tasks(active_tasks: &mut Vec<JoinHandle<()>>) {
-    while let Some(handle) = active_tasks.pop() {
-        if let Err(error) = handle.await {
-            logging::log_warn("ipc", format!("connection task failed: {error}"));
+/// Drop the handles of tasks that have already finished.
+///
+/// It is not only housekeeping: `recycle_if_needed` reads `active_tasks.is_empty()` as "this
+/// connection has nothing in flight", and a finished handle is indistinguishable from a running one
+/// to `is_empty`. Since every request now runs as a task, a connection that has served ANY request
+/// carries handles for ever, so without this the first recycle check always found work, deferred,
+/// and the recycle waited a further 60s tick for no reason.
+fn reap_finished_tasks(active_tasks: &mut Vec<JoinHandle<()>>) {
+    active_tasks.retain(|active| !active.is_finished());
+}
+
+/// Join the tasks this connection spawned, giving up after [`TASK_JOIN_TIMEOUT`]. Returns whether
+/// every one of them finished; the handles that did not are left in `active_tasks`.
+///
+/// Callers must cancel what they can BEFORE calling this (see `cancel_background_work`) — the wait
+/// is for work that cannot be cancelled, not a substitute for cancelling.
+async fn wait_for_active_tasks(active_tasks: &mut Vec<JoinHandle<()>>) -> bool {
+    let deadline = tokio::time::Instant::now() + TASK_JOIN_TIMEOUT;
+    let mut unfinished = Vec::new();
+
+    for mut handle in std::mem::take(active_tasks) {
+        match tokio::time::timeout_at(deadline, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                logging::log_warn("ipc", format!("connection task failed: {error}"));
+            }
+            // Past the deadline. `timeout_at` returns immediately for every remaining handle, so
+            // the whole loop costs the bound once, not once per task.
+            Err(_) => unfinished.push(handle),
         }
     }
+
+    if !unfinished.is_empty() {
+        logging::log_warn(
+            "ipc",
+            format!(
+                "{} connection task(s) did not finish within {}s; continuing without them",
+                unfinished.len(),
+                TASK_JOIN_TIMEOUT.as_secs()
+            ),
+        );
+    }
+
+    let finished = unfinished.is_empty();
+    *active_tasks = unfinished;
+    finished
+}
+
+/// Stop every background job this connection owns that CAN be stopped, before the connection waits
+/// for the ones that cannot.
+///
+/// Cancellation here is cooperative and cheap: a superseded/abandoned build, revalidation or
+/// registry fetch checks its flag before it starts and skips. What it cannot reach is a build
+/// already inside Rolldown — hence [`TASK_JOIN_TIMEOUT`] — and the prefetch jobs, which are
+/// abandoned rather than joined (NFR-004c).
+fn cancel_background_work(
+    prefetcher: &Prefetcher,
+    registry_refresh: &RegistryRefreshLifecycle,
+    document_stream: &DocumentTaskLifecycle,
+    swr_refresh: &DocumentTaskLifecycle,
+    size_builds: &DocumentTaskLifecycle,
+) {
+    prefetcher.cancel();
+    registry_refresh.cancel_all();
+    document_stream.cancel_all();
+    swr_refresh.cancel_all();
+    size_builds.cancel_all();
 }
 
 /// Answer a document analysis from the cache, then build its misses and push each one as it lands.
@@ -1126,17 +1329,53 @@ fn spawn_document_analysis(
 /// Size a document, then — if anything was served stale — revalidate it in the background and push
 /// the fresh results. One task, off the connection loop: the combined build this runs is the one
 /// that used to hold the loop hostage while every streamed import queued up behind it.
+///
+/// Off the loop, but not unbounded — for an interactive read. `combined_build` admits ONE combined
+/// build per document at a time and drops the build of a size read a newer keystroke has already
+/// replaced. Without it, every keystroke in a document with imports stacked another combined build
+/// against the two-permit engine pool, since the day the handlers started running concurrently. See
+/// [`CombinedBuildBound`].
 fn spawn_file_size_document(
     service: &std::sync::Arc<ImportLensService>,
     outbound_tx: &mpsc::UnboundedSender<OutboundFrame>,
     request: crate::ipc::protocol::FileSizeDocumentRequest,
     swr_cancelled: Arc<AtomicBool>,
+    combined_build: Option<CombinedBuildBound>,
 ) -> JoinHandle<()> {
     let service = std::sync::Arc::clone(service);
     let outbound = outbound_tx.clone();
 
     tokio::spawn(async move {
         let request_for_error = request.clone();
+        // Waiting HERE, and not in the engine, is the point: an engine permit is daemon-wide, so a
+        // combined build queued for one is not holding anything back — right up until it gets one,
+        // after which it holds it for as long as its build takes.
+        let mut permit = None;
+
+        if let Some(bound) = combined_build {
+            let Ok(acquired) = Arc::clone(&bound.gate).acquire_owned().await else {
+                // The gate is never closed; unreachable in practice.
+                return;
+            };
+            permit = Some(acquired);
+
+            if bound.superseded.load(Ordering::Acquire) {
+                // The user typed past this size read while it waited. Building now would measure a
+                // document state nobody is looking at, so it is answered with an error instead —
+                // which the client drops on the same generation guard that drops a superseded push
+                // (FR-004a), and which costs it nothing: the newer read behind us in the queue is
+                // about to produce the number it will actually show.
+                queue_outbound(
+                    &outbound,
+                    &protocol_error_file_size_document_response(
+                        &request_for_error,
+                        "superseded by a newer size read for this document".to_owned(),
+                    ),
+                );
+                return;
+            }
+        }
+
         let size_service = std::sync::Arc::clone(&service);
         // Streaming: the file's own totals still come from a real combined build, but the
         // per-import states are served from the cache and the misses come back `loading`.
@@ -1161,6 +1400,9 @@ fn spawn_file_size_document(
             .map(|result| result.specifier.clone())
             .collect::<std::collections::HashSet<_>>();
         queue_outbound(&outbound, &response);
+        // The combined build is done; the next size read for this document may start. What follows
+        // is per-import revalidation, which has supersession and single-flight of its own.
+        drop(permit);
 
         if stale_specifiers.is_empty() {
             return;
@@ -1354,16 +1596,24 @@ async fn recycle_if_needed(
     prefetcher: &Prefetcher,
     service: &ImportLensService,
     active_tasks: &mut Vec<JoinHandle<()>>,
+    maintenance_task: &mut Option<AbortOnDrop>,
 ) -> bool {
     let Some(reason) = lifecycle.should_recycle(Instant::now()) else {
         return false;
     };
 
     prefetcher.cancel();
+    // A finished handle is not work in flight. Reap first, or a connection that has served any
+    // request at all looks busy for ever and every recycle costs an extra 60s tick.
+    reap_finished_tasks(active_tasks);
     if !active_tasks.is_empty() {
         wait_for_active_tasks(active_tasks).await;
         return false;
     }
+
+    // Nothing is in flight, so nothing is competing with the flush — but the maintenance pass is
+    // still scheduled, and a pass that starts during the flush compacts the shards it is writing.
+    *maintenance_task = None;
 
     if let Err(error) = service.flush_cache() {
         logging::log_warn(
@@ -1398,8 +1648,130 @@ fn restrict_unix_socket_permissions(pipe_name: &str) -> Result<(), Box<dyn Error
 
 #[cfg(test)]
 mod tests {
-    use super::RegistryRefreshLifecycle;
+    use super::{
+        DocumentBuildGate, DocumentTaskLifecycle, RegistryRefreshLifecycle, TASK_JOIN_TIMEOUT,
+        reap_finished_tasks, wait_for_active_tasks,
+    };
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::task::JoinHandle;
+
+    /// Shutdown must not be hostage to a build it cannot cancel.
+    ///
+    /// A build already inside Rolldown runs to `BUILD_TIMEOUT` (8s) whatever the daemon wants,
+    /// and the extension force-kills the daemon 5s after asking it to stop — so a join that waits
+    /// for that build is a join that ends with the process being killed before it flushes. The wait
+    /// is therefore bounded, and the handles it gave up on are reported, not silently dropped.
+    #[tokio::test]
+    async fn waiting_for_active_tasks_gives_up_on_a_task_that_outlives_the_bound() {
+        let parked = TASK_JOIN_TIMEOUT * 15;
+        let mut active_tasks: Vec<JoinHandle<()>> = vec![tokio::spawn(async move {
+            // Stands in for a build parked inside the bundler: far longer than the bound, and
+            // nothing here can cancel it.
+            tokio::time::sleep(parked).await;
+        })];
+
+        let started_at = std::time::Instant::now();
+        let finished = wait_for_active_tasks(&mut active_tasks).await;
+
+        assert!(
+            !finished,
+            "a task that outlives the bound must be reported as unfinished, not waited out"
+        );
+        assert!(
+            started_at.elapsed() < parked / 2,
+            "the wait must end at the bound, not at the task: waited {:?}",
+            started_at.elapsed()
+        );
+        assert_eq!(
+            active_tasks.len(),
+            1,
+            "the handle it gave up on is kept, so a later pass can still join it"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_for_active_tasks_joins_the_tasks_that_do_finish() {
+        let mut active_tasks: Vec<JoinHandle<()>> =
+            vec![tokio::spawn(async {}), tokio::spawn(async {})];
+
+        assert!(wait_for_active_tasks(&mut active_tasks).await);
+        assert!(active_tasks.is_empty());
+    }
+
+    /// `recycle_if_needed` reads `active_tasks.is_empty()` as "nothing in flight". Now that every
+    /// request runs as a task, a connection that served ONE request keeps its handle for ever
+    /// unless finished handles are reaped — so the recycle check would find work that had long
+    /// since completed and defer the recycle by a whole 60s tick, every time.
+    #[tokio::test]
+    async fn finished_task_handles_are_reaped() {
+        let finished = tokio::spawn(async {});
+        let running = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        finished.await.expect("the finished task cannot panic");
+        // `await` above consumed the handle, so re-create the pair the loop would be holding.
+        let mut active_tasks: Vec<JoinHandle<()>> = vec![tokio::spawn(async {}), running];
+        tokio::task::yield_now().await;
+
+        reap_finished_tasks(&mut active_tasks);
+
+        assert_eq!(
+            active_tasks.len(),
+            1,
+            "only the still-running task may be left"
+        );
+        assert!(!active_tasks[0].is_finished());
+    }
+
+    /// The combined file-size build's bound: one gate per document, shared by every size read of
+    /// that document, and a separate one for every other document (a build for `a.ts` must never
+    /// wait on a build for `b.ts`).
+    #[test]
+    fn the_document_build_gate_is_shared_per_document_and_pruned_when_idle() {
+        let mut gate = DocumentBuildGate::new();
+
+        let first = gate.gate_for("C:/ws", "C:/ws/a.ts");
+        let same_document = gate.gate_for("C:/ws", "C:/ws/a.ts");
+        let other_document = gate.gate_for("C:/ws", "C:/ws/b.ts");
+
+        assert!(
+            Arc::ptr_eq(&first, &same_document),
+            "two size reads of the same document must queue on the SAME gate"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &other_document),
+            "a size read of another document must not wait behind this one"
+        );
+
+        // The map must not grow by one entry per document the session ever sized.
+        drop(first);
+        drop(same_document);
+        drop(other_document);
+        let _fresh = gate.gate_for("C:/ws", "C:/ws/c.ts");
+        assert_eq!(
+            gate.gates.len(),
+            1,
+            "gates nobody holds are inert and must be pruned"
+        );
+    }
+
+    /// Shutdown cancels before it joins. `Drop` cannot do this job: it runs when the connection
+    /// function RETURNS, which is after the join it was meant to shorten.
+    #[test]
+    fn cancelling_a_document_lifecycle_flips_every_documents_flag() {
+        let mut lifecycle = DocumentTaskLifecycle::new();
+        let first = lifecycle.start_document("C:/ws", "C:/ws/a.ts");
+        let second = lifecycle.start_document("C:/ws", "C:/ws/b.ts");
+        assert!(!first.load(Ordering::Acquire));
+        assert!(!second.load(Ordering::Acquire));
+
+        lifecycle.cancel_all();
+
+        assert!(first.load(Ordering::Acquire));
+        assert!(second.load(Ordering::Acquire));
+    }
 
     #[test]
     fn registry_refresh_lifecycle_supersedes_only_within_the_same_source() {

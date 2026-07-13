@@ -165,7 +165,9 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         continue;
       }
 
-      store.set(
+      // `replace`, not `set`: this recomputes insights over the states already stored and opens no
+      // analysis, so it must not consume the pushes an in-flight one is still owed.
+      store.replace(
         editor.document.uri,
         applyImportAnalysisInsights(states, {
           importCostHistory: history,

@@ -291,6 +291,49 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   diagnostic) but is not persisted, so the next read of that import recomputes rather than
   serving the accident back. Lands with the streaming-redesign commit; SRS FR-026c.
 
+### D14 — The transience gate extends to the EXTENSION's persisted stores · 2026-07-13
+- **Context:** D13 gated every cache the daemon writes. It did not gate the two stores the
+  *extension* writes, because nothing had ever gated them: the import-cost history
+  (`globalState`) and the bundle-impact history (`globalState`). Both are strictly worse
+  places for a fabrication than any daemon cache — no TTL, no cache generation, not cleared by
+  either Clear Caches command, and one row per identity. A daemon cache serves the accident
+  back for a generation; these two *overwrite the import's real baseline for good*, and every
+  later trend insight is then measured against a number that never happened. This is the same
+  defect for the fourth time, in the fourth place.
+- **Decision:** both stores gate on the daemon's own evidence, not on `error` (which a
+  degraded result does not carry). `analysis/transience.ts` mirrors `stage::is_transient` and
+  is the single funnel: `importCostHistoryItemsForStates` drops an import whose diagnostics
+  name a transient stage, and `bundleImpactHistoryItemForResponse` refuses a total that is
+  transiently degraded *or* `incomplete`. A drift check
+  (`scripts/test/engine-stage-coordination.test.mjs`) fails the build if the Rust and TS stage
+  lists disagree.
+- **Decision (protocol):** `FileSizeDocumentResponse` gains `incomplete` on the wire.
+  `FileSizeComputation::incomplete` already existed daemon-side (it is what keeps a floor out
+  of the L1 aggregate cache), and the client cannot re-derive it: the diagnostic naming a
+  still-`loading` import is stage-tagged `file_size_fallback`, exactly like the diagnostic for
+  a deterministic per-import failure, which is a real fact and no reason to distrust the total.
+  Additive, `#[serde(default)]`, no protocol-version bump.
+- **Consequences / status:** an estimate is still shown ("· estimate"), with no delta against
+  the previous run — comparing an honest total to a floor invents a regression — and is simply
+  never written down. SRS FR-026c.
+
+### D15 — Shutdown flushes under a bound; a build it cannot cancel is abandoned · 2026-07-13
+- **Context:** shutdown joined every task the connection spawned before flushing. One class of
+  task cannot be cancelled: a build already inside Rolldown runs to `BUILD_TIMEOUT` (8s). The
+  extension force-kills the daemon 5s after sending `shutdown`, so the unbounded join
+  *guaranteed* the kill landed first and `flush_cache` never ran — the graceful shutdown lost
+  the session's unwritten cache to wait on one build whose result, if it timed out, D13 would
+  have refused to cache anyway.
+- **Decision:** cancel everything cancellable first (prefetch, registry blocks, streamed-import
+  builds, SWR, queued combined builds, the scheduled maintenance pass — via explicit
+  `cancel_all`, because `Drop` runs *after* the join it was meant to shorten), then join under
+  `TASK_JOIN_TIMEOUT` (2s, comfortably inside the 5s kill), then flush unconditionally. A task
+  still running at the deadline is abandoned and its result is recomputed next session.
+- **Consequences / status:** the "no build is still writing to the cache after the flush"
+  guarantee is downgraded to what is actually true and stated as such in FR-004c. Worst case, a
+  late build writes to `papaya` after the flush and the process exits before it is persisted:
+  one rebuild lost, against the whole session's cache saved.
+
 ---
 
 ## Parked / deferred

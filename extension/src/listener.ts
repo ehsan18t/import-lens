@@ -119,6 +119,10 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#store.applyRefreshedResults(uri, results, {
       identities,
       isCurrent,
+      // The generation travels WITH the push into the store, because a push that arrived in the
+      // same socket chunk as its own response is re-applied by the `set` that stores that
+      // response's states — and only by that one.
+      generation,
       refine: (states) =>
         applyImportAnalysisInsights(states, {
           changedLines,
@@ -218,14 +222,15 @@ export class DocumentAnalysisController implements vscode.Disposable {
         }
       }
 
-      // Store the response BEFORE awaiting anything else. The daemon answers a cold
-      // import `loading` and pushes its size the moment its build lands — which can be
-      // before the git diff below resolves. A push can only update a state that exists
-      // (`mergeRefreshedResults` maps over the states it is given), so a push that
-      // arrived while this method was still awaiting would have been dropped and that
-      // import would have sat at "Calculating..." for ever. It also paints the cache
-      // hits at once, which is the point of the whole exercise.
-      this.#store.set(document.uri, responseStates);
+      // Store the response BEFORE awaiting anything else, and stamp it with the generation
+      // it belongs to. The daemon answers a cold import `loading` and pushes its size the
+      // moment its build lands — which can be in the same socket chunk as this very response,
+      // long before the git diff below resolves. The generation is what lets the store re-apply
+      // such a push over these states instead of letting them overwrite it (see
+      // `DocumentAnalysisStates`); without it, on every re-analysis that import went back to
+      // "Calculating..." and stayed there until the next edit. Storing early also paints the
+      // cache hits at once, which is the point of the whole exercise.
+      this.#store.set(document.uri, responseStates, requestId);
 
       const history = this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
       const changedLines = await changedLinesPromise;
@@ -246,6 +251,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
           importCostHistory: history,
           budgets: config.budgets,
         }),
+        requestId,
       );
       try {
         await recordImportCostHistory(

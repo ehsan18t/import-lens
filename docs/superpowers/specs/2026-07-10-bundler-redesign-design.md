@@ -1346,7 +1346,7 @@ all three are part of I16's vocabulary:
 | stage | meaning |
 | --- | --- |
 | `panic` | a Rolldown/OXC panic unwound into the boundary's `catch_unwind`; Unmeasured for this import only |
-| `timeout` | the build did not finish within `BUILD_TIMEOUT` (8s) and was cancelled. That is its whole meaning: one build, its own clock. It says nothing about how long a request took, because no request waits for a build |
+| `timeout` | the build did not finish within `BUILD_TIMEOUT` (8s) and was cancelled. That is its whole meaning: one build, its own clock. It says nothing about how long a *document analysis* took, because that request no longer waits for the builds its imports miss on — but `AnalyzeSpecifiers` deliberately still does (SRS FR-004b), and there a parked build costs that command its full 8s |
 | `engine_gone` | the engine runtime was torn down without replying — not a panic, and must not be counted as one |
 
 `timeout` is not a slowness policy; it is the *only* containment for the panic class that matters.

@@ -1,6 +1,7 @@
 import path from "node:path";
-import type { DetectedImport, ImportResult } from "../ipc/protocol.js";
+import type { DetectedImport, FileSizeDocumentResponse, ImportResult } from "../ipc/protocol.js";
 import { formatBytes } from "../ui/format.js";
+import { isDurableFileSize } from "./transience.js";
 
 export const bundleImpactHistoryKey = "importLens.bundleImpactHistory";
 export const importCostHistoryKey = "importLens.importCostHistory";
@@ -33,6 +34,38 @@ export interface ImportCostHistoryItem {
   brotliBytes: number;
   zstdBytes: number;
 }
+
+/**
+ * The bundle-impact row a sized document contributes to the PERSISTED history — or `undefined` when
+ * its totals are not a measurement of the file.
+ *
+ * The gate lives here, next to the only constructor of the row, because the response gives three
+ * different ways to be wrong and only one of them looks wrong: `error` is the obvious one, but a
+ * combined build that timed out or panicked degrades to a conservative sum with `error: null`, and
+ * an `incomplete` total is a floor whose missing input was simply an import still being measured.
+ * Recording either one writes a number the file never had into a store with no TTL, and the very
+ * next honest sizing then reads as a regression against it.
+ */
+export const bundleImpactHistoryItemForResponse = (
+  response: FileSizeDocumentResponse,
+  fileName: string,
+  timestamp: number = Date.now(),
+): BundleImpactHistoryItem | undefined => {
+  if (!isDurableFileSize(response)) {
+    return undefined;
+  }
+
+  return {
+    timestamp,
+    fileName,
+    rawBytes: response.raw_bytes,
+    minifiedBytes: response.minified_bytes,
+    gzipBytes: response.gzip_bytes,
+    brotliBytes: response.brotli_bytes,
+    zstdBytes: response.zstd_bytes,
+    importCount: response.imports.length,
+  };
+};
 
 export const recordBundleImpactHistory = async (
   store: BundleImpactHistoryStore,

@@ -3,6 +3,7 @@ import { formatCurrentFileSizeSummary } from "../analysis/fileSize.js";
 import {
   type BundleImpactHistoryItem,
   bundleImpactHistoryDeltaLabel,
+  bundleImpactHistoryItemForResponse,
   bundleImpactHistoryKey,
   previousBundleImpactForFile,
   recordBundleImpactHistory,
@@ -88,29 +89,33 @@ export const showCurrentFileSize = async (
       return;
     }
 
-    const currentHistoryItem: BundleImpactHistoryItem = {
-      timestamp: Date.now(),
-      fileName: document.fileName,
-      rawBytes: response.raw_bytes,
-      minifiedBytes: response.minified_bytes,
-      gzipBytes: response.gzip_bytes,
-      brotliBytes: response.brotli_bytes,
-      zstdBytes: response.zstd_bytes,
-      importCount: response.imports.length,
-    };
+    // `undefined` when the totals are a floor rather than the file: an import still being measured,
+    // or one a transient engine failure sized for us. Such a number is worth SHOWING (a floor beats
+    // a blank) and must never be recorded — the history has no TTL and keeps one row per file, so it
+    // would become that file's baseline and make the next honest sizing read as a regression.
+    const currentHistoryItem = bundleImpactHistoryItemForResponse(response, document.fileName);
     const previous = previousBundleImpactForFile(
       context.globalState.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []),
       document.fileName,
     );
-    await recordBundleImpactHistory(context.globalState, currentHistoryItem);
+
+    if (currentHistoryItem) {
+      await recordBundleImpactHistory(context.globalState, currentHistoryItem);
+    }
 
     const skipped = response.states.length - response.imports.length;
     const skippedSuffix = skipped > 0 ? ` · ${skipped} skipped` : "";
-    const diffSuffix = previous
-      ? ` · ${bundleImpactHistoryDeltaLabel(currentHistoryItem, previous)}`
-      : "";
+    // No delta against a floor either: the comparison would be arithmetic on a number the file never
+    // had, and would report a regression or a win that did not happen.
+    const diffSuffix =
+      previous && currentHistoryItem
+        ? ` · ${bundleImpactHistoryDeltaLabel(currentHistoryItem, previous)}`
+        : "";
+    const estimateSuffix = currentHistoryItem
+      ? ""
+      : " · estimate (some imports are not fully measured)";
     await vscode.window.showInformationMessage(
-      `${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}${diffSuffix}`,
+      `${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}${diffSuffix}${estimateSuffix}`,
     );
   } catch (error) {
     logger.warn(

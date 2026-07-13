@@ -1100,6 +1100,11 @@ impl ImportLensService {
             zstd_bytes: file_size.zstd_bytes,
             imports: results,
             states,
+            // The one fact the bytes cannot carry: whether every import that belongs in them was
+            // really measured. The extension needs it to keep a floor out of its persisted
+            // bundle-impact history (FR-026c) — a store with no TTL, where one fabricated row
+            // becomes the file's permanent baseline.
+            incomplete: file_size.incomplete,
             error: file_size.error,
             diagnostics: file_size.diagnostics,
         }
@@ -2736,6 +2741,9 @@ fn file_size_document_prelude(
             zstd_bytes: 0,
             imports: Vec::new(),
             states: Vec::new(),
+            // Nothing was summed at all; `error` is the answer, and every client already refuses
+            // an errored response.
+            incomplete: false,
             error: Some(error.clone()),
             diagnostics: vec![ImportDiagnostic::for_stage("document_parse", &error)],
         })
@@ -3005,6 +3013,7 @@ pub fn protocol_error_file_size_document_response(
         zstd_bytes: 0,
         imports: Vec::new(),
         states: Vec::new(),
+        incomplete: false,
         error: Some(message.clone()),
         diagnostics: vec![ImportDiagnostic::for_stage("protocol", message)],
     }

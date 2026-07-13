@@ -156,6 +156,12 @@ export interface FileSizeDocumentResponse {
   zstd_bytes: number;
   imports: ImportResult[];
   states: ImportAnalysisItem[];
+  // The totals are a FLOOR, not the file's size: an import that belongs in them was never
+  // measured — its own build had not landed (`status: "loading"`), or a transient engine failure
+  // fabricated the size it carries. Safe to show with the diagnostics that say so (FR-024a),
+  // never safe to record as a historical data point (FR-026c). Absent from an older daemon, which
+  // is why it is optional; read it as `incomplete === true`.
+  incomplete?: boolean;
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }
