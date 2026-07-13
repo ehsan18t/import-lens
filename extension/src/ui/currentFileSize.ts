@@ -76,10 +76,11 @@ export const showCurrentFileSize = async (
       return;
     }
 
-    // `undefined` when the totals are a floor rather than the file: an import still being measured,
-    // or one a transient engine failure sized for us. Such a number is worth SHOWING (a floor beats
-    // a blank) and must never be recorded — the history has no TTL and keeps one row per file, so it
-    // would become that file's baseline and make the next honest sizing read as a regression.
+    // `undefined` when the totals are not this file's: an import still being measured or unmeasured
+    // (a floor), or the file's own combined build having failed (an un-deduplicated per-import sum).
+    // Such a number is worth SHOWING (a floor beats a blank) and must never be recorded — the
+    // history has no TTL and keeps one row per file, so it would become that file's baseline and
+    // make the next honest sizing read as a regression.
     const currentHistoryItem = bundleImpactHistoryItemForResponse(response, document.fileName);
     const previous = previousBundleImpactForFile(
       context.globalState.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []),
@@ -95,9 +96,9 @@ export const showCurrentFileSize = async (
       return;
     }
 
-    if (currentHistoryItem) {
-      await recordBundleImpactHistory(context.globalState, currentHistoryItem);
-    }
+    // Offered unconditionally: the store applies the gate itself and keeps nothing when the totals
+    // are not the file's, so a caller cannot record a floor by forgetting to ask.
+    await recordBundleImpactHistory(context.globalState, response, document.fileName);
 
     await vscode.window.showInformationMessage(report.message);
   } catch (error) {

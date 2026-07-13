@@ -109,7 +109,9 @@ const errorDiagnosticsMarkdown = (result: ImportResult, confidenceBadge: string)
   const rows = [
     "**Diagnostics**",
     "Import Lens could not compute this import size.",
-    `- Error: ${result.error}`,
+    // A result with no size normally carries the reason; a still-building one carries none, and the
+    // tooltip says what it knows rather than printing `null`.
+    `- Error: ${result.error ?? "no size was produced for this import"}`,
     `- Confidence: **${confidenceBadge}**`,
     ...result.confidence_reasons.map((reason) => `- ${reason}`),
     `- ${copyDiagnosticsMarkdown(result)}`,
@@ -127,7 +129,10 @@ export const tooltipForResultMarkdown = (
   const parts: string[] = [`**${result.specifier}**`];
   const confidence = confidenceVisualFor(result.confidence);
 
-  if (result.error) {
+  // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). Everything below this
+  // renders a number; the check that decides whether to render one has to be the check for whether
+  // there IS one.
+  if (!measuredSizes(result)) {
     parts.push(errorDiagnosticsMarkdown(result, confidence.badge));
     return parts.filter(Boolean).join("\n\n");
   }

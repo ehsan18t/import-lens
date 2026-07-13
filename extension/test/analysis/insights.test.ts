@@ -165,10 +165,9 @@ test("applyImportAnalysisInsights adds import cost history trends", () => {
 test("recordImportCostHistory skips unchanged consecutive import entries", async () => {
   const store = new MemoryStore();
   const first = measuredHistoryItem(detected(), result(), 1_700_000);
-  const duplicate = measuredHistoryItem(detected(), result(), 1_800_000);
 
-  await recordImportCostHistory(store, [first]);
-  await recordImportCostHistory(store, [duplicate]);
+  await recordImportCostHistory(store, [readyState()], 1_700_000);
+  await recordImportCostHistory(store, [readyState()], 1_800_000);
 
   assert.deepEqual(store.get<ImportCostHistoryItem[]>(importCostHistoryKey, []), [first]);
 });

@@ -8,6 +8,7 @@ import {
   daemonBinaryPath,
   EXIT_BUDGET_EXCEEDED,
   EXIT_COULD_NOT_MEASURE,
+  isUsableFileSize,
   loadBudgetConfig,
   parseCliArgs,
   resolveCliStoragePaths,
@@ -17,7 +18,10 @@ import {
 const analyzed = (overrides = {}) => ({
   filePath: "/workspace/src/app.ts",
   brotliBytes: 1200,
+  error: null,
   incomplete: false,
+  degraded: false,
+  diagnostics: [],
   unmeasured: [],
   imports: [{ specifier: "small-lib", brotliBytes: 900 }],
   ...overrides,
@@ -167,6 +171,87 @@ test("runImportLensCheck refuses a verdict for a deterministically unmeasurable 
     "src/app.ts: an import that belongs in this file's total was not measured; file total is a floor - budget not evaluated",
     "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
   ]);
+});
+
+// **The eighth instance, and the one the seventh fix left standing.** A file imports two packages.
+// Both are individually Measured and cached. The file's own COMBINED build — strictly larger than
+// either, and so the likeliest thing in the system to hit the build timeout — fails. The daemon
+// falls back to a sum of the per-import costs, and every contributor being Measured leaves
+// `incomplete: false`. The wire response is then: `incomplete: false`, `error: null`, a size on
+// every import, and `brotli_bytes` holding an UN-DEDUPLICATED sum — a Combined Import Cost, which
+// ADR-0004 says is a different quantity from a File Cost, and an over-count of it.
+//
+// `FileSizeCache::insert` refuses that number. `isDurableFileSize` refuses it. This gate read it and
+// issued a pass/fail verdict, which ADR-0006 invariant 3 calls a durable store like any other.
+//
+// An over-count cannot produce a false PASS — but it can produce a false FAIL, and invariant 5
+// forbids both: a budget judged against a number the file never had is neither passed nor failed.
+test("runImportLensCheck refuses a verdict when the file's own combined build failed", async () => {
+  const output = [];
+  const exitCode = await runImportLensCheck({
+    cwd: "/workspace",
+    budgets: { perFileBrotliBytes: 1000 },
+    changedFiles: async () => ["src/app.ts"],
+    analyzeFile: async () =>
+      analyzed({
+        // Every import measured. Nothing unmeasured. No error. The only thing wrong with this
+        // number is that it is not this file's.
+        degraded: true,
+        brotliBytes: 2500,
+        unmeasured: [],
+        imports: [
+          { specifier: "alpha", brotliBytes: 1500 },
+          { specifier: "beta", brotliBytes: 1000 },
+        ],
+      }),
+    writeLine: (line) => output.push(line),
+  });
+
+  assert.equal(
+    exitCode,
+    EXIT_COULD_NOT_MEASURE,
+    "2500 > 1000 looks like a regression, and it is not one - it is a sum of the wrong quantity",
+  );
+  assert.deepEqual(output, [
+    "src/app.ts: the file's combined build failed, so its total is an un-deduplicated sum of its imports and not the file's size - budget not evaluated",
+    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+  ]);
+});
+
+// The gate the CLI applies to the raw wire response, in isolation. The daemon's
+// `FileSizeComputation::is_cacheable` and the extension's `isDurableFileSize` are the same rule, and
+// a drift check holds all three together (file-size-usability-coordination.test.mjs).
+test("isUsableFileSize refuses every shape that is not this file's size", () => {
+  const response = (overrides = {}) => ({
+    error: null,
+    incomplete: false,
+    degraded: false,
+    diagnostics: [],
+    ...overrides,
+  });
+
+  assert.equal(isUsableFileSize(response()), true, "a clean measurement IS judged");
+  assert.equal(isUsableFileSize(response({ error: "no import could be sized" })), false);
+  assert.equal(isUsableFileSize(response({ incomplete: true })), false, "a floor: an under-count");
+  assert.equal(
+    isUsableFileSize(response({ degraded: true })),
+    false,
+    "a per-import sum: an OVER-count, and the one with no other signal on the wire",
+  );
+  assert.equal(
+    isUsableFileSize(response({ diagnostics: [{ stage: "timeout", message: "x", details: [] }] })),
+    false,
+    "a transient stage on the aggregate's own diagnostics",
+  );
+  // A DETERMINISTIC stage on the aggregate is not, by itself, a reason to refuse: a `types_only`
+  // diagnostic rides on a perfectly complete total. `degraded` is what says the build failed.
+  assert.equal(
+    isUsableFileSize(
+      response({ diagnostics: [{ stage: "types_only", message: "x", details: [] }] }),
+    ),
+    true,
+    "without this, the fix could be 'made to pass' by refusing every total that carries a diagnostic",
+  );
 });
 
 test("runImportLensCheck resolves changed files against resolveRoot but reports relative to cwd", async () => {

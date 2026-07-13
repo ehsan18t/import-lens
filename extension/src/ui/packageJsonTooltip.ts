@@ -2,6 +2,7 @@ import type { ImportLensConfig } from "../config.js";
 import type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 import type { PackageJsonDependencySectionName } from "../ipc/protocol.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
+import { measuredSizes } from "./format.js";
 import {
   isFreshLatestRelease,
   packageJsonDependencyVersionStatusLabel,
@@ -110,8 +111,13 @@ export const packageJsonDependencyTooltipMarkdown = (
   options: PackageJsonTooltipActionOptions = {},
 ): string => {
   const parts: string[] = [`**${state.name}**`];
+  // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). This branch renders one
+  // — through `importResultSizeMarkdown`, which is why the guard that scans for the banned check
+  // never saw this file: it names no size of its own. It asks the question correctly now, and the
+  // guard discovers it by the RESULT it handles rather than by the words it happens to spell.
+  const sizes = state.status === "ready" ? measuredSizes(state.result) : null;
 
-  if (state.status === "ready" && state.result && !state.result.error) {
+  if (state.result && sizes) {
     if (isTypesOnlyResult(state.result)) {
       parts.push("Type-only package: yes");
     } else {
@@ -122,9 +128,9 @@ export const packageJsonDependencyTooltipMarkdown = (
         parts.push(conservativeSizing);
       }
     }
-  } else if (state.status === "ready" && state.result?.error) {
+  } else if (state.status === "ready" && state.result) {
     parts.push("Import Lens could not compute this dependency size.");
-    parts.push(state.result.error);
+    parts.push(state.result.error ?? "No size was produced for this dependency.");
   } else if (state.message) {
     parts.push(state.message);
   }

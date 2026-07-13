@@ -24,6 +24,25 @@ const result = (overrides: Partial<ImportResult> = {}): ImportResult => ({
   ...overrides,
 });
 
+/**
+ * **Unmeasured** (ADR-0006): no size, ever. The fixtures here used to say `{ error: "failed" }` and
+ * keep all five sizes — the *fabricated* shape the daemon can no longer produce, and the one whose
+ * existence made `!result.error` look like a working usability check. There is nothing to
+ * tree-shake without a build, and now there is nothing to read, either.
+ */
+const unmeasured = (stage: string): ImportResult =>
+  result({
+    raw_bytes: null,
+    minified_bytes: null,
+    gzip_bytes: null,
+    brotli_bytes: null,
+    zstd_bytes: null,
+    truly_treeshakeable: false,
+    error: "engine build did not complete",
+    unmeasured_stage: stage,
+    diagnostics: [{ stage, message: "engine build did not complete", details: [] }],
+  });
+
 test("treeShakeActionReason explains non tree-shakeable import results", () => {
   assert.match(treeShakeActionReason(result({ is_cjs: true })) ?? "", /CommonJS/u);
   assert.match(treeShakeActionReason(result({ side_effects: true })) ?? "", /side effects/u);
@@ -33,9 +52,13 @@ test("treeShakeActionReason explains non tree-shakeable import results", () => {
   );
 });
 
-test("treeShakeActionReason ignores already tree-shakeable and errored imports", () => {
+test("treeShakeActionReason ignores an already tree-shakeable import and one with no size", () => {
   assert.equal(treeShakeActionReason(result()), null);
-  assert.equal(treeShakeActionReason(result({ error: "failed" })), null);
+  // Unmeasured, under a DETERMINISTIC stage and a TRANSIENT one. Neither has a build behind it, so
+  // neither has a tree-shaking verdict to report — and `is_cjs`/`side_effects` on such a result are
+  // the conservative defaults `ImportResult::unmeasured` stamps, not findings.
+  assert.equal(treeShakeActionReason(unmeasured("parse")), null);
+  assert.equal(treeShakeActionReason(unmeasured("timeout")), null);
 });
 
 const detected = (overrides: Partial<DetectedImport> = {}): DetectedImport =>
@@ -64,5 +87,15 @@ test("shouldOfferNamedExportCandidates targets namespace imports that do not tre
     false,
   );
   assert.equal(shouldOfferNamedExportCandidates(state({}, { truly_treeshakeable: true })), false);
-  assert.equal(shouldOfferNamedExportCandidates(state({}, { error: "failed" })), false);
+  // No size, so no build, so no verdict to act on. Offering to narrow a namespace import of a
+  // package nobody could measure is advice from nothing — and `!result.error` would have let a
+  // still-LOADING import through, which has no error either.
+  assert.equal(
+    shouldOfferNamedExportCandidates({
+      detected: detected(),
+      status: "ready",
+      result: unmeasured("parse"),
+    }),
+    false,
+  );
 });

@@ -169,9 +169,15 @@ pub fn shared_file_size_cache() -> &'static FileSizeCache {
 pub fn file_size_signature(context: &AnalysisContext, imports: &[SizedImport]) -> u64 {
     let mut tokens = imports
         .iter()
-        .map(|import| &import.request)
-        .map(
-            |request| match resolve_package_entry(&context.active_document_path, request) {
+        .map(|import| {
+            // A NOT-INSTALLED import has no request at all, and it still belongs in the signature:
+            // it is what makes the total a floor (FR-024a), and installing the package must move the
+            // signature so the floor is recomputed rather than served from L1.
+            let Some(request) = import.request.as_ref() else {
+                return format!("not_installed:{}", import.specifier);
+            };
+
+            match resolve_package_entry(&context.active_document_path, request) {
                 Ok(resolved) => resolved_import_token(request, &resolved),
                 Err(_) => format!(
                     "unresolved:{}:{}:{}:{:?}:{:?}:{}",
@@ -182,8 +188,8 @@ pub fn file_size_signature(context: &AnalysisContext, imports: &[SizedImport]) -
                     request.import_kind,
                     request.named.join(",")
                 ),
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     tokens.sort();
 
@@ -294,10 +300,7 @@ mod tests {
     /// An import whose own size the caller already knows nothing about; the signature only
     /// reads the request, so the measurement is irrelevant here.
     fn sized(request: ImportRequest) -> SizedImport {
-        SizedImport {
-            request,
-            result: None,
-        }
+        SizedImport::installed(request, None)
     }
 
     #[test]
@@ -467,6 +470,21 @@ mod tests {
         assert_ne!(
             file_size_signature(&ctx, &[sized(named_request("alpha", &["x"]))]),
             file_size_signature(&ctx, &[sized(named_request("alpha", &["x", "y"]))])
+        );
+    }
+
+    /// A not-installed import is part of the file's identity: it is what makes the total a floor
+    /// (FR-024a), and a signature that cannot see it would serve the L1 entry computed before the
+    /// import was added. Fails if the import is dropped from the token list.
+    #[test]
+    fn signature_sees_an_import_whose_package_is_not_installed() {
+        let _generation = hold_generation_steady();
+        let ctx = unresolvable_context();
+        let installed = sized(named_request("alpha", &["x"]));
+
+        assert_ne!(
+            file_size_signature(&ctx, std::slice::from_ref(&installed)),
+            file_size_signature(&ctx, &[installed, SizedImport::not_installed("ghost")]),
         );
     }
 

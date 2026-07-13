@@ -180,6 +180,15 @@ export interface FileSizeDocumentResponse {
   // never safe to record as a historical data point (FR-026c). Absent from an older daemon, which
   // is why it is optional; read it as `incomplete === true`.
   incomplete?: boolean;
+  // The file's OWN combined build failed, so these totals are an un-deduplicated sum of the
+  // per-import costs — a *different quantity* from a File Cost (ADR-0004), and an OVER-count.
+  //
+  // `incomplete` structurally cannot see this: a combined build is the biggest build in the system,
+  // so it is the likeliest to hit the daemon's build timeout — and when it does, every one of the
+  // file's imports may still be perfectly Measured. The response then carries `incomplete: false`,
+  // `error: null`, a size on every import, and a number the file never had. Show it, never store it,
+  // never judge a budget against it (ADR-0006, invariants 4 and 5).
+  degraded?: boolean;
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }
@@ -380,6 +389,11 @@ export interface FileSizeResponse {
   brotli_bytes: number;
   zstd_bytes: number;
   imports: ImportResult[];
+  // The same two flags, with the same meanings, as on `FileSizeDocumentResponse`. The daemon has
+  // always computed them for this surface too; omitting them here made it the one response where a
+  // floor and a measurement are indistinguishable.
+  incomplete?: boolean;
+  degraded?: boolean;
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }

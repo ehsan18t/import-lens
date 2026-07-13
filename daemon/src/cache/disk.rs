@@ -270,6 +270,24 @@ impl DiskCache {
             self.remove(key);
             return None;
         };
+        // **The durability gate is on the READ too, not only on `insert_at_generation`**
+        // (ADR-0006, invariant 3). A write-side gate protects a store from what it is handed
+        // today; it does nothing about what is already on disk. L2 outlives the process, so a row
+        // written by a build that predates the gate — or by any future path that reaches redb some
+        // other way — would be decoded, served, and re-promoted into L1 forever, and every read
+        // path (`get_with_freshness`, and the prewarm's `load_recent`) goes through here. Refusing
+        // and removing it costs one rebuild.
+        if !cached.result.is_durable() {
+            crate::logging::log_debug(
+                "cache",
+                format!(
+                    "evicting a non-durable disk entry for {key} (stage: {})",
+                    cached.result.unmeasured_stage().unwrap_or("none")
+                ),
+            );
+            self.remove(key);
+            return None;
+        }
         // First-party-ness is key-derived; stamp it once at hydration so the
         // per-hit gate never has to re-decode the identity.
         cached.first_party = crate::cache::key::cache_key_is_first_party(key);
@@ -344,6 +362,34 @@ impl DiskCache {
             );
             return Ok(());
         }
+
+        self.write_at_generation(key, cached, generation)
+    }
+
+    /// The write, with the durability gate already applied — or, in a test, deliberately not.
+    ///
+    /// The gate protects L2 from what it is handed *today*. It says nothing about a row a build
+    /// that predates it already wrote, and that row is on real users' disks right now. This is the
+    /// only way to put one there, and it is `#[cfg(test)]` so it stays the only way.
+    #[cfg(test)]
+    pub(crate) fn write_ungated_for_test(
+        &self,
+        key: &str,
+        cached: &CachedImport,
+    ) -> Result<(), String> {
+        if self.db_read().is_none() {
+            return Ok(());
+        }
+
+        self.write_at_generation(key, cached, self.clear_generation())
+    }
+
+    fn write_at_generation(
+        &self,
+        key: &str,
+        cached: &CachedImport,
+        generation: u64,
+    ) -> Result<(), String> {
         #[cfg(test)]
         {
             test_support::record_insert_attempt(key);
@@ -1725,6 +1771,101 @@ mod tests {
 
         drop(disk);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The gate is on the READ too** (ADR-0006, invariant 3).
+    ///
+    /// The write-side gate protects L2 from what it is handed today. It does nothing about a row a
+    /// build that predates it already wrote — and L2 outlives the process, so those rows are on real
+    /// users' disks right now. Left alone, a `timeout` result would be decoded, served as a cache
+    /// hit, and re-promoted into L1 on every access, for as long as the package's bytes did not
+    /// change: a transient condition producing a durable wrong answer, which is the one disease this
+    /// model exists to end.
+    #[test]
+    fn a_non_durable_row_already_on_disk_is_refused_on_read_and_evicted() {
+        use super::DiskCache;
+
+        let dir = std::env::temp_dir().join(format!(
+            "il-l2-hydration-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let disk = DiskCache::new(Some(dir.clone()), true);
+
+        // A MEASURED result whose full-package comparison build timed out: real sizes, a transient
+        // diagnostic, and `error: None`. The shape every negative-`error` check waves through, and
+        // the one a store must refuse.
+        let mut degraded = crate::ipc::protocol::ImportResult::measured(
+            "react",
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 17_550,
+                minified_bytes: 9_000,
+                gzip_bytes: 3_000,
+                brotli_bytes: 2_500,
+                zstd_bytes: 2_400,
+            },
+        );
+        degraded.diagnostics = vec![crate::ipc::protocol::ImportDiagnostic::for_stage(
+            crate::engine::stage::TIMEOUT,
+            "comparison build did not complete within 8s",
+        )];
+        assert!(
+            !degraded.is_durable(),
+            "test setup: this is precisely a result no store may hold"
+        );
+
+        // The gate refuses it on the way in, which is why writing it needs the test-only door.
+        disk.insert("v4:react:degraded", &cached_with(degraded, 7))
+            .expect("the write gate refuses it, and refusing is not an error");
+        disk.flush_pending_inserts();
+        assert!(
+            disk.get("v4:react:degraded").is_none(),
+            "premise: the write gate already holds"
+        );
+
+        disk.write_ungated_for_test("v4:react:legacy", &cached_with(legacy_degraded(), 7))
+            .expect("simulate a row written before the gate existed");
+        disk.flush_pending_inserts();
+
+        assert!(
+            disk.get("v4:react:legacy").is_none(),
+            "a non-durable row already on disk must be refused on READ, not served and re-promoted"
+        );
+        assert!(
+            disk.get("v4:react:legacy").is_none(),
+            "and evicted, so the next read does not pay to decode it again"
+        );
+
+        // Control: a healthy row written the same way is still served. Without this the fix could be
+        // "made to pass" by refusing everything.
+        disk.write_ungated_for_test("v4:react:healthy", &sample_cached(8))
+            .expect("write a healthy row");
+        disk.flush_pending_inserts();
+        assert!(
+            disk.get("v4:react:healthy").is_some(),
+            "a durable row must still hydrate"
+        );
+
+        drop(disk);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn legacy_degraded() -> crate::ipc::protocol::ImportResult {
+        let mut result = crate::ipc::protocol::ImportResult::measured(
+            "react",
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 17_550,
+                minified_bytes: 9_000,
+                gzip_bytes: 3_000,
+                brotli_bytes: 2_500,
+                zstd_bytes: 2_400,
+            },
+        );
+        result.diagnostics = vec![crate::ipc::protocol::ImportDiagnostic::for_stage(
+            crate::engine::stage::TIMEOUT,
+            "comparison build did not complete within 8s",
+        )];
+        result
     }
 
     #[test]

@@ -39,8 +39,8 @@ fn context(workspace: &Path) -> AnalysisContext {
 }
 
 fn request(package: &str, export: &str, runtime: ImportRuntime) -> SizedImport {
-    SizedImport {
-        request: ImportRequest {
+    SizedImport::installed(
+        ImportRequest {
             specifier: package.to_owned(),
             package_name: package.to_owned(),
             version: "1.0.0".to_owned(),
@@ -48,8 +48,8 @@ fn request(package: &str, export: &str, runtime: ImportRuntime) -> SizedImport {
             import_kind: ImportKind::Named,
             runtime,
         },
-        result: None,
-    }
+        None,
+    )
 }
 
 /// `host` has a single, runtime-independent entry: the root entry is pre-resolved

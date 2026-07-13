@@ -43,19 +43,33 @@ export const isDurableImportResult = (result: ImportResult | undefined): result 
   result !== undefined && measuredSizes(result) !== null && !isTransientResult(result);
 
 /**
- * Whether a document's totals are a measurement of the file, and so may be written to the
- * persisted bundle-impact history.
+ * Whether a document's totals are a measurement of **this file**, and so may be written to a durable
+ * store or judged against a budget.
  *
- * Three ways they are not, and only one of them is an error. `incomplete` says an import that
- * belongs in the totals contributed no bytes — its own build had not landed (`loading`), or it could
- * not be measured, for ANY reason: a transient failure, a deterministic one, or an entry that would
- * not resolve. Deterministically-unknown bytes are still unknown, so the number is a floor either
- * way: real enough to SHOW beside the diagnostics that say so (FR-024a), and worthless as a
- * historical data point, because the next run's honest total would read as a regression against it.
- * A transient stage in the response's own diagnostics says the combined build itself degraded the
- * same way.
+ * **This is the one predicate.** The daemon's `FileSizeComputation::is_cacheable` is its Rust twin,
+ * and `cli/importlens.mjs` reads the same three fields off the same wire response — because the
+ * defect this exists to end was three consumers each asking a slightly different question of the
+ * same number, and the CLI asking the weakest one and issuing a CI verdict from it.
+ *
+ * Four ways the totals are not the file's, and only one of them is an error.
+ *
+ * - `error` — nothing was summed at all.
+ * - `incomplete` — an import that belongs in the totals contributed no bytes: its own build had not
+ *   landed (`loading`), or it could not be measured, for ANY reason (transient, deterministic, an
+ *   entry that would not resolve, a package that is not installed). An UNDER-count.
+ * - `degraded` — the file's own combined build failed, so the totals fell back to a sum of
+ *   per-import costs with no shared-module deduplication. An OVER-count, and the one that carries no
+ *   other signal: every contributor can be Measured, leaving `incomplete: false` and `error: null`.
+ * - a transient stage among the response's own diagnostics — belt and braces with `degraded`, and
+ *   the shape that catches a transient failure that reached the aggregate any other way.
+ *
+ * A total that fails this is still worth SHOWING (a floor beats a blank, FR-024a). It is never worth
+ * writing down, and never worth a verdict (ADR-0006, invariant 5).
  */
 export const isDurableFileSize = (
-  response: Pick<FileSizeDocumentResponse, "error" | "diagnostics" | "incomplete">,
+  response: Pick<FileSizeDocumentResponse, "error" | "diagnostics" | "incomplete" | "degraded">,
 ): boolean =>
-  !response.error && response.incomplete !== true && !hasTransientStage(response.diagnostics);
+  !response.error &&
+  response.incomplete !== true &&
+  response.degraded !== true &&
+  !hasTransientStage(response.diagnostics);

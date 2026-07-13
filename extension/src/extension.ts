@@ -38,6 +38,7 @@ import { ImportMemberCompletionProvider } from "./ui/completions.js";
 import { showBundleImpactHistory, showCurrentFileSize } from "./ui/currentFileSize.js";
 import { DecorationController } from "./ui/decorations.js";
 import { copyImportDiagnosticsCommand, formatImportDiagnostics } from "./ui/diagnostics.js";
+import { measuredSizes } from "./ui/format.js";
 import { ImportLensHoverProvider } from "./ui/hoverProvider.js";
 import { ImportLensInlayHintsProvider } from "./ui/inlayHints.js";
 import {
@@ -297,7 +298,9 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(
       "importLens.showImportDetails",
       async (result: ImportResult, runtime: ImportRuntime = "component") => {
-        if (result.error) {
+        // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). The details view
+        // below renders the five sizes; the gate in front of it has to ask whether there are any.
+        if (!measuredSizes(result)) {
           const action = await vscode.window.showWarningMessage(
             "Import Lens could not compute this import size.",
             "Copy diagnostics",

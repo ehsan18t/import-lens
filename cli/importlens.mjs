@@ -120,10 +120,24 @@ export const runImportLensCheck = async ({
     // measure leaves the file's size just as unknown as one that timed out, and CI is the one place
     // where nobody is looking at the screen to notice. No verdict from a floor (ADR-0006,
     // invariant 5).
+    //
+    // And a DEGRADED total cannot condemn one. `degraded` says the file's own combined build failed
+    // and the number fell back to a sum of per-import costs — a Combined Import Cost, which ADR-0004
+    // calls a different quantity from a File Cost, because a module two imports share is counted
+    // twice. It is an OVER-count, so it cannot pass a budget it should have failed... but it can
+    // FAIL one it should have passed, and invariant 5 forbids both: a budget judged against a number
+    // the file never had is neither passed nor failed. The daemon refuses to cache this shape and
+    // the extension refuses to persist it; this gate is the third consumer of the same rule, and it
+    // is the one that was still issuing a verdict.
     const transient = (result.unmeasured ?? []).filter((item) => item.transient);
 
-    if (result.incomplete || transient.length > 0) {
-      unmeasurable.push({ relative, transient });
+    // **The gate is HERE, in the thing that issues the verdict** — not in `analyzeFile`, which is
+    // injected and could be replaced by a caller who forgot it. A pass/fail verdict is a durable
+    // store (ADR-0006, invariant 3), and a store that trusts its caller to have asked is a store
+    // that eventually will not be asked. The daemon and the extension both learned this the same
+    // way, and moved their gates inside their stores.
+    if (!isUsableFileSize(result) || transient.length > 0) {
+      unmeasurable.push({ relative, transient, degraded: result.degraded === true });
       continue;
     }
 
@@ -179,15 +193,21 @@ export const runImportLensCheck = async ({
   return 0;
 };
 
-const unmeasurableLine = ({ relative, transient }) => {
+const unmeasurableLine = ({ relative, transient, degraded }) => {
   const stages = [...new Set(transient.map((item) => item.stage))].sort().join(", ");
   const count = transient.length;
-  const detail =
-    count > 0
-      ? `could not measure ${count} ${count === 1 ? "import" : "imports"} (stage: ${stages})`
-      : "an import that belongs in this file's total was not measured";
 
-  return `${relative}: ${detail}; file total is a floor - budget not evaluated`;
+  if (count > 0) {
+    return `${relative}: could not measure ${count} ${count === 1 ? "import" : "imports"} (stage: ${stages}); file total is a floor - budget not evaluated`;
+  }
+
+  if (degraded) {
+    // Not a floor: the opposite. The imports were measured; the file's own combined build was not,
+    // so the number is a sum of per-import costs with shared modules counted once per import.
+    return `${relative}: the file's combined build failed, so its total is an un-deduplicated sum of its imports and not the file's size - budget not evaluated`;
+  }
+
+  return `${relative}: an import that belongs in this file's total was not measured; file total is a floor - budget not evaluated`;
 };
 
 const main = async () => {
@@ -211,7 +231,10 @@ const main = async () => {
         analyzeFile: async (filePath) => ({
           filePath,
           brotliBytes: 0,
+          error: null,
           incomplete: false,
+          degraded: false,
+          diagnostics: [],
           unmeasured: [],
           imports: [],
         }),
@@ -294,9 +317,15 @@ const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
   return {
     filePath,
     brotliBytes: response.brotli_bytes,
-    // The daemon's own word for "an import that belongs in this total was never measured", which
-    // the client cannot re-derive: a still-`loading` import leaves no failure of any stage behind.
+    // The three fields `isUsableFileSize` asks about, carried through verbatim rather than collapsed
+    // into a verdict here. The verdict belongs to the gate, and the gate belongs to `runImportLensCheck`.
+    error: response.error ?? null,
+    // The daemon's own word for "an import that belongs in this total was never measured", which the
+    // client cannot re-derive: a still-`loading` import leaves no failure of any stage behind.
     incomplete: response.incomplete === true,
+    // And for "the file's own combined build failed", which `incomplete` cannot see at all.
+    degraded: response.degraded === true,
+    diagnostics: response.diagnostics ?? [],
     unmeasured,
     imports: measured.map((item) => ({
       specifier: item.specifier,
@@ -304,6 +333,28 @@ const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
     })),
   };
 };
+
+/**
+ * Whether a file's totals are a measurement of THAT FILE, and so may be judged against a budget.
+ *
+ * ADR-0006 invariant 3 names "any pass/fail verdict" a durable store, so this is the same gate the
+ * L1 aggregate cache applies (`FileSizeComputation::is_cacheable`, Rust) and the extension applies
+ * before persisting a bundle-impact row (`isDurableFileSize`, TypeScript). It is stated a third time
+ * here only because this CLI ships standalone and can import neither — the same forced duplication
+ * as `transientStages` below, and held to the same standard: the three are kept in lockstep by a
+ * drift check (`scripts/test/file-size-usability-coordination.test.mjs`), so a field added to one
+ * and forgotten in the others fails the build rather than shipping a fourth instance of this defect.
+ *
+ * `degraded` is the one that was missing, and it is the one a CI gate is most likely to meet: a
+ * file's combined build is the biggest build in the system, so it is the likeliest to hit the
+ * daemon's build timeout — and when it does, every import can still be perfectly Measured, leaving
+ * `incomplete: false`, `error: null`, and an un-deduplicated per-import sum in `brotli_bytes`.
+ */
+export const isUsableFileSize = (response) =>
+  !response.error &&
+  response.incomplete !== true &&
+  response.degraded !== true &&
+  !(response.diagnostics ?? []).some((item) => transientStages.has(item.stage));
 
 // Mirrors `stage::is_transient` in daemon/src/engine/mod.rs (and `transientEngineStages` in
 // extension/src/analysis/transience.ts). The three of them are kept in step by the drift check in

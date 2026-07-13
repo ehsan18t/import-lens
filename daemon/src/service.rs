@@ -805,10 +805,7 @@ impl ImportLensService {
             .iter()
             .cloned()
             .zip(imports.iter().cloned())
-            .map(|(request, result)| SizedImport {
-                request,
-                result: Some(result),
-            })
+            .map(|(request, result)| SizedImport::installed(request, Some(result)))
             .collect::<Vec<_>>();
         let file_size = self.file_size_with_cache(&context, &request.active_document_path, &sized);
 
@@ -822,6 +819,7 @@ impl ImportLensService {
             zstd_bytes: file_size.zstd_bytes,
             imports,
             incomplete: file_size.incomplete,
+            degraded: file_size.degraded,
             error: file_size.error,
             diagnostics: file_size.diagnostics,
         }
@@ -1074,15 +1072,18 @@ impl ImportLensService {
         context: &AnalysisContext,
         states: Vec<ImportAnalysisItem>,
     ) -> FileSizeDocumentResponse {
-        // Every import that resolved is an entry of the combined build; the ones already
-        // measured also feed the conservative fallback if that build fails.
+        // EVERY detected import reaches the aggregate — including one whose package is not installed
+        // at all, which has no `request` because a request carries the installed version.
+        //
+        // Such an import used to be `filter_map`ped away right here, so it never reached the floor
+        // check: the file's total silently omitted it, was cached, was persisted as the file's
+        // baseline, and `importlens check` exited 0 on a number that was missing a whole dependency.
+        // It is a floor now, like every other unmeasured contributor (SRS FR-024a, bullet 4).
         let sized = states
             .iter()
-            .filter_map(|state| {
-                state.request.clone().map(|request| SizedImport {
-                    request,
-                    result: state.result.clone(),
-                })
+            .map(|state| match state.request.clone() {
+                Some(request) => SizedImport::installed(request, state.result.clone()),
+                None => SizedImport::not_installed(state.detected.specifier.clone()),
             })
             .collect::<Vec<_>>();
         let results = states
@@ -1106,6 +1107,10 @@ impl ImportLensService {
             // bundle-impact history (FR-026c) — a store with no TTL, where one fabricated row
             // becomes the file's permanent baseline.
             incomplete: file_size.incomplete,
+            // And the fact `incomplete` cannot carry: whether the file's OWN combined build
+            // succeeded. It can fail with every contributor Measured, and then these totals are an
+            // un-deduplicated per-import sum — a different quantity, and an over-count.
+            degraded: file_size.degraded,
             error: file_size.error,
             diagnostics: file_size.diagnostics,
         }
@@ -2743,6 +2748,7 @@ fn file_size_document_prelude(
             // Nothing was summed at all; `error` is the answer, and every client already refuses
             // an errored response.
             incomplete: false,
+            degraded: false,
             error: Some(error.clone()),
             diagnostics: vec![ImportDiagnostic::for_stage("document_parse", &error)],
         })
@@ -3011,6 +3017,7 @@ pub fn protocol_error_file_size_document_response(
         imports: Vec::new(),
         states: Vec::new(),
         incomplete: false,
+        degraded: false,
         error: Some(message.clone()),
         diagnostics: vec![ImportDiagnostic::for_stage("protocol", message)],
     }
@@ -3066,6 +3073,7 @@ pub fn protocol_error_file_size_response(
             .collect(),
         // Nothing was summed at all; `error` is the answer.
         incomplete: false,
+        degraded: false,
         error: Some(message.clone()),
         diagnostics: vec![ImportDiagnostic {
             stage: crate::pipeline::stage::PROTOCOL.to_owned(),
@@ -3457,10 +3465,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
     fn file_total(results: Vec<(&str, ImportResult)>) -> FileSizeComputation {
         let sized = results
             .into_iter()
-            .map(|(specifier, result)| SizedImport {
-                request: request(specifier),
-                result: Some(result),
-            })
+            .map(|(specifier, result)| SizedImport::installed(request(specifier), Some(result)))
             .collect::<Vec<_>>();
         per_import_totals_for_test(&sized)
     }
@@ -3630,18 +3635,30 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         // And the state no stage describes: an import whose own build has not landed yet.
         let cache = FileSizeCache::new();
         let loading = per_import_totals_for_test(&[
-            SizedImport {
-                request: request("alpha"),
-                result: Some(measured("alpha", 100)),
-            },
-            SizedImport {
-                request: request("beta"),
-                result: None,
-            },
+            SizedImport::installed(request("alpha"), Some(measured("alpha", 100))),
+            SizedImport::installed(request("beta"), None),
         ]);
         assert!(loading.incomplete);
         cache.insert(path.clone(), 1, loading);
         assert!(cache.get(&path, 1).is_none());
+
+        // And the shape `incomplete` structurally cannot see (ADR-0006, invariant 4, second half):
+        // every contributor Measured, `error: None`, a real number — and the file's OWN combined
+        // build failed, so that number is an un-deduplicated per-import sum, not a File Cost.
+        // `file_size.rs::a_failed_combined_build_degrades_the_total_even_with_every_import_measured`
+        // proves the flag is raised; this proves the STORE refuses it.
+        let cache = FileSizeCache::new();
+        let mut over_counted = file_total(vec![
+            ("alpha", measured("alpha", 100)),
+            ("beta", measured("beta", 20)),
+        ]);
+        over_counted.degraded = true;
+        assert!(!over_counted.incomplete && over_counted.error.is_none());
+        cache.insert(path.clone(), 1, over_counted);
+        assert!(
+            cache.get(&path, 1).is_none(),
+            "a degraded total is an OVER-count of the file, and just as unusable as a floor"
+        );
 
         // Control: every import measured — this really IS the file, and it must still cache.
         let cache = FileSizeCache::new();

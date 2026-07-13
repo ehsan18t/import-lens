@@ -3,6 +3,12 @@ import type { DetectedImport, FileSizeDocumentResponse, ImportResult } from "../
 import { formatBytes, measuredSizes } from "../ui/format.js";
 import { isDurableFileSize, isDurableImportResult } from "./transience.js";
 
+// The two persisted histories live in `globalState`: no TTL, no cache generation, no Clear Caches
+// command behind them, and one row per identity. A row that should not be there does not go stale —
+// it REPLACES that import's (or that file's) real baseline permanently, and every later trend is
+// computed against a number that never happened. So both stores below take the raw daemon output and
+// apply the gate themselves; neither will accept a row (ADR-0006, invariant 3; SRS FR-026c).
+
 export const bundleImpactHistoryKey = "importLens.bundleImpactHistory";
 export const importCostHistoryKey = "importLens.importCostHistory";
 
@@ -74,13 +80,36 @@ export const bundleImpactHistoryItemForResponse = (
   };
 };
 
+/**
+ * Write a sized document to the persisted bundle-impact history — **if it is a measurement of that
+ * file**.
+ *
+ * The store takes the RESPONSE, not a row, and that is the whole point. It used to take a
+ * `BundleImpactHistoryItem`, which is five numbers and a filename: by the time one exists, every
+ * trace of how it was measured is gone, so the store could not re-derive whether it was safe to
+ * keep and had to trust that its caller had asked. That is a predicate beside a store, which is the
+ * exact shape of this defect — something the next caller can forget, with nothing failing when they
+ * do. Handing it the response instead makes forgetting impossible: the gate is the store's own.
+ *
+ * The daemon fixed this same shape on its side (`FileSizeCache::insert` asks `is_cacheable` itself);
+ * this is the other half of it (FR-026c).
+ */
 export const recordBundleImpactHistory = async (
   store: BundleImpactHistoryStore,
-  item: BundleImpactHistoryItem,
+  response: FileSizeDocumentResponse,
+  fileName: string,
+  timestamp: number = Date.now(),
   limit = 20,
-): Promise<void> => {
+): Promise<BundleImpactHistoryItem | undefined> => {
+  const item = bundleImpactHistoryItemForResponse(response, fileName, timestamp);
+
+  if (!item) {
+    return undefined;
+  }
+
   const existing = store.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []);
   await store.update(bundleImpactHistoryKey, [item, ...existing].slice(0, Math.max(1, limit)));
+  return item;
 };
 
 export const bundleImpactHistoryLabel = (item: BundleImpactHistoryItem): string =>
@@ -169,13 +198,52 @@ export const importCostHistoryDeltaLabel = (
   return `${sign}${formatBytes(Math.abs(delta))}`;
 };
 
+/**
+ * The rows a document's analysis states contribute to the persisted import-cost history.
+ *
+ * A `filter`, not a `map`: `importCostHistoryItem` refuses a result that may not be written down,
+ * and the refusals simply do not become rows.
+ */
+export const importCostHistoryItemsForStates = (
+  states: readonly ImportCostHistorySource[],
+  now: number = Date.now(),
+): ImportCostHistoryItem[] =>
+  states
+    .filter((state) => state.status === "ready" && state.result !== undefined)
+    .map((state) => importCostHistoryItem(state.detected, state.result as ImportResult, now))
+    .filter((item): item is ImportCostHistoryItem => item !== undefined);
+
+/**
+ * What the import-cost store takes: an import's identity and the result the daemon gave for it.
+ *
+ * Structural, so `ImportAnalysisState` satisfies it without this module having to import the UI's
+ * state type (and without the cycle that would create).
+ */
+export interface ImportCostHistorySource {
+  detected: DetectedImport;
+  status: string;
+  result?: ImportResult;
+}
+
 let historyWriteChain: Promise<void> = Promise.resolve();
 
+/**
+ * Write a document's imports to the persisted import-cost history — **each one only if it may be
+ * written down**.
+ *
+ * Like `recordBundleImpactHistory`, this takes the analysis states and builds the rows itself. It
+ * used to take `readonly ImportCostHistoryItem[]`, so the gate lived in the row's constructor and
+ * the store would accept any row anyone handed it. That is not a store with a gate; it is a store
+ * beside a predicate, and FR-026c says the difference is the entire lesson.
+ */
 export const recordImportCostHistory = (
   store: BundleImpactHistoryStore,
-  items: readonly ImportCostHistoryItem[],
+  states: readonly ImportCostHistorySource[],
+  now: number = Date.now(),
   limit = 200,
 ): Promise<void> => {
+  const items = importCostHistoryItemsForStates(states, now);
+
   // Serialize writes so concurrent analyses (e.g. switching tabs while a
   // previous file's analysis is still in flight) do not read-modify-write the
   // same array and lose each other's entries.

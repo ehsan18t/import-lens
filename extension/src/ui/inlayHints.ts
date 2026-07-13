@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { AnalysisStore } from "../analysis/state.js";
 import { getImportLensConfig } from "../config.js";
 import { shouldShowNativeInlayHints } from "./displayGuards.js";
+import { measuredSizes } from "./format.js";
 import { importHintAnchorPosition } from "./importHintAnchor.js";
 import { importHintParts } from "./importHintParts.js";
 import { inlineHintSegmentsFromParts } from "./inlineHintSegments.js";
@@ -46,7 +47,11 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
         const labelPart = new vscode.InlayHintLabelPart(value);
         labelPart.tooltip = stateTooltip;
 
-        if (state.status === "ready" && state.result && !state.result.error) {
+        // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). The details view
+        // this command opens renders the sizes, so the affordance belongs on an import that HAS
+        // them. `!state.result.error` was the same question asked the wrong way — and it would have
+        // let through the one shape that carries no error and no size either: a still-loading import.
+        if (state.status === "ready" && measuredSizes(state.result)) {
           labelPart.command = {
             title: "Show Import Details",
             command: "importLens.showImportDetails",

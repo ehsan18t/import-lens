@@ -1,7 +1,12 @@
 import type { ImportResult } from "../ipc/protocol.js";
+import { measuredSizes } from "./format.js";
 
 export const treeShakeActionReason = (result: ImportResult): string | null => {
-  if (result.error) {
+  // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). Every field this reads
+  // below — `is_cjs`, `side_effects`, `truly_treeshakeable` — is decided by a build, so a result no
+  // build produced has nothing to say about tree-shaking. `error` was only ever a proxy for that,
+  // and it is the wrong one: a Loading result has no size and no error either.
+  if (!measuredSizes(result)) {
     return null;
   }
 

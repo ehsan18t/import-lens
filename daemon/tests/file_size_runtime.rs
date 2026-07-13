@@ -35,8 +35,8 @@ fn context(workspace: &Path) -> AnalysisContext {
 }
 
 fn request(package: &str, export: &str, runtime: ImportRuntime) -> SizedImport {
-    SizedImport {
-        request: ImportRequest {
+    SizedImport::installed(
+        ImportRequest {
             specifier: package.to_owned(),
             package_name: package.to_owned(),
             version: "1.0.0".to_owned(),
@@ -46,8 +46,8 @@ fn request(package: &str, export: &str, runtime: ImportRuntime) -> SizedImport {
         },
         // Nothing measured yet: these sizings exercise the combined build, which is what the
         // file's totals come from — the per-import measurements only feed the fallback.
-        result: None,
-    }
+        None,
+    )
 }
 
 fn size(context: &AnalysisContext, requests: &[SizedImport]) -> FileSizeComputation {

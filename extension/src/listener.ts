@@ -9,10 +9,7 @@ import {
   importCostHistoryKey,
   recordImportCostHistory,
 } from "./analysis/history.js";
-import {
-  applyImportAnalysisInsights,
-  importCostHistoryItemsForStates,
-} from "./analysis/insights.js";
+import { applyImportAnalysisInsights } from "./analysis/insights.js";
 import { ImportResultLogTracker } from "./analysis/resultLogging.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
@@ -139,14 +136,14 @@ export class DocumentAnalysisController implements vscode.Disposable {
     // `recordImportCostHistory` serializes its writes and skips unchanged rows, so a push
     // that merged nothing costs nothing.
     if (isCurrent) {
-      void recordImportCostHistory(
-        this.#historyStore,
-        importCostHistoryItemsForStates(this.#store.get(uri)),
-      ).catch((error: unknown) => {
-        this.#logger.warn(
-          `Import history update failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
+      // The STORE applies the gate — it takes the states, not rows built for it.
+      void recordImportCostHistory(this.#historyStore, this.#store.get(uri)).catch(
+        (error: unknown) => {
+          this.#logger.warn(
+            `Import history update failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        },
+      );
     }
   }
 
@@ -261,10 +258,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
         });
       this.#store.set(document.uri, refine(currentStates), requestId, refine);
       try {
-        await recordImportCostHistory(
-          this.#historyStore,
-          importCostHistoryItemsForStates(currentStates),
-        );
+        await recordImportCostHistory(this.#historyStore, currentStates);
       } catch (error) {
         this.#logger.warn(
           `Import history update failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -313,8 +307,12 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
     if (!response || response.error) {
-      // Analysis itself succeeded (decorations are shown); a failed size
-      // round-trip should not read as "Unavailable".
+      // Nothing was summed at all, so there is no number to show — the ONE thing the aggregate's
+      // `error` legitimately answers. It is not the question "is this number usable?": `incomplete`
+      // and `degraded` answer that, and they are consulted below.
+      //
+      // Analysis itself succeeded (decorations are shown); a failed size round-trip should not read
+      // as "Unavailable".
       this.setStatusForActive(document, { kind: "ready" });
       return;
     }
@@ -327,7 +325,12 @@ export class DocumentAnalysisController implements vscode.Disposable {
       this.setStatusForActive(document, { kind: "ready" });
       return;
     }
-    const label = `${formatBytes(bytesForCompression(response, config.compression))} ${labelForCompression(config.compression)}`;
+    // A floor (`incomplete`) or an un-deduplicated per-import sum (`degraded`) is worth SHOWING —
+    // FR-024a, a floor beats a blank — but it is not the file's size, and the status bar is the one
+    // surface that shows the number with no diagnostics beside it to say so. `~` is the codebase's
+    // existing mark for "this figure is approximate" (FR-031).
+    const approximate = response.incomplete === true || response.degraded === true;
+    const label = `${approximate ? "~" : ""}${formatBytes(bytesForCompression(response, config.compression))} ${labelForCompression(config.compression)}`;
     this.setStatusForActive(document, { kind: "size", label });
   }
 

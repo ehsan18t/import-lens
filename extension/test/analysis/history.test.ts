@@ -5,10 +5,13 @@ import {
   bundleImpactHistoryDeltaLabel,
   bundleImpactHistoryLabel,
   type ImportCostHistoryItem,
+  type ImportCostHistorySource,
   importCostHistoryKey,
   recordBundleImpactHistory,
   recordImportCostHistory,
 } from "../../src/analysis/history.js";
+import type { FileSizeDocumentResponse, ImportResult } from "../../src/ipc/protocol.js";
+import { detectedImport } from "../helpers/detectedImport.js";
 
 class MemoryStore {
   readonly values = new Map<string, unknown>();
@@ -33,12 +36,30 @@ const item = (fileName: string, brotliBytes: number): BundleImpactHistoryItem =>
   importCount: 2,
 });
 
+/** A measured document: the store takes the RESPONSE and builds the row itself. */
+const sizedDocument = (brotliBytes: number): FileSizeDocumentResponse => ({
+  version: 7,
+  request_id: 1,
+  raw_bytes: 10_000,
+  minified_bytes: 5_000,
+  gzip_bytes: 1_900,
+  brotli_bytes: brotliBytes,
+  zstd_bytes: 1_700,
+  imports: [],
+  states: [
+    { detected: detectedImport({ specifier: "dayjs", packageName: "dayjs" }), status: "ready" },
+    { detected: detectedImport({ specifier: "clsx", packageName: "clsx" }), status: "ready" },
+  ],
+  error: null,
+  diagnostics: [],
+});
+
 test("recordBundleImpactHistory keeps newest entries first under the limit", async () => {
   const store = new MemoryStore();
 
-  await recordBundleImpactHistory(store, item("/workspace/src/a.ts", 1500), 2);
-  await recordBundleImpactHistory(store, item("/workspace/src/b.ts", 1200), 2);
-  await recordBundleImpactHistory(store, item("/workspace/src/c.ts", 900), 2);
+  await recordBundleImpactHistory(store, sizedDocument(1500), "/workspace/src/a.ts", 1_800_000, 2);
+  await recordBundleImpactHistory(store, sizedDocument(1200), "/workspace/src/b.ts", 1_800_000, 2);
+  await recordBundleImpactHistory(store, sizedDocument(900), "/workspace/src/c.ts", 1_800_000, 2);
 
   assert.deepEqual(
     store
@@ -72,17 +93,33 @@ test("bundleImpactHistoryDeltaLabel formats import cost deltas", () => {
   );
 });
 
-const costItem = (identity: string, brotliBytes: number): ImportCostHistoryItem => ({
-  identity,
-  timestamp: 1_800_000,
-  specifier: identity,
-  importKind: "named",
-  named: [],
-  rawBytes: brotliBytes * 4,
-  minifiedBytes: brotliBytes * 2,
-  gzipBytes: brotliBytes,
-  brotliBytes,
-  zstdBytes: brotliBytes,
+/**
+ * A measured import, as an analysis state — the only thing `recordImportCostHistory` accepts.
+ *
+ * It used to accept a finished `ImportCostHistoryItem`, so this helper built one directly and the
+ * store wrote it down. That is what "the gate is in the constructor, not the store" bought: a row
+ * nobody gated went into `globalState`, which has no TTL. The store takes the raw result now, so
+ * there is no way to express the bad call.
+ */
+const costSource = (specifier: string, brotliBytes: number): ImportCostHistorySource => ({
+  detected: detectedImport({ specifier, packageName: specifier, importKind: "named", named: [] }),
+  status: "ready",
+  result: {
+    specifier,
+    raw_bytes: brotliBytes * 4,
+    minified_bytes: brotliBytes * 2,
+    gzip_bytes: brotliBytes,
+    brotli_bytes: brotliBytes,
+    zstd_bytes: brotliBytes,
+    cache_hit: false,
+    side_effects: false,
+    truly_treeshakeable: true,
+    is_cjs: false,
+    confidence: "high",
+    confidence_reasons: [],
+    error: null,
+    diagnostics: [],
+  } satisfies ImportResult,
 });
 
 class SlowStore extends MemoryStore {
@@ -96,26 +133,26 @@ test("concurrent import-cost history writes both persist", async () => {
   const store = new SlowStore();
 
   await Promise.all([
-    recordImportCostHistory(store, [costItem("react", 100)]),
-    recordImportCostHistory(store, [costItem("lodash-es", 200)]),
+    recordImportCostHistory(store, [costSource("react", 100)]),
+    recordImportCostHistory(store, [costSource("lodash-es", 200)]),
   ]);
 
-  const identities = store
+  const specifiers = store
     .get<ImportCostHistoryItem[]>(importCostHistoryKey, [])
-    .map((entry) => entry.identity);
-  assert.ok(identities.includes("react"), `react missing: ${identities.join(",")}`);
-  assert.ok(identities.includes("lodash-es"), `lodash-es missing: ${identities.join(",")}`);
+    .map((entry) => entry.specifier);
+  assert.ok(specifiers.includes("react"), `react missing: ${specifiers.join(",")}`);
+  assert.ok(specifiers.includes("lodash-es"), `lodash-es missing: ${specifiers.join(",")}`);
 });
 
 test("recording a changed import cost keeps one row per identity", async () => {
   const store = new MemoryStore();
 
-  await recordImportCostHistory(store, [costItem("react", 100)]);
-  await recordImportCostHistory(store, [costItem("react", 150)]);
+  await recordImportCostHistory(store, [costSource("react", 100)]);
+  await recordImportCostHistory(store, [costSource("react", 150)]);
 
   const rows = store
     .get<ImportCostHistoryItem[]>(importCostHistoryKey, [])
-    .filter((entry) => entry.identity === "react");
+    .filter((entry) => entry.specifier === "react");
   assert.equal(rows.length, 1);
   assert.equal(rows[0].brotliBytes, 150);
 });

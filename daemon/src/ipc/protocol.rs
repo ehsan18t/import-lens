@@ -437,6 +437,26 @@ impl ImportResult {
                 .iter()
                 .all(|diagnostic| stage_is_durable(&diagnostic.stage))
     }
+
+    /// A **declarations-only** package: a package that resolves to no runtime entry *because it
+    /// ships no runtime code*, and is answered Measured — a genuine zero, at High confidence
+    /// ([`crate::pipeline::types_only`]).
+    ///
+    /// The distinction this exists to draw is "resolved to nothing because there is nothing" versus
+    /// "could not be resolved". They look identical to [`crate::pipeline::resolver`], which returns
+    /// `Err` for both, and the aggregate must tell them apart: a types-only import contributes zero
+    /// bytes as a **fact**, so it leaves the file's total complete. Treating it as a gap instead
+    /// made every file importing an `@types/…` package a permanent floor — never cached, never
+    /// persisted, exit 3 from `importlens check` — which is a large fraction of real TypeScript.
+    ///
+    /// The sizes must be present: the zero is an *answer*, and an answer has a size.
+    pub fn is_types_only(&self) -> bool {
+        self.sizes().is_some()
+            && self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == crate::pipeline::stage::TYPES_ONLY)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,6 +601,18 @@ pub struct FileSizeDocumentResponse {
     /// real, cacheable fact, and no reason to distrust the total) carries too. SRS FR-024a/FR-026c.
     #[serde(default)]
     pub incomplete: bool,
+    /// The file's **own combined build** failed, so these totals are not the file's — whatever the
+    /// state of its imports ([`crate::pipeline::file_size::FileSizeComputation::degraded`]).
+    ///
+    /// The second half of ADR-0006's invariant 4, and the one `incomplete` structurally cannot see:
+    /// a combined build is strictly larger than any single import's build, so it is the likeliest
+    /// thing in the system to hit `BUILD_TIMEOUT` — and when it does, every contributor may still be
+    /// perfectly Measured, leaving `incomplete: false`, `error: None`, and an un-deduplicated
+    /// per-import SUM on the wire. That sum is a Combined Import Cost, a different quantity from a
+    /// File Cost (ADR-0004), and an OVER-count rather than a floor. It must be shown, and it must
+    /// never be stored, compared, or judged.
+    #[serde(default)]
+    pub degraded: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }
@@ -979,6 +1011,10 @@ pub struct FileSizeResponse {
     /// it is no worse off than it was.
     #[serde(default)]
     pub incomplete: bool,
+    /// The file's own combined build failed — the same flag, and the same meaning, as
+    /// [`FileSizeDocumentResponse::degraded`]. Missing here for the same reason `incomplete` was.
+    #[serde(default)]
+    pub degraded: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }

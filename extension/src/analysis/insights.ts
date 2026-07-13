@@ -8,7 +8,6 @@ import {
   previousImportCostFor,
 } from "./history.js";
 import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
-import { isDurableImportResult } from "./transience.js";
 
 export interface ImportAnalysisInsightOptions {
   changedLines?: ReadonlySet<number>;
@@ -63,30 +62,6 @@ export const insightLabelSuffix = (
 
   return labels.length > 0 ? ` · ${labels.join(" · ")}` : "";
 };
-
-/**
- * The rows a document's states contribute to the PERSISTED import-cost history.
- *
- * `isDurableImportResult` is the whole reason this is a filter and not a map. The history keeps one
- * row per import identity, with no TTL and no cache generation, so a row that should not be there
- * does not merely go stale — it overwrites that import's real baseline permanently, and every later
- * trend ("was 17 KB, now 58 B") is measured against a number that never happened. Two results must
- * be refused: one with no size (nothing to record), and one whose measurement was degraded by a
- * transient failure of the daemon rather than a fact about the package.
- */
-export const importCostHistoryItemsForStates = (
-  states: readonly ImportAnalysisState[],
-  now: number = Date.now(),
-): ImportCostHistoryItem[] =>
-  states
-    .filter(
-      (
-        state,
-      ): state is ImportAnalysisState & { result: NonNullable<ImportAnalysisState["result"]> } =>
-        state.status === "ready" && isDurableImportResult(state.result),
-    )
-    .map((state) => importCostHistoryItem(state.detected, state.result, now))
-    .filter((item): item is ImportCostHistoryItem => item !== undefined);
 
 /**
  * "This import adds N bytes to your working-tree change."

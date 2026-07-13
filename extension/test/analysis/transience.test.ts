@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  type BundleImpactHistoryItem,
   bundleImpactHistoryItemForResponse,
-  importCostHistoryItem,
+  bundleImpactHistoryKey,
+  type ImportCostHistoryItem,
+  importCostHistoryItemsForStates,
+  importCostHistoryKey,
+  recordBundleImpactHistory,
+  recordImportCostHistory,
 } from "../../src/analysis/history.js";
-import { importCostHistoryItemsForStates } from "../../src/analysis/insights.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import {
   isDurableFileSize,
@@ -96,16 +101,35 @@ const fileSize = (overrides: Partial<FileSizeDocumentResponse> = {}): FileSizeDo
   ...overrides,
 });
 
+class MemoryStore {
+  readonly values = new Map<string, unknown>();
+
+  get<T>(key: string, defaultValue: T): T {
+    return (this.values.get(key) as T | undefined) ?? defaultValue;
+  }
+
+  async update(key: string, value: unknown): Promise<void> {
+    this.values.set(key, value);
+  }
+}
+
 /**
  * **Property** over EVERY transient stage the daemon declares × every durable store the extension
  * owns. A stage added to `transientEngineStages` that some store forgets to gate on fails here.
+ *
+ * **It feeds the STORES, not the constructors.** It used to feed `importCostHistoryItem` and
+ * `bundleImpactHistoryItemForResponse` — the row builders — and assert they returned `undefined`.
+ * That proved the predicate worked; it proved nothing about the store, which took a
+ * `ImportCostHistoryItem[]` and wrote down whatever it was handed. A row built by hand went
+ * straight into `globalState`. That is precisely the predicate-beside-a-store shape the daemon
+ * fixed on its side and FR-026c says must not exist, and it was still standing here.
  *
  * The extension's stores are the worst place in the system for a fabricated number to land: they
  * have no TTL, no cache generation, and one row per identity, so the value does not go stale — it
  * becomes that import's permanent baseline, and every later trend is measured against a number
  * that never happened.
  */
-test("no durable store takes a transient outcome, in any of its shapes", () => {
+test("no durable store takes a transient outcome, in any of its shapes", async () => {
   assert.ok(transientEngineStages.length > 0, "there must be at least one transient stage");
 
   for (const stage of transientEngineStages) {
@@ -120,51 +144,73 @@ test("no durable store takes a transient outcome, in any of its shapes", () => {
       `a measurement whose comparison build hit \`${stage}\` carries a fabricated tree-shake verdict`,
     );
 
-    assert.deepEqual(
-      importCostHistoryItemsForStates(
-        [stateFor("lodash-es", unmeasured(stage)), stateFor("dayjs", measured)],
-        1_000,
-      ).map((item) => item.specifier),
-      ["dayjs"],
-      `a \`${stage}\` row would replace lodash-es's real baseline for good`,
-    );
-
-    // **The row CONSTRUCTOR**, not just the filter in front of it. `ImportCostHistoryItem` is five
-    // sizes and an identity: once one exists, nothing downstream can tell how it was measured, so
-    // `recordImportCostHistory` cannot re-derive whether it was safe to keep. The gate has to be
-    // here, or the store is takeable by anyone who builds a row directly — which is the whole shape
-    // of this defect: a predicate the caller was supposed to remember.
+    // **The import-cost STORE.** Hand it the states — a transient failure beside a healthy import —
+    // and only the healthy one may be written down. There is no way to hand it a row.
     for (const shape of [unmeasured(stage), comparisonDegraded(stage)]) {
-      assert.equal(
-        importCostHistoryItem(
-          detectedImport({
-            specifier: "lodash-es",
-            packageName: "lodash-es",
-            named: [],
-            importKind: "default",
-          }),
-          shape,
-          1_000,
-        ),
-        undefined,
-        `a \`${stage}\` result must not even be CONSTRUCTIBLE as a history row`,
+      const store = new MemoryStore();
+      await recordImportCostHistory(
+        store,
+        [stateFor("lodash-es", shape), stateFor("dayjs", measured)],
+        1_000,
+      );
+
+      assert.deepEqual(
+        store.get<ImportCostHistoryItem[]>(importCostHistoryKey, []).map((item) => item.specifier),
+        ["dayjs"],
+        `a \`${stage}\` row would replace lodash-es's real baseline for good, and the STORE must be \
+the thing that refuses it`,
       );
     }
 
-    assert.equal(
-      bundleImpactHistoryItemForResponse(
-        fileSize({ diagnostics: [{ stage, message: "combined build", details: [] }] }),
-        "C:/app/index.ts",
-        5,
-      ),
-      undefined,
+    // **The bundle-impact STORE.** Same shape: it takes the response, applies the gate itself, and
+    // writes nothing when the totals are not this file's.
+    const fileStore = new MemoryStore();
+    await recordBundleImpactHistory(
+      fileStore,
+      fileSize({ diagnostics: [{ stage, message: "combined build", details: [] }] }),
+      "C:/app/index.ts",
+      5,
+    );
+    assert.deepEqual(
+      fileStore.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []),
+      [],
       `a file total degraded by \`${stage}\` is not this file's size`,
     );
+
     assert.equal(
       isDurableFileSize(fileSize({ diagnostics: [{ stage, message: "x", details: [] }] })),
       false,
     );
   }
+});
+
+/**
+ * **The shape `incomplete` cannot see** (ADR-0006, invariant 4, second half): every contributor
+ * Measured, `error: null`, `incomplete: false` — and the file's own combined build failed, so the
+ * number is an un-deduplicated sum of per-import costs. An over-count, and a different quantity
+ * from a File Cost (ADR-0004).
+ *
+ * The `degraded` flag is its only evidence, and this store is one of the three consumers that has
+ * to refuse it (the L1 aggregate cache and `importlens check` are the others).
+ */
+test("the bundle-impact store refuses a total whose own combined build failed", async () => {
+  const response = fileSize({ degraded: true, incomplete: false, error: null });
+
+  assert.equal(
+    isDurableFileSize(response),
+    false,
+    "a per-import sum with shared modules counted twice is not this file's size",
+  );
+
+  const store = new MemoryStore();
+  await recordBundleImpactHistory(store, response, "C:/app/index.ts", 5);
+
+  assert.deepEqual(
+    store.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []),
+    [],
+    "an over-count persisted with no TTL becomes this file's permanent baseline, and the next \
+honest sizing reads as an improvement that never happened",
+  );
 });
 
 test("a measurement is durable and a deterministic failure has nothing to record", () => {
