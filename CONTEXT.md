@@ -61,11 +61,38 @@ An import whose measured cost is meaningfully below the cost of importing its wh
 narrowly, and it is only asked of a named, non-Side-Effectful import.
 _Avoid_: tree-shakes, shakeable
 
+### The state of a result
+
+**Measured**:
+An import whose build succeeded. It has sizes. A size exists **if and only if** a result is
+Measured — see [ADR-0006](docs/adr/0006-the-result-model.md).
+
+**Loading**:
+An import whose build is still in flight. It has **no size yet**. The response does not wait
+for it; it is delivered later by a push. Loading is not a failure and must never be recorded,
+cached, summed, or compared.
+_Avoid_: pending, unresolved
+
 **Unmeasured**:
-The state of an import whose graph Rolldown could not build — a failed build, a manifest we
-cannot parse, an entry over the module source limit. An Unmeasured import has **no size**.
-It is not a size of zero, and it is not an estimate carrying a low-confidence badge.
+An import whose graph Rolldown could not build — a failed build, a manifest we cannot parse,
+an entry over the module source limit. An Unmeasured import has **no size**, ever. It is not a
+size of zero, and it is not an estimate carrying a low-confidence badge. Distinct from
+[[Loading]]: no size *ever*, versus no size *yet*.
 _Avoid_: fallback size, approximate size, conservative estimate
+
+**Transient** / **Deterministic**:
+The two causes of an Unmeasured import, and the distinction the whole caching model rests on.
+**Deterministic** (`parse`, `link`, `missing_export`, `module_graph_limit`, …) is a property of
+the package's **bytes** — same input, same outcome — so it may be cached. **Transient**
+(`panic`, `timeout`, `engine_gone`) is a property of **this moment's scheduling** and says
+nothing about the package: it may never be cached, persisted, compared, or turned into a
+pass/fail verdict.
+
+**Floor**:
+An aggregate computed from inputs that were not all Measured. It is a lower bound, not a size.
+A Floor is flagged `incomplete`, and **no verdict may be drawn from it** — a budget judged
+against a Floor is neither passed nor failed, it is *not evaluated*.
+_Avoid_: total, conservative total
 
 **Marginal Cost**:
 What adding an import to a project that already contains some of its dependencies would

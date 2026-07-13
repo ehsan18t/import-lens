@@ -33,18 +33,24 @@ What actually shipped:
 - **`loading` (no size *yet*) and `Unmeasured` (no size *ever*) are different states** and every consumer must distinguish them.
 - On a **cold** document, every import arrives by push. Anything that reads results at response time sees nothing.
 
-### 2. THE SIGNATURE DEFECT OF THIS CODEBASE
+### 2. THE SIGNATURE DEFECT — now diagnosed. Read [ADR-0006](../../adr/0006-the-result-model.md).
 
 > **A TRANSIENT condition producing a DURABLE wrong answer.**
 
-It has now appeared **four times, in four different places**:
+It appeared **six times, in six different places**, each found only after the previous fix shipped:
 
 1. A circuit breaker condemned a *healthy* package to static sizing for a whole cache generation.
-2. A degraded 58-byte fallback was cached over a healthy 17,550-byte package — `should_cache_result` was `result.error.is_none()`, and a fallback carries `error: None` **plus a plausible size**.
-3. An incomplete file-size total (computed while imports were still `loading`) was cached for its 30s TTL.
-4. **Task 5, as originally written, creates the fourth** — see below.
+2. A degraded 58-byte fallback was cached over a healthy 17,550-byte package.
+3. An incomplete file-size total (computed while imports were still `loading`) was cached for its TTL.
+4. A fabricated size was written to the persisted **import-cost history**, destroying that import's real baseline.
+5. A fabricated **import count** was written to the **bundle-impact history** (the `incomplete` gate guards *bytes*, not *counts*).
+6. **`importlens check` decides CI pass/fail from a fabricated size and silently PASSES** — so the regression merges. The worst of the six.
 
-**Before implementing any task: ask what happens if this build fails *transiently*. Then check every cache, memo, and durable store it can reach** — the L1 memory cache, the **L2 disk cache** (it survives restarts), `full_package.rs`, `export_list.rs`, `build_memo.rs`, `file_size_cache.rs`, and the extension's `workspaceState` / `globalState` history.
+**It is not six bugs. It is one missing model.** Every consumer asks *"is this result usable?"* as `!result.error` / `error.is_none()` — a **negative check on `error`** — and a transiently-degraded result carries **`error: None` PLUS a fabricated size**, so it passes all of them.
+
+**[ADR-0006](../../adr/0006-the-result-model.md) is the fix.** A size exists **iff** a build succeeded; the question becomes *"is there a size?"* (an `Option`, compiler-enforced), never *"is there an error?"*. **Task 5 is therefore not merely an ADR implementation — it is the structural fix for this entire defect class**, and four of the six instances dissolve under it without being touched. It must ship with the **Guards** ADR-0006 requires, because six rounds of *documenting* the rule did not prevent the seventh instance.
+
+**Before implementing any task: ask what happens if this build fails *transiently*, and which durable stores that can reach** — the L1 cache, the **L2 disk cache** (it survives restarts), `full_package.rs`, `export_list.rs`, `build_memo.rs`, `file_size_cache.rs`, the extension's `workspaceState` / `globalState` histories, and **any pass/fail verdict**.
 
 ### 3. Tasks 5+6, 8 and 9 were traced end-to-end before implementation. All three were "right but incomplete."
 
