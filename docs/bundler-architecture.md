@@ -104,6 +104,15 @@ Two distinct measurements come out of it:
 
 Editing is debounced in the editor, so a burst of keystrokes produces one analysis.
 
+**The answer does not wait for the builds.** The response comes back immediately with every
+import the cache could answer, and each import still being built is marked as *Loading* and
+**pushed to the editor as it lands**. This is not a performance nicety — it is what makes one
+slow import survivable. The response used to be all-or-nothing, so a single pathological package
+could push it past the editor's deadline and the editor would then discard **the entire
+document's results, including the nineteen imports already answered from cache**. Now a
+pathological package delays *its own number* and nothing else. (§9 explains why a package can be
+pathological in the first place.)
+
 ### Opening `package.json`
 
 Every declared dependency is sized as if it were imported for its whole surface. This answers
@@ -271,10 +280,15 @@ takes the whole surface), and the full-package result is remembered per package 
 import — otherwise ten different named imports from one library would each pay for their own
 identical full build.
 
-**Confidence is a first-class output, not a footnote.** When the bundler emits a warning, when
-a package's side-effect declaration prevents a clean answer, or when a build failed and the
-number came from a fallback, the user is told. A number that quietly hides its own uncertainty
-is worse than no number.
+**Confidence is a first-class output, not a footnote.** When the bundler emits a warning, when a
+package's side-effect declaration prevents a clean answer, or when a package ships bytes we did
+not count, the user is told. A number that quietly hides its own uncertainty is worse than no
+number.
+
+But confidence is a *qualifier on a real measurement* — it is not a licence to report a made-up
+one. There is no such thing as a low-confidence guess here: a build either produced a number or
+it did not (§9). The product once used confidence that way, and a badge is no defence against a
+byte count that is wrong by an order of magnitude, because users read the number.
 
 ---
 
@@ -336,6 +350,27 @@ the build's thread pool was once sized to the build *concurrency* limit, which p
 build to two threads no matter how many cores existed. Separating them made real-package builds
 substantially faster without changing memory usage at all.
 
+### A build can hang forever, and that is not our bug to fix
+
+The bundler fans each module out onto its own async task, and **the async runtime swallows a
+panic in a spawned task**. When one of those module tasks dies, the bundler's loader goes on
+waiting for a completion message that will never arrive — on a channel it holds open itself, so
+it never closes either. **The build parks. Forever.**
+
+Catching panics at our own boundary does not see this, because nothing ever unwinds to us. So
+every build carries a **hard time limit**, and that limit exists for exactly one reason: a
+parked build must not hold one of the two build slots for the life of the daemon. Two of them
+would wedge it permanently — no further import could ever be measured, and only a restart would
+recover it.
+
+This is the *only* timeout the design has. Nothing else needs one, because — since imports
+stream (§3) — **no request waits on a build**. A parked build costs its own number and nothing
+else. Earlier designs tried to bound the *request* instead, with a per-request deadline and with
+a circuit-breaker that remembered which packages had parked. Both were deleted: neither could
+bound a request that named several bad packages, and the circuit-breaker durably condemned
+*healthy* packages that had merely been slow once. Bounding the build, and refusing to make
+anyone wait for it, is the whole answer.
+
 ---
 
 ## 8. Freshness: knowing when an answer went wrong
@@ -379,32 +414,84 @@ trigger a rebuild against a filesystem that is mid-flight.
 ## 9. When the build fails
 
 It will. Packages ship broken syntax, unresolvable optional dependencies, and graphs that blow
-every reasonable limit. The rule is that **failure degrades, and never fabricates.**
+every reasonable limit. The rule is exactly one sentence:
+
+> **A size exists if and only if a build succeeded.**
+
+There is no fallback number, no estimate, no approximation. Every result is in one of three
+states, and the state is legible from its *type* — not from a convention a reader has to know.
 
 ```mermaid
 graph TD
     B[build] --> R{outcome}
-    R -->|success| OK([the measured number])
-    R -->|"the requested export<br/>does not exist,<br/>or is ambiguous"| ERR([an error — no size at all])
-    R -->|"anything else:<br/>parse · link · resolve ·<br/>limits · minify"| FB[fall back:<br/>size the entry file alone]
-    FB --> LOW([a number, marked low-confidence,<br/>carrying the reason it failed])
+    R -->|success| OK([Measured — the number])
+    R -->|"still running"| LOAD([Loading — no size YET;<br/>delivered when it lands])
+    R -->|"could not answer"| UN{why?}
+    UN -->|"parse · link · missing export ·<br/>graph limit · output shape"| DET([Unmeasured — DETERMINISTIC<br/>a fact about the package's bytes])
+    UN -->|"panic · timeout · engine gone"| TR([Unmeasured — TRANSIENT<br/>a fact about this moment])
 
     style OK fill:#22543d,color:#fff
-    style ERR fill:#742a2a,color:#fff
-    style LOW fill:#744210,color:#fff
+    style LOAD fill:#1a365d,color:#fff
+    style DET fill:#744210,color:#fff
+    style TR fill:#742a2a,color:#fff
 ```
 
-The asymmetry is the whole point.
+### Why the fallback was deleted
+
+The product used to substitute a number when a build failed: the entry file's own bytes, or the
+package's size on disk. It carried a low-confidence badge, and it looked responsible.
+
+It was not. A large UI kit that breached a graph limit was reported at **the few kilobytes of
+its barrel file** when the true answer was megabytes. Users read the byte count; a number wrong
+by an order of magnitude while *looking* like a measurement is worse than no number, because it
+is actionable and the action is wrong.
+
+Worse, the fabricated result carried `error: null` **plus that plausible size** — so every
+consumer that asked *"is this usable?"* by checking `!result.error` let it straight through.
+That single missing distinction produced **the same defect seven times in seven different
+places**: a healthy package condemned to static sizing for a whole cache generation; a
+58-byte fabrication cached over a healthy 17,550-byte package; an incomplete total cached;
+a fabrication written to the persisted cost history, destroying that import's real baseline;
+a fabricated import *count*; and — worst — the CI gate deciding pass/fail from a fabricated
+size and **silently passing**, so the regression merged.
+
+It was never seven bugs. It was one missing model, replicated everywhere anyone needed to ask
+the question. The fix is not a seventh patch: it is to make the state **unrepresentable**. With
+no size to misuse, every one of those checks becomes correct by construction.
+
+### Deterministic and transient are not the same failure
+
+This is the distinction the code never made, and it is the one everything else rests on.
+
+A **deterministic** failure — a parse error, an unresolvable link, a breached limit — is a fact
+about the package's **bytes**. Same input, same outcome, forever. It **may be cached**: the
+cache is already keyed by those bytes' fingerprints, so it expires exactly when the answer would
+change. Refusing to cache it would re-enter the bundler for a broken package on *every* analysis,
+permanently occupying one of only two build slots.
+
+A **transient** failure — a panic, a timeout, a lost engine — is a fact about **this moment's
+scheduling**. It says nothing whatsoever about the package. It may **never** be cached, never
+persisted, never compared against a baseline, and never turned into a pass/fail verdict. A
+transient failure that becomes durable is the single worst thing this system can do, because it
+converts a momentary accident into a permanently wrong answer that outlives the daemon.
+
+### Aggregates inherit the weakest input
+
+A file's combined total is only as complete as the imports that fed it. If **any** contributor
+is Loading or Unmeasured, the total is a **floor** — a lower bound, not a size. It is flagged
+as such, and no verdict may be drawn from it: a budget judged against a floor is neither passed
+nor failed, it is *not evaluated*.
+
+And a gate that cannot measure **must never report success**. `importlens check` exits non-zero
+with a code distinct from a real budget failure, so a flaky CI machine is diagnosable and is
+never mistaken for a genuine regression. A silent pass is the worst outcome available — it
+merges the regression.
+
+### The one thing that is still true from before
 
 A **missing or ambiguous export** means the user asked for a name the package does not provide.
-Producing a size there would paper over a real mistake in their code, so it is reported as an
-error with no size at all. This is the one place the product refuses to answer, and it refuses
-deliberately.
-
-**Everything else** falls back to measuring the entry file on its own — a real number, a
-drastic under-estimate, and clearly marked as such: low confidence, plus the stage that failed.
-The user sees that something went wrong and roughly how much code is involved, rather than a
-spinner or a lie.
+Producing a size there would paper over a real mistake in their code. It is reported as an error
+with no size — deliberately.
 
 No failure path may invent a symbol, measure a half-linked graph, or silently substitute an
 unvalidated result.
@@ -418,11 +505,23 @@ The decisions most likely to look like bugs to someone who wasn't there.
 **Contributions don't sum to the total.** Measured before final minification, and chunk glue
 belongs to no module. Approximate by construction. (§6)
 
-**The whole-file compressed total is a lower bound when a file mixes runtimes.** A file that
-imports both client and server code must be built once per runtime, because the two resolve
-dependencies under genuinely different conditions. Those results are then compressed together,
-which means an identifier appearing in both is not compressed twice. The alternative — reporting
-two totals, or compressing separately and adding — is more confusing and no more true.
+**The whole-file compressed total is a lower bound when a file mixes runtimes — and this is a
+known defect, not a trade-off.** A file that imports both client and server code must be built
+once per runtime, because the two resolve dependencies under genuinely different conditions.
+Those results are currently compressed *together*, so an identifier appearing in both is
+compressed only once.
+
+This was originally defended on the grounds that "compressing separately and adding is no more
+true, because compression is not additive." **That reasoning is wrong.** Non-additivity applies
+to parts that would, in reality, be compressed *together*. Two runtime groups never are: they
+are two artifacts that genuinely ship, and each is genuinely compressed on its own. Summing their
+separately-compressed sizes therefore models reality **exactly** — it is the concatenation that
+distorts it, by compressing away redundancy between two payloads that never meet.
+
+**A runtime is an artifact boundary.** Compressed bytes may be summed *across* one and never
+*within* one. The same rule extends to the non-JavaScript assets a package ships. Measured on a
+shared-heavy two-runtime Astro file, the current concatenation under-reports by ~36%. The
+correction is decided and pending.
 
 **A namespace import is measured at full weight, with no attempt to be clever.** A namespace
 object can be indexed dynamically, so nothing in the package can be proven dead. Some bundlers
@@ -471,10 +570,33 @@ because they were once false.
    is a lie.
 5. **Bytes are fingerprinted as they are read**, never afterwards.
 6. **The analyzer revision is bumped whenever a change can move a number.**
-7. **A cache hit never waits for a build.**
-8. **No failure path fabricates a symbol or measures partial code.**
-9. **The bundler is never asked to build the same document's imports as separate bundles** —
-   shared dependencies must be deduplicated by the bundler, not estimated afterwards.
+7. **Nothing waits for a build.** A cache hit never queues behind one, and a request never
+   blocks on one: results are delivered as they land. A single slow import may cost its own
+   number and nothing else.
+8. **No failure path fabricates a symbol, measures partial code, or invents a size.**
+
+And the five that exist because ignoring them produced the same defect seven times:
+
+9. **A size exists if and only if a build succeeded.** There is no fallback number anywhere in
+   the system.
+10. **The question a consumer asks is "is there a size?" — never "is there an error?".** Sizes
+    are optional and the compiler enforces the check. Invariant 9 is what makes this safe: a
+    failed build has no size to misuse. *Any new code that reaches for `!result.error` to mean
+    "usable" is reintroducing the bug.*
+11. **A transient failure may never become durable.** Not cached, not persisted, not compared
+    against a baseline, not turned into a pass/fail verdict. A *deterministic* failure may be
+    cached — it is a fact about the bytes, and the cache is keyed by those bytes.
+12. **An aggregate is only as complete as its inputs.** Any Loading or Unmeasured contributor
+    makes the total a **floor**, and **no verdict may be drawn from a floor** — a budget judged
+    against one is not failed, it is *not evaluated*. **A gate that cannot measure must never
+    report success.**
+13. **A runtime is an artifact boundary.** Compressed bytes may be summed across one and never
+    within one. Nothing is ever deduplicated across a runtime, because each runtime genuinely
+    ships its own copy.
+
+**The bundler is never asked to build one document's imports as separate bundles *within* a
+runtime** — shared dependencies must be deduplicated by the bundler, not estimated afterwards.
+Across runtimes, separate bundles are exactly right (invariant 13).
 
 ---
 
