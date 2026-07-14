@@ -516,7 +516,6 @@ const workspaceReportRequest = (requestId: number): WorkspaceReportRequest => ({
   workspace_root: "C:/workspace",
   budgets: {
     perImportBrotliBytes: 1,
-    perFileBrotliBytes: 1,
   },
 });
 

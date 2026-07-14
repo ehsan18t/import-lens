@@ -757,13 +757,19 @@ pub struct RefreshRegistryHintsResponse {
     pub diagnostics: Vec<ImportDiagnostic>,
 }
 
+/// The budgets the workspace report can judge, which is the **per-import** one and only that.
+///
+/// A per-file budget is judged against a **File Cost** — one bundle over all a file's imports, so a
+/// module two of them reach is counted once (ADR-0004) — and the report has no such build behind a
+/// row. It used to sum each file's per-import brotli and warn off THAT: an upper bound that
+/// double-counts every shared module, and a verdict the editor and `importlens check` (which both
+/// measure the File Cost) contradicted on the same file under the same budget. The field is gone so
+/// that nothing can be judged against a number the report does not have (SRS FR-036i, FR-036q).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceReportBudgets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_import_brotli_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub per_file_brotli_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

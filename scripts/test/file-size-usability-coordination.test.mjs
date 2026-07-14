@@ -105,3 +105,43 @@ test("all three gates refuse a transient stage on the aggregate's own diagnostic
 either, and it must never report a pass",
   );
 });
+
+// GUARD. One file budget, one number. The file budget is judged against a FILE COST - one bundle
+// over all the file's imports, so a module two of them reach is counted once (ADR-0004) - and the
+// only two surfaces that hold one are the editor (`file_size_document`) and `importlens check`.
+//
+// The workspace report held a second one. `apply_file_budget_warnings` summed each row's per-import
+// brotli per source file and warned "File budget exceeded" off THAT: a Combined Import Cost, an
+// upper bound, never a size. So the same file, under the same budget, was over budget in the report
+// and inside it in the editor - and the report's number could not be fixed in place, because a
+// report row is an import and has no combined build behind it.
+//
+// It is gone, and it stays gone: the report's unit is the import, and its per-import budget check
+// (`is_import_budget_violation`) is genuinely per-import.
+test("the workspace report runs no SECOND file budget off a sum of per-import costs", () => {
+  const protocol = read("daemon/src/ipc/protocol.rs");
+  const reportBudgets = bodyBetween(protocol, "pub struct WorkspaceReportBudgets {", "\n}");
+
+  assert.doesNotMatch(
+    reportBudgets,
+    /per_file/u,
+    "WorkspaceReportBudgets carries a per-file budget again - the report has no File Cost to judge \
+it against, so whatever it judges is a sum of per-import costs and will contradict the editor and \
+importlens check on the same file",
+  );
+  // The CODE, not the prose: the comments in these files explain at length why the file budget is
+  // not here, and a guard that cannot be explained is a guard nobody keeps.
+  assert.doesNotMatch(
+    withoutComments(read("daemon/src/report/model.rs")),
+    /file.?budget/iu,
+    "the report model reaches a per-file budget verdict again (ADR-0004: its rows are imports, and \
+their sum is a Combined Import Cost, not the file's size)",
+  );
+});
+
+/** Rust source with `//`-comments removed, so a guard matches what the code DOES, not what it says. */
+const withoutComments = (source) =>
+  source
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/u, ""))
+    .join("\n");

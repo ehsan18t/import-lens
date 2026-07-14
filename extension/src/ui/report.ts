@@ -38,7 +38,10 @@ export const showReport = async (
           version: protocolVersion,
           request_id: nextIpcRequestId(),
           workspace_root: workspaceRoot,
-          budgets: config.budgets,
+          // The per-import budget only. The report's rows are imports; the per-file budget is
+          // judged against a File Cost, which lives in the editor's diagnostics and in
+          // `importlens check` (ADR-0004, SRS FR-036i).
+          budgets: { perImportBrotliBytes: config.budgets.perImportBrotliBytes },
         }),
     );
 

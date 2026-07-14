@@ -531,9 +531,17 @@ export interface WorkspaceReportRequest {
   budgets?: WorkspaceReportBudgets;
 }
 
+/**
+ * The budgets the workspace report can judge: the **per-import** one, and only that.
+ *
+ * A per-file budget is judged against a File Cost — one bundle over all a file's imports (ADR-0004)
+ * — and the report has no combined build behind a row, only a sum of per-import costs, which counts
+ * a shared module twice. It used to warn off that sum, and disagreed with the editor and
+ * `importlens check` about the same file under the same budget. The per-file budget is theirs; it
+ * is not on this request, so nothing here can be judged against a number the report does not have.
+ */
 export interface WorkspaceReportBudgets {
   perImportBrotliBytes?: number;
-  perFileBrotliBytes?: number;
 }
 
 export interface WorkspaceReportRow {

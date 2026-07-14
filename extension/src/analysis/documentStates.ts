@@ -1,4 +1,5 @@
 import type { ImportResult } from "../ipc/protocol.js";
+import type { DocumentFileCost } from "./fileSize.js";
 import { mergeRefreshedResults, type RefreshMergeOptions } from "./refreshMerge.js";
 import type { ImportAnalysisState } from "./state.js";
 
@@ -77,6 +78,7 @@ const maxQueuedRefreshBatches = 256;
 export class DocumentAnalysisStates {
   readonly #states = new Map<string, ImportAnalysisState[]>();
   readonly #queued = new Map<string, QueuedRefresh[]>();
+  readonly #fileCosts = new Map<string, DocumentFileCost>();
 
   /**
    * Store the states of analysis `generation`, and re-apply every push that belongs to it — whether
@@ -104,6 +106,13 @@ export class DocumentAnalysisStates {
     refine?: RefineStates,
   ): ImportAnalysisState[] {
     this.#states.set(key, states);
+    // A new analysis is a new document. The File Cost in hand measured the file as it was BEFORE
+    // the keystroke that opened this generation — the import the user just deleted is still in it —
+    // and a budget judged against it is judged against a file that no longer exists. It is dropped
+    // here and re-armed by the size read this analysis is about to make (`listener.updateFileSize`),
+    // so between the two the file budget is simply **not evaluated**, which is the honest answer
+    // while the number is unknown (ADR-0006, invariant 5).
+    this.#fileCosts.delete(key);
 
     const queued = this.#queued.get(key);
     this.#queued.delete(key);
@@ -129,6 +138,25 @@ export class DocumentAnalysisStates {
 
   get(key: string): ImportAnalysisState[] {
     return this.#states.get(key) ?? [];
+  }
+
+  /**
+   * The document's File Cost — the daemon's combined build over its imports, the one number the
+   * per-file budget may be judged against ({@link DocumentFileCost}). `undefined` means the store
+   * has not been told one for the document as it stands now, and the file budget is then not
+   * evaluated: a summed alternative is a *different quantity* (ADR-0004), not a fallback.
+   */
+  setFileCost(key: string, fileCost: DocumentFileCost | undefined): void {
+    if (fileCost === undefined) {
+      this.#fileCosts.delete(key);
+      return;
+    }
+
+    this.#fileCosts.set(key, fileCost);
+  }
+
+  fileCost(key: string): DocumentFileCost | undefined {
+    return this.#fileCosts.get(key);
   }
 
   /**
@@ -164,6 +192,7 @@ export class DocumentAnalysisStates {
     // queued belong to the analysis that was just abandoned (closed document, failed or empty
     // response). Holding them would only let them merge into a LATER analysis of the same file.
     this.#queued.delete(key);
+    this.#fileCosts.delete(key);
   }
 
   all(): ImportAnalysisState[] {

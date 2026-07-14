@@ -29,18 +29,24 @@ export class BudgetDiagnosticsController implements vscode.Disposable {
       return;
     }
 
-    const diagnostics = budgetViolationsForStates(this.#store.get(uri), config.budgets).map(
-      (violation) => {
-        const diagnostic = new vscode.Diagnostic(
-          rangeFromSourceRange(violation.range),
-          violation.message,
-          vscode.DiagnosticSeverity.Warning,
-        );
-        diagnostic.source = "Import Lens";
-        diagnostic.code = violation.kind === "file" ? "file-budget" : "import-budget";
-        return diagnostic;
-      },
-    );
+    // The states AND the File Cost: the per-import budget is genuinely per-import, the file budget
+    // is judged against the daemon's combined build over the whole file, and this is the one place
+    // that holds both (`AnalysisStore.setFileCost`). With no File Cost in the store the file budget
+    // is not evaluated — never re-derived from the states, which sum to a different quantity.
+    const diagnostics = budgetViolationsForStates(
+      this.#store.get(uri),
+      config.budgets,
+      this.#store.fileCost(uri),
+    ).map((violation) => {
+      const diagnostic = new vscode.Diagnostic(
+        rangeFromSourceRange(violation.range),
+        violation.message,
+        vscode.DiagnosticSeverity.Warning,
+      );
+      diagnostic.source = "Import Lens";
+      diagnostic.code = violation.kind === "file" ? "file-budget" : "import-budget";
+      return diagnostic;
+    });
 
     this.#collection.set(uri, diagnostics);
   }

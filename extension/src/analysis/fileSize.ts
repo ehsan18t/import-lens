@@ -45,6 +45,34 @@ export const formatCurrentFileSizeSummary = (
   ].join(" · ");
 };
 
+/**
+ * The **File Cost** of one document: ONE bundle over all its imports, so a module two of them reach
+ * is counted **once** (ADR-0004). It is the file's size, and it is the ONLY number the per-file
+ * budget may be judged against.
+ *
+ * It comes off `file_size_document`, which is why it has to be carried: the budget check runs over
+ * the analysis store's per-import states, and summing THOSE gives a *Combined Import Cost* — an
+ * upper bound that counts a shared graph once per import, which warned a file with five
+ * `@mui/material` subpath imports as 3x over budget while the status bar, one line away, showed it
+ * inside budget.
+ *
+ * It carries the daemon's honesty flags with it, unread: whether the number may be judged at all is
+ * {@link isDurableFileSize}'s question and nobody else's, and asking it a second way here is how the
+ * same defect got into three consumers (FR-026c, and the drift check that now holds them together).
+ */
+export interface DocumentFileCost
+  extends Pick<FileSizeDocumentResponse, "error" | "diagnostics" | "incomplete" | "degraded"> {
+  brotliBytes: number;
+}
+
+export const documentFileCost = (response: FileSizeDocumentResponse): DocumentFileCost => ({
+  brotliBytes: response.brotli_bytes,
+  error: response.error,
+  diagnostics: response.diagnostics,
+  incomplete: response.incomplete,
+  degraded: response.degraded,
+});
+
 /** What the "Show current file size" command can say about a size response. */
 export type CurrentFileSizeReport = { kind: "no-imports" } | { kind: "summary"; message: string };
 

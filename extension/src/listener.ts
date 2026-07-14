@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { importAnalysisStateFromDaemon } from "./analysis/daemonState.js";
 import { DebouncedDocumentScheduler } from "./analysis/debouncedDocumentScheduler.js";
+import { documentFileCost } from "./analysis/fileSize.js";
 import { AnalysisFreshnessTracker } from "./analysis/freshness.js";
 import { changedLinesForFile } from "./analysis/gitDiff.js";
 import {
@@ -27,6 +28,15 @@ import { bytesForCompression, formatBytes, labelForCompression } from "./ui/form
 import type { StatusBarController, StatusBarState } from "./ui/statusbar.js";
 import { analysisRootForFile } from "./workspaceContext.js";
 
+/** The inputs a File Cost re-read needs, and the generation they belong to. @see DocumentAnalysisController.refetchFileSizeWhenSettled */
+interface FileSizeContext {
+  document: vscode.TextDocument;
+  workspaceRoot: string;
+  generation: number;
+  /** One re-read per analysis: the re-read itself can trigger another SWR push, and a push that re-reads on every push is a loop. */
+  refetched: boolean;
+}
+
 export class DocumentAnalysisController implements vscode.Disposable {
   readonly #store: AnalysisStore;
   readonly #daemon: DaemonManager;
@@ -39,6 +49,11 @@ export class DocumentAnalysisController implements vscode.Disposable {
   // current generation so a pushed import can be captioned with its git delta without
   // shelling out to `git diff` once per import. Dropped when the document closes.
   readonly #changedLines = new Map<string, ReadonlySet<number>>();
+  // What a streamed push needs in order to re-read the file's size once the document has finished
+  // streaming: the document itself, the root it was analyzed against, and the generation that owns
+  // both. A push carries only a URI (`daemon.onRefreshedResults`), and the File Cost is fetched per
+  // document, per workspace root. Dropped when the document closes.
+  readonly #analysisContexts = new Map<string, FileSizeContext>();
 
   constructor(
     context: vscode.ExtensionContext,
@@ -144,7 +159,38 @@ export class DocumentAnalysisController implements vscode.Disposable {
           );
         },
       );
+      this.refetchFileSizeWhenSettled(uri, generation);
     }
+  }
+
+  /**
+   * Re-read the file's size once the last streamed import has landed.
+   *
+   * The size read the analysis made ran while the document was COLD: every import was still being
+   * built, and any one of them that had not been measured yet made the file's total a floor
+   * (`incomplete`) — a number that may not be judged against a budget at all (ADR-0006, invariant
+   * 5). Without this, that "not evaluated" is the verdict the file keeps until the user's next
+   * keystroke, on a document whose imports are now all measured and whose File Cost is now real.
+   *
+   * Once per analysis, and only when nothing is loading: the re-read is itself a `file_size_document`
+   * request, which can serve stale and push a refresh of its own, and a re-read armed by every push
+   * is a loop.
+   */
+  private refetchFileSizeWhenSettled(uri: vscode.Uri, generation?: number): void {
+    const context = this.#analysisContexts.get(uri.toString());
+
+    if (!context || context.refetched || generation !== context.generation) {
+      return;
+    }
+
+    const states = this.#store.get(uri);
+
+    if (states.length === 0 || states.some((state) => state.status === "loading")) {
+      return;
+    }
+
+    context.refetched = true;
+    void this.updateFileSize(context.document, context.workspaceRoot, context.generation);
   }
 
   async analyze(document: vscode.TextDocument): Promise<void> {
@@ -169,6 +215,14 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
     this.setStatusForActive(document, { kind: "computing" });
     this.#logger.debug(`Starting document analysis request ${requestId}.`);
+    // What a streamed push will need to re-read the File Cost when the document settles: a push
+    // knows only the document's path.
+    this.#analysisContexts.set(documentKey, {
+      document,
+      workspaceRoot,
+      generation: requestId,
+      refetched: false,
+    });
 
     try {
       const resultLogger = new ImportResultLogTracker(
@@ -306,6 +360,20 @@ export class DocumentAnalysisController implements vscode.Disposable {
     if (!this.#freshness.isCurrent(documentKey, analysisRequestId)) {
       return;
     }
+    // The File Cost goes into the STORE, because the surface that judges it — the per-file budget
+    // diagnostic — reads the store and never sees this response. That is the whole defect: the
+    // budget checker could not reach this number, so it re-derived one by SUMMING the per-import
+    // costs, which counts a shared graph once per import and warned files that were inside budget
+    // (ADR-0004). It is stored with the daemon's honesty flags and judged through the one predicate
+    // (`isDurableFileSize`); a floor or an over-count leaves the budget *not evaluated*, never
+    // "under".
+    //
+    // `undefined` withdraws it: a failed round-trip is not evidence that the previous number still
+    // describes this document.
+    this.#store.setFileCost(
+      document.uri,
+      response && !response.error ? documentFileCost(response) : undefined,
+    );
     if (!response || response.error) {
       // Nothing was summed at all, so there is no number to show — the ONE thing the aggregate's
       // `error` legitimately answers. It is not the question "is this number usable?": `incomplete`
@@ -347,6 +415,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#scheduler.cancel(key);
     this.#freshness.forget(key);
     this.#changedLines.delete(key);
+    this.#analysisContexts.delete(key);
     this.#store.clear(document.uri);
   }
 
@@ -354,5 +423,6 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#scheduler.dispose();
     this.#freshness.clear();
     this.#changedLines.clear();
+    this.#analysisContexts.clear();
   }
 }

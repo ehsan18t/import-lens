@@ -5,6 +5,7 @@ import {
   type RefineStates,
   type RefreshApplyOptions,
 } from "./documentStates.js";
+import type { DocumentFileCost } from "./fileSize.js";
 
 export type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
 
@@ -60,6 +61,26 @@ export class AnalysisStore implements vscode.Disposable {
 
   get(uri: vscode.Uri): ImportAnalysisState[] {
     return this.#documents.get(uri.toString());
+  }
+
+  /**
+   * Hand the store the document's File Cost — the daemon's combined build over its imports — and
+   * re-render, because the per-file budget diagnostic is judged against it and nothing else
+   * ({@link DocumentFileCost}). `undefined` withdraws it: the size read failed, or its answer was
+   * not this file's number, and the file budget goes back to "not evaluated".
+   *
+   * It lives here, beside the states, because the two are read together and by the same consumer:
+   * `BudgetDiagnosticsController` refreshes off `onDidChange` and must see both. The controller that
+   * FETCHES the File Cost (`listener.updateFileSize`) is not the one that judges it, which is
+   * exactly why there was nowhere to put it and why the budget check summed the imports instead.
+   */
+  setFileCost(uri: vscode.Uri, fileCost: DocumentFileCost | undefined): void {
+    this.#documents.setFileCost(uri.toString(), fileCost);
+    this.#onDidChange.fire(uri);
+  }
+
+  fileCost(uri: vscode.Uri): DocumentFileCost | undefined {
+    return this.#documents.fileCost(uri.toString());
   }
 
   /**

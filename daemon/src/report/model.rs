@@ -17,13 +17,17 @@ pub struct WorkspaceReportItem {
 }
 
 /// Rows plus summary counters derived structurally during row construction.
-/// The TypeScript `reportModel.ts` derives `conservativeCount` /
-/// `budgetViolationCount` by substring-matching the formatted warning text
-/// (`"Conservative estimate"` and `/budget exceeded/i`, the latter matching
-/// both per-import "Budget exceeded" and per-file "File budget exceeded"
-/// warnings). The counters here are computed from the same structured facts
-/// that produce those warning strings, so the counts stay in lockstep with
-/// the TS semantics without fragile text matching.
+/// The counters are computed from the same structured facts that produce the
+/// rows' warning strings, so a count never disagrees with the text beside it.
+///
+/// **The report's unit is the IMPORT** (ADR-0004), and so is its budget. It used to warn a
+/// per-FILE budget too, computed by summing each source file's per-import brotli — a *Combined
+/// Import Cost*, which counts a module two imports share twice, and which no file ever ships. A
+/// file budget is judged against a **File Cost**: one bundle over all a file's imports, which
+/// exists only where a combined build was run for that file (`file_size_document`). The report has
+/// no such build behind a row, so it reached a verdict the editor and `importlens check` — both of
+/// which measure the File Cost — would contradict on the same file, under the same budget. It is
+/// gone; those two enforce the file budget (SRS FR-036i).
 pub struct WorkspaceReportRowSet {
     pub rows: Vec<WorkspaceReportRow>,
     pub conservative_count: u64,
@@ -42,15 +46,9 @@ pub fn build_report_rows(
         .iter()
         .filter(|item| is_conservative_item(item))
         .count() as u64;
-    let import_violations = items
+    let budget_violation_count = items
         .iter()
-        .map(|item| is_import_budget_violation(item, budgets))
-        .collect::<Vec<_>>();
-    let file_violations = apply_file_budget_warnings(&mut rows, budgets);
-    let budget_violation_count = import_violations
-        .iter()
-        .zip(&file_violations)
-        .filter(|(import_violation, file_violation)| **import_violation || **file_violation)
+        .filter(|item| is_import_budget_violation(item, budgets))
         .count() as u64;
     rows.sort_by_cached_key(|row| {
         (
@@ -219,50 +217,6 @@ fn warning_for_item(item: &WorkspaceReportItem, budgets: &WorkspaceReportBudgets
         }
     }
     warnings.join(" \u{b7} ")
-}
-
-/// Appends "File budget exceeded" to the first row of each over-budget file
-/// and returns index-aligned flags marking which rows were warned. The flags
-/// feed `budget_violation_count`: the TS `/budget exceeded/i` counter matches
-/// file-budget warnings as well as per-import ones.
-fn apply_file_budget_warnings(
-    rows: &mut [WorkspaceReportRow],
-    budgets: &WorkspaceReportBudgets,
-) -> Vec<bool> {
-    let mut flags = vec![false; rows.len()];
-    let Some(limit) = budgets.per_file_brotli_bytes else {
-        return flags;
-    };
-    let mut totals = BTreeMap::<String, u64>::new();
-    for row in rows.iter() {
-        // A file's total is the sum of its MEASURED imports. An unmeasured one adds nothing —
-        // which makes the total a floor, and a floor can still exceed a budget (that verdict is
-        // sound: the real number is at least this large). It cannot *absolve* one, and it does not
-        // try to: an under-budget floor produces no warning either way.
-        if let Some(brotli_bytes) = row.brotli_bytes.filter(|bytes| *bytes > 0) {
-            *totals.entry(row.source_file.clone()).or_default() += brotli_bytes;
-        }
-    }
-    let mut warned_files = BTreeSet::<String>::new();
-    for (index, row) in rows.iter_mut().enumerate() {
-        let total = totals.get(&row.source_file).copied().unwrap_or_default();
-        if total > limit && warned_files.insert(row.source_file.clone()) {
-            row.warning = append_warning(
-                &row.warning,
-                &format!("File budget exceeded: {total} B br > {limit} B br"),
-            );
-            flags[index] = true;
-        }
-    }
-    flags
-}
-
-fn append_warning(existing: &str, next: &str) -> String {
-    if existing.is_empty() {
-        next.to_owned()
-    } else {
-        format!("{existing} \u{b7} {next}")
-    }
 }
 
 fn confidence_reason_suffix(result: &ImportResult) -> String {
@@ -462,7 +416,6 @@ mod tests {
     fn no_budgets() -> WorkspaceReportBudgets {
         WorkspaceReportBudgets {
             per_import_brotli_bytes: None,
-            per_file_brotli_bytes: None,
         }
     }
 
@@ -506,7 +459,6 @@ mod tests {
         ];
         let budgets = WorkspaceReportBudgets {
             per_import_brotli_bytes: Some(10),
-            per_file_brotli_bytes: None,
         };
 
         let row_set = build_report_rows(&items, &budgets);
@@ -567,30 +519,34 @@ mod tests {
         );
     }
 
+    /// The report judges each import on its own and NEVER the file they sit in (ADR-0004). Two
+    /// imports of 8 B each are both inside a 10 B per-import budget; their sum, 16 B, is a
+    /// *Combined Import Cost* — it counts whatever graph they share twice, so it is not a size and
+    /// there is no budget it can be judged against. This is where the report used to warn "File
+    /// budget exceeded", disagreeing with the editor and `importlens check` about the same file.
     #[test]
-    fn summary_counts_file_budget_rows_as_violations() {
+    fn the_report_reaches_no_verdict_about_a_file_only_about_its_imports() {
         let items = vec![
             report_item("a", 0, "src/a.ts", Some(ok_result("a", 8))),
             report_item("b", 1, "src/a.ts", Some(ok_result("b", 8))),
         ];
         let budgets = WorkspaceReportBudgets {
-            per_import_brotli_bytes: None,
-            per_file_brotli_bytes: Some(10),
+            per_import_brotli_bytes: Some(10),
         };
 
         let row_set = build_report_rows(&items, &budgets);
         let summary = build_report_summary(&row_set);
 
-        // TS counts `/budget exceeded/i`, which matches the per-file
-        // "File budget exceeded" warning; only the first row of the file
-        // receives that warning, so the count is one, not two.
-        assert_eq!(summary.budget_violation_count, 1);
-        let warned_rows = row_set
-            .rows
-            .iter()
-            .filter(|row| row.warning.contains("File budget exceeded"))
-            .count();
-        assert_eq!(warned_rows, 1);
+        assert_eq!(summary.budget_violation_count, 0);
+        assert!(
+            row_set.rows.iter().all(|row| row.warning.is_empty()),
+            "no row may carry a verdict drawn from the file's summed imports: {:?}",
+            row_set
+                .rows
+                .iter()
+                .map(|row| &row.warning)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -603,7 +559,6 @@ mod tests {
         )];
         let budgets = WorkspaceReportBudgets {
             per_import_brotli_bytes: Some(100),
-            per_file_brotli_bytes: Some(100),
         };
 
         let row_set = build_report_rows(&items, &budgets);

@@ -650,7 +650,17 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
 **FR-036h** (Medium) - For namespace imports whose result is not truly tree-shakeable, the extension must offer a CodeAction that enumerates named exports through `EnumerateExportsRequest`, lets the user select one or more export names, and copies a candidate named import statement to the clipboard. The action must not rewrite source automatically because namespace member usage requires semantic transformation outside the current static import-cost scope.
 
-**FR-036i** (Medium) - The extension must support configured bundle budgets for per-import and per-file Brotli thresholds. Budget violations must appear as VS Code diagnostics, must be visible in inline/hover/report text, and must be counted in report summaries.
+**FR-036i** (High) - **One file budget, one number.** The extension must support configured bundle budgets for per-import and per-file Brotli thresholds, surfaced as VS Code diagnostics and in inline/hover text.
+
+  The **per-import** budget is judged against the import's own size — genuinely per-import, on every surface that shows imports, the workspace report included.
+
+  The **per-file** budget is judged against the **File Cost**: the daemon's ONE combined build over all the document's imports, in which a module two of them reach is counted **once** ([ADR-0004](adr/0004-import-lens-measures-imports-not-bundles.md)). It must never be re-derived by summing the per-import costs — that sum is a *Combined Import Cost*, an upper bound that counts a shared graph once per import, and a quantity no file ever ships. Summing it warned a file with five `@mui/material` subpath imports (40 kB each, 55 kB built together) as 3x over a 60 kB budget, while the status bar, one line away, showed the same file inside budget: **two totals for one file, and the wrong one raised the diagnostic.**
+
+  The File Cost comes from `FileSizeDocument`, so the extension must **hold** it — the analysis store keeps it per document beside that document's import states, because the controller that fetches it is not the surface that judges it. It is dropped when a new analysis opens (it measured the file as it was before the keystroke) and re-read when the document's imports finish streaming (the read the analysis made ran while the document was cold).
+
+  A File Cost that is `incomplete` or `degraded`, or absent, yields **no verdict at all** — no violation and **no pass** (FR-032a). The predicate is the one the daemon's aggregate cache and the persisted history apply (FR-026c), not a second reading of the flags.
+
+  Only the two surfaces that hold a File Cost enforce the file budget: the **editor's diagnostics** and **`importlens check`**. The workspace report holds none — its rows are imports — so it enforces the per-import budget only, and its `budgetViolationCount` counts per-import violations. It previously summed each source file's per-import brotli and warned "File budget exceeded" off that sum, contradicting both of the other two on the same file under the same budget.
 
 **FR-032a** (Critical) - **No verdict from a floor, and a gate that cannot measure must never report success.** A budget is judged against a size, so an import that has none is **not evaluated** — neither "pass" nor "fail". This applies to every surface that reaches a verdict: the Problems-panel diagnostics, the workspace report's violation counters, and `importlens check`.
 
@@ -686,7 +696,7 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
 **FR-036p** (Medium) - The extension must support `.importlensignore` using gitignore-style package, path, and import-pattern rules to suppress analysis and decorations for matching imports.
 
-**FR-036q** (High) - The daemon must own workspace report source scanning and report data aggregation. The extension host may request a workspace report for a workspace root and render the returned report model, but it must not enumerate/open every source file or rebuild duplicate-import/shared-module summaries itself. The request carries the editor's current report budgets so per-import and per-file budget warnings remain user-configurable while the aggregation stays daemon-owned. The daemon scan is read-only, limited to supported source extensions, and skips `node_modules`, `dist`, `build`, `out`, and `coverage` directories.
+**FR-036q** (High) - The daemon must own workspace report source scanning and report data aggregation. The extension host may request a workspace report for a workspace root and render the returned report model, but it must not enumerate/open every source file or rebuild duplicate-import/shared-module summaries itself. The request carries the editor's current **per-import** budget so those warnings remain user-configurable while the aggregation stays daemon-owned; it carries no per-file budget, because a report row has no File Cost behind it and the file budget is enforced by the editor and `importlens check` (FR-036i). The daemon scan is read-only, limited to supported source extensions, and skips `node_modules`, `dist`, `build`, `out`, and `coverage` directories.
 
 ### 5.7 Configuration
 
@@ -1303,9 +1313,10 @@ interface WorkspaceReportRequest {
   version: number;
   request_id: number;
   workspace_root: string;
+  // The per-import budget only: the report has no File Cost to judge a per-file budget against
+  // (FR-036i).
   budgets?: {
     perImportBrotliBytes?: number;
-    perFileBrotliBytes?: number;
   };
 }
 

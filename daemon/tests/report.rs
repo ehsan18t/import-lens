@@ -45,7 +45,6 @@ fn workspace_report_scans_supported_sources_and_skips_node_modules() {
         workspace_root: workspace.to_string_lossy().to_string(),
         budgets: WorkspaceReportBudgets {
             per_import_brotli_bytes: Some(1),
-            per_file_brotli_bytes: Some(1),
         },
     });
 

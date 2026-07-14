@@ -3242,7 +3242,6 @@ mod report_panic_isolation_tests {
             workspace_root: "unused".to_owned(),
             budgets: WorkspaceReportBudgets {
                 per_import_brotli_bytes: None,
-                per_file_brotli_bytes: None,
             },
         };
 
@@ -3324,7 +3323,6 @@ mod task_lifecycle_tests {
                 workspace_root: "__IMPORTLENS_FORCE_REPORT_PANIC__".to_owned(),
                 budgets: WorkspaceReportBudgets {
                     per_import_brotli_bytes: None,
-                    per_file_brotli_bytes: None,
                 },
             },
             tx,
