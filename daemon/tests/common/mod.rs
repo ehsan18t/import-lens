@@ -130,6 +130,75 @@ pub mod engine_fixtures {
     }
 }
 
+/// The same installed fixtures, entered through the **pipeline** instead of the engine.
+///
+/// `engine_fixtures` stops at `BundleArtifact`, which has no badges on it: `side_effects`,
+/// `truly_treeshakeable` and `confidence` are decided in `pipeline::analyze`, so a harness that
+/// wants to assert them has to produce an `ImportResult` (candidate_badges.rs).
+#[allow(dead_code)]
+pub mod pipeline_fixtures {
+    use import_lens_daemon::ipc::protocol::{
+        ImportKind, ImportRequest, ImportResult, ImportRuntime,
+    };
+    use import_lens_daemon::pipeline::analyze::{AnalysisContext, analyze_import};
+    use std::fs;
+    use std::path::Path;
+
+    /// The version the workspace actually installed, read from the package's own manifest.
+    ///
+    /// Not a constant in the test: a pinned version is a fact about
+    /// `scripts/accuracy-fixtures/package.json`, and repeating it in a test would only add a second
+    /// place to forget.
+    pub fn installed_version(workspace: &Path, package: &str) -> String {
+        let mut manifest_path = workspace.join("node_modules");
+        for segment in package.split('/') {
+            manifest_path.push(segment);
+        }
+        manifest_path.push("package.json");
+        let manifest = fs::read_to_string(&manifest_path).unwrap_or_else(|error| {
+            panic!(
+                "{} should be installed ({}): {error}",
+                package,
+                manifest_path.display()
+            )
+        });
+        let manifest: serde_json::Value =
+            serde_json::from_str(&manifest).expect("fixture manifest should be valid JSON");
+        manifest
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{package} manifest should declare a string version"))
+            .to_owned()
+    }
+
+    /// One named import of a real installed package, all the way through `analyze_import` — the
+    /// only path on which the badges exist.
+    pub fn analyze_named_import(
+        workspace: &Path,
+        package: &str,
+        named: &[&str],
+        runtime: ImportRuntime,
+    ) -> ImportResult {
+        // The synthetic document anchors node_modules resolution at the fixtures workspace,
+        // exactly like a user file in a real project (mirrors `engine_fixtures`).
+        let active_document_path = workspace.join("src").join("app.ts");
+        let context = AnalysisContext {
+            workspace_root: workspace.to_path_buf(),
+            active_document_path,
+        };
+        let request = ImportRequest {
+            specifier: package.to_owned(),
+            package_name: package.to_owned(),
+            version: installed_version(workspace, package),
+            named: named.iter().map(|name| (*name).to_owned()).collect(),
+            import_kind: ImportKind::Named,
+            runtime,
+        };
+
+        analyze_import(&context, &request)
+    }
+}
+
 // OXC validation helpers shared by the candidate qualification suites
 // (candidate_matrix.rs, candidate_packages.rs). Copied out of
 // daemon/tests/bundle.rs on purpose: that file is deleted at cutover and

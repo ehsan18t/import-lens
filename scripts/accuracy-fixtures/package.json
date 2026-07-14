@@ -2,13 +2,15 @@
   "name": "importlens-accuracy-real-fixtures",
   "version": "0.0.0",
   "private": true,
-  "description": "Pinned real-world packages the accuracy suite installs on demand. Exact direct versions are not enough on their own: css-tree depends on source-map-js through a caret range, so the committed pnpm-lock.yaml is what keeps before/after byte counts comparable across an OXC upgrade.",
+  "description": "Pinned real-world packages the accuracy suite and the candidate qualification suites install on demand. Exact direct versions are not enough on their own: css-tree depends on source-map-js through a caret range, so the committed pnpm-lock.yaml is what keeps before/after byte counts comparable across an OXC upgrade. Each package is here for one reason; daemon/tests/candidate_badges.rs names it beside the row that depends on it.",
   "dependencies": {
+    "@uiw/react-md-editor": "4.0.8",
     "css-tree": "3.2.1",
     "date-fns": "4.1.0",
     "lodash": "4.17.21",
     "lodash-es": "4.18.1",
     "react": "19.2.7",
+    "react-loading-skeleton": "3.5.0",
     "uuid": "14.0.1",
     "zod": "4.4.3"
   }

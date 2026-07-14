@@ -1086,8 +1086,23 @@ instrumented at all.** Three holes, all in the instruments rather than the engin
 
 3. **The §10.3 real-package set contains no CSS-shipping package**, which is exactly why the I19
    asset defect survived qualification: every pinned fixture is pure JavaScript. A package that
-   imports CSS (`swiper`, `react-datepicker`, `react-toastify`) joins the set, and the construct
-   matrix gains a CSS row.
+   imports CSS joins the set.
+
+**Closed 2026-07-14.** All three holes are instrumented, and the gates were watched failing under a
+deliberate mutation before being trusted (a broken 500 ms constant turns the p95 gate red; a
+hardwired `truly_treeshakeable` turns 6 of 9 badge rows red):
+
+- `validate.yml` runs `candidate_performance` and the new `candidate_badges` on every pull request,
+  gated on `run_candidate_packages` (which `ci.yml` already sets), on the same installed fixtures.
+- `daemon/tests/candidate_badges.rs` baselines `side_effects`, `truly_treeshakeable` and
+  `confidence` for every pinned package, each row derived from what the package *declares*.
+- The CSS fixture is **`@uiw/react-md-editor`**, not one of the three packages named above.
+  Correction: `swiper`, `react-datepicker` and `react-toastify` **ship** a stylesheet but never
+  **import** one from published JavaScript (verified across versions — their JS contains no `.css`
+  reference), and a user's bare `import "x.css"` is not analysed at all, so none of them would
+  exercise this path. `@uiw/react-md-editor`'s ESM entry really does `import "./index.css"`.
+  `react-loading-skeleton` joins too, for a different reason: it declares an **array**
+  `sideEffects`, the form I18 is about, and no pinned package had one.
 
 ### 10.7 Gate outcome
 
@@ -1157,6 +1172,20 @@ Performance and stability (§10.6, release build, 5 warm-ups + 30 recorded runs)
 | 20-import batch (2 concurrent), wall | 605 ms | — |
 | 20-import batch peak RSS | 78 MB | < 400 MB |
 | determinism (per-package byte-compare of code, loaded paths, contributions, exports; stable failure stages across repeated matrix runs) | pass | required |
+
+**Re-measured 2026-07-14, when the gates were first actually executed** (release build, real
+fixtures, `IMPORT_LENS_PERF_MULTIPLIER=1`, win32-x64). Three of these had never been measured by
+anything: they are read from the **shipped daemon binary** over the real IPC transport, because an
+in-process service is not a startup and a test binary's RSS is not an idle daemon's.
+
+| measurement | result | gate |
+| --- | --- | --- |
+| cold `css-tree/parse` p50 / p95 / max | 18.5 ms / 18.5 ms / 19.2 ms | p95 ≤ 500 ms |
+| daemon startup (spawn → IPC connection accepted) | 17.1 ms | < 500 ms |
+| cache-hit response (identical batch, full IPC round trip) | 14.6 ms | < 50 ms |
+| idle RSS (shipped daemon, cache populated) | 21 MB | < 100 MB |
+| 20-import batch peak RSS | 66 MB | < 400 MB |
+| cold miss through the whole shipped stack (context, not a gate) | 135 ms | — |
 
 **Caveat, resolved 2026-07-12.** These measurements were taken on a Tokio runtime sized to
 `num_cpus`, while the shipped daemon built its engine runtime with `worker_threads(ENGINE_PERMITS)`

@@ -143,6 +143,31 @@ jobs:
         if: ${{ inputs.run_candidate_packages }}
         run: cargo test -p import-lens-daemon --locked --test candidate_packages -- --ignored
 
+      # `daemon/tests/candidate_badges.rs` is the only place any real package's CLAIMS are
+      # asserted: `side_effects`, `truly_treeshakeable` and `confidence` live on `ImportResult`,
+      # which the engine-level suite above never builds, and the accuracy oracle compares bytes and
+      # nothing else.
+      - name: Run real-package badge baseline
+        if: ${{ inputs.run_candidate_packages }}
+        run: cargo test -p import-lens-daemon --release --locked --test candidate_badges -- --ignored --nocapture
+
+      # The §10.6 absolute performance and memory gates: cold p95, daemon startup, cache-hit
+      # response, idle RSS, and the 20-import batch. They are `#[ignore]`d and need the same
+      # installed fixtures as the steps above -- and until now NOTHING invoked them, so the suite
+      # written to protect this engine had never run once. `Run performance smoke test` below is a
+      # DIFFERENT file (the legacy synthetic suite) and is not a substitute; it is also gated on
+      # `run_performance`, which only `build.yml`'s workflow_dispatch ever sets. This step is gated
+      # on `run_candidate_packages`, which `ci.yml` sets on every pull request -- which is the whole
+      # point. `--release`: a debug-build timing gate is meaningless.
+      - name: Run real-package performance gates
+        if: ${{ inputs.run_candidate_packages }}
+        env:
+          # Shared CI hardware, same tolerance the legacy smoke test runs with. The memory gates are
+          # absolute regardless.
+          IMPORT_LENS_PERF_MULTIPLIER: 8
+        # --test-threads=1: three timing gates that contend with each other are three noisy gates.
+        run: cargo test -p import-lens-daemon --release --locked --test candidate_performance -- --ignored --nocapture --test-threads=1
+
       - name: Run performance smoke test
         if: ${{ inputs.run_performance }}
         env:

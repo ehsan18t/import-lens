@@ -207,13 +207,21 @@ pub mod diagnostic_stage {
     ///
     /// The mechanism is the **plugin**, not the output shape. Rolldown 1.1.5 does not emit a CSS
     /// asset — it refuses the build outright at the LINK stage (`UNSUPPORTED_FEATURE: Bundling CSS
-    /// is no longer supported`), so every CSS-shipping package (swiper, react-datepicker,
-    /// react-toastify, most UI kits) was `unmeasured_stage: Some("link")` and nobody saw it,
-    /// because a failed build silently became a fabricated size. `plugin.rs` links the stylesheet
-    /// as `ModuleType::Empty` and records its bytes here instead. (The earlier account of this —
-    /// that a `.css` module became an emitted asset and the adapter's "no assets" guard then failed
-    /// the build — was wrong: neutering `is_stylesheet` and running the build produces a link
-    /// failure, never an asset.)
+    /// is no longer supported`), so a package whose entry graph **imports** a stylesheet was
+    /// `unmeasured_stage: Some("link")` and nobody saw it, because a failed build silently became a
+    /// fabricated size. `plugin.rs` links the stylesheet as `ModuleType::Empty` and records its
+    /// bytes here instead. (The earlier account of this — that a `.css` module became an emitted
+    /// asset and the adapter's "no assets" guard then failed the build — was wrong: neutering
+    /// `is_stylesheet` and running the build produces a link failure, never an asset.)
+    ///
+    /// **What this is NOT (measured 2026-07-14).** The trigger is an `import "./x.css"` reachable
+    /// from the entry — not "the package ships a `.css` file". An earlier draft named swiper,
+    /// react-datepicker and react-toastify as examples; **none of the three qualifies.** Their
+    /// published JavaScript contains no reference to a stylesheet at all (the consumer is told to
+    /// import the CSS themselves), and Import Lens never analyses that bare side-effect import,
+    /// because a specifier with no default/named/namespace clause produces no `DetectedImport`. The
+    /// real-package guard is `@uiw/react-md-editor`, whose ESM entry really does `import
+    /// "./index.css"` (`daemon/tests/candidate_badges.rs`).
     ///
     /// **Confidence: an asset-emitting package is Medium by design.** It is not exempted as
     /// "disclosure only". A number that omits bytes the user's bundle really will carry is not a
