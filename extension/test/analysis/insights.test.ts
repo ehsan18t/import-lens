@@ -137,6 +137,52 @@ test("applyImportAnalysisInsights explains shared dependency modules", () => {
   assert.match(states[0]?.insights?.[0]?.tooltip ?? "", /debounce\.js/u);
 });
 
+// An Astro document: two frontmatter imports (server) both pull `shared.js`, and a client <script>
+// import pulls it too. The two server imports genuinely share it — one Server chunk carries it once.
+// The client import does NOT: a runtime is an artifact boundary, and the Client artifact ships its
+// own copy (ADR-0005). Naming the client specifier as a sharer sells the user a deduplication the
+// build model explicitly does not perform.
+test("applyImportAnalysisInsights does not name a cross-runtime import as a sharer", () => {
+  const sharedModule = { path: "/workspace/node_modules/shared-core/shared.js", bytes: 300 };
+
+  const states = applyImportAnalysisInsights(
+    [
+      readyState(
+        { specifier: "server-alpha", packageName: "server-alpha", runtime: "server" },
+        { specifier: "server-alpha", shared_bytes: 300, module_breakdown: [sharedModule] },
+      ),
+      readyState(
+        { specifier: "server-beta", packageName: "server-beta", runtime: "server" },
+        { specifier: "server-beta", shared_bytes: 300, module_breakdown: [sharedModule] },
+      ),
+      readyState(
+        { specifier: "client-gamma", packageName: "client-gamma", runtime: "client" },
+        // The daemon now reports zero shared bytes for it, because within the Client runtime
+        // nothing shares this module — that is the same fix, on the other side of the wire.
+        { specifier: "client-gamma", shared_bytes: 0, module_breakdown: [sharedModule] },
+      ),
+    ],
+    { importCostHistory: [] },
+  );
+
+  const tooltip = states[0]?.insights?.[0]?.tooltip ?? "";
+
+  assert.match(tooltip, /server-beta/u, "sharing WITHIN the Server runtime is real and must show");
+  assert.match(tooltip, /shared\.js/u);
+  assert.doesNotMatch(
+    tooltip,
+    /client-gamma/u,
+    "the client <script> import ships its own copy of the module — it saves the server imports \
+     nothing, and naming it claims a deduplication that never happens (ADR-0005)",
+  );
+
+  assert.equal(
+    states[2]?.insights?.length ?? 0,
+    0,
+    "and the cross-runtime import itself has no shared-dependency insight to show",
+  );
+});
+
 test("applyImportAnalysisInsights warns about barrel re-export boundaries", () => {
   const [state] = applyImportAnalysisInsights(
     [

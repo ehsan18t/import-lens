@@ -92,6 +92,24 @@ pub struct PendingImport {
 /// The streamed builds need these: shared-module bytes are a property of the WHOLE document (which
 /// modules two imports both pull in), so the final annotation pass cannot see only the imports that
 /// arrived late.
+///
+/// The import's runtime rides in on `identity`, which needs it anyway (two runtime variants of one
+/// Astro import statement are two rows, and a specifier+kind+named key collides them into one), so
+/// it is not repeated as a second field here. Both construction sites used to drop the runtime on
+/// the floor, which is why the closing shared-bytes pass could not see the boundary at all.
+///
+/// **There IS a copy, and an earlier version of this comment denied it.** `ImportRuntime` lives on
+/// two structs, and the two partitions read different ones: SHARING partitions on
+/// `DetectedImport.runtime` (via this identity), while the BUILD partitions on
+/// `ImportRequest.runtime` (`pipeline::file_size` does `groups.entry(request.runtime)`). What keeps
+/// them from disagreeing is not the absence of a second field — it is that there is exactly one
+/// SOURCE (`DetectedImport.runtime`, decided in `document::script_regions`) and exactly one
+/// DERIVATION that copies it forward ([`import_request_for_detected`]). That is a fine design. It
+/// is not the same claim, and the difference is not academic: the derivation was the unpinned link,
+/// and rewriting that one line to a constant left the whole daemon suite green while a
+/// mixed-runtime file silently under-reported by ~49%. What makes the copy safe is the test that
+/// now pins it (`tests/file_size_runtime.rs::a_mixed_runtime_astro_document_is_built_as_two_artifacts`),
+/// not an assertion that the copy does not exist.
 #[derive(Clone)]
 pub struct MeasuredImport {
     pub result: ImportResult,
@@ -138,6 +156,7 @@ impl CachedDocumentAnalysis {
                         specifier: item.detected.specifier.clone(),
                         import_kind: item.detected.import_kind,
                         named: item.detected.named.clone(),
+                        runtime: item.detected.runtime,
                     },
                 })
             })
@@ -712,7 +731,7 @@ impl ImportLensService {
             active_document_path: PathBuf::from(&request.active_document_path),
         };
         let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
-        annotate_shared_bytes(&mut imports);
+        annotate_shared_bytes(runtimes_of(&request.imports).zip(imports.iter_mut()));
 
         BatchResponse {
             version: request.version,
@@ -775,7 +794,7 @@ impl ImportLensService {
                 indexes: Some(vec![index]),
             });
         });
-        annotate_shared_bytes(&mut imports);
+        annotate_shared_bytes(runtimes_of(&request.imports).zip(imports.iter_mut()));
 
         BatchResponse {
             version: request.version,
@@ -798,7 +817,7 @@ impl ImportLensService {
             active_document_path: PathBuf::from(&request.active_document_path),
         };
         let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
-        annotate_shared_bytes(&mut imports);
+        annotate_shared_bytes(runtimes_of(&request.imports).zip(imports.iter_mut()));
         // Hand the per-import measurements to the aggregate: if its combined build fails, the
         // conservative fallback sums THESE instead of re-analyzing every import through the
         // engine a second time.
@@ -1304,6 +1323,7 @@ impl ImportLensService {
                 specifier: detected_import.specifier.clone(),
                 import_kind: detected_import.import_kind,
                 named: detected_import.named.clone(),
+                runtime: detected_import.runtime,
             });
         }
 
@@ -1712,7 +1732,19 @@ impl ImportLensService {
             ),
         );
         let (indexes, mut results): (Vec<_>, Vec<_>) = indexed_results.into_iter().unzip();
-        annotate_shared_bytes(&mut results);
+        // A dependency of a `package.json` has no document position and so no runtime split; its
+        // request carries the runtime all the same, and taking it from there keeps ONE source of
+        // the partition rather than assuming a default here.
+        let runtimes = indexes
+            .iter()
+            .map(|index| {
+                import_requests[*index]
+                    .as_ref()
+                    .map(|(request, _)| request.runtime)
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        annotate_shared_bytes(runtimes.into_iter().zip(results.iter_mut()));
         for (index, result) in indexes.into_iter().zip(results) {
             states[index].status = ImportAnalysisStatus::Ready;
             states[index].result = Some(result);
@@ -2447,6 +2479,7 @@ impl ImportLensService {
                 specifier: import.detected.specifier,
                 import_kind: import.detected.import_kind,
                 named: import.detected.named,
+                runtime: import.detected.runtime,
             };
             emit(vec![result.clone()], vec![identity.clone()]);
             landed
@@ -2738,6 +2771,14 @@ fn effective_registry_hint_mode(
     }
 }
 
+/// The runtime each request resolves under, in request order — the partition
+/// [`annotate_shared_bytes`] counts sharing within (ADR-0005). The batch handlers' results are
+/// index-aligned with their requests, which is the same alignment `SizedImport::installed` already
+/// relies on in `handle_file_size`.
+fn runtimes_of(requests: &[ImportRequest]) -> impl Iterator<Item = ImportRuntime> + '_ {
+    requests.iter().map(|request| request.runtime)
+}
+
 /// Re-derive `shared_bytes` across a document's COMPLETE set of measurements and return only the
 /// imports whose figure the client does not already hold correctly.
 ///
@@ -2757,7 +2798,12 @@ fn shared_bytes_corrections(
         .iter()
         .map(|import| import.result.clone())
         .collect::<Vec<_>>();
-    annotate_shared_bytes(&mut annotated);
+    annotate_shared_bytes(
+        document
+            .iter()
+            .map(|import| import.identity.runtime)
+            .zip(annotated.iter_mut()),
+    );
 
     let mut results = Vec::new();
     let mut identities = Vec::new();
@@ -2780,17 +2826,12 @@ fn shared_bytes_corrections(
 /// figure over the whole document once the last streamed import has landed, and pushes the
 /// corrections (`shared_bytes_corrections`).
 fn annotate_ready_items(items: &mut [ImportAnalysisItem]) {
-    let mut results = items
-        .iter_mut()
-        .filter_map(|item| item.result.take())
-        .collect::<Vec<_>>();
-    annotate_shared_bytes(&mut results);
-    let mut result_iter = results.into_iter();
-    for item in items {
-        if item.status == ImportAnalysisStatus::Ready {
-            item.result = result_iter.next();
-        }
-    }
+    annotate_shared_bytes(items.iter_mut().filter_map(|item| {
+        // Read the runtime off the item BEFORE the result is borrowed mutably; it is the same
+        // `DetectedImport` runtime that decides which combined build the import is sized in.
+        let runtime = item.detected.runtime;
+        item.result.as_mut().map(|result| (runtime, result))
+    }));
 }
 
 /// The version check and document parse both file-size document handlers share. The error arm is
@@ -2991,6 +3032,13 @@ fn import_request_for_detected(
         version,
         named: detected.named.clone(),
         import_kind: detected.import_kind,
+        // The COPY. `DetectedImport.runtime` is the one source of a document's runtime split
+        // (`document::script_regions`), and this line is the one derivation that carries it onto the
+        // request `pipeline::file_size` groups its builds by. Break it — a constant here — and an
+        // Astro file's Server and Client imports collapse into one bundle, `shared-core` is linked
+        // once for two payloads that each ship it, and the compressed total under-reports by ~49%
+        // with nothing failing (ADR-0005). Pinned by
+        // `tests/file_size_runtime.rs::a_mixed_runtime_astro_document_is_built_as_two_artifacts`.
         runtime: detected.runtime,
     })
 }

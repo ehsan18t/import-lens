@@ -196,10 +196,16 @@ export interface FileSizeDocumentResponse {
 // A stable per-import identity for the SWR refresh push: the specifier alone is
 // NOT unique (two imports of the same package differ by kind / named exports but
 // share a specifier), so pushes carry this alongside each result to disambiguate.
+//
+// `runtime` is part of the identity because it is part of the import: an Astro document can import
+// the same package, with the same kind and the same named exports, from its frontmatter (server)
+// and from a client <script>, and those are two rows with two different sizes (ADR-0005). Without
+// it the two variants collide on one key and the client collapses them into a single row.
 export interface RefreshedImportIdentity {
   specifier: string;
   import_kind: ImportKind;
   named: string[];
+  runtime: ImportRuntime;
 }
 
 // Unsolicited server->client push: freshly-recomputed sizes for a document after a

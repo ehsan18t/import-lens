@@ -1731,6 +1731,53 @@ mod tests {
         assert_eq!(decoded.result.shared_bytes, Some(0));
     }
 
+    /// **Guard.** `internal_contributions` is `#[serde(skip)]` on `ImportResult` — it is the FULL
+    /// module set, far too large for the wire, and only the top 10 go out as `module_breakdown`. The
+    /// L2 envelope therefore carries it explicitly as `full_contributions` and restores it on
+    /// decode. Nothing pinned that, and the field it protects is now load-bearing twice over:
+    /// `annotate_shared_bytes` prefers `internal_contributions` over `module_breakdown`, so if a
+    /// cache hit came back without it, every shared-byte figure in the system would silently be
+    /// computed from the truncated top-10 list instead of the real graph — a smaller, wrong number,
+    /// on exactly the results that hit cache (i.e. almost all of them).
+    ///
+    /// Delete `full_contributions` from the envelope, or trust `#[serde(skip)]` to round-trip it,
+    /// and this goes red.
+    #[test]
+    fn the_full_module_set_survives_the_l2_round_trip_even_though_the_wire_drops_it() {
+        use crate::ipc::protocol::ModuleContribution;
+
+        let mut result = crate::ipc::protocol::ImportResult::measured(
+            "react",
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 100,
+                minified_bytes: 80,
+                gzip_bytes: 40,
+                brotli_bytes: 30,
+                zstd_bytes: 35,
+            },
+        );
+        // The wire carries the top 10; the graph had more, and the extras are what a shared-byte
+        // count needs.
+        result.internal_contributions = (0..14)
+            .map(|index| ModuleContribution {
+                path: format!("/workspace/node_modules/react/module-{index:02}.js"),
+                bytes: 10 + index,
+            })
+            .collect();
+        result.module_breakdown = Some(result.internal_contributions[..10].to_vec());
+
+        let encoded =
+            super::encode_cache_value(cached_with(result.clone(), 5)).expect("encode the envelope");
+        let decoded = decode_cached_result(&encoded).expect("decode the envelope");
+
+        assert_eq!(
+            decoded.result.internal_contributions, result.internal_contributions,
+            "the full module set must come back off disk: `#[serde(skip)]` drops it from the wire, \
+             so the L2 envelope has to carry it, and `annotate_shared_bytes` reads it"
+        );
+        assert_eq!(decoded.result.module_breakdown, result.module_breakdown);
+    }
+
     #[test]
     fn superseded_generation_insert_is_dropped_after_clear() {
         use super::DiskCache;

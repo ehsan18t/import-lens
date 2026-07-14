@@ -5,7 +5,7 @@ use crate::{
     },
     pipeline::{
         analyze::{AnalysisContext, engine_selection},
-        compress::compress_all,
+        compress::{CompressionSizes, compress_all},
         minify::minify_source,
         resolver::resolve_package_entry,
         util::diagnostic,
@@ -207,20 +207,42 @@ impl FileSizeComputation {
     }
 }
 
-pub fn annotate_shared_bytes(results: &mut [ImportResult]) {
-    let mut counts = HashMap::<String, usize>::new();
+/// How much of each import's weight another import of the SAME document also pulls in — counted
+/// **within a runtime**, because that is the only place a shared module is shared.
+///
+/// Each import arrives paired with the runtime it resolves under, and the count is partitioned by
+/// it. A module reached from Astro frontmatter (Server) and from a client `<script>` (Client) is
+/// **not** shared: the two runtimes are two artifacts that ship separately, each carrying its own
+/// copy ([ADR-0005]). Counting it across the boundary claimed a deduplication the build model
+/// explicitly does not perform, and `insights.ts` rendered that claim to the user as a
+/// shared-dependency saving — on exactly the file shape the runtime split exists to handle.
+///
+/// The runtime comes in with the result rather than being re-derived here, so there is exactly one
+/// source of the partition.
+pub fn annotate_shared_bytes<'a>(
+    imports: impl IntoIterator<Item = (ImportRuntime, &'a mut ImportResult)>,
+) {
+    let mut imports = imports.into_iter().collect::<Vec<_>>();
+    let mut counts = HashMap::<ImportRuntime, HashMap<String, usize>>::new();
 
-    for module in results
-        .iter()
-        .flat_map(|result| result_contributions(result).iter())
-    {
-        *counts.entry(module.path.clone()).or_default() += 1;
+    for (runtime, result) in &imports {
+        let within = counts.entry(*runtime).or_default();
+        for module in result_contributions(result) {
+            *within.entry(module.path.clone()).or_default() += 1;
+        }
     }
 
-    for result in results {
+    for (runtime, result) in &mut imports {
+        let within = counts.get(runtime);
         let shared = result_contributions(result)
             .iter()
-            .filter(|module| counts.get(&module.path).copied().unwrap_or_default() > 1)
+            .filter(|module| {
+                within
+                    .and_then(|within| within.get(&module.path))
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+            })
             .map(|module| module.bytes)
             .sum();
 
@@ -247,16 +269,27 @@ fn result_contributions(result: &ImportResult) -> &[ModuleContribution] {
 /// resolves the *other* runtime's packages against the wrong conditions, and the
 /// mis-conditioned build still succeeds, so nothing warns. A single Astro file
 /// reaches this: frontmatter imports are Server, processed `<script>` imports are
-/// Client (spec I15).
+/// Client (design doc §6.3, I15).
 ///
 /// Grouping is per runtime rather than per entry on purpose: shared-module
 /// deduplication is only ever real *within* a runtime, since Server and Client code
 /// never share a chunk in the shipped product.
+///
+/// Each group is minified and **compressed on its own, and the results are added** — a runtime is
+/// an artifact boundary, and compressed bytes may be summed across such a boundary and never within
+/// one ([ADR-0005], [ADR-0004]; design doc §6.3, I20/I15). Only a document that mixes runtimes has
+/// more than one group, and only an Astro document mixes them: every other document's imports are
+/// `Component`, so the sum has exactly one term and cannot over-report.
 pub fn compute_file_size(
     context: &AnalysisContext,
     imports: &[SizedImport],
 ) -> FileSizeComputation {
-    compute_file_size_with(context, imports, &|code| minify_source(code, false))
+    compute_file_size_with(
+        context,
+        imports,
+        &|code| minify_source(code, false),
+        &|code| compress_all(code).map_err(|error| error.to_string()),
+    )
 }
 
 /// [`compute_file_size`] with the minifier injected, which no production caller does.
@@ -277,6 +310,7 @@ fn compute_file_size_with(
     context: &AnalysisContext,
     imports: &[SizedImport],
     minify: &dyn Fn(&str) -> Result<String, String>,
+    compress: &dyn Fn(&str) -> Result<CompressionSizes, String>,
 ) -> FileSizeComputation {
     let mut diagnostics = Vec::new();
     let mut totals = FileSizeComputation::default();
@@ -379,11 +413,20 @@ fn compute_file_size_with(
         };
     }
 
-    // Minified output of every group that built cleanly. Compression runs once over
-    // the concatenation so a shared identifier across groups is not compressed twice
-    // — which makes the compressed figures a lower bound on two independent bundles,
-    // not a sum of them (recorded in the SRS).
-    let mut minified_parts: Vec<String> = Vec::new();
+    // Each runtime group is minified AND COMPRESSED on its own, and the results are added.
+    //
+    // A runtime is an artifact boundary (ADR-0005): the Server bundle and the Client bundle are two
+    // things that ship, each carrying its own copy of anything both need, and each genuinely
+    // compressed alone. Summing their separately-compressed sizes therefore models reality exactly.
+    //
+    // This used to join the groups' minified outputs and compress the CONCATENATION once, on the
+    // reasoning that summing separately-compressed parts is unsound because compression is not
+    // additive. Non-additivity is real, but it applies to parts that would in reality be compressed
+    // TOGETHER — and two runtime groups never are. The join compressed away every byte of
+    // redundancy between two payloads that never meet, so the figure it produced was a strict lower
+    // bound on what ships (measured at ~49% under-report on a shared-heavy two-runtime Astro file),
+    // presented as a size, and about to gate the per-file budget. See the design doc §6.3 (I20,
+    // superseding I15's first accepted consequence).
     let mut any_sized = false;
 
     for (runtime, group) in groups {
@@ -427,7 +470,7 @@ fn compute_file_size_with(
         // union under each entry's key would clobber the accurate per-entry sets the
         // per-import analyses already recorded (`analyze.rs`), making an edit to one
         // package invalidate another document's cached size for an unrelated one
-        // (spec I14).
+        // (design doc §6.3, I14).
         diagnostics.extend(artifact.diagnostics.iter().map(|item| ImportDiagnostic {
             stage: item.stage.clone(),
             message: item.message.clone(),
@@ -457,9 +500,40 @@ fn compute_file_size_with(
             }
         };
 
+        let compressed = match compress(&minified) {
+            Ok(compressed) => compressed,
+            Err(error) => {
+                // Degrade only this runtime, exactly as the build and minify arms above do. This
+                // arm used to sit AFTER the loop, where `return error_computation(..)` was right:
+                // there was one compression pass over every group's output, so its failure really
+                // was the file's. Inside the loop that same `return` discards every OTHER group's
+                // real, already-measured bytes and reports ZERO for the whole file — one group's
+                // compressor failing says nothing about another group's bytes.
+                totals.degraded = true;
+                diagnostics.push(diagnostic(
+                    crate::pipeline::stage::COMPRESSION,
+                    error,
+                    vec![
+                        "compression failed for this runtime; its totals are conservative \
+                         per-import sums without shared-module deduplication"
+                            .to_owned(),
+                    ],
+                ));
+                let fallback = per_import_totals(&group.sized, &mut diagnostics);
+                any_sized |= totals.absorb_fallback(fallback);
+                continue;
+            }
+        };
+
         any_sized = true;
         totals.raw_bytes += artifact.code.len() as u64;
-        minified_parts.push(minified);
+        // `minified_bytes` is measured on the same string this group's compressors saw, so the two
+        // numbers describe the same bytes. The old join added one separator per extra group, so the
+        // minified total described a string that ships nowhere.
+        totals.minified_bytes += minified.len() as u64;
+        totals.gzip_bytes += compressed.gzip_bytes;
+        totals.brotli_bytes += compressed.brotli_bytes;
+        totals.zstd_bytes += compressed.zstd_bytes;
     }
 
     if !any_sized {
@@ -469,28 +543,6 @@ fn compute_file_size_with(
             "no import could be sized conservatively".to_owned(),
             diagnostics,
         );
-    }
-
-    if !minified_parts.is_empty() {
-        let minified = minified_parts.join("\n");
-        let compressed = match compress_all(&minified) {
-            Ok(compressed) => compressed,
-            Err(error) => {
-                return error_computation(
-                    &totals,
-                    crate::pipeline::stage::COMPRESSION,
-                    error.to_string(),
-                    diagnostics,
-                );
-            }
-        };
-        // Measure `minified_bytes` on the same string the compressors saw, so the two
-        // numbers describe the same bytes (the join adds one separator per extra
-        // group).
-        totals.minified_bytes += minified.len() as u64;
-        totals.gzip_bytes += compressed.gzip_bytes;
-        totals.brotli_bytes += compressed.brotli_bytes;
-        totals.zstd_bytes += compressed.zstd_bytes;
     }
 
     FileSizeComputation {
@@ -717,6 +769,18 @@ mod tests {
 
     fn absorb(sized: &[SizedImport]) -> FileSizeComputation {
         per_import_totals_for_test(sized)
+    }
+
+    /// The production compressor, for the tests that inject only the *other* hook.
+    fn real_compress(code: &str) -> Result<CompressionSizes, String> {
+        compress_all(code).map_err(|error| error.to_string())
+    }
+
+    fn runtime_request(specifier: &str, runtime: ImportRuntime) -> ImportRequest {
+        ImportRequest {
+            runtime,
+            ..request(specifier)
+        }
     }
 
     #[test]
@@ -1128,6 +1192,7 @@ mod tests {
                 SizedImport::installed(request("beta-lib"), Some(result("beta-lib", 20))),
             ],
             &|_| Err("minifier gave up on the linked chunk".to_owned()),
+            &real_compress,
         );
 
         assert!(
@@ -1186,6 +1251,97 @@ mod tests {
         assert!(!totals.incomplete, "{:?}", totals.diagnostics);
         assert!(totals.is_cacheable(), "{:?}", totals.diagnostics);
         assert!(totals.minified_bytes > 0);
+    }
+
+    /// **The trap in moving compression inside the per-runtime loop.** Compression is now per
+    /// runtime, because two runtimes are two artifacts that ship separately and each pays for its
+    /// own redundancy (ADR-0005). The naive move takes the old post-loop `Err` arm with it — a
+    /// `return error_computation(..)` — and that arm now fires **inside** the loop, discarding every
+    /// OTHER runtime group's real, already-measured bytes and reporting **zero** for the whole file.
+    ///
+    /// One group's compressor failing says nothing about the other group's bytes. So it degrades
+    /// exactly like the build and minify arms beside it: that group alone falls back to its
+    /// un-deduplicated per-import sum, the file is flagged `degraded` and refused every store, and
+    /// the other groups keep their real numbers.
+    ///
+    /// The compressor is injected because nothing in a fixture can make `compress_all` fail — the
+    /// same reason the minify arm is injected. It selects the Server group by a marker string the
+    /// minifier preserves, so exactly one of the two groups fails.
+    #[test]
+    fn a_compression_failure_in_one_runtime_does_not_zero_the_file() {
+        let fixture = Fixture::new("compress-degraded");
+        fixture
+            .package("server-lib", "export const value = \"MARKER_SERVER\";\n")
+            .package("client-lib", "export const value = \"MARKER_CLIENT\";\n");
+
+        let clean = compute_file_size(
+            &fixture.context(),
+            &[SizedImport::installed(
+                runtime_request("client-lib", ImportRuntime::Client),
+                Some(result("client-lib", 20)),
+            )],
+        );
+        assert!(
+            clean.brotli_bytes > 0,
+            "test setup: the Client group alone compresses to real bytes: {:?}",
+            clean.diagnostics
+        );
+
+        let totals = compute_file_size_with(
+            &fixture.context(),
+            &[
+                SizedImport::installed(
+                    runtime_request("server-lib", ImportRuntime::Server),
+                    Some(result("server-lib", 100)),
+                ),
+                SizedImport::installed(
+                    runtime_request("client-lib", ImportRuntime::Client),
+                    Some(result("client-lib", 20)),
+                ),
+            ],
+            &|code| minify_source(code, false),
+            &|code| {
+                if code.contains("MARKER_SERVER") {
+                    return Err("compressor gave up on the Server chunk".to_owned());
+                }
+                real_compress(code)
+            },
+        );
+
+        assert!(
+            totals.error.is_none(),
+            "one group's compressor failing is not a failure of the FILE: the Client group \
+             compressed fine and the Server group has per-import measurements to fall back on: {:?}",
+            totals.diagnostics
+        );
+        assert!(
+            totals.degraded,
+            "the Server group's totals are now an un-deduplicated per-import sum, so the file's \
+             totals are not the file's: {:?}",
+            totals.diagnostics
+        );
+        assert_eq!(
+            totals.brotli_bytes,
+            clean.brotli_bytes + 100,
+            "the OTHER group's real compressed bytes must survive: the Client group keeps its {} \
+             measured bytes and the Server group contributes its 100-byte per-import fallback. \
+             Zero here is the regression: `return error_computation(..)` inside the loop throws \
+             away every group that compressed cleanly.",
+            clean.brotli_bytes,
+        );
+        assert!(
+            !totals.is_cacheable(),
+            "a part-bundle, part-per-import-sum total is not this file's size (ADR-0006, \
+             invariant 4)"
+        );
+        assert!(
+            totals
+                .diagnostics
+                .iter()
+                .any(|item| item.stage == crate::pipeline::stage::COMPRESSION),
+            "the user is owed the stage that degraded the total: {:?}",
+            totals.diagnostics
+        );
     }
 
     /// **IMPORTANT 1 — a path alias is not a missing package.** `@app/components` has no installed

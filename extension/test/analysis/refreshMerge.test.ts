@@ -145,8 +145,8 @@ test("mergeRefreshedResults gives same-specifier variants their own size (no cro
     ],
     {
       identities: [
-        { specifier: "react", import_kind: "default", named: [] },
-        { specifier: "react", import_kind: "named", named: ["useState"] },
+        { specifier: "react", import_kind: "default", named: [], runtime: "component" },
+        { specifier: "react", import_kind: "named", named: ["useState"], runtime: "component" },
       ],
     },
   );
@@ -179,12 +179,76 @@ test("mergeRefreshedResults matches variants regardless of named-set order", () 
     [result({ specifier: "react", brotli_bytes: 777 })],
     {
       // Same set, different order — the identity key must normalize order.
-      identities: [{ specifier: "react", import_kind: "named", named: ["a", "b"] }],
+      identities: [
+        { specifier: "react", import_kind: "named", named: ["a", "b"], runtime: "component" },
+      ],
     },
   );
 
   assert.equal(outcome.changed, true);
   assert.equal(outcome.next[0]?.result?.brotli_bytes, 777);
+});
+
+// An Astro document imports the same package, with the same kind and the same named exports, from
+// its frontmatter (server) and from a client <script>. Those are TWO rows: the two runtimes resolve
+// dependencies under materially different conditions, so they have two different sizes, and each
+// runtime ships its own artifact (ADR-0005).
+//
+// The identity key was specifier + kind + named, so the two runtime variants collided on ONE key.
+// The map kept the last result, both states matched it, and the client collapsed the two rows into
+// one — showing the client size on the frontmatter import — in the one document shape the runtime
+// split exists for.
+test("mergeRefreshedResults gives the two runtime variants of one import their own size", () => {
+  const existing: ImportAnalysisState[] = [
+    {
+      detected: detectedImport({
+        specifier: "shared-core",
+        importKind: "named",
+        named: ["shared"],
+        runtime: "server",
+      }),
+      status: "loading",
+      result: undefined,
+    },
+    {
+      detected: detectedImport({
+        specifier: "shared-core",
+        importKind: "named",
+        named: ["shared"],
+        runtime: "client",
+        line: 9,
+      }),
+      status: "loading",
+      result: undefined,
+    },
+  ];
+
+  const outcome = mergeRefreshedResults(
+    existing,
+    [
+      result({ specifier: "shared-core", brotli_bytes: 1_111 }),
+      result({ specifier: "shared-core", brotli_bytes: 2_222 }),
+    ],
+    {
+      identities: [
+        { specifier: "shared-core", import_kind: "named", named: ["shared"], runtime: "server" },
+        { specifier: "shared-core", import_kind: "named", named: ["shared"], runtime: "client" },
+      ],
+    },
+  );
+
+  assert.equal(outcome.changed, true);
+  assert.equal(
+    outcome.next[0]?.result?.brotli_bytes,
+    1_111,
+    "the frontmatter (server) import must keep the size measured under Server conditions",
+  );
+  assert.equal(
+    outcome.next[1]?.result?.brotli_bytes,
+    2_222,
+    "the client <script> import must keep the size measured under Client conditions — the two \
+     runtime variants of one statement are two rows, not one",
+  );
 });
 
 test("mergeRefreshedResults drops a superseded (stale) refresh batch", () => {

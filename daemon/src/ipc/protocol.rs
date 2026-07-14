@@ -621,12 +621,25 @@ pub struct FileSizeDocumentResponse {
 /// NOT unique — two imports of the same package differ by import kind / named
 /// exports but share a specifier — so each pushed result is paired with this to
 /// disambiguate variants on the client.
+///
+/// `runtime` is part of the identity because **it is part of the import**. An Astro document can
+/// import the same package, with the same kind and the same named exports, from its frontmatter
+/// (Server) and from a client `<script>` (Client), and those are two rows with two different sizes
+/// — the two runtimes resolve dependencies under materially different conditions ([ADR-0005]).
+/// Without it the two variants collide on one key and the client collapses them into a single row,
+/// in the one document shape the runtime split exists for.
+///
+/// Additive and `#[serde(default)]`, so it needs no protocol-version bump: an older client ignores
+/// the extra field, and a payload without it decodes to the default (`Component`) — which is the
+/// runtime of every non-Astro document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshedImportIdentity {
     pub specifier: String,
     pub import_kind: ImportKind,
     #[serde(default)]
     pub named: Vec<String>,
+    #[serde(default)]
+    pub runtime: ImportRuntime,
 }
 
 /// Unsolicited server→client push carrying freshly-recomputed sizes for a document

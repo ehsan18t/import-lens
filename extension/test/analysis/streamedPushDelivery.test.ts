@@ -97,7 +97,9 @@ const streamedPush = (generation: number): RefreshedResultsResponse => ({
   workspace_root: "C:/workspace/app",
   document_path: documentPath,
   results: [measured],
-  identities: [{ specifier: "lodash-es", import_kind: "named", named: ["debounce"] }],
+  identities: [
+    { specifier: "lodash-es", import_kind: "named", named: ["debounce"], runtime: "component" },
+  ],
   generation,
 });
 
@@ -224,7 +226,9 @@ test("a held push is not replayed onto the states of a different analysis genera
 
   documents.set(documentKey, stateFor(loadingResponse(11)), 11);
   documents.applyRefreshedResults(documentKey, [measured], {
-    identities: [{ specifier: "lodash-es", import_kind: "named", named: ["debounce"] }],
+    identities: [
+      { specifier: "lodash-es", import_kind: "named", named: ["debounce"], runtime: "component" },
+    ],
     isCurrent: true,
     generation: 11,
   });
@@ -308,7 +312,9 @@ test("`set` captions a replayed push with the analysis's insight inputs, not the
   documents.set(documentKey, stateFor(loadingResponse(12)), 12, analysisRefine);
   // ...a streamed import lands while it is still awaiting the diff...
   documents.applyRefreshedResults(documentKey, [measured], {
-    identities: [{ specifier: "lodash-es", import_kind: "named", named: ["debounce"] }],
+    identities: [
+      { specifier: "lodash-es", import_kind: "named", named: ["debounce"], runtime: "component" },
+    ],
     isCurrent: true,
     generation: 12,
     refine: pushRefine,

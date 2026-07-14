@@ -1,4 +1,4 @@
-import type { ImportResult, RefreshedImportIdentity } from "../ipc/protocol.js";
+import type { ImportResult, ImportRuntime, RefreshedImportIdentity } from "../ipc/protocol.js";
 import type { ImportAnalysisState } from "./state.js";
 
 export interface RefreshMergeOutcome {
@@ -9,10 +9,11 @@ export interface RefreshMergeOutcome {
 export interface RefreshMergeOptions {
   /**
    * Per-result import identity, index-aligned with `results` (the SWR push carries
-   * it). Present -> results are keyed by full identity (specifier + kind + named)
-   * so two imports of the same package differing only by import kind / named
-   * exports each receive their OWN refreshed size. Absent or length-mismatched
-   * (older daemon) -> specifier-only keying, preserving legacy behavior.
+   * it). Present -> results are keyed by full identity (specifier + kind + named +
+   * runtime) so two imports of the same package differing only by import kind /
+   * named exports / runtime each receive their OWN refreshed size. Absent or
+   * length-mismatched (older daemon) -> specifier-only keying, preserving legacy
+   * behavior.
    */
   identities?: readonly RefreshedImportIdentity[];
   /**
@@ -26,12 +27,24 @@ export interface RefreshMergeOptions {
 }
 
 // A stable, order-independent key for one import. specifier alone is NOT unique
-// (same-specifier variants differ by kind / named), so the full identity keys the
-// merge. NUL/SOH separators keep field boundaries unambiguous (a specifier or
-// export name cannot contain them), and `named` is sorted so a differing source
+// (same-specifier variants differ by kind / named / runtime), so the full identity
+// keys the merge. NUL/SOH separators keep field boundaries unambiguous (a specifier
+// or export name cannot contain them), and `named` is sorted so a differing source
 // order still yields the same key.
-const identityKey = (specifier: string, importKind: string, named: readonly string[]): string =>
-  `${specifier}\u0000${importKind}\u0000${[...named].sort().join("\u0001")}`;
+//
+// The runtime is part of the key because it is part of the import. An Astro document can import the
+// same package, with the same kind and the same named exports, from its frontmatter (server) and
+// from a client <script>; the two resolve dependencies under materially different conditions, so
+// they have two different sizes, and each runtime ships its own artifact (ADR-0005). Without it the
+// two variants collide on ONE key: the map keeps a single result, both states match it, and the
+// client collapses two rows into one — in the very document shape the runtime split exists for.
+const identityKey = (
+  specifier: string,
+  importKind: string,
+  named: readonly string[],
+  runtime: ImportRuntime,
+): string =>
+  `${specifier}\u0000${importKind}\u0000${runtime}\u0000${[...named].sort().join("\u0001")}`;
 
 /**
  * Pure merge of pushed import results into a document's states, matched by a stable
@@ -82,6 +95,7 @@ export const mergeRefreshedResults = (
             identities[index].specifier,
             identities[index].import_kind,
             identities[index].named,
+            identities[index].runtime,
           )
         : result.specifier;
       return [key, result];
@@ -91,7 +105,12 @@ export const mergeRefreshedResults = (
   let changed = false;
   const next = existing.map((state) => {
     const key = useIdentity
-      ? identityKey(state.detected.specifier, state.detected.importKind, state.detected.named)
+      ? identityKey(
+          state.detected.specifier,
+          state.detected.importKind,
+          state.detected.named,
+          state.detected.runtime,
+        )
       : state.detected.specifier;
     const refreshed = byKey.get(key);
 

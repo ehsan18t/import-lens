@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { ImportRuntime } from "../ipc/protocol.js";
 import { formatBytes, measuredSizes } from "../ui/format.js";
 import { budgetInsightForState, type ImportLensBudgets } from "./budgets.js";
 import {
@@ -107,8 +108,13 @@ const sharedDependencyInsight = (
     return null;
   }
 
+  // Sharers are looked up within THIS import's runtime. An import in another runtime pulling the
+  // same module is not a sharer: it ships its own copy, so it saves this import nothing (ADR-0005).
+  const sharersOf = (modulePath: string): ReadonlySet<string> =>
+    sharedModules.get(sharedModuleKey(state.detected.runtime, modulePath)) ?? new Set<string>();
+
   const shared = (result.module_breakdown ?? [])
-    .filter((module) => (sharedModules.get(module.path)?.size ?? 0) > 1)
+    .filter((module) => sharersOf(module.path).size > 1)
     .slice(0, 3);
 
   if (shared.length === 0) {
@@ -120,7 +126,7 @@ const sharedDependencyInsight = (
   const otherSpecifiers = new Set<string>();
 
   for (const module of shared) {
-    for (const specifier of sharedModules.get(module.path) ?? []) {
+    for (const specifier of sharersOf(module.path)) {
       if (specifier !== state.detected.specifier) {
         otherSpecifiers.add(specifier);
       }
@@ -186,6 +192,18 @@ const historyTrendInsight = (
   };
 };
 
+/**
+ * Which imports pull each module in — indexed **within a runtime**, because a runtime is an
+ * artifact boundary (ADR-0005) and that is the only place a module is genuinely shared.
+ *
+ * A module reached from Astro frontmatter (server) and from a client `<script>` was counted as
+ * shared, and `sharedDependencyInsight` sold that to the user as a deduplication saving. The build
+ * model explicitly does not perform it: the Server artifact and the Client artifact each ship their
+ * own copy. The claim was false on exactly the file shape the runtime split exists to handle.
+ */
+const sharedModuleKey = (runtime: ImportRuntime, modulePath: string): string =>
+  `${runtime}\u0000${modulePath}`;
+
 const sharedModuleIndex = (states: readonly ImportAnalysisState[]): Map<string, Set<string>> => {
   const modules = new Map<string, Set<string>>();
 
@@ -195,9 +213,10 @@ const sharedModuleIndex = (states: readonly ImportAnalysisState[]): Map<string, 
     }
 
     for (const module of state.result?.module_breakdown ?? []) {
-      const specifiers = modules.get(module.path) ?? new Set<string>();
+      const key = sharedModuleKey(state.detected.runtime, module.path);
+      const specifiers = modules.get(key) ?? new Set<string>();
       specifiers.add(state.detected.specifier);
-      modules.set(module.path, specifiers);
+      modules.set(key, specifiers);
     }
   }
 
