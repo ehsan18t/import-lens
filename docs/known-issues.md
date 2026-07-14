@@ -160,6 +160,25 @@ not persisted — stated in the SRS rather than papered over.
 
 ## Instrumentation honesty
 
+### G0 — The legacy `performance.rs` smoke suite still claims to gate the NFR numbers, at 8× loose
+**Status: Deferred** · Not an active hole — but a second suite that *appears* to gate what it does not
+
+`daemon/tests/performance.rs` (the pre-existing synthetic-fixture smoke suite) asserts the **literal
+NFR numbers** — `threshold_ms(500)` for a cache miss and `threshold_ms(50)` for a cache hit — with a
+default multiplier of **6**, and CI's `pnpm test:performance` step sets **8**. So it enforces a
+4000 ms "cache miss" and a **400 ms "cache hit" against a hard 50 ms Critical requirement**.
+
+**This is not a coverage hole today.** `candidate_performance` now genuinely gates NFR-002 at an
+absolute, unscaled 50 ms on every PR — proven by mutation (an 80 ms sleep on the cache-hit path
+turns it red at 89 ms). The real gate works.
+
+But it is **exactly the shape of the trap that hid the dark gate for months**: a suite whose name
+and thresholds suggest it enforces a requirement, which in fact enforces something 8× looser. The
+next person to read it will believe it.
+
+**Fix:** either stop it naming the NFR numbers (they are its own smoke thresholds, not the
+requirements), or delete it now that a real gate exists.
+
 ### G1 — The negative-`error` Guard catches 14 of 18 spellings
 **Status: Accepted** · The number is machine-pinned, not claimed
 
