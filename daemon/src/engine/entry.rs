@@ -46,7 +46,7 @@ pub fn virtual_entry_source(entries: &[super::BundleEntry]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{BundleEntry, BundleSelection, SideEffectsMode};
+    use super::super::{BundleEntry, BundleSelection};
     use super::*;
     use std::path::PathBuf;
 
@@ -55,7 +55,6 @@ mod tests {
             entry_path: PathBuf::from("pkg/index.js"),
             package_root: PathBuf::from("pkg"),
             selection,
-            reported_side_effects: SideEffectsMode::Unknown,
         }
     }
 

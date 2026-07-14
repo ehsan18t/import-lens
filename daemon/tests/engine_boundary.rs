@@ -3,7 +3,6 @@
 use import_lens_daemon::{
     engine::{BundleEntry, BundlePurpose, BundleRequest, BundleSelection, boundary},
     ipc::protocol::ImportRuntime,
-    pipeline::resolver::SideEffectsMode,
 };
 use std::{fs, path::Path};
 
@@ -44,7 +43,6 @@ fn boundary_caps_concurrent_builds_at_two_permits() {
                             entry_path,
                             package_root,
                             selection: BundleSelection::Named(vec![name.to_owned()]),
-                            reported_side_effects: SideEffectsMode::False,
                         }],
                         runtime: ImportRuntime::Component,
                         purpose: BundlePurpose::ImportSize,

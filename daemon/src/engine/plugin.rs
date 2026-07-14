@@ -160,10 +160,50 @@ impl BuildState {
 /// That gap predates supplying anything and cannot be closed at this API — known issue C6. Do not
 /// "fix" it by supplying the nearest manifest instead: that trades a rare format error for a
 /// common `sideEffects` error.
+///
+/// **The two paths must be spelled so Rolldown can relativize one against the other, and that is
+/// the whole of this type's job.** Rolldown answers `sideEffects` by
+/// `resolved_id.id.relative_path(package_json.realpath().parent())` and matching the *result*
+/// against the declared globs (`ecma_module_view_factory.rs`, `lazy_check_side_effects`). It does
+/// **not** re-derive the manifest's location: `try_get_package_json_or_create` takes the string we
+/// hand it verbatim ("User has the responsibility to ensure `path` is real path if needed"). So the
+/// package-relative path Rolldown matches is computed from **our two strings**, and if they do not
+/// share a root the relativization silently yields the whole absolute path instead.
+///
+/// It did not share a root. The id is `entry_path`, which is `fs::canonicalize` output — a Windows
+/// **`\\?\` verbatim** path — while the manifest was `package_root.join("package.json")`, built
+/// from the non-canonical document path. `sugar_path`'s `relative` splits a Windows root off each
+/// side, sees `//?/C:` against `C:`, takes its "different roots" branch and returns the target
+/// unchanged. `check_side_effects_for` then matched the globs against
+/// `\\?\C:\…\node_modules\refractor\lib\common.js`.
+///
+/// **That is not a near miss; it is a silent, one-directional corruption of retention, and it hid
+/// behind the matcher's own normalisation.** A pattern with no separator, or a `./` prefix, is
+/// prefixed with `**/` before matching — and `**/` happily swallows a whole absolute path, so
+/// `["index.js"]` still "matched" and every test we had passed. A pattern that **contains a `/`**
+/// is used VERBATIM and anchored, so it can **never** match an absolute path. Real packages use
+/// that form: `refractor` declares `["lib/all.js","lib/common.js"]` and its entry is
+/// `lib/common.js`, so Rolldown tree-shook away ~35 gated `refractor.register(lang)` statements and
+/// we reported **30,229 B** for a package that is really **113,152 B** — a 3.7x undercount, from a
+/// path *we* handed it.
+///
+/// The fix is the input, never the badge: [ADR-0002] makes Rolldown the authority on retention
+/// *given correct inputs*, and a badge taught to agree with a retention our own plugin corrupted
+/// would bless the wrong number. So the manifest path is **canonicalized**, which puts it in the
+/// same verbatim spelling as `entry_path` and — just as importantly — resolves the same symlinks:
+/// under pnpm, `node_modules/<name>` is a link into the store and a **workspace-linked** package's
+/// `node_modules/<name>` is a junction onto `packages/<name>`, so even two non-verbatim paths would
+/// not have shared a prefix. Canonical-vs-canonical is the only spelling that relativizes for all
+/// three layouts.
+///
+/// The id is deliberately left **exactly as it is**: `entry_path` is canonicalized upstream because
+/// read-time fingerprinting keys on that stable spelling (§8.3), and the `load` hook, the loaded
+/// path set and the module contributions all speak it. Nothing here needs the id to change — only
+/// the manifest had to come and meet it.
 #[derive(Debug)]
 struct PreResolvedTarget {
     entry_path: PathBuf,
-    /// `<package_root>/package.json`, or `None` when there is none to point at.
+    /// The **canonical** `<package_root>/package.json`, or `None` when there is none to point at.
     ///
     /// The guard is not caution, it is correctness: Rolldown *reads* this path
     /// (`Resolver::try_get_package_json_or_create`) and an unreadable one fails the whole build
@@ -176,14 +216,30 @@ struct PreResolvedTarget {
 
 impl PreResolvedTarget {
     fn for_entry(entry: &super::BundleEntry) -> Self {
-        let manifest = entry.package_root.join("package.json");
         Self {
-            entry_path: entry.entry_path.clone(),
-            manifest_path: manifest
-                .is_file()
-                .then(|| manifest.to_string_lossy().into_owned()),
+            // Canonical on both sides or the relativization is junk, and `BundleEntry` promises
+            // only an absolute entry, not a canonical one — the pipeline's legacy-fallback
+            // resolution joins the manifest field onto the package root without canonicalizing. It
+            // is idempotent for the paths that already are canonical, which is nearly all of them,
+            // and it does not change what the daemon *tracks*: `load` and `module_parsed`
+            // canonicalize every path they record regardless.
+            entry_path: std::fs::canonicalize(&entry.entry_path)
+                .unwrap_or_else(|_| entry.entry_path.clone()),
+            manifest_path: canonical_manifest_path(&entry.package_root)
+                .map(|manifest| manifest.to_string_lossy().into_owned()),
         }
     }
+}
+
+/// The package manifest, spelled the way the entry id is spelled: canonical.
+///
+/// `canonicalize` both proves it exists and resolves the links — see [`PreResolvedTarget`] for why
+/// both halves are load-bearing. The `is_file` check survives it because a *directory* named
+/// `package.json` canonicalizes just as happily as a file, and handing Rolldown a directory to read
+/// fails the entire build.
+fn canonical_manifest_path(package_root: &Path) -> Option<PathBuf> {
+    let manifest = std::fs::canonicalize(package_root.join("package.json")).ok()?;
+    manifest.is_file().then_some(manifest)
 }
 
 #[derive(Debug)]

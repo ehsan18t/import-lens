@@ -125,7 +125,6 @@ pub mod engine_fixtures {
             entry_path: resolved.entry_path,
             package_root: resolved.package_root,
             selection: BundleSelection::Named(vec![export.to_owned()]),
-            reported_side_effects: resolved.side_effects,
         }
     }
 }

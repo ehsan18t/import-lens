@@ -16,7 +16,6 @@
 
 use import_lens_daemon::engine::{
     BundleEntry, BundlePurpose, BundleRequest, BundleSelection, ImportRuntime, RolldownEngine,
-    SideEffectsMode,
 };
 use std::fs;
 
@@ -56,7 +55,6 @@ async fn total_source_limit_is_enforced() {
                 entry_path: root.join("entry.js"),
                 package_root: root.clone(),
                 selection: BundleSelection::Named(vec!["x".to_owned()]),
-                reported_side_effects: SideEffectsMode::Unknown,
             }],
             runtime: ImportRuntime::default(),
             purpose: BundlePurpose::ImportSize,

@@ -72,6 +72,23 @@ test("the rolldown family is exact-pinned at the monorepo version", () => {
   assert.doesNotMatch(cargoToml, /^\s*rolldown[^=]*=\s*\{[^}]*optional\s*=\s*true/mu);
 });
 
+test("the glob matcher is exact-pinned at the version rolldown resolved", () => {
+  // The daemon calls `fast_glob::glob_match` DIRECTLY to decide whether the entry it
+  // measured is one the package declared side-effectful, and Rolldown matches the same
+  // `sideEffects` array with the same crate to decide what it retains. The answer is only
+  // right because the two agree, so a floating range -- which would let Cargo hand the
+  // daemon a different copy from the one rolldown_utils got -- is a silent disagreement.
+  assert.match(
+    repoFile("daemon/Cargo.toml"),
+    new RegExp(
+      `^${compilerStackConfig.globMatcherCrate} = "=${escapeVersion(
+        compilerStackConfig.currentGlobMatcherVersion,
+      )}"$`,
+      "mu",
+    ),
+  );
+});
+
 test("oxc_mangler stays out of the dependency graph", () => {
   // Guard: mangling would change emitted identifiers and break size accuracy.
   assert.doesNotMatch(repoFile("daemon/Cargo.toml"), /^oxc_mangler = /mu);
@@ -115,6 +132,11 @@ test("coordinated crates resolve to exactly one version each, at the configured 
     [compilerStackConfig.rolldownCrate, compilerStackConfig.currentRolldownVersion],
     ["oxc_resolver", compilerStackConfig.currentResolverVersion],
     ...compilerStackConfig.oxcCrates.map((crate) => [crate, compilerStackConfig.currentOxcVersion]),
+    // Drift, and the one that makes the daemon's own glob answers trustworthy: the
+    // fingerprint records the matcher version ROLLDOWN resolved. If our direct pin ever
+    // names a different one, Cargo resolves two copies, this row sees rolldown's, and the
+    // disagreement is red instead of silent.
+    [compilerStackConfig.globMatcherCrate, compilerStackConfig.currentGlobMatcherVersion],
   ];
 
   for (const [name, expected] of expectations) {
@@ -135,4 +157,10 @@ test("coordinated crates resolve to exactly one version each, at the configured 
   assert.ok(versionsByName.has(compilerStackConfig.rolldownCrate));
   assert.ok(versionsByName.has("oxc_parser"));
   assert.ok(versionsByName.has("oxc_resolver"));
+  assert.ok(
+    versionsByName.has(compilerStackConfig.globMatcherCrate),
+    "the glob matcher must be reachable from rolldown -- if rolldown stopped using it, the " +
+      "daemon's copy would no longer be the bundler's matcher, and matching the entry ourselves " +
+      "would be a lookalike again",
+  );
 });

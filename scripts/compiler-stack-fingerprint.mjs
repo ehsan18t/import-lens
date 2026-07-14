@@ -1,13 +1,25 @@
 import { execFile as execFileCallback } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
+import { compilerStackConfig } from "./compiler-stack.config.mjs";
 
 export const FINGERPRINT_PATH = "scripts/compiler-stack.fingerprint.json";
 
-// The fingerprint is the sorted (name, version, source) set of every oxc*/
-// rolldown* package reachable from the top-level rolldown package in the
-// feature-resolved, locked graph. It is generated data: `deps:update:compiler`
-// rewrites it, tests recompute it, and nobody edits it by hand.
+// Every coordinated package reachable from the top-level rolldown package in the
+// feature-resolved, locked graph, as a sorted (name, version, source) set: the
+// oxc*/rolldown* families, plus the glob matcher, which is coordinated for a
+// different reason -- the daemon calls it DIRECTLY to answer the Side-Effectful
+// badge, and its whole job is to agree with the copy rolldown resolved. Recording
+// the version rolldown got is what turns a divergence from our own pin into a red
+// test instead of two matchers quietly disagreeing about one `sideEffects` array.
+//
+// Generated data: `deps:update:compiler` rewrites it, tests recompute it, and
+// nobody edits it by hand.
+const COORDINATED_PACKAGE = new RegExp(
+  `^(?:oxc|rolldown|${compilerStackConfig.globMatcherCrate})`,
+  "u",
+);
+
 export const fingerprintFromMetadata = (metadata, rootCrateName = "rolldown") => {
   const packagesById = new Map(metadata.packages.map((pkg) => [pkg.id, pkg]));
   const nodesById = new Map(metadata.resolve.nodes.map((node) => [node.id, node]));
@@ -29,7 +41,7 @@ export const fingerprintFromMetadata = (metadata, rootCrateName = "rolldown") =>
     if (!pkg) {
       continue;
     }
-    if (/^(?:oxc|rolldown)/u.test(pkg.name)) {
+    if (COORDINATED_PACKAGE.test(pkg.name)) {
       tuples.push({ name: pkg.name, version: pkg.version, source: pkg.source ?? "path" });
     }
     for (const dependency of nodesById.get(id)?.dependencies ?? []) {

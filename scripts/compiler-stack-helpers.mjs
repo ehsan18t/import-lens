@@ -30,6 +30,13 @@ export const validateCurrentStack = (cargoToml) => {
     throw new Error("Missing exact pin (=) for oxc_resolver");
   }
 
+  // The daemon and Rolldown must read one `sideEffects` array through ONE matcher.
+  // A floating range here would let Cargo hand the daemon a different copy from the
+  // one rolldown_utils got, and the two would disagree in silence.
+  if (!exactPin(compilerStackConfig.globMatcherCrate, cargoToml)) {
+    throw new Error(`Missing exact pin (=) for ${compilerStackConfig.globMatcherCrate}`);
+  }
+
   // The engine is production (spec §11 Phase 2): the rolldown family is an
   // unconditional exact-pinned dependency, like the OXC crates.
   for (const crate of rolldownFamilyCrates()) {
@@ -90,7 +97,10 @@ export const latestCrateVersion = async (fetchJson, crate) => {
   return version;
 };
 
-export const updateCargoToml = (cargoToml, { rolldownVersion, oxcVersion, resolverVersion }) => {
+export const updateCargoToml = (
+  cargoToml,
+  { rolldownVersion, oxcVersion, resolverVersion, globMatcherVersion },
+) => {
   let next = cargoToml;
   for (const crate of compilerStackConfig.oxcCrates) {
     next = next.replace(
@@ -105,7 +115,11 @@ export const updateCargoToml = (cargoToml, { rolldownVersion, oxcVersion, resolv
       `${crate} = "=${rolldownVersion}"`,
     );
   }
-  return next;
+  const globMatcher = compilerStackConfig.globMatcherCrate;
+  return next.replace(
+    new RegExp(`^${escapeRegExp(globMatcher)}\\s*=\\s*"[^"]+"$`, "gmu"),
+    `${globMatcher} = "=${globMatcherVersion}"`,
+  );
 };
 
 export const updateManifest = (manifest) => {
@@ -144,23 +158,31 @@ export const replaceKnownVersions = (content, { rolldownVersion, oxcVersion, res
   return content.replace(pattern, (match) => replacements.get(match) ?? match);
 };
 
-export const updateConfig = (content, { rolldownVersion, oxcVersion, resolverVersion }) =>
+export const updateConfig = (
+  content,
+  { rolldownVersion, oxcVersion, resolverVersion, globMatcherVersion },
+) =>
   content
     .replace(/currentRolldownVersion:\s*"[^"]+"/u, `currentRolldownVersion: "${rolldownVersion}"`)
     .replace(/currentOxcVersion:\s*"[^"]+"/u, `currentOxcVersion: "${oxcVersion}"`)
-    .replace(/currentResolverVersion:\s*"[^"]+"/u, `currentResolverVersion: "${resolverVersion}"`);
+    .replace(/currentResolverVersion:\s*"[^"]+"/u, `currentResolverVersion: "${resolverVersion}"`)
+    .replace(
+      /currentGlobMatcherVersion:\s*"[^"]+"/u,
+      `currentGlobMatcherVersion: "${globMatcherVersion}"`,
+    );
 
 export const formatCompilerUpdateResult = ({
   dryRun,
   rolldownVersion,
   oxcVersion,
   resolverVersion,
+  globMatcherVersion,
   changedFiles,
 }) => {
   const mode = dryRun ? "Dry run" : "Updated";
   const files =
     changedFiles.length === 0 ? "No file edits needed." : `Files: ${changedFiles.join(", ")}`;
-  return `${mode}: rolldown ${rolldownVersion}, OXC ${oxcVersion}, oxc_resolver ${resolverVersion}\n${files}\n`;
+  return `${mode}: rolldown ${rolldownVersion}, OXC ${oxcVersion}, oxc_resolver ${resolverVersion}, ${compilerStackConfig.globMatcherCrate} ${globMatcherVersion}\n${files}\n`;
 };
 
 const crateVersion = async (fetchJson, crate, version) => {

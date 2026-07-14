@@ -335,7 +335,6 @@ pub(crate) fn analyze_with_rolldown_engine(
         entry_path: entry_path.to_path_buf(),
         package_root: package_root.to_path_buf(),
         selection,
-        reported_side_effects: side_effects_mode.clone(),
     };
     let artifact = boundary::bundle_sync(BundleRequest {
         entries: vec![bundle_entry(engine_selection(request))],
@@ -363,11 +362,18 @@ pub(crate) fn analyze_with_rolldown_engine(
         )
     })?;
 
-    // §7.4/§14.5: with glob matching unavailable from public bundler
-    // metadata, an Array declaration reports conservatively as
-    // side-effectful (legacy ORs in glob matches over graph modules; the
-    // adapter's conservative-confidence diagnostic already flags this).
-    let side_effects = side_effects_mode.has_side_effects() || side_effects_mode.is_array();
+    // §7.4/FR-021: Side-Effectful is a property of THE IMPORT — is the entry being measured one
+    // the package declares effectful? — so the glob form answers by MATCHING the entry, and
+    // `has_side_effects` is the whole answer.
+    //
+    // It used to be ORed with `is_array()`, which overrode that correct answer with an
+    // unconditional `true` for every array declaration. `"sideEffects": ["**/*.css"]` says nothing
+    // about a JavaScript entry, and it is an everyday declaration — so an everyday package was
+    // reported side-effectful, forced `truly_treeshakeable: false` BY CONSTRUCTION (the comparison
+    // below is gated on `!side_effects` and never ran), and could never reach High confidence. The
+    // premise that bought that conservatism — "glob matching unavailable from public bundler
+    // metadata" — was retracted by the §10.7 amendment, and the matcher is now Rolldown's own.
+    let side_effects = side_effects_mode.has_side_effects();
     let mut diagnostics: Vec<ImportDiagnostic> = artifact
         .diagnostics
         .iter()

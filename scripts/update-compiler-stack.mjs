@@ -136,8 +136,13 @@ export const updateCompilerStack = async ({
 
   const targetOxcVersion = probe.oxcVersion;
   const targetResolverVersion = probe.resolverVersion;
+  // Never requested, always derived: the glob matcher's coordinated version is whatever
+  // Cargo resolved for ROLLDOWN'S OWN graph, because agreeing with rolldown is the only
+  // thing the daemon's copy is for. There is no `--fast-glob` flag, and there must not be.
+  const targetGlobMatcherVersion = probe.globMatcherVersion;
   validateVersion("OXC", targetOxcVersion);
   validateVersion("oxc_resolver", targetResolverVersion);
+  validateVersion(compilerStackConfig.globMatcherCrate, targetGlobMatcherVersion);
   await validateAvailableVersions(fetchJson, {
     rolldownVersion: targetRolldownVersion,
     oxcVersion: targetOxcVersion,
@@ -148,6 +153,7 @@ export const updateCompilerStack = async ({
     rolldownVersion: targetRolldownVersion,
     oxcVersion: targetOxcVersion,
     resolverVersion: targetResolverVersion,
+    globMatcherVersion: targetGlobMatcherVersion,
   };
 
   const nextFiles = {
@@ -250,6 +256,7 @@ const resolveProbeStack = async ({
       rolldownVersion: resolvedVersion(metadata, compilerStackConfig.rolldownCrate),
       oxcVersion: resolvedVersion(metadata, "oxc_parser"),
       resolverVersion: resolvedVersion(metadata, "oxc_resolver"),
+      globMatcherVersion: resolvedVersion(metadata, compilerStackConfig.globMatcherCrate),
     };
 
     // The overrides were exact constraints in the probe manifest, so a
@@ -272,6 +279,7 @@ const assertSingleCoordinatedVersions = (metadata) => {
     ...rolldownFamilyCrates(),
     "oxc",
     "oxc_resolver",
+    compilerStackConfig.globMatcherCrate,
     ...compilerStackConfig.oxcCrates,
   ]);
   const versionsByName = new Map();
@@ -336,7 +344,7 @@ const valueAfter = (argv, index, option) => {
 
 const updateLockfiles = async (
   execFile,
-  { rolldownVersion, oxcVersion, resolverVersion },
+  { rolldownVersion, oxcVersion, resolverVersion, globMatcherVersion },
   platform,
   rootDir,
 ) => {
@@ -361,6 +369,11 @@ const updateLockfiles = async (
   for (const crate of compilerStackConfig.oxcCrates) {
     await execFile("cargo", ["update", "-p", crate, "--precise", oxcVersion], { cwd: rootDir });
   }
+  await execFile(
+    "cargo",
+    ["update", "-p", compilerStackConfig.globMatcherCrate, "--precise", globMatcherVersion],
+    { cwd: rootDir },
+  );
 };
 
 const defaultFetchJson = async (url) => {

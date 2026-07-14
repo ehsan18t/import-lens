@@ -329,7 +329,6 @@ fn compute_file_size_with(
                     entry_path: resolved.entry_path.clone(),
                     package_root: resolved.package_root.clone(),
                     selection: engine_selection(request),
-                    reported_side_effects: resolved.side_effects.clone(),
                 });
                 group.sized.push(import.clone());
             }

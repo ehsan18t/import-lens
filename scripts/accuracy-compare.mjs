@@ -58,6 +58,11 @@ const realFixtures = [
   { package: "css-tree", named: "parse", label: "css-tree (deep ESM graph, transitive deps)" },
   { package: "date-fns", named: "format", label: "date-fns (deep zero-dependency ESM graph)" },
   { package: "lodash", named: "debounce", label: "lodash (CommonJS wrapper path)" },
+  {
+    package: "refractor",
+    named: "refractor",
+    label: "refractor (sideEffects glob anchored at the package root)",
+  },
 ];
 
 const main = async () => {
@@ -246,6 +251,35 @@ const assertRealFixturePreconditions = async (workspace) => {
     throw new Error(
       "lodash fixture declares a `module` field, so it now resolves to an ESM entry; " +
         "the CommonJS wrapper path is no longer covered by any benchmark",
+    );
+  }
+
+  // refractor is here for ONE property: its `sideEffects` carries a pattern with a `/`.
+  //
+  // That is the branch nothing else in this suite reaches. `sideEffects` globs are matched against
+  // the entry's PACKAGE-RELATIVE path, and the matcher prefixes `**/` to any pattern that has no
+  // separator (or a `./` prefix) — so those patterns match an absolute path too, by accident, and
+  // stay green even when the path being matched is wrong. Only a pattern that CONTAINS a `/` is
+  // used verbatim and anchored at the package root, and it is the one that goes red.
+  //
+  // It went red for real: the daemon handed Rolldown a `\\?\` verbatim entry id against a
+  // non-canonical package.json path, the relativization silently degraded to the whole absolute
+  // path, `["lib/all.js","lib/common.js"]` matched nothing, and refractor's ~35 gated
+  // `refractor.register(lang)` statements were tree-shaken away — 30,229 B reported for a package
+  // esbuild puts at 114,296 B. Every offline test passed. THIS suite, comparing real bytes against
+  // an independent bundler, is what a wrong number on a real package has to answer to.
+  //
+  // So the property is guarded rather than assumed: if a future version drops the anchored pattern,
+  // or moves the entry out from under it, this benchmark silently stops covering that branch.
+  const sideEffects = manifests.refractor.sideEffects;
+  const anchored =
+    Array.isArray(sideEffects) &&
+    sideEffects.some((pattern) => typeof pattern === "string" && pattern.includes("/"));
+  if (!anchored) {
+    throw new Error(
+      "refractor fixture no longer declares a `sideEffects` pattern containing a `/` " +
+        `(got ${JSON.stringify(sideEffects)}); no benchmark now covers a package-root-anchored ` +
+        "sideEffects glob, which is the form that hid a 3.7x undercount",
     );
   }
 

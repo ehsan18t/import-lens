@@ -4,7 +4,7 @@
 
 use import_lens_daemon::engine::{
     BundleArtifact, BundleEntry, BundleFailure, BundlePurpose, BundleRequest, BundleSelection,
-    ImportRuntime, RolldownEngine, SideEffectsMode,
+    ImportRuntime, RolldownEngine,
 };
 use std::{
     fs,
@@ -51,7 +51,6 @@ fn request(root: &Path, entry: &str, selection: BundleSelection) -> BundleReques
             entry_path: root.join(entry),
             package_root: root.to_path_buf(),
             selection,
-            reported_side_effects: SideEffectsMode::Unknown,
         }],
         runtime: ImportRuntime::default(),
         purpose: BundlePurpose::ImportSize,
@@ -906,13 +905,11 @@ async fn matrix_37_multi_package_request() {
                     entry_path: root.join("pkg_a/index.js"),
                     package_root: root.clone(),
                     selection: named(&["a"]),
-                    reported_side_effects: SideEffectsMode::Unknown,
                 },
                 BundleEntry {
                     entry_path: root.join("pkg_b/index.js"),
                     package_root: root.clone(),
                     selection: named(&["b"]),
-                    reported_side_effects: SideEffectsMode::Unknown,
                 },
             ],
             runtime: ImportRuntime::default(),
@@ -1278,8 +1275,9 @@ fn write_installed_package(
 // report. So the rows that exist to prove "Rolldown owns `sideEffects`" all exercised the one code
 // path production never takes. This is that path.
 //
-// `reported_side_effects` is deliberately `Unknown`: the statement must be dropped because
-// Rolldown read the manifest we pointed it at, not because Import Lens told it anything (§7.4).
+// The engine boundary carries NO `sideEffects` metadata at all (`BundleEntry`), which is what makes
+// this row provable: the statement must be dropped because Rolldown read the manifest we pointed it
+// at, not because Import Lens told it anything (§7.4).
 #[tokio::test]
 async fn matrix_49_installed_package_entry_carries_its_manifest() {
     let root = temp_workspace();
@@ -1303,7 +1301,6 @@ async fn matrix_49_installed_package_entry_carries_its_manifest() {
                 entry_path,
                 package_root,
                 selection: named(&["parse"]),
-                reported_side_effects: SideEffectsMode::Unknown,
             }],
             runtime: ImportRuntime::default(),
             purpose: BundlePurpose::ImportSize,
@@ -1367,7 +1364,6 @@ async fn matrix_50_installed_esm_entry_gets_node_interop_for_commonjs() {
                 entry_path,
                 package_root,
                 selection: named(&["value"]),
-                reported_side_effects: SideEffectsMode::Unknown,
             }],
             runtime: ImportRuntime::default(),
             purpose: BundlePurpose::ImportSize,
@@ -1450,13 +1446,11 @@ async fn matrix_51_multi_entry_manifests_do_not_cross() {
                     entry_path: pure_entry,
                     package_root: pure_root,
                     selection: named(&["parse"]),
-                    reported_side_effects: SideEffectsMode::Unknown,
                 },
                 BundleEntry {
                     entry_path: dirty_entry,
                     package_root: dirty_root,
                     selection: named(&["format"]),
-                    reported_side_effects: SideEffectsMode::Unknown,
                 },
             ],
             runtime: ImportRuntime::default(),

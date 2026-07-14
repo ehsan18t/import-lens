@@ -16,7 +16,6 @@ use import_lens_daemon::engine::{
     BundleEntry, BundlePurpose, BundleRequest, BundleSelection, boundary,
 };
 use import_lens_daemon::ipc::protocol::ImportRuntime;
-use import_lens_daemon::pipeline::resolver::SideEffectsMode;
 use std::{fs, path::Path, path::PathBuf};
 
 mod common;
@@ -37,7 +36,6 @@ fn bundle(
             entry_path,
             package_root,
             selection: BundleSelection::Named(vec!["used".to_owned()]),
-            reported_side_effects: SideEffectsMode::False,
         }],
         runtime: ImportRuntime::Component,
         purpose: BundlePurpose::ImportSize,

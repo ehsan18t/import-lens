@@ -47,7 +47,7 @@ impl RolldownEngine {
         let plugin = ImportLensPlugin::for_request(&request);
         let state = plugin.state();
         let output = run_build(options, plugin, &state).await?;
-        translate(output, &state, &request)
+        translate(output, &state)
     }
 
     /// Export enumeration (§8.4): the resolved real entry becomes the strict
@@ -182,7 +182,6 @@ async fn run_build(
 fn translate(
     output: rolldown::BundleOutput,
     state: &BuildState,
-    request: &BundleRequest,
 ) -> Result<BundleArtifact, BundleFailure> {
     let chunk = single_chunk(&output, state)?;
 
@@ -214,29 +213,14 @@ fn translate(
             message: format!("external module kept as an import boundary: {import}"),
         });
     }
-    if request
-        .entries
-        .iter()
-        .any(|entry| entry.reported_side_effects.is_array())
-    {
-        // §7.4: matched side-effect paths would need Rolldown to expose its retention
-        // decisions, which its public output does not. Reporting stays conservative
-        // rather than re-implementing a matcher.
-        //
-        // Deliberately does NOT claim the size is undercounted on Windows. That claim
-        // came from matrix rows 42/43, whose `#[ignore]` blames "backslashed relative
-        // paths" — but Rolldown matches through `fast_glob`, which uses
-        // `std::path::is_separator` and accepts `\` for a pattern's `/` on Windows, and
-        // those fixtures' pattern (`fx.js`, at the package root) contains no separator
-        // at all. The rows fail for an unrelated reason. Do not assert a direction of
-        // error that has not been reproduced.
-        diagnostics.push(ImportDiagnostic {
-            stage: diagnostic_stage::SIDE_EFFECTS.to_owned(),
-            message: "package sideEffects globs present; matched paths are unavailable from \
-                      public bundler metadata, so side-effect confidence is conservative"
-                .to_owned(),
-        });
-    }
+    // There used to be a `side_effects` diagnostic here, pushed for EVERY glob declaration: "matched
+    // paths are unavailable from public bundler metadata, so side-effect confidence is
+    // conservative". Its premise was retracted (§10.7) and the daemon now matches the entry with
+    // `fast_glob` — Rolldown's own matcher — so the matched paths are not unavailable at all: the
+    // one that decides the badge is answered exactly. The diagnostic was the last thing holding
+    // every `["**/*.css"]` package below High confidence, and it also made `BundleEntry` carry a
+    // `reported_side_effects` nobody else read. Both are gone. Rolldown still owns retention
+    // (FR-021); the daemon only reports what the package declared about the entry it measured.
 
     let (read_time_fingerprints, unhashed_paths) = state.read_time_fingerprints();
 

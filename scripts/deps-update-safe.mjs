@@ -42,6 +42,7 @@ export const runSafeUpdate = async ({
     ...rolldownFamilyCrates().map((crate) => [crate, compilerStackConfig.currentRolldownVersion]),
     ["oxc_resolver", compilerStackConfig.currentResolverVersion],
     ...compilerStackConfig.oxcCrates.map((crate) => [crate, compilerStackConfig.currentOxcVersion]),
+    [compilerStackConfig.globMatcherCrate, compilerStackConfig.currentGlobMatcherVersion],
   ];
   for (const [crate, version] of pins) {
     await execFile("cargo", ["update", "-p", crate, "--precise", version], { cwd: rootDir });

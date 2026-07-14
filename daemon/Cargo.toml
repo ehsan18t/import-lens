@@ -11,6 +11,12 @@ path = "src/main.rs"
 [dependencies]
 brotli = "^8"
 bytes = "^1"
+# Coordinated compiler stack, exact-pinned: this is the matcher Rolldown itself
+# reads `sideEffects` globs with (`rolldown_common`, `rolldown_utils`). Its whole
+# purpose is to AGREE with the bundler that owns retention, so resolving it to a
+# different version than rolldown got would break that agreement silently. Moved
+# only by `pnpm deps:update:compiler`, which derives it from rolldown's own graph.
+fast-glob = "=1.0.1"
 flate2 = "^1.1"
 futures-util = { version = "^0.3", default-features = false, features = ["sink", "std"] }
 httpdate = "^1"

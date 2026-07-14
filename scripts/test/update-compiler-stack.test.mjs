@@ -17,6 +17,8 @@ import { parseUpdateArgs, updateCompilerStack } from "../update-compiler-stack.m
 const currentRolldown = compilerStackConfig.currentRolldownVersion;
 const currentOxc = compilerStackConfig.currentOxcVersion;
 const currentResolver = compilerStackConfig.currentResolverVersion;
+const currentGlobMatcher = compilerStackConfig.currentGlobMatcherVersion;
+const globMatcher = compilerStackConfig.globMatcherCrate;
 
 // A synthetic upgrade target, always one minor ahead of whatever is pinned
 // today, so it can never coincide with the current version and let "nothing
@@ -34,8 +36,10 @@ const rolldownFamily = rolldownFamilyCrates();
 const escapeVersion = (version) => version.replaceAll(".", "\\.");
 
 // Minimal `cargo metadata` shape shared by the probe resolution and the
-// fingerprint recompute.
-const probeMetadata = ({ rolldown, oxc, resolver }) => ({
+// fingerprint recompute. The glob matcher hangs off rolldown because that is
+// where it really comes from: the updater never asks for a version of it, it
+// reads the one rolldown's own graph resolved.
+const probeMetadata = ({ rolldown, oxc, resolver, glob = currentGlobMatcher }) => ({
   packages: [
     { id: "id:rolldown", name: "rolldown", version: rolldown, source: "registry+crates-io" },
     { id: "id:oxc_parser", name: "oxc_parser", version: oxc, source: "registry+crates-io" },
@@ -45,12 +49,14 @@ const probeMetadata = ({ rolldown, oxc, resolver }) => ({
       version: resolver,
       source: "registry+crates-io",
     },
+    { id: "id:glob", name: globMatcher, version: glob, source: "registry+crates-io" },
   ],
   resolve: {
     nodes: [
-      { id: "id:rolldown", dependencies: ["id:oxc_parser", "id:oxc_resolver"] },
+      { id: "id:rolldown", dependencies: ["id:oxc_parser", "id:oxc_resolver", "id:glob"] },
       { id: "id:oxc_parser", dependencies: [] },
       { id: "id:oxc_resolver", dependencies: [] },
+      { id: "id:glob", dependencies: [] },
     ],
   },
 });
@@ -227,10 +233,14 @@ test("updateCompilerStack updates manifests, SRS, config, lockfiles, and the fin
   const repo = await tempRepo();
   const execs = [];
   const probe = probeLifecycle();
+  // The matcher moves because ROLLDOWN's graph moved it, which is the only way it ever
+  // moves: the updater has no flag for it and must adopt whatever the probe resolved.
+  const targetGlobMatcher = nextMinor(currentGlobMatcher);
   const metadata = probeMetadata({
     rolldown: targetRolldown,
     oxc: targetOxc,
     resolver: targetResolver,
+    glob: targetGlobMatcher,
   });
 
   const result = await updateCompilerStack({
@@ -256,6 +266,15 @@ test("updateCompilerStack updates manifests, SRS, config, lockfiles, and the fin
   for (const crate of rolldownFamily) {
     assert.match(cargoToml, new RegExp(`^${crate} = "=${escapeVersion(targetRolldown)}"$`, "mu"));
   }
+  assert.match(
+    cargoToml,
+    new RegExp(`^${globMatcher} = "=${escapeVersion(targetGlobMatcher)}"$`, "mu"),
+    "the daemon's matcher must follow the copy rolldown resolved, or the two disagree",
+  );
+  assert.match(
+    config,
+    new RegExp(`currentGlobMatcherVersion: "${escapeVersion(targetGlobMatcher)}"`, "u"),
+  );
   assert.equal(manifest.scripts["deps:update:compiler"], "node scripts/update-compiler-stack.mjs");
   assert.equal(manifest.scripts["deps:update:safe"], "node scripts/deps-update-safe.mjs");
   assert.match(srs, new RegExp(escapeVersion(targetRolldown), "u"));
@@ -295,6 +314,11 @@ test("updateCompilerStack updates manifests, SRS, config, lockfiles, and the fin
       { cwd: repo.root },
     ]),
   );
+  assert.deepEqual(execs[oxcOffset + compilerStackConfig.oxcCrates.length], [
+    "cargo",
+    ["update", "-p", globMatcher, "--precise", targetGlobMatcher],
+    { cwd: repo.root },
+  ]);
   const last = execs.at(-1);
   assert.ok(isCargoMetadata(last[0], last[1]));
   assert.ok(last[1].includes("--locked"));
@@ -649,6 +673,13 @@ test("runSafeUpdate restores the stack and validates the fingerprint", async () 
       { cwd: "/repo" },
     ]),
   );
+  // A range-respecting `cargo update` can move the matcher out from under the daemon just
+  // as it can move rolldown's own crates; the restore has to put it back.
+  assert.deepEqual(execs[restoreOffset + compilerStackConfig.oxcCrates.length], [
+    "cargo",
+    ["update", "-p", globMatcher, "--precise", currentGlobMatcher],
+    { cwd: "/repo" },
+  ]);
   const last = execs.at(-1);
   assert.ok(isCargoMetadata(last[0], last[1]));
 });
@@ -707,6 +738,7 @@ const availableVersionPayload = (url) => {
 
 const cargoTomlFixture = () => `[dependencies]
 brotli = "^8"
+${globMatcher} = "=${currentGlobMatcher}"
 ${compilerStackConfig.oxcCrates.map((crate) => `${crate} = "=${currentOxc}"`).join("\n")}
 oxc_resolver = "=${currentResolver}"
 ${rolldownFamily.map((crate) => `${crate} = "=${currentRolldown}"`).join("\n")}
@@ -736,5 +768,6 @@ const configFixture = () => `export const compilerStackConfig = {
   currentRolldownVersion: "${currentRolldown}",
   currentOxcVersion: "${currentOxc}",
   currentResolverVersion: "${currentResolver}",
+  currentGlobMatcherVersion: "${currentGlobMatcher}",
 };
 `;

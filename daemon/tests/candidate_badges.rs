@@ -115,15 +115,22 @@ const EXPECTATIONS: &[BadgeExpectation] = &[
     BadgeExpectation {
         package: "react-loading-skeleton",
         named: &["SkeletonTheme"],
-        side_effects: true,
-        truly_treeshakeable: false,
-        confidence: ConfidenceLevel::Medium,
-        derivation: "declares `sideEffects: [\"**/*.css\"]`. An ARRAY declaration reports \
-                     side-effectful today whatever it matches (`pipeline::analyze` ORs in \
-                     `is_array()`), which forces `truly_treeshakeable: false` by construction — \
-                     even though the entry (`dist/index.js`) matches no pattern in it. This row is \
-                     the only real-package detector of that rule: it MUST move when the array \
-                     semantics do",
+        side_effects: false,
+        truly_treeshakeable: true,
+        confidence: ConfidenceLevel::High,
+        derivation: "declares `sideEffects: [\"**/*.css\"]` — and the entry being measured is \
+                     `dist/index.js` (the `import` condition of its `exports`), which matches no \
+                     pattern in it. Side-Effectful is a property of THE IMPORT: the one file in \
+                     this package the rule does describe is `dist/skeleton.css`, and the published \
+                     JavaScript never imports it. So the import is not side-effectful, the \
+                     full-package comparison runs, and `SkeletonTheme` really is a slice of the \
+                     surface (esbuild puts it at 83% of the whole, well under the 95% bar) — \
+                     nothing is unmeasured, so confidence is High. This row read \
+                     `true`/`false`/Medium until Task 4, and every one of those three came from \
+                     `pipeline::analyze` ORing `is_array()` into the answer: the array form was \
+                     reported side-effectful WHATEVER it matched, which gated the comparison build \
+                     off and made `truly_treeshakeable: false` true by construction. It is the \
+                     only real-package detector of that rule, and it moved when the rule did",
     },
     BadgeExpectation {
         package: "@uiw/react-md-editor",
@@ -134,6 +141,27 @@ const EXPECTATIONS: &[BadgeExpectation] = &[
         derivation: "declares no `sideEffects`, so it reports conservatively — and its ESM entry \
                      does `import \"./index.css\"`, which is why it is in the set at all (see \
                      `a_css_shipping_real_package_is_measured_and_discloses_its_stylesheet`)",
+    },
+    BadgeExpectation {
+        package: "refractor",
+        named: &["refractor"],
+        side_effects: true,
+        truly_treeshakeable: false,
+        confidence: ConfidenceLevel::Medium,
+        derivation: "declares `sideEffects: [\"lib/all.js\",\"lib/common.js\"]` and its `exports` \
+                     entry IS `./lib/common.js` — so the entry being measured is one the package \
+                     names effectful, and the badge is `true`. The badge was ALWAYS true; what was \
+                     wrong was the size behind it. The two patterns are the only ones in the whole \
+                     fixture set that carry a `/`, which the matcher anchors at the package root \
+                     instead of prefixing with `**/` — and the daemon was handing Rolldown a \
+                     `\\\\?\\` verbatim entry id against a non-canonical package.json path, so the \
+                     relativization degraded to an absolute path, both patterns missed, and \
+                     Rolldown tree-shook ~35 gated `refractor.register(lang)` calls out of a \
+                     package it had just been told was effectful: 30,229 B reported, 113,152 B \
+                     real. This row cannot detect that (a badge is not a byte) — \
+                     `scripts/accuracy-compare.mjs` measures it against esbuild, and \
+                     `every_side_effects_form_answers_with_what_rolldown_retained` pins the \
+                     declaration form. It is here because every pinned fixture must have a row",
     },
 ];
 

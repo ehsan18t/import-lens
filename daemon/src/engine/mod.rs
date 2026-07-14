@@ -14,7 +14,6 @@ pub(crate) mod scheduling;
 use std::path::PathBuf;
 
 pub use crate::ipc::protocol::ImportRuntime;
-pub use crate::pipeline::resolver::SideEffectsMode;
 pub use adapter::RolldownEngine;
 
 #[derive(Debug, Clone)]
@@ -24,6 +23,12 @@ pub struct BundleRequest {
     pub purpose: BundlePurpose,
 }
 
+/// An entry to measure. It carries **no `sideEffects` metadata**, and that is the contract, not an
+/// omission: Rolldown reads the package's `sideEffects` itself, from the manifest the plugin
+/// supplies alongside the entry, and it is the only authority on retention (FR-021). The daemon's
+/// own reading of the field is *reporting* metadata — it decides a badge, never a byte — so it
+/// belongs on the pipeline's side of this boundary and stays there. The field used to be here, and
+/// its one and only reader was a diagnostic justified by a premise that has since been retracted.
 #[derive(Debug, Clone)]
 pub struct BundleEntry {
     /// Pre-resolved absolute entry file; the engine never re-resolves the
@@ -31,7 +36,6 @@ pub struct BundleEntry {
     pub entry_path: PathBuf,
     pub package_root: PathBuf,
     pub selection: BundleSelection,
-    pub reported_side_effects: SideEffectsMode,
 }
 
 #[derive(Debug, Clone)]
@@ -197,9 +201,6 @@ pub mod stage {
 pub mod diagnostic_stage {
     /// A module Rolldown kept as an import boundary instead of bundling.
     pub const EXTERNAL: &str = "external";
-    /// The package declares `sideEffects` as an array and the matched paths are not
-    /// recoverable from public bundler metadata, so confidence stays conservative.
-    pub const SIDE_EFFECTS: &str = "side_effects";
     /// Bytes the graph pulled in that are NOT in the measured chunk — a stylesheet, almost always.
     ///
     /// The build **succeeds**. The size we report is the JS chunk, measured exactly; these bytes

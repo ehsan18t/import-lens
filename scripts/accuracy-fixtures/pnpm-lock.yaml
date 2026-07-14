@@ -29,6 +29,9 @@ importers:
       react-loading-skeleton:
         specifier: 3.5.0
         version: 3.5.0(react@19.2.7)
+      refractor:
+        specifier: 5.0.0
+        version: 5.0.0
       uuid:
         specifier: 14.0.1
         version: 14.0.1

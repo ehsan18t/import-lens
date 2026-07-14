@@ -241,6 +241,34 @@ gate lives **inside** each store.
 
 ---
 
+## Cache
+
+### K1 — The `sideEffects` badge fix is invisible on a warm cache until `ANALYZER_REVISION` moves
+**Status: Watch** · A **hard dependency on Task 14**, not a nice-to-have
+
+**What actually happens.** A user who analysed `react-loading-skeleton` — or any package declaring
+a `sideEffects` glob, or `[]` — on a pre-fix daemon holds a persisted entry that says
+`side_effects: true`, `truly_treeshakeable: false`, **Medium**. That is the exact wrong badge
+`8f607a0` and this commit exist to abolish, and they keep being served it.
+
+Nothing re-examines it. `ImportResult::is_durable()` is an **insert-time** gate: it decides what may
+*enter* a store, and a stored entry is never re-validated on read. The only thing that rejects an
+entry computed by older code is its `CacheIdentity.analyzer_version`
+(`ANALYZER_VERSION` = crate version + `ANALYZER_REVISION`, `cache/key.rs`), which both stores check
+on read and which `purge_orphan_entries` sweeps on. **The analyzer changed; the identity did not.**
+
+**Why it is not fixed here.** `ANALYZER_REVISION` is bumped **once** for the whole bundler-redesign
+batch, by Task 14 — bumping it per fix would throw every user's cache away several times over the
+branch, and the disk schema stays at 8 meanwhile.
+
+**The condition to watch.** If Task 14 lands **without** bumping `ANALYZER_REVISION`, this fix and
+`8f607a0` are dead code for **every existing install**: only a brand-new cache would ever show the
+corrected badge, and the packages most likely to be already cached are exactly the popular ones this
+fixes. The entry closes when Task 14 bumps the revision, at which point every pre-fix entry is
+rejected on read and re-measured.
+
+---
+
 ## Deferred product work
 
 These are real, and they are queued — not abandoned.

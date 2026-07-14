@@ -917,6 +917,7 @@ version = "0.1.0"
 dependencies = [
  "brotli",
  "bytes",
+ "fast-glob",
  "flate2",
  "futures-util",
  "httpdate",

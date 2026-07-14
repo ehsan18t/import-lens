@@ -95,7 +95,7 @@ pub const ALL: &[&str] = &[
 /// True only for a stage that is a **property of the package's bytes** — so the cache, which is
 /// keyed by those bytes' fingerprints, expires it exactly when the answer would change — or for a
 /// purely informational stage that rides along on a successful measurement (`external`,
-/// `side_effects`, `uncounted_assets`, `types_only`).
+/// `uncounted_assets`, `types_only`).
 ///
 /// False for everything else, **including a stage this function has never heard of**. That default
 /// is the whole design: a new stage is refused until someone classifies it, so the failure mode of
@@ -116,7 +116,6 @@ pub fn may_enter_a_durable_store(stage: &str) -> bool {
             // Informational stages an engine build emits on the SUCCESS path. Refusing one of
             // these would refuse to cache a healthy package.
             | diagnostic_stage::EXTERNAL
-            | diagnostic_stage::SIDE_EFFECTS
             | diagnostic_stage::UNCOUNTED_ASSETS
             // Pipeline failures that are a property of the package's bytes.
             | PACKAGE_VALIDATION
