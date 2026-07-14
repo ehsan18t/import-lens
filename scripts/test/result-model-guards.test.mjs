@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { lineAt, sourceFiles, stripComments } from "../source-scan.mjs";
 
 // GUARDS for the result model (docs/adr/0006-the-result-model.md).
 //
@@ -81,119 +80,10 @@ import { fileURLToPath } from "node:url";
 // whether the guarded block USES the error's value. That is a heuristic: a block that early-exits
 // while quoting the message somewhere passes. It is not airtight and does not claim to be.
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(here, "../..");
-
-const sourceRoots = ["daemon/src", "extension/src", "cli", "scripts"];
-const sourceExtensions = new Set([".rs", ".ts", ".mjs", ".js"]);
-const skippedDirectories = new Set(["node_modules", "dist", "target", "out"]);
-
-const walk = (directory, found = []) => {
-  for (const entry of readdirSync(directory)) {
-    const full = path.join(directory, entry);
-    if (statSync(full).isDirectory()) {
-      if (!skippedDirectories.has(entry)) {
-        walk(full, found);
-      }
-    } else if (sourceExtensions.has(path.extname(entry))) {
-      found.push(full);
-    }
-  }
-  return found;
-};
-
-const allFiles = sourceRoots
-  .flatMap((root) => walk(path.join(repoRoot, root)))
-  .map((full) => ({
-    path: path.relative(repoRoot, full).split(path.sep).join("/"),
-    text: readFileSync(full, "utf8"),
-  }))
+const allFiles = sourceFiles().filter(
   // This file quotes every banned pattern in order to ban it.
-  .filter((file) => file.path !== "scripts/test/result-model-guards.test.mjs");
-
-/** Where the Rust raw string at `index` ends (`r"…"`, `r#"…"#`), or -1 if one does not start there. */
-const endOfRawString = (text, index) => {
-  let hashes = 0;
-  while (text[index + 1 + hashes] === "#") {
-    hashes += 1;
-  }
-  if (text[index + 1 + hashes] !== '"') {
-    return -1;
-  }
-  const terminator = `"${"#".repeat(hashes)}`;
-  const end = text.indexOf(terminator, index + 2 + hashes);
-  return end === -1 ? text.length : end + terminator.length;
-};
-
-/** Where the string literal at `index` ends, or -1 if one does not start there. */
-const endOfLiteral = (text, index) => {
-  const char = text[index];
-  if (char === "r" && !/[\w$]/u.test(text[index - 1] ?? "")) {
-    return endOfRawString(text, index);
-  }
-  if (char !== '"' && char !== "'" && char !== "`") {
-    return -1;
-  }
-
-  let scan = index + 1;
-  while (scan < text.length && text[scan] !== char) {
-    scan += text[scan] === "\\" ? 2 : 1;
-  }
-  return scan + 1;
-};
-
-/** Where the comment at `index` ends, or -1 if one does not start there. */
-const endOfComment = (text, index) => {
-  if (text[index] !== "/") {
-    return -1;
-  }
-  if (text[index + 1] === "/") {
-    const end = text.indexOf("\n", index);
-    return end === -1 ? text.length : end;
-  }
-  if (text[index + 1] === "*") {
-    const end = text.indexOf("*/", index + 2);
-    return end === -1 ? text.length : end + 2;
-  }
-  return -1;
-};
-
-/**
- * Every comment blanked to spaces, with newlines kept — so line and column offsets are unchanged and
- * a match still reports where it really is.
- *
- * This replaces the old "skip a line that STARTS with a comment token" rule, which a leading block
- * comment silenced completely: `/* size *\/ if (!result.error) { … }` was invisible to it, and so was
- * an aggregate exemption satisfied by PROSE inside the guarded block rather than by code. String and
- * template literals are tracked (a URL is not a comment), as are Rust raw strings.
- */
-const stripComments = (text) => {
-  const out = [...text];
-  let index = 0;
-
-  while (index < text.length) {
-    const literal = endOfLiteral(text, index);
-    if (literal !== -1) {
-      index = literal;
-      continue;
-    }
-
-    const comment = endOfComment(text, index);
-    if (comment === -1) {
-      index += 1;
-      continue;
-    }
-
-    for (let scan = index; scan < comment; scan += 1) {
-      if (out[scan] !== "\n") {
-        out[scan] = " ";
-      }
-    }
-    index = comment;
-  }
-
-  return out.join("");
-};
+  (file) => file.path !== "scripts/test/result-model-guards.test.mjs",
+);
 
 /**
  * A file consumes a size if it names one of the five measurements or reaches for them through the
@@ -263,17 +153,33 @@ const resultHandlingFiles = allFiles.filter(
  * So the exemption is not a list of blessed receivers, and it is no longer a demand that the
  * *statement* name the flags either — that version was satisfied by a **comment**, and an early-exit
  * gate consults the flags after the exit by construction, never inside it. It is a demand on the
- * RECEIVER: the same object must be asked `.incomplete` or `.degraded` somewhere in the same file.
- * Only an aggregate has those fields, in either language, so a per-import result cannot buy the
- * exemption without a field that does not compile.
+ * RECEIVER: the same object must be asked `.incomplete` or `.degraded` somewhere in the same file —
+ * **or handed to the one model that asks them**.
+ *
+ * Delegation counts, and counts for MORE than an inline re-read. ADR-0006's whole conclusion is that
+ * the question belongs in one predicate rather than being re-derived at each call site, because
+ * three consumers each asking it a slightly different way is what shipped the defect. `listener.ts`
+ * reads the aggregate's `error` (the one thing it legitimately answers: nothing was summed at all)
+ * and asks what the number IS by calling `fileCostQuality(response)` — which is the model, not a
+ * fourth reading of the flags. Demanding it also spell `.incomplete` inline would be demanding
+ * exactly the duplication this ADR exists to delete.
+ *
+ * The exemption still cannot be bought by a per-import result: `ImportResult` has no `incomplete`
+ * and no `degraded`, so it cannot be asked for them and it cannot be passed to any of these three
+ * predicates without a type error.
  */
+const aggregateGates = "fileCostQuality|isDurableFileSize|isUsableFileSize|is_cacheable";
+
 const consultsTheAggregateFlags = (code, receiver) => {
   const chain = receiver
     .split(/\s*\??\.\s*/u)
     .filter(Boolean)
     .map((part) => part.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
     .join("\\s*\\??\\.\\s*");
-  return new RegExp(`\\b${chain}\\s*\\??\\.\\s*(?:incomplete|degraded)\\b`, "u").test(code);
+  return (
+    new RegExp(`\\b${chain}\\s*\\??\\.\\s*(?:incomplete|degraded)\\b`, "u").test(code) ||
+    new RegExp(`\\b(?:${aggregateGates})\\s*\\(\\s*${chain}\\b`, "u").test(code)
+  );
 };
 
 /**
@@ -286,9 +192,6 @@ const consultsTheAggregateFlags = (code, receiver) => {
  * would catch that. The runtime gates would.
  */
 const isAnAssertion = (statement) => /\b(?:assert|debug_assert|expect)\b/u.test(statement);
-
-/** The line `index` sits on, 1-based. */
-const lineAt = (text, index) => text.slice(0, index).split("\n").length;
 
 /** The source line containing `index`, trimmed — for the offence report. */
 const lineTextAt = (text, index) => {
@@ -796,13 +699,41 @@ const buildDerivedStores = [
   "daemon/src/pipeline/export_list.rs",
   "daemon/src/pipeline/build_memo.rs",
   "daemon/src/engine/dependency_paths.rs",
-].map((relative) => ({
-  path: relative,
-  text: readFileSync(path.join(repoRoot, relative), "utf8"),
-}));
+];
+
+/**
+ * The files one named store is made of: the module itself, or — if it has since become a module
+ * DIRECTORY — everything under it. Empty when the name resolves to nothing at all.
+ *
+ * **A guard that cannot fail is worse than no guard**, and this one had gone vacuous. The scan was
+ * `allFiles.find((file) => file.path === relative)?.text ?? ""`, so a store that was MOVED or RENAMED
+ * was simply no longer scanned, and the test stayed green forever — proved by mutation: rename
+ * `build_memo.rs` and the run still printed `✔ a build-derived store cannot be handed an
+ * ImportResult`, with the file it exists to guard absent from the tree. The `?? ""` was the whole
+ * defect: an empty string matches no banned pattern, so absence read as innocence.
+ */
+const filesOf = (store) => {
+  const directory = `${store.replace(/\.rs$/u, "")}/`;
+  return allFiles.filter((file) => file.path === store || file.path.startsWith(directory));
+};
 
 test("a build-derived store cannot be handed an ImportResult", () => {
-  const offenders = buildDerivedStores
+  const stores = buildDerivedStores.map((store) => ({ store, files: filesOf(store) }));
+  const missing = stores.filter(({ files }) => files.length === 0).map(({ store }) => store);
+
+  // NOT a `?? ""`. A store this guard names and cannot find is a store this guard is not guarding,
+  // and the only safe reading of that is a failure: either the file moved and this list must move
+  // with it, or the store is gone and its name must go.
+  assert.deepEqual(
+    missing,
+    [],
+    "this guard names a build-derived store that is not in the tree, so it is scanning NOTHING for \
+it. Point the list at where the store lives now, or delete the name if the store is gone (ADR-0006, \
+invariant 3)",
+  );
+
+  const offenders = stores
+    .flatMap(({ files }) => files)
     .filter((file) => /\bImportResult\b/u.test(file.text))
     .map((file) => file.path);
 

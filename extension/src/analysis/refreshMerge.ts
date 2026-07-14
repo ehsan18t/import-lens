@@ -1,4 +1,9 @@
-import type { ImportResult, ImportRuntime, RefreshedImportIdentity } from "../ipc/protocol.js";
+import type { ImportResult, RefreshedImportIdentity } from "../ipc/protocol.js";
+import {
+  importIdentityKey,
+  importIdentityOf,
+  refreshedImportIdentityOf,
+} from "./importIdentity.js";
 import type { ImportAnalysisState } from "./state.js";
 
 export interface RefreshMergeOutcome {
@@ -26,30 +31,12 @@ export interface RefreshMergeOptions {
   isCurrent?: boolean;
 }
 
-// A stable, order-independent key for one import. specifier alone is NOT unique
-// (same-specifier variants differ by kind / named / runtime), so the full identity
-// keys the merge. NUL/SOH separators keep field boundaries unambiguous (a specifier
-// or export name cannot contain them), and `named` is sorted so a differing source
-// order still yields the same key.
-//
-// The runtime is part of the key because it is part of the import. An Astro document can import the
-// same package, with the same kind and the same named exports, from its frontmatter (server) and
-// from a client <script>; the two resolve dependencies under materially different conditions, so
-// they have two different sizes, and each runtime ships its own artifact (ADR-0005). Without it the
-// two variants collide on ONE key: the map keeps a single result, both states match it, and the
-// client collapses two rows into one — in the very document shape the runtime split exists for.
-const identityKey = (
-  specifier: string,
-  importKind: string,
-  named: readonly string[],
-  runtime: ImportRuntime,
-): string =>
-  `${specifier}\u0000${importKind}\u0000${runtime}\u0000${[...named].sort().join("\u0001")}`;
-
 /**
  * Pure merge of pushed import results into a document's states, matched by a stable
- * per-import identity. Two kinds of push arrive here and both are merged the same way:
- * a background stale-while-revalidate refresh, and an import the daemon answered
+ * per-import identity ({@link importIdentityKey} — specifier alone is NOT unique, and the
+ * two variants of `import React, { useState } from "react"` would otherwise collide on one
+ * key and collapse into a single row). Two kinds of push arrive here and both are merged the
+ * same way: a background stale-while-revalidate refresh, and an import the daemon answered
  * `loading` because its engine build had not run when the response went out.
  *
  * Order is preserved; unmatched states pass through untouched. Insights are dropped on
@@ -91,12 +78,7 @@ export const mergeRefreshedResults = (
   const byKey = new Map<string, ImportResult>(
     results.map((result, index) => {
       const key = useIdentity
-        ? identityKey(
-            identities[index].specifier,
-            identities[index].import_kind,
-            identities[index].named,
-            identities[index].runtime,
-          )
+        ? importIdentityKey(refreshedImportIdentityOf(identities[index]))
         : result.specifier;
       return [key, result];
     }),
@@ -105,12 +87,7 @@ export const mergeRefreshedResults = (
   let changed = false;
   const next = existing.map((state) => {
     const key = useIdentity
-      ? identityKey(
-          state.detected.specifier,
-          state.detected.importKind,
-          state.detected.named,
-          state.detected.runtime,
-        )
+      ? importIdentityKey(importIdentityOf(state.detected))
       : state.detected.specifier;
     const refreshed = byKey.get(key);
 

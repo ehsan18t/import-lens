@@ -18,7 +18,10 @@ export const transientEngineStages: readonly string[] = ["timeout", "panic", "en
 
 const transientStages = new Set(transientEngineStages);
 
-const hasTransientStage = (diagnostics: readonly ImportDiagnostic[] | undefined): boolean =>
+/** Exported for {@link ../analysis/fileCostQuality.fileCostQuality}, which asks the same question of
+ * an aggregate's diagnostics in order to NAME the number rather than to store it. One definition of
+ * "transient", read for two purposes. */
+export const hasTransientStage = (diagnostics: readonly ImportDiagnostic[] | undefined): boolean =>
   (diagnostics ?? []).some((diagnostic) => transientStages.has(diagnostic.stage));
 
 const isTransientResult = (result: ImportResult): boolean =>

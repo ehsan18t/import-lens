@@ -552,6 +552,8 @@ This is one trade, not two independent losses. The same synthetic namespace that
   * **`incomplete`** — a conservative per-import sum (FR-024a) that skipped a still-`loading` import carries `error: None` and no failing stage at all. The daemon must flag as `incomplete` any sum missing a contributor's bytes, for any reason, including a deterministic one and a package that is **not installed** (FR-024a — a path alias that resolves to first-party source is not one of those, and must flag nothing), and must lift the missing import's stage into the aggregate's diagnostics. The sum must be structurally incapable of adding the bytes and dropping that signal.
   * **`degraded`** — the file's own combined build failed, so the totals are an un-deduplicated per-import sum: a different quantity, and an over-count (FR-024a). This is refused **separately**, and it must be, because it is exactly the state in which every contributor is Measured, `incomplete` is `false` and `error` is `None`. A transient-stage scan catches only half of it: a *deterministic* combined-build failure carries a perfectly durable stage.
 
+  **A guard that cannot fail is worse than no guard.** The static check that the four *build-derived* stores (`full_package`, `export_list`, `build_memo`, `dependency_paths`) are never handed an `ImportResult` names those stores by path, and it resolved a missing path to an empty string — so a store that was **moved or renamed was simply no longer scanned, and the check stayed green forever**. Proved by mutation: rename `build_memo.rs` and the run still reports the guard passing, with the file it exists to protect absent from the tree. A named store that cannot be found must **fail** the check, not be skipped: the day an `ImportResult` is plumbed into a store that has since become a module directory, silence is the one answer that must be impossible. Every guard in this repository must be mutation-tested — plant the defect, watch it go red — because a guard nobody has seen fail is a guard nobody has written.
+
   **"Any durable store" includes the extension's, and those are worse.** The import-cost history and the bundle-impact history have no TTL, no cache generation, and no Clear Caches command behind them. They keep **one row per identity**, so a bad row does not go stale — it *replaces that import's real baseline permanently*, and every later trend is computed against a number that never happened.
 
   **The gate lives in the STORE, not in the row's constructor.** Gating only the constructor leaves the store takeable: `ImportCostHistoryItem` is five sizes and an identity, so once one exists nothing downstream can re-derive how it was measured, and a row built by hand went straight into `globalState`. `recordImportCostHistory` and `recordBundleImpactHistory` therefore take the **raw daemon output** — the analysis states, the file-size response — and build the rows themselves. Neither will accept a row. The property test must feed the **stores**, not the constructors.
@@ -562,7 +564,7 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
   **One rule, three processes, one drift check.** The daemon (`FileSizeComputation::is_cacheable`), the extension (`isDurableFileSize`) and the CLI (`isUsableFileSize`) each state this gate, because the CLI ships standalone and can import neither of the others — the same forced duplication as `engine::stage::is_transient`. They must consult the same fields, and a drift check must fail when one of them falls behind (`scripts/test/file-size-usability-coordination.test.mjs`). `degraded` was added to the first two and not the third, and the third is the one that issues CI verdicts.
 
-  A total that fails this gate is still **shown** (a floor beats a blank, FR-024a) — labelled as an estimate (the status bar prefixes it `~`), and with no delta against the previous run, since comparing an honest number to a floor invents a regression. It is simply never written down.
+  A total that fails this gate is still **shown** (a floor beats a blank, FR-024a) — marked `~` and **named for the quantity it actually is** (FR-033: a floor is a *File Cost floor*, a failed combined build leaves a *Combined Import Cost*), and with no delta against the previous run, since comparing an honest number to a floor invents a regression. It is simply never written down. The gate decides whether the number may be **stored or judged**; `fileCostQuality` decides what it may be **called**, and the two are readings of the same fields — a surface that names a number the budget refuses to judge is the contradiction that shipped, so they are pinned together by a property test over the whole flag space.
 
 **FR-026d** (Critical) - **A size exists if and only if a build succeeded.** Every import analysis is in exactly one of three states, and the state must be legible from the result's *type*, not from a convention a reader has to know (ADR-0006):
 
@@ -624,7 +626,17 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
 **FR-032** (High) - The extension must display a loading indicator next to imports that are currently being computed (cache miss in progress).
 
-**FR-033** (High) - The extension must provide a status bar item showing the daemon's current state: `Import Lens: Ready`, `Import Lens: Computing...`, or `Import Lens: Unavailable`.
+**FR-033** (High) - The extension must provide a status bar item showing the daemon's current state: `Import Lens: Ready`, `Import Lens: Computing...`, or `Import Lens: Unavailable`. When it shows a size, the item must name **the quantity it actually has** and must not be framed as a bundle size — the tooltip read `Import Lens: Current file bundle size`, and [ADR-0004](adr/0004-import-lens-measures-imports-not-bundles.md) forbids any displayed figure being named or framed as what the project ships.
+
+  **The quantity and its quality travel with the number, from the daemon to every surface.** The extension used to destroy them at the boundary: `incomplete` and `degraded` were collapsed into a `~` character baked inside a `label` string, and the status-bar state had no field for either — so no surface downstream could tell the truth even if it wanted to, and the tooltip *guessed*. On a `degraded` response — the file's own combined build failed, so the number is an un-deduplicated sum of the per-import costs — it named that sum a "File Cost, this file's imports built as one bundle": a confident, specific claim about the one mechanism that provably did not run. **A vague wrong label is a defect; a precise wrong mechanism is worse.**
+
+  The state must therefore carry the number, its compression, and the **quality** the daemon reported (`fileCostQuality`: which quantity, and whether an import that belongs in it is missing), and every surface must derive its words from that one model — the status bar, `Import Lens: Show Current File Size` (FR-036e), and `importlens check` (FR-032a), whose sentences are shared verbatim under a drift check because it ships standalone and cannot import them. Three states, three names:
+
+  * **File Cost** — one bundle over the file's imports. The only one the per-file budget may be judged against (FR-036i).
+  * **File Cost floor** (`incomplete`) — an import that belongs in the number contributed no bytes. A lower bound. Shown with a `~`, and **no verdict** (FR-032a).
+  * **Combined Import Cost** (`degraded`) — the combined build failed, so the number counts a shared module once per import. A *different quantity* ([ADR-0004](adr/0004-import-lens-measures-imports-not-bundles.md)), an over-count, never a size, and **no verdict**. Both flags at once is a real state — the fallback sum is short an import *and* double-counts others, so it is a bound in neither direction — and the words must say both.
+
+  Any figure that is not a File Cost must state, on the surface that shows it, that **no budget was evaluated from it**. The status bar and `importlens check` displayed the same 183.2 kB for the same file on the same run, and only the CLI said what it was.
 
 **FR-034** (High) - Changing the `importLens.compression` setting must immediately update all currently visible inline decorations to reflect the new format selection without requiring a file change or editor reload.
 
@@ -632,7 +644,17 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
 **FR-036** (Medium) - The extension must provide a command `Import Lens: Show Report` that opens a webview panel listing all imports in the workspace along with their sizes, sorted by brotli size descending. The report must include workspace summary metrics, duplicate import aggregation, duplicate/vendored module insights, a static SVG treemap sized by Brotli bytes, confidence legend colors, and a static shared-module table so users can quickly identify dominant dependencies without running scripts in the webview.
 
+  **The report's headline figure is a *Combined Import Cost*, and it must be labelled as one.** It is the sum of independent Import Costs — each import priced as though the application were otherwise empty ([ADR-0004](adr/0004-import-lens-measures-imports-not-bundles.md)) — so it counts a dependency at **every site it is imported from**, and it counts a single `import React, { useState } from "react"` **twice**, because that statement is two imports. The panel must state both of those facts beside the number. It must not be called a total: `combinedImportCostBrotliBytes` was `totalBrotliBytes` and was rendered "Total Brotli", which a reader takes to mean *what my project ships*, when it counts a dependency imported in fifty files fifty times. The arithmetic was correct; the word was the defect. The figure must not be deduplicated — subtracting the overlap would assert a project-level bundle quantity this product does not model, and compressed sizes are not additive in any case, so it is an upper bound that **ranks** imports and **apportions blame** and is never presented as a size. The treemap's percentages and each duplicate-import group's `combinedImportCostBrotliBytes` are shares of, and sums within, that same figure.
+
+  **The naming rule is guarded, and the guard's reach is measured rather than claimed.** `scripts/test/import-cost-naming-guards.test.mjs` bans a total-flavoured name on a size in the two places a figure gets one: its declaration, and its rendered label. It is a **naming** guard and cannot see arithmetic — no regex can decide where a `u64` came from. Its catch rate is computed against a planted corpus and asserted, so weakening a matcher fails the test rather than quietly lowering the coverage. It stands at **18 of 22**, and the four it cannot see are named in the file with reasons (an unnamed sum handed straight to a renderer; a euphemism; a method rather than a field). It previously claimed 12 of 16 while its `sizeWords` did not contain `br`, `gz`, `min` or `kb` — **the abbreviations the product itself renders** — so `totalBr`, `overallGz` and `grandKb`, planted in the report renderer, all came back green, as did `<h2>`, `<caption>` and `<td>` labels, which its scan never read. A guard that looks stronger than it is buys false confidence, which is how the defect survived four surfaces.
+
+  **A shared module has a size, and its importing sites have a combined cost, and the table must show them as two numbers.** `DuplicateModuleGroup` must carry `moduleBytes` — the module's own rendered size, the largest single contribution across the builds that reached it, because two builds may tree-shake it differently and the module is not the smaller of them — and `combinedImportCostBytes`, that module counted once per importing site. The second is a Combined Import Cost and an upper bound; it must never be called a total. The group carried only the sum, in a field named `totalBytes` rendered under the header "Total Bytes", so `react-dom/index.js` — which **is 100 kB**, reached by `react-dom`, `react-dom/client` and `react-dom/server` — was reported as **300 kB**: the same defect as the headline, in the panel below it. The table states beside the numbers that every one of those imports pays for the module.
+
+  **And the note beside the table must be reconcilable with the two numbers in it.** It said *"Module Bytes is what the module costs at a single site"* and that Combined Import Cost *"counts it once per site"*, which invites the reader to multiply. That is not the arithmetic: `moduleBytes` is a **max** across the builds that reached the module, not a per-site constant, and `combinedImportCostBytes` adds each build's *own* contribution. The daemon's own test pins the divergence (900 B in one build, 400 B in another → `moduleBytes` 900, `combinedImportCostBytes` 1,300, count 2), and the table renders exactly that while the sentence told the reader 900 × 2 = 1,800. The numbers were right and the prose explaining them was false — which fails this requirement as squarely as a wrong number, because the reader leaves with a figure the product never rendered. The note must say that Module Bytes is the module *at its fullest* and that the two columns **need not multiply**.
+
 **FR-036a** (Medium) - Report rows and hover tooltips must surface file-level sharing information when the daemon returns it. `ImportResult.module_breakdown` contains the top 10 module contributors for an import. `ImportResult.shared_bytes` contains the number of raw module bytes shared with at least one other import in the same file **and the same runtime** — sharing is only ever real within a runtime, because Server and Client ship as two artifacts and each carries its own copy ([ADR-0005](adr/0005-a-runtime-is-an-artifact-boundary.md)). The report must expose both the top contributors and shared-byte value without changing the inline decoration format.
+
+  **Sharing is per RESULT, so the surfaces that name the sharers must key by result too.** The daemon computes `shared_bytes` for an import result, and one specifier can be two results: `import React, { useState } from "react"` is a default import and a named import, measured, cached and shared separately. A shared-module index keyed by specifier collapses them, finds no module with more than one sharer, and tells the user the shared bytes are "outside the public top-module breakdown" — which is false, because the sharer is the sibling import on the same line. The index must be keyed by the import's identity (specifier + import kind + named exports + runtime), and the sibling must be **named** by that identity, or a specifier-keyed name renders an empty list. The "outside the public top-module breakdown" message must be kept for the case where it is true: the wire carries only the top 10 modules, so bytes the daemon knows are shared can be shared through a module the extension never receives.
 
 **FR-036c** (Medium) - Report rows, hover tooltips, and copied diagnostics must expose `ImportResult.confidence` and `ImportResult.confidence_reasons`. Low- and medium-confidence rows must be countable in the report summary and must include the reasons in the row warning text.
 
@@ -642,9 +664,11 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
   **The file's imports are its `states`, never its `imports`.** This read is streamed like any other (it does not force-fresh), so `imports` carries only the imports the daemon has already MEASURED, while `states` carries every one it detected. On a **cold** document — the one the user just opened, and the likeliest one to run this command on — `imports` is therefore empty while the file's own totals, which come from the combined build and not from the per-import measurements, are perfectly real. Gating the report on `imports` told the user the file had "no resolvable package imports" for a file the daemon had sized correctly, and counting them reported "0 imports" for a file that had three. Only a document whose `states` are empty has nothing to report. The same trap is called out for the status bar in the FR-024a floor rules, and it is the same one, in the same shape, one command away.
 
-  `skipped` in the summary means *the daemon could not size this import* (`missing`/`unavailable`), never *it has not sized it yet*: an import still building is not skipped — it is why the total is flagged as an estimate.
+  `skipped` in the summary means *the daemon could not size this import* (`missing`/`unavailable`), never *it has not sized it yet*: an import still building is not skipped — it is why the number is a floor.
 
-**FR-036f** (Medium) - The extension must provide a command `Import Lens: Show Bundle Impact History` that reads recent current-file measurements from VS Code global storage and opens a script-free static SVG history panel with timestamp, file path, import count, and byte details.
+  **The summary is headed by the name of the quantity, and explains itself from the response — never from what the history store did with it.** It read `Current file: 183.2 kB br … · estimate (some imports are not fully measured)` on a `degraded` file where **every import was fully measured** and the file's own build was what failed. The suffix was keyed on the bundle-impact row being absent, and the store withholds that row for a floor and for an un-deduplicated sum alike, so `degraded` borrowed `incomplete`'s explanation. It must name the quantity (`File Cost`, `File Cost floor`, `Combined Import Cost`) and give the reason the daemon's flags actually support (FR-033).
+
+**FR-036f** (Medium) - The extension must provide a command `Import Lens: Show Bundle Impact History` that reads recent current-file measurements from VS Code global storage and opens a script-free static SVG history panel with timestamp, file path, import count, and byte details. Every row is one file's **File Cost** — one combined build over that file's imports, priced against an otherwise-empty application — and the panel must name it as one: nothing is summed across files, and no row is what the project ships. Its columns were headed "Brotli"/"Gzip"/"Minified", which name a compression format and not a quantity.
 
 **FR-036g** (Medium) - The extension must provide CodeActions for imports whose current result is CommonJS, side-effectful, or not truly tree-shakeable. These actions must allow users to inspect existing Import Lens details or copy diagnostics. They must not automatically rewrite user source.
 
@@ -657,6 +681,8 @@ This is one trade, not two independent losses. The same synthetic namespace that
   The **per-file** budget is judged against the **File Cost**: the daemon's ONE combined build over all the document's imports, in which a module two of them reach is counted **once** ([ADR-0004](adr/0004-import-lens-measures-imports-not-bundles.md)). It must never be re-derived by summing the per-import costs — that sum is a *Combined Import Cost*, an upper bound that counts a shared graph once per import, and a quantity no file ever ships. Summing it warned a file with five `@mui/material` subpath imports (40 kB each, 55 kB built together) as 3x over a 60 kB budget, while the status bar, one line away, showed the same file inside budget: **two totals for one file, and the wrong one raised the diagnostic.**
 
   The File Cost comes from `FileSizeDocument`, so the extension must **hold** it — the analysis store keeps it per document beside that document's import states, because the controller that fetches it is not the surface that judges it. It is dropped when a new analysis opens (it measured the file as it was before the keystroke) and re-read when the document's imports finish streaming (the read the analysis made ran while the document was cold).
+
+  **One analysis generation issues ONE `FileSizeDocument` at a time, and at most one re-read.** The daemon supersedes an older size request for the same document and answers it `error`, and an errored size read withdraws the File Cost — so a second request for one generation blanks the status bar for a round trip on exactly the cold document the re-read exists to serve. A settle that lands *before* the analysis has issued its own read needs no read of its own (that read is about to see the settled document); a settle that lands *while* one is in flight waits for it rather than superseding it. The status bar shows a File Cost and must not name it a bundle size (FR-033).
 
   A File Cost that is `incomplete` or `degraded`, or absent, yields **no verdict at all** — no violation and **no pass** (FR-032a). The predicate is the one the daemon's aggregate cache and the persisted history apply (FR-026c), not a second reading of the flags.
 
@@ -688,7 +714,7 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
 **FR-036l** (Medium) - When `importLens.enableRegistryHints` is enabled, the daemon performs all npm registry fetches for registry-based hints via the protocol v7 `RefreshRegistryHintsRequest`. The setting must default to `true`; the extension host must never call the npm registry directly and registry work must never block size computation or package.json analysis. The extension host only requests refreshes and renders the returned results. The controller must render cached registry hints immediately on `package.json` open, including stale successful hints when no fresh value is available, then request a `refresh_stale` mode refresh for missing or stale metadata automatically in the background. Automatic and manual refreshes must use the daemon's shared refresh path: bounded concurrency, shared interval rate limiting, package-level in-flight de-duplication, short per-request timeouts, hard retry limits, `Retry-After` handling for npm `429` responses, and cached retry windows after transient failures. Positive, negative, and transient-error states are cached in the daemon's centralized package metadata cache under the extension-managed daemon cache base. Registry failures must fail silently without affecting size computation. Package dependency hovers must expose a trusted refresh action that sends a `force_refresh` mode request for that one package only while still using the daemon's shared concurrency/rate-limit path. Dependency summary hovers must expose a trusted refresh action that sends a `force_refresh` mode request for all dependencies represented by that summary, again using the daemon's shared concurrency/rate-limit path.
 
-**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost end-of-line decorations for dependency blocks using local package resolution and daemon-owned size requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from a decoration refresh handler. The package.json controller must request daemon streaming so dependency rows appear as soon as entries are parsed and package resolution completes, then update individual rows incrementally as package size results and registry hints arrive. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. A daemon timeout or failure after partial responses must preserve completed states and mark only remaining `checking...` rows unavailable. Each dependency block should also expose a compact measured/total summary when analysis state is available. Dependency hovers must show the individual registry fetched time when available. Summary hovers must show the oldest registry fetched time across represented dependencies, or state that some registry info has not been fetched yet. Inline decorations must use independent primary and suffix colors: primary text (size, `types only`, `checking...`, or `unavailable`) uses `descriptionForeground` except `unavailable`, which uses `list.errorForeground`; registry suffixes (`latest`, `update`, `install`) use `gitDecoration.addedResourceForeground` and `gitDecoration.modifiedResourceForeground` respectively, rendered in italic, and may appear even when sizing is unavailable. Section summaries use muted foreground only.
+**FR-036m** (Medium) - When a `package.json` file is open, the extension must provide compact dependency-cost end-of-line decorations for dependency blocks using local package resolution and daemon-owned size requests. Rendering must read from cached package.json analysis state rather than starting daemon, registry, or resolver work from a decoration refresh handler. The package.json controller must request daemon streaming so dependency rows appear as soon as entries are parsed and package resolution completes, then update individual rows incrementally as package size results and registry hints arrive. Each dependency entry may show its measured compressed size, `not installed`, `checking...`, `unavailable`, or a deprecation suffix. A daemon timeout or failure after partial responses must preserve completed states and mark only remaining `checking...` rows unavailable. Each dependency block should also expose a compact measured/combined summary when analysis state is available — and the summed figure must be **named**: it adds up dependencies each measured **alone**, so `react-dom` is priced with the whole of `react` inside it and then counted again beside `react`, which makes the figure a *Combined Import Cost*, an upper bound, and never what the package costs ([ADR-0004](adr/0004-import-lens-measures-imports-not-bundles.md)). It renders as `3/3 measured · 141.2 kB br combined`, and the summary hover states what "combined" means. A bare byte count next to "3/3 measured" reads as a size. Dependency hovers must show the individual registry fetched time when available. Summary hovers must show the oldest registry fetched time across represented dependencies, or state that some registry info has not been fetched yet. Inline decorations must use independent primary and suffix colors: primary text (size, `types only`, `checking...`, or `unavailable`) uses `descriptionForeground` except `unavailable`, which uses `list.errorForeground`; registry suffixes (`latest`, `update`, `install`) use `gitDecoration.addedResourceForeground` and `gitDecoration.modifiedResourceForeground` respectively, rendered in italic, and may appear even when sizing is unavailable. Section summaries use muted foreground only.
 
 **FR-036n** (Medium) - The extension must provide `Import Lens: Compare Imports`, allowing users to compare two package specifiers side by side using the same local daemon sizing path as normal import analysis.
 
@@ -1320,19 +1346,64 @@ interface WorkspaceReportRequest {
   };
 }
 
+// One row is one IMPORT (ADR-0004), not one file. A size is `null` when the engine could not
+// measure that import: an exported report printing "0 B" for a package it failed to build is the
+// sentinel this model exists to abolish (FR-026d).
 interface WorkspaceReportRow {
-  file: string;
-  imports: ImportResult[];
-  totalBrotliBytes: number;
-  budgetWarnings?: string[];
+  packageName: string;
+  specifier: string;
+  sourceFile: string;
+  line: number;
+  runtime: string;
+  minifiedBytes: number | null;
+  gzipBytes: number | null;
+  brotliBytes: number | null;
+  zstdBytes: number | null;
+  sharedBytes: number;
+  confidence: string;
+  confidenceReasons: string;
+  topModules: string;
+  warning: string;
+  moduleContributions: ModuleContribution[];
+}
+
+interface DuplicateImportGroup {
+  specifier: string;
+  count: number;
+  // Every site's Import Cost, summed: three files importing `react` is three Reacts (FR-036).
+  combinedImportCostBrotliBytes: number;
+  sourceFiles: string[];
+}
+
+interface DuplicateModuleGroup {
+  modulePath: string;
+  basename: string;
+  // The imports that reach this module.
+  count: number;
+  // What the module IS: its own rendered size, the largest contribution across the builds that
+  // reached it. `react-dom/index.js` is 100 kB whether one import reaches it or three (FR-036).
+  moduleBytes: number;
+  // What its SITES pay: the module counted once per importing site. A Combined Import Cost, an
+  // upper bound — this was `totalBytes`, and 3 x 100 kB was rendered as the module's "Total Bytes".
+  combinedImportCostBytes: number;
+  specifiers: string[];
+  vendored: boolean;
 }
 
 interface WorkspaceReportSummary {
-  totalFiles: number;
-  totalImports: number;
-  totalBrotliBytes: number;
-  filesOverBudget: number;
-  importsOverBudget: number;
+  importCount: number;
+  // The sum of independent Import Costs — an upper bound that counts a dependency at every import
+  // site and counts `import React, { useState } from "react"` twice. Never a total (FR-036).
+  combinedImportCostBrotliBytes: number;
+  lowConfidenceCount: number;
+  mediumConfidenceCount: number;
+  conservativeCount: number;
+  // Per-import violations only: the report has no File Cost to judge a file budget against
+  // (FR-036i).
+  budgetViolationCount: number;
+  duplicateImports: DuplicateImportGroup[];
+  sharedModules: DuplicateModuleGroup[];
+  treemap: WorkspaceReportTreemapItem[];
 }
 
 interface WorkspaceReportResponse {
@@ -1743,9 +1814,11 @@ import-lens/
 │   │   ├── configRefresh.ts           # visible-editor refresh on settings changes
 │   │   ├── analysis/
 │   │   │   ├── fileSize.ts            # current-file size summary formatting
+│   │   │   ├── fileSizeReads.ts       # one file_size_document per generation, and one re-read
 │   │   │   ├── freshness.ts           # request freshness tracking
 │   │   │   ├── gitDiff.ts             # working-tree changed-line extraction
 │   │   │   ├── history.ts             # bundle and per-import history globalState helpers
+│   │   │   ├── importIdentity.ts      # what makes one import ONE import: key and user-facing label
 │   │   │   ├── insights.ts            # extension-side analysis insight builder
 │   │   │   ├── status.ts              # loading/unavailable state helpers
 │   │   │   └── state.ts               # Per-document import analysis state
@@ -1785,7 +1858,7 @@ import-lens/
 │   │   │   ├── displayGuards.ts       # display-mode enablement helpers
 │   │   │   ├── format.ts              # size and display label formatting
 │   │   │   ├── packageJsonDecorations.ts # package.json dependency end-of-line decorations
-│   │   │   ├── packageJsonLabels.ts   # package.json dependency label formatting
+│   │   │   ├── packageJsonLabels.ts   # package.json dependency labels; the section's combined cost
 │   │   │   ├── namedExportCandidatePolicy.ts # pure policy for named export CodeAction eligibility
 │   │   │   ├── namedExportCandidates.ts # named export candidate QuickPick command
 │   │   │   ├── statusbar.ts           # Status bar item
@@ -1793,7 +1866,8 @@ import-lens/
 │   │   │   ├── treeShakeActionReason.ts # pure tree-shaking action reason helper
 │   │   │   ├── treeShakeActions.ts    # CodeActions for tree-shaking diagnostics and candidates
 │   │   │   ├── diagnostics.ts         # Clipboard formatting for ImportResult diagnostics
-│   │   │   └── report.ts              # Show Report webview
+│   │   │   ├── report.ts              # Show Report webview
+│   │   │   └── reportContent.ts       # vscode-free report HTML: the Combined Import Cost labels
 │   │   ├── logger.ts                  # OutputChannel-based diagnostic logger (FR-040)
 │   │   └── config.ts                  # VS Code settings access
 │   └── dist/

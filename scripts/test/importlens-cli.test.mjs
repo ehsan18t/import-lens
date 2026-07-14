@@ -132,7 +132,38 @@ test("runImportLensCheck refuses a verdict when an import could not be measured"
   );
   assert.notEqual(EXIT_COULD_NOT_MEASURE, EXIT_BUDGET_EXCEEDED);
   assert.deepEqual(output, [
-    "src/app.ts: could not measure 1 import (stage: timeout); file total is a floor - budget not evaluated",
+    "src/app.ts: an import that belongs in this file's total was not measured, so the number is a floor and not the file's size (1 unmeasured import; stage: timeout) - budget not evaluated",
+    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+  ]);
+});
+
+/**
+ * The file's OWN total is sound: its combined build succeeded, so nothing is missing from it — a
+ * combined build owes nothing to the per-import builds beside it (ADR-0006, invariant 4). What
+ * failed is one import's separate build, so it is that IMPORT's budget that was not evaluated.
+ *
+ * The line used to say "file total is a floor", which is a claim about a number that is not a floor.
+ * The verdict (exit 3) is unchanged and correct: a gate that could not measure something it was
+ * asked to judge must never report success.
+ */
+test("a transient import failure does not make a sound file total a floor", async () => {
+  const output = [];
+  const exitCode = await runImportLensCheck({
+    cwd: "/workspace",
+    budgets: { perImportBrotliBytes: 2000, perFileBrotliBytes: 3000 },
+    changedFiles: async () => ["src/app.ts"],
+    analyzeFile: async () =>
+      analyzed({
+        // The combined build landed. One import's own build timed out.
+        incomplete: false,
+        unmeasured: [{ specifier: "lodash-es", stage: "timeout", transient: true }],
+      }),
+    writeLine: (line) => output.push(line),
+  });
+
+  assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
+  assert.deepEqual(output, [
+    "src/app.ts: could not measure 1 import (stage: timeout) - budgets not evaluated",
     "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
   ]);
 });
@@ -171,7 +202,7 @@ test("runImportLensCheck refuses a verdict for a deterministically unmeasurable 
   );
   assert.deepEqual(output, [
     "src/measured.ts: large-lib Brotli budget exceeded: 1.5 kB > 1.0 kB",
-    "src/app.ts: an import that belongs in this file's total was not measured; file total is a floor - budget not evaluated",
+    "src/app.ts: an import that belongs in this file's total was not measured, so the number is a floor and not the file's size - budget not evaluated",
     "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
   ]);
 });
@@ -216,7 +247,43 @@ test("runImportLensCheck refuses a verdict when the file's own combined build fa
     "2500 > 1000 looks like a regression, and it is not one - it is a sum of the wrong quantity",
   );
   assert.deepEqual(output, [
-    "src/app.ts: the file's combined build failed, so its total is an un-deduplicated sum of its imports and not the file's size - budget not evaluated",
+    "src/app.ts: the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size - budget not evaluated",
+    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+  ]);
+});
+
+// The canonical wire shape of the eighth instance: the combined build did not merely fail, it TIMED
+// OUT — the biggest build in the system hitting the daemon's deadline. The daemon then sets `degraded`
+// AND pushes the `timeout` stage into the aggregate's own diagnostics, while every import stays
+// Measured (`incomplete: false`). This is the shape the previous test skipped, with an empty
+// `diagnostics`. The transient stage on the aggregate must NOT add "and an import that belongs in it
+// was not measured either" to the line — that clause claims a missing contributor a timed-out combined
+// build does not have. The timeout is the combined build's OWN failure, which `degraded` already says.
+test("runImportLensCheck names a timed-out combined build a Combined Import Cost, without a false missing-import clause", async () => {
+  const output = [];
+  const exitCode = await runImportLensCheck({
+    cwd: "/workspace",
+    budgets: { perFileBrotliBytes: 1000 },
+    changedFiles: async () => ["src/app.ts"],
+    analyzeFile: async () =>
+      analyzed({
+        // The combined build timed out. `degraded`, and its `timeout` stage on the aggregate's own
+        // diagnostics — but every import is Measured, so nothing is actually missing from the sum.
+        degraded: true,
+        brotliBytes: 2500,
+        diagnostics: [{ stage: "timeout", message: "build cancelled", details: [] }],
+        unmeasured: [],
+        imports: [
+          { specifier: "alpha", brotliBytes: 1500 },
+          { specifier: "beta", brotliBytes: 1000 },
+        ],
+      }),
+    writeLine: (line) => output.push(line),
+  });
+
+  assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
+  assert.deepEqual(output, [
+    "src/app.ts: the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size - budget not evaluated",
     "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
   ]);
 });

@@ -153,6 +153,19 @@ export const packageJsonDependencyHintLabel = (
   return [parts.primary, parts.suffix].filter((part): part is string => Boolean(part)).join(" · ");
 };
 
+/**
+ * What the reader must be told about the figure beside "N/M measured", because it is not what the
+ * package costs and nothing on the line said so.
+ *
+ * Each dependency is measured **alone**, against an otherwise-empty app, and the section adds those
+ * numbers up. But `react-dom` pulls `react`'s whole graph and `@mui/material` pulls emotion's, and
+ * in any real build those graphs are shared — so the figure counts them at every site. It is a
+ * **Combined Import Cost** (ADR-0004): an upper bound that ranks a section's dependencies and
+ * apportions blame among them, and never a size.
+ */
+export const packageJsonCombinedImportCostNote =
+  "Combined Import Cost: each dependency measured on its own, as if nothing else were installed, then added up. Dependencies that share a graph are counted at every site, so this is an upper bound — not what this package costs.";
+
 export const packageJsonSectionSummaryLabel = (
   section: PackageJsonDependencySectionName,
   states: readonly PackageJsonDependencyHintState[],
@@ -164,8 +177,8 @@ export const packageJsonSectionSummaryLabel = (
     return null;
   }
 
-  // "N/M measured" means exactly that now: a dependency with no size is not one of the N, and its
-  // bytes are not in the total. `!state.result?.error` counted a fabricated size as a measurement.
+  // "N/M measured" means exactly that: a dependency with no size is not one of the N, and its bytes
+  // are not in the figure. `!state.result?.error` counted a fabricated size as a measurement.
   const measuredSections = sectionStates
     .map((state): [PackageJsonDependencyHintState, MeasuredSizes | null] => [
       state,
@@ -173,7 +186,10 @@ export const packageJsonSectionSummaryLabel = (
     ])
     .filter((pair): pair is [PackageJsonDependencyHintState, MeasuredSizes] => pair[1] !== null);
   const measuredStates = measuredSections.map(([state]) => state);
-  const totalBytes = measuredSections.reduce(
+  // A sum of standalone Import Costs — a **Combined Import Cost**, and the label says so. Rendered
+  // bare, "141.2 kB br" beside "3/3 measured" reads as *what this package costs*, which is a number
+  // this product does not compute and this one is not (ADR-0004).
+  const combinedImportCostBytes = measuredSections.reduce(
     (sum, [, sizes]) => sum + bytesForCompression(sizes, config.compression),
     0,
   );
@@ -196,7 +212,7 @@ export const packageJsonSectionSummaryLabel = (
 
   const parts = [
     `${measuredStates.length}/${sectionStates.length} measured`,
-    `${formatBytes(totalBytes)} ${labelForCompression(config.compression)}`,
+    `${formatBytes(combinedImportCostBytes)} ${labelForCompression(config.compression)} combined`,
   ];
 
   if (missingCount > 0) {

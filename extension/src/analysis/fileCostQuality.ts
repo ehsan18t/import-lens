@@ -1,0 +1,97 @@
+import type { FileSizeDocumentResponse } from "../ipc/protocol.js";
+import { hasTransientStage } from "./transience.js";
+
+/**
+ * **WHICH QUANTITY the daemon just handed over, and how sound it is.** The one model every surface
+ * derives its words from.
+ *
+ * The daemon knows exactly what it is sending. The extension used to throw that away at the boundary
+ * — `listener.ts` collapsed `incomplete` and `degraded` into a `~` character baked inside a `label`
+ * string, and `StatusBarState` had no field for either — so **no surface downstream could tell the
+ * truth even if it wanted to.** The status bar guessed, and guessed wrong, and the same defect was
+ * then found one surface at a time: the editor budget, the report headline, the Shared Modules
+ * table, the package.json summary, and the status bar.
+ *
+ * Two independent axes, because the daemon's two flags are independent (ADR-0006, invariant 4):
+ *
+ * - **`quantity`** — a `degraded` response is not a smaller or larger File Cost, it is a *different
+ *   number*: the combined build failed, so what is on offer is the SUM of the per-import costs, and
+ *   a module two imports reach is counted twice. ADR-0004 calls that a Combined Import Cost, an
+ *   upper bound, and says it must never be presented as a size.
+ * - **`short`** — an import that belongs in the number contributed nothing to it (still building,
+ *   unmeasurable, not installed, or a transient failure that reached the aggregate WITHOUT degrading
+ *   it — the defensive path), so the number is missing bytes. A transient failure that *degrades* the
+ *   aggregate is not short: it is the `combined-import-cost` quantity above, the combined build's own
+ *   failure, and the `degraded` axis already reports it. Reading it as short too would claim a missing
+ *   contributor that a timed-out combined build does not have.
+ *
+ * Both at once is a real state and neither word alone describes it: a fallback sum that is *also*
+ * short double-counts some imports and omits others, so it is a bound in neither direction.
+ */
+export type FileCostQuantity = "file-cost" | "combined-import-cost";
+
+export interface FileCostQuality {
+  /** The quantity the number IS — not what the surface wishes it were. */
+  quantity: FileCostQuantity;
+  /** An import that belongs in the number contributed nothing to it. */
+  short: boolean;
+}
+
+/** The three fields on the wire that decide what the number is. Nothing here asks about `error`: a
+ * response that failed outright has no number at all, and that is the one question `error` answers. */
+export type FileCostFlags = Pick<
+  FileSizeDocumentResponse,
+  "diagnostics" | "incomplete" | "degraded"
+>;
+
+export const fileCostQuality = (response: FileCostFlags): FileCostQuality => ({
+  quantity: response.degraded === true ? "combined-import-cost" : "file-cost",
+  short:
+    response.incomplete === true ||
+    (response.degraded !== true && hasTransientStage(response.diagnostics)),
+});
+
+/**
+ * Whether the number is the file's size: one bundle over its imports, nothing missing.
+ *
+ * This is the same rule `isDurableFileSize` applies to decide whether the number may be stored or
+ * judged, read for a different purpose — and the two are pinned together by a property test over the
+ * whole flag space (`fileCostQuality.test.ts`), because a surface that NAMES a number the budget
+ * refuses to JUDGE is exactly the contradiction this model exists to end.
+ */
+export const isFileCost = (quality: FileCostQuality): boolean =>
+  quality.quantity === "file-cost" && !quality.short;
+
+/** What to call the number. A floor is not a File Cost, and a per-import sum is not one either. */
+export const fileCostQuantityName = (quality: FileCostQuality): string => {
+  if (quality.quantity === "combined-import-cost") {
+    return "Combined Import Cost";
+  }
+
+  return quality.short ? "File Cost floor" : "File Cost";
+};
+
+/**
+ * **The sentences, written ONCE.**
+ *
+ * `cli/importlens.mjs` mirrors these verbatim — it ships standalone and can import no TypeScript,
+ * the same forced duplication as `transientStages` — and a drift check holds the two in lockstep
+ * (`scripts/test/file-size-usability-coordination.test.mjs`). Two surfaces showing one number and
+ * contradicting each other in words is how this got shipped: the CLI said the total was "an
+ * un-deduplicated sum of its imports and not the file's size" while the status bar, on the same run,
+ * called it a File Cost "built as one bundle".
+ */
+export const fileCostBecause = (quality: FileCostQuality): string => {
+  const missingImport =
+    "an import that belongs in this file's total was not measured, so the number is a floor and not the file's size";
+  const combinedBuildFailed =
+    "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size";
+
+  if (quality.quantity === "combined-import-cost") {
+    return quality.short
+      ? `${combinedBuildFailed}, and an import that belongs in it was not measured either`
+      : combinedBuildFailed;
+  }
+
+  return quality.short ? missingImport : "this file's imports built as one bundle";
+};

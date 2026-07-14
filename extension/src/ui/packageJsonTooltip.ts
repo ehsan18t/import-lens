@@ -5,6 +5,7 @@ import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import { measuredSizes } from "./format.js";
 import {
   isFreshLatestRelease,
+  packageJsonCombinedImportCostNote,
   packageJsonDependencyVersionStatusLabel,
 } from "./packageJsonLabels.js";
 import {
@@ -199,7 +200,10 @@ export const packageJsonSectionSummaryTooltipMarkdown = (
   config: PackageJsonRegistryTooltipConfig,
   options: PackageJsonSectionSummaryTooltipOptions = {},
 ): string => {
-  const parts = ["**Import Lens dependency summary**", label];
+  // The inline label has room for one word — "combined" — and this is where that word is explained.
+  // A reader who does not know that `react-dom` was priced with `react`'s whole graph inside it, and
+  // then counted again next to `react`, reads the figure as what the package costs (ADR-0004).
+  const parts = ["**Import Lens dependency summary**", label, packageJsonCombinedImportCostNote];
 
   if (config.enableRegistryHints) {
     parts.push(sectionFetchedAtMarkdown(states, options));

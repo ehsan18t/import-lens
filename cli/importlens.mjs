@@ -140,7 +140,11 @@ export const runImportLensCheck = async ({
       unmeasurable.push({
         relative,
         transient,
+        // The raw flags, carried through so the LINE derives its words from the same model the GUI
+        // does. Collapsing them into a verdict here is how the two drifted apart in the first place.
+        incomplete: result.incomplete === true,
         degraded: result.degraded === true,
+        diagnostics: result.diagnostics ?? [],
         error: result.error ?? null,
       });
       continue;
@@ -198,7 +202,7 @@ export const runImportLensCheck = async ({
   return 0;
 };
 
-const unmeasurableLine = ({ relative, transient, degraded, error }) => {
+const unmeasurableLine = ({ relative, transient, incomplete, degraded, diagnostics, error }) => {
   const stages = [...new Set(transient.map((item) => item.stage))].sort().join(", ");
   const count = transient.length;
 
@@ -210,17 +214,23 @@ const unmeasurableLine = ({ relative, transient, degraded, error }) => {
     return `${relative}: could not measure this file (${error}) - budget not evaluated`;
   }
 
-  if (count > 0) {
-    return `${relative}: could not measure ${count} ${count === 1 ? "import" : "imports"} (stage: ${stages}); file total is a floor - budget not evaluated`;
+  const quality = fileCostQuality({ incomplete, degraded, diagnostics });
+
+  // The file's OWN total is sound — its combined build succeeded and nothing is missing from it —
+  // and a SEPARATE per-import build failed transiently, so it is that import's budget that cannot be
+  // judged. This used to say "file total is a floor", which is a claim about the wrong number: a
+  // combined build that succeeded owes nothing to the per-import builds beside it (ADR-0006,
+  // invariant 4, first bullet).
+  if (isFileCost(quality)) {
+    return `${relative}: could not measure ${count} ${count === 1 ? "import" : "imports"} (stage: ${stages}) - budgets not evaluated`;
   }
 
-  if (degraded) {
-    // Not a floor: the opposite. The imports were measured; the file's own combined build was not,
-    // so the number is a sum of per-import costs with shared modules counted once per import.
-    return `${relative}: the file's combined build failed, so its total is an un-deduplicated sum of its imports and not the file's size - budget not evaluated`;
-  }
+  const detail =
+    count > 0
+      ? ` (${count} unmeasured ${count === 1 ? "import" : "imports"}; stage: ${stages})`
+      : "";
 
-  return `${relative}: an import that belongs in this file's total was not measured; file total is a floor - budget not evaluated`;
+  return `${relative}: ${fileCostBecause(quality)}${detail} - budget not evaluated`;
 };
 
 const main = async () => {
@@ -372,6 +382,49 @@ export const isUsableFileSize = (response) =>
   response.incomplete !== true &&
   response.degraded !== true &&
   !(response.diagnostics ?? []).some((item) => transientStages.has(item.stage));
+
+/**
+ * WHICH QUANTITY the daemon handed over, and how sound it is — the CLI's mirror of
+ * `extension/src/analysis/fileCostQuality.ts`.
+ *
+ * Duplicated for the same forced reason as `isUsableFileSize` and `transientStages`: this CLI ships
+ * standalone and can import no TypeScript. **The sentences below are the sentences the status bar
+ * and "Show Current File Size" render**, and a drift check pins them
+ * (`scripts/test/file-size-usability-coordination.test.mjs`) — because two surfaces showing ONE
+ * number and contradicting each other in words is the defect. This file already said the total was
+ * "an un-deduplicated sum of its imports and not the file's size" while the status bar, on the same
+ * response, called it a File Cost "built as one bundle": the one mechanism that provably did not run.
+ */
+export const fileCostQuality = (response) => ({
+  quantity: response.degraded === true ? "combined-import-cost" : "file-cost",
+  // A `degraded` aggregate is a Combined Import Cost, not also short: the transient stage the daemon
+  // pushes on a combined-build TIMEOUT is that build's OWN failure, which `degraded` already reports,
+  // not a missing contributor. Reading it as short here made `importlens check` print "... and an
+  // import that belongs in it was not measured either" on a file where every import WAS measured. A
+  // transient stage WITHOUT a degrade (the defensive path) is still short. The extension's copy in
+  // `extension/src/analysis/fileCostQuality.ts` carries the identical guard.
+  short:
+    response.incomplete === true ||
+    (response.degraded !== true &&
+      (response.diagnostics ?? []).some((item) => transientStages.has(item.stage))),
+});
+
+export const isFileCost = (quality) => quality.quantity === "file-cost" && !quality.short;
+
+export const fileCostBecause = (quality) => {
+  const missingImport =
+    "an import that belongs in this file's total was not measured, so the number is a floor and not the file's size";
+  const combinedBuildFailed =
+    "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size";
+
+  if (quality.quantity === "combined-import-cost") {
+    return quality.short
+      ? `${combinedBuildFailed}, and an import that belongs in it was not measured either`
+      : combinedBuildFailed;
+  }
+
+  return quality.short ? missingImport : "this file's imports built as one bundle";
+};
 
 // Mirrors `stage::is_transient` in daemon/src/engine/mod.rs (and `transientEngineStages` in
 // extension/src/analysis/transience.ts). The three of them are kept in step by the drift check in

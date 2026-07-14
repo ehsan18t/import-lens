@@ -7,8 +7,13 @@ import {
   recordImportCostHistory,
 } from "../../src/analysis/history.js";
 import { applyImportAnalysisInsights, insightLabelSuffix } from "../../src/analysis/insights.js";
+import { mergeRefreshedResults } from "../../src/analysis/refreshMerge.js";
 import type { ImportAnalysisState } from "../../src/analysis/state.js";
-import type { DetectedImport, ImportResult } from "../../src/ipc/protocol.js";
+import type {
+  DetectedImport,
+  ImportResult,
+  RefreshedImportIdentity,
+} from "../../src/ipc/protocol.js";
 import { detectedImport, sourceRange } from "../helpers/detectedImport.js";
 
 class MemoryStore {
@@ -135,6 +140,118 @@ test("applyImportAnalysisInsights explains shared dependency modules", () => {
 
   assert.match(states[0]?.insights?.[0]?.tooltip ?? "", /my-ui-lib/u);
   assert.match(states[0]?.insights?.[0]?.tooltip ?? "", /debounce\.js/u);
+});
+
+// `import React, { useState } from "react"` is ONE specifier and TWO imports — a default and a
+// named — and the daemon measures, and shares, by RESULT. Keyed by specifier, the two collapsed into
+// one entry, no module had more than one "sharer", and the user was told the bytes the daemon had
+// just reported as shared were "outside the public top-module breakdown". That is false: they are
+// the sibling import of the same package, sitting on the same line.
+const reactModule = { path: "/workspace/node_modules/react/index.js", bytes: 6_000 };
+
+const reactDefaultDetected: Partial<DetectedImport> = {
+  specifier: "react",
+  packageName: "react",
+  importKind: "default",
+  named: [],
+};
+
+const reactNamedDetected: Partial<DetectedImport> = {
+  specifier: "react",
+  packageName: "react",
+  importKind: "named",
+  named: ["useState"],
+};
+
+const reactResult = (): ImportResult =>
+  result({ specifier: "react", shared_bytes: 6_000, module_breakdown: [reactModule] });
+
+test("applyImportAnalysisInsights names the sibling import that shares the same specifier", () => {
+  const states = applyImportAnalysisInsights(
+    [
+      { detected: detected(reactDefaultDetected), status: "ready", result: reactResult() },
+      { detected: detected(reactNamedDetected), status: "ready", result: reactResult() },
+    ],
+    { importCostHistory: [] },
+  );
+
+  const defaultTooltip = states[0]?.insights?.[0]?.tooltip ?? "";
+  const namedTooltip = states[1]?.insights?.[0]?.tooltip ?? "";
+
+  assert.match(defaultTooltip, /index\.js/u);
+  assert.match(
+    defaultTooltip,
+    /react \{ useState \}/u,
+    "the sharer is the OTHER result of the same specifier, and it must be named by its identity",
+  );
+  assert.doesNotMatch(
+    defaultTooltip,
+    /outside the public top-module breakdown/u,
+    "the shared module is right there in the breakdown — claiming otherwise is the lie",
+  );
+  assert.match(namedTooltip, /react \(default\)/u);
+});
+
+test("the shared-dependency tooltip works on a COLD document, where results arrive by push", () => {
+  const loading = (overrides: Partial<DetectedImport>): ImportAnalysisState => ({
+    detected: detected(overrides),
+    status: "loading",
+  });
+  const identity = (importKind: "default" | "named", named: string[]): RefreshedImportIdentity => ({
+    specifier: "react",
+    import_kind: importKind,
+    named,
+    runtime: "component",
+  });
+
+  // Nothing is measured yet: on a cold document every import lands as a push.
+  const cold = [loading(reactDefaultDetected), loading(reactNamedDetected)];
+
+  const merged = mergeRefreshedResults(cold, [reactResult(), reactResult()], {
+    identities: [identity("default", []), identity("named", ["useState"])],
+  });
+  const states = applyImportAnalysisInsights(merged.next, { importCostHistory: [] });
+
+  assert.equal(merged.changed, true);
+  assert.match(
+    states[0]?.insights?.[0]?.tooltip ?? "",
+    /react \{ useState \}/u,
+    "the pushed results carry shared_bytes and a breakdown; the insight must work off them too",
+  );
+});
+
+// The message is TRUE whenever the shared module falls outside the top-10 breakdown the wire
+// carries: the daemon knows the bytes are shared, and the extension genuinely cannot name what
+// shares them. Only the specifier-collision case was a lie, and fixing that must not delete a
+// message that is right the other half of the time.
+test("applyImportAnalysisInsights still reports sharing outside the public top-module breakdown", () => {
+  const states = applyImportAnalysisInsights(
+    [
+      readyState(
+        { specifier: "alpha", packageName: "alpha" },
+        {
+          specifier: "alpha",
+          shared_bytes: 300,
+          module_breakdown: [{ path: "/workspace/node_modules/alpha/big.js", bytes: 9_000 }],
+        },
+      ),
+      readyState(
+        { specifier: "beta", packageName: "beta" },
+        {
+          specifier: "beta",
+          shared_bytes: 300,
+          module_breakdown: [{ path: "/workspace/node_modules/beta/big.js", bytes: 9_000 }],
+        },
+      ),
+    ],
+    { importCostHistory: [] },
+  );
+
+  assert.match(
+    states[0]?.insights?.[0]?.tooltip ?? "",
+    /outside the public top-module breakdown/u,
+    "the 300 shared bytes are real and nothing in the top-10 breakdown accounts for them",
+  );
 });
 
 // An Astro document: two frontmatter imports (server) both pull `shared.js`, and a client <script>

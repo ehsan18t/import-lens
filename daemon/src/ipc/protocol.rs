@@ -820,31 +820,73 @@ pub struct WorkspaceReportTreemapItem {
     pub confidence: String,
 }
 
+/// Every import of one specifier across the workspace, and what they cost **together** — three files
+/// importing `react` is three Reacts (see [`WorkspaceReportSummary::combined_import_cost_brotli_bytes`]).
+/// The field was `total_brotli_bytes`, and a "total" of fifty Reacts is a number no project ships.
+/// Under the honest label the panel is finally saying the thing it exists to say.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateImportGroup {
     pub specifier: String,
     pub count: u64,
-    pub total_brotli_bytes: u64,
+    pub combined_import_cost_brotli_bytes: u64,
     pub source_files: Vec<String>,
 }
 
+/// One module, and the imports that reach it.
+///
+/// **A module has a size, and its importing sites have a combined cost, and they are two different
+/// numbers.** This group carried one field, `total_bytes` — the module's bytes added up once per
+/// importing row — and the report rendered it under the header "Total Bytes". So
+/// `react-dom/index.js`, which **is 100 kB** and is reached by three imports (`react-dom`,
+/// `react-dom/client`, `react-dom/server`), was reported as **300 kB**. That is a *Combined Import
+/// Cost* wearing the one word [ADR-0004] exists to abolish, one table below the headline that was
+/// relabelled for exactly this reason.
+///
+/// - [`Self::module_bytes`] — what the module **is**: the largest single rendered contribution seen
+///   across the builds that reached it. (Two builds may tree-shake it differently, so it need not be
+///   one number; the largest is the module at its fullest, and it is a byte count that really came
+///   out of a build rather than an average of two that did not.)
+/// - [`Self::combined_import_cost_bytes`] — what the **sites** pay: that module counted once per
+///   importing site. An **upper bound**, because each import is priced as though the application
+///   were otherwise empty, and never a size.
+///
+/// [ADR-0004]: ../../../docs/adr/0004-import-lens-measures-imports-not-bundles.md
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateModuleGroup {
     pub module_path: String,
     pub basename: String,
+    /// The number of imports that reach this module.
     pub count: u64,
-    pub total_bytes: u64,
+    /// The module's own rendered size.
+    pub module_bytes: u64,
+    /// The module counted once per importing site: a Combined Import Cost, an upper bound.
+    pub combined_import_cost_bytes: u64,
     pub specifiers: Vec<String>,
     pub vendored: bool,
 }
 
+/// The report's headline figure is a **Combined Import Cost**: the sum of independent Import Costs,
+/// each priced as though the application were otherwise empty ([ADR-0004]).
+///
+/// It counts a dependency at **every site it is imported from** — `react` in fifty files is fifty
+/// Reacts, and a single `import React, { useState } from "react"` is **two imports** and is counted
+/// **twice**. That is not an error to be corrected: subtracting the overlap would assert a
+/// project-level bundle quantity this product deliberately does not model, and compressed sizes are
+/// not additive anyway, so the sum is an **upper bound**. It **ranks** imports and **apportions
+/// blame**; it is never a size.
+///
+/// It was called `total_brotli_bytes` and rendered as "Total Brotli", which every reader takes to
+/// mean *what my project ships*. The arithmetic was right; the word was the defect. The treemap's
+/// percentages are shares of this figure, not of a bundle.
+///
+/// [ADR-0004]: ../../../docs/adr/0004-import-lens-measures-imports-not-bundles.md
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceReportSummary {
     pub import_count: u64,
-    pub total_brotli_bytes: u64,
+    pub combined_import_cost_brotli_bytes: u64,
     pub low_confidence_count: u64,
     pub medium_confidence_count: u64,
     pub conservative_count: u64,

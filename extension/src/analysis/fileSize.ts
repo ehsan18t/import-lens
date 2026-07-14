@@ -5,6 +5,12 @@ import {
   formatBytes,
   labelForCompression,
 } from "../ui/format.js";
+import {
+  fileCostBecause,
+  fileCostQuality,
+  fileCostQuantityName,
+  isFileCost,
+} from "./fileCostQuality.js";
 import { type BundleImpactHistoryItem, bundleImpactHistoryDeltaLabel } from "./history.js";
 
 /**
@@ -31,6 +37,13 @@ const skippedCountFor = (response: Pick<FileSizeDocumentResponse, "states">): nu
 const isUnsizable = (status: ImportAnalysisItem["status"]): boolean =>
   status === "missing" || status === "unavailable";
 
+/**
+ * The summary line, headed by **the name of the quantity it is showing**.
+ *
+ * It said `Current file: 183.2 kB br`, which names no quantity at all — on a file whose real File
+ * Cost was 118.0 kB and whose combined build had failed, leaving an un-deduplicated sum of its five
+ * imports. "Current file" is where the number was measured, not what it is.
+ */
 export const formatCurrentFileSizeSummary = (
   response: FileSizeDocumentResponse,
   compression: CompressionFormat,
@@ -39,7 +52,7 @@ export const formatCurrentFileSizeSummary = (
   const importLabel = importCount === 1 ? "import" : "imports";
 
   return [
-    `Current file: ${formatBytes(bytesForCompression(response, compression))} ${labelForCompression(compression)}`,
+    `${fileCostQuantityName(fileCostQuality(response))}: ${formatBytes(bytesForCompression(response, compression))} ${labelForCompression(compression)}`,
     `${formatBytes(response.minified_bytes)} min`,
     `${importCount} ${importLabel}`,
   ].join(" · ");
@@ -111,10 +124,16 @@ export const currentFileSizeReport = (
     history.previous && history.current
       ? ` · ${bundleImpactHistoryDeltaLabel(history.current, history.previous)}`
       : "";
-  const estimateSuffix = history.current ? "" : " · estimate (some imports are not fully measured)";
+  // WHY the number is what it is, read off the response — not inferred from whether the history
+  // store kept it. The suffix used to be keyed on `history.current` being absent, and the store
+  // withholds that for a floor and for an un-deduplicated sum alike, so a `degraded` response
+  // borrowed `incomplete`'s explanation: "estimate (some imports are not fully measured)" on a file
+  // where every single import IS fully measured, and the file's own build is what failed.
+  const quality = fileCostQuality(response);
+  const becauseSuffix = isFileCost(quality) ? "" : ` · ${fileCostBecause(quality)}`;
 
   return {
     kind: "summary",
-    message: `${formatCurrentFileSizeSummary(response, compression)}${skippedSuffix}${diffSuffix}${estimateSuffix}`,
+    message: `${formatCurrentFileSizeSummary(response, compression)}${skippedSuffix}${diffSuffix}${becauseSuffix}`,
   };
 };

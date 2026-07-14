@@ -4,6 +4,17 @@ import {
 } from "../analysis/history.js";
 import { formatBytes } from "./format.js";
 
+/**
+ * Every row here is one file's **File Cost** — the daemon's single combined build over that file's
+ * imports, in which a module two of them reach is counted once (ADR-0004). Nothing is summed across
+ * files, and no row is what the project ships.
+ *
+ * The column said "Brotli", which names a compression format and not a quantity, under a panel that
+ * says "Bundle Impact". A number with no name is how a File Cost gets read as a bundle size.
+ */
+export const fileCostHistoryNote =
+  "Each row is one file's File Cost: one bundle over that file's imports, priced as though nothing else were in the app. It is not what your project ships, and nothing here is added up across files.";
+
 export const bundleImpactHistoryHtml = (history: readonly BundleImpactHistoryItem[]): string => {
   const newestFirst = [...history].sort((left, right) => right.timestamp - left.timestamp);
   const oldestFirst = [...newestFirst].reverse();
@@ -33,6 +44,11 @@ h1 {
   margin: 0 0 16px;
   font-size: 20px;
   font-weight: 600;
+}
+.note {
+  margin: 0 0 16px;
+  max-width: 80ch;
+  color: var(--vscode-descriptionForeground);
 }
 .summary {
   display: flex;
@@ -89,6 +105,7 @@ th {
 </head>
 <body>
 <h1>Bundle Impact History</h1>
+<p class="note">${escapeHtml(fileCostHistoryNote)}</p>
 ${historySummaryHtml(newestFirst)}
 ${historyChartSvg(oldestFirst, maxBrotli)}
 <table>
@@ -97,9 +114,9 @@ ${historyChartSvg(oldestFirst, maxBrotli)}
 <th>Measured</th>
 <th>File</th>
 <th>Imports</th>
-<th>Brotli</th>
-<th>Gzip</th>
-<th>Minified</th>
+<th>File Cost (br)</th>
+<th>File Cost (gz)</th>
+<th>File Cost (min)</th>
 </tr>
 </thead>
 <tbody>${rows}</tbody>
@@ -118,8 +135,8 @@ const historySummaryHtml = (history: readonly BundleImpactHistoryItem[]): string
   const delta =
     latest && previous ? bundleImpactHistoryDeltaLabel(latest, previous) : "No previous match";
 
-  return `<section class="summary" aria-label="Bundle impact summary">
-<div class="metric">Latest Brotli<strong>${latest ? formatBytes(latest.brotliBytes) : "0 B"}</strong></div>
+  return `<section class="summary" aria-label="File Cost history summary">
+<div class="metric">Latest File Cost<strong>${latest ? formatBytes(latest.brotliBytes) : "0 B"}</strong></div>
 <div class="metric">Latest Imports<strong>${latest?.importCount ?? 0}</strong></div>
 <div class="metric">Latest Delta<strong>${escapeHtml(delta)}</strong></div>
 </section>`;
@@ -161,7 +178,7 @@ const historyChartSvg = (
     )
     .join("");
 
-  return `<svg role="img" aria-label="Brotli size trend" viewBox="0 0 ${width} ${height}">
+  return `<svg role="img" aria-label="File Cost trend" viewBox="0 0 ${width} ${height}">
 <line x1="${padding}" y1="${height - padding}" x2="${width - padding}" y2="${height - padding}" stroke="var(--vscode-panel-border)" />
 <line x1="${padding}" y1="${padding}" x2="${padding}" y2="${height - padding}" stroke="var(--vscode-panel-border)" />
 <text x="${padding}" y="18" fill="var(--vscode-descriptionForeground)" font-size="12">${escapeHtml(formatBytes(maxBrotli))} br</text>

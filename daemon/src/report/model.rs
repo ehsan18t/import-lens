@@ -66,12 +66,16 @@ pub fn build_report_rows(
 
 pub fn build_report_summary(row_set: &WorkspaceReportRowSet) -> WorkspaceReportSummary {
     let rows = &row_set.rows;
+    // The sum of independent Import Costs — a **Combined Import Cost**, which counts a dependency at
+    // every site it is imported from and is therefore an upper bound, never a size (ADR-0004).
+    //
     // Only a MEASURED row contributes. An unmeasured one has no bytes to add, and
-    // `.unwrap_or_default()` here would silently fold a fabricated zero into the workspace total.
-    let total_brotli_bytes = rows.iter().filter_map(|row| row.brotli_bytes).sum::<u64>();
+    // `.unwrap_or_default()` here would silently fold a fabricated zero into the figure.
+    let combined_import_cost_brotli_bytes =
+        rows.iter().filter_map(|row| row.brotli_bytes).sum::<u64>();
     WorkspaceReportSummary {
         import_count: rows.len() as u64,
-        total_brotli_bytes,
+        combined_import_cost_brotli_bytes,
         low_confidence_count: rows.iter().filter(|row| row.confidence == "low").count() as u64,
         medium_confidence_count: rows.iter().filter(|row| row.confidence == "medium").count()
             as u64,
@@ -79,7 +83,7 @@ pub fn build_report_summary(row_set: &WorkspaceReportRowSet) -> WorkspaceReportS
         budget_violation_count: row_set.budget_violation_count,
         duplicate_imports: build_duplicate_import_groups(rows),
         shared_modules: build_duplicate_module_groups(rows),
-        treemap: build_treemap(rows, total_brotli_bytes),
+        treemap: build_treemap(rows, combined_import_cost_brotli_bytes),
     }
 }
 
@@ -235,12 +239,12 @@ fn build_duplicate_import_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateIm
             .or_insert_with(|| DuplicateImportGroup {
                 specifier: row.specifier.clone(),
                 count: 0,
-                total_brotli_bytes: 0,
+                combined_import_cost_brotli_bytes: 0,
                 source_files: Vec::new(),
             });
         group.count += 1;
         if let Some(brotli_bytes) = row.brotli_bytes {
-            group.total_brotli_bytes += brotli_bytes;
+            group.combined_import_cost_brotli_bytes += brotli_bytes;
         }
         group.source_files.push(row.source_file.clone());
     }
@@ -261,12 +265,25 @@ fn build_duplicate_import_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateIm
         right
             .count
             .cmp(&left.count)
-            .then_with(|| right.total_brotli_bytes.cmp(&left.total_brotli_bytes))
+            .then_with(|| {
+                right
+                    .combined_import_cost_brotli_bytes
+                    .cmp(&left.combined_import_cost_brotli_bytes)
+            })
             .then_with(|| left.specifier.cmp(&right.specifier))
     });
     groups
 }
 
+/// A module reached by more than one import, and the **two** numbers that describes.
+///
+/// This used to add `module.bytes` once per importing row into a field called `total_bytes`, and the
+/// report rendered it "Total Bytes". A 100 kB `react-dom/index.js` reached by three imports came out
+/// as **300 kB** — a *Combined Import Cost* presented as the module's size (ADR-0004). The module's
+/// own size and the cost across its sites are different quantities and are now carried separately:
+/// the module **is** [`DuplicateModuleGroup::module_bytes`], and the sites together pay
+/// [`DuplicateModuleGroup::combined_import_cost_bytes`], which is an upper bound and is never a
+/// total.
 fn build_duplicate_module_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateModuleGroup> {
     let mut groups = BTreeMap::<String, DuplicateModuleGroup>::new();
     for row in rows {
@@ -277,12 +294,17 @@ fn build_duplicate_module_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateMo
                     module_path: module.path.clone(),
                     basename: basename(&module.path),
                     count: 0,
-                    total_bytes: 0,
+                    module_bytes: 0,
+                    combined_import_cost_bytes: 0,
                     specifiers: Vec::new(),
                     vendored: is_vendored_module_path(&module.path),
                 });
             group.count += 1;
-            group.total_bytes += module.bytes;
+            // The module at its fullest. Each import's build renders it independently, and one that
+            // tree-shakes it harder does not make the module smaller than the other build measured
+            // it — so this is a max, never a sum and never an average of two builds that happened.
+            group.module_bytes = group.module_bytes.max(module.bytes);
+            group.combined_import_cost_bytes += module.bytes;
             group.specifiers.push(row.specifier.clone());
         }
     }
@@ -303,15 +325,22 @@ fn build_duplicate_module_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateMo
         right
             .count
             .cmp(&left.count)
-            .then_with(|| right.total_bytes.cmp(&left.total_bytes))
+            .then_with(|| {
+                right
+                    .combined_import_cost_bytes
+                    .cmp(&left.combined_import_cost_bytes)
+            })
             .then_with(|| left.module_path.cmp(&right.module_path))
     });
     groups
 }
 
+/// Each slice is a share of the **Combined Import Cost**, not of a bundle: the denominator counts a
+/// dependency once per import site, so a slice says "this import is 12% of what your imports cost
+/// added up", never "12% of what you ship".
 fn build_treemap(
     rows: &[WorkspaceReportRow],
-    total_brotli_bytes: u64,
+    combined_import_cost_brotli_bytes: u64,
 ) -> Vec<WorkspaceReportTreemapItem> {
     rows.iter()
         // A treemap slices a whole into parts. An import with no size has no part to slice, so it
@@ -327,8 +356,8 @@ fn build_treemap(
             specifier: row.specifier.clone(),
             source_file: row.source_file.clone(),
             brotli_bytes,
-            percentage: ((brotli_bytes * 100) + (total_brotli_bytes / 2))
-                .checked_div(total_brotli_bytes)
+            percentage: ((brotli_bytes * 100) + (combined_import_cost_brotli_bytes / 2))
+                .checked_div(combined_import_cost_brotli_bytes)
                 .unwrap_or(0),
             confidence: row.confidence.clone(),
         })
@@ -507,8 +536,8 @@ mod tests {
         assert_eq!(broken.gzip_bytes, None);
         assert_eq!(broken.zstd_bytes, None);
         assert_eq!(
-            summary.total_brotli_bytes, 40,
-            "the workspace total is the sum of what was measured, and nothing else"
+            summary.combined_import_cost_brotli_bytes, 40,
+            "the combined import cost is the sum of what was measured, and nothing else"
         );
         assert!(
             summary
@@ -569,6 +598,37 @@ mod tests {
         assert!(row_set.rows[0].warning.is_empty());
     }
 
+    /// ADR-0004. The headline is a **Combined Import Cost**: the sum of independent Import Costs,
+    /// which counts a dependency at EVERY site it is imported from. `react` in three files is three
+    /// Reacts — and `import React, { useState } from "react"` is TWO imports of react, so it is
+    /// counted twice. Nothing is deduplicated out of it, because deduplicating it would assert a
+    /// project-level bundle quantity this product does not model. It ranks and it apportions blame;
+    /// it is never a size, and the label — not the arithmetic — is what had to change.
+    #[test]
+    fn the_headline_is_a_combined_import_cost_that_counts_every_site() {
+        let items = vec![
+            report_item("react", 0, "src/a.tsx", Some(ok_result("react", 40))),
+            report_item("react", 0, "src/b.tsx", Some(ok_result("react", 40))),
+            report_item("react", 1, "src/b.tsx", Some(ok_result("react", 40))),
+        ];
+
+        let row_set = build_report_rows(&items, &no_budgets());
+        let summary = build_report_summary(&row_set);
+
+        assert_eq!(summary.combined_import_cost_brotli_bytes, 120);
+        assert_eq!(
+            summary.duplicate_imports[0].combined_import_cost_brotli_bytes, 120,
+            "three sites, three Reacts — that IS the duplicate panel's point"
+        );
+        assert!(
+            summary
+                .treemap
+                .iter()
+                .all(|treemap_item| treemap_item.percentage == 33),
+            "each slice is a share of the combined import cost"
+        );
+    }
+
     #[test]
     fn duplicate_import_groups_require_multiple_rows_and_dedupe_sources() {
         let items = vec![
@@ -585,7 +645,7 @@ mod tests {
         let group = &summary.duplicate_imports[0];
         assert_eq!(group.specifier, "dup");
         assert_eq!(group.count, 3);
-        assert_eq!(group.total_brotli_bytes, 12);
+        assert_eq!(group.combined_import_cost_brotli_bytes, 12);
         assert_eq!(group.source_files, vec!["src/a.ts", "src/b.ts"]);
     }
 
@@ -621,9 +681,78 @@ mod tests {
         assert_eq!(group.module_path, shared_path);
         assert_eq!(group.basename, "index.js");
         assert_eq!(group.count, 2);
-        assert_eq!(group.total_bytes, 6);
+        assert_eq!(group.module_bytes, 3, "the module is 3 B in both builds");
+        assert_eq!(group.combined_import_cost_bytes, 6, "and two sites pay it");
         assert_eq!(group.specifiers, vec!["a", "b"]);
         assert!(group.vendored, "nested node_modules paths are vendored");
+    }
+
+    /// ADR-0004, one table below the headline `52a7d5c` relabelled.
+    ///
+    /// `react-dom/index.js` is **100 kB**, and three imports reach it — `react-dom`,
+    /// `react-dom/client`, `react-dom/server`. This group added `module.bytes` once per importing
+    /// row into a field called `total_bytes`, and the report rendered it **"Total Bytes: 300 kB"**.
+    /// The module is not 300 kB and never was: that is a **Combined Import Cost** — the module
+    /// counted at every site that reaches it, an upper bound — wearing the one word ADR-0004 exists
+    /// to abolish. The size of the module and the sum across its sites are two different quantities,
+    /// so the group carries **both**, each named for what it is.
+    #[test]
+    fn a_shared_module_is_its_own_size_and_the_sum_across_its_sites_is_never_a_total() {
+        let module_path = "C:/ws/node_modules/react-dom/index.js";
+        let reached_by = |specifier: &str, line: u32| {
+            let mut result = ok_result(specifier, 40);
+            result.module_breakdown = Some(vec![ModuleContribution {
+                path: module_path.to_owned(),
+                bytes: 100_000,
+            }]);
+            report_item(specifier, line, "src/app.tsx", Some(result))
+        };
+        let items = vec![
+            reached_by("react-dom", 0),
+            reached_by("react-dom/client", 1),
+            reached_by("react-dom/server", 2),
+        ];
+
+        let row_set = build_report_rows(&items, &no_budgets());
+        let summary = build_report_summary(&row_set);
+
+        let group = &summary.shared_modules[0];
+        assert_eq!(group.count, 3, "reached by three imports");
+        assert_eq!(
+            group.module_bytes, 100_000,
+            "the module is 100 kB — that is what it is, however many imports reach it"
+        );
+        assert_eq!(
+            group.combined_import_cost_bytes, 300_000,
+            "and the sum across the three sites is a Combined Import Cost, an upper bound"
+        );
+    }
+
+    /// The two builds tree-shook the module differently, so it has no single size. The larger
+    /// contribution is the module at its fullest, and it is the one a reader must not have averaged
+    /// or summed away.
+    #[test]
+    fn a_module_measured_differently_by_two_builds_reports_its_largest_contribution() {
+        let module_path = "C:/ws/node_modules/lib/index.js";
+        let reached_with = |specifier: &str, line: u32, bytes: u64| {
+            let mut result = ok_result(specifier, 10);
+            result.module_breakdown = Some(vec![ModuleContribution {
+                path: module_path.to_owned(),
+                bytes,
+            }]);
+            report_item(specifier, line, "src/a.ts", Some(result))
+        };
+        let items = vec![
+            reached_with("lib", 0, 900),
+            reached_with("lib/small", 1, 400),
+        ];
+
+        let row_set = build_report_rows(&items, &no_budgets());
+        let summary = build_report_summary(&row_set);
+
+        let group = &summary.shared_modules[0];
+        assert_eq!(group.module_bytes, 900);
+        assert_eq!(group.combined_import_cost_bytes, 1_300);
     }
 
     #[test]

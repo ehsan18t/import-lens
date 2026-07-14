@@ -234,7 +234,42 @@ test("packageJsonSectionSummaryLabel totals measured dependencies and problem co
 
   assert.equal(
     packageJsonSectionSummaryLabel("dependencies", states, config()),
-    "2/3 measured · 2.0 kB br · 1 not installed",
+    "2/3 measured · 2.0 kB br combined · 1 not installed",
+  );
+});
+
+// A bare byte count beside "3/3 measured" reads as *what this package costs*. It is not.
+//
+// react (6.2 kB br), react-dom (45 kB br) and @mui/material (90 kB br) each measured ALONE, on an
+// otherwise-empty app, and added up: 141.2 kB. But react-dom pulls react's whole graph and
+// @mui/material pulls emotion's, and in any real build those graphs are shared — so the figure
+// counts them at every site. It is a **Combined Import Cost**: an upper bound that ranks and
+// apportions blame, and never a size (ADR-0004). The word "combined" is what says so.
+test("the package.json section summary names its sum a combined cost, not a size", () => {
+  const states: PackageJsonDependencyHintState[] = [
+    {
+      name: "react",
+      section: "dependencies",
+      status: "ready",
+      result: result({ brotli_bytes: 6_200 }),
+    },
+    {
+      name: "react-dom",
+      section: "dependencies",
+      status: "ready",
+      result: result({ brotli_bytes: 45_000 }),
+    },
+    {
+      name: "@mui/material",
+      section: "dependencies",
+      status: "ready",
+      result: result({ brotli_bytes: 90_000 }),
+    },
+  ];
+
+  assert.equal(
+    packageJsonSectionSummaryLabel("dependencies", states, config()),
+    "3/3 measured · 141.2 kB br combined",
   );
 });
 

@@ -106,6 +106,45 @@ either, and it must never report a pass",
   );
 });
 
+// DRIFT. One number, one set of WORDS for it.
+//
+// The daemon hands over a number and says what it is. Two processes then have to explain it to a
+// human: the extension (status bar, "Show Current File Size") and `importlens check`. They said
+// different things about the SAME number on the SAME run — the CLI printed "the file's combined
+// build failed, so [it] is an un-deduplicated sum of its imports and not the file's size", and the
+// status bar, on that response, said "File Cost - this file's imports built as one bundle": a
+// confident, specific claim about the one mechanism that provably did not run.
+//
+// The sentences are written once, in `fileCostQuality.ts`, and mirrored in the CLI because the CLI
+// ships standalone and can import no TypeScript - the same forced duplication as `isUsableFileSize`
+// above. Reword one and forget the other, and this is red.
+const qualityModel = read("extension/src/analysis/fileCostQuality.ts");
+
+/** Every sentence the extension explains a non-durable total with. Derived, never typed out here. */
+const sharedSentences = [
+  ...bodyBetween(qualityModel, "export const fileCostBecause = (", "\n};").matchAll(
+    /"([^"]{40,})"/gu,
+  ),
+].map((match) => match[1]);
+
+test("the GUI and the CLI explain a total in the same words", () => {
+  const cli = read("cli/importlens.mjs");
+
+  assert.ok(
+    sharedSentences.length >= 3,
+    `only ${sharedSentences.length} sentences found in fileCostBecause; the extraction is broken, \
+and a drift check that reads nothing agrees with everything`,
+  );
+
+  for (const sentence of sharedSentences) {
+    assert.ok(
+      cli.includes(sentence),
+      `cli/importlens.mjs does not say what the extension says about the same number:\n  ${sentence}\n\
+Two surfaces showing ONE figure and contradicting each other in words is the defect (ADR-0004).`,
+    );
+  }
+});
+
 // GUARD. One file budget, one number. The file budget is judged against a FILE COST - one bundle
 // over all the file's imports, so a module two of them reach is counted once (ADR-0004) - and the
 // only two surfaces that hold one are the editor (`file_size_document`) and `importlens check`.

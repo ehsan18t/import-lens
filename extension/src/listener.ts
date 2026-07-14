@@ -1,7 +1,15 @@
 import * as vscode from "vscode";
 import { importAnalysisStateFromDaemon } from "./analysis/daemonState.js";
 import { DebouncedDocumentScheduler } from "./analysis/debouncedDocumentScheduler.js";
+import { fileCostQuality } from "./analysis/fileCostQuality.js";
 import { documentFileCost } from "./analysis/fileSize.js";
+import {
+  documentSettled,
+  type FileSizeReadState,
+  initialFileSizeReadState,
+  sizeReadFinished,
+  sizeReadStarted,
+} from "./analysis/fileSizeReads.js";
 import { AnalysisFreshnessTracker } from "./analysis/freshness.js";
 import { changedLinesForFile } from "./analysis/gitDiff.js";
 import {
@@ -24,7 +32,7 @@ import {
 import { nextIpcRequestId } from "./ipc/requestIds.js";
 import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
-import { bytesForCompression, formatBytes, labelForCompression } from "./ui/format.js";
+import { bytesForCompression } from "./ui/format.js";
 import type { StatusBarController, StatusBarState } from "./ui/statusbar.js";
 import { analysisRootForFile } from "./workspaceContext.js";
 
@@ -33,8 +41,8 @@ interface FileSizeContext {
   document: vscode.TextDocument;
   workspaceRoot: string;
   generation: number;
-  /** One re-read per analysis: the re-read itself can trigger another SWR push, and a push that re-reads on every push is a loop. */
-  refetched: boolean;
+  /** How many `file_size_document` reads this generation has issued, and may still issue. @see fileSizeReads */
+  reads: FileSizeReadState;
 }
 
 export class DocumentAnalysisController implements vscode.Disposable {
@@ -172,14 +180,14 @@ export class DocumentAnalysisController implements vscode.Disposable {
    * 5). Without this, that "not evaluated" is the verdict the file keeps until the user's next
    * keystroke, on a document whose imports are now all measured and whose File Cost is now real.
    *
-   * Once per analysis, and only when nothing is loading: the re-read is itself a `file_size_document`
-   * request, which can serve stale and push a refresh of its own, and a re-read armed by every push
-   * is a loop.
+   * **Whether this settle owes a read at all is {@link documentSettled}'s question** — one
+   * generation gets ONE `file_size_document` in flight, because a second supersedes the first in the
+   * daemon and blanks the status bar for a round trip on exactly the cold document this serves.
    */
   private refetchFileSizeWhenSettled(uri: vscode.Uri, generation?: number): void {
     const context = this.#analysisContexts.get(uri.toString());
 
-    if (!context || context.refetched || generation !== context.generation) {
+    if (!context || generation !== context.generation) {
       return;
     }
 
@@ -189,8 +197,12 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
 
-    context.refetched = true;
-    void this.updateFileSize(context.document, context.workspaceRoot, context.generation);
+    const step = documentSettled(context.reads);
+    context.reads = step.state;
+
+    if (step.read) {
+      void this.updateFileSize(context.document, context.workspaceRoot, context.generation);
+    }
   }
 
   async analyze(document: vscode.TextDocument): Promise<void> {
@@ -221,7 +233,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       document,
       workspaceRoot,
       generation: requestId,
-      refetched: false,
+      reads: initialFileSizeReadState,
     });
 
     try {
@@ -336,6 +348,14 @@ export class DocumentAnalysisController implements vscode.Disposable {
   ): Promise<void> {
     const documentKey = document.uri.toString();
     const config = getImportLensConfig();
+    // The generation's read state, if this read still belongs to it. A newer analysis replaces the
+    // context wholesale, and a read for a superseded generation has nothing left to sequence.
+    const opening = this.#analysisContexts.get(documentKey);
+
+    if (opening?.generation === analysisRequestId) {
+      opening.reads = sizeReadStarted(opening.reads);
+    }
+
     let response: FileSizeDocumentResponse | null = null;
     try {
       response = await this.#daemon.requestFileSizeDocument({
@@ -354,6 +374,24 @@ export class DocumentAnalysisController implements vscode.Disposable {
       this.#logger.warn(
         `File-size status request failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    }
+
+    // The flight is over, so a settle that arrived mid-flight can have its re-read now — the one it
+    // was made to WAIT for rather than supersede. Issued before this response is applied below, and
+    // its own round trip guarantees this response lands first.
+    //
+    // Read back from the map rather than reusing the context captured above: a newer analysis may
+    // have opened while this read was in the air, and that generation owns its own reads. Its size
+    // request is already on the way, and this one is about to be dropped as superseded.
+    const settled = this.#analysisContexts.get(documentKey);
+
+    if (settled?.generation === analysisRequestId) {
+      const step = sizeReadFinished(settled.reads);
+      settled.reads = step.state;
+
+      if (step.read) {
+        void this.updateFileSize(settled.document, settled.workspaceRoot, settled.generation);
+      }
     }
 
     // A newer analysis for this document supersedes this size result.
@@ -395,11 +433,19 @@ export class DocumentAnalysisController implements vscode.Disposable {
     }
     // A floor (`incomplete`) or an un-deduplicated per-import sum (`degraded`) is worth SHOWING —
     // FR-024a, a floor beats a blank — but it is not the file's size, and the status bar is the one
-    // surface that shows the number with no diagnostics beside it to say so. `~` is the codebase's
-    // existing mark for "this figure is approximate" (FR-031).
-    const approximate = response.incomplete === true || response.degraded === true;
-    const label = `${approximate ? "~" : ""}${formatBytes(bytesForCompression(response, config.compression))} ${labelForCompression(config.compression)}`;
-    this.setStatusForActive(document, { kind: "size", label });
+    // surface that shows the number with no diagnostics beside it to say so.
+    //
+    // **So the quality travels WITH the number.** This is where it used to be destroyed: both flags
+    // were collapsed into a `~` baked inside a `label` string, and the status bar's tooltip — which
+    // has no other input — then had to guess what it was showing. It guessed "File Cost, built as
+    // one bundle", on a response whose combined build had failed. Nothing downstream could have told
+    // the truth, because the truth was thrown away here.
+    this.setStatusForActive(document, {
+      kind: "size",
+      bytes: bytesForCompression(response, config.compression),
+      compression: config.compression,
+      quality: fileCostQuality(response),
+    });
   }
 
   private setStatusForActive(document: vscode.TextDocument, state: StatusBarState): void {

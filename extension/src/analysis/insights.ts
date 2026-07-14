@@ -8,6 +8,7 @@ import {
   importCostHistoryItem,
   previousImportCostFor,
 } from "./history.js";
+import { importIdentityKey, importIdentityLabel, importIdentityOf } from "./importIdentity.js";
 import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
 
 export interface ImportAnalysisInsightOptions {
@@ -97,9 +98,20 @@ const gitDeltaInsight = (
   return null;
 };
 
+/**
+ * "These bytes are shared, and here is who with."
+ *
+ * The daemon computes `shared_bytes` **per result**, and this named the sharers **per specifier** —
+ * so `import React, { useState } from "react"`, which is one specifier and TWO results, found no
+ * module with more than one "sharer" and told the user the shared bytes were *"outside the public
+ * top-module breakdown"*. They were not: the sharer was the sibling import on the same line, and the
+ * module was right there in the breakdown. Keyed by identity, both halves of that statement are
+ * found, and the sibling is NAMED by its identity too — naming it by specifier would render
+ * "…also appears in ;" with an empty list, because both results say "react".
+ */
 const sharedDependencyInsight = (
   state: ImportAnalysisState,
-  sharedModules: Map<string, Set<string>>,
+  sharedModules: SharedModuleIndex,
 ): ImportAnalysisInsight | null => {
   const result = state.result;
   const sharedBytes = result?.shared_bytes ?? 0;
@@ -110,31 +122,36 @@ const sharedDependencyInsight = (
 
   // Sharers are looked up within THIS import's runtime. An import in another runtime pulling the
   // same module is not a sharer: it ships its own copy, so it saves this import nothing (ADR-0005).
-  const sharersOf = (modulePath: string): ReadonlySet<string> =>
-    sharedModules.get(sharedModuleKey(state.detected.runtime, modulePath)) ?? new Set<string>();
+  const sharersOf = (modulePath: string): ReadonlyMap<string, string> =>
+    sharedModules.get(sharedModuleKey(state.detected.runtime, modulePath)) ??
+    new Map<string, string>();
 
   const shared = (result.module_breakdown ?? [])
     .filter((module) => sharersOf(module.path).size > 1)
     .slice(0, 3);
 
+  // Still true, and still said: the wire carries only the top 10 modules, so bytes the daemon knows
+  // are shared can be shared by a module this side never sees. That case was never the lie — the
+  // specifier collision was — and a message that is right half the time is not deleted.
   if (shared.length === 0) {
     return {
       tooltip: `Shared dependency: ${formatBytes(sharedBytes)} is shared with other imports in this file outside the public top-module breakdown.`,
     };
   }
 
-  const otherSpecifiers = new Set<string>();
+  const self = importIdentityKey(importIdentityOf(state.detected));
+  const otherImports = new Set<string>();
 
   for (const module of shared) {
-    for (const specifier of sharersOf(module.path)) {
-      if (specifier !== state.detected.specifier) {
-        otherSpecifiers.add(specifier);
+    for (const [identity, label] of sharersOf(module.path)) {
+      if (identity !== self) {
+        otherImports.add(label);
       }
     }
   }
 
   const modules = shared.map((module) => path.basename(module.path)).join(", ");
-  const others = [...otherSpecifiers].sort().join(", ");
+  const others = [...otherImports].sort().join(", ");
 
   return {
     tooltip: `Shared dependency: ${modules} also appears in ${others}; shared bytes in this file: ${formatBytes(sharedBytes)}.`,
@@ -193,30 +210,36 @@ const historyTrendInsight = (
 };
 
 /**
- * Which imports pull each module in — indexed **within a runtime**, because a runtime is an
- * artifact boundary (ADR-0005) and that is the only place a module is genuinely shared.
+ * Which imports pull each module in: module (within a runtime) -> the IMPORTS that reach it, keyed
+ * by {@link importIdentityKey} and valued by the label the user is shown.
  *
- * A module reached from Astro frontmatter (server) and from a client `<script>` was counted as
- * shared, and `sharedDependencyInsight` sold that to the user as a deduplication saving. The build
- * model explicitly does not perform it: the Server artifact and the Client artifact each ship their
- * own copy. The claim was false on exactly the file shape the runtime split exists to handle.
+ * **Indexed by import, not by specifier**, because the daemon shares by RESULT and one specifier can
+ * be two imports (see {@link sharedDependencyInsight}). And **within a runtime**, because a runtime
+ * is an artifact boundary (ADR-0005) and that is the only place a module is genuinely shared: a
+ * module reached from Astro frontmatter (server) and from a client `<script>` was counted as shared,
+ * and `sharedDependencyInsight` sold that to the user as a deduplication saving the build model
+ * explicitly does not perform — false on exactly the file shape the runtime split exists to handle.
  */
+type SharedModuleIndex = ReadonlyMap<string, Map<string, string>>;
+
 const sharedModuleKey = (runtime: ImportRuntime, modulePath: string): string =>
   `${runtime}\u0000${modulePath}`;
 
-const sharedModuleIndex = (states: readonly ImportAnalysisState[]): Map<string, Set<string>> => {
-  const modules = new Map<string, Set<string>>();
+const sharedModuleIndex = (states: readonly ImportAnalysisState[]): SharedModuleIndex => {
+  const modules = new Map<string, Map<string, string>>();
 
   for (const state of states) {
     if (state.status !== "ready" || !measuredSizes(state.result)) {
       continue;
     }
 
+    const identity = importIdentityOf(state.detected);
+
     for (const module of state.result?.module_breakdown ?? []) {
       const key = sharedModuleKey(state.detected.runtime, module.path);
-      const specifiers = modules.get(key) ?? new Set<string>();
-      specifiers.add(state.detected.specifier);
-      modules.set(key, specifiers);
+      const importers = modules.get(key) ?? new Map<string, string>();
+      importers.set(importIdentityKey(identity), importIdentityLabel(identity));
+      modules.set(key, importers);
     }
   }
 

@@ -63,14 +63,14 @@ const coldResponse = (): FileSizeDocumentResponse =>
     incomplete: true,
   });
 
-test("formatCurrentFileSizeSummary formats current file totals with selected compression", () => {
+test("formatCurrentFileSizeSummary names the quantity it is showing", () => {
   assert.equal(
     formatCurrentFileSizeSummary(response(), "brotli"),
-    "Current file: 1.5 kB br · 5.3 kB min · 2 imports",
+    "File Cost: 1.5 kB br · 5.3 kB min · 2 imports",
   );
   assert.equal(
     formatCurrentFileSizeSummary(response({ states: [state("pkg-0", "ready")] }), "gzip"),
-    "Current file: 1.8 kB gz · 5.3 kB min · 1 import",
+    "File Cost: 1.8 kB gz · 5.3 kB min · 1 import",
   );
 });
 
@@ -87,7 +87,7 @@ test("a file with no runtime package imports has nothing to report", () => {
  * land, and `states` is what says whether the file HAS imports. `listener.ts` documents exactly this
  * trap for the status bar; the command was left on `imports`.
  */
-test("a cold document reports the size the daemon measured, flagged as an estimate", () => {
+test("a cold document reports the size the daemon measured, named as the floor it is", () => {
   const cold = coldResponse();
   const report = currentFileSizeReport(cold, "brotli", {
     // A floor: never recorded, so never compared either.
@@ -97,8 +97,34 @@ test("a cold document reports the size the daemon measured, flagged as an estima
   assert.deepEqual(report, {
     kind: "summary",
     message:
-      "Current file: 1.5 kB br · 5.3 kB min · 2 imports · estimate (some imports are not fully measured)",
+      "File Cost floor: 1.5 kB br · 5.3 kB min · 2 imports · an import that belongs in this file's total was not measured, so the number is a floor and not the file's size",
   });
+});
+
+/**
+ * **The fifth instance, one command over.** The file's own combined build failed, so the totals are
+ * an un-deduplicated sum of the per-import costs. EVERY import is Measured — `incomplete: false`,
+ * `error: null`, a size on every one of them — and the command said *"estimate (some imports are not
+ * fully measured)"*, which is false about every import in the file.
+ *
+ * The suffix was keyed on `history.current` being absent, and the store withholds that for a floor
+ * and an over-count alike, so `degraded` borrowed `incomplete`'s explanation. It now derives its
+ * words from the quantity the daemon actually handed over, like every other surface.
+ */
+test("a degraded total is named a Combined Import Cost, not an estimate with unmeasured imports", () => {
+  const degraded = response({ degraded: true, brotli_bytes: 183_200, minified_bytes: 354_000 });
+  const report = currentFileSizeReport(degraded, "brotli");
+
+  assert.deepEqual(report, {
+    kind: "summary",
+    message:
+      "Combined Import Cost: 183.2 kB br · 354.0 kB min · 2 imports · the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size",
+  });
+  assert.doesNotMatch(
+    report.kind === "summary" ? report.message : "",
+    /not fully measured/u,
+    "every import in this response IS fully measured; the file's own build is what failed",
+  );
 });
 
 /**
@@ -113,7 +139,7 @@ test("only the imports the daemon could not size count as skipped", () => {
 
   assert.deepEqual(currentFileSizeReport(warm, "brotli", { current }), {
     kind: "summary",
-    message: "Current file: 1.5 kB br · 5.3 kB min · 3 imports · 1 skipped",
+    message: "File Cost: 1.5 kB br · 5.3 kB min · 3 imports · 1 skipped",
   });
 });
 
@@ -127,6 +153,6 @@ test("a measured total is compared against the file's previous measurement", () 
 
   assert.deepEqual(currentFileSizeReport(measured, "brotli", { current, previous }), {
     kind: "summary",
-    message: "Current file: 1.5 kB br · 5.3 kB min · 2 imports · +300 B br vs previous",
+    message: "File Cost: 1.5 kB br · 5.3 kB min · 2 imports · +300 B br vs previous",
   });
 });

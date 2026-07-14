@@ -573,25 +573,53 @@ export interface WorkspaceReportTreemapItem {
   confidence: ConfidenceLevel | "unknown";
 }
 
+/**
+ * Every import of one specifier across the workspace, and what they cost **together**: three files
+ * importing `react` is three Reacts. It was `totalBrotliBytes`, and a "total" of three Reacts is a
+ * number no project ships — under the honest label the panel finally says what it exists to say.
+ */
 export interface DuplicateImportGroup {
   specifier: string;
   count: number;
-  totalBrotliBytes: number;
+  combinedImportCostBrotliBytes: number;
   sourceFiles: string[];
 }
 
+/**
+ * One module, and the imports that reach it — **two** numbers, because the module's size and what
+ * its importing sites pay are two different quantities (ADR-0004).
+ *
+ * It carried one, `totalBytes`: the module's bytes added up once per importing row, rendered under
+ * the header "Total Bytes". `react-dom/index.js` **is 100 kB** and is reached by three imports, and
+ * the panel said **300 kB**.
+ */
 export interface DuplicateModuleGroup {
   modulePath: string;
   basename: string;
+  /** The number of imports that reach this module. */
   count: number;
-  totalBytes: number;
+  /** The module's own rendered size — the largest contribution seen across the builds that reached it. */
+  moduleBytes: number;
+  /** The module counted once per importing site: a Combined Import Cost, an upper bound. */
+  combinedImportCostBytes: number;
   specifiers: string[];
   vendored: boolean;
 }
 
+/**
+ * The report's headline is a **Combined Import Cost**: the sum of independent Import Costs, each
+ * priced as though the application were otherwise empty (ADR-0004).
+ *
+ * It counts a dependency at every site it is imported from — `react` in fifty files is fifty Reacts,
+ * and one `import React, { useState } from "react"` is TWO imports, counted twice. Subtracting the
+ * overlap would assert a project-level bundle quantity this product does not model, and compressed
+ * sizes are not additive regardless, so the figure is an upper bound. It ranks imports and
+ * apportions blame; it is never a size. It was `totalBrotliBytes`, rendered "Total Brotli" — the
+ * arithmetic was right and the word was the defect. The treemap's percentages are shares of it.
+ */
 export interface WorkspaceReportSummary {
   importCount: number;
-  totalBrotliBytes: number;
+  combinedImportCostBrotliBytes: number;
   lowConfidenceCount: number;
   mediumConfidenceCount: number;
   conservativeCount: number;

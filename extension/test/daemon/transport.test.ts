@@ -222,7 +222,7 @@ class FakeTransport implements AnalysisTransport {
       rows: [],
       summary: {
         importCount: 0,
-        totalBrotliBytes: 0,
+        combinedImportCostBrotliBytes: 0,
         lowConfidenceCount: 0,
         mediumConfidenceCount: 0,
         conservativeCount: 0,
