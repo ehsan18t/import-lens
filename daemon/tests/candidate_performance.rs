@@ -1,33 +1,58 @@
 //! The §10.6 runtime performance and memory gates, over the pinned REAL packages. Release-only and
-//! explicitly ignored, mirroring daemon/tests/performance.rs and its IMPORT_LENS_PERF_MULTIPLIER
-//! tolerance:
+//! explicitly ignored, mirroring daemon/tests/performance.rs:
 //!
 //! ```text
 //! node scripts/prepare-candidate-fixtures.mjs
 //! # set IMPORT_LENS_FIXTURES_WORKSPACE to the directory it prints, then:
 //! cargo test -p import-lens-daemon --release --locked \
 //!     --test candidate_performance -- \
-//!     --ignored --nocapture
+//!     --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! **Until 2026-07-14 nothing invoked this file.** It is `#[ignore]`d and needs installed fixtures,
 //! and no workflow step and no package.json script named it — while `pnpm test:performance`, which
 //! CI *does* call, runs `daemon/tests/performance.rs`: the legacy suite over synthetic fixtures, a
-//! different file. So a gate appeared to run and did not, and the suite written to protect the
-//! engine had never executed once. `validate.yml` runs it now, on the same installed fixtures as
-//! `candidate_packages`, on every pull request.
+//! different file. So a gate appeared to run and did not. `validate.yml` runs it now, on the same
+//! installed fixtures as `candidate_packages`, on every pull request.
 //!
-//! An earlier header said startup, idle RSS and the cache-hit path were "governed by the existing
-//! release baselines" because the candidate engine "is not compiled into the shipped binary". That
-//! stopped being true at the Phase 3 cutover — Rolldown *is* the shipped engine — and those three
-//! gates then belonged to nobody. They are measured here, against the shipped daemon binary over
-//! real packages, because that is the only process whose startup and idle RSS mean anything: a
-//! cargo test binary shares one process across every test in the file, so an RSS reading taken
-//! inside it describes the harness, not the daemon.
+//! **Every gate here is measured against the SHIPPED DAEMON BINARY, over the real IPC transport,
+//! over a real package.** That is not ceremony. Each §10.6 number is a claim about the process the
+//! user runs, and an in-process `ImportLensService` is not that process:
 //!
-//! Latency gates carry the file's existing IMPORT_LENS_PERF_MULTIPLIER tolerance (default 6) for
-//! shared CI hardware; the memory gates are absolute. Set IMPORT_LENS_PERF_MULTIPLIER=1 to hold a
-//! run to the literal §10.6 numbers.
+//! - a cold import is not `RolldownEngine::bundle`. A cache miss also resolves the specifier, runs
+//!   a *second* engine build (the full-package comparison behind `truly_treeshakeable`), minifies
+//!   through OXC, runs three compressors, fingerprints, and writes the cache. The first version of
+//!   this file gated the engine build alone — 22 ms — and let the other ~107 ms of the real cold
+//!   path (measured below) regress untouched. NFR-003 is about the whole miss;
+//! - an in-process service construction is not a startup (NFR-005);
+//! - the RSS of a cargo-test process that has just bundled twenty packages in-process is not the
+//!   daemon's RSS (NFR-004). Both memory gates read the spawned daemon's own working set.
+//!
+//! The engine build survives as a *diagnostic* at the bottom of the file: when the cold gate goes
+//! red, it says whether the engine moved or the pipeline around it did.
+//!
+//! `IMPORT_LENS_PERF_MULTIPLIER` **defaults to 1** — the literal §10.6 numbers. A default above 1
+//! means no run anywhere, local or CI, ever enforces the requirement that was written down; the
+//! default used to be 6, so none ever did. CI opts *up*, by a measured amount, and says why in
+//! `validate.yml`.
+//!
+//! It scales the two gates that measurably need CPU headroom on a shared runner, and **nothing
+//! else**. Measured on this file's own fixtures with the process pinned to 4 logical cores (a
+//! GitHub `ubuntu-24.04` runner is 4 vCPU) and those 4 cores 2x oversubscribed with competing load
+//! — deliberately harsher than a dedicated runner — against the literal gates:
+//!
+//! | gate | hostile-CI p95 | literal gate | margin |
+//! | --- | --- | --- | --- |
+//! | cold import | 406 ms | 500 ms | 1.23x — thin, needs the multiplier |
+//! | daemon startup | 77 ms | 500 ms | 6.5x |
+//! | cache-hit response | 19 ms | 50 ms | 2.6x — holds, so it is NOT scaled |
+//! | idle RSS | 20 MB | 100 MB | 5.0x |
+//! | 20-import batch RSS | 86 MB | 400 MB | 4.7x |
+//!
+//! So the memory gates stay absolute, and **so does the cache-hit gate**: NFR-002's 50 ms is
+//! Critical, it survives the hostile emulation with 2.6x to spare, and multiplying it — CI used to
+//! run at 8, making it 400 ms — turns a hard requirement into a number no one chose. If it ever
+//! does go red on CI, that is a fact about NFR-002 worth hearing, not a number to inflate.
 
 use import_lens_daemon::engine::{
     BundleEntry, BundlePurpose, BundleRequest, ImportRuntime, RolldownEngine,
@@ -37,17 +62,28 @@ use import_lens_daemon::ipc::protocol::{
     BatchRequest, BatchResponse, HelloMessage, ImportKind, ImportRequest, PROTOCOL_VERSION,
 };
 use std::env;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 mod common;
 
+/// §10.6: "five warm-up runs followed by at least 30 recorded runs".
+const WARMUP_RUNS: usize = 5;
+const RECORDED_RUNS: usize = 30;
+
+/// The one import every latency gate is measured on. `css-tree` is the deep-ESM-graph fixture of
+/// the §10.3 real-package set, and `parse` is one export of it — a typical named import, which is
+/// what NFR-003 sizes. Holding the cold gate and the engine diagnostic to the *same* import is what
+/// makes the two numbers subtractable.
+const LATENCY_PACKAGE: &str = "css-tree";
+const LATENCY_EXPORT: &str = "parse";
+
 fn threshold_ms(base_ms: u128) -> u128 {
     let multiplier = env::var("IMPORT_LENS_PERF_MULTIPLIER")
         .ok()
         .and_then(|value| value.parse::<u128>().ok())
-        .unwrap_or(6)
+        .unwrap_or(1)
         .max(1);
 
     base_ms * multiplier
@@ -59,77 +95,111 @@ fn p95_of(durations: &mut [Duration]) -> Duration {
     durations[index]
 }
 
-/// Peak (not current) working set of THIS process. Tests in one binary share
-/// the process, so the reading can only overstate a single scenario — the
-/// conservative direction for an upper-bound gate.
+/// p50 / p95 / max of a recorded run, printed and then gated on p95.
+struct Percentiles {
+    p50: Duration,
+    p95: Duration,
+    max: Duration,
+}
+
+fn percentiles_of(durations: &mut [Duration]) -> Percentiles {
+    assert_eq!(
+        durations.len(),
+        RECORDED_RUNS,
+        "§10.6 requires at least 30 recorded runs"
+    );
+    durations.sort();
+    Percentiles {
+        p50: durations[durations.len() / 2],
+        p95: p95_of(durations),
+        max: *durations.last().expect("recorded runs are non-empty"),
+    }
+}
+
+/// Peak (high-water) working set of the SPAWNED DAEMON. NFR-004's 400 MB batch ceiling is a claim
+/// about the daemon process, so it is read from the daemon process — the cargo-test binary that
+/// drives it is not the thing under test, and it shares one process across every test in this file.
 #[cfg(windows)]
-fn peak_working_set_bytes() -> u64 {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("(Get-Process -Id {}).PeakWorkingSet64", std::process::id()),
-        ])
-        .output()
-        .expect("powershell should be available for the peak-RSS probe");
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .expect("PeakWorkingSet64 should be numeric")
+fn peak_working_set_bytes(process_id: u32) -> u64 {
+    windows_process_metric(process_id, "PeakWorkingSet64")
 }
 
 #[cfg(not(windows))]
-fn peak_working_set_bytes() -> u64 {
-    let status =
-        std::fs::read_to_string("/proc/self/status").expect("/proc/self/status should be readable");
-    let kilobytes: u64 = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmHWM:"))
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|value| value.parse().ok())
-        .expect("VmHWM should be present and numeric");
-    kilobytes * 1024
+fn peak_working_set_bytes(process_id: u32) -> u64 {
+    proc_status_kilobytes(process_id, "VmHWM:") * 1024
 }
 
-/// Current (not peak) working set of ANOTHER process — the spawned daemon. Idle RSS is a claim
-/// about the daemon, so it has to be read from the daemon.
+/// Current (not peak) working set of the spawned daemon: NFR-004's idle-RSS half.
 #[cfg(windows)]
 fn working_set_bytes(process_id: u32) -> u64 {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("(Get-Process -Id {process_id}).WorkingSet64"),
-        ])
-        .output()
-        .expect("powershell should be available for the idle-RSS probe");
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .expect("WorkingSet64 should be numeric")
+    windows_process_metric(process_id, "WorkingSet64")
 }
 
 #[cfg(not(windows))]
 fn working_set_bytes(process_id: u32) -> u64 {
+    proc_status_kilobytes(process_id, "VmRSS:") * 1024
+}
+
+#[cfg(windows)]
+fn windows_process_metric(process_id: u32, property: &str) -> u64 {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Process -Id {process_id}).{property}"),
+        ])
+        .output()
+        .expect("powershell should be available for the RSS probe");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| {
+            panic!("{property} of pid {process_id} should be numeric: {error} — is it still alive?")
+        })
+}
+
+#[cfg(not(windows))]
+fn proc_status_kilobytes(process_id: u32, field: &str) -> u64 {
     let status = std::fs::read_to_string(format!("/proc/{process_id}/status"))
-        .expect("/proc/<pid>/status should be readable");
-    let kilobytes: u64 = status
+        .expect("/proc/<pid>/status should be readable — is the daemon still alive?");
+    status
         .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .find_map(|line| line.strip_prefix(field))
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|value| value.parse().ok())
-        .expect("VmRSS should be present and numeric");
-    kilobytes * 1024
+        .unwrap_or_else(|| panic!("{field} should be present and numeric"))
 }
 
-/// Kills the daemon however this test ends. A panicking gate must not leave a daemon behind
-/// holding the pipe.
-struct DaemonProcess(std::process::Child);
+#[cfg(windows)]
+type DaemonStream = tokio::net::windows::named_pipe::NamedPipeClient;
+#[cfg(not(windows))]
+type DaemonStream = tokio::net::UnixStream;
 
-impl Drop for DaemonProcess {
+/// A spawned daemon, connected and greeted, with its own storage directory.
+///
+/// The `Drop` kills it and removes the storage however the test ends: a panicking gate must not
+/// leave a daemon behind holding the pipe, and — because the cold gate spawns a fresh daemon per
+/// run — must not leave 35 redb databases behind either.
+struct DaemonSession {
+    child: std::process::Child,
+    stream: DaemonStream,
+    decoder: FrameDecoder,
+    storage: PathBuf,
+    /// Spawn → the moment the daemon accepted an IPC connection. NFR-005 word for word.
+    startup: Duration,
+}
+
+impl DaemonSession {
+    fn process_id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for DaemonSession {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.storage);
     }
 }
 
@@ -153,7 +223,7 @@ fn endpoint_name() -> String {
 }
 
 #[cfg(windows)]
-async fn connect(endpoint: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
+async fn connect(endpoint: &str) -> DaemonStream {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -169,7 +239,7 @@ async fn connect(endpoint: &str) -> tokio::net::windows::named_pipe::NamedPipeCl
 }
 
 #[cfg(not(windows))]
-async fn connect(endpoint: &str) -> tokio::net::UnixStream {
+async fn connect(endpoint: &str) -> DaemonStream {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match tokio::net::UnixStream::connect(endpoint).await {
@@ -179,6 +249,51 @@ async fn connect(endpoint: &str) -> tokio::net::UnixStream {
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
         }
+    }
+}
+
+/// Spawns the shipped binary in the shipped configuration — disk cache on, in a storage directory
+/// of its own — and returns once it has answered a connection and been greeted.
+async fn start_daemon(workspace: &Path) -> DaemonSession {
+    let storage = common::temp_workspace("import-lens-candidate-storage");
+    let endpoint = endpoint_name();
+
+    let launched = Instant::now();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_import-lens-daemon"))
+        .args([
+            "--pipe",
+            &endpoint,
+            "--workspace",
+            &workspace.to_string_lossy(),
+            "--storage",
+            &storage.to_string_lossy(),
+        ])
+        .spawn()
+        .expect("the shipped daemon binary should start");
+    let mut stream = connect(&endpoint).await;
+    let startup = launched.elapsed();
+
+    send(
+        &mut stream,
+        &HelloMessage {
+            message_type: "hello".to_owned(),
+            version: PROTOCOL_VERSION,
+            workspace_root: workspace.to_string_lossy().into_owned(),
+            storage_path: storage.to_string_lossy().into_owned(),
+            enable_disk_cache: true,
+            cache_max_size_mb: 200,
+            registry_cache_max_size_mb: 50,
+            log_level: "error".to_owned(),
+        },
+    )
+    .await;
+
+    DaemonSession {
+        child,
+        stream,
+        decoder: FrameDecoder::default(),
+        storage,
+        startup,
     }
 }
 
@@ -220,7 +335,32 @@ where
     }
 }
 
-fn fixture_batch(workspace: &std::path::Path, request_id: u64) -> BatchRequest {
+/// One request/response round trip, timed the way the user experiences it: from the moment the
+/// request leaves to the moment the answer is decoded.
+async fn timed_batch(
+    session: &mut DaemonSession,
+    request: &BatchRequest,
+) -> (BatchResponse, Duration) {
+    let start = Instant::now();
+    send(&mut session.stream, request).await;
+    let response = read_batch_response(&mut session.stream, &mut session.decoder).await;
+    (response, start.elapsed())
+}
+
+fn named_import(workspace: &Path, package: &str, export: &str) -> ImportRequest {
+    ImportRequest {
+        specifier: package.to_owned(),
+        package_name: package.to_owned(),
+        // Read from the installed manifest, never typed here: a pinned version is a fact about
+        // scripts/accuracy-fixtures/package.json, and repeating it would add a place to forget.
+        version: common::pipeline_fixtures::installed_version(workspace, package),
+        named: vec![export.to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::default(),
+    }
+}
+
+fn batch_of(workspace: &Path, request_id: u64, imports: Vec<ImportRequest>) -> BatchRequest {
     BatchRequest {
         version: PROTOCOL_VERSION,
         request_id,
@@ -230,115 +370,210 @@ fn fixture_batch(workspace: &std::path::Path, request_id: u64) -> BatchRequest {
             .join("app.ts")
             .to_string_lossy()
             .into_owned(),
-        imports: vec![ImportRequest {
-            specifier: "date-fns".to_owned(),
-            package_name: "date-fns".to_owned(),
-            version: common::pipeline_fixtures::installed_version(workspace, "date-fns"),
-            named: vec!["format".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::default(),
-        }],
+        imports,
         streaming: false,
     }
 }
 
-// §10.6 hard gates: daemon startup < 500 ms, cache-hit response < 50 ms, idle RSS < 100 MB — the
-// three that had no owner. They are measured against the SHIPPED BINARY over a real package,
-// through the real IPC transport, because that is what each of them is a claim about: an in-process
-// `ImportLensService` is not a startup, and the RSS of a test binary that has just bundled twenty
-// packages is not an idle daemon.
+fn latency_batch(workspace: &Path, request_id: u64) -> BatchRequest {
+    batch_of(
+        workspace,
+        request_id,
+        vec![named_import(workspace, LATENCY_PACKAGE, LATENCY_EXPORT)],
+    )
+}
+
+/// A gate that timed a FAILED analysis would be timing the error path, and an Unmeasured result
+/// never enters the engine at all — it would make every gate here trivially green.
+fn assert_measured(response: &BatchResponse, expected: usize) {
+    assert_eq!(
+        response.imports.len(),
+        expected,
+        "the daemon answered a different number of imports than it was asked"
+    );
+    for result in &response.imports {
+        assert!(
+            result.sizes().is_some(),
+            "every import must be MEASURED for these timings to mean anything — `{}` is unmeasured \
+             (stage: {:?}, error: {:?})",
+            result.specifier,
+            result.unmeasured_stage(),
+            result.error,
+        );
+    }
+}
+
+// NFR-003 (Critical, §10.6): a single typical cold import — a CACHE MISS — has p95 ≤ 500 ms.
+// NFR-005 (High, §10.6): the daemon accepts connections within 500 ms of being spawned.
+//
+// A cold import is measured END TO END, through the shipped daemon: specifier resolution, the
+// engine build, the full-package comparison build, OXC minification, gzip/Brotli/zstd, the
+// fingerprint, and the cache write — the work a user's cache miss actually pays for. The previous
+// version of this gate called `RolldownEngine::bundle` directly and asserted on that, which is one
+// of those steps.
+//
+// Every run gets a FRESH DAEMON with a FRESH STORAGE DIRECTORY, which is the only way to keep 30
+// runs genuinely cold: the daemon memoizes the full-package build, the export list and file sizes
+// in process, so a second miss against a package the same daemon already touched is a
+// partially-warm path wearing a cold name. Startup rides along on the same 30 spawns for free —
+// which is also the first time NFR-005 has been read from more than a single sample.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "release-only candidate measurement; requires installed fixtures (scripts/prepare-candidate-fixtures.mjs)"]
-async fn shipped_daemon_startup_cache_hit_and_idle_rss_stay_under_release_thresholds() {
+async fn shipped_daemon_cold_import_p95_and_startup_stay_under_release_thresholds() {
     let workspace = common::engine_fixtures::fixtures_workspace();
-    let storage = common::temp_workspace("import-lens-candidate-storage");
-    let endpoint = endpoint_name();
 
-    let launched = Instant::now();
-    let daemon = DaemonProcess(
-        std::process::Command::new(env!("CARGO_BIN_EXE_import-lens-daemon"))
-            .args([
-                "--pipe",
-                &endpoint,
-                "--workspace",
-                &workspace.to_string_lossy(),
-                "--storage",
-                &storage.to_string_lossy(),
-            ])
-            .spawn()
-            .expect("the shipped daemon binary should start"),
+    let mut cold = Vec::with_capacity(RECORDED_RUNS);
+    let mut startup = Vec::with_capacity(RECORDED_RUNS);
+    for run in 0..(WARMUP_RUNS + RECORDED_RUNS) {
+        let mut session = start_daemon(&workspace).await;
+        let (miss, elapsed) = timed_batch(&mut session, &latency_batch(&workspace, 1)).await;
+
+        assert_measured(&miss, 1);
+        assert!(
+            !miss.imports[0].cache_hit,
+            "a fresh daemon on a fresh storage directory must MISS: {:?}",
+            miss.imports[0],
+        );
+
+        if run >= WARMUP_RUNS {
+            cold.push(elapsed);
+            startup.push(session.startup);
+        }
+    }
+
+    let cold = percentiles_of(&mut cold);
+    let startup = percentiles_of(&mut startup);
+    eprintln!(
+        "shipped daemon cold {LATENCY_PACKAGE}/{LATENCY_EXPORT} (end to end, {RECORDED_RUNS} runs): \
+         p50 {:?}, p95 {:?}, max {:?}\nshipped daemon startup ({RECORDED_RUNS} spawns): p50 {:?}, \
+         p95 {:?}, max {:?}",
+        cold.p50, cold.p95, cold.max, startup.p50, startup.p95, startup.max,
     );
-    let process_id = daemon.0.id();
 
-    let mut stream = connect(&endpoint).await;
-    let startup = launched.elapsed();
+    assert!(
+        cold.p95.as_millis() <= threshold_ms(500),
+        "cold single import p95 exceeded the 500 ms gate (NFR-003): {}ms",
+        cold.p95.as_millis()
+    );
+    assert!(
+        startup.p95.as_millis() <= threshold_ms(500),
+        "daemon startup p95 exceeded the 500 ms gate (NFR-005): {}ms",
+        startup.p95.as_millis()
+    );
+}
 
-    // The shipped configuration: the disk cache on, in a storage directory of its own.
-    send(
-        &mut stream,
-        &HelloMessage {
-            message_type: "hello".to_owned(),
-            version: PROTOCOL_VERSION,
-            workspace_root: workspace.to_string_lossy().into_owned(),
-            storage_path: storage.to_string_lossy().into_owned(),
-            enable_disk_cache: true,
-            cache_max_size_mb: 200,
-            registry_cache_max_size_mb: 50,
-            log_level: "error".to_owned(),
-        },
-    )
-    .await;
+// NFR-002 (Critical, §10.6): cache-hit response stays under 50 ms. ABSOLUTE — see the module
+// header: this gate is not scaled by IMPORT_LENS_PERF_MULTIPLIER, because it does not need to be.
+// NFR-004 (High, §10.6): idle RSS with the cache populated stays under 100 MB.
+//
+// One daemon, one cold request to populate the cache, then 30 recorded identical requests over the
+// same connection. 50 ms is a hard number in the SRS, so it is read as a p95 over 30 round trips
+// rather than the single sample this used to take.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "release-only candidate measurement; requires installed fixtures (scripts/prepare-candidate-fixtures.mjs)"]
+async fn shipped_daemon_cache_hit_p95_and_idle_rss_stay_under_release_thresholds() {
+    let workspace = common::engine_fixtures::fixtures_workspace();
+    let mut session = start_daemon(&workspace).await;
 
-    let mut decoder = FrameDecoder::default();
-    let miss_start = Instant::now();
-    send(&mut stream, &fixture_batch(&workspace, 1)).await;
-    let miss = read_batch_response(&mut stream, &mut decoder).await;
-    let miss_elapsed = miss_start.elapsed();
+    let (miss, _) = timed_batch(&mut session, &latency_batch(&workspace, 1)).await;
+    assert_measured(&miss, 1);
+    assert!(!miss.imports[0].cache_hit, "{:?}", miss.imports[0]);
 
-    let hit_start = Instant::now();
-    send(&mut stream, &fixture_batch(&workspace, 2)).await;
-    let hit = read_batch_response(&mut stream, &mut decoder).await;
-    let hit_elapsed = hit_start.elapsed();
+    let mut hits = Vec::with_capacity(RECORDED_RUNS);
+    for run in 0..(WARMUP_RUNS + RECORDED_RUNS) {
+        let request_id = 2 + run as u64;
+        let (hit, elapsed) =
+            timed_batch(&mut session, &latency_batch(&workspace, request_id)).await;
 
-    // NFR-004 measures idle RSS "with the cache populated", which the two requests above did.
+        assert_measured(&hit, 1);
+        assert!(
+            hit.imports[0].cache_hit,
+            "an identical repeated request must be served from the cache: {:?}",
+            hit.imports[0],
+        );
+
+        if run >= WARMUP_RUNS {
+            hits.push(elapsed);
+        }
+    }
+    let hits = percentiles_of(&mut hits);
+
+    // NFR-004 measures idle RSS "with the cache populated", which the requests above did.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let idle_rss = working_set_bytes(process_id);
-    drop(daemon);
-    let _ = std::fs::remove_dir_all(&storage);
+    let idle_rss = working_set_bytes(session.process_id());
 
     eprintln!(
-        "shipped daemon: startup {startup:?}, cold miss {miss_elapsed:?}, cache hit \
-         {hit_elapsed:?}, idle RSS {} MB",
-        idle_rss / (1024 * 1024)
-    );
-
-    // A gate that measured a FAILED analysis would be measuring the error path's speed, and an
-    // Unmeasured result is served without ever entering the engine on the second request.
-    assert!(
-        miss.imports[0].sizes().is_some(),
-        "the cold request must be MEASURED for these numbers to mean anything: {:?}",
-        miss.imports[0],
-    );
-    assert!(!miss.imports[0].cache_hit, "{:?}", miss.imports[0]);
-    assert!(
-        hit.imports[0].cache_hit,
-        "the second identical request must be served from the cache: {:?}",
-        hit.imports[0],
+        "shipped daemon cache hit ({RECORDED_RUNS} round trips): p50 {:?}, p95 {:?}, max {:?}\n\
+         shipped daemon idle RSS (cache populated): {} MB",
+        hits.p50,
+        hits.p95,
+        hits.max,
+        idle_rss / (1024 * 1024),
     );
 
     assert!(
-        startup.as_millis() <= threshold_ms(500),
-        "daemon startup exceeded the 500 ms gate: {}ms",
-        startup.as_millis()
-    );
-    assert!(
-        hit_elapsed.as_millis() <= threshold_ms(50),
-        "cache-hit response exceeded the 50 ms gate: {}ms",
-        hit_elapsed.as_millis()
+        hits.p95.as_millis() <= 50,
+        "cache-hit response p95 exceeded the 50 ms gate (NFR-002, Critical, unscaled): {}ms",
+        hits.p95.as_millis()
     );
     assert!(
         idle_rss < 100 * 1024 * 1024,
-        "idle RSS exceeded the 100 MB gate: {idle_rss} bytes"
+        "idle RSS exceeded the 100 MB gate (NFR-004): {idle_rss} bytes"
+    );
+}
+
+// NFR-004 (High, §10.6): a 20-import active batch stays below 400 MB peak RSS — in the DAEMON.
+//
+// The batch is sent as one `BatchRequest` to the shipped binary, so the concurrency, the engine
+// permits and the allocator are the shipped ones. It matches the spec's comparison set:
+// independent packages, shared transitive dependencies, a CJS package, and repeated different
+// exports from single packages.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "release-only candidate measurement; requires installed fixtures (scripts/prepare-candidate-fixtures.mjs)"]
+async fn shipped_daemon_twenty_import_batch_peak_rss_stays_under_release_threshold() {
+    const BATCH: &[(&str, &str)] = &[
+        ("css-tree", "parse"),
+        ("css-tree", "generate"),
+        ("css-tree", "walk"),
+        ("date-fns", "format"),
+        ("date-fns", "addDays"),
+        ("date-fns", "parseISO"),
+        ("date-fns", "subDays"),
+        ("lodash-es", "debounce"),
+        ("lodash-es", "throttle"),
+        ("lodash-es", "cloneDeep"),
+        ("lodash-es", "merge"),
+        ("lodash", "debounce"),
+        ("zod", "z"),
+        ("zod", "ZodError"),
+        ("react", "useState"),
+        ("react", "useEffect"),
+        ("react", "useMemo"),
+        ("uuid", "v4"),
+        ("uuid", "v1"),
+        ("uuid", "validate"),
+    ];
+
+    let workspace = common::engine_fixtures::fixtures_workspace();
+    let mut session = start_daemon(&workspace).await;
+
+    let imports = BATCH
+        .iter()
+        .map(|(package, export)| named_import(&workspace, package, export))
+        .collect::<Vec<_>>();
+    let (response, elapsed) = timed_batch(&mut session, &batch_of(&workspace, 1, imports)).await;
+
+    assert_measured(&response, BATCH.len());
+    // Read before the `Drop` kills the daemon: a dead process has no working set to report.
+    let peak = peak_working_set_bytes(session.process_id());
+
+    eprintln!(
+        "shipped daemon 20-import batch: {elapsed:?} wall clock, peak RSS {} MB",
+        peak / (1024 * 1024)
+    );
+    assert!(
+        peak < 400 * 1024 * 1024,
+        "20-import batch peak RSS exceeded the 400 MB gate (NFR-004): {peak} bytes"
     );
 }
 
@@ -354,100 +589,51 @@ async fn bundle_once(entry: BundleEntry) -> usize {
     artifact.code.len()
 }
 
-// §10.6 hard gate: single typical cold import p95 ≤ 500 ms. Every run builds
-// a fresh bundler (no reuse across requests), so each is a genuinely cold
-// engine pass; the OS file cache stays warm, as it would in the daemon.
+// DIAGNOSTIC, not the NFR-003 gate. `RolldownEngine::bundle` is ONE STEP of a cold import — the
+// cold gate above measures all of them, on the same package and export, through the shipped daemon.
+// Subtract the two and you get the cost of everything that is not the engine (resolution, the
+// second comparison build, minification, compression, the cache write); that attribution is the
+// only reason this row still exists, and it is what tells you where a red cold gate regressed.
+//
+// The 500 ms assertion is kept because it is a genuine necessary condition — one step of the cold
+// path cannot exceed the budget for all of it — but it is subsumed by the gate above and must never
+// again be mistaken for it.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "release-only candidate measurement; requires installed fixtures (scripts/prepare-candidate-fixtures.mjs)"]
-async fn cold_single_import_p95_stays_under_release_threshold() {
+async fn engine_only_bundle_p95_diagnostic_stays_under_release_threshold() {
     let workspace = common::engine_fixtures::fixtures_workspace();
-    let resolve =
-        || common::engine_fixtures::resolve_fixture_entry(&workspace, "css-tree", "3.2.1", "parse");
+    let version = common::pipeline_fixtures::installed_version(&workspace, LATENCY_PACKAGE);
+    let resolve = || {
+        common::engine_fixtures::resolve_fixture_entry(
+            &workspace,
+            LATENCY_PACKAGE,
+            &version,
+            LATENCY_EXPORT,
+        )
+    };
 
-    for _ in 0..5 {
+    for _ in 0..WARMUP_RUNS {
         bundle_once(resolve()).await;
     }
-    let mut durations = Vec::with_capacity(30);
+    let mut durations = Vec::with_capacity(RECORDED_RUNS);
     let mut raw_bytes = 0usize;
-    for _ in 0..30 {
+    for _ in 0..RECORDED_RUNS {
         let entry = resolve();
         let start = Instant::now();
         raw_bytes = bundle_once(entry).await;
         durations.push(start.elapsed());
     }
-    let p50 = durations[durations.len() / 2];
-    let p95 = p95_of(&mut durations);
-    let max = *durations.last().expect("30 runs recorded");
+    let engine = percentiles_of(&mut durations);
     eprintln!(
-        "candidate cold css-tree/parse: p50 {p50:?}, p95 {p95:?}, max {max:?} over 30 runs \
-         ({raw_bytes} raw bytes)"
+        "DIAGNOSTIC — engine build only, {LATENCY_PACKAGE}/{LATENCY_EXPORT} ({RECORDED_RUNS} runs): \
+         p50 {:?}, p95 {:?}, max {:?} ({raw_bytes} raw bytes). This is one step of the cold import \
+         gated above, not the cold import.",
+        engine.p50, engine.p95, engine.max,
     );
 
     assert!(
-        p95.as_millis() <= threshold_ms(500),
-        "cold single import p95 exceeded the 500 ms gate: {}ms",
-        p95.as_millis()
-    );
-}
-
-// §10.6 hard gate: a 20-import active batch stays below 400 MB peak RSS.
-// The batch matches the spec's comparison set: independent packages, shared
-// transitive dependencies, a CJS package, and repeated different exports
-// from single packages. Concurrency is capped at two builds in flight — the
-// execution-boundary shape Part C introduces.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "release-only candidate measurement; requires installed fixtures (scripts/prepare-candidate-fixtures.mjs)"]
-async fn twenty_import_batch_peak_rss_stays_under_release_threshold() {
-    const BATCH: &[(&str, &str, &str)] = &[
-        ("css-tree", "3.2.1", "parse"),
-        ("css-tree", "3.2.1", "generate"),
-        ("css-tree", "3.2.1", "walk"),
-        ("date-fns", "4.1.0", "format"),
-        ("date-fns", "4.1.0", "addDays"),
-        ("date-fns", "4.1.0", "parseISO"),
-        ("date-fns", "4.1.0", "subDays"),
-        ("lodash-es", "4.18.1", "debounce"),
-        ("lodash-es", "4.18.1", "throttle"),
-        ("lodash-es", "4.18.1", "cloneDeep"),
-        ("lodash-es", "4.18.1", "merge"),
-        ("lodash", "4.17.21", "debounce"),
-        ("zod", "4.4.3", "z"),
-        ("zod", "4.4.3", "ZodError"),
-        ("react", "19.2.7", "useState"),
-        ("react", "19.2.7", "useEffect"),
-        ("react", "19.2.7", "useMemo"),
-        ("uuid", "14.0.1", "v4"),
-        ("uuid", "14.0.1", "v1"),
-        ("uuid", "14.0.1", "validate"),
-    ];
-
-    let workspace = common::engine_fixtures::fixtures_workspace();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
-    let batch_start = Instant::now();
-    let mut handles = Vec::with_capacity(BATCH.len());
-    for (package, version, export) in BATCH {
-        let entry =
-            common::engine_fixtures::resolve_fixture_entry(&workspace, package, version, export);
-        let permits = Arc::clone(&semaphore);
-        handles.push(tokio::spawn(async move {
-            let _permit = permits.acquire().await.expect("semaphore should stay open");
-            bundle_once(entry).await
-        }));
-    }
-    let mut total_raw_bytes = 0usize;
-    for handle in handles {
-        total_raw_bytes += handle.await.expect("batch task should not panic");
-    }
-    let elapsed = batch_start.elapsed();
-    let peak = peak_working_set_bytes();
-
-    eprintln!(
-        "candidate 20-import batch: {elapsed:?} wall clock, peak RSS {} MB, \
-         {total_raw_bytes} total raw bytes",
-        peak / (1024 * 1024)
-    );
-    assert!(
-        peak < 400 * 1024 * 1024,
-        "20-import batch peak RSS exceeded the 400 MB gate: {peak} bytes"
+        engine.p95.as_millis() <= threshold_ms(500),
+        "engine-only bundle p95 exceeded the 500 ms budget for a whole cold import: {}ms",
+        engine.p95.as_millis()
     );
 }

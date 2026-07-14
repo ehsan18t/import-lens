@@ -1088,9 +1088,13 @@ instrumented at all.** Three holes, all in the instruments rather than the engin
    asset defect survived qualification: every pinned fixture is pure JavaScript. A package that
    imports CSS joins the set.
 
-**Closed 2026-07-14.** All three holes are instrumented, and the gates were watched failing under a
-deliberate mutation before being trusted (a broken 500 ms constant turns the p95 gate red; a
-hardwired `truly_treeshakeable` turns 6 of 9 badge rows red):
+**Closed 2026-07-14.** All three holes are instrumented, and every gate was watched failing under a
+deliberate mutation **of the daemon** before being trusted — not of the gate's own constant, which
+proves only that an assert asserts. Each of the five was broken in turn and its RED output recorded:
+a 600 ms sleep between the engine build and the minifier (cold, 708 ms), a 700 ms sleep before the
+listener (startup, 721 ms), an 80 ms sleep on the cache-hit arm (cache hit, 89 ms), a retained
+150 MB allocation (idle RSS, 178 MB), and 20 MB per import held for the life of a batch (batch RSS,
+502 MB). A hardwired `truly_treeshakeable` turns 6 of 9 badge rows red.
 
 - `validate.yml` runs `candidate_performance` and the new `candidate_badges` on every pull request,
   gated on `run_candidate_packages` (which `ci.yml` already sets), on the same installed fixtures.
@@ -1178,14 +1182,50 @@ fixtures, `IMPORT_LENS_PERF_MULTIPLIER=1`, win32-x64). Three of these had never 
 anything: they are read from the **shipped daemon binary** over the real IPC transport, because an
 in-process service is not a startup and a test binary's RSS is not an idle daemon's.
 
+**Corrected the same day — the first pass gated the wrong things (I24).** Executing the gates was
+not the same as pointing them at the product, and two of them were still instruments built to pass:
+
+- **the cold gate called `RolldownEngine::bundle` directly.** That is *one step* of a cache miss.
+  The real miss also resolves the specifier, runs a **second** engine build (the full-package
+  comparison behind `truly_treeshakeable`), minifies through OXC, runs three compressors,
+  fingerprints, and writes the cache — and the harness already computed that number (135 ms) and
+  **asserted nothing about it**. So NFR-003 and §10.6's cold gate were enforced over ~20% of the
+  path they name; a 600 ms regression injected between the engine and the minifier left the old
+  gate green. The cold gate now measures a real cache miss end to end, through the daemon, with a
+  fresh daemon and a fresh storage directory per run (the daemon memoizes the full-package build,
+  the export list and file sizes in-process, so a repeated miss in one process is a partially-warm
+  path wearing a cold name);
+- **the 20-import RSS gate measured the cargo-test process**, which never spawned a daemon at all.
+  NFR-004's batch ceiling is about the shipped daemon; it is now read from the daemon's own peak
+  working set.
+
+Startup and cache-hit response are now p95 over 30 runs rather than a single sample. §10.6 asks for
+30 recorded runs; they were getting one.
+
 | measurement | result | gate |
 | --- | --- | --- |
-| cold `css-tree/parse` p50 / p95 / max | 18.5 ms / 18.5 ms / 19.2 ms | p95 ≤ 500 ms |
-| daemon startup (spawn → IPC connection accepted) | 17.1 ms | < 500 ms |
-| cache-hit response (identical batch, full IPC round trip) | 14.6 ms | < 50 ms |
-| idle RSS (shipped daemon, cache populated) | 21 MB | < 100 MB |
-| 20-import batch peak RSS | 66 MB | < 400 MB |
-| cold miss through the whole shipped stack (context, not a gate) | 135 ms | — |
+| cold `css-tree/parse`, END TO END through the shipped daemon, p50 / p95 / max | 100.2 ms / 103.6 ms / 104.8 ms | p95 ≤ 500 ms (NFR-003) |
+| daemon startup (spawn → IPC connection accepted) p50 / p95 / max | 18.4 ms / 22.1 ms / 22.7 ms | p95 < 500 ms (NFR-005) |
+| cache-hit response (identical batch, full IPC round trip) p50 / p95 / max | 4.8 ms / 5.2 ms / 5.3 ms | p95 < 50 ms (NFR-002) |
+| idle RSS (shipped daemon, cache populated) | 19 MB | < 100 MB (NFR-004) |
+| 20-import batch peak RSS (shipped daemon) | 80 MB | < 400 MB (NFR-004) |
+| engine build alone, same import (DIAGNOSTIC, not a gate) | 21.0 / 22.3 / 23.1 ms | — |
+
+The last row is what the cold gate used to assert on. Subtracting it from the first says the engine
+build is ~22 ms of a ~104 ms cold import: **four fifths of NFR-003's budget was ungated.**
+
+**The multiplier no longer enforces a number nobody chose.** `IMPORT_LENS_PERF_MULTIPLIER` scaled
+*every* latency gate, defaulted to **6**, and CI set **8** — so the literal §10.6 numbers were
+enforced nowhere, by anyone: CI's real gates were a 4000 ms cold import and a 400 ms "cache hit"
+against a 50 ms Critical requirement. The default is now **1** (the numbers as written), and CI sets
+**2**, chosen from a measurement rather than a feeling: with the suite pinned to 4 logical cores
+(a GitHub `ubuntu-24.04` runner is 4 vCPU) and those cores 2x oversubscribed with competing load —
+harsher than a dedicated runner — cold p95 measured **406 ms** against the literal 500 ms gate. It
+holds, but 19% margin is a gate that flakes, and a flaky gate gets switched off; 2 puts that worst
+measured case 2.5x inside the gate. Under the same hostile load the cache-hit p95 measured **19 ms**
+against 50 ms and startup **77 ms** against 500 ms, so **the cache-hit gate and both memory gates are
+absolute and unscaled** — NFR-002 is Critical, it holds on this hardware, and it is enforced as
+written.
 
 **Caveat, resolved 2026-07-12.** These measurements were taken on a Tokio runtime sized to
 `num_cpus`, while the shipped daemon built its engine runtime with `worker_threads(ENGINE_PERMITS)`
