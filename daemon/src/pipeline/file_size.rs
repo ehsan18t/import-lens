@@ -13,6 +13,35 @@ use crate::{
 };
 use std::collections::{BTreeMap, HashMap};
 
+/// What the daemon knows about the package behind an import, before any build runs.
+///
+/// The two non-`Installed` kinds are both "there is no `node_modules/<name>/package.json`", and they
+/// are **not the same fact**. Collapsing them into one is a regression this enum exists to make
+/// unrepresentable: see [`crate::pipeline::resolver::resolves_to_first_party_source`], which is what
+/// decides between them — and decides it on positive evidence that the specifier IS first-party,
+/// never on the absence of a `package.json` declaration.
+#[derive(Debug, Clone)]
+pub enum SizedPackage {
+    /// Installed: the daemon resolved its manifest and built a request (a request carries the
+    /// installed version), so this import is an **entry** of the file's combined build.
+    Installed(ImportRequest),
+    /// **Not installed** — and not first-party either: the specifier resolves to nothing at all. An
+    /// uninstalled dependency, a typo, a stale import. Its bytes belong in this file's total and are
+    /// missing from it, however cleanly every build goes, so the total is a floor (SRS FR-024a,
+    /// bullet 4). Whether `package.json` happens to declare it changes none of that.
+    NotInstalled,
+    /// **Not a package at all** — a tsconfig path alias (`@app/components`, `~lib/foo`, or a bare
+    /// `components/Button` under a `baseUrl`) resolving to first-party source. Import Lens measures
+    /// third-party imports (ADR-0004), so first-party code contributes nothing to any total it
+    /// reports, exactly like a relative import. It is **not a gap** and flags nothing: reading it as
+    /// a missing dependency made every file that uses path aliases a permanent floor — never cached,
+    /// never persisted, and refused a verdict by `importlens check`.
+    ///
+    /// (The `@/…`, `~/…`, `#…` and `$…` spellings never get this far: `document::specifier` drops
+    /// them before detection. It is the alias forms that look like package names that reach here.)
+    PathAlias,
+}
+
 /// One import a file-size computation must account for, together with whatever the caller has
 /// already measured for it.
 ///
@@ -23,12 +52,11 @@ use std::collections::{BTreeMap, HashMap};
 /// the fallback sums measurements, and there is not one yet. A fallback that had to skip it is
 /// marked [`FileSizeComputation::incomplete`] and is never cached.
 ///
-/// `request` is `None` when the package is **not installed at all** — the daemon could not even
-/// build a request for it, because a request carries the installed version. Such an import is not
-/// an entry of any build and has no measurement to contribute, and it used to be dropped from the
-/// aggregate's input entirely (`service.rs` filtered it out), so the file's total silently omitted
-/// it, was cached, was persisted as the file's baseline, and passed `importlens check` with exit 0.
-/// It is a floor now, exactly like every other unmeasured contributor (SRS FR-024a, bullet 4).
+/// A [`SizedPackage::NotInstalled`] import is not an entry of any build and has no measurement to
+/// contribute, and it used to be dropped from the aggregate's input entirely (`service.rs` filtered
+/// it out), so the file's total silently omitted it, was cached, was persisted as the file's
+/// baseline, and passed `importlens check` with exit 0. It is a floor now, exactly like every other
+/// unmeasured contributor (SRS FR-024a, bullet 4).
 ///
 /// Carrying the measurement in rather than re-deriving it is also what keeps the fallback out of
 /// the engine. It used to re-analyze every import of the failing runtime group from scratch, so
@@ -36,8 +64,7 @@ use std::collections::{BTreeMap, HashMap};
 /// set of permits, the very builds the caller had already run or was already running.
 #[derive(Debug, Clone)]
 pub struct SizedImport {
-    /// `None` = the package is not installed. The specifier below is then its only identity.
-    pub request: Option<ImportRequest>,
+    pub package: SizedPackage,
     /// The specifier as written in the source — the one thing every import has, installed or not.
     pub specifier: String,
     pub result: Option<ImportResult>,
@@ -48,16 +75,26 @@ impl SizedImport {
     pub fn installed(request: ImportRequest, result: Option<ImportResult>) -> Self {
         Self {
             specifier: request.specifier.clone(),
-            request: Some(request),
+            package: SizedPackage::Installed(request),
             result,
         }
     }
 
-    /// An import of a package that is **not installed**. It contributes no bytes and cannot be
-    /// measured, so it makes the file's total a floor (SRS FR-024a).
+    /// An import whose package is **not installed** and whose specifier is not first-party source
+    /// either. It contributes no bytes and cannot be measured, so it makes the file's total a floor
+    /// (SRS FR-024a).
     pub fn not_installed(specifier: impl Into<String>) -> Self {
         Self {
-            request: None,
+            package: SizedPackage::NotInstalled,
+            specifier: specifier.into(),
+            result: None,
+        }
+    }
+
+    /// An import whose specifier is a **path alias**, not a package. It flags nothing.
+    pub fn path_alias(specifier: impl Into<String>) -> Self {
+        Self {
+            package: SizedPackage::PathAlias,
             specifier: specifier.into(),
             result: None,
         }
@@ -219,6 +256,28 @@ pub fn compute_file_size(
     context: &AnalysisContext,
     imports: &[SizedImport],
 ) -> FileSizeComputation {
+    compute_file_size_with(context, imports, &|code| minify_source(code, false))
+}
+
+/// [`compute_file_size`] with the minifier injected, which no production caller does.
+///
+/// The minify-failure arm below degrades the file's totals exactly as a build failure does, and
+/// **no fixture can reach it**: Rolldown parses every module with the same OXC parser that
+/// [`minify_source`] re-parses the linked chunk with, in strict module mode, so any source that
+/// would fail the chunk's re-parse fails the *build* first. (Measured, not assumed: `'0'`-prefixed
+/// octal literals, `with`, duplicate parameters, `delete` of a local, a hashbang — every one of them
+/// comes back a `parse` failure of the combined build, never a `minify` failure of its chunk.)
+///
+/// The arm is real all the same — a codegen/minifier defect, or a construct OXC can print and not
+/// re-parse — and being unreachable from a fixture is precisely why it went untested: `degraded` was
+/// deleted from it and the entire daemon suite stayed green, which is Critical 1's exact shape (the
+/// file's own build fails while every contributor is Measured). So the seam is here, used by one
+/// test, and by nothing else.
+fn compute_file_size_with(
+    context: &AnalysisContext,
+    imports: &[SizedImport],
+    minify: &dyn Fn(&str) -> Result<String, String>,
+) -> FileSizeComputation {
     let mut diagnostics = Vec::new();
     let mut totals = FileSizeComputation::default();
     // Entries and their originating imports, grouped by the runtime they must be
@@ -228,20 +287,39 @@ pub fn compute_file_size(
 
     for import in imports {
         let specifier = format!("specifier: {}", import.specifier);
-        let Some(request) = import.request.as_ref() else {
-            // The package is NOT INSTALLED, so there is no request, no entry, and no measurement.
-            // Its bytes are missing from the totals however cleanly every build goes, and it used to
-            // be filtered out of the aggregate's input before it could say so (SRS FR-024a,
-            // bullet 4). Floor.
-            totals.incomplete = true;
-            diagnostics.push(diagnostic(
-                crate::pipeline::stage::PACKAGE_RESOLUTION,
-                "package is not installed, so its bytes are missing from this file's total, which \
-                 is a floor"
-                    .to_owned(),
-                vec![specifier],
-            ));
-            continue;
+        let request = match &import.package {
+            SizedPackage::Installed(request) => request,
+            SizedPackage::NotInstalled => {
+                // The package is NOT INSTALLED and the specifier is not first-party source: no
+                // request, no entry, no measurement. Its bytes are missing from the totals however
+                // cleanly every build goes, and it used to be filtered out of the aggregate's input
+                // before it could say so (SRS FR-024a, bullet 4). Floor.
+                totals.incomplete = true;
+                diagnostics.push(diagnostic(
+                    crate::pipeline::stage::PACKAGE_RESOLUTION,
+                    "package is not installed, so its bytes are missing from this file's total, \
+                     which is a floor"
+                        .to_owned(),
+                    vec![specifier],
+                ));
+                continue;
+            }
+            SizedPackage::PathAlias => {
+                // NOT a missing dependency: a tsconfig path alias, which RESOLVES to first-party
+                // source. Import Lens measures third-party imports (ADR-0004), so this contributes
+                // nothing to a total it reports — exactly like a relative import, which is never even
+                // detected. It is a fact, not a gap: NO flag, and the total stays complete. Flagging
+                // it made every aliased file a permanent floor.
+                diagnostics.push(diagnostic(
+                    crate::pipeline::stage::PATH_ALIAS,
+                    "specifier is a path alias resolving to first-party source, not an installed \
+                     package; Import Lens measures third-party imports, so it contributes no bytes \
+                     to this file's total"
+                        .to_owned(),
+                    vec![specifier],
+                ));
+                continue;
+            }
         };
 
         match resolve_package_entry(&context.active_document_path, request) {
@@ -294,8 +372,8 @@ pub fn compute_file_size(
 
     if groups.is_empty() {
         // No combined build to run. Either the file has no imports at all, or every one of them is
-        // declarations-only (both a complete, honest zero), or not one could be resolved
-        // (`incomplete`, and never cached as this file's size).
+        // declarations-only or a path alias (all three a complete, honest zero), or not one could be
+        // resolved (`incomplete`, and never cached as this file's size).
         return FileSizeComputation {
             diagnostics,
             ..totals
@@ -357,7 +435,7 @@ pub fn compute_file_size(
             details: Vec::new(),
         }));
 
-        let minified = match minify_source(&artifact.code, false) {
+        let minified = match minify(&artifact.code) {
             Ok(minified) => minified,
             Err(error) => {
                 // Degrade only this runtime, exactly as a build failure does. Returning
@@ -903,6 +981,74 @@ mod tests {
         );
     }
 
+    /// **ADR-0006, invariant 4, first bullet — and it had NO test at all.**
+    ///
+    /// *"If the combined build SUCCEEDS, the total is real — even while every per-import result is
+    /// still Loading. On a cold document that is the normal case, and it is not a floor."*
+    ///
+    /// A File Cost has its **own build**: one bundle over all the file's imports, which does not
+    /// depend on the per-import builds at all. So a document nobody has measured yet — every
+    /// `result` still `None`, because the streaming handlers answer from cache and let the misses
+    /// land later — has a total that is a genuine measurement of the file, and it must be cached. On
+    /// a cold document that is the NORMAL case.
+    ///
+    /// The ADR records that reading it the other way already caused a regression once: flagging any
+    /// Loading contributor made **every cold document** a floor, so nothing was ever cached and the
+    /// combined build re-ran on every keystroke. Yet the mutation that reintroduces it —
+    /// `if import.result.is_none() { totals.incomplete = true; }` at the top of the loop in
+    /// `compute_file_size_with` — left the entire daemon suite green (162 lib, 49 service, 500
+    /// total, 0 failed). Every existing test either measures its imports or fails the build. An
+    /// invariant nothing can detect is not an invariant.
+    ///
+    /// The distinction this pins down is exactly the one `per_import_totals` gets right for the
+    /// FALLBACK sum, where a `None` result really is a missing input: there, no build is left to
+    /// count the bytes. Here the build counted them.
+    #[test]
+    fn a_cold_document_whose_combined_build_succeeds_is_not_a_floor() {
+        let fixture = Fixture::new("cold");
+        fixture
+            .package("alpha-lib", "export const alpha = 1;\n")
+            .package("beta-lib", "export const beta = 2;\n");
+
+        let totals = compute_file_size(
+            &fixture.context(),
+            &[
+                // NOTHING is measured: this is a cold document, and the per-import builds have not
+                // landed. The combined build still runs, and still answers.
+                SizedImport::installed(request("alpha-lib"), None),
+                SizedImport::installed(request("beta-lib"), None),
+            ],
+        );
+
+        assert!(
+            totals.error.is_none(),
+            "test setup: the combined build succeeds — both packages are real: {:?}",
+            totals.diagnostics
+        );
+        assert!(
+            !totals.degraded,
+            "test setup: the file's own build succeeded, so the totals are a real File Cost: {:?}",
+            totals.diagnostics
+        );
+        assert!(
+            totals.raw_bytes > 0 && totals.minified_bytes > 0,
+            "test setup: the combined build produced the file's bytes: {totals:?}"
+        );
+        assert!(
+            !totals.incomplete,
+            "a Loading contributor is NOT a missing input when the file's own combined build \
+             succeeded — that build counted its bytes. Flagging it makes every cold document a \
+             permanent floor, which is the regression ADR-0006 invariant 4 records: {:?}",
+            totals.diagnostics
+        );
+        assert!(
+            totals.is_cacheable(),
+            "and a cold document's total must be CACHED, or the combined build re-runs on every \
+             keystroke and `importlens check` can never judge a file it measured first: {:?}",
+            totals.diagnostics
+        );
+    }
+
     /// **CRITICAL 1.** Every contributor Measured, and the file's OWN combined build fails. The
     /// contributors are all fine, so `incomplete` is correctly `false`; `error` is `None`, because
     /// the fallback summed successfully. What is on the wire is an un-deduplicated per-import sum —
@@ -951,6 +1097,140 @@ mod tests {
             "an un-deduplicated per-import sum is a different QUANTITY from a File Cost; caching \
              it serves a number the file never had for the whole TTL, and a budget judged against \
              it is neither passed nor failed (ADR-0006, invariants 4 and 5)"
+        );
+    }
+
+    /// **The minify-failure arm.** The chunk LINKED — the combined build succeeded — and the
+    /// minifier could not process it, so this runtime group falls back to the same un-deduplicated
+    /// per-import sum a build failure falls back to, and the file's totals are just as much not the
+    /// file's. Every contributor here is Measured and `error` is `None`, which is Critical 1's exact
+    /// shape: nothing but `degraded` says the number is wrong.
+    ///
+    /// `degraded` was deleted from this arm and the entire daemon suite stayed green.
+    ///
+    /// The minifier is injected because **no fixture can reach this arm** — Rolldown parses each
+    /// module with the same OXC parser that re-parses the linked chunk, so anything that would fail
+    /// the chunk's re-parse fails the *build* first (measured: octal literals, `with`, duplicate
+    /// parameters, `delete` of a local, a hashbang — every one comes back a `parse` failure of the
+    /// build). Being unreachable from a fixture is exactly why the arm went untested; it is not a
+    /// reason to leave it that way. Everything else in this test is the real thing: a real package,
+    /// a real Rolldown build, the real fallback.
+    #[test]
+    fn a_minify_failure_degrades_the_total_even_with_every_import_measured() {
+        let fixture = Fixture::new("minify-degraded");
+        fixture
+            .package("alpha-lib", "export const alpha = 1;\n")
+            .package("beta-lib", "export const beta = 2;\n");
+
+        let totals = compute_file_size_with(
+            &fixture.context(),
+            &[
+                SizedImport::installed(request("alpha-lib"), Some(result("alpha-lib", 100))),
+                SizedImport::installed(request("beta-lib"), Some(result("beta-lib", 20))),
+            ],
+            &|_| Err("minifier gave up on the linked chunk".to_owned()),
+        );
+
+        assert!(
+            totals.degraded,
+            "the chunk could not be minified, so these totals are a per-import sum and not the \
+             file's: {:?}",
+            totals.diagnostics
+        );
+        assert!(
+            !totals.incomplete,
+            "test setup: EVERY contributor is Measured — `incomplete` sees nothing wrong here"
+        );
+        assert!(
+            totals.error.is_none(),
+            "test setup: the fallback sum succeeded, so `error` is None too: {:?}",
+            totals.diagnostics
+        );
+        assert_eq!(
+            totals.brotli_bytes, 120,
+            "test setup: the number IS there — the un-deduplicated sum of the per-import costs"
+        );
+        assert!(
+            !totals.is_cacheable(),
+            "a per-import sum is a different QUANTITY from a File Cost (ADR-0004); caching it \
+             serves a number the file never had for the whole TTL, and judging a budget against it \
+             is neither a pass nor a fail (ADR-0006, invariants 4 and 5)"
+        );
+        assert!(
+            totals
+                .diagnostics
+                .iter()
+                .any(|item| item.stage == crate::pipeline::stage::MINIFY),
+            "the user is owed the stage that degraded the total: {:?}",
+            totals.diagnostics
+        );
+    }
+
+    /// Control for the injected minifier: with the REAL one, the same input is a clean, cacheable
+    /// measurement. Without this, the test above could be "made to pass" by degrading everything.
+    #[test]
+    fn the_same_file_with_a_working_minifier_is_a_clean_measurement() {
+        let fixture = Fixture::new("minify-ok");
+        fixture
+            .package("alpha-lib", "export const alpha = 1;\n")
+            .package("beta-lib", "export const beta = 2;\n");
+
+        let totals = compute_file_size(
+            &fixture.context(),
+            &[
+                SizedImport::installed(request("alpha-lib"), Some(result("alpha-lib", 100))),
+                SizedImport::installed(request("beta-lib"), Some(result("beta-lib", 20))),
+            ],
+        );
+
+        assert!(!totals.degraded, "{:?}", totals.diagnostics);
+        assert!(!totals.incomplete, "{:?}", totals.diagnostics);
+        assert!(totals.is_cacheable(), "{:?}", totals.diagnostics);
+        assert!(totals.minified_bytes > 0);
+    }
+
+    /// **IMPORTANT 1 — a path alias is not a missing package.** `@app/components` has no installed
+    /// package and no request, exactly like an uninstalled dependency, and it is a completely
+    /// different fact: it resolves to first-party source, which Import Lens does not measure
+    /// (ADR-0004). It contributes no bytes because there are none to contribute — a fact, not a gap
+    /// — so the total stays complete and cacheable. Flagging it made every file that uses path
+    /// aliases a permanent floor.
+    #[test]
+    fn a_path_alias_import_leaves_its_file_complete_and_cacheable() {
+        let fixture = Fixture::new("path-alias");
+        fixture.package("fine-lib", "export const fine = 1;\n");
+
+        let totals = compute_file_size(
+            &fixture.context(),
+            &[
+                SizedImport::installed(request("fine-lib"), Some(result("fine-lib", 20))),
+                SizedImport::path_alias("@app/components"),
+            ],
+        );
+
+        assert!(
+            !totals.incomplete,
+            "an alias is not an unmeasured dependency: {:?}",
+            totals.diagnostics
+        );
+        assert!(
+            totals.is_cacheable(),
+            "aliased files must still be cached and persisted, or the combined build re-runs on \
+             every keystroke and `importlens check` exits 3 forever: {:?}",
+            totals.diagnostics
+        );
+        assert!(totals.raw_bytes > 0, "the real package is still measured");
+        assert!(
+            totals
+                .diagnostics
+                .iter()
+                .any(|item| item.stage == crate::pipeline::stage::PATH_ALIAS
+                    && item
+                        .details
+                        .iter()
+                        .any(|detail| detail == "specifier: @app/components")),
+            "the user is still told why that specifier contributes nothing: {:?}",
+            totals.diagnostics
         );
     }
 

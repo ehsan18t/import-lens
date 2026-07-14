@@ -584,18 +584,22 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#client?.send({ type: "cache_invalidate_all" });
   }
 
-  nodeModulesChanged(packageJsonPaths: readonly string[]): void {
+  nodeModulesChanged(
+    packageJsonPaths: readonly string[],
+    tsconfigPaths: readonly string[] = [],
+  ): void {
     if (!this.#client || this.#state !== "ready") {
       this.#logger.debug(`Skipping node_modules invalidation because daemon is ${this.#state}.`);
       return;
     }
 
     this.#logger.info(
-      `Sending ${packageJsonPaths.length} node_modules package.json invalidation(s).`,
+      `Sending ${packageJsonPaths.length} node_modules package.json and ${tsconfigPaths.length} tsconfig invalidation(s).`,
     );
     this.#client.send({
       type: "node_modules_changed",
       package_json_paths: [...packageJsonPaths],
+      tsconfig_paths: [...tsconfigPaths],
     });
   }
 

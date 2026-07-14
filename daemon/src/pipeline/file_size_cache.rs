@@ -7,7 +7,7 @@ use crate::{
     ipc::protocol::{ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
-        file_size::{FileSizeComputation, SizedImport},
+        file_size::{FileSizeComputation, SizedImport, SizedPackage},
         resolver::{ResolvedPackage, resolve_package_entry},
     },
 };
@@ -170,11 +170,18 @@ pub fn file_size_signature(context: &AnalysisContext, imports: &[SizedImport]) -
     let mut tokens = imports
         .iter()
         .map(|import| {
-            // A NOT-INSTALLED import has no request at all, and it still belongs in the signature:
-            // it is what makes the total a floor (FR-024a), and installing the package must move the
-            // signature so the floor is recomputed rather than served from L1.
-            let Some(request) = import.request.as_ref() else {
-                return format!("not_installed:{}", import.specifier);
+            // An import with no request has no resolved entry to fingerprint, and it still belongs
+            // in the signature. The two kinds get DIFFERENT tokens, because they mean opposite
+            // things to the total and the user can move an import between them: a package that is
+            // not installed makes the total a floor (FR-024a) — installing it, or adding the
+            // tsconfig `paths` entry that makes the daemon see a specifier as first-party, must move
+            // the signature so the total is recomputed rather than served from L1.
+            let request = match &import.package {
+                SizedPackage::Installed(request) => request,
+                SizedPackage::NotInstalled => {
+                    return format!("not_installed:{}", import.specifier);
+                }
+                SizedPackage::PathAlias => return format!("path_alias:{}", import.specifier),
             };
 
             match resolve_package_entry(&context.active_document_path, request) {

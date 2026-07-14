@@ -30,7 +30,9 @@ use crate::{
         AnalysisContext, analyze_import, analyze_resolved_import_with_dependencies,
     },
     pipeline::file_size::{SizedImport, annotate_shared_bytes, compute_file_size},
-    pipeline::resolver::{ResolvedPackage, find_package_root, resolve_package_entry},
+    pipeline::resolver::{
+        ResolvedPackage, find_package_root, resolve_package_entry, resolves_to_first_party_source,
+    },
 };
 use rayon::prelude::*;
 use serde_json::Value;
@@ -1072,17 +1074,49 @@ impl ImportLensService {
         context: &AnalysisContext,
         states: Vec<ImportAnalysisItem>,
     ) -> FileSizeDocumentResponse {
-        // EVERY detected import reaches the aggregate — including one whose package is not installed
-        // at all, which has no `request` because a request carries the installed version.
+        // EVERY detected import reaches the aggregate — including one with no `request`, because a
+        // request carries the installed version and there is none.
         //
         // Such an import used to be `filter_map`ped away right here, so it never reached the floor
         // check: the file's total silently omitted it, was cached, was persisted as the file's
         // baseline, and `importlens check` exited 0 on a number that was missing a whole dependency.
         // It is a floor now, like every other unmeasured contributor (SRS FR-024a, bullet 4).
+        //
+        // But "no request" is TWO facts, and flagging both cost a regression of its own. A **path
+        // alias** (`@app/components`, a bare `components/Button` under a `baseUrl`) is not a package
+        // at all — it points at first-party source, which Import Lens does not measure (ADR-0004),
+        // so its zero is a fact and not a gap. Treating an alias as a missing dependency made every
+        // file that uses path aliases a permanent floor: never cached, never persisted, never judged.
+        //
+        // The discriminator is POSITIVE evidence — the specifier resolves, through tsconfig `paths`,
+        // to first-party source — and never the absence of it. A specifier that resolves to nothing
+        // is a floor, whether the project declared it or not: a typo and an uninstalled dependency
+        // omit the same bytes from this total, and refusing a verdict is the direction ADR-0006
+        // demands to fail in.
+        //
+        // The resolve runs only for an import that HAS no request (a rare path), and it reuses the
+        // memoized `references` walk for the workspace's config, so the happy path pays nothing. The
+        // RESOLVERS are rebuilt per query on purpose: one that outlives the query memoizes the
+        // filesystem, and the miss it memoizes is the one answer that must never be cached — an
+        // import written before the file it points at would stay a floor for the daemon's life, even
+        // after the developer created the file (`ResolverSet::alias_config_graphs`).
+        //
+        // It is keyed on the WORKSPACE, not on the document: "does this specifier map to first-party
+        // source?" is a question about the project's alias table, and the answer must not change
+        // because the import happens to sit in a `.vue` file rather than a `.ts` one. It did — see
+        // `resolves_to_first_party_source`.
         let sized = states
             .iter()
             .map(|state| match state.request.clone() {
                 Some(request) => SizedImport::installed(request, state.result.clone()),
+                None if resolves_to_first_party_source(
+                    &context.workspace_root,
+                    &context.active_document_path,
+                    &state.detected.specifier,
+                ) =>
+                {
+                    SizedImport::path_alias(state.detected.specifier.clone())
+                }
                 None => SizedImport::not_installed(state.detected.specifier.clone()),
             })
             .collect::<Vec<_>>();
@@ -2215,6 +2249,51 @@ impl ImportLensService {
         }
         crate::pipeline::resolver::invalidate_shared_resolvers();
         crate::cache::memory::bump_cache_generation();
+        true
+    }
+
+    /// A `tsconfig.json` / `jsconfig.json` changed on disk, so the workspace's **alias table** did.
+    ///
+    /// That table is the sole discriminator between a path alias and a package that is not
+    /// installed (`pipeline::resolver::resolves_to_first_party_source`), and the daemon read it
+    /// exactly once: `oxc_resolver` memoizes the parsed config in the shared resolver's FS cache,
+    /// and nothing ever dropped it. So a developer hitting the floor the SRS tells them to repair —
+    /// "mirror the alias into tsconfig `paths`" — applied the repair, saved the file, and the
+    /// daemon went on returning `incomplete: true` for the rest of its life. The remedy the spec
+    /// prescribes did nothing.
+    ///
+    /// **What this still buys, now that the alias resolvers memoize no filesystem fact.** A `paths`
+    /// edit no longer needs a message at all: the resolvers are rebuilt per query (which is what
+    /// stops a floor being sticky), so the config is re-read on the next request. What survives the
+    /// query is the **reachable-config walk** — which projects the workspace's `references` graph
+    /// reaches — and a config that starts *referencing* the project that owns the `paths` is
+    /// invisible until that memo is dropped. This is what drops it.
+    ///
+    /// It rides the SAME path a `node_modules` change already rides (the extension's watcher →
+    /// `node_modules_changed` → here → `invalidate_shared_resolvers`), because it is the same fact:
+    /// something the resolvers memoized is no longer true.
+    ///
+    /// What it does NOT do is bump the cache generation or touch a shard. A tsconfig has no bearing
+    /// on what a package *weighs* — package entries are resolved by the runtime resolvers, which
+    /// never read it — so re-verifying every cached import against disk would buy nothing. What it
+    /// does invalidate is the L1 **aggregate**: a file whose alias classification flips changes
+    /// which of its imports contribute bytes, and whether its total is a floor at all.
+    ///
+    /// Returns whether anything was invalidated, so an empty batch stays a no-op.
+    pub fn invalidate_workspace_config_paths(&self, config_paths: &[String]) -> bool {
+        if config_paths.is_empty() {
+            return false;
+        }
+
+        crate::logging::log_debug(
+            "cache",
+            format!(
+                "workspace config changed ({} path(s)); dropping the shared resolvers and L1 aggregates",
+                config_paths.len()
+            ),
+        );
+        crate::pipeline::resolver::invalidate_shared_resolvers();
+        crate::pipeline::file_size_cache::shared_file_size_cache().clear();
         true
     }
 

@@ -1,8 +1,12 @@
 use crate::cache::key::CacheIdentity;
 use crate::ipc::protocol::{ImportRequest, ImportRuntime};
-use oxc_resolver::{ModuleType, ResolveOptions, Resolver};
+use oxc_resolver::{
+    ModuleType, PathUtil, ResolveOptions, Resolver, TsConfig, TsconfigDiscovery, TsconfigOptions,
+    TsconfigReferences,
+};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, RwLock},
@@ -301,6 +305,258 @@ fn find_package_manifest(
     })
 }
 
+/// Whether `specifier` resolves — through the project's `tsconfig.json` / `jsconfig.json` `paths` /
+/// `baseUrl` — to a real file **outside `node_modules`**: first-party source, and therefore a **path
+/// alias** rather than a package.
+///
+/// **The question is about the WORKSPACE'S ALIAS TABLE, not about the importing document.**
+/// "Does this specifier map to first-party source?" is a property of the project's `paths` /
+/// `baseUrl` and of the file those point at. Which document happens to contain the import decides
+/// nothing — the same specifier in the same project means the same thing from a `.ts`, a `.vue`, a
+/// `.svelte` or an `.astro` file.
+///
+/// It was keyed on the document, and that broke three of the six languages the extension activates
+/// on. The first implementation used `resolve_file`, which drives `TsconfigDiscovery::Auto`:
+/// oxc walks up to the nearest tsconfig **that claims the document through `files` / `include` /
+/// `exclude`**, and returns `None` when none does. TypeScript's default `include` claims no `.vue`,
+/// `.svelte` or `.astro` file — so for every Vue, Svelte and Astro user, **every file using a path
+/// alias stayed a permanent floor**: never cached, never persisted, and refused a verdict by
+/// `importlens check`. That is the exact regression the alias fix is named for, surviving inside
+/// the fix.
+///
+/// So the config is located by [`find_workspace_config`] and handed to oxc explicitly
+/// (`TsconfigDiscovery::Manual`), which applies its `paths` regardless of what `include` claims.
+///
+/// **And that alone regressed the solution-style config**, which is the literal create-vue /
+/// create-astro scaffold: a root `tsconfig.json` that is nothing but `references`, with the real
+/// `paths` in a referenced `tsconfig.app.json`. `include` had been the only thing distinguishing
+/// sibling referenced projects, and with it discarded `TsconfigReferences::Auto` falls back to
+/// picking the **first referenced project whose base directory contains the document** — in a
+/// solution-style config every referenced project sits at the workspace root, so all of them contain
+/// it and the tie breaks on **`references` list order**. create-vue lists the project *without*
+/// `paths` first. The alias then resolved to nothing from every document type, `.ts` included.
+///
+/// The answer is to stop asking oxc to CHOOSE a project at all, because the question is
+/// document-independent: *does this specifier map, through **any** `paths` table the workspace
+/// reaches, to a first-party file that exists?* So [`ResolverSet::alias_resolvers`] collects every
+/// reachable table — the nearest config, everything in its `references` (transitively), and the
+/// `extends` chain each of those folds in — and the specifier is tried against **each**, with
+/// `TsconfigReferences::Disabled` so no resolver is ever in the business of picking a sibling. One
+/// hit is positive evidence. The answer cannot depend on which document asks, nor on the order the
+/// references happen to be listed in.
+///
+/// The discriminator stays **positive evidence**, never the absence of it: an alias is recognized
+/// because it *resolves to a real file outside `node_modules`*, which is the thing that actually
+/// makes its zero a fact. So the two errors are not symmetric. A specifier that resolves to nothing
+/// — a typo, a stale import, a genuinely uninstalled dependency — is a **floor**, which refuses a
+/// verdict; it can never be a silent pass on a total that is missing a whole package. That is the
+/// direction ADR-0006 demands to fail in.
+///
+/// This is the one fact that tells the two kinds of "no `node_modules/<name>/package.json`" apart,
+/// and they must never be conflated:
+///
+/// * **a package that is not installed.** Its bytes belong in the file's total and are missing from
+///   it, so the total is a floor (SRS FR-024a, bullet 4). Whether the project *declared* it changes
+///   nothing: `import _ from "lodash"` omits exactly the same bytes whether or not `package.json`
+///   mentions lodash, so declaration is **not** the discriminator — an earlier attempt made it one
+///   and had to narrow FR-024a to fit, blessing a typo'd import as an alias.
+/// * **a specifier that is not a package at all** — a tsconfig / bundler **path alias**
+///   (`@app/components`, `~lib/foo`, a bare `components/Button` under a `baseUrl`) pointing at
+///   first-party source. Import Lens measures third-party imports ([ADR-0004]), so first-party code
+///   contributes nothing to any total it reports, exactly like a relative import. It is not a gap,
+///   and it must flag nothing.
+///
+/// Treating the second as the first made **every file that uses path aliases a permanent floor**.
+/// Aliases are ordinary in real TypeScript projects.
+///
+/// **The target does NOT have to sit inside the workspace root.** A previous revision required that,
+/// mirroring the bound [`find_workspace_config`] holds on the *config*, and the two are not the same
+/// rule. A target that **exists** and is **not** inside `node_modules` is first-party source wherever
+/// it sits — the project's own tsconfig says so — and it contributes no package bytes to any total
+/// Import Lens reports, so it must flag nothing. With the bound, opening **one package of a
+/// monorepo** (an ordinary way to open one) made every file using a cross-package alias
+/// (`"@shared/*": ["../shared/*"]`) a permanent floor. The `node_modules` test is what stops a real
+/// package being mistaken for source, and it is the only bound the target needs.
+///
+/// **No filesystem fact here is memoized, and that is deliberate** (see [`ResolverSet`]): the
+/// resolvers are built per query, so an alias whose target did not exist *yet* — the import written
+/// before the file it points at — stops being a floor the moment the file appears, with no daemon
+/// restart and no invalidation message. A memoized miss is a cached negative that nothing can lift,
+/// which is the same defect class as the config the daemon read exactly once.
+///
+/// The residual limits, stated rather than papered over. All but the last land on **floor** —
+/// conservative, never a wrong number:
+///
+/// * an alias declared **only** in a Vite / webpack / Rollup config, which the daemon does not read;
+/// * an alias whose target file does not exist (the *pattern* matching is not evidence; the file is);
+/// * a `references` graph wider than [`MAX_REACHABLE_ALIAS_CONFIGS`], whose tail is not asked;
+/// * and the one that does **not** point at floor: because *every* reachable table is asked, an alias
+///   defined only in `tsconfig.node.json` also resolves for a document governed by
+///   `tsconfig.app.json`. That is inherent to a document-independent answer (nothing tells the daemon
+///   which project owns a document once `include` is discarded — see [`alias_resolve_options`]), and
+///   it errs toward "flag nothing" for a specifier that really is first-party source *somewhere* in
+///   the workspace. It can never invent a number: the specifier still resolves to a file that exists
+///   outside `node_modules`, which weighs nothing in either project.
+pub fn resolves_to_first_party_source(
+    workspace_root: &Path,
+    active_document_path: &Path,
+    specifier: &str,
+) -> bool {
+    let Some(directory) = active_document_path.parent() else {
+        return false;
+    };
+    let resolvers = shared_resolvers();
+    let Some(alias_resolvers) = resolvers.alias_resolvers(workspace_root, active_document_path)
+    else {
+        // No `tsconfig.json` / `jsconfig.json` anywhere between the document and the workspace root:
+        // the project has no alias table the daemon can read, so there is no positive evidence to
+        // be had and the specifier is not an alias.
+        return false;
+    };
+
+    // ANY reachable table that maps the specifier to first-party source settles it. There is no
+    // "the" project to choose, and choosing one is what broke the create-vue scaffold.
+    alias_resolvers.iter().any(|resolver| {
+        resolver
+            .resolve(directory, specifier)
+            .is_ok_and(|resolution| is_first_party_source(&resolution.full_path()))
+    })
+}
+
+/// The positive evidence itself: a file that **exists** and is not inside `node_modules` — where it
+/// would be a package, whose bytes this file's total owes.
+fn is_first_party_source(path: &Path) -> bool {
+    path.is_file()
+        && !path
+            .components()
+            .any(|component| component.as_os_str() == "node_modules")
+}
+
+/// The config files whose `paths` / `baseUrl` make up the workspace's alias table, nearest first.
+///
+/// `jsconfig.json` is here because a JavaScript project declares its aliases in it and in nothing
+/// else — and `oxc_resolver`'s own discovery looks for `tsconfig.json` alone, which is why the
+/// previous implementation could not see one at all. Naming the config explicitly is what lets us
+/// read either.
+const ALIAS_CONFIG_FILE_NAMES: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
+
+/// The nearest `tsconfig.json` / `jsconfig.json` at or above the document, **bounded at the
+/// workspace root**.
+///
+/// The bound is not cosmetic: an unbounded walk reaches `C:\Users\<you>\tsconfig.json` and would
+/// let a config from outside the project decide whether one of its imports is first-party.
+///
+/// A document that is not under the workspace root finds nothing and its specifiers land on floor —
+/// conservative, and the direction ADR-0006 demands to fail in.
+fn find_workspace_config(workspace_root: &Path, active_document_path: &Path) -> Option<PathBuf> {
+    active_document_path
+        .ancestors()
+        .skip(1)
+        .take_while(|directory| directory.starts_with(workspace_root))
+        .find_map(|directory| {
+            ALIAS_CONFIG_FILE_NAMES
+                .iter()
+                .map(|name| directory.join(name))
+                .find(|candidate| candidate.is_file())
+        })
+}
+
+/// A cap on the `references` graph, so a config that references a hundred projects cannot turn one
+/// unresolvable specifier into a hundred resolver builds. Real scaffolds have two or three.
+///
+/// **It is a truncation, and it is a residual limit** (stated in SRS FR-024a, not papered over): the
+/// tail of a wider graph is not asked, so an alias defined only in the 25th reachable project reads
+/// as a floor. Conservative, and the direction to fail in.
+const MAX_REACHABLE_ALIAS_CONFIGS: usize = 24;
+
+/// Every config whose `paths` table the workspace can reach from `config_file`: the config itself,
+/// and every project in its `references`, transitively.
+///
+/// The `extends` chain is NOT enumerated here, and does not need to be — `oxc_resolver` folds an
+/// extended config's `compilerOptions.paths` into the extending config when it loads one, so a
+/// resolver built on `config_file` already sees them.
+///
+/// `references` are different in kind: a referenced project is a *separate* program with its own
+/// alias table, not a base whose settings are inherited. Nothing merges them, and the one that owns
+/// the `paths` is not knowable from the document (see [`resolves_to_first_party_source`]) — so the
+/// daemon collects them all and asks each.
+fn reachable_alias_configs(config_file: &Path) -> Vec<PathBuf> {
+    let mut discovered = vec![config_file.to_path_buf()];
+    let mut next = 0;
+
+    while next < discovered.len() && discovered.len() < MAX_REACHABLE_ALIAS_CONFIGS {
+        let current = discovered[next].clone();
+        next += 1;
+
+        for referenced in referenced_alias_configs(&current) {
+            if !discovered.contains(&referenced) {
+                discovered.push(referenced);
+                if discovered.len() >= MAX_REACHABLE_ALIAS_CONFIGS {
+                    break;
+                }
+            }
+        }
+    }
+
+    discovered
+}
+
+/// The configs named in one config's `references`, as absolute paths to the config *files* — **each
+/// one checked on its own, so one bad entry costs only its own table.**
+///
+/// This used to hand the whole config to `oxc_resolver`'s `resolve_tsconfig` with
+/// `TsconfigReferences::Auto` and read `references_resolved`. That call loads **every** referenced
+/// project and fails if *any* of them cannot be loaded, so a single stale entry — a `references`
+/// pointing at a `tsconfig.node.json` somebody deleted, which is not exotic — returned `Err`, the
+/// walk enumerated **nothing**, and every alias in the workspace became a floor. A bad reference must
+/// cost that project's table and no other.
+///
+/// The parse is still oxc's own ([`TsConfig::parse`]): a `tsconfig.json` is JSONC (the create-vue
+/// scaffold ships comments in one), and a second parser here would be a second source of truth about
+/// what a tsconfig means. It is used *without* loading the references, which is exactly the part that
+/// could fail. `references` are never inherited through `extends` — oxc's `extend_tsconfig` copies
+/// `files` / `include` / `exclude` / `compilerOptions` and not `references` — so the config's own
+/// text is the whole list.
+///
+/// A config that cannot be read or parsed yields nothing rather than failing the lookup: the tables
+/// that *did* load are still evidence, and a specifier none of them maps is a floor.
+fn referenced_alias_configs(config_file: &Path) -> Vec<PathBuf> {
+    let Some(directory) = config_file.parent() else {
+        return Vec::new();
+    };
+    let Ok(source) = fs::read_to_string(config_file) else {
+        return Vec::new();
+    };
+    let Ok(tsconfig) = TsConfig::parse(true, config_file, config_file, source) else {
+        return Vec::new();
+    };
+
+    tsconfig
+        .references
+        .iter()
+        .filter_map(|reference| referenced_config_file(directory, &reference.path))
+        .collect()
+}
+
+/// What config a single `references` entry names, or `None` if it names nothing that exists.
+///
+/// The three spellings are `oxc_resolver`'s own (`Cache::get_tsconfig`), and TypeScript's: a path to
+/// a **file** is that file; a path to a **directory** implies its `tsconfig.json`; anything else gets
+/// `.json` appended.
+fn referenced_config_file(directory: &Path, reference: &Path) -> Option<PathBuf> {
+    let candidate = directory.normalize_with(reference);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    if candidate.is_dir() {
+        let implied = candidate.join("tsconfig.json");
+        return implied.is_file().then_some(implied);
+    }
+
+    let with_extension = append_extension(&candidate, "json");
+    with_extension.is_file().then_some(with_extension)
+}
+
 pub fn find_package_root(
     active_document_path: &Path,
     package_name: &str,
@@ -523,12 +779,39 @@ fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
     Ok(found_path)
 }
 
+/// A cap on the alias-config-graph memo, which is otherwise keyed by every distinct nearest-config
+/// path the daemon has ever been asked about — unbounded, in a monorepo with a `tsconfig.json` per
+/// package. Overflow **clears** the map rather than evicting one entry: the map holds path lists, not
+/// measurements, so the whole cost of being wrong is one re-walk of the `references` graph, and an
+/// LRU would be more machinery than the thing it protects.
+const MAX_MEMOIZED_ALIAS_CONFIG_GRAPHS: usize = 64;
+
 /// The three runtime resolvers share one `oxc_resolver` FS cache (Component and
 /// Client use identical options, so they share a resolver; Server has its own).
 /// Building a fresh resolver per request threw that cache away every time.
 pub struct ResolverSet {
     browser: Resolver,
     server: Resolver,
+    /// The `references` graph reachable from a nearest `tsconfig.json` / `jsconfig.json`: config
+    /// paths only, memoized per nearest-config path.
+    ///
+    /// **What is memoized is the WALK, not the filesystem.** The walk parses every reachable config
+    /// to enumerate its `references`, and that is the expensive part; the resolvers built from these
+    /// paths are built **fresh on every query** and thrown away
+    /// ([`ResolverSet::alias_resolvers`]) — because an `oxc_resolver` that outlives a query memoizes
+    /// the filesystem, and a memoized **miss** is a cached negative that nothing lifts. An alias
+    /// whose target did not exist when the daemon first looked would stay a floor for the daemon's
+    /// life, even after the developer created the file. That is the same defect as the config the
+    /// daemon read exactly once, one level down.
+    ///
+    /// (Each alias resolver must in any case hold its OWN oxc FS cache rather than sharing one: oxc
+    /// memoizes a **manually configured** tsconfig on the cache entry for `/` — one slot, whatever
+    /// the config path — so two configs sharing a cache would silently answer with whichever loaded
+    /// first. That is precisely the shape here.)
+    ///
+    /// The map dies with the `ResolverSet` on [`invalidate_shared_resolvers`], which is what makes a
+    /// `tsconfig.json` edit take effect (FR-027a).
+    alias_config_graphs: RwLock<HashMap<PathBuf, Arc<Vec<PathBuf>>>>,
 }
 
 impl ResolverSet {
@@ -537,7 +820,11 @@ impl ResolverSet {
         // clone_with_options shares the same Arc<Cache>, so all runtimes reuse
         // one set of memoized (option-independent) filesystem facts.
         let server = browser.clone_with_options(resolve_options(ImportRuntime::Server));
-        Self { browser, server }
+        Self {
+            browser,
+            server,
+            alias_config_graphs: RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn resolver(&self, runtime: ImportRuntime) -> &Resolver {
@@ -545,6 +832,101 @@ impl ResolverSet {
             ImportRuntime::Component | ImportRuntime::Client => &self.browser,
             ImportRuntime::Server => &self.server,
         }
+    }
+
+    /// The resolvers that read the workspace's alias tables — one per config reachable from the
+    /// nearest one — used by [`resolves_to_first_party_source`] and by nothing else.
+    ///
+    /// They are deliberately NOT the resolver that finds package entries. A tsconfig `paths` entry
+    /// can shadow a real package name, and a *measurement* must be of what the package manager
+    /// actually installed — the bytes that ship — not of whatever the editor's alias table points
+    /// at. The alias tables answer one question only: "is this specifier first-party?"
+    ///
+    /// **Built fresh, every query, on purpose.** See [`ResolverSet::alias_config_graphs`]: a
+    /// surviving resolver caches the filesystem, and the miss it caches is the one answer that must
+    /// never be cached. The query runs only for an import with no installed package behind it, and
+    /// it reuses the memoized config graph, so what a rebuild costs is a `Resolver` per reachable
+    /// config and a JSONC parse per config it actually consults — against a Rolldown build, nothing.
+    fn alias_resolvers(
+        &self,
+        workspace_root: &Path,
+        active_document_path: &Path,
+    ) -> Option<Vec<Resolver>> {
+        let config_file = find_workspace_config(workspace_root, active_document_path)?;
+
+        Some(
+            self.alias_config_graph(&config_file)
+                .iter()
+                .map(|config| Resolver::new(alias_resolve_options(config)))
+                .collect(),
+        )
+    }
+
+    /// The memoized `references` walk for one nearest-config path.
+    fn alias_config_graph(&self, config_file: &Path) -> Arc<Vec<PathBuf>> {
+        if let Ok(memo) = self.alias_config_graphs.read()
+            && let Some(configs) = memo.get(config_file)
+        {
+            return Arc::clone(configs);
+        }
+
+        let configs = Arc::new(reachable_alias_configs(config_file));
+        if let Ok(mut memo) = self.alias_config_graphs.write() {
+            if memo.len() >= MAX_MEMOIZED_ALIAS_CONFIG_GRAPHS {
+                memo.clear();
+            }
+            return Arc::clone(
+                memo.entry(config_file.to_path_buf())
+                    .or_insert_with(|| Arc::clone(&configs)),
+            );
+        }
+        configs
+    }
+}
+
+/// Resolution options for ONE alias table: that config, handed over **explicitly**.
+///
+/// `TsconfigDiscovery::Manual` is half the fix. `Auto` only applies a config that CLAIMS the
+/// importing document through `files` / `include` / `exclude`, and TypeScript's default `include`
+/// claims no `.vue`, `.svelte` or `.astro` file — so an alias resolved fine from a `.ts` document
+/// and resolved to nothing from the other three. `Manual` applies the `paths` table as a property
+/// of the project, which is what it is.
+///
+/// `TsconfigReferences::Disabled` is the other half, and **its old justification was measured false,
+/// so here is the one that holds.** The old one said `Auto` would make oxc pick ONE referenced
+/// project by `references` **list order**, killing the create-vue scaffold. That was true of the
+/// design where oxc chose the project; it is not true of this one, because [`reachable_alias_configs`]
+/// walks the `references` graph itself and every table gets its own resolver. Flipping this single
+/// word to `Auto` leaves the whole suite green — the alias matrix included — so *that* claim detects
+/// nothing and has been retracted.
+///
+/// What `Disabled` really buys is **immunity to a broken reference**. Under `Auto`, loading a config
+/// also loads every project in its `references`, and oxc fails the whole load if any one of them
+/// cannot be read: a config that owns a perfectly good `paths` table and happens to list a
+/// `tsconfig.node.json` somebody deleted would resolve **nothing at all**, and every alias in it
+/// would become a floor. `Disabled` drops the references before they are loaded, so that config's own
+/// table still answers. The sibling half of the same hazard is fixed in
+/// [`referenced_alias_configs`], and both have a test that goes red without them.
+///
+/// Nobody picks a project; every table is asked. An `extends` chain still folds in automatically,
+/// which is why it needs no walk of its own.
+///
+/// The extension list adds `.vue`, `.svelte` and `.astro` to the module extensions, because an
+/// alias in those projects routinely points AT a component file (`@app/Button` → `src/Button.vue`).
+/// It only ever widens what counts as *first-party source* — the file still has to exist and still
+/// has to sit outside `node_modules` — and this resolver never picks a package entry, so no
+/// measurement can reach these extensions.
+fn alias_resolve_options(config_file: &Path) -> ResolveOptions {
+    let mut extensions = module_extensions();
+    extensions.extend([".vue", ".svelte", ".astro"].map(str::to_owned));
+
+    ResolveOptions {
+        tsconfig: Some(TsconfigDiscovery::Manual(TsconfigOptions {
+            config_file: config_file.to_path_buf(),
+            references: TsconfigReferences::Disabled,
+        })),
+        extensions,
+        ..resolve_options(ImportRuntime::Component)
     }
 }
 
@@ -561,10 +943,16 @@ pub fn shared_resolvers() -> Arc<ResolverSet> {
         .unwrap_or_else(|_| Arc::new(ResolverSet::new()))
 }
 
-/// Publishes a fresh `ResolverSet` (empty cache). In-flight resolutions keep
-/// their `Arc` snapshot and finish against the old cache, so this is safe to
-/// call while background prewarm/report resolutions run — unlike oxc's in-place
-/// `clear_cache`, which is documented as unsafe against concurrent resolution.
+/// Publishes a fresh `ResolverSet` (empty cache, empty alias-config-graph memo). In-flight resolutions
+/// keep their `Arc` snapshot and finish against the old cache, so this is safe to call while
+/// background prewarm/report resolutions run — unlike oxc's in-place `clear_cache`, which is
+/// documented as unsafe against concurrent resolution.
+///
+/// It is what a `tsconfig.json` / `jsconfig.json` edit rides, as well as a `node_modules` change.
+/// Without that, the alias table the daemon loaded at startup was the alias table it used until it
+/// died: a developer who followed the documented remedy — add the missing `paths` entry — saw the
+/// file stay a floor forever, because the config had been memoized in the resolver's FS cache
+/// (`service::invalidate_workspace_config_paths`).
 pub fn invalidate_shared_resolvers() {
     if let Ok(mut guard) = resolver_slot().write() {
         *guard = Arc::new(ResolverSet::new());
@@ -841,4 +1229,292 @@ fn subpath_for_request(request: &ImportRequest) -> Option<&str> {
 
 fn path_looks_cjs(path: &str) -> bool {
     path.ends_with(".cjs") || path.ends_with(".cts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ConfigFixture {
+        root: PathBuf,
+    }
+
+    impl ConfigFixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "il-config-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::remove_dir_all(&root).ok();
+            fs::create_dir_all(&root).expect("fixture root");
+            Self { root }
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("parent dir");
+            fs::write(&path, contents).expect("write");
+            path
+        }
+    }
+
+    impl Drop for ConfigFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    /// **The Minor, and it is not cosmetic.** The walk that looks for the workspace's alias table
+    /// must stop at the workspace root. Unbounded, it reaches `C:\Users\<you>\tsconfig.json` — a
+    /// config from outside the project, deciding whether one of its imports is first-party. A stray
+    /// `paths` entry in a home directory would silently bless a missing dependency as an alias,
+    /// which is a total short a whole package, cached and passed by `importlens check`.
+    #[test]
+    fn the_alias_config_search_stops_at_the_workspace_root() {
+        let fixture = ConfigFixture::new("bounded");
+        // A tsconfig ABOVE the workspace. Nothing in the project put it there.
+        fixture.write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@app/*":["elsewhere/*"]}}}"#,
+        );
+        let workspace_root = fixture.root.join("workspace");
+        fs::create_dir_all(workspace_root.join("src")).expect("workspace src");
+
+        assert_eq!(
+            find_workspace_config(
+                &workspace_root,
+                &workspace_root.join("src").join("index.ts")
+            ),
+            None,
+            "a config outside the workspace must never supply the workspace's alias table"
+        );
+    }
+
+    /// A JavaScript project declares its aliases in `jsconfig.json` and in nothing else.
+    /// `oxc_resolver`'s own discovery looks for `tsconfig.json` alone — which is why naming the
+    /// config explicitly is what lets the daemon read one at all.
+    #[test]
+    fn the_alias_config_search_finds_a_jsconfig() {
+        let fixture = ConfigFixture::new("jsconfig");
+        let config = fixture.write(
+            "jsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+        );
+        fs::create_dir_all(fixture.root.join("src")).expect("src");
+
+        assert_eq!(
+            find_workspace_config(&fixture.root, &fixture.root.join("src").join("index.js")),
+            Some(config),
+        );
+    }
+
+    /// The nearest config wins, exactly as TypeScript resolves one: a monorepo package's own
+    /// tsconfig, not the repo root's.
+    #[test]
+    fn the_alias_config_search_prefers_the_nearest_config() {
+        let fixture = ConfigFixture::new("nearest");
+        fixture.write("tsconfig.json", r#"{"compilerOptions":{"baseUrl":"."}}"#);
+        let nested = fixture.write(
+            "packages/app/tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+        );
+
+        assert_eq!(
+            find_workspace_config(
+                &fixture.root,
+                &fixture
+                    .root
+                    .join("packages")
+                    .join("app")
+                    .join("src")
+                    .join("index.ts"),
+            ),
+            Some(nested),
+        );
+    }
+
+    /// A project with no config at all has no alias table the daemon can read, so there is no
+    /// positive evidence to be had and every bare specifier that is not installed is a floor.
+    #[test]
+    fn a_specifier_is_not_first_party_without_a_config() {
+        let fixture = ConfigFixture::new("no-config");
+        fixture.write("src/components.ts", "export const Button = 1;\n");
+
+        assert!(!resolves_to_first_party_source(
+            &fixture.root,
+            &fixture.root.join("src").join("index.ts"),
+            "@app/components",
+        ));
+    }
+
+    /// Every `paths` table the nearest config REACHES is asked, including the ones in its
+    /// `references` — and `reachable_alias_configs` is what finds them. The solution-style scaffold
+    /// keeps its aliases in a referenced project, and the root config that points at it has none of
+    /// its own, so a walk that stops at the root config can only ever answer "not an alias".
+    #[test]
+    fn the_reachable_configs_include_every_referenced_project() {
+        let fixture = ConfigFixture::new("references");
+        let root = fixture.write(
+            "tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./tsconfig.node.json"},{"path":"./tsconfig.app.json"}]}"#,
+        );
+        let node = fixture.write("tsconfig.node.json", r#"{"include":["vite.config.*"]}"#);
+        let app = fixture.write(
+            "tsconfig.app.json",
+            r#"{"include":["src/**/*"],"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+        );
+
+        let mut reachable = reachable_alias_configs(&root);
+        reachable.sort();
+        let mut expected = vec![root, node, app];
+        expected.sort();
+
+        assert_eq!(reachable, expected);
+    }
+
+    /// **An alias target above the workspace root IS first-party source.** A monorepo opened at one
+    /// package — `packages/web`, whose `paths` reach `../shared` — is an ordinary way to open one,
+    /// and the sibling package's source is the user's own code: it ships no npm-package bytes, so it
+    /// must flag nothing.
+    ///
+    /// A previous revision required the target to sit inside the workspace root, mirroring the bound
+    /// [`find_workspace_config`] holds on the *config*. The two are not the same rule, and this one
+    /// made **every file using a cross-package alias a permanent floor** — never cached, never
+    /// persisted, and refused a verdict by `importlens check`. The `node_modules` test is what stops
+    /// a real package being mistaken for source, and it is the only bound the target needs.
+    #[test]
+    fn an_alias_target_above_the_workspace_root_is_first_party_source() {
+        let fixture = ConfigFixture::new("monorepo-alias");
+        fixture.write("packages/shared/ui.ts", "export const Button = 1;\n");
+        fixture.write("packages/web/src/local.ts", "export const local = 1;\n");
+        fixture.write(
+            "packages/web/tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@shared/*":["../shared/*"],"@app/*":["src/*"]}}}"#,
+        );
+
+        let workspace_root = fixture.root.join("packages").join("web");
+        let document = workspace_root.join("src").join("index.ts");
+
+        assert!(
+            resolves_to_first_party_source(&workspace_root, &document, "@shared/ui"),
+            "the alias target exists and is not inside node_modules: it is the user's own source, \
+             wherever it sits, and a total that omits it omits nothing"
+        );
+        assert!(
+            resolves_to_first_party_source(&workspace_root, &document, "@app/local"),
+            "test setup: the same config's in-workspace alias must still resolve"
+        );
+        assert!(
+            !resolves_to_first_party_source(&workspace_root, &document, "@shared/missing"),
+            "and the bound that matters still holds: a target that does not exist is no evidence"
+        );
+    }
+
+    /// **The floor is not sticky.** An import written before the file it points at is correctly a
+    /// floor — and creating that file must lift it, on the next request, with no daemon restart and
+    /// no invalidation message. Nothing watches first-party source, so nothing can send one.
+    ///
+    /// It did not: the alias resolvers were memoized per config, and `oxc_resolver` negative-caches a
+    /// missing path in its FS cache. The daemon's *first* answer for a specifier was its answer
+    /// forever — a cached negative that nothing invalidates, the same defect as the config the daemon
+    /// read exactly once. The resolvers are therefore built per query now, and only the `references`
+    /// walk is memoized.
+    #[test]
+    fn creating_the_alias_target_lifts_the_floor_without_an_invalidation() {
+        let fixture = ConfigFixture::new("sticky-floor");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+        );
+        fixture.write("src/index.ts", "export const app = 1;\n");
+        let document = fixture.root.join("src").join("index.ts");
+
+        // The developer writes the import before the component exists. It is a floor, and the daemon
+        // has now looked at (and, before the fix, memoized) a path that does not exist.
+        assert!(
+            !resolves_to_first_party_source(&fixture.root, &document, "@app/components"),
+            "test setup: the alias target does not exist yet, so there is no positive evidence"
+        );
+
+        // They create it. No restart, no `invalidate_shared_resolvers`, no watcher event.
+        fixture.write("src/components.ts", "export const Button = 1;\n");
+
+        assert!(
+            resolves_to_first_party_source(&fixture.root, &document, "@app/components"),
+            "creating the alias target must lift the floor. It did not: the miss was cached in the \
+             memoized resolver's filesystem cache, so the file stayed a floor for the daemon's life \
+             - never cached, never persisted, and refused a verdict by `importlens check`"
+        );
+    }
+
+    /// **`TsconfigReferences::Disabled` is load-bearing, and this is what goes red without it.**
+    ///
+    /// The original justification for `Disabled` — that `Auto` would make oxc pick a referenced
+    /// project by list order — stopped being true when the daemon started walking the `references`
+    /// graph itself, and flipping the word to `Auto` leaves the rest of the suite green.
+    ///
+    /// What `Disabled` actually buys: under `Auto`, oxc loads a config's `references` when it loads
+    /// the config, and **fails the whole load if any one of them cannot be read**. A config that owns
+    /// a perfectly good `paths` table and lists one project that was deleted would then resolve
+    /// nothing at all, and every alias in it would become a floor. `Disabled` drops the references
+    /// before they are loaded, so the config's own table still answers.
+    #[test]
+    fn a_dangling_reference_does_not_silence_the_config_that_declares_it() {
+        let fixture = ConfigFixture::new("dangling-self");
+        // A real alias table, and a `references` entry pointing at a project that is not there —
+        // a `tsconfig.node.json` somebody deleted, which is not exotic.
+        fixture.write(
+            "tsconfig.json",
+            r#"{"references":[{"path":"./tsconfig.deleted.json"}],"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+        );
+        fixture.write("src/components.ts", "export const Button = 1;\n");
+
+        assert!(
+            resolves_to_first_party_source(
+                &fixture.root,
+                &fixture.root.join("src").join("index.ts"),
+                "@app/components",
+            ),
+            "a stale `references` entry must cost that project's table and nothing else. Loading \
+             the references with this config would fail the whole load, and every alias in the \
+             workspace would become a floor"
+        );
+    }
+
+    /// **And a dangling reference must not silence its SIBLINGS either.**
+    ///
+    /// `referenced_alias_configs` used to ask oxc to resolve the root config with its references, and
+    /// read `references_resolved`. One unloadable entry made that call `Err`, so **no** reference was
+    /// enumerated — the `tsconfig.app.json` beside it, which owns the only `paths` table in a
+    /// solution-style scaffold, was never asked, and every alias in the workspace became a floor.
+    /// Each entry is checked on its own now.
+    #[test]
+    fn a_dangling_reference_does_not_silence_its_siblings() {
+        let fixture = ConfigFixture::new("dangling-sibling");
+        let root = fixture.write(
+            "tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./tsconfig.deleted.json"},{"path":"./tsconfig.app.json"}]}"#,
+        );
+        let app = fixture.write(
+            "tsconfig.app.json",
+            r#"{"include":["src/**/*"],"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+        );
+        fixture.write("src/components.ts", "export const Button = 1;\n");
+
+        assert_eq!(
+            reachable_alias_configs(&root),
+            vec![root.clone(), app],
+            "the reference that does not exist is skipped; the one beside it is still enumerated"
+        );
+        assert!(
+            resolves_to_first_party_source(
+                &fixture.root,
+                &fixture.root.join("src").join("index.ts"),
+                "@app/components",
+            ),
+            "one stale `references` entry must not take every alias table in the workspace down \
+             with it"
+        );
+    }
 }

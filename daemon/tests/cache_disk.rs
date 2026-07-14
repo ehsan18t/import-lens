@@ -487,6 +487,68 @@ fn cached(specifier: &str) -> CachedImport {
     }
 }
 
+/// **The L2 WRITE gate, which nothing detected.** (ADR-0006, invariant 3: "the gate lives inside
+/// each durable store".)
+///
+/// `DiskCache` gates a non-durable result on the way **in** *and* on the way **out**, and only the
+/// read gate had a test — so the write gate could be deleted with the whole suite green. That is a
+/// guard nobody is guarding: the two are not redundant, they cover different windows. The read gate
+/// evicts a bad row that is *already on disk*; the write gate is what stops a transient outcome
+/// reaching disk **at all**, which matters because redb outlives the process and because every future
+/// reader of that row (a scan, a rollup, a byte-budget eviction, a `load_recent` prewarm) is one more
+/// path that has to remember to ask.
+///
+/// So this asserts on the **raw redb table**, past both gates: a `panic` result — transient, a
+/// property of this moment's scheduling and not of the package's bytes — must never become a row.
+/// The measured result beside it must, or the assertion would pass on an empty database.
+#[test]
+fn a_transient_result_never_reaches_the_disk_table() {
+    use import_lens_daemon::engine::stage;
+    use redb::ReadableTableMetadata;
+
+    let storage = temp_storage();
+    fs::create_dir_all(&storage).expect("storage dir");
+
+    {
+        let disk = DiskCache::new(Some(storage.clone()), true);
+
+        let mut transient = cached("flaky-lib@1::default");
+        transient.result = ImportResult::unmeasured(
+            "flaky-lib",
+            stage::PANIC,
+            "the build unwound into the boundary's catch_unwind",
+            Vec::new(),
+        );
+        disk.insert("flaky-lib@1::default", &transient)
+            .expect("a refused insert is a no-op, never an error");
+
+        // The control: a real measurement, which MUST land, or an empty table would prove nothing.
+        disk.insert("solid-lib@1::default", &cached("solid-lib@1::default"))
+            .expect("a measured result is durable");
+
+        disk.flush_pending_inserts();
+    }
+
+    let db = Database::open(db_path(&storage)).expect("reopen");
+    let read = db.begin_read().expect("read");
+    let table = read.open_table(CACHE_TABLE).expect("cache table");
+
+    assert!(
+        table.get("solid-lib@1::default").expect("read").is_some(),
+        "test setup: a measured result must reach the disk table, or this test proves nothing"
+    );
+    assert!(
+        table.get("flaky-lib@1::default").expect("read").is_none(),
+        "a transient result must never become a row. The read gate would evict it on the way out, \
+         but L2 outlives the process and every other reader of the table - the byte-budget scan, \
+         the rollup, the prewarm's load_recent - is one more path that has to remember to ask"
+    );
+    assert_eq!(table.len().expect("len"), 1);
+
+    drop(db);
+    fs::remove_dir_all(storage).expect("cleanup");
+}
+
 #[test]
 fn shard_rollup_sums_bytes_and_tracks_oldest_seq() {
     use import_lens_daemon::cache::disk::ShardRollup;

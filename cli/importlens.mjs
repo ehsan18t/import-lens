@@ -137,7 +137,12 @@ export const runImportLensCheck = async ({
     // that eventually will not be asked. The daemon and the extension both learned this the same
     // way, and moved their gates inside their stores.
     if (!isUsableFileSize(result) || transient.length > 0) {
-      unmeasurable.push({ relative, transient, degraded: result.degraded === true });
+      unmeasurable.push({
+        relative,
+        transient,
+        degraded: result.degraded === true,
+        error: result.error ?? null,
+      });
       continue;
     }
 
@@ -193,9 +198,17 @@ export const runImportLensCheck = async ({
   return 0;
 };
 
-const unmeasurableLine = ({ relative, transient, degraded }) => {
+const unmeasurableLine = ({ relative, transient, degraded, error }) => {
   const stages = [...new Set(transient.map((item) => item.stage))].sort().join(", ");
   const count = transient.length;
+
+  // The aggregate failed OUTRIGHT: no bytes at all, for this one file. It used to throw out of
+  // `analyzeFileWithDaemon` and abandon the whole run with exit 2 — one unmeasurable file taking
+  // every other changed file's budget with it, and reporting a code that means "the CLI broke"
+  // rather than the one FR-032a mandates for "could not measure". One bad file is one bad file.
+  if (error) {
+    return `${relative}: could not measure this file (${error}) - budget not evaluated`;
+  }
 
   if (count > 0) {
     return `${relative}: could not measure ${count} ${count === 1 ? "import" : "imports"} (stage: ${stages}); file total is a floor - budget not evaluated`;
@@ -285,7 +298,14 @@ const changedFiles = async (cwd) => {
   };
 };
 
-const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
+/**
+ * One file's raw wire response, flattened into the fields the gate reads. It issues no verdict and
+ * throws for no file: an aggregate that **failed outright** (`error: Some` — nothing could be sized)
+ * used to throw here, which `main` catches into exit **2**, abandoning every other changed file's
+ * budget with it. One unmeasurable file is one unmeasurable file: it is reported as such, the run
+ * continues, and the verdict is the exit 3 that FR-032a mandates for "could not measure".
+ */
+export const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
   const source = await readFile(filePath, "utf8");
   const response = await daemon.request({
     type: "file_size_document",
@@ -299,15 +319,12 @@ const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
     force_fresh: true,
   });
 
-  if (response.error) {
-    throw new Error(`Import Lens file-size request failed for ${filePath}: ${response.error}`);
-  }
-
   // "Is there a size?", never "is there an error?". The old filter was `!item.error`, and a
   // transiently-degraded import carried `error: null` PLUS a fabricated size, so it sailed
   // through — measured against the wrong number, or dropped from the file total entirely.
-  const measured = response.imports.filter((item) => typeof item.brotli_bytes === "number");
-  const unmeasured = response.imports
+  const imports = response.imports ?? [];
+  const measured = imports.filter((item) => typeof item.brotli_bytes === "number");
+  const unmeasured = imports
     .filter((item) => typeof item.brotli_bytes !== "number")
     .map((item) => {
       const stage = item.unmeasured_stage ?? "unknown";

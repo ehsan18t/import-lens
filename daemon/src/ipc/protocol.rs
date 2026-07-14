@@ -946,12 +946,25 @@ pub struct PrewarmPackageJsonMessage {
     pub active_document_path: String,
 }
 
+/// The watcher's "something the daemon memoized is no longer true" message.
+///
+/// It carries two kinds of path because two kinds of file feed the resolvers, and both were only
+/// ever half-watched: a `node_modules/<pkg>/package.json` (an install / uninstall) and a
+/// `tsconfig.json` / `jsconfig.json` (the workspace's **alias table**, the sole discriminator
+/// between a path alias and a package that is not installed). The second is new; without it the
+/// alias table the daemon parsed at startup was the one it used until it died, and the repair the
+/// SRS prescribes for an unrecognized alias — add the `paths` entry — had no effect at all.
+///
+/// `tsconfig_paths` is `#[serde(default)]`, so an older client that sends only
+/// `package_json_paths` still decodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeModulesChangedMessage {
     #[serde(rename = "type")]
     #[serde(default = "node_modules_changed_message_type")]
     pub message_type: String,
     pub package_json_paths: Vec<String>,
+    #[serde(default)]
+    pub tsconfig_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

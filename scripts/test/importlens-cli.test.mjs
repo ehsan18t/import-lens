@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { encode } from "@msgpack/msgpack";
 import {
+  analyzeFileWithDaemon,
   createDaemonClient,
   daemonBinaryPath,
   EXIT_BUDGET_EXCEEDED,
@@ -216,6 +219,77 @@ test("runImportLensCheck refuses a verdict when the file's own combined build fa
     "src/app.ts: the file's combined build failed, so its total is an un-deduplicated sum of its imports and not the file's size - budget not evaluated",
     "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
   ]);
+});
+
+// One file whose AGGREGATE failed outright (`error: Some` — no bytes at all) used to throw out of
+// `analyzeFileWithDaemon`, which `main` catches into exit 2 — abandoning the whole run, and taking
+// every other changed file's budget with it. Exit 2 also means "the CLI broke", not the exit 3
+// FR-032a mandates for "could not measure", so CI could not tell one from the other.
+test("analyzeFileWithDaemon reports a failed aggregate instead of aborting the run", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "importlens-cli-"));
+  const brokenPath = path.join(workspace, "broken.ts");
+  writeFileSync(brokenPath, "import 'broken-lib';\n");
+
+  const daemon = {
+    request: async () => ({
+      request_id: 1,
+      raw_bytes: 0,
+      brotli_bytes: 0,
+      imports: [],
+      states: [],
+      incomplete: false,
+      degraded: false,
+      error: "no import could be sized conservatively",
+      diagnostics: [],
+    }),
+  };
+
+  try {
+    const result = await analyzeFileWithDaemon(brokenPath, workspace, daemon);
+
+    assert.equal(result.error, "no import could be sized conservatively");
+    assert.equal(isUsableFileSize(result), false, "and the gate refuses it, as it always did");
+
+    // End to end: the failed file is reported, the OTHER file is still analyzed and its violation
+    // still printed, and the verdict is exit 3 - never the exit 2 of an aborted run.
+    const output = [];
+    const analyzedPaths = [];
+    const exitCode = await runImportLensCheck({
+      cwd: workspace,
+      budgets: { perImportBrotliBytes: 1000 },
+      changedFiles: async () => ["broken.ts", "measured.ts"],
+      analyzeFile: async (filePath) => {
+        analyzedPaths.push(filePath);
+        return filePath.endsWith("broken.ts")
+          ? analyzeFileWithDaemon(filePath, workspace, daemon)
+          : {
+              filePath,
+              brotliBytes: 900,
+              error: null,
+              incomplete: false,
+              degraded: false,
+              diagnostics: [],
+              unmeasured: [],
+              imports: [{ specifier: "large-lib", brotliBytes: 1500 }],
+            };
+      },
+      writeLine: (line) => output.push(line),
+    });
+
+    assert.equal(
+      analyzedPaths.length,
+      2,
+      "one unmeasurable file must not abandon the rest of the run",
+    );
+    assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
+    assert.deepEqual(output, [
+      "measured.ts: large-lib Brotli budget exceeded: 1.5 kB > 1.0 kB",
+      "broken.ts: could not measure this file (no import could be sized conservatively) - budget not evaluated",
+      "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+    ]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 // The gate the CLI applies to the raw wire response, in isolation. The daemon's

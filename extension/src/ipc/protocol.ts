@@ -346,9 +346,18 @@ export interface PrewarmPackageJsonMessage {
   active_document_path: string;
 }
 
+/**
+ * Something the daemon memoized is no longer true. Two kinds of path, because two kinds of file
+ * feed its resolvers: a `node_modules/<pkg>/package.json` (an install or uninstall), and a
+ * `tsconfig.json` / `jsconfig.json` — the workspace's alias table, which is the only thing that
+ * tells a path alias apart from a package that is not installed. The daemon read that table once
+ * and never again, so adding the `paths` entry that repairs an unrecognized alias did nothing for
+ * the rest of the daemon's life.
+ */
 export interface NodeModulesChangedMessage {
   type: "node_modules_changed";
   package_json_paths: string[];
+  tsconfig_paths: string[];
 }
 
 export interface EnumerateExportsRequest {

@@ -28,8 +28,17 @@ use crate::engine::{diagnostic_stage, stage as engine_stage};
 
 /// The package name is unsafe (traversal, separators). A property of the specifier.
 pub const PACKAGE_VALIDATION: &str = "package_validation";
-/// No `node_modules/<package>/package.json` at all.
+/// No `node_modules/<package>/package.json` at all, and the specifier is not first-party source
+/// either. A missing dependency: its bytes belong in the file's total and are not in it.
 pub const PACKAGE_RESOLUTION: &str = "package_resolution";
+/// The specifier is not a package at all — a tsconfig **path alias** (`@app/components`, `~lib/foo`,
+/// a bare `components/Button` under a `baseUrl`) that RESOLVES to first-party source
+/// (`crate::pipeline::resolver::resolves_to_first_party_source`).
+///
+/// **Not a failure.** Import Lens measures third-party imports (ADR-0004), so first-party code
+/// contributes nothing to a total it reports, exactly like a relative import — the total stays
+/// complete. Only ever an *aggregate* diagnostic; no `ImportResult` carries it.
+pub const PATH_ALIAS: &str = "path_alias";
 /// The manifest exists but cannot be parsed, or has no string `version`.
 pub const PACKAGE_MANIFEST: &str = "package_manifest";
 /// The manifest is fine but no entry point can be resolved from it.
@@ -69,6 +78,7 @@ pub const TYPES_ONLY: &str = "types_only";
 pub const ALL: &[&str] = &[
     PACKAGE_VALIDATION,
     PACKAGE_RESOLUTION,
+    PATH_ALIAS,
     PACKAGE_MANIFEST,
     ENTRY_RESOLUTION,
     ENTRY_METADATA,
@@ -146,6 +156,7 @@ mod tests {
                 engine_stage::PANIC,
                 engine_stage::TIMEOUT,
                 engine_stage::ENGINE_GONE,
+                PATH_ALIAS,
                 ENTRY_METADATA,
                 COMPRESSION,
                 PROTOCOL,
@@ -153,7 +164,9 @@ mod tests {
             ],
             "a stage that reaches a durable store must be classified on purpose. Refused today: \
              the three transient engine stages, plus the machine conditions (`entry_metadata`, \
-             `compression`) and the two stages that never ride an ImportResult"
+             `compression`) and the three stages that never ride an ImportResult (`path_alias`, \
+             `protocol`, `file_size_fallback`) — refusing an aggregate-only stage costs nothing, \
+             because no result carries one into a cache"
         );
 
         for stage in engine_stage::ALL

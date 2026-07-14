@@ -1082,7 +1082,12 @@ where
                 );
             }
             ClientMessage::NodeModulesChanged(message) if hello_received => {
-                if service.invalidate_package_json_paths(&message.package_json_paths) {
+                // Both halves always run: `|` and not `||`, because a batch can carry an install AND
+                // a tsconfig edit, and short-circuiting would drop the second.
+                let invalidated = service
+                    .invalidate_package_json_paths(&message.package_json_paths)
+                    | service.invalidate_workspace_config_paths(&message.tsconfig_paths);
+                if invalidated {
                     prefetcher.cancel();
                 }
             }
