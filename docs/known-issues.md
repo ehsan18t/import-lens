@@ -156,6 +156,50 @@ unconditionally. A build already inside Rolldown cannot be cancelled, so a parke
 shutdown to its 8s limit. A task still running at the deadline is abandoned and its result is
 not persisted — stated in the SRS rather than papered over.
 
+### C6 — A nested `"type"` does not reach the pre-resolved entry (dual-package layouts)
+**Status: Accepted** · One field, two lookups — no fix exists at the current upstream API
+
+The plugin supplies the **package-root** `package.json` for the entry it pre-resolves
+(`HookResolveIdOutput::package_json_path`). Rolldown then makes **two different** lookups against
+it, and the field can only be right for one:
+
+| lookup | manifest Rolldown wants | our supply |
+| --- | --- | --- |
+| `sideEffects` | the **topmost** manifest before the `node_modules` boundary (`find_package_json_for_a_package`) — the package root | **correct** |
+| `"type"` (module format) | the **NEAREST** manifest above the file (`esm_file_format`) | correct **only when no manifest intervenes** |
+
+**What actually happens.** Take the standard dual-package layout — root `package.json` is
+`{"main":"./esm/index.js"}` with no `"type"`, and a nested `esm/package.json` is
+`{"type":"module"}` — whose entry statically imports a CJS dependency. The same package emits two
+different chunks depending on how it is reached (measured in-repo, unminified chunk):
+
+```js
+// reached TRANSITIVELY (Rolldown resolves the file, finds esm/package.json): 1333 B
+var import_dep = /* @__PURE__ */ __toESM(require_dep(), 1);
+
+// reached as the PRE-RESOLVED ENTRY — the production shape: 1330 B
+var import_dep = /* @__PURE__ */ __toESM(require_dep());
+```
+
+The `isNodeMode` flag is what makes the namespace's `default` the whole `module.exports` object,
+which is what Node does for an ES module importing CommonJS. Without it the entry is finalized as
+a CommonJS importer: a **different `default` binding and a different measured size**.
+
+**It is not a regression.** With no manifest supplied at all (the pre-`f2bdc17` behaviour) this
+layout emits the identical 1330 B chunk — the entry's format was `Unknown` then and is decided
+from a `"type"`-less root manifest now. Supplying the root manifest closed the `sideEffects` half
+of the hole and left this half exactly where it was.
+
+**Why it is not fixed.** Swapping in the nearest manifest would break the `sideEffects` half —
+the half that stops a `"sideEffects": false` package's entry keeping statements Rollup and webpack
+drop — which is a strictly larger error on a far more common layout. There is no third option
+through this API.
+
+**What would fix it:** an upstream Rolldown resolve-hook field that accepts the nearest manifest
+separately from the package-root one; or resolving the entry **through** Rolldown instead of
+pre-resolving it, which FR-017/§6.1 forbids (the engine must never re-resolve the bare specifier).
+Recorded in SRS §10.7.
+
 ---
 
 ## Instrumentation honesty

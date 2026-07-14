@@ -138,21 +138,75 @@ impl BuildState {
     }
 }
 
+/// One pre-resolved entry the virtual module maps `import-lens:target/<i>` to, carrying its
+/// package's **root** manifest.
+///
+/// Pre-resolving is the point (§6.1): the engine must never re-resolve the bare package
+/// specifier. But Rolldown builds a plugin-resolved `ResolvedId`'s `package_json` from
+/// `HookResolveIdOutput::package_json_path` and from **nothing else**, so pre-resolving without
+/// supplying the manifest leaves the entry module — and only the entry module — with no package
+/// metadata at all. Every *transitive* module is resolved by Rolldown and gets the real thing.
+///
+/// Supplying it is metadata supply, not a semantic override (ADR-0002): we hand Rolldown a
+/// manifest, and it alone decides what that manifest means. `side_effects` stays `None` — §7.4
+/// reserves the side-effect decision for Rolldown.
+///
+/// **It is the package-ROOT manifest, and that is not the same manifest for both of Rolldown's
+/// lookups.** `sideEffects` is read from the topmost manifest before the `node_modules` boundary —
+/// the package root, so our supply is exactly right, and that is why this exists. `"type"` is read
+/// from the *nearest* manifest above the file. One field cannot answer both: a package that nests
+/// a manifest between its root and its entry (the dual-package `esm/package.json`
+/// `{"type":"module"}` layout) still has its entry's module format decided by the root manifest.
+/// That gap predates supplying anything and cannot be closed at this API — known issue C6. Do not
+/// "fix" it by supplying the nearest manifest instead: that trades a rare format error for a
+/// common `sideEffects` error.
+#[derive(Debug)]
+struct PreResolvedTarget {
+    entry_path: PathBuf,
+    /// `<package_root>/package.json`, or `None` when there is none to point at.
+    ///
+    /// The guard is not caution, it is correctness: Rolldown *reads* this path
+    /// (`Resolver::try_get_package_json_or_create`) and an unreadable one fails the whole build
+    /// with `UNHANDLEABLE_ERROR: Failed to read or parse package.json`. A `BundleEntry` does not
+    /// promise its `package_root` holds a manifest — the pipeline's always does, because that is
+    /// how the root was found, but the engine's own qualification fixtures point at bare
+    /// directories. Absent a manifest there is simply nothing Rolldown would have found either.
+    manifest_path: Option<String>,
+}
+
+impl PreResolvedTarget {
+    fn for_entry(entry: &super::BundleEntry) -> Self {
+        let manifest = entry.package_root.join("package.json");
+        Self {
+            entry_path: entry.entry_path.clone(),
+            manifest_path: manifest
+                .is_file()
+                .then(|| manifest.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ImportLensPlugin {
     entry_source: String,
-    targets: Vec<PathBuf>,
+    targets: Vec<PreResolvedTarget>,
     state: Arc<BuildState>,
 }
 
 impl ImportLensPlugin {
+    /// `targets` is indexed BY POSITION: the virtual entry emits `import-lens:target/<i>` for
+    /// `entries[i]` and `resolve_id` maps it back with `targets.get(i)`. A file-size build submits
+    /// several entries at once, each from a DIFFERENT package, so any reordering here hands one
+    /// package's manifest to another package's entry — which does not withhold a declaration, it
+    /// applies the wrong one. Never sort, dedup or filter this vector. Row 51 of the construct
+    /// matrix is what notices.
     pub(super) fn for_request(request: &super::BundleRequest) -> Self {
         Self {
             entry_source: super::entry::virtual_entry_source(&request.entries),
             targets: request
                 .entries
                 .iter()
-                .map(|entry| entry.entry_path.clone())
+                .map(PreResolvedTarget::for_entry)
                 .collect(),
             state: Arc::new(BuildState::default()),
         }
@@ -204,10 +258,14 @@ impl Plugin for ImportLensPlugin {
                 .into());
             };
             // Pre-resolved absolute path (§6.1): never re-resolve the bare
-            // package specifier.
-            return Ok(Some(HookResolveIdOutput::from_id(
-                target.to_string_lossy().into_owned(),
-            )));
+            // package specifier — but hand Rolldown the package manifest it would have
+            // found on the way, or the entry module classifies its own side effects from
+            // source alone while every module behind it uses the real declaration
+            // (see [`PreResolvedTarget`]).
+            return Ok(Some(HookResolveIdOutput {
+                package_json_path: target.manifest_path.clone(),
+                ..HookResolveIdOutput::from_id(target.entry_path.to_string_lossy().into_owned())
+            }));
         }
         Ok(None)
     }

@@ -1231,3 +1231,264 @@ async fn matrix_48_generic_symbol_collision() {
     assert!(artifact.code.contains("= 2"), "{}", artifact.code);
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
+
+/// Installs a package under `node_modules` and returns the pair a production request is made
+/// of: the entry file **inside** `node_modules`, and the package root beside it.
+///
+/// This is the shape [`write_side_effect_package`] cannot produce. That helper roots the build
+/// at a workspace `entry.js` doing `import 'testpkg'`, which makes the package a **transitive**
+/// module — resolved by Rolldown itself, and therefore handed its own `package.json`. Here the
+/// package's entry **is** the `BundleEntry`, so our plugin resolves it, exactly as happens
+/// whenever a user imports a package by name.
+fn write_installed_package(
+    root: &Path,
+    name: &str,
+    side_effects_field: Option<&str>,
+    entry_source: &str,
+) -> (PathBuf, PathBuf) {
+    let side_effects = side_effects_field
+        .map(|value| format!(",\"sideEffects\":{value}"))
+        .unwrap_or_default();
+    write_source(
+        root,
+        &format!("node_modules/{name}/package.json"),
+        &format!(
+            "{{\"name\":\"{name}\",\"version\":\"0.0.0\",\"type\":\"module\",\
+             \"main\":\"./index.js\"{side_effects}}}"
+        ),
+    );
+    write_source(root, &format!("node_modules/{name}/index.js"), entry_source);
+
+    let package_root = root.join("node_modules").join(name);
+    let entry_path = package_root.join("index.js");
+    (entry_path, package_root)
+}
+
+// Row 49 (§7.4, ADR-0002): the PRODUCTION shape — the requested package's own entry file IS the
+// `BundleEntry`, so our plugin resolves it rather than Rolldown.
+//
+// Every side-effects row above (38-44) roots its build at a workspace `entry.js` that does
+// `import 'testpkg'`. That makes the package a TRANSITIVE module: Rolldown resolves it and hands
+// the module its own `package.json`. Production is the opposite shape — the user imports
+// `date-fns`, so `node_modules/date-fns/index.js` is the entry — and a plugin-resolved id carries
+// only the metadata the plugin supplies, through `HookResolveIdOutput::package_json_path`. Leave
+// that `None` and the entry module has no manifest at all: its side-effect classification falls
+// back to pure source analysis, so a package declaring `sideEffects: false` keeps every top-level
+// statement the analysis cannot prove pure — bytes Rollup and webpack drop, added to the number we
+// report. So the rows that exist to prove "Rolldown owns `sideEffects`" all exercised the one code
+// path production never takes. This is that path.
+//
+// `reported_side_effects` is deliberately `Unknown`: the statement must be dropped because
+// Rolldown read the manifest we pointed it at, not because Import Lens told it anything (§7.4).
+#[tokio::test]
+async fn matrix_49_installed_package_entry_carries_its_manifest() {
+    let root = temp_workspace();
+    let (entry_path, package_root) = write_installed_package(
+        &root,
+        "purepkg",
+        Some("false"),
+        "export { parse } from './parse.js';\n\
+         const defaults = { locale: \"en-US\" };\n\
+         Object.freeze(defaults);\n",
+    );
+    write_source(
+        &root,
+        "node_modules/purepkg/parse.js",
+        "export const parse = (input) => String(input).trim();",
+    );
+
+    let artifact = RolldownEngine
+        .bundle(BundleRequest {
+            entries: vec![BundleEntry {
+                entry_path,
+                package_root,
+                selection: named(&["parse"]),
+                reported_side_effects: SideEffectsMode::Unknown,
+            }],
+            runtime: ImportRuntime::default(),
+            purpose: BundlePurpose::ImportSize,
+        })
+        .await
+        .expect("bundle should succeed");
+    assert_artifact_valid(&artifact);
+
+    assert!(
+        artifact.code.contains("trim"),
+        "the requested export must survive:\n{}",
+        artifact.code
+    );
+    assert!(
+        !artifact.code.contains("Object.freeze"),
+        "the package declares `sideEffects: false`, so its impure-looking top-level statement \
+         must be dropped — retaining it means the entry module never learned which package it \
+         belongs to:\n{}",
+        artifact.code
+    );
+    assert!(
+        !artifact.code.contains("en-US"),
+        "the value the dropped statement reads must go with it:\n{}",
+        artifact.code
+    );
+    fs::remove_dir_all(root).expect("temp workspace should be removed");
+}
+
+// Row 50: the manifest carries a SECOND thing — the entry's module FORMAT.
+//
+// `infer_module_def_format` reads `"type"` from the same `package.json`, so a plugin-resolved
+// `.js` entry is `ModuleDefFormat::Unknown` without it and `EsmPackageJson` with it. Rolldown
+// gates Node's ESM-imports-CommonJS interop on exactly that
+// (`should_consider_node_esm_spec_for_static_import` -> `def_format.is_esm()`): an ESM importer
+// gets `__toESM(require_dep(), 1)`, whose `isNodeMode` flag makes the namespace's `default` the
+// whole `module.exports` object, which is what Node does. An entry that does not know its own
+// package's `type` silently gets the CommonJS-importer interop instead — a different `default`
+// binding, and a different measured size (this is the one real-package number the manifest fix
+// moved: react-loading-skeleton, +2 minified bytes, from the wrong interop to the right one).
+//
+// Row 49 cannot catch this: it would stay green for an implementation that supplied the manifest
+// only for packages that declare `sideEffects`. This is the other half of the same field.
+#[tokio::test]
+async fn matrix_50_installed_esm_entry_gets_node_interop_for_commonjs() {
+    let root = temp_workspace();
+    let (entry_path, package_root) = write_installed_package(
+        &root,
+        "interoppkg",
+        None,
+        "import dep from './dep.cjs';\nexport const value = dep.value;\n",
+    );
+    write_source(
+        &root,
+        "node_modules/interoppkg/dep.cjs",
+        "module.exports = { value: 1 };",
+    );
+
+    let artifact = RolldownEngine
+        .bundle(BundleRequest {
+            entries: vec![BundleEntry {
+                entry_path,
+                package_root,
+                selection: named(&["value"]),
+                reported_side_effects: SideEffectsMode::Unknown,
+            }],
+            runtime: ImportRuntime::default(),
+            purpose: BundlePurpose::ImportSize,
+        })
+        .await
+        .expect("bundle should succeed");
+    assert_artifact_valid(&artifact);
+
+    let interop = artifact
+        .code
+        .lines()
+        .find(|line| line.contains("__toESM("))
+        .unwrap_or_else(|| {
+            panic!(
+                "the CommonJS dependency must be imported through the interop helper:\n{}",
+                artifact.code
+            )
+        });
+    assert!(
+        interop.contains(", 1)"),
+        "the package declares `\"type\": \"module\"`, so its entry is an ES module and its static \
+         CommonJS import must get Node's ESM interop (`__toESM(…, 1)`) — the bare form means the \
+         entry never learned its own package's `type` and was finalized as a CommonJS \
+         importer:\n{interop}"
+    );
+    fs::remove_dir_all(root).expect("temp workspace should be removed");
+}
+
+// Row 51: EACH entry's OWN package governs it — the multi-entry shape rows 49/50 cannot reach.
+//
+// Rows 49 and 50 are single-entry, so any entry->manifest mapping, right or wrong, points at the
+// one manifest there is. The file-size path is the opposite: it submits every import of a file as
+// entries of ONE build (`pipeline::file_size`), each `BundleEntry` carrying its own
+// `package_root`. The plugin maps `import-lens:target/<i>` back to `targets[i]`, so the mapping is
+// positional — and nothing else in the suite fails if that position slips.
+//
+// It is a worse bug than the one row 49 fixed, because it does not withhold metadata, it applies
+// the WRONG package's declaration: swap the two manifests here and `dirtypkg`'s `Object.freeze` —
+// a statement its `sideEffects: true` requires be kept — is silently deleted from the chunk, and
+// its bytes vanish from the size we report. Measured: under that mutation every other matrix row,
+// every badge row, every package row and the accuracy oracle stay green. This row is the only
+// thing that goes red.
+//
+// Two entries, opposite declarations, one build: `purepkg` (`sideEffects: false`) must lose its
+// freeze and `dirtypkg` (`sideEffects: true`) must keep its own.
+#[tokio::test]
+async fn matrix_51_multi_entry_manifests_do_not_cross() {
+    let root = temp_workspace();
+    let (pure_entry, pure_root) = write_installed_package(
+        &root,
+        "purepkg",
+        Some("false"),
+        "export { parse } from './parse.js';\n\
+         const defaults = { locale: \"en-PURE\" };\n\
+         Object.freeze(defaults);\n",
+    );
+    write_source(
+        &root,
+        "node_modules/purepkg/parse.js",
+        "export const parse = (input) => String(input).trim();",
+    );
+    let (dirty_entry, dirty_root) = write_installed_package(
+        &root,
+        "dirtypkg",
+        Some("true"),
+        "export { format } from './format.js';\n\
+         const settings = { locale: \"en-DIRTY\" };\n\
+         Object.freeze(settings);\n",
+    );
+    write_source(
+        &root,
+        "node_modules/dirtypkg/format.js",
+        "export const format = (input) => String(input).toUpperCase();",
+    );
+
+    let artifact = RolldownEngine
+        .bundle(BundleRequest {
+            entries: vec![
+                BundleEntry {
+                    entry_path: pure_entry,
+                    package_root: pure_root,
+                    selection: named(&["parse"]),
+                    reported_side_effects: SideEffectsMode::Unknown,
+                },
+                BundleEntry {
+                    entry_path: dirty_entry,
+                    package_root: dirty_root,
+                    selection: named(&["format"]),
+                    reported_side_effects: SideEffectsMode::Unknown,
+                },
+            ],
+            runtime: ImportRuntime::default(),
+            purpose: BundlePurpose::FileSize,
+        })
+        .await
+        .expect("bundle should succeed");
+    assert_artifact_valid(&artifact);
+
+    assert!(
+        artifact.code.contains("trim") && artifact.code.contains("toUpperCase"),
+        "both requested exports must survive:\n{}",
+        artifact.code
+    );
+    assert!(
+        !artifact.code.contains("en-PURE"),
+        "`purepkg` declares `sideEffects: false`, so ITS impure-looking top-level statement must be \
+         dropped — retaining it means entry 0 was governed by some other package's manifest:\n{}",
+        artifact.code
+    );
+    assert!(
+        artifact.code.contains("en-DIRTY"),
+        "`dirtypkg` declares `sideEffects: true`, so ITS top-level statement must be KEPT — \
+         dropping it means entry 1 was governed by `purepkg`'s manifest, and bytes that really \
+         ship have vanished from the size we report:\n{}",
+        artifact.code
+    );
+    assert_eq!(
+        artifact.code.matches("Object.freeze").count(),
+        1,
+        "exactly one of the two freezes — `dirtypkg`'s — may survive:\n{}",
+        artifact.code
+    );
+    fs::remove_dir_all(root).expect("temp workspace should be removed");
+}
