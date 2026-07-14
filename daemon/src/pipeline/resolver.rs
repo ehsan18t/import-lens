@@ -1226,8 +1226,15 @@ fn side_effects_array_mode(
 /// pnpm store link, and a Windows `\\?\` verbatim spelling on one side but not the other.
 ///
 /// `None` — an entry with no package-relative form — is the one thing [`SideEffectsMode::Unknown`]
-/// is still for. It means the entry does not live under its own package root, which the resolver
-/// cannot produce.
+/// is still for. It means the entry does not live under its own package root.
+///
+/// That is **reachable**, and an earlier version of this comment claimed it was not. A package whose
+/// `dist/` is itself a junction (Windows) or symlink (POSIX) onto a directory *outside* the package
+/// resolves, after canonicalization, to an entry the strip cannot reach — so the badge reports
+/// side-effectful while Rolldown, which resolves the link exactly as webpack does, drops the entry's
+/// effects as pure. The size is right; the badge is not, and `truly_treeshakeable: false` is then
+/// true by construction. Recorded as **S1** in `docs/known-issues.md`; do not re-assert that it
+/// cannot happen.
 fn normalized_side_effect_path(package_root: &Path, entry_path: &Path) -> Option<String> {
     let root = fs::canonicalize(package_root).ok()?;
     let entry = fs::canonicalize(entry_path).ok()?;
