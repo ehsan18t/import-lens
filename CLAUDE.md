@@ -8,6 +8,17 @@ Project instructions for agents working in this repository.
 - Use `pnpm` as the npm package manager. Do not use `npm` or `yarn` for project scripts or dependency changes.
 - Windows is the primary supported platform right now. Keep Windows compilation and packaging working before broadening to other targets.
 - The SRS is the source of truth for intended behavior: `docs/ImportLens-SRS.md`.
+- Known issues we have decided **not** to fix live in `docs/known-issues.md`. **Read it before reporting or "fixing" something** — it may already be a recorded, deliberate decision (some of them were "fixed" once and the fix was worse than the issue).
+
+## Deciding What To Fix Now
+
+A finding being **real** is not the same as it being **blocking**.
+
+> **Fix it in the current piece of work only if it (a) shows the user a WRONG NUMBER, or (b) can WEDGE the system or lose data.**
+
+Everything else gets an entry in `docs/known-issues.md` — stating what actually happens and why it is not fixed — and goes back in the queue. Add the entry when you **decide** not to fix something, not when you find it.
+
+If a fix chains into a third round on the same sub-item, stop and re-check it against the plan. Do not let the next review report decide your priorities for you.
 
 ## File And Formatting Rules
 
