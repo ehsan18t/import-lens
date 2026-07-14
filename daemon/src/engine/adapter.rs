@@ -74,7 +74,7 @@ impl RolldownEngine {
         Ok(ExportEnumeration {
             names: chunk.exports.iter().map(|name| name.to_string()).collect(),
             // A successful build's warnings used to be dropped on the floor.
-            diagnostics: warning_diagnostics(&output.warnings),
+            diagnostics: contract_diagnostics(&output.warnings),
             read_time_fingerprints,
             unhashed_paths,
         })
@@ -205,7 +205,7 @@ fn translate(
     }
 
     let uncounted = uncounted_assets(&output, state);
-    let mut diagnostics = warning_diagnostics(&output.warnings);
+    let mut diagnostics = contract_diagnostics(&output.warnings);
     diagnostics.extend(uncounted_assets_diagnostic(&uncounted));
     for import in &chunk.imports {
         diagnostics.push(ImportDiagnostic {
@@ -267,7 +267,7 @@ fn single_chunk(
                  from one chunk without under-reporting the rest",
                 chunks.len()
             ),
-            diagnostics: warning_diagnostics(&output.warnings),
+            diagnostics: contract_diagnostics(&output.warnings),
             loaded_paths: state.sorted_loaded_paths(),
             read_time_fingerprints: Vec::new(),
         });
@@ -344,23 +344,32 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
         return BundleFailure {
             stage: stage::MODULE_GRAPH_LIMIT.to_owned(),
             message: breach,
-            diagnostics: error_diagnostics(&diagnostics),
+            diagnostics: contract_diagnostics(&diagnostics),
             loaded_paths,
             read_time_fingerprints,
         };
     }
 
+    // THE EARLIEST STAGE PRESENT, not the first diagnostic in the vector. Rolldown accumulates
+    // these from module tasks it runs concurrently, so their order is a race — and this stage is
+    // what the user sees (ADR-0006: a failed build has no size, so the stage is the whole answer)
+    // AND what the cache stores. Ranking by pipeline position makes it a fact about the bytes.
+    // `engine::stage::rank` is where the order lives, and why.
     let failure_stage = diagnostics
         .iter()
         .map(stage_for)
-        .find(|candidate| *candidate != stage::LINK)
+        .min_by_key(|candidate| stage::rank(candidate))
         .unwrap_or(stage::LINK);
+    // Rendered from the SAME ordering, for the same reason: the message and the diagnostic list are
+    // durable values too, and a message whose lines are shuffled by task timing is a different
+    // cached answer for unchanged bytes.
+    let diagnostics = contract_diagnostics(&diagnostics);
     let message = if diagnostics.is_empty() {
         "rolldown build failed without diagnostics".to_owned()
     } else {
         diagnostics
             .iter()
-            .map(ToString::to_string)
+            .map(|diagnostic| diagnostic.message.clone())
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -368,7 +377,7 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
     BundleFailure {
         stage: failure_stage.to_owned(),
         message,
-        diagnostics: error_diagnostics(&diagnostics),
+        diagnostics,
         loaded_paths,
         read_time_fingerprints,
     }
@@ -404,22 +413,31 @@ fn stage_for(diagnostic: &BuildDiagnostic) -> &'static str {
 /// Diagnostics cross the contract as plain strings only (§5.1): the stable
 /// machine code plus the rendered message, never a Rolldown type or Debug
 /// representation.
-fn error_diagnostics(diagnostics: &[BuildDiagnostic]) -> Vec<ImportDiagnostic> {
-    diagnostics
+///
+/// **Errors and warnings go through the very same mapping.** Warnings used to be stamped
+/// `generate` wholesale, which mislabelled the one diagnostic a user is most likely to meet: an
+/// unresolved import is a **warning** — Rolldown externalizes it and the build SUCCEEDS (construct
+/// matrix rows 24/25) — so the note saying "this package imports something that is not installed
+/// and its bytes are not in this number" arrived labelled as a code-generation problem, on a
+/// perfectly good measurement. A diagnostic's stage is where it came from; which side of the
+/// build it landed on does not change that.
+///
+/// **Sorted, because the input order is a race.** Rolldown accumulates both vectors from module
+/// tasks it runs concurrently, and these diagnostics are cached on the result. Ordering them by
+/// rank, then by text, makes the stored value a function of the bytes rather than of the machine
+/// the build happened to run on.
+fn contract_diagnostics(diagnostics: &[BuildDiagnostic]) -> Vec<ImportDiagnostic> {
+    let mut contract: Vec<ImportDiagnostic> = diagnostics
         .iter()
         .map(|diagnostic| ImportDiagnostic {
             stage: stage_for(diagnostic).to_owned(),
             message: format!("{}: {}", diagnostic.kind(), diagnostic),
         })
-        .collect()
-}
-
-fn warning_diagnostics(warnings: &[BuildDiagnostic]) -> Vec<ImportDiagnostic> {
-    warnings
-        .iter()
-        .map(|warning| ImportDiagnostic {
-            stage: stage::GENERATE.to_owned(),
-            message: format!("{}: {}", warning.kind(), warning),
-        })
-        .collect()
+        .collect();
+    contract.sort_by(|left, right| {
+        stage::rank(&left.stage)
+            .cmp(&stage::rank(&right.stage))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    contract
 }

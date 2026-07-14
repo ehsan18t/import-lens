@@ -132,31 +132,39 @@ pub struct ExportEnumeration {
 /// the drift this module exists to make impossible, and `daemon/src/engine` is guarded
 /// against it.
 pub mod stage {
-    /// Declares the vocabulary. Each constant and its membership in [`ALL`] are emitted from
-    /// the *same* line of the same invocation, so a stage that exists but is missing from
-    /// `ALL` — and is therefore relabelled `generate` at the contract edge while
-    /// `file_size.rs` passes it through untouched, one failure under two names — is not a
-    /// mistake you can make here. It is unrepresentable rather than merely tested for.
+    /// Declares the vocabulary. Each constant, its membership in [`ALL`], and — because `ALL` is
+    /// ordered — its [`rank`] are emitted from the *same* line of the same invocation. So a stage
+    /// that exists but is missing from `ALL` (and is therefore relabelled `generate` at the
+    /// contract edge while `file_size.rs` passes it through untouched, one failure under two
+    /// names), or one that exists with no place in the order, is not a mistake you can make here.
     macro_rules! stages {
         ($($(#[$attribute:meta])* $name:ident => $value:literal,)+) => {
             $($(#[$attribute])* pub const $name: &str = $value;)+
 
-            /// Every stage declared above, in contract order. Anything absent from this list
-            /// would collapse to [`GENERATE`] at the contract edge — which is why the list is
-            /// generated from the declarations instead of restated beside them.
+            /// Every stage declared above, **in rank order** — see [`rank`]. Anything absent from
+            /// this list would collapse to [`GENERATE`] at the contract edge, and would have no
+            /// rank; which is why the list is generated from the declarations instead of restated
+            /// beside them.
             pub const ALL: &[&str] = &[$($name),+];
         };
     }
 
+    // DECLARATION ORDER IS RANK ORDER. Adding a stage means deciding where the build reaches it,
+    // and nothing else; see `rank`.
     stages! {
-        RESOLVE => "resolve",
-        PARSE => "parse",
-        LINK => "link",
-        GENERATE => "generate",
-        OUTPUT_SHAPE => "output_shape",
-        MODULE_GRAPH_LIMIT => "module_graph_limit",
-        MISSING_EXPORT => "missing_export",
-        AMBIGUOUS_EXPORT => "ambiguous_export",
+        // ---- The build did not happen. --------------------------------------------------------
+        //
+        // These three are not stages the build reached — they are the build being LOST, and they
+        // preempt everything below because nothing below ever ran. Ranking them first is what makes
+        // it impossible for a deterministic failure to outrank a transient one and so present a
+        // scheduling accident as a fact about the package's bytes — the one that must be cacheable
+        // and the other that must never be (ADR-0006, invariant 3).
+        //
+        // Today they cannot even compete: each is constructed in `boundary.rs` at a point where the
+        // build's diagnostics do not exist (a panic unwinds straight past `classify_failure`; a
+        // timeout drops the future), so each carries `diagnostics: Vec::new()` and no ranking is
+        // performed. This order means that if that ever changes, the safe answer is the one that
+        // wins by default rather than the one someone remembered to special-case.
         /// A build that unwound into the boundary's `catch_unwind`.
         PANIC => "panic",
         /// A build that did not finish within `boundary::BUILD_TIMEOUT` and was cancelled.
@@ -165,6 +173,55 @@ pub mod stage {
         TIMEOUT => "timeout",
         /// The engine runtime dropped the build without replying.
         ENGINE_GONE => "engine_gone",
+
+        // ---- The build's own stages, in the order the build reaches them. ----------------------
+        /// Resolving a module's dependencies, before anything is read.
+        RESOLVE => "resolve",
+        /// Reading a module — where the plugin's `load` hook refuses one that is over the module
+        /// source limit, before its bytes are read. The same limit is re-checked after parsing,
+        /// which is the later of the two places it can be detected; it is ranked at the earlier.
+        MODULE_GRAPH_LIMIT => "module_graph_limit",
+        /// Parsing and transforming a module's source.
+        PARSE => "parse",
+        /// Linking: a requested export that no module provides.
+        MISSING_EXPORT => "missing_export",
+        /// Linking: a name two star providers both claim.
+        AMBIGUOUS_EXPORT => "ambiguous_export",
+        /// Linking, everything else — and the catch-all for a Rolldown event kind this contract
+        /// has no name for, which is why it must rank AFTER the two link failures it would
+        /// otherwise mask.
+        LINK => "link",
+        /// Generating the chunk.
+        GENERATE => "generate",
+        /// Inspecting what was generated: the build produced something other than one JS chunk.
+        OUTPUT_SHAPE => "output_shape",
+    }
+
+    /// Where a stage sits in the order above. **The earliest one present is the one reported.**
+    ///
+    /// A failure stage is a durable, user-visible value — under ADR-0006 a failed build has no size
+    /// at all, so the stage *is* the answer, and a deterministic one is cached against the bytes it
+    /// was measured from. It therefore may not be decided by a race, and it was: Rolldown fans its
+    /// module tasks out onto the async runtime and accumulates their diagnostics **in the order the
+    /// tasks report**, so the adapter's old "first diagnostic that is not `link`" picked whichever
+    /// module happened to finish first. A build with a parse error in one module and an unresolved
+    /// import in another answered `parse` on one run and `resolve` on the next, for byte-identical
+    /// inputs — measured at 38/10 over 48 runs (`daemon/tests/engine_failure_stage.rs`).
+    ///
+    /// **Earliest wins, and the order is the pipeline's, not a severity ladder.** The earliest
+    /// failure is the likeliest ROOT CAUSE — a module that failed to resolve is often *why*
+    /// something downstream is malformed, and the later diagnostics are frequently its shrapnel —
+    /// and, unlike a hand-picked severity order, it needs no judgement call to maintain: a new stage
+    /// is ranked by where the build reaches it. We do not claim to know which failure a user would
+    /// rather hear about.
+    ///
+    /// A stage outside the vocabulary sorts last. `adapter::stage_for` can only return a declared
+    /// one, so that arm is unreachable from the ranking's only caller; it is here so the order is
+    /// total rather than partial.
+    pub fn rank(stage: &str) -> usize {
+        ALL.iter()
+            .position(|known| *known == stage)
+            .unwrap_or(ALL.len())
     }
 
     /// Whether a stage describes a failure of **this run of the daemon** rather than of the

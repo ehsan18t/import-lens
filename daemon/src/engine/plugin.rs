@@ -129,12 +129,25 @@ impl BuildState {
             .take()
     }
 
+    /// Keeps the SMALLEST breach message, not the first one to arrive.
+    ///
+    /// These hooks run on concurrently-spawned module tasks, so "first" means "whichever module the
+    /// runtime happened to finish first". A graph that breaches in more than one place — two
+    /// oversized modules, or an oversized module and the total-source cap — would then name a
+    /// different module on different runs of the same bytes, and that message is durable: a
+    /// `module_graph_limit` failure is deterministic, so it is cached (ADR-0006, invariant 3) and
+    /// the user is shown its message. The stage was never in doubt here; the message was. Ordering
+    /// by content rather than by arrival makes the whole answer a function of the bytes, which is
+    /// the same rule `engine::stage::rank` applies to the diagnostics beside it.
     fn record_breach(&self, message: &str) {
         let mut breach = self
             .limit_breach
             .lock()
             .expect("limit-breach slot should not be poisoned");
-        breach.get_or_insert_with(|| message.to_owned());
+        match breach.as_deref() {
+            Some(recorded) if recorded <= message => {}
+            _ => *breach = Some(message.to_owned()),
+        }
     }
 }
 
