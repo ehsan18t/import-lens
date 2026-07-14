@@ -1183,8 +1183,14 @@ async fn a_streamed_import_is_delivered_while_a_file_size_build_is_in_flight() {
     assert_eq!(analysis.request_id, 21);
     assert_eq!(analysis.imports.len(), 2);
 
-    // The combined build is now in flight (it is queued behind the per-import builds for the engine
-    // permits it needs). Ask a fresh, trivial question: the loop must still be able to hear it.
+    // The combined build is now in flight. Nothing orders it behind the per-import builds: the
+    // file-size handler and the analysis handler are spawned independently and their builds race for
+    // the engine permits. With two permits, the trivial `tiny-stream-lib` build can even be starved
+    // while the combined build and the heavy per-import build hold both — so whether a per-import
+    // push reaches the socket before the file-size response is a scheduling coin toss, not a
+    // guarantee. Do NOT assert that ordering (an earlier version did, and it flaked in CI under
+    // different core counts). Assert instead the property the loop actually owes and the old
+    // inline-`.await` broke: it stays live while the build runs. Ask a fresh, trivial question now.
     client_stream
         .write_all(
             &encode_frame(&cache_status(&workspace, 23)).expect("cache status should encode"),
@@ -1221,11 +1227,14 @@ async fn a_streamed_import_is_delivered_while_a_file_size_build_is_in_flight() {
         .expect("the file-size response must arrive");
 
     assert_eq!(file_size.request_id, 22);
-    assert!(
-        pushes_before_size_response > 0,
-        "a streamed import must reach the socket while the file-size build is still in flight; the \
-         connection loop delivered none until the build had finished"
-    );
+    // The deterministic proof that the loop was never suspended inside the file-size arm: a request
+    // that arrived AFTER the combined build began was still read, dispatched, and answered BEFORE
+    // that build's own response. `cache_status` needs no engine permit, so in a healthy loop it
+    // always overtakes the slow 8 MB build; under the old inline `.await` the loop could not even
+    // read the frame until the build finished. (That the imports stream at all is proven
+    // deterministically by `a_cold_document_answers_at_once_and_streams_each_import_as_it_lands`; and
+    // that none are dropped is proven below. What is NOT asserted is a per-import push arriving
+    // before the file-size response — that is a permit race, see above.)
     assert!(
         answered_a_new_request,
         "a request sent while the file-size build was in flight must still be answered before it; \
