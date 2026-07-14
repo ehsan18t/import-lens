@@ -31,7 +31,7 @@ use crate::{
     },
     pipeline::file_size::{SizedImport, annotate_shared_bytes, compute_file_size},
     pipeline::resolver::{
-        ResolvedPackage, find_package_root, resolve_package_entry, resolves_to_first_party_source,
+        FirstPartySourceProbe, ResolvedPackage, find_package_root, resolve_package_entry,
     },
 };
 use rayon::prelude::*;
@@ -1094,27 +1094,30 @@ impl ImportLensService {
         // omit the same bytes from this total, and refusing a verdict is the direction ADR-0006
         // demands to fail in.
         //
-        // The resolve runs only for an import that HAS no request (a rare path), and it reuses the
-        // memoized `references` walk for the workspace's config, so the happy path pays nothing. The
-        // RESOLVERS are rebuilt per query on purpose: one that outlives the query memoizes the
-        // filesystem, and the miss it memoizes is the one answer that must never be cached — an
-        // import written before the file it points at would stay a floor for the daemon's life, even
-        // after the developer created the file (`ResolverSet::alias_config_graphs`).
+        // ONE probe for the whole loop. It holds the workspace's alias resolvers — one per reachable
+        // tsconfig, each a `Resolver::new` and a cold JSONC parse — and asking for them per specifier
+        // made this `O(aliased imports × reachable configs)`: on the create-vue shape a 20-alias page
+        // component burned ~20 ms of the 50 ms NFR-002 warm budget here, on every debounced
+        // keystroke. Built once, reused across the loop, it is `O(reachable configs)`.
+        //
+        // It must not outlive this response, and it does not: a `Resolver` that survives the request
+        // memoizes the filesystem, and the miss it memoizes is the one answer that must never be
+        // cached — an import written before the file it points at would stay a floor for the daemon's
+        // life, even after the developer created the file (`ResolverSet::alias_config_graphs`). The
+        // probe also builds nothing until the first import that HAS no request, so a document whose
+        // every import is installed still pays nothing.
         //
         // It is keyed on the WORKSPACE, not on the document: "does this specifier map to first-party
         // source?" is a question about the project's alias table, and the answer must not change
         // because the import happens to sit in a `.vue` file rather than a `.ts` one. It did — see
-        // `resolves_to_first_party_source`.
+        // `FirstPartySourceProbe`.
+        let first_party =
+            FirstPartySourceProbe::new(&context.workspace_root, &context.active_document_path);
         let sized = states
             .iter()
             .map(|state| match state.request.clone() {
                 Some(request) => SizedImport::installed(request, state.result.clone()),
-                None if resolves_to_first_party_source(
-                    &context.workspace_root,
-                    &context.active_document_path,
-                    &state.detected.specifier,
-                ) =>
-                {
+                None if first_party.resolves_to_first_party_source(&state.detected.specifier) => {
                     SizedImport::path_alias(state.detected.specifier.clone())
                 }
                 None => SizedImport::not_installed(state.detected.specifier.clone()),
@@ -2255,7 +2258,7 @@ impl ImportLensService {
     /// A `tsconfig.json` / `jsconfig.json` changed on disk, so the workspace's **alias table** did.
     ///
     /// That table is the sole discriminator between a path alias and a package that is not
-    /// installed (`pipeline::resolver::resolves_to_first_party_source`), and the daemon read it
+    /// installed (`pipeline::resolver::FirstPartySourceProbe`), and the daemon read it
     /// exactly once: `oxc_resolver` memoizes the parsed config in the shared resolver's FS cache,
     /// and nothing ever dropped it. So a developer hitting the floor the SRS tells them to repair —
     /// "mirror the alias into tsconfig `paths`" — applied the repair, saved the file, and the

@@ -1318,8 +1318,12 @@ const FLOOR_CASES: [FloorCase; 5] = [
 /// So every one of these — a package that is simply not installed (declared or not), a typo, an alias
 /// whose target file does not exist, a bare specifier in a project with no config at all — must stay
 /// a FLOOR from every document type. The discriminator is positive evidence of first-party SOURCE:
-/// a file that exists, outside `node_modules`, inside the workspace. A pattern that matches is not
-/// evidence, and a missing declaration is not evidence of anything at all.
+/// a file that **exists** and is **not under `node_modules`**. That is the whole test — the target
+/// does *not* have to sit inside the workspace root, because a monorepo alias (`"@shared/*":
+/// ["../shared/*"]`) points at a sibling package above the opened root and that is still the user's
+/// own code — which is what the alias matrix's "monorepo, target above the root" row is for. A
+/// pattern that matches is not evidence, and a missing declaration is not evidence of anything at
+/// all.
 #[test]
 fn an_unresolvable_specifier_stays_a_floor_from_every_document_type() {
     let mut measured = Vec::new();

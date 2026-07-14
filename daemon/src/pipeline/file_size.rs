@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 ///
 /// The two non-`Installed` kinds are both "there is no `node_modules/<name>/package.json`", and they
 /// are **not the same fact**. Collapsing them into one is a regression this enum exists to make
-/// unrepresentable: see [`crate::pipeline::resolver::resolves_to_first_party_source`], which is what
+/// unrepresentable: see [`crate::pipeline::resolver::FirstPartySourceProbe`], which is what
 /// decides between them — and decides it on positive evidence that the specifier IS first-party,
 /// never on the absence of a `package.json` declaration.
 #[derive(Debug, Clone)]

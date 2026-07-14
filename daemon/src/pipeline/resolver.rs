@@ -6,6 +6,7 @@ use oxc_resolver::{
 };
 use serde_json::Value;
 use std::{
+    cell::OnceCell,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -305,9 +306,29 @@ fn find_package_manifest(
     })
 }
 
-/// Whether `specifier` resolves — through the project's `tsconfig.json` / `jsconfig.json` `paths` /
+/// Whether a specifier resolves — through the project's `tsconfig.json` / `jsconfig.json` `paths` /
 /// `baseUrl` — to a real file **outside `node_modules`**: first-party source, and therefore a **path
 /// alias** rather than a package.
+///
+/// **It is a REQUEST-scoped object, and both halves of that are load-bearing.**
+///
+/// *Scoped to a request*, because the alias resolvers it holds must not outlive one. Each `Resolver`
+/// carries an `oxc_resolver` filesystem cache that negative-caches a miss, and the miss here is the
+/// one answer that must never be cached: an import written *before* the file it points at is
+/// correctly a floor, and creating that file has to lift it — with no daemon restart and no
+/// invalidation message, because nothing watches first-party source and nothing can send one. A
+/// memoized resolver made that floor **sticky for the daemon's life**
+/// ([`ResolverSet::alias_config_graphs`], and the test that goes red without this). The probe is
+/// built by the response that needs it and dropped with it, so no filesystem fact survives the query.
+///
+/// *Scoped to a REQUEST*, not to a specifier, because [`ResolverSet::alias_resolvers`] builds one
+/// `Resolver` per reachable config, each with its own cold JSONC parse. Asking that question once per
+/// specifier made the cost `O(aliased imports × reachable configs)`: on the create-vue shape (three
+/// reachable configs) a 20-alias page component spent ~20 ms of the 50 ms NFR-002 interactive budget
+/// inside the daemon alone, on every debounced keystroke. One probe per response builds the set once
+/// and reuses it across the whole specifier loop — `O(reachable configs)` — and a warm resolver
+/// answers the next specifier in tens of microseconds. The set is still built **lazily**: a document
+/// whose every import is installed never asks, and pays nothing.
 ///
 /// **The question is about the WORKSPACE'S ALIAS TABLE, not about the importing document.**
 /// "Does this specifier map to first-party source?" is a property of the project's `paths` /
@@ -327,23 +348,22 @@ fn find_package_manifest(
 /// So the config is located by [`find_workspace_config`] and handed to oxc explicitly
 /// (`TsconfigDiscovery::Manual`), which applies its `paths` regardless of what `include` claims.
 ///
-/// **And that alone regressed the solution-style config**, which is the literal create-vue /
-/// create-astro scaffold: a root `tsconfig.json` that is nothing but `references`, with the real
-/// `paths` in a referenced `tsconfig.app.json`. `include` had been the only thing distinguishing
-/// sibling referenced projects, and with it discarded `TsconfigReferences::Auto` falls back to
-/// picking the **first referenced project whose base directory contains the document** — in a
-/// solution-style config every referenced project sits at the workspace root, so all of them contain
-/// it and the tie breaks on **`references` list order**. create-vue lists the project *without*
-/// `paths` first. The alias then resolved to nothing from every document type, `.ts` included.
+/// **And the nearest config alone is not the alias table**, in the literal create-vue / create-astro
+/// scaffold: a root `tsconfig.json` that is nothing but `references`, with the real `paths` in a
+/// referenced `tsconfig.app.json`. A resolver built on the nearest config and asked to *choose* a
+/// project out of that list answered with whichever it picked — and the one that owns the `paths` is
+/// not knowable from the document once `include` is discarded.
 ///
 /// The answer is to stop asking oxc to CHOOSE a project at all, because the question is
 /// document-independent: *does this specifier map, through **any** `paths` table the workspace
 /// reaches, to a first-party file that exists?* So [`ResolverSet::alias_resolvers`] collects every
 /// reachable table — the nearest config, everything in its `references` (transitively), and the
 /// `extends` chain each of those folds in — and the specifier is tried against **each**, with
-/// `TsconfigReferences::Disabled` so no resolver is ever in the business of picking a sibling. One
-/// hit is positive evidence. The answer cannot depend on which document asks, nor on the order the
-/// references happen to be listed in.
+/// `TsconfigReferences::Disabled` so that one deleted `references` entry cannot silence the good
+/// `paths` table of the config that lists it (the reason is written out at [`alias_resolve_options`],
+/// and it is *not* the list-order story an earlier revision told here — that one was measured false
+/// and retracted). One hit is positive evidence. The answer cannot depend on which document asks, nor
+/// on the order the references happen to be listed in.
 ///
 /// The discriminator stays **positive evidence**, never the absence of it: an alias is recognized
 /// because it *resolves to a real file outside `node_modules`*, which is the thing that actually
@@ -378,9 +398,9 @@ fn find_package_manifest(
 /// (`"@shared/*": ["../shared/*"]`) a permanent floor. The `node_modules` test is what stops a real
 /// package being mistaken for source, and it is the only bound the target needs.
 ///
-/// **No filesystem fact here is memoized, and that is deliberate** (see [`ResolverSet`]): the
-/// resolvers are built per query, so an alias whose target did not exist *yet* — the import written
-/// before the file it points at — stops being a floor the moment the file appears, with no daemon
+/// **No filesystem fact here outlives the request, and that is deliberate** (see [`ResolverSet`]):
+/// the resolvers die with the probe, so an alias whose target did not exist *yet* — the import
+/// written before the file it points at — stops being a floor on the next request, with no daemon
 /// restart and no invalidation message. A memoized miss is a cached negative that nothing can lift,
 /// which is the same defect class as the config the daemon read exactly once.
 ///
@@ -397,30 +417,55 @@ fn find_package_manifest(
 ///   it errs toward "flag nothing" for a specifier that really is first-party source *somewhere* in
 ///   the workspace. It can never invent a number: the specifier still resolves to a file that exists
 ///   outside `node_modules`, which weighs nothing in either project.
-pub fn resolves_to_first_party_source(
-    workspace_root: &Path,
-    active_document_path: &Path,
-    specifier: &str,
-) -> bool {
-    let Some(directory) = active_document_path.parent() else {
-        return false;
-    };
-    let resolvers = shared_resolvers();
-    let Some(alias_resolvers) = resolvers.alias_resolvers(workspace_root, active_document_path)
-    else {
-        // No `tsconfig.json` / `jsconfig.json` anywhere between the document and the workspace root:
-        // the project has no alias table the daemon can read, so there is no positive evidence to
-        // be had and the specifier is not an alias.
-        return false;
-    };
+pub struct FirstPartySourceProbe<'a> {
+    workspace_root: &'a Path,
+    active_document_path: &'a Path,
+    /// The workspace's alias tables, one resolver each — built on the FIRST specifier that needs
+    /// them (a document whose every import is installed builds none), reused by every specifier
+    /// after it, and dropped with the probe. `Some(_)` holding an empty answer is impossible; `None`
+    /// means the project has no config to read.
+    alias_resolvers: OnceCell<Option<Vec<Resolver>>>,
+}
 
-    // ANY reachable table that maps the specifier to first-party source settles it. There is no
-    // "the" project to choose, and choosing one is what broke the create-vue scaffold.
-    alias_resolvers.iter().any(|resolver| {
-        resolver
-            .resolve(directory, specifier)
-            .is_ok_and(|resolution| is_first_party_source(&resolution.full_path()))
-    })
+impl<'a> FirstPartySourceProbe<'a> {
+    pub fn new(workspace_root: &'a Path, active_document_path: &'a Path) -> Self {
+        Self {
+            workspace_root,
+            active_document_path,
+            alias_resolvers: OnceCell::new(),
+        }
+    }
+
+    /// Whether `specifier` maps, through **any** alias table this workspace reaches, to a file that
+    /// exists outside `node_modules`.
+    pub fn resolves_to_first_party_source(&self, specifier: &str) -> bool {
+        let Some(directory) = self.active_document_path.parent() else {
+            return false;
+        };
+        let Some(alias_resolvers) = self.alias_resolvers().as_ref() else {
+            // No `tsconfig.json` / `jsconfig.json` anywhere between the document and the workspace
+            // root: the project has no alias table the daemon can read, so there is no positive
+            // evidence to be had and the specifier is not an alias.
+            return false;
+        };
+
+        // ANY reachable table that maps the specifier to first-party source settles it. There is no
+        // "the" project to choose, and choosing one is what broke the create-vue scaffold.
+        alias_resolvers.iter().any(|resolver| {
+            resolver
+                .resolve(directory, specifier)
+                .is_ok_and(|resolution| is_first_party_source(&resolution.full_path()))
+        })
+    }
+
+    /// One `Resolver` per reachable config, built at most once per probe — which is what keeps the
+    /// per-specifier cost at one warm `resolve` instead of a resolver build and a JSONC parse per
+    /// config.
+    fn alias_resolvers(&self) -> &Option<Vec<Resolver>> {
+        self.alias_resolvers.get_or_init(|| {
+            shared_resolvers().alias_resolvers(self.workspace_root, self.active_document_path)
+        })
+    }
 }
 
 /// The positive evidence itself: a file that **exists** and is not inside `node_modules` — where it
@@ -796,13 +841,13 @@ pub struct ResolverSet {
     /// paths only, memoized per nearest-config path.
     ///
     /// **What is memoized is the WALK, not the filesystem.** The walk parses every reachable config
-    /// to enumerate its `references`, and that is the expensive part; the resolvers built from these
-    /// paths are built **fresh on every query** and thrown away
-    /// ([`ResolverSet::alias_resolvers`]) — because an `oxc_resolver` that outlives a query memoizes
-    /// the filesystem, and a memoized **miss** is a cached negative that nothing lifts. An alias
-    /// whose target did not exist when the daemon first looked would stay a floor for the daemon's
-    /// life, even after the developer created the file. That is the same defect as the config the
-    /// daemon read exactly once, one level down.
+    /// to enumerate its `references`, and it holds nothing but paths; the resolvers built from those
+    /// paths are built **fresh for every request** and thrown away with it
+    /// ([`ResolverSet::alias_resolvers`], [`FirstPartySourceProbe`]) — because an `oxc_resolver`
+    /// that outlives a request memoizes the filesystem, and a memoized **miss** is a cached negative
+    /// that nothing lifts. An alias whose target did not exist when the daemon first looked would
+    /// stay a floor for the daemon's life, even after the developer created the file. That is the
+    /// same defect as the config the daemon read exactly once, one level down.
     ///
     /// (Each alias resolver must in any case hold its OWN oxc FS cache rather than sharing one: oxc
     /// memoizes a **manually configured** tsconfig on the cache entry for `/` — one slot, whatever
@@ -842,11 +887,13 @@ impl ResolverSet {
     /// actually installed — the bytes that ship — not of whatever the editor's alias table points
     /// at. The alias tables answer one question only: "is this specifier first-party?"
     ///
-    /// **Built fresh, every query, on purpose.** See [`ResolverSet::alias_config_graphs`]: a
-    /// surviving resolver caches the filesystem, and the miss it caches is the one answer that must
-    /// never be cached. The query runs only for an import with no installed package behind it, and
-    /// it reuses the memoized config graph, so what a rebuild costs is a `Resolver` per reachable
-    /// config and a JSONC parse per config it actually consults — against a Rolldown build, nothing.
+    /// **Built fresh for every request, on purpose — and exactly once per request.** See
+    /// [`ResolverSet::alias_config_graphs`]: a resolver that survives a request caches the
+    /// filesystem, and the miss it caches is the one answer that must never be cached. But a
+    /// resolver per *specifier* is not the price of that: building the set costs a `Resolver` and a
+    /// cold JSONC parse per reachable config, and paying it per specifier put a 20-alias component
+    /// at ~20 ms of a 50 ms warm budget. [`FirstPartySourceProbe`] owns the set for the life of one
+    /// response, which is the shortest lifetime that is not per-specifier.
     fn alias_resolvers(
         &self,
         workspace_root: &Path,
@@ -1263,6 +1310,20 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).ok();
         }
+    }
+
+    /// One probe, one specifier — the shape a *single* request has when it asks about *one* import.
+    /// A test that asks twice therefore asks through two probes, exactly as two requests would, which
+    /// is what makes `creating_the_alias_target_lifts_the_floor_without_an_invalidation` a real
+    /// guard: nothing it does can carry a filesystem fact from the first ask to the second, unless
+    /// somebody memoizes the resolvers where they must not be memoized.
+    fn resolves_to_first_party_source(
+        workspace_root: &Path,
+        active_document_path: &Path,
+        specifier: &str,
+    ) -> bool {
+        FirstPartySourceProbe::new(workspace_root, active_document_path)
+            .resolves_to_first_party_source(specifier)
     }
 
     /// **The Minor, and it is not cosmetic.** The walk that looks for the workspace's alias table

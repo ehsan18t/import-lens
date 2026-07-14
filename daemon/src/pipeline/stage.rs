@@ -33,7 +33,7 @@ pub const PACKAGE_VALIDATION: &str = "package_validation";
 pub const PACKAGE_RESOLUTION: &str = "package_resolution";
 /// The specifier is not a package at all — a tsconfig **path alias** (`@app/components`, `~lib/foo`,
 /// a bare `components/Button` under a `baseUrl`) that RESOLVES to first-party source
-/// (`crate::pipeline::resolver::resolves_to_first_party_source`).
+/// (`crate::pipeline::resolver::FirstPartySourceProbe`).
 ///
 /// **Not a failure.** Import Lens measures third-party imports (ADR-0004), so first-party code
 /// contributes nothing to a total it reports, exactly like a relative import — the total stays
