@@ -340,6 +340,17 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
     // to expire against. The read-time map is populated in `load`, before Rolldown parses anything,
     // so it has every module whose bytes this build actually read.
     let (read_time_fingerprints, _) = state.read_time_fingerprints();
+    // A breach preempts every diagnostic below, and the ranking agrees: `MODULE_GRAPH_LIMIT` is the
+    // first deterministic stage in `engine::stage`, because a blown graph limit is a fact about the
+    // WHOLE build — it was too big to complete — and not about any one module in it. The two used to
+    // disagree: the stage was ranked where the breach is DETECTED (the plugin's `load` hook, after
+    // resolve), so the declared order promised `resolve` would win a build this arm has always
+    // answered `module_graph_limit`.
+    //
+    // It is not a redundant fast path. `stage_for` maps Rolldown event kinds, and NONE of them is a
+    // graph-limit breach — the limit is ours, enforced in the plugin — so the ranking below can
+    // never produce this stage. Remove this arm and a breaching build reports the resolve error of
+    // some module inside a graph that was abandoned: the shrapnel, with the reason hidden.
     if let Some(breach) = state.take_breach() {
         return BundleFailure {
             stage: stage::MODULE_GRAPH_LIMIT.to_owned(),

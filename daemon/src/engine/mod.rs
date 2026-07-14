@@ -174,13 +174,33 @@ pub mod stage {
         /// The engine runtime dropped the build without replying.
         ENGINE_GONE => "engine_gone",
 
+        // ---- The build was abandoned. ----------------------------------------------------------
+        //
+        // Not a module's failure: a fact about the WHOLE build. The graph blew a hard limit
+        // (`engine::limits`), so it was never going to complete, and under ADR-0006 that is the
+        // reason the import has no size at all. A resolve error in one module of a graph that was
+        // abandoned is shrapnel — reporting it would hand the user the symptom and hide the cause,
+        // and the stage is what the user gets and what the cache stores.
+        //
+        // It ranks here rather than at the point the breach is DETECTED (the plugin's `load` hook,
+        // i.e. between `resolve` and `parse`), and that is the correction: ranking it at load put it
+        // behind `resolve`, so the declared order promised `resolve` would win a build that
+        // `classify_failure` has always — correctly — answered `module_graph_limit`, by
+        // short-circuiting on the recorded breach before any ranking runs. The rank was decorative
+        // and it disagreed with the code, which is the same defect in the other direction: the SRS
+        // derives the reported order FROM this list, so the list said something false.
+        //
+        // The breach is not produced by the ranking and cannot be: the limit is ours, enforced in
+        // the plugin, and no Rolldown event kind maps to it (`adapter::stage_for`). The short-circuit
+        // is its only producer. This rank is therefore what the order CLAIMS — the SRS's sentence,
+        // and `contract_diagnostics`'s sort key — and it now claims what the code does.
+        /// The module graph breached a hard limit (2,000 modules, 20 MiB per module source, 100 MiB
+        /// total), so the build was abandoned rather than completed on a partial graph.
+        MODULE_GRAPH_LIMIT => "module_graph_limit",
+
         // ---- The build's own stages, in the order the build reaches them. ----------------------
         /// Resolving a module's dependencies, before anything is read.
         RESOLVE => "resolve",
-        /// Reading a module — where the plugin's `load` hook refuses one that is over the module
-        /// source limit, before its bytes are read. The same limit is re-checked after parsing,
-        /// which is the later of the two places it can be detected; it is ranked at the earlier.
-        MODULE_GRAPH_LIMIT => "module_graph_limit",
         /// Parsing and transforming a module's source.
         PARSE => "parse",
         /// Linking: a requested export that no module provides.
@@ -214,6 +234,14 @@ pub mod stage {
     /// and, unlike a hand-picked severity order, it needs no judgement call to maintain: a new stage
     /// is ranked by where the build reaches it. We do not claim to know which failure a user would
     /// rather hear about.
+    ///
+    /// **Four stages are not ranked by where the build reaches them, because the build never reached
+    /// them.** The three transients are the build being LOST and `module_graph_limit` is the build
+    /// being ABANDONED; none is a thing that happened *to a module*, and each is the reason there is
+    /// no answer at all. They lead the order for that reason, not because they occur early — the
+    /// breach is in fact *detected* in the `load` hook, after resolve. Ranking a module's diagnostic
+    /// ahead of one of them would report the shrapnel of a build that was never going to finish, and
+    /// hide the cause. Every other stage is a position in a build that was genuinely running.
     ///
     /// A stage outside the vocabulary sorts last. `adapter::stage_for` can only return a declared
     /// one, so that arm is unreachable from the ranking's only caller; it is here so the order is

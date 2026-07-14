@@ -275,6 +275,92 @@ fn the_breach_message_of_a_multi_breach_graph_is_the_same_on_every_run() {
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
 
+/// A graph that breaches the limit AND cannot resolve one of its imports reports the **breach**.
+///
+/// The two failures are not peers. A resolve error says one module of the graph is broken; a breach
+/// says the graph was too big to build at all — the whole build was abandoned — and under ADR-0006
+/// that is *why* the import has no size. Reporting `resolve` here would hand the user the shrapnel
+/// and hide the reason, and it would be cached that way.
+///
+/// **Measured, both ways.** Before the fix this build answered `module_graph_limit` 48/48 — the
+/// right answer for the wrong reason, because `classify_failure` short-circuits on the recorded
+/// breach *before* it ranks anything, while the declaration order ranked `MODULE_GRAPH_LIMIT` after
+/// `RESOLVE`. Delete the short-circuit and the ranking decides: the same bytes then answered
+/// `resolve` 48/48. The rank is pinned next door
+/// ([`a_graph_limit_breach_outranks_every_stage_a_module_can_fail_at`]); this pins the outcome.
+#[test]
+fn a_graph_that_breaches_the_limit_and_fails_to_resolve_reports_the_breach() {
+    let root = common::temp_workspace("import-lens-breach-outranks-resolve");
+    let oversized = "A".repeat(21 * 1024 * 1024);
+    write_source(
+        &root,
+        "entry.js",
+        "export { late } from './unresolved.js';\nexport { big } from './big.js';",
+    );
+    write_source(
+        &root,
+        "unresolved.js",
+        "export { late } from './nowhere.js';",
+    );
+    write_source(
+        &root,
+        "big.js",
+        &format!("export const big = \"{oversized}\";"),
+    );
+
+    let mut stages = BTreeSet::new();
+    for _ in 0..RUNS {
+        let failure = bundle(&root, "entry.js", &["late", "big"])
+            .expect_err("a graph that breaches the module source limit cannot be built");
+        stages.insert(failure.stage);
+    }
+
+    assert_eq!(
+        stages,
+        BTreeSet::from([stage::MODULE_GRAPH_LIMIT.to_owned()]),
+        "a build that blew the module source limit reported something else across {RUNS} runs. The \
+         breach is a fact about the whole build and it preempts every module diagnostic in it — \
+         both because it is the reason there is no number, and because the stage is durable and may \
+         not be decided by whichever of Rolldown's concurrent module tasks reported first (§10.6)"
+    );
+
+    fs::remove_dir_all(root).expect("temp workspace should be removed");
+}
+
+/// A breach outranks every stage a MODULE can fail at — the half of the claim the behavioural test
+/// above cannot see.
+///
+/// That test passes on the short-circuit alone, so it cannot tell whether the *order* agrees with
+/// the code. It did not: `MODULE_GRAPH_LIMIT` sat after `RESOLVE`, so the declared order said
+/// `resolve` should win a build the adapter has always answered `module_graph_limit`. The rank is
+/// not decoration — the SRS derives the reported order from this very list, so a wrong rank is a
+/// false sentence in the spec, and `contract_diagnostics` sorts the durable diagnostic list by it.
+///
+/// **Property** over the vocabulary, so a stage added tomorrow is ranked against the breach without
+/// anyone remembering to come back here.
+#[test]
+fn a_graph_limit_breach_outranks_every_stage_a_module_can_fail_at() {
+    let module_failures: Vec<&str> = stage::ALL
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !stage::is_transient(candidate) && *candidate != stage::MODULE_GRAPH_LIMIT
+        })
+        .collect();
+
+    assert!(!module_failures.is_empty());
+
+    for fact in &module_failures {
+        assert!(
+            stage::rank(stage::MODULE_GRAPH_LIMIT) < stage::rank(fact),
+            "a graph-limit breach is a property of the WHOLE build — it was too big to complete — \
+             and it is the reason there is no number at all. `{fact}` describes one module inside a \
+             graph that was never going to finish, so ranking it ahead of `module_graph_limit` \
+             would report the shrapnel and hide the reason (§10.6)"
+        );
+    }
+}
+
 /// **Property** over the whole engine vocabulary: no deterministic stage can outrank a transient
 /// one.
 ///
