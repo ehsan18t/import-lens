@@ -300,7 +300,7 @@ gate lives **inside** each store.
 ## Cache
 
 ### K1 — The `sideEffects` badge fix is invisible on a warm cache until `ANALYZER_REVISION` moves
-**Status: Watch** · A **hard dependency on Task 14**, not a nice-to-have
+**Status: Resolved (2026-07-15)** · Task 14 bumped `ANALYZER_REVISION` to `rolldown-1.1.x+3`
 
 **What actually happens.** A user who analysed `react-loading-skeleton` — or any package declaring
 a `sideEffects` glob, or `[]` — on a pre-fix daemon holds a persisted entry that says
@@ -317,11 +317,11 @@ on read and which `purge_orphan_entries` sweeps on. **The analyzer changed; the 
 batch, by Task 14 — bumping it per fix would throw every user's cache away several times over the
 branch, and the disk schema stays at 8 meanwhile.
 
-**The condition to watch.** If Task 14 lands **without** bumping `ANALYZER_REVISION`, this fix and
-`8f607a0` are dead code for **every existing install**: only a brand-new cache would ever show the
-corrected badge, and the packages most likely to be already cached are exactly the popular ones this
-fixes. The entry closes when Task 14 bumps the revision, at which point every pre-fix entry is
-rejected on read and re-measured.
+**Resolution.** Task 14 bumped `ANALYZER_REVISION` from `rolldown2` to `rolldown-1.1.x+3`
+(`cache/key.rs`), which lands with every measurement-affecting change on this branch. Every entry
+computed by the pre-fix daemon now fails the `analyzer_version` check on read and is re-measured, so
+the corrected badge reaches existing installs — not only brand-new caches. This was the hard
+dependency the whole batch of badge and size fixes rode on; it is discharged.
 
 ---
 

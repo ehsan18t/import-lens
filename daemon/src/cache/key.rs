@@ -33,6 +33,13 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// records the revision it was computed under and is rejected when it differs, which
 /// is the only thing standing between a user and a size measured by the old code.
 ///
+/// Format: `<engine>-<minor line>.x+<revision>`. The minor line (patch held as a wildcard `x`) names
+/// the engine without churning on every patch — a bare `rolldown3` reads as "Rolldown v3" when the
+/// crate is pinned in the 1.1.x line. A Rolldown patch that does NOT move numbers needs no edit here;
+/// a patch that does — or any of our own number-moving changes — bumps the trailing `+<revision>`; a
+/// minor or major bump changes the line itself (`rolldown-1.2.x+1`). Kept in step with
+/// `daemon/Cargo.toml`'s pin by the `compiler-stack-upgrade` skill.
+///
 /// `rolldown2` (2026-07-12): post-cutover correctness fixes moved real numbers.
 /// Rolldown's `//#region` debug comments are no longer billed as package cost (N2);
 /// the platform is `Neutral`, so the Server runtime stopped resolving `browser`
@@ -40,9 +47,22 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// are grouped per runtime, which was swinging a file's size by two orders of
 /// magnitude depending on import order (I15); and type-position-only TypeScript
 /// imports are elided (W4).
+///
+/// `rolldown-1.1.x+3` (2026-07-15): the release-review fixes moved numbers again, so every entry
+/// computed under `rolldown2` must be rejected on read. A Windows verbatim (extended-length) entry path broke
+/// Rolldown's path relativization, so a slash-bearing `sideEffects` pattern could never match and
+/// side-effectful modules were dropped — `refractor` under-reported 3.7x (30 kB vs 113 kB real, 1%
+/// off esbuild once fixed); array-form `sideEffects` matched with `fast_glob` now retains them
+/// (Task 4). The three fabricated-size fallbacks are deleted: an unbuildable import reports no size,
+/// never an invented one, and a transient failure is no longer cached (Tasks 5/6). Mixed-runtime
+/// files compress per runtime and sum, ending a ~49% under-report from concatenating payloads that
+/// never ship together (Task 8). The failure stage is ranked deterministically rather than decided
+/// by a parse-vs-resolve race and then cached (Task 7). And export enumeration resolves under the
+/// import's runtime, so an entry cached under the old hardcoded `Component` runtime no longer means
+/// what it did (Task 10).
 macro_rules! analyzer_revision {
     () => {
-        "rolldown2"
+        "rolldown-1.1.x+3"
     };
 }
 
