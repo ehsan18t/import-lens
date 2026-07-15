@@ -625,3 +625,93 @@ before the code is written, is the entire reason this product exists.
 Interactively, a cold build of a large package lands in tens of milliseconds; a cached answer is
 effectively instant; and a full document of imports stays well inside the memory budget the
 daemon is allowed to occupy while sharing a machine with the editor.
+
+---
+
+## 13. Precise contracts (for implementers)
+
+The sections above are the *why*. This is the exact *what*: the machine-precise contracts the
+narrative summarizes, gathered so the bundler lives in one place. `docs/ImportLens-SRS.md`
+points here for all of it rather than restating any of it.
+
+### 13.1 The virtual entry module (§4 in exact form)
+
+For each cache miss the engine plugin serves an in-memory virtual entry under a synthetic id. Each
+requested package maps to `import-lens:target/<index>` which resolves to the pre-resolved absolute
+entry path (so the bundler never re-resolves the bare specifier). Every requested surface gets a
+unique positional alias so strict entry signatures keep it alive, and names are emitted as
+JSON-escaped string literals so a user-controlled name is never interpolated raw:
+
+```javascript
+// Named import (per requested name; string-literal names work identically)
+export { "debounce" as __il_entry_0_export_0 } from "import-lens:target/0";
+
+// Default import
+export { default as __il_entry_0_default } from "import-lens:target/0";
+
+// Namespace / dynamic / full-package use the escaping-namespace form, because
+// `export * from` would drop the target's default export:
+import * as __il_entry_0_namespace from "import-lens:target/0";
+export { __il_entry_0_namespace };
+```
+
+Dynamic-import sizing maps to the full-package form (code splitting is disabled, so the measurement
+stays one static chunk). Multi-import file sizing supplies all resolved requests as entries of one
+build (indexes `0..n`) so shared dependencies link once.
+
+### 13.2 Compression (§6 in exact form)
+
+After codegen emits the minified string, the three compressions run in parallel (nested
+`rayon::join`): **gzip level 6**, **brotli level 4**, **zstd level 3**, all over the minified string,
+never the raw one. All three are collected before the response is sent.
+
+### 13.3 The tree-shakeability threshold (§6 in exact form)
+
+`truly_treeshakeable` is `false` when
+`named_export_minified_size / full_package_minified_size > 0.95` (minified bytes, because minified
+and compressed bytes are the user-facing surfaces). It is also `false` whenever the import is
+**side-effectful** (FR-021: `sideEffects` absent, `true`, or a glob the *measured entry* matches),
+because the comparison is only meaningful for a side-effect-free named import. A glob the entry does
+*not* match (`["**/*.css"]` on a JS entry) is not side-effectful, so the flag is measured normally.
+The full-package variant is a second build; if it fails, the flag degrades to `false` with a
+diagnostic rather than failing the analysis.
+
+### 13.4 The engine boundary contract (§2, §5 in exact form)
+
+The engine adapter (`daemon/src/engine/`) is the only place permitted to name a Rolldown type; no
+public or persistent type contains one (invariant 2). Callers submit a `BundleRequest` (entries with
+pre-resolved `entry_path`, package root, and selection (named / default / namespace / full), plus
+the runtime profile and purpose) and receive either a `BundleArtifact` or a typed `BundleFailure`.
+**No `sideEffects` metadata crosses this boundary**: Rolldown reads the declaration itself from the
+manifest the plugin supplies, and FR-021 makes it the sole authority on retention. Artifact
+invariants:
+
+- `code` is one complete, parseable, unminified ESM chunk.
+- `loaded_paths` is every internal real file loaded during the scan (including tree-shaken ones),
+  canonicalized, sorted, deduplicated.
+- `contributions` is only rendered modules, using Rolldown's rendered lengths; pre-minification
+  approximations, not required to sum to the chunk length.
+- `exported_names` comes from the entry chunk's public export list, never a custom export walker.
+
+**The reporting-only `sideEffects` match.** Recorded so it is not mistaken for dead code or for a
+second bundler: the daemon *does* match `package.json#sideEffects` globs against the entry it
+measures, but that match is **reporting-only and retention-neutral**: it never reaches Rolldown and
+cannot change what is retained or what size is reported. It survives on the **successful measurement**
+path, where it decides the `side_effects` badge the UI shows, because Rolldown 1.1.5 does not expose
+its own retention decisions and there is no other way to tell the user whether the file they imported
+is one the package declared effectful. The matcher itself is **not ours**: it is
+`fast_glob::glob_match` (the crate `rolldown_common`/`rolldown_utils` match `sideEffects` with),
+called with Rolldown's own pattern normalization mirrored around it and exact-pinned into the
+coordinated compiler stack at the version Rolldown resolves. A lookalike matcher would be a way to
+contradict the bundler whose retention we are describing ([ADR-0002](adr/0002-upstream-owns-everything-it-can-answer.md):
+where upstream vendors a component, we use *that* component).
+
+### 13.5 The analyzer revision
+
+The authoritative value and its rationale live in `daemon/src/cache/key.rs` (`ANALYZER_REVISION`).
+History: `graph2` (old custom engine) → `rolldown1` (Phase 3 cutover) → `rolldown2` (2026-07-12,
+post-cutover correctness fixes) → `rolldown-1.1.x+3` (2026-07-15, the release-review fixes: the
+Windows verbatim-path `sideEffects` bug behind `refractor`'s 3.7x under-report, the deleted
+fabricator, per-runtime compression, deterministic failure-stage ranking, runtime-correct
+enumeration). Format `<engine>-<minor line>.x+<revision>`: the patch is a wildcard so a Rolldown
+patch that moves no numbers needs no bump; our own number-moving changes advance the counter.

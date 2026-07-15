@@ -1537,48 +1537,11 @@ Superseded by FR-026d: there is no package-directory approximation to persist. A
 
 ### 10.3 Virtual Entry Module
 
-For each cache miss, the daemon constructs an in-memory virtual entry that the engine's plugin serves under a synthetic module id. Each requested package maps to a synthetic target `import-lens:target/<index>` that resolves to the pre-resolved absolute entry path from FR-017, so the bundler never re-resolves the bare package. Every requested surface gets a unique positional alias so strict entry signatures keep it alive, and names are emitted as JSON-escaped string literals so user-controlled names are never interpolated raw:
-
-```javascript
-// Named import (per requested name; string-literal names work identically)
-export { "debounce" as __il_entry_0_export_0 } from "import-lens:target/0";
-
-// Default import
-export { default as __il_entry_0_default } from "import-lens:target/0";
-
-// Namespace, dynamic, and full-package requests use the escaping-namespace
-// form, because `export * from` would drop the target's default export:
-import * as __il_entry_0_namespace from "import-lens:target/0";
-export { __il_entry_0_namespace };
-```
-
-Dynamic-import sizing maps to the full-package form: the daemon measures the complete asynchronously loaded module cost, and code splitting is disabled so the measurement stays a single static chunk. Multi-import file sizing supplies all resolved requests as entries of one build (indexes 0..n) so shared dependencies are linked once and never double-counted.
+The virtual entry module format (the synthetic `import-lens:target/<index>` ids resolving to the FR-017 pre-resolved path, the per-surface export forms, and multi-import batching so shared dependencies link once) is specified in [bundler-architecture.md](bundler-architecture.md) §13.1.
 
 ### 10.4 Compression Pipeline
 
-After codegen emits the minified JavaScript string, the three compression steps run in parallel using nested `rayon::join` calls:
-
-```rust
-// rayon::join accepts exactly 2 closures.
-// For 3 parallel tasks, nest the second join inside the first.
-let (gzip_bytes, (brotli_bytes, zstd_bytes)) = rayon::join(
-    || gzip_compress(&minified_string, 6),
-    || rayon::join(
-        || brotli_compress(&minified_string, 4),
-        || zstd_compress(&minified_string, 3),
-    ),
-);
-```
-
-```
-minified_string (from oxc_codegen)
-    ├─► flate2::GzEncoder (level 6) ────► gzip_bytes
-    └─► rayon::join
-        ├─► brotli::enc (level 4) ──────► brotli_bytes
-        └─► zstd::encode (level 3) ─────► zstd_bytes
-```
-
-All three results are collected before the response is sent.
+The compression pipeline (gzip level 6, brotli level 4, zstd level 3, run in parallel over the minified string and collected before the response is sent) is specified in [bundler-architecture.md](bundler-architecture.md) §13.2.
 
 ### 10.5 Daemon Startup and Lifecycle
 
@@ -1606,17 +1569,13 @@ Extension activates
 
 ### 10.6 Tree-Shakeability Detection
 
-After computing the requested named exports, the daemon computes the full-package variant through the same bundle and minifier path. If:
-
-```
-named_export_minified_size / full_package_minified_size > 0.95
-```
-
-then `truly_treeshakeable` is set to `false`. The comparison uses minified bytes rather than raw source bytes because minified and compressed bytes are the primary user-facing size surfaces. This catches packages that declare `"sideEffects": false` in `package.json` but whose internal module graph does not actually support granular export isolation. The flag is also `false` whenever the import is **side-effectful** per FR-021 — `sideEffects` absent, `true`, or a glob **the measured entry matches** — because the comparison is only meaningful for a side-effect-free named import. A glob the entry does *not* match (`["**/*.css"]` on a JavaScript entry) is not side-effectful, so the comparison runs and the flag is measured like any other package's; it used to be gated off by construction, which is the bug FR-021 records. The full-package variant is a second engine build; if it fails, the flag degrades to `false` with a diagnostic rather than failing the analysis.
+The tree-shakeability rule (the `0.95` minified-size ratio between the named and full-package builds, the side-effectful exclusion, and the degrade-to-`false` behavior when the second build fails) is specified in [bundler-architecture.md](bundler-architecture.md) §13.3. The side-effect classification it depends on is FR-021.
 
 ### 10.7 Bundling Engine Contract
 
-Cross-module linking and tree-shaking are owned by the embedded Rolldown bundler. The daemon does not implement module-graph construction, reachability analysis, binding renaming, namespace materialization, or ESM/CJS interop; the previous custom module graph walk algorithm was deleted at the bundler-redesign Phase 3 cutover. `ANALYZER_REVISION` moved to `rolldown1` at that cutover, to **`rolldown2`** on 2026-07-12 (the post-cutover correctness fixes: debug-comment billing, platform/`NODE_ENV` injection, per-runtime file grouping, type-only import elision), and to **`rolldown-1.1.x+3`** on 2026-07-15, when the bundler-redesign release fixes moved real numbers again (the Windows verbatim-path `sideEffects` bug that made `refractor` under-report 3.7x, the deleted fabricator, per-runtime compression of mixed-runtime files, deterministic failure-stage ranking, and runtime-correct export enumeration). The revision format is `<engine>-<minor line>.x+<revision>`: the patch is a wildcard so a Rolldown patch that does not move numbers needs no bump, while our own number-moving changes advance the trailing counter.
+The bundler's design and rationale (what Rolldown owns and why, the failure model, the invariants, and the precise virtual-entry, compression, and tree-shakeability contracts) live in [bundler-architecture.md](bundler-architecture.md). This section specifies the engine boundary the FRs reference.
+
+Cross-module linking and tree-shaking are owned by the embedded Rolldown bundler. The daemon does not implement module-graph construction, reachability analysis, binding renaming, namespace materialization, or ESM/CJS interop; the previous custom module graph walk algorithm was deleted at the bundler-redesign Phase 3 cutover. The `ANALYZER_REVISION` history and its `<engine>-<minor line>.x+<revision>` format are recorded authoritatively in `daemon/src/cache/key.rs` and summarized in [bundler-architecture.md](bundler-architecture.md) §13.5.
 
 One exception to the "does not implement" list above, recorded so it is not mistaken for dead code: the daemon **matches `package.json#sideEffects` globs against the entry it is measuring**, but that match is *reporting-only and retention-neutral*. It never reaches Rolldown and cannot change what is retained or what size is reported. It survives on the **successful measurement** path, where it decides the `side_effects` flag the UI shows beside the size, because Rolldown 1.1.5 does not expose its own retention decisions and there is no other way to tell the user whether the file they imported is one the package declared effectful. (It used to be described as surviving "solely on the static-fallback path". That path is deleted; the match is not, and it never depended on it.) See the I9 amendment in the bundler-redesign design.
 

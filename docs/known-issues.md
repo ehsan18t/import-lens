@@ -467,4 +467,24 @@ not a defect.
 | P7 | **Rebuild fixed option data once, not per build** — ~180 `String`s allocated per build; `LazyLock` candidates. |
 | P8 | **The miss drain spawns fresh OS threads per call** — a single cache miss spawns a thread to do work the caller could do inline; a 500-file report can perform hundreds of thread creations. |
 | P9 | **The completion path re-verifies a whole package graph on every popup** — re-reads and re-hashes every non-`node_modules` file per keystroke inside an import's braces. |
-| P10 | **`ENGINE_PERMITS` is 2 against a 5× memory headroom** — 20 misses serialise into 10 rounds. (This one **is** a plan task; it is listed here only so the set is complete.) |
+| P10 | **`ENGINE_PERMITS` is 2 — tried at 4 (Task 13), measured, reverted.** Not deferred; see the outcome below. |
+
+**P10 outcome (Task 13 — measured 2026-07-15, reverted).** Raising `engine_permits()` to
+`available_parallelism().clamp(2, 4)` was implemented and measured against the §10.6 gate on an
+8+-core Windows machine (release, single runs):
+
+| | permits=2 | permits=4 |
+| --- | --- | --- |
+| 20-import wall | 943 ms | 883 ms (−6%) |
+| 20-import peak RSS | 82 MB | 137 MB (+67%) |
+| cold p95 | 105 ms | 107 ms |
+
+Both pass the 400 MB / 500 ms gate. But the wall-time gain is **within single-run perf noise**, while
+the RSS rise is **structural** (more permits → more concurrent resident graphs). The bottleneck at this
+core count is **core saturation, not permits**: each build already runs an 8-wide Rolldown runtime, so
+two concurrent builds oversubscribe the cores and a third/fourth adds resident memory without
+throughput. **Reverted** — a real memory cost for a noise-level speed gain, in the C7 concurrency
+area, does not earn its place. The win would materialise only where the runtime width does not already
+saturate cores (much higher core counts, or lighter builds); revisit only if the runtime-width vs
+permit split is reworked. The change was clean (const → `LazyLock` semaphore + `miss_drain_workers()`,
+all sites converted, tests green) — the code is not the problem, the tuning simply did not pay off here.
