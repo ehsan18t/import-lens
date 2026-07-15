@@ -11,9 +11,25 @@ import {
   FINGERPRINT_PATH,
   formatFingerprint,
 } from "./compiler-stack-fingerprint.mjs";
-import { rolldownFamilyCrates } from "./compiler-stack-helpers.mjs";
 
 const execFilePromise = promisify(execFileCallback);
+
+// The set of crates the restore must pin back, and the exact version each must
+// return to, read straight from the committed fingerprint -- the ONLY complete
+// record of the coordinated closure. The direct crates (rolldown, its support
+// siblings, the retained OXC crates, oxc_resolver, the glob matcher) are a
+// minority of it: rolldown pins its ~40 workspace siblings with caret ranges,
+// so a range-respecting `cargo update` drifts them within their carets. Pinning
+// only the direct crates leaves those siblings drifted and the recompute
+// diverges, which is exactly the failure this function exists to prevent.
+//
+// registry only: path/git sources cannot drift on a `cargo update` and cannot be
+// pinned with `--precise` anyway. The fingerprint records all 53 as registry, so
+// this filter is a guard, not a live subtraction.
+export const deriveRestorePins = (fingerprintText) =>
+  JSON.parse(fingerprintText)
+    .packages.filter((pkg) => typeof pkg.source === "string" && pkg.source !== "path")
+    .map((pkg) => [pkg.name, pkg.version]);
 
 // Range-respecting refresh of everything OUTSIDE the compiler stack. `pnpm
 // update` stays within package.json ranges and `cargo update` within
@@ -38,20 +54,16 @@ export const runSafeUpdate = async ({
   }
   await execFile("cargo", ["update"], { cwd: rootDir });
 
-  const pins = [
-    ...rolldownFamilyCrates().map((crate) => [crate, compilerStackConfig.currentRolldownVersion]),
-    ["oxc_resolver", compilerStackConfig.currentResolverVersion],
-    ...compilerStackConfig.oxcCrates.map((crate) => [crate, compilerStackConfig.currentOxcVersion]),
-    [compilerStackConfig.globMatcherCrate, compilerStackConfig.currentGlobMatcherVersion],
-  ];
-  for (const [crate, version] of pins) {
+  // One read of the committed fingerprint serves both roles: it names every
+  // crate to pin back (below) and is the target the recompute must match (end).
+  const committed = await readFile(path.join(rootDir, FINGERPRINT_PATH), "utf8");
+  for (const [crate, version] of deriveRestorePins(committed)) {
     await execFile("cargo", ["update", "-p", crate, "--precise", version], { cwd: rootDir });
   }
 
   const recomputed = formatFingerprint(
     await computeCompilerStackFingerprint({ execFile, rootDir }),
   );
-  const committed = await readFile(path.join(rootDir, FINGERPRINT_PATH), "utf8");
   if (recomputed !== committed) {
     throw new Error(
       "deps:update:safe could not restore the recorded compiler stack; the resolved " +

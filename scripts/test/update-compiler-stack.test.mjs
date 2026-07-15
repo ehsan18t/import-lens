@@ -6,7 +6,6 @@ import test from "node:test";
 import { compilerStackConfig } from "../compiler-stack.config.mjs";
 import { fingerprintFromMetadata, formatFingerprint } from "../compiler-stack-fingerprint.mjs";
 import { replaceKnownVersions, rolldownFamilyCrates } from "../compiler-stack-helpers.mjs";
-import { runSafeUpdate } from "../deps-update-safe.mjs";
 import { parseUpdateArgs, updateCompilerStack } from "../update-compiler-stack.mjs";
 
 // The fixtures below stand in for a repo sitting on the CURRENT pins, because
@@ -629,83 +628,9 @@ test("updateCompilerStack rejects a rolldown release whose support crates are un
   assert.deepEqual(writes, []);
 });
 
-test("runSafeUpdate restores the stack and validates the fingerprint", async () => {
-  const metadata = probeMetadata({
-    rolldown: currentRolldown,
-    oxc: currentOxc,
-    resolver: currentResolver,
-  });
-  const committed = formatFingerprint(fingerprintFromMetadata(metadata));
-  const execs = [];
-
-  await runSafeUpdate({
-    rootDir: "/repo",
-    platform: "linux",
-    execFile: cargoAwareExec(execs, metadata),
-    readFile: async () => committed,
-  });
-
-  assert.deepEqual(execs[0], ["pnpm", ["update"], { cwd: "/repo" }]);
-  assert.deepEqual(execs[1], ["cargo", ["update"], { cwd: "/repo" }]);
-  assert.deepEqual(
-    execs.slice(2, 2 + rolldownFamily.length),
-    rolldownFamily.map((crate) => [
-      "cargo",
-      ["update", "-p", crate, "--precise", currentRolldown],
-      { cwd: "/repo" },
-    ]),
-  );
-  assert.deepEqual(execs[2 + rolldownFamily.length], [
-    "cargo",
-    ["update", "-p", "oxc_resolver", "--precise", currentResolver],
-    { cwd: "/repo" },
-  ]);
-  const restoreOffset = 3 + rolldownFamily.length;
-  const crateRestores = execs.slice(
-    restoreOffset,
-    restoreOffset + compilerStackConfig.oxcCrates.length,
-  );
-  assert.deepEqual(
-    crateRestores,
-    compilerStackConfig.oxcCrates.map((crate) => [
-      "cargo",
-      ["update", "-p", crate, "--precise", currentOxc],
-      { cwd: "/repo" },
-    ]),
-  );
-  // A range-respecting `cargo update` can move the matcher out from under the daemon just
-  // as it can move rolldown's own crates; the restore has to put it back.
-  assert.deepEqual(execs[restoreOffset + compilerStackConfig.oxcCrates.length], [
-    "cargo",
-    ["update", "-p", globMatcher, "--precise", currentGlobMatcher],
-    { cwd: "/repo" },
-  ]);
-  const last = execs.at(-1);
-  assert.ok(isCargoMetadata(last[0], last[1]));
-});
-
-test("runSafeUpdate fails when the restored graph no longer matches the fingerprint", async () => {
-  const metadata = probeMetadata({
-    rolldown: currentRolldown,
-    oxc: currentOxc,
-    resolver: currentResolver,
-  });
-  const moved = probeMetadata({
-    rolldown: currentRolldown,
-    oxc: targetOxc,
-    resolver: currentResolver,
-  });
-
-  await assert.rejects(
-    runSafeUpdate({
-      rootDir: "/repo",
-      platform: "linux",
-      execFile: cargoAwareExec([], moved),
-      readFile: async () => formatFingerprint(fingerprintFromMetadata(metadata)),
-    }),
-    /could not restore the recorded compiler stack/u,
-  );
-});
+// runSafeUpdate (deps:update:safe) lives in deps-update-safe.test.mjs; its
+// restore now derives every pin from the committed fingerprint, so those tests
+// read the real fingerprint rather than a synthetic four-crate probe graph.
 
 const availableVersions = () => async (url) => availableVersionPayload(url);
 
