@@ -117,6 +117,10 @@ pub struct ExportEnumeration {
     pub names: Vec<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
     pub read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    /// Every module the graph loaded, canonical and sorted. The memo needs these — not just
+    /// the fingerprints — to find the first-party manifests that shaped resolution, exactly
+    /// as the size path does (`analyze::manifest_augmented_fingerprints`).
+    pub loaded_paths: Vec<PathBuf>,
     /// Loaded paths with no read-time fingerprint. A non-empty list means the
     /// enumeration must not be memoized: there is nothing to expire it against.
     pub unhashed_paths: Vec<PathBuf>,

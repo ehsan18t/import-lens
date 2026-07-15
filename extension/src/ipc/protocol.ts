@@ -375,6 +375,10 @@ export interface EnumerateExportsRequest {
   specifier: string;
   package: string;
   package_version: string;
+  // The import's UTF-16 offset in the document. The daemon classifies it into a runtime so the
+  // enumeration resolves under the same conditions the size does (an import in Astro frontmatter
+  // is Server, not Component). Omit for a document with no runtime-bearing regions.
+  cursor_offset?: number;
 }
 
 export interface EnumerateExportsResponse {

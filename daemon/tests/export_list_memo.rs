@@ -9,6 +9,7 @@
 
 use import_lens_daemon::engine::boundary::builds_started;
 use import_lens_daemon::ipc::protocol::ImportRuntime;
+use import_lens_daemon::pipeline::analyze::AnalysisContext;
 use import_lens_daemon::pipeline::export_list::enumerate_exports_cached;
 use std::{fs, path::Path, path::PathBuf};
 
@@ -31,10 +32,16 @@ fn write_alpha(workspace: &Path, body: &str) {
     fs::write(path, format!("export const alpha = () => '{body}';\n")).expect("alpha");
 }
 
-fn enumerate(entry: &Path) -> (Vec<String>, usize) {
+fn enumerate(workspace: &Path, entry: &Path) -> (Vec<String>, usize) {
+    let context = AnalysisContext {
+        workspace_root: workspace.to_path_buf(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let package_root = entry.parent().expect("entry has a parent").to_path_buf();
     let before = builds_started();
-    let enumeration = enumerate_exports_cached(entry, ImportRuntime::Component)
-        .expect("enumeration should succeed");
+    let enumeration =
+        enumerate_exports_cached(&context, &package_root, entry, ImportRuntime::Component)
+            .expect("enumeration should succeed");
     let mut names = enumeration.names;
     names.sort();
     (names, builds_started() - before)
@@ -45,11 +52,11 @@ fn enumeration_is_built_once_and_expires_when_a_module_it_read_changes() {
     let workspace = common::temp_workspace("import-lens-export-memo");
     let entry = write_package(&workspace);
 
-    let (names, builds) = enumerate(&entry);
+    let (names, builds) = enumerate(&workspace, &entry);
     assert_eq!(names, vec!["alpha".to_owned(), "beta".to_owned()]);
     assert_eq!(builds, 1, "a cold enumeration builds once");
 
-    let (names, builds) = enumerate(&entry);
+    let (names, builds) = enumerate(&workspace, &entry);
     assert_eq!(names, vec!["alpha".to_owned(), "beta".to_owned()]);
     assert_eq!(
         builds, 0,
@@ -59,7 +66,7 @@ fn enumeration_is_built_once_and_expires_when_a_module_it_read_changes() {
     // A module the enumeration read changed. Same length, fresh mtime — the memo
     // validates with the same strict, hash-verifying check the import cache uses.
     write_alpha(&workspace, "gamma");
-    let (_, builds) = enumerate(&entry);
+    let (_, builds) = enumerate(&workspace, &entry);
     assert_eq!(
         builds, 1,
         "editing a module the enumeration read must expire it"

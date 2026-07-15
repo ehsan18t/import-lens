@@ -130,12 +130,33 @@ fn full_package_fingerprints(
     package_root: &Path,
     full: &crate::engine::BundleArtifact,
 ) -> Vec<crate::cache::key::FileFingerprint> {
+    manifest_augmented_fingerprints(
+        context,
+        package_root,
+        &full.read_time_fingerprints,
+        &full.loaded_paths,
+    )
+}
+
+/// A build's read-time fingerprints, augmented with the package's own manifest and the
+/// first-party manifests its sources loaded (§8.3) — the freshness set every build-derived
+/// memo needs so a manifest edit that no source file reflects still expires it.
+///
+/// Shared by the full-package comparison memo and the export-list memo so the two cannot
+/// drift in what they call "still fresh" — and so there is exactly one manifest walker
+/// (`first_party_manifests`), per ADR-0002.
+pub(crate) fn manifest_augmented_fingerprints(
+    context: &AnalysisContext,
+    package_root: &Path,
+    read_time_fingerprints: &[crate::cache::key::FileFingerprint],
+    loaded_paths: &[PathBuf],
+) -> Vec<crate::cache::key::FileFingerprint> {
     use crate::cache::key::file_fingerprint_reading_hash;
 
-    let mut fingerprints = full.read_time_fingerprints.clone();
+    let mut fingerprints = read_time_fingerprints.to_vec();
     fingerprints.extend(
         std::iter::once(package_root.join("package.json"))
-            .chain(first_party_manifests(context, &full.loaded_paths))
+            .chain(first_party_manifests(context, loaded_paths))
             .filter_map(file_fingerprint_reading_hash),
     );
     fingerprints

@@ -1,4 +1,5 @@
-use super::script_regions::{ScriptRegion, script_regions_for_document};
+use super::script_regions::{ScriptRegion, byte_offset_for_utf16, script_regions_for_document};
+use crate::ipc::protocol::ImportRuntime;
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_span::Span;
@@ -9,6 +10,10 @@ use std::collections::HashMap;
 pub struct NamedImportCompletionContext {
     pub specifier: String,
     pub imported_names: Vec<String>,
+    /// The runtime the import at the cursor resolves under, from the region that contained
+    /// it. The enumeration answered for this specifier must use it, or the completion list
+    /// is drawn under different conditions than the size (ADR-0002).
+    pub runtime: ImportRuntime,
 }
 
 pub fn named_import_completion_context(
@@ -32,21 +37,6 @@ pub fn named_import_completion_context(
     None
 }
 
-// VS Code's `document.offsetAt` counts UTF-16 code units, while oxc spans are
-// byte offsets; the two only coincide for pure-ASCII prefixes.
-fn byte_offset_for_utf16(source: &str, utf16_offset: usize) -> usize {
-    let mut utf16_seen = 0;
-
-    for (byte_index, char) in source.char_indices() {
-        if utf16_seen >= utf16_offset {
-            return byte_index;
-        }
-        utf16_seen += char.len_utf16();
-    }
-
-    source.len()
-}
-
 fn region_completion_context(
     region: &ScriptRegion<'_>,
     offset: usize,
@@ -59,7 +49,10 @@ fn region_completion_context(
         return None;
     }
 
-    completion_context_from_module_record(region.source, offset, &parsed.module_record)
+    let mut context =
+        completion_context_from_module_record(region.source, offset, &parsed.module_record)?;
+    context.runtime = region.runtime;
+    Some(context)
 }
 
 fn completion_context_from_module_record(
@@ -102,6 +95,9 @@ fn completion_context_from_module_record(
         return Some(NamedImportCompletionContext {
             specifier: group.specifier,
             imported_names: group.imported_names,
+            // Overwritten with the matched region's runtime by `region_completion_context`,
+            // which is the only caller and the only place that knows the region.
+            runtime: ImportRuntime::Component,
         });
     }
 
@@ -123,6 +119,8 @@ fn completion_context_from_module_record(
             return Some(NamedImportCompletionContext {
                 specifier: specifier.as_str().to_owned(),
                 imported_names: Vec::new(),
+                // Overwritten with the matched region's runtime by the caller.
+                runtime: ImportRuntime::Component,
             });
         }
     }

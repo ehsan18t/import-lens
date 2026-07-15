@@ -1233,6 +1233,8 @@ interface PrewarmPackageJsonMessage {
 
 Used by the named-import completion provider. This protocol v2+ request asks the daemon to resolve a package and return statically-known named exports from the cached or newly-built graph.
 
+The enumeration resolves under the import's **runtime**, not always `Component`. A package whose `exports` map diverges across `node` and `browser` conditions resolves to a different entry file — and therefore a different export surface — depending on the runtime, and the size of that same import is already computed under its runtime (see FileSize). Offering names under `browser` while pricing under `node` would let completions and sizing disagree by construction. The daemon derives the runtime from the cursor's document region using the one document classifier (`document::runtime_at_offset`, the same one that classifies Astro frontmatter as Server) — the client never computes and sends a runtime (ADR-0002). `cursor_offset` carries the import's UTF-16 offset for that classification; it is optional, and its absence (a plain `.ts`/`.js` file, or an older client) classifies as `Component`, the correct default for a document with no runtime-bearing regions. The completion popup path (`CompleteImportMembersRequest`) already carries the live buffer and cursor, so it classifies directly from those and sends no offset here.
+
 ```typescript
 interface EnumerateExportsRequest {
   type: "enumerate_exports";
@@ -1243,6 +1245,7 @@ interface EnumerateExportsRequest {
   specifier: string;
   package: string;
   package_version: string;
+  cursor_offset?: number; // UTF-16 offset of the import; classified into a runtime, defaults to Component
 }
 
 interface EnumerateExportsResponse {

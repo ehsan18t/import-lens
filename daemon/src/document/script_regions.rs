@@ -48,6 +48,46 @@ pub fn script_regions_for_document<'a>(filename: &str, source: &'a str) -> Vec<S
     }]
 }
 
+/// The import runtime in effect at a document cursor, from the one document classifier.
+///
+/// This is the sole authority for "what conditions does an import here resolve under?"
+/// (ADR-0002): completion and export enumeration both go through it, so a name offered
+/// and the size measured for that same import can never disagree. A cursor outside every
+/// runtime-bearing region — a plain `.ts`/`.js`/`.jsx` file, or the HTML body of an
+/// `.astro`/`.vue`/`.svelte` document — is `Component`, the default a bare file already
+/// carries.
+pub fn runtime_at_offset(
+    filename: &str,
+    source: &str,
+    utf16_cursor_offset: usize,
+) -> ImportRuntime {
+    let offset = byte_offset_for_utf16(source, utf16_cursor_offset);
+
+    for region in script_regions_for_document(filename, source) {
+        let region_end = region.offset + region.source.len();
+        if offset >= region.offset && offset <= region_end {
+            return region.runtime;
+        }
+    }
+
+    ImportRuntime::Component
+}
+
+/// VS Code's `document.offsetAt` counts UTF-16 code units, while oxc spans and the region
+/// offsets above are byte offsets; the two only coincide for pure-ASCII prefixes.
+pub(super) fn byte_offset_for_utf16(source: &str, utf16_offset: usize) -> usize {
+    let mut utf16_seen = 0;
+
+    for (byte_index, char) in source.char_indices() {
+        if utf16_seen >= utf16_offset {
+            return byte_index;
+        }
+        utf16_seen += char.len_utf16();
+    }
+
+    source.len()
+}
+
 pub(super) fn source_type_for_region(filename: &str) -> SourceType {
     let source_type =
         SourceType::from_path(Path::new(filename)).unwrap_or_else(|_| SourceType::mjs());

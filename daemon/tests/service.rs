@@ -501,6 +501,7 @@ fn enumerate_exports_request(workspace: &Path, request_id: u64) -> EnumerateExpo
         specifier: "exports-lib".to_owned(),
         package_name: "exports-lib".to_owned(),
         package_version: "1.0.0".to_owned(),
+        cursor_offset: None,
     }
 }
 

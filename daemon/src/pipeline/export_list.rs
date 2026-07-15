@@ -4,9 +4,13 @@
 //! full, uncached Rolldown build of the entire package graph — on every popup, for a
 //! list that only changes when the package's files do.
 //!
-//! See [`crate::pipeline::build_memo`] for what makes this safe to cache. The
-//! enumeration's own read-time fingerprints describe exactly the files the export list
-//! was derived from, so it expires precisely when that list would have gone wrong.
+//! See [`crate::pipeline::build_memo`] for what makes this safe to cache. The enumeration
+//! is fingerprinted against exactly the freshness set the size path uses — its own
+//! read-time module fingerprints PLUS the package and first-party manifests
+//! (`analyze::manifest_augmented_fingerprints`, §8.3) — so it expires precisely when the
+//! export list would have gone wrong. Fingerprinting only the source modules left a
+//! first-party `package.json` edit (its `type`, `exports`, or `sideEffects`) serving the
+//! old list forever, since that edit moves no source file.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -14,6 +18,7 @@ use std::sync::LazyLock;
 use super::build_memo::BuildMemo;
 use crate::engine::{BundleFailure, ExportEnumeration, boundary};
 use crate::ipc::protocol::ImportRuntime;
+use crate::pipeline::analyze::{AnalysisContext, manifest_augmented_fingerprints};
 
 static MEMO: LazyLock<BuildMemo<ExportEnumeration>> = LazyLock::new(BuildMemo::new);
 
@@ -24,6 +29,8 @@ static MEMO: LazyLock<BuildMemo<ExportEnumeration>> = LazyLock::new(BuildMemo::n
 /// build — by `boundary::BUILD_TIMEOUT`. Only a *successful* enumeration is memoized, so a build
 /// that timed out or panicked leaves nothing behind to be served as if it were an answer.
 pub fn enumerate_exports_cached(
+    context: &AnalysisContext,
+    package_root: &Path,
     entry_path: &Path,
     runtime: ImportRuntime,
 ) -> Result<ExportEnumeration, BundleFailure> {
@@ -39,11 +46,17 @@ pub fn enumerate_exports_cached(
     // A graph carrying a module the plugin could not fingerprint as it read it has no
     // complete read-time record, so there is nothing to expire a memo against.
     if enumeration.unhashed_paths.is_empty() {
+        let fingerprints = manifest_augmented_fingerprints(
+            context,
+            package_root,
+            &enumeration.read_time_fingerprints,
+            &enumeration.loaded_paths,
+        );
         MEMO.insert(
             entry_path,
             runtime,
             enumeration.clone(),
-            enumeration.read_time_fingerprints.clone(),
+            fingerprints,
             generation,
         );
     }

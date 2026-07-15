@@ -9,7 +9,7 @@ use crate::{
     document::{
         IgnoreRuleResolver, analyze_imports, get_package_name, is_runtime_package_specifier,
         named_import_completion_context, package_json_dependency_entries,
-        package_json_dependency_sections, should_ignore_import,
+        package_json_dependency_sections, runtime_at_offset, should_ignore_import,
     },
     ipc::protocol::{
         AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
@@ -1825,16 +1825,24 @@ impl ImportLensService {
             }
         };
 
-        let response = self.enumerate_exports(EnumerateExportsRequest {
-            message_type: "enumerate_exports".to_owned(),
-            version: request.version,
-            request_id: request.request_id,
-            workspace_root: request.workspace_root,
-            active_document_path: request.active_document_path,
-            specifier: context.specifier.clone(),
-            package_name,
-            package_version,
-        });
+        // The runtime is already classified from the LIVE editor buffer (`request.source`)
+        // by `named_import_completion_context` — the one document classifier — so hand it
+        // to the enumeration directly rather than re-deriving it from disk. `cursor_offset`
+        // is therefore `None`: the runtime is not re-classified for this path.
+        let response = self.enumerate_exports_with_runtime(
+            EnumerateExportsRequest {
+                message_type: "enumerate_exports".to_owned(),
+                version: request.version,
+                request_id: request.request_id,
+                workspace_root: request.workspace_root,
+                active_document_path: request.active_document_path,
+                specifier: context.specifier.clone(),
+                package_name,
+                package_version,
+                cursor_offset: None,
+            },
+            context.runtime,
+        );
 
         CompleteImportMembersResponse {
             version: response.version,
@@ -1859,6 +1867,20 @@ impl ImportLensService {
             };
         }
 
+        let runtime = runtime_for_enumeration(&request);
+        self.enumerate_exports_with_runtime(request, runtime)
+    }
+
+    /// The enumeration itself, once the runtime has been decided. Both callers reach it
+    /// with a runtime derived from the ONE document classifier — the completion popup from
+    /// the live buffer, the direct request from the cursor offset — so a hardcoded
+    /// `Component` (the old bug) cannot creep back in. The runtime drives BOTH resolution
+    /// (`browser` vs `node` conditions pick a different entry file) and the memo key.
+    fn enumerate_exports_with_runtime(
+        &self,
+        request: EnumerateExportsRequest,
+        runtime: ImportRuntime,
+    ) -> EnumerateExportsResponse {
         let context = AnalysisContext {
             workspace_root: PathBuf::from(&request.workspace_root),
             active_document_path: PathBuf::from(&request.active_document_path),
@@ -1869,7 +1891,7 @@ impl ImportLensService {
             version: request.package_version,
             named: Vec::new(),
             import_kind: ImportKind::Namespace,
-            runtime: ImportRuntime::Component,
+            runtime,
         };
 
         let resolved = match resolve_package_entry(&context.active_document_path, &import_request) {
@@ -1891,6 +1913,8 @@ impl ImportLensService {
         };
 
         match crate::pipeline::export_list::enumerate_exports_cached(
+            &context,
+            &resolved.package_root,
             &resolved.entry_path,
             import_request.runtime,
         ) {
@@ -3163,6 +3187,24 @@ pub fn protocol_error_batch_response(request: &BatchRequest, message: String) ->
             .map(|item| protocol_error(item, message.clone()))
             .collect(),
         indexes: None,
+    }
+}
+
+/// The runtime a direct `enumerate_exports` request resolves under, from the ONE document
+/// classifier (`document::runtime_at_offset`) so it cannot disagree with the size path.
+///
+/// The request carries the cursor's UTF-16 offset when the caller has one; the daemon owns
+/// the classification (ADR-0002), reading the document from disk. Absent — a plain file, or
+/// an older client that never sent it — or unreadable, the answer is `Component`, which is
+/// the correct default for a document with no runtime-bearing regions.
+fn runtime_for_enumeration(request: &EnumerateExportsRequest) -> ImportRuntime {
+    let Some(offset) = request.cursor_offset else {
+        return ImportRuntime::Component;
+    };
+
+    match fs::read_to_string(&request.active_document_path) {
+        Ok(source) => runtime_at_offset(&request.active_document_path, &source, offset),
+        Err(_) => ImportRuntime::Component,
     }
 }
 

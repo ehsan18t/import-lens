@@ -76,6 +76,7 @@ impl RolldownEngine {
             // A successful build's warnings used to be dropped on the floor.
             diagnostics: contract_diagnostics(&output.warnings),
             read_time_fingerprints,
+            loaded_paths: state.sorted_loaded_paths(),
             unhashed_paths,
         })
     }

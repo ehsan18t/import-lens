@@ -1041,6 +1041,14 @@ pub struct EnumerateExportsRequest {
     #[serde(rename = "package")]
     pub package_name: String,
     pub package_version: String,
+    /// The import's UTF-16 cursor offset in `active_document_path`, when the caller has
+    /// one. The daemon classifies it into a runtime (`document::runtime_at_offset`) so the
+    /// enumeration resolves under the same conditions the size will — an import in Astro
+    /// frontmatter (Server) must be enumerated under node conditions, not browser. Absent
+    /// (a plain file, or an older client), the classifier default is `Component`.
+    /// `#[serde(default)]` keeps an older client that omits it decoding.
+    #[serde(default)]
+    pub cursor_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
