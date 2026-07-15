@@ -200,6 +200,36 @@ separately from the package-root one; or resolving the entry **through** Rolldow
 pre-resolving it, which FR-017/§6.1 forbids (the engine must never re-resolve the bare specifier).
 Recorded in SRS §10.7.
 
+### C7 — The engine-permit scheduling model is a repeat source of nondeterminism
+**Status: Watch** · Design-health watch. Becomes a redesign task if a THIRD genuine *code-level*
+race appears here.
+
+The engine boundary — a fair `Semaphore` of `ENGINE_PERMITS`, with each request handler spawning
+its own builds — has produced three distinct nondeterminism issues on this branch:
+
+- **A liveness bug** (C1): a parked build held a permit forever. Fixed at the design level with
+  `BUILD_TIMEOUT` + a drop-guard.
+- **A determinism bug** (Task 7 / `fb7624d`): the failure *stage* was decided by a parse-vs-resolve
+  race and then **cached**. Fixed by ranking stages in declaration order.
+- **A test over-assertion** (`33411bc`): the streaming test asserted a per-import push reaches the
+  socket *before* the file-size response. `AnalyzeDocument` and `FileSizeDocument` spawn independent
+  tasks that race for the two permits, so the trivial per-import build can be starved and the
+  combined build can answer first. No user impact — like C4, push/response ordering is not a
+  guarantee — but it flaked CI on a runner with a different core count.
+
+**Current assessment: no redesign.** The first two were real defects and were *hardened*, not
+patched around. The third is not a code defect at all — the multiplexing loop is non-blocking and
+correct; the test claimed a promise the code never made. The one real cost is that a document's
+per-import builds and its combined file-size build **duplicate module work while racing** for
+permits — a known perf tradeoff, partly mitigated by module-level caching, tuned by Task 13's permit
+count, and invisible to users.
+
+**What flips this to a redesign task:** a THIRD genuine *code-level* race here (not a test) — results
+that are **wrong or dropped**, not merely reordered. At that point the two builds should be
+**coordinated** (the combined build reusing the per-import module builds, which also makes ordering
+deterministic) rather than left to race. Per the "redesign at third recurrence" rule, that redesign
+is the **first priority after release blockers and major fixes**.
+
 ---
 
 ## Side effects
@@ -311,6 +341,31 @@ Compression must follow the artifact rule: an asset is a separate artifact from 
 it is compressed on its own and summed
 ([ADR-0005](adr/0005-a-runtime-is-an-artifact-boundary.md)).
 
+**Mechanism for CSS (identified 2026-07-15).** rolldown 1.1.5 refuses to bundle CSS
+(`UNSUPPORTED_FEATURE` at LINK — `engine/mod.rs`), so `engine/plugin.rs` currently stubs a reachable
+`import "./x.css"` and records its **raw** file size as an uncounted asset. To count it as it would
+ship, run the CSS through **Lightning CSS** — the `lightningcss` Rust crate (Parcel's engine, and
+what the JS `@tsdown/css` plugin is itself built on): bundle `@import`s, minify, autoprefix, then
+compress per the artifact rule above. This is the [ADR-0002](adr/0002-upstream-owns-everything-it-can-answer.md)
+call — the specialized upstream owns CSS, we do not hand-roll it — and it slots into the interception
+point the plugin already has. The JS `@tsdown/css` package itself is **not** usable: the daemon
+embeds the *Rust* rolldown crate, not the JS tsdown wrapper. Costs that are NOT optional:
+`lightningcss` joins the exact-pinned compiler stack (a version bump moves reported CSS sizes, so it
+is version-tested like rolldown/oxc), and the esbuild oracle + badge baselines must re-baseline for
+CSS-shipping packages.
+
+**Decided shape (2026-07-15).** Count **all** shipped asset bytes, not CSS only. The headline Import
+Cost folds in JS + CSS + wasm + fonts, each compressed as its own artifact and summed
+([ADR-0005](adr/0005-a-runtime-is-an-artifact-boundary.md)); the details/inlay panel gains a
+**per-type breakdown line** (CSS / wasm / fonts) whenever that type is present, so the number is
+shown together but its composition is legible. CSS goes through Lightning CSS (bundle `@import`s +
+minify); wasm and fonts need **no processor** — their shipped size is the raw file bytes, compressed
+— so the only new engine dependency is `lightningcss`. This turns the engine's `uncounted_assets`
+disclosure into a **counted per-type breakdown**; a genuine per-asset failure (Lightning CSS cannot
+parse a stylesheet) falls back to today's raw disclosure, never below it. Closes D1 in full rather
+than CSS-first. When built, this graduates from a known issue to its own spec + plan. Full design:
+[asset-counting-design.md](asset-counting-design.md).
+
 ### D2 — An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
 
@@ -346,6 +401,53 @@ Any changed file with an unmeasurable import now exits **3 — "could not measur
 silently passing. That is deliberate: a gate that cannot measure must never report success, and
 a silent pass **merges the regression**. But it is a real workflow cost, and if it proves noisy
 the answer is to make fewer imports unmeasurable — not to make the gate lie.
+
+### D6 — "Unavailable" is one label for several causes, and one unbundleable leaf discards the whole package
+**Status: Deferred** · The most visible gap in real projects · **Fix universally, never per-package**
+
+**What the user sees.** In a real `package.json`, a growing fraction of dependencies render
+**unavailable** — and *not only* native CLIs. The bigger the project, the more of them, which
+reads as "the build was too big." It is not a size problem.
+
+**"Unavailable" collapses distinct causes into one word.** Measured against esbuild (Import Lens's
+own accuracy oracle) on the installed packages, every failure is **fast (4–300 ms), never a
+timeout**:
+
+| Package | Real cause | Class |
+| --- | --- | --- |
+| `@vscode/vsce` | imports `keytar.node` (a compiled native addon) | native leaf |
+| `ovsx` | `keytar.node` + `@node-rs/crc32`'s `.node` | native leaf |
+| `@biomejs/biome` | no importable entry — `bin` only, no `main`/`module`/`exports` | no entry |
+| `jest`, `@next/font`, `eslint-plugin-autofix` | **unconfirmed** — pure JS, so *not* native; likely an unresolvable or dynamic-`require` leaf, or no clean entry | needs the daemon's actual stage |
+
+`eslint-plugin-autofix` in particular *looks like it should measure* — treat it as a candidate
+**genuine bug**, not assumed-correct, until its stage is known.
+
+**The universal defect: one leaf poisons the whole number.** A single unbundleable edge — a `.node`
+addon, a dynamic `require`, an unresolvable specifier — *anywhere* in the graph fails the ENTIRE
+package build, so a 2 MB JS graph with one native leaf reports **nothing** instead of "≥ 2 MB,
+excluding a native addon". Import Lens ALREADY does the right thing for one class: it externalizes
+an unresolvable *bare* import (`tsdown` measured at 134.7 kB where esbuild refused on `@tsdown/css`).
+The gap is that this leniency does not extend to `.node` files or unfollowable dynamic requires.
+
+**The universal fix (never per-package).** At the engine/resolver boundary, treat every unbundleable
+leaf as an **external boundary** rather than a hard failure: measure the JS graph that *did* bundle
+as a **floor**, and disclose the uncounted leaf exactly as D1 discloses non-JS assets. Same shape as
+D2 (a floor beats a blank), but triggered by a build **error**, not only a graph-limit breach. Pair
+it with a **labeled reason** in the UI — "native addon (keytar)", "no importable entry",
+"unresolved: X" — so the badge names the truth instead of a blanket "unavailable". Do this at the
+boundary, so it covers every package by construction; do NOT special-case `keytar`, `jest`, or any
+named dependency.
+
+**Why it is not a blocker.** "Unavailable" is honest today — no wrong number, cannot wedge (it is
+the anti-fabricator working). This is a coverage/UX upgrade, not a correctness fix. The one thing
+that could BE a bug — a pure-JS package that should measure and does not — is hiding in the
+unconfirmed row above and must be flushed out.
+
+**Prerequisite: get the distribution before designing the fix.** A diagnostic that runs the daemon
+over a real project's whole dependency set and **buckets each "unavailable" by its actual stage**
+(native-leaf / no-entry / unresolved / dynamic-require / graph-limit / timeout / parse) sizes the
+fix and surfaces any genuine bug. Build that first.
 
 ---
 
