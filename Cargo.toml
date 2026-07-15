@@ -23,6 +23,27 @@ lto = true
 panic = "unwind"
 strip = true
 
+# Every daemon integration test is its own binary that statically links the whole
+# embedded Rolldown/oxc graph. With full dependency debuginfo each of those ~36
+# binaries carries a 300-380 MB `.pdb`, almost all of it Rolldown/oxc, and that
+# debuginfo dominates each rustc/link.exe's peak memory. A full-parallel rebuild
+# runs many of them at once, so on a machine with a tight commit ceiling the peak
+# can exhaust memory and die with `rustc-LLVM ERROR: out of memory` / `LNK1102`
+# (known issue E1).
+#
+# Dropping debuginfo for dependencies (workspace crates below keep theirs) collapses
+# each `.pdb` to the daemon's own code, roughly quartering build memory and speeding
+# links for local dev and CI. It lowers the pressure rather than raising the ceiling,
+# so a memory-starved machine may still need more commit headroom; the only thing lost
+# is stepping *into* Rolldown/oxc internals, which we never do, and the daemon's own
+# code stays fully debuggable. `dev` and `test` are both set because a test build
+# compiles its dependencies under either profile.
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
+
 # The high-value groups (correctness/suspicious/style/complexity/perf, plus the
 # disallowed-macros ban in clippy.toml) are hard errors. The two threshold-based
 # lints below are pedantic/nursery: kept as non-blocking warnings so they flag
