@@ -156,14 +156,21 @@ background refinement of the number), to name the figure for what it is, or to a
 recorded rather than fixed because it touches every number in the product and every baseline that gates them,
 which is its own piece of work.
 
-### D9: A stylesheet's own `@import` tree is bounded at 64 files
+### D9: A stylesheet's own `@import` tree is bounded at 256 files
 **Status: Accepted** · A bound where there was none · Found by the B2 adversarial review
 
 A stylesheet's `@import` children are never graph modules, so none of the engine's limits ever applied to them.
 Lightning CSS recurses per `@import`, and a deep enough chain overflows the stack, which is NOT catchable: the
-process dies rather than the import failing. One tree is therefore bounded to 64 files and 8 MB; breaching it
-falls back to raw-byte disclosure, which is not a wrong number. 64 is far above any real stylesheet's tree (a
-published sheet pulls in a handful of files) and far below where a debug build's stack gives out.
+process dies rather than the import failing. One tree is therefore bounded to 256 files and 8 MB. Breaching it
+is not a wrong number: the set falls back to the per-sheet path, and failing that to raw-byte disclosure.
+
+The file count doubles as the depth bound, because a chain of N files costs N reads and nothing else can see
+depth from where the bound is applied. 256 stops the walk roughly three times short of where a release build's
+stack gives out, and is far more than any real stylesheet's tree. It cannot simply be raised on the grounds that
+a flat set of many sheets carries no stack risk: the bound cannot tell breadth from depth, and giving the walk
+its own larger stack does not help either, because Lightning CSS drives the `@import` graph on `rayon` workers
+whose stacks it does not own. A set past the bound therefore degrades into the per-sheet path, where sheets
+sharing an `@import` are counted once each, which over-counts the shared part and is disclosed.
 
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003

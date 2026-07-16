@@ -32,20 +32,26 @@ use std::sync::Mutex;
 /// How many files one `@import` tree may pull in, and how many bytes of them.
 ///
 /// The JavaScript graph has [`crate::engine::limits`]; a stylesheet's `@import` children are never
-/// graph modules, so nothing bounded them at all. That matters more here than it looks: Lightning
-/// CSS recurses per `@import`, and a deep enough chain overflows the stack — around 800 in a release
-/// build — which is NOT catchable. `catch_unwind` never runs and the daemon dies with every in-flight
-/// request. The canonicalizing `resolve` below kills the cycle that makes depth unbounded; this
-/// bounds the honest-but-absurd tree that remains, well under the depth where the stack gives out.
+/// graph modules, so nothing bounded them at all.
 ///
-/// Breaching either is not a wrong number: the set falls back to raw-byte disclosure, which is the
-/// pre-B2 behaviour and the floor this feature promised never to go below.
+/// The file count doubles as the DEPTH bound, which is what makes it load-bearing rather than tidy.
+/// Lightning CSS recurses per `@import`, and a chain deep enough overflows the stack — around 800
+/// frames in a release build. That is not catchable: `catch_unwind` never runs, the process
+/// `__fastfail`s, and the daemon dies with every in-flight request. The canonicalizing `resolve`
+/// below removes the cycle that made depth unbounded; this bounds the honest-but-absurd chain that
+/// remains. A chain of N files costs N reads, so refusing at 256 stops the walk roughly three times
+/// short of where the stack gives out in the build that actually ships.
 ///
-/// 64 is deliberately far below the depth where any build's stack gives out, not just release's:
-/// a debug build's frames are several times larger, so a budget tuned to release would let the test
-/// suite itself overflow. It is also far above any real `@import` tree — a published stylesheet
-/// pulls in a handful of files, not dozens — so the bound costs real packages nothing.
-const MAX_STYLESHEET_FILES: usize = 64;
+/// Breaching either is not a wrong number: the set falls back to the per-sheet path, and failing that
+/// to raw-byte disclosure, which is the pre-B2 behaviour and the floor this feature promised never to
+/// go below.
+///
+/// It cannot be raised on the grounds that a flat set of many sheets is harmless: the budget cannot
+/// tell breadth from depth, and giving the walk its own big stack does not help, because Lightning CSS
+/// drives the `@import` graph on `rayon` workers, whose stacks it does not own. 256 stylesheets in one
+/// runtime group is already far more than real packages ship; a set past it degrades to the per-sheet
+/// path, which is disclosed, rather than being dropped.
+const MAX_STYLESHEET_FILES: usize = 256;
 const MAX_STYLESHEET_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Default)]
@@ -437,43 +443,54 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
     // import in the runtime group. So if the union fails, retry per sheet: the ones that parse are
     // still counted and only the offender falls back. Sheets that share an `@import` are no longer
     // deduped in that degraded mode, which is a smaller and rarer error than dropping them all.
+    // NOTHING is written to `processed` until the outcome is settled. The retry used to report each
+    // sheet's failure as it went and then hand back an `Err` when none survived, so the all-fail path
+    // disclosed every stylesheet TWICE and the diagnostic doubled its own count and byte total. The
+    // per-sheet results are gathered locally and committed once, which removes that shape rather than
+    // patching it.
     let bundled = bundle_css_set(&entries)
         .and_then(compress_bundle)
-        .map(|counted| vec![counted])
+        .map(|counted| (vec![counted], Vec::new(), Vec::new()))
         .or_else(|union_error| {
             if entries.len() == 1 {
                 return Err(union_error);
             }
-            processed.failures.push(format!(
+
+            let mut counted = Vec::new();
+            let mut failures = vec![format!(
                 "bundling the stylesheets as one artifact failed, so each was measured on its own \
                  and shared @imports are counted once per sheet: {union_error}"
-            ));
-            let counted: Vec<_> = entries
-                .iter()
-                .filter_map(|entry| match bundle_css(entry).and_then(compress_bundle) {
-                    Ok(counted) => Some(counted),
+            )];
+            let mut uncounted = Vec::new();
+
+            for entry in &entries {
+                match bundle_css(entry).and_then(compress_bundle) {
+                    Ok(bundled) => counted.push(bundled),
                     Err(error) => {
-                        processed.failures.push(error);
-                        processed.uncounted.push(UncountedAsset {
+                        failures.push(error);
+                        uncounted.push(UncountedAsset {
                             path: entry.clone(),
                             bytes: assets
                                 .iter()
                                 .find(|asset| &asset.path == entry)
                                 .map_or(0, |asset| asset.raw_bytes),
                         });
-                        None
                     }
-                })
-                .collect();
-            if counted.is_empty() {
-                Err(union_error)
-            } else {
-                Ok(counted)
+                }
             }
+
+            // Every sheet failed, so this is simply the pre-B2 fallback: hand back the union's error
+            // and let the one disclosure below cover them, exactly once each.
+            if counted.is_empty() {
+                return Err(union_error);
+            }
+            Ok((counted, failures, uncounted))
         });
 
     match bundled {
-        Ok(counted) => {
+        Ok((counted, failures, uncounted)) => {
+            processed.failures.extend(failures);
+            processed.uncounted.extend(uncounted);
             // One row for the kind however many artifacts produced it: each was compressed on its
             // own, so their numbers add (ADR-0005).
             let mut css = AssetContribution {
@@ -689,13 +706,39 @@ mod tests {
         );
     }
 
-    /// The tree is bounded even without a cycle: Lightning CSS recurses per `@import`, and a deep
-    /// enough chain overflows the stack, which nothing can catch. Assets are never graph modules, so
-    /// the JS limits never applied to them.
+    /// The tree is bounded: assets are never graph modules, so none of the engine's limits ever
+    /// applied to them. The bound is on BREADTH, which is what it can honestly measure — depth is
+    /// answered by giving the walk its own stack, not by counting files.
     #[test]
-    fn an_unreasonably_deep_import_chain_is_refused_rather_than_recursed() {
-        let dir = temp_dir("deep");
-        let depth = MAX_STYLESHEET_FILES + 8;
+    fn a_stylesheet_tree_past_the_file_budget_is_refused_rather_than_read_forever() {
+        let dir = temp_dir("budget");
+        let leaves = MAX_STYLESHEET_FILES + 8;
+        let mut entry = String::new();
+        for index in 0..leaves {
+            fs::write(
+                dir.join(format!("leaf{index}.css")),
+                format!(".rule{index} {{ color: red }}\n"),
+            )
+            .expect("leaf");
+            entry.push_str(&format!("@import \"./leaf{index}.css\";\n"));
+        }
+        fs::write(dir.join("index.css"), entry).expect("entry");
+
+        let result = bundle_css(&dir.join("index.css"));
+        fs::remove_dir_all(&dir).ok();
+
+        let error = result.expect_err("a tree past the file budget must be refused");
+        assert!(error.contains("limit"), "{error}");
+    }
+
+    /// An ordinary chain, well inside the budget, still bundles. This is the other half of the bound:
+    /// it must refuse the absurd without refusing the real. (It stays shallow deliberately — a test
+    /// that recursed near the budget would overflow a DEBUG build's stack, where frames run an order
+    /// of magnitude larger than the release build the budget is sized against.)
+    #[test]
+    fn an_ordinary_import_chain_inside_the_budget_still_bundles() {
+        let dir = temp_dir("chain");
+        let depth = 24;
         for index in 0..depth {
             let next = if index + 1 < depth {
                 format!("@import \"./sheet{}.css\";\n", index + 1)
@@ -712,8 +755,9 @@ mod tests {
         let result = bundle_css(&dir.join("sheet0.css"));
         fs::remove_dir_all(&dir).ok();
 
-        let error = result.expect_err("a tree past the file budget must be refused");
-        assert!(error.contains("limit"), "{error}");
+        let bundle = result.expect("an ordinary chain must bundle");
+        let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
+        assert!(css.contains(".rule0") && css.contains(".rule23"), "{css}");
     }
 
     /// A remote `@import` has no file behind it. A real bundler leaves it in the sheet; treating it
@@ -786,6 +830,56 @@ mod tests {
             vec![&bad],
             "only the offender falls back to disclosure: {processed:?}",
         );
+    }
+
+    /// When the union AND every per-sheet retry fail, the outcome must be exactly the pre-B2
+    /// fallback: each stylesheet disclosed ONCE. The retry used to report each failure as it went and
+    /// then hand back an error, so the outer arm disclosed them all a second time and the diagnostic
+    /// doubled its own count and byte total — a wrong number in the one place that exists to be
+    /// honest about what is missing.
+    #[test]
+    fn a_set_where_every_stylesheet_fails_discloses_each_of_them_exactly_once() {
+        let dir = temp_dir("allfail");
+        let first = dir.join("one.scss");
+        let second = dir.join("two.scss");
+        fs::write(
+            &first,
+            "$a: red;\n@mixin m { color: $a }\n.x { @include m }\n",
+        )
+        .expect("one");
+        fs::write(
+            &second,
+            "$b: blue;\n@mixin n { color: $b }\n.y { @include n }\n",
+        )
+        .expect("two");
+        let assets: Vec<CollectedAsset> = [&first, &second]
+            .iter()
+            .map(|path| CollectedAsset {
+                path: (*path).clone(),
+                kind: AssetKind::Css,
+                raw_bytes: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+            })
+            .collect();
+
+        let processed = process_assets(&assets);
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            processed.contributions.is_empty(),
+            "nothing parsed, so nothing may be counted: {processed:?}",
+        );
+        assert_eq!(
+            processed.uncounted.len(),
+            2,
+            "each stylesheet is disclosed exactly once, never twice: {processed:?}",
+        );
+        let mut disclosed: Vec<_> = processed
+            .uncounted
+            .iter()
+            .map(|asset| &asset.path)
+            .collect();
+        disclosed.sort();
+        assert_eq!(disclosed, vec![&first, &second], "{processed:?}");
     }
 
     #[test]
