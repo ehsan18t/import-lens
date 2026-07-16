@@ -10,7 +10,13 @@ pub struct CompressionSizes {
 }
 
 pub fn compress_all(source: &str) -> Result<CompressionSizes, Box<dyn Error + Send + Sync>> {
-    let bytes = source.as_bytes();
+    compress_all_bytes(source.as_bytes())
+}
+
+/// The same three compressors over raw bytes, for an artifact that is not text: a wasm module or a
+/// font, whose shipped size is simply its bytes (B2). A woff2 is already brotli-internally, so it
+/// barely shrinks again here — which is correct, and exactly what it costs on the wire.
+pub fn compress_all_bytes(bytes: &[u8]) -> Result<CompressionSizes, Box<dyn Error + Send + Sync>> {
     let (gzip, (brotli, zstd)) = join(
         || gzip_compress(bytes),
         || join(|| brotli_compress(bytes), || zstd_compress(bytes)),

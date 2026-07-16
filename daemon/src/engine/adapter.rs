@@ -205,9 +205,9 @@ fn translate(
         });
     }
 
-    let uncounted = uncounted_assets(&output, state);
+    let emitted = emitted_assets(&output);
     let mut diagnostics = contract_diagnostics(&output.warnings);
-    diagnostics.extend(uncounted_assets_diagnostic(&uncounted));
+    diagnostics.extend(uncounted_assets_diagnostic(&emitted));
     for import in &chunk.imports {
         diagnostics.push(ImportDiagnostic {
             stage: diagnostic_stage::EXTERNAL.to_owned(),
@@ -234,7 +234,8 @@ fn translate(
         exported_names: chunk.exports.iter().map(|name| name.to_string()).collect(),
         diagnostics,
         matched_side_effect_paths: Vec::new(),
-        uncounted_assets: uncounted,
+        assets: state.sorted_assets(),
+        emitted_assets: emitted,
     })
 }
 
@@ -276,33 +277,28 @@ fn single_chunk(
     Ok(chunks.remove(0))
 }
 
-/// Every byte this build knows about and did NOT count, named and totalled.
+/// Bytes this build knows about that it cannot process, named and totalled.
 ///
-/// Two sources, because there are two ways a non-JS byte can exist here. The stylesheets the graph
-/// imported, which the plugin linked as empty modules (Rolldown 1.1.5 cannot bundle CSS: left to
-/// it, the whole build fails at the LINK stage). And anything Rolldown itself emitted beside the
-/// chunk — **nothing does today**, CSS included, but the output-shape guard no longer treats one as
-/// fatal, so it must not be silent either.
+/// The stylesheets, wasm and fonts the graph imported are NOT here: the plugin classifies them and
+/// the pipeline processes them the way they ship and counts them (B2). What is left is anything
+/// **Rolldown itself emitted** beside the chunk — nothing does today, CSS included, but the
+/// output-shape guard no longer treats one as fatal, so it must not be silent either. There is no
+/// file on disk behind an emitted asset to run a processor over, so it is disclosed, not counted.
 ///
-/// These bytes ship with the package and are not in the reported size, so the user is owed the
-/// number. See [`diagnostic_stage::UNCOUNTED_ASSETS`] for why disclosing them costs the result its
-/// High confidence rather than being exempted.
-fn uncounted_assets(output: &rolldown::BundleOutput, state: &BuildState) -> Vec<UncountedAsset> {
-    let mut assets = state
-        .sorted_uncounted_assets()
-        .into_iter()
-        .map(|(path, bytes)| UncountedAsset { path, bytes })
-        .collect::<Vec<_>>();
-
-    assets.extend(output.assets.iter().filter_map(|item| match item {
-        Output::Asset(asset) => Some(UncountedAsset {
-            path: PathBuf::from(asset.filename.to_string()),
-            bytes: asset.source.as_bytes().len() as u64,
-        }),
-        Output::Chunk(_) => None,
-    }));
-
-    assets
+/// See [`diagnostic_stage::UNCOUNTED_ASSETS`] for why disclosing bytes costs the result its High
+/// confidence rather than being exempted.
+fn emitted_assets(output: &rolldown::BundleOutput) -> Vec<UncountedAsset> {
+    output
+        .assets
+        .iter()
+        .filter_map(|item| match item {
+            Output::Asset(asset) => Some(UncountedAsset {
+                path: PathBuf::from(asset.filename.to_string()),
+                bytes: asset.source.as_bytes().len() as u64,
+            }),
+            Output::Chunk(_) => None,
+        })
+        .collect()
 }
 
 fn uncounted_assets_diagnostic(assets: &[UncountedAsset]) -> Option<ImportDiagnostic> {

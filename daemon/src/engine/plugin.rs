@@ -23,6 +23,7 @@ use rolldown_common::{ModuleInfo, NormalModule};
 
 use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
 use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
+use super::{AssetKind, CollectedAsset};
 use crate::cache::key::{
     FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
 };
@@ -42,9 +43,9 @@ pub(super) struct BuildState {
     canonical: Mutex<HashMap<PathBuf, PathBuf>>,
     total_source_bytes: AtomicUsize,
     limit_breach: Mutex<Option<String>>,
-    /// Non-JavaScript modules the graph imported, and their byte counts. See
-    /// [`ImportLensPlugin::load`] and [`super::diagnostic_stage::UNCOUNTED_ASSETS`].
-    uncounted_assets: Mutex<HashMap<PathBuf, u64>>,
+    /// Classified non-JavaScript modules the graph imported, keyed by canonical path. See
+    /// [`ImportLensPlugin::load`]; the pipeline processes them and counts their shipped bytes (B2).
+    assets: Mutex<HashMap<PathBuf, (AssetKind, u64)>>,
 }
 
 impl BuildState {
@@ -82,19 +83,23 @@ impl BuildState {
         (fingerprints, unhashed)
     }
 
-    /// The non-JavaScript modules this build's graph imported, with their byte counts, sorted for
-    /// a stable diagnostic. Their bytes are NOT in the measured size — the size is the JS chunk —
-    /// and they DO ship with the package, so the adapter discloses them.
-    pub(super) fn sorted_uncounted_assets(&self) -> Vec<(PathBuf, u64)> {
+    /// The classified non-JavaScript modules this build's graph imported, sorted for a stable
+    /// result. Their bytes are NOT in the JavaScript chunk and they DO ship with the package, so
+    /// the pipeline processes them the way they ship and folds the result into the size (B2).
+    pub(super) fn sorted_assets(&self) -> Vec<CollectedAsset> {
         let assets = self
-            .uncounted_assets
+            .assets
             .lock()
-            .expect("uncounted-asset map should not be poisoned");
-        let mut sorted: Vec<(PathBuf, u64)> = assets
+            .expect("asset map should not be poisoned");
+        let mut sorted: Vec<CollectedAsset> = assets
             .iter()
-            .map(|(path, bytes)| (path.clone(), *bytes))
+            .map(|(path, (kind, raw_bytes))| CollectedAsset {
+                path: path.clone(),
+                kind: *kind,
+                raw_bytes: *raw_bytes,
+            })
             .collect();
-        sorted.sort();
+        sorted.sort_by(|left, right| left.path.cmp(&right.path));
         sorted
     }
 
@@ -299,6 +304,24 @@ impl ImportLensPlugin {
         self.state.record_breach(&message);
         std::io::Error::other(message)
     }
+
+    /// Capture len+mtime from the stat taken BEFORE the read, paired with a hash of the bytes we
+    /// actually read, so freshness describes the bytes the size was measured from (§8.3).
+    fn record_read_time(&self, canonical: &Path, len: u64, modified_millis: u64, bytes: &[u8]) {
+        self.state
+            .read_time
+            .lock()
+            .expect("read-time fingerprint map should not be poisoned")
+            .entry(canonical.to_path_buf())
+            .or_insert_with(|| {
+                file_fingerprint_from_read_time(
+                    canonical,
+                    len,
+                    modified_millis,
+                    content_hash(bytes),
+                )
+            });
+    }
 }
 
 impl Plugin for ImportLensPlugin {
@@ -398,44 +421,30 @@ impl Plugin for ImportLensPlugin {
         let Ok(bytes) = tokio::fs::read(path).await else {
             return Ok(None);
         };
-        // Binary modules (wasm, assets) are not UTF-8. Rolldown handles those itself;
-        // the caller back-fills their fingerprints from `read_time_fingerprints`.
-        let Ok(source) = String::from_utf8(bytes.clone()) else {
-            return Ok(None);
-        };
-
         let canonical = self.state.canonical_path(path);
-        self.state
-            .read_time
-            .lock()
-            .expect("read-time fingerprint map should not be poisoned")
-            .entry(canonical.clone())
-            .or_insert_with(|| {
-                file_fingerprint_from_read_time(
-                    &canonical,
-                    len,
-                    modified_millis,
-                    content_hash(&bytes),
-                )
-            });
 
-        // A STYLESHEET the package's own entry imports. Rolldown 1.1.5 does not bundle CSS at all
-        // — it fails the whole build with `UNSUPPORTED_FEATURE: Bundling CSS is no longer
-        // supported` at the LINK stage — so every package whose ESM entry does `import
-        // './styles.css'` (most UI kits) could not be measured. Nobody saw it: the pipeline caught
-        // the failure and fabricated a size, and deleting that fabricator without this would send
-        // all of them to "Size unavailable".
+        // A non-JavaScript ASSET the package's own entry imports, intercepted BEFORE the UTF-8
+        // conversion below — a wasm or font is not UTF-8, and handing one back to Rolldown lets it
+        // perturb or fail the JS build, which is the number we need exact.
+        //
+        // Stylesheets have their own reason: Rolldown 1.1.5 does not bundle CSS at all (it fails
+        // the whole build with `UNSUPPORTED_FEATURE` at the LINK stage), so every package whose ESM
+        // entry does `import './styles.css'` (most UI kits) could not be measured.
         //
         // `ModuleType::Empty` makes the module link as nothing (and shims any binding imported from
-        // it, so `import styles from './x.css'` works too). The JS graph then measures exactly, and
-        // the stylesheet's bytes — real bytes, which really do ship — are recorded here and
-        // DISCLOSED rather than silently folded into the number or thrown away with it.
-        if is_stylesheet(path) {
+        // it, so `import styles from './x.css'` works too), so the JS graph measures exactly. The
+        // asset itself is recorded here with its kind, and the pipeline then processes it the way
+        // it really ships and folds those bytes into the Import Cost (B2) — they are neither
+        // fabricated into the JS number nor thrown away with it.
+        if let Some(kind) = classify_asset(path) {
+            // Fingerprint it like any other module we read: an edit to a stylesheet, wasm, or font
+            // must invalidate the size it contributed to. Binary bytes hash the same as text.
+            self.record_read_time(&canonical, len, modified_millis, &bytes);
             self.state
-                .uncounted_assets
+                .assets
                 .lock()
-                .expect("uncounted-asset map should not be poisoned")
-                .insert(canonical, len);
+                .expect("asset map should not be poisoned")
+                .insert(canonical, (kind, len));
 
             return Ok(Some(HookLoadOutput {
                 code: String::new().into(),
@@ -443,6 +452,14 @@ impl Plugin for ImportLensPlugin {
                 ..HookLoadOutput::default()
             }));
         }
+
+        // A binary module that is NOT a classified asset. Rolldown handles those itself; the caller
+        // back-fills their fingerprints from `read_time_fingerprints`.
+        let Ok(source) = String::from_utf8(bytes.clone()) else {
+            return Ok(None);
+        };
+
+        self.record_read_time(&canonical, len, modified_millis, &bytes);
 
         Ok(Some(HookLoadOutput {
             code: source.into(),
@@ -517,21 +534,30 @@ impl Plugin for ImportLensPlugin {
     }
 }
 
-/// A stylesheet the JavaScript graph imports.
+/// What a non-JavaScript module the JavaScript graph imports ships as, or `None` for anything
+/// `load` should hand to Rolldown untouched.
 ///
-/// Rolldown 1.1.5 removed CSS bundling outright, so any of these reaching it as a graph module
-/// fails the ENTIRE build (`UNSUPPORTED_FEATURE`, at the link stage) rather than merely going
-/// uncounted. The list is deliberately narrow: only what a published package's JS entry plausibly
-/// imports. Anything else non-JS (a `.wasm` or an image) is not UTF-8, so `load` already hands it
-/// back to Rolldown untouched.
-fn is_stylesheet(path: &Path) -> bool {
-    path.extension()
+/// Every kind here is intercepted and stubbed, for two different reasons. A **stylesheet** reaching
+/// Rolldown 1.1.5 as a graph module fails the ENTIRE build (`UNSUPPORTED_FEATURE`, at the link
+/// stage) rather than merely going uncounted. A **wasm or font** would not fail the build, but it is
+/// an artifact that ships on its own terms, and leaving it in the graph lets it perturb the JS chunk
+/// we need to measure exactly.
+///
+/// The lists are deliberately narrow: only what a published package's JS entry plausibly imports.
+/// Anything else (an image, a JSON blob, a `.node` addon) is not an asset we count, and falls
+/// through to Rolldown exactly as before.
+fn classify_asset(path: &Path) -> Option<AssetKind> {
+    let extension = path
+        .extension()
         .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|extension| {
-            matches!(
-                extension.as_str(),
-                "css" | "scss" | "sass" | "less" | "styl" | "stylus" | "pcss" | "postcss"
-            )
-        })
+        .map(str::to_ascii_lowercase)?;
+
+    match extension.as_str() {
+        "css" | "scss" | "sass" | "less" | "styl" | "stylus" | "pcss" | "postcss" => {
+            Some(AssetKind::Css)
+        }
+        "wasm" => Some(AssetKind::Wasm),
+        "woff" | "woff2" | "ttf" | "otf" | "eot" => Some(AssetKind::Font),
+        _ => None,
+    }
 }

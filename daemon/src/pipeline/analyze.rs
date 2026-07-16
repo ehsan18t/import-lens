@@ -5,6 +5,7 @@ use crate::{
         ModuleContribution,
     },
     pipeline::{
+        assets::{process_assets, uncounted_assets_diagnostic},
         compress::compress_all,
         fallback::source_excerpt_detail,
         full_package,
@@ -15,6 +16,7 @@ use crate::{
     },
 };
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -398,6 +400,13 @@ pub(crate) fn analyze_with_rolldown_engine(
         )
     })?;
 
+    // The package's non-JavaScript assets, processed the way they really ship, so their bytes JOIN
+    // the Import Cost instead of being disclosed beside a number that excluded them (B2). Each
+    // artifact is compressed on its own and summed (ADR-0005). This never fails: an asset it cannot
+    // process falls back to the raw-byte disclosure that was the whole behaviour before B2.
+    let assets = process_assets(&artifact.assets);
+    let asset_sizes = assets.total();
+
     // §7.4/FR-021: Side-Effectful is a property of THE IMPORT — is the entry being measured one
     // the package declares effectful? — so the glob form answers by MATCHING the entry, and
     // `has_side_effects` is the whole answer.
@@ -419,6 +428,9 @@ pub(crate) fn analyze_with_rolldown_engine(
             details: Vec::new(),
         })
         .collect();
+    // An asset that could not be processed keeps the old disclosure: its bytes are real, they ship,
+    // and they are NOT in the number — which is exactly what this stage has always meant.
+    diagnostics.extend(uncounted_assets_diagnostic(&assets));
 
     // Full-package comparison (§8.4/§6.3): a second engine build measures the
     // complete surface; failure degrades to "not treeshakeable", never an
@@ -511,8 +523,26 @@ pub(crate) fn analyze_with_rolldown_engine(
     let mut stat_paths = artifact.unhashed_paths;
     stat_paths.push(package_root.join("package.json"));
     stat_paths.extend(first_party_manifests(context, &artifact.loaded_paths));
+    // A stylesheet's `@import` children are real inputs to the measured size, but they were never
+    // graph modules — Rolldown never saw them, Lightning CSS resolved them after the build — so
+    // nothing has fingerprinted them and an edit to one would not invalidate the size it fed. The
+    // entry itself is already captured at read time by the plugin, so it is filtered out here
+    // rather than being re-hashed post-build, which would widen the window the read-time capture
+    // exists to close.
+    let fingerprinted: HashSet<&str> = artifact
+        .read_time_fingerprints
+        .iter()
+        .map(|fingerprint| fingerprint.path.as_str())
+        .collect();
+    stat_paths.extend(
+        assets
+            .read_paths
+            .iter()
+            .filter(|path| !fingerprinted.contains(path.to_string_lossy().as_ref()))
+            .cloned(),
+    );
     let freshness = FingerprintSource::ReadTime {
-        fingerprints: artifact.read_time_fingerprints,
+        fingerprints: artifact.read_time_fingerprints.clone(),
         stat_paths,
     };
     let loaded_paths = artifact.loaded_paths;
@@ -520,11 +550,11 @@ pub(crate) fn analyze_with_rolldown_engine(
     let mut result = ImportResult::measured(
         request.specifier.clone(),
         MeasuredSizes {
-            raw_bytes: artifact.code.len() as u64,
-            minified_bytes: minified.len() as u64,
-            gzip_bytes: compressed.gzip_bytes,
-            brotli_bytes: compressed.brotli_bytes,
-            zstd_bytes: compressed.zstd_bytes,
+            raw_bytes: artifact.code.len() as u64 + asset_sizes.raw_bytes,
+            minified_bytes: minified.len() as u64 + asset_sizes.minified_bytes,
+            gzip_bytes: compressed.gzip_bytes + asset_sizes.gzip_bytes,
+            brotli_bytes: compressed.brotli_bytes + asset_sizes.brotli_bytes,
+            zstd_bytes: compressed.zstd_bytes + asset_sizes.zstd_bytes,
         },
     );
     result.side_effects = side_effects;

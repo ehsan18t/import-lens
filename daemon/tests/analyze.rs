@@ -2604,12 +2604,13 @@ fn a_workspace_linked_package_answers_with_what_rolldown_retained() {
 /// Nobody noticed, because the pipeline caught the failure and fabricated a size for it; delete the
 /// fabricator without `plugin.rs` linking the stylesheet as an empty module and they all go BLANK.
 ///
-/// The JS chunk is real and is measured exactly. The stylesheet's bytes are not in that number and
-/// do ship with the package, so they are disclosed — and they cost the result its High confidence,
-/// by design (see `engine::diagnostic_stage::UNCOUNTED_ASSETS`): a size that omits bytes the user's
-/// bundle will really carry is not a High-confidence measurement of that package's cost.
+/// The JS chunk is measured exactly, and the stylesheet's bytes are folded into the same number
+/// (B2): they really do ship, so a size that omitted them was an undercount of every CSS-shipping
+/// package. Proven against an identical package with no stylesheet, so the delta can only be the
+/// CSS. The disclosure this test used to assert is now only the FALLBACK, for a stylesheet that
+/// cannot be processed.
 #[test]
-fn analyze_a_css_shipping_package_measures_its_javascript_and_discloses_the_rest() {
+fn analyze_a_css_shipping_package_counts_its_stylesheet_in_the_import_cost() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -2639,25 +2640,56 @@ fn analyze_a_css_shipping_package_measures_its_javascript_and_discloses_the_rest
         ),
     );
 
+    // An identical package that ships NO stylesheet. Its JavaScript is byte-for-byte the same, so
+    // any difference between the two numbers is the stylesheet and nothing else.
+    write_package(
+        &workspace,
+        "plain-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "export const widget = () => 'widget';\n",
+    );
+    let plain = analyze_import(
+        &context,
+        &import_request(
+            "plain-lib",
+            "plain-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(
         result.error, None,
         "an emitted stylesheet is not an output-shape failure: {result:?}",
     );
     let sizes = common::measured_sizes(&result);
+    let plain_sizes = common::measured_sizes(&plain);
     assert!(sizes.brotli_bytes > 0, "{result:?}");
+
+    // THE POINT OF B2. Before it, both packages measured the same and the stylesheet's bytes were
+    // merely disclosed beside a number that excluded them — a systematic undercount of every
+    // CSS-shipping package. The stylesheet really ships, so it is in the number.
     assert!(
-        result
+        sizes.brotli_bytes > plain_sizes.brotli_bytes,
+        "a package that ships CSS must measure larger than the same package without it: styled \
+         {sizes:?} vs plain {plain_sizes:?}",
+    );
+    assert!(
+        sizes.raw_bytes > plain_sizes.raw_bytes
+            && sizes.minified_bytes > plain_sizes.minified_bytes,
+        "every quantity carries the stylesheet, not just the compressed one: styled {sizes:?} vs \
+         plain {plain_sizes:?}",
+    );
+
+    // The disclosure is the FALLBACK now, not the outcome: nothing here failed to process, so there
+    // are no uncounted bytes to name.
+    assert!(
+        !result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "uncounted_assets"
-                && diagnostic.message.contains("styles.css")),
-        "the bytes this size does NOT include must be named: {result:?}",
-    );
-    assert_eq!(
-        result.confidence,
-        ConfidenceLevel::Medium,
-        "an asset-emitting package is Medium by design; High would claim a completeness the number \
-         does not have: {result:?}",
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "a counted stylesheet must not also be disclosed as uncounted: {result:?}",
     );
 }

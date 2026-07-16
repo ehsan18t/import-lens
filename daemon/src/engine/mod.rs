@@ -63,13 +63,51 @@ pub struct ModuleContribution {
 /// A non-JavaScript module the graph imported: real bytes that ship with the package and are NOT
 /// in the measured size, because the measured size is the JavaScript chunk.
 ///
-/// Almost always a stylesheet. Rolldown 1.1.5 cannot bundle CSS at all, so the plugin links it as
-/// an empty module and records it here; disclosing it is the honest alternative to counting bytes
-/// the bundler never rendered, or to failing the build and reporting nothing at all.
+/// This is now the FALLBACK shape only. A classified asset ([`CollectedAsset`]) is processed the
+/// way it ships and counted (B2); an asset reaches here only when it could not be processed — a
+/// Lightning CSS failure — or when Rolldown itself emitted one beside the chunk (nothing does
+/// today). Disclosing those bytes is the honest alternative to counting bytes nothing rendered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UncountedAsset {
     pub path: PathBuf,
     pub bytes: u64,
+}
+
+/// What a non-JavaScript module ships as, which decides how it is processed (B2).
+///
+/// CSS needs a processor (Lightning CSS resolves its `@import` tree and minifies it). A wasm or
+/// font has none: its shipped size is its raw bytes, and compressing them is the whole answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AssetKind {
+    Css,
+    Wasm,
+    Font,
+}
+
+impl AssetKind {
+    /// Every kind, so a test can quantify over the whole vocabulary rather than the subset
+    /// someone remembered.
+    pub const ALL: &'static [Self] = &[Self::Css, Self::Wasm, Self::Font];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Css => "css",
+            Self::Wasm => "wasm",
+            Self::Font => "font",
+        }
+    }
+}
+
+/// A non-JavaScript module the graph imported, classified and intercepted at the load boundary so
+/// the JavaScript chunk still measures exactly. Its bytes really do ship, so the pipeline processes
+/// it the way it ships and folds the result into the Import Cost (B2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedAsset {
+    pub path: PathBuf,
+    pub kind: AssetKind,
+    /// The file's size on disk. Used for the raw-byte fallback when processing fails, never as the
+    /// shipped size of a stylesheet (which is only known after Lightning CSS bundles it).
+    pub raw_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -98,9 +136,14 @@ pub struct BundleArtifact {
     pub exported_names: Vec<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
     pub matched_side_effect_paths: Vec<PathBuf>,
-    /// Bytes this size does NOT include (see [`UncountedAsset`]). Already summarized into a
-    /// `uncounted_assets` diagnostic; kept structured so a future surface can show them.
-    pub uncounted_assets: Vec<UncountedAsset>,
+    /// The classified non-JavaScript modules the graph imported, intercepted at the load boundary
+    /// (see [`CollectedAsset`]). The pipeline processes these and folds their shipped bytes into
+    /// the size (B2); they are NOT in `code`, which is the JavaScript chunk alone.
+    pub assets: Vec<CollectedAsset>,
+    /// Bytes this build knows about but cannot process: assets Rolldown itself emitted beside the
+    /// chunk. Nothing does today, so this is normally empty; it is disclosed rather than counted
+    /// because there is no file behind it to process.
+    pub emitted_assets: Vec<UncountedAsset>,
 }
 
 /// The result of export enumeration (§8.4).

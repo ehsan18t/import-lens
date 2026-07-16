@@ -5,6 +5,7 @@ use crate::{
     },
     pipeline::{
         analyze::{AnalysisContext, engine_selection},
+        assets::{process_assets, uncounted_assets_diagnostic},
         compress::{CompressionSizes, compress_all},
         minify::minify_source,
         resolver::resolve_package_entry,
@@ -543,15 +544,30 @@ fn compute_file_size_with(
             }
         };
 
+        // This group's non-JavaScript assets, processed the way they ship (B2). The combined build
+        // saw every import in this runtime, so its stylesheets bundle into ONE artifact for the
+        // whole group — which is how they ship, and it dedupes what two imports both `@import`
+        // rather than counting it twice. Each artifact is compressed on its own and summed
+        // (ADR-0005); an asset that cannot be processed falls back to disclosure and is reported.
+        let assets = process_assets(&artifact.assets);
+        let asset_sizes = assets.total();
+        if let Some(uncounted) = uncounted_assets_diagnostic(&assets) {
+            diagnostics.push(diagnostic(
+                &uncounted.stage,
+                uncounted.message,
+                uncounted.details,
+            ));
+        }
+
         any_sized = true;
-        totals.raw_bytes += artifact.code.len() as u64;
+        totals.raw_bytes += artifact.code.len() as u64 + asset_sizes.raw_bytes;
         // `minified_bytes` is measured on the same string this group's compressors saw, so the two
         // numbers describe the same bytes. The old join added one separator per extra group, so the
         // minified total described a string that ships nowhere.
-        totals.minified_bytes += minified.len() as u64;
-        totals.gzip_bytes += compressed.gzip_bytes;
-        totals.brotli_bytes += compressed.brotli_bytes;
-        totals.zstd_bytes += compressed.zstd_bytes;
+        totals.minified_bytes += minified.len() as u64 + asset_sizes.minified_bytes;
+        totals.gzip_bytes += compressed.gzip_bytes + asset_sizes.gzip_bytes;
+        totals.brotli_bytes += compressed.brotli_bytes + asset_sizes.brotli_bytes;
+        totals.zstd_bytes += compressed.zstd_bytes + asset_sizes.zstd_bytes;
     }
 
     if !any_sized {
