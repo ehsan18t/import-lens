@@ -34,34 +34,10 @@ while eleven plan tasks sat untouched. "Real" was never the right bar.
 
 # Priority 0: release blockers
 
-These must be fixed before the release ships. B1 (the all-inline-`type` over-count) and B3 (native-binary
-mislabeling) have landed and moved to Resolved below; the single `ANALYZER_REVISION` bump to `rolldown-1.1.x+4`
-covers both. B2 is the one blocker still open, and the largest by far, so it lands as its **own pull request**
-before the release ships and will bump `ANALYZER_REVISION` again when it does.
-
-### B2: The Import Cost ignores shipped non-JS asset bytes (CSS, wasm, fonts)
-**Status: Blocker (lands in its own pull request, before release)** · Correctness (a systematic undercount) · Full design: [asset-counting-design.md](asset-counting-design.md)
-
-A package's real cost is not only its JavaScript. UI kits ship CSS; some packages ship wasm or fonts. The
-engine measures the JS chunk and records a reachable stylesheet's raw bytes as an `uncounted_asset` (disclosed
-on the result), but never folds it into the Import Cost and never processes it as it would actually ship. So
-every CSS-shipping package, and every package that ships wasm or fonts, reports a headline Import Cost lower
-than what it really adds to a bundle: a systematic undercount across a whole category of packages.
-
-**Why it is a blocker.** The number shown under the "Import Cost" label is materially smaller than the import's
-real shipped cost, so the headline figure is wrong for these packages even though the shortfall is disclosed
-beside it. That makes it a correctness issue, not a coverage nicety.
-
-**The fix is fully designed** in [asset-counting-design.md](asset-counting-design.md): classify assets at the
-`plugin.rs` load boundary, run CSS through Lightning CSS (the `lightningcss` Rust crate) and take wasm and font
-bytes raw, compress each asset as its own artifact and sum per
-[ADR-0005](adr/0005-a-runtime-is-an-artifact-boundary.md), and turn the `uncounted_assets` disclosure into a
-counted per-type breakdown. Non-optional consequences: `lightningcss` joins the exact-pinned compiler stack,
-and the esbuild oracle plus badge baselines re-baseline.
-
-**Not this issue.** A native binary leaf in the graph (a `.node` addon, an unfollowable dynamic `require`) is a
-different failure, tracked as D6. That leaf fails the entire build so the package reports nothing; it is not a
-shipped-asset undercount.
+Nothing is open. B1 (the all-inline-`type` over-count), B3 (native-binary mislabeling), and B2 (non-JS asset
+counting) have all landed and moved to Resolved below. B1 and B3 shipped together under a single
+`ANALYZER_REVISION` bump to `rolldown-1.1.x+4`; B2 followed in its own pull request and moved it to
+`rolldown-1.1.x+5`.
 
 ---
 
@@ -119,6 +95,75 @@ native-binary packages that used to sit here (for example `@biomejs/biome`) are 
 project's whole dependency set and buckets each "unavailable" by its actual stage (native-leaf, no-entry,
 unresolved, dynamic-require, graph-limit, timeout, parse) sizes the fix and surfaces any genuine bug. Build
 that first.
+
+### D7: A stylesheet its own package declares droppable is counted anyway
+**Status: Deferred** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the B2 adversarial review
+
+A bundler DROPS a bare `import "./styles.css"` from a package declaring `"sideEffects": false`, so that CSS
+never ships. Import Lens counts it anyway: the plugin banks an asset in the `load` hook, and rolldown only
+decides side effects afterwards, so the asset is recorded before the decision that discards it. For such a
+package the reported Import Cost includes bytes the user's bundle will not carry.
+
+**Why it is not a blocker: the shape was measured, not assumed.** Zero of the 503 packages in this repo's store
+bare-import CSS from their entry (118 declare `sideEffects: false`). Zero of 44 real CSS-shipping packages
+surveyed on npm have both halves: only `react-select` and `@fullcalendar/core` declare `sideEffects: false`, and
+neither imports CSS. Every real CSS shipper is in the correct bucket, declaring `["**/*.css"]` or nothing at
+all. The shape is a self-inflicted packaging bug that silently drops the package's own styles in webpack,
+rollup, and vite, which is exactly why maintainers do not ship it.
+
+**Do NOT fix it by filtering the collected assets against what the build retained.** That inverts into a far
+worse under-count: the `Empty` stub gives a stylesheet no statements, so rolldown treats it as side-effect-free
+and drops it even when the package declares nothing, which is the common and correct case. Filtering by
+retention would zero out the CSS for `@uiw/react-md-editor` and undo B2 entirely. The honest fix asks the
+DECLARATION rather than the build: `SideEffectsMode::False` already identifies the case at the single-import
+boundary, and `resolver` already owns rolldown's own glob matcher for per-asset matching. The File Cost path
+needs per-asset package attribution first, which is the real work.
+
+### D8: One stylesheet Lightning CSS cannot parse falls back alone, but a cyclic one undercounts
+**Status: Accepted** · Never below the pre-B2 floor · Found by the B2 adversarial review
+
+Lightning CSS parses plain CSS. A published package that imports a preprocessor source (`.scss`, `.less`) or a
+stylesheet with a bare `@import "pkg/base.css"` cannot be bundled, so that sheet falls back to raw-byte
+disclosure. That is the ADR-0006 fallback working: it lands exactly on the pre-B2 behaviour, never below it.
+Originally one such sheet sank every stylesheet in the set; a failed set now retries per sheet, so only the
+offender falls back and the rest stay counted. In that degraded mode two sheets sharing an `@import` are no
+longer deduped against each other, which over-counts the shared part, a smaller and rarer error than dropping
+them all.
+
+A stylesheet caught in an `@import` cycle keeps its `@import`ed rules but loses its own, which undercounts that
+one sheet. Cycles are silent in browsers and in every real bundler, so a package can ship one unknowingly. It no
+longer threatens the daemon (that wedge is fixed and pinned by a regression test); it is now only an accuracy
+edge on broken input, and still strictly better than before B2, when the package contributed zero CSS either
+way.
+
+The `asset-counting-plan.md` claim that the provider falls back to `oxc_resolver` for a bare `@import` describes
+work that was not built; the plan is corrected rather than the gap papered over.
+
+### D10: Every reported brotli size is high, because the daemon compresses at quality 4
+**Status: Deferred** · A systematic over-report on every package · Surfaced by the B2 oracle re-baseline
+
+The daemon compresses brotli at **quality 4** (`pipeline::compress`), while the web serves **quality 11**. So
+every brotli figure Import Lens shows is larger than what a CDN actually delivers, by 2.6 to 15% across the
+accuracy benchmarks and around 25% on highly-compressible CSS. It is not an asset-counting artifact and it
+predates B2 by a long way: the accuracy oracle compresses at quality 11, which is why every benchmark has always
+read high, and it is the entire reason the CSS benchmark needed its own tolerance rather than the shared gate
+being loosened.
+
+Quality 4 is a deliberate speed choice (the compressor runs per keystroke and quality 11 can take seconds on a
+large chunk), so this is a real trade, not an oversight. But the number is presented as the brotli size, and it
+is not the brotli size anyone ships. The honest options are to compress at 11 off the interactive path (a
+background refinement of the number), to name the figure for what it is, or to accept it deliberately. It is
+recorded rather than fixed because it touches every number in the product and every baseline that gates them,
+which is its own piece of work.
+
+### D9: A stylesheet's own `@import` tree is bounded at 64 files
+**Status: Accepted** · A bound where there was none · Found by the B2 adversarial review
+
+A stylesheet's `@import` children are never graph modules, so none of the engine's limits ever applied to them.
+Lightning CSS recurses per `@import`, and a deep enough chain overflows the stack, which is NOT catchable: the
+process dies rather than the import failing. One tree is therefore bounded to 64 files and 8 MB; breaching it
+falls back to raw-byte disclosure, which is not a wrong number. 64 is far above any real stylesheet's tree (a
+published sheet pulls in a handful of files) and far below where a debug build's stack gives out.
 
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
@@ -603,6 +648,27 @@ problem, the tuning simply did not pay off here.
 # Resolved and historical
 
 Kept for the record.
+
+### B2: The Import Cost ignored shipped non-JS asset bytes (CSS, wasm, fonts)
+**Status: Resolved (2026-07-17)** · Fixed by `fix(analysis): count a package's shipped CSS, wasm, and font bytes` · Design: [asset-counting-design.md](asset-counting-design.md) · Plan: [asset-counting-plan.md](asset-counting-plan.md)
+
+A package's real cost is not only its JavaScript. The engine measured the JS chunk and recorded a reachable
+stylesheet's raw bytes as an `uncounted_asset`, disclosed beside the result but never folded into the Import
+Cost and never processed as it would actually ship, so every CSS-shipping package undercounted.
+
+The load boundary now classifies each non-JavaScript module as a stylesheet, wasm, font, or passthrough and
+stubs the first three, so the JavaScript chunk still measures exactly. Every reachable stylesheet becomes one
+artifact via Lightning CSS, which resolves the `@import` tree and minifies it, mirroring how CSS ships and how
+the esbuild oracle emits a single sibling stylesheet; wasm and fonts are counted raw. Each artifact is
+compressed on its own and summed ([ADR-0005](adr/0005-a-runtime-is-an-artifact-boundary.md)), in both the
+single-import and the per-runtime File Cost paths. The result carries a per-kind `asset_breakdown` so the number
+is legible, and a stylesheet that processes cleanly no longer costs the package its confidence. Any processing
+failure falls back to the old raw-byte disclosure, so the result is a strict improvement or a tie, never a
+regression ([ADR-0006](adr/0006-the-result-model.md)). `ANALYZER_REVISION` moved to `rolldown-1.1.x+5`.
+
+Verified against the esbuild oracle on `@uiw/react-md-editor`, the only real package whose published ESM entry
+imports CSS: the minified totals agree within 1%, so both sides fold in the same stylesheet exactly once. The
+residual limits it left behind are D7, D8, and D9 below.
 
 ### B1: An all-inline-`type` named import was measured as the whole package
 **Status: Resolved (2026-07-16)** · Fixed by `fix(daemon): stop sizing an all-inline-type import as the whole package`

@@ -135,7 +135,8 @@ B2 moves measured numbers, so bump `ANALYZER_REVISION` to `rolldown-1.1.x+5` (th
   contained the same way rolldown/oxc are.
 - **Empirical tolerance.** The Lightning-CSS-vs-esbuild CSS delta is measured, not assumed; the tolerance may
   need re-derivation or a `cssTolerance`.
-- **Bare `@import`.** Published dist CSS almost always uses relative imports; the `oxc_resolver` fallback in the
-  provider covers the rare bare case, and any failure falls back to raw bytes.
+- **Bare `@import`.** Published dist CSS almost always uses relative imports. The provider does NOT resolve a
+  bare specifier (an `oxc_resolver` fallback was planned and not built): such a sheet falls back to raw-byte
+  disclosure on its own, which is the pre-B2 floor. Recorded as D8 rather than left as an unmet promise here.
 - **Build cost.** One more compiled crate; `rayon`/`dashmap` are modest and partly shared. Watch the build-memory
   budget the recent `debuginfo` change protects.
