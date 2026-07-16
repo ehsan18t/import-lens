@@ -26,6 +26,9 @@ allow = [
   "ISC",                  # rustls, ring, rustls-webpki, untrusted, hmac-sha1-compact
   "CDLA-Permissive-2.0",  # webpki-roots (Mozilla CA bundle data)
   "BSL-1.0",              # xxhash-rust (Boost Software License 1.0)
+  # Weak, file-level copyleft. Safe to ship as an unmodified library: MPL-2.0 covers
+  # modifications to the MPL'd files themselves, not code that merely depends on them.
+  "MPL-2.0",              # lightningcss + its Servo-derived cssparser / parcel_selectors (CSS asset sizing, B2)
 ]
 
 [bans]

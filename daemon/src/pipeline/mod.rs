@@ -1,4 +1,5 @@
 pub mod analyze;
+pub mod assets;
 mod build_memo;
 pub mod compress;
 pub mod export_list;

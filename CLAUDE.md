@@ -71,7 +71,7 @@ assert.match(dockerfile, /^FROM node:24-bookworm$/mu);
 
 **Prefer making drift impossible over testing for drift.** A Drift check is a consolation prize for two sources of truth you could not merge. Before writing one, try to delete the second source. Keep the check only where duplication is genuinely forced — `cli/importlens.mjs` and `extension/src/daemon/platform.ts` each redeclare `daemonRoot` because neither can import `scripts/targets.mjs` at runtime.
 
-**Never assert a dependency version in a test, except compiler-stack coordination.** The coordinated compiler stack (rolldown, the OXC monorepo crates, and oxc_resolver) is the only set of dependencies where a version bump can silently break the app. Do not assert versions of GitHub Actions, pnpm, Node, the Rust toolchain, `@types/vscode`, or any dev tooling. A break there is caught by CI before it ships.
+**Never assert a dependency version in a test, except the size-determining stack.** These are the only dependencies where a version bump can silently change measured output, so they are exact-pinned and version-tested: rolldown, the OXC monorepo crates, oxc_resolver, the `sideEffects` glob matcher (fast-glob), and the CSS processor (lightningcss). The first four are coordinated (their versions derive from rolldown's own graph, via `deps:update:compiler`); lightningcss is a STANDALONE exact-pin (its version is chosen independently and it is not reachable from rolldown/oxc, so it stays out of the fingerprint closure). Do not assert versions of GitHub Actions, pnpm, Node, the Rust toolchain, `@types/vscode`, or any dev tooling. A break there is caught by CI before it ships.
 
 Do not:
 

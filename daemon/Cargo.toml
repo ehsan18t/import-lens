@@ -20,6 +20,16 @@ fast-glob = "=1.0.1"
 flate2 = "^1.1"
 futures-util = { version = "^0.3", default-features = false, features = ["sink", "std"] }
 httpdate = "^1"
+# Coordinated compiler stack, exact-pinned: it processes a package's CSS the way it
+# ships (resolve `@import`s, minify) so the reported size is right, which means a
+# version bump can silently move CSS numbers. Pinned and upgrade-gated like rolldown /
+# oxc. `bundler` gives parse + `@import` + minify; `browserslist` stays OFF so output
+# is deterministic and target-free. It has only ever shipped `1.0.0-alpha.*`, and the
+# API breaks between alphas, so the exact pin is load-bearing. `serde` is enabled
+# because `bundler`'s `ResolveResult` carries an ungated `#[serde(untagged)]` (a
+# feature-gating hole in this alpha); serde is already in our tree, so it costs
+# nothing. `browserslist` stays off to keep output deterministic.
+lightningcss = { version = "=1.0.0-alpha.71", default-features = false, features = ["bundler", "serde"] }
 oxc_allocator = "=0.139.0"
 oxc_codegen = "=0.139.0"
 oxc_minifier = "=0.139.0"

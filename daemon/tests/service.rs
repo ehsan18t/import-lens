@@ -2111,7 +2111,9 @@ fn service_streams_package_json_loading_states_before_ready_results() {
     let resolved_loading = partials
         .iter()
         .skip(1)
-        .find(|partial| partial.indexes.as_deref() == Some(&[0, 1]))
+        // Compare slice-to-slice (`as_slice`), not slice-to-array-ref: the array-ref form
+        // (`Some(&[0, 1])`) fails inference once the wider dependency graph is in scope.
+        .find(|partial| partial.indexes.as_deref() == Some([0usize, 1].as_slice()))
         .expect("resolved loading package.json partial should be emitted");
     assert!(
         resolved_loading
@@ -2137,7 +2139,7 @@ fn service_streams_package_json_loading_states_before_ready_results() {
         .expect("tiny-lib should be present in initial partial");
     assert!(
         partials.iter().any(|partial| {
-            partial.indexes.as_deref() == Some(&[tiny_index])
+            partial.indexes.as_deref() == Some([tiny_index].as_slice())
                 && partial.states.first().is_some_and(|state| {
                     state.name == "tiny-lib" && state.status == ImportAnalysisStatus::Ready
                 })
@@ -2193,7 +2195,7 @@ fn service_batches_cached_package_json_size_partials_before_uncached_work() {
     let cached_ready = partials
         .iter()
         .find(|partial| {
-            partial.indexes.as_deref() == Some(&[0, 1, 2])
+            partial.indexes.as_deref() == Some([0usize, 1, 2].as_slice())
                 && partial.states.len() == 3
                 && partial.states.iter().all(|state| {
                     state.status == ImportAnalysisStatus::Ready
@@ -2212,7 +2214,7 @@ fn service_batches_cached_package_json_size_partials_before_uncached_work() {
     );
     assert!(
         partials.iter().any(|partial| {
-            partial.indexes.as_deref() == Some(&[3])
+            partial.indexes.as_deref() == Some([3usize].as_slice())
                 && partial.states.first().is_some_and(|state| {
                     state.name == "uncached-d"
                         && state.status == ImportAnalysisStatus::Ready
