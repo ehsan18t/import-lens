@@ -290,6 +290,27 @@ program.parse();
 }
 
 #[test]
+fn an_all_inline_type_named_import_is_not_sized_as_a_namespace() {
+    // `import { type X } from "pkg"` — every specifier carries the inline `type`
+    // modifier, so TypeScript erases the whole statement and it costs nothing at
+    // runtime. oxc marks the entry `is_type`, but the module REQUEST is `is_type = false`
+    // (the type is on the specifier, not the request). Without registering the statement
+    // as elided, the `requested_modules` fallback resurrects it as a namespace import of
+    // the entire package — a large over-count on a common TypeScript pattern.
+    let source = r#"
+import { type Config } from "tailwindcss";
+export const c: Config = { content: [] };
+"#;
+
+    let imports = analyze_imports("sample.ts", source).expect("imports should parse");
+
+    assert!(
+        imports.iter().all(|item| item.specifier != "tailwindcss"),
+        "an all-inline-type import must not be sized as a runtime import: {imports:?}"
+    );
+}
+
+#[test]
 fn a_binding_used_as_both_type_and_value_is_not_elided() {
     // A class is a type AND a value. Eliding it would silently under-count.
     let source = r#"

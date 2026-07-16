@@ -60,9 +60,17 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// by a parse-vs-resolve race and then cached (Task 7). And export enumeration resolves under the
 /// import's runtime, so an entry cached under the old hardcoded `Component` runtime no longer means
 /// what it did (Task 10).
+///
+/// `rolldown-1.1.x+4` (2026-07-16): the release-blocker batch moves numbers again, so every entry
+/// computed under `rolldown-1.1.x+3` must be rejected on read. An all-inline-`type` named import
+/// (`import { type X } from "pkg"`, every specifier carrying the inline `type` keyword) was sized as a
+/// namespace import of the whole package: oxc marks the entry `is_type` but leaves the module request
+/// `is_type = false`, so the static-import loop dropped it while the `requested_modules` fallback
+/// resurrected it as `import * as ...`. It is now registered as an elided statement and costs zero,
+/// matching TypeScript's erasure (B1).
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+3"
+        "rolldown-1.1.x+4"
     };
 }
 

@@ -156,11 +156,7 @@ fn imports_from_static_imports(
     // zero-cost type import into the package's entire weight.
     let mut elided_statements = HashSet::<(String, u32, u32)>::new();
 
-    for entry in module_record
-        .import_entries
-        .iter()
-        .filter(|entry| !entry.is_type)
-    {
+    for entry in module_record.import_entries.iter() {
         let specifier = entry.module_request.name.as_str();
         if !is_runtime_package_specifier(specifier) {
             continue;
@@ -172,7 +168,16 @@ fn imports_from_static_imports(
             entry.statement_span.end,
         );
 
-        if type_only_spans.contains(&entry.local_name.span) {
+        // Two spellings erase to nothing at runtime and must not be sized. A specifier
+        // carrying the inline `type` modifier (`{ type X }`), or a whole `import type`,
+        // is marked `is_type` by oxc. The legacy elision form — a value binding
+        // referenced only in type positions, with no `type` keyword — is caught by
+        // `type_only_spans`. Either way, register the statement as elided so the
+        // `requested_modules` fallback below cannot resurrect an all-type statement as a
+        // namespace import of the whole package. A mixed statement keeps its surviving
+        // value binding in `binding_imports` (added below) and is emitted normally; the
+        // elided key is then redundant with that entry and changes nothing.
+        if entry.is_type || type_only_spans.contains(&entry.local_name.span) {
             elided_statements.insert(key);
             continue;
         }
