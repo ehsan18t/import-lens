@@ -34,45 +34,13 @@ while eleven plan tasks sat untouched. "Real" was never the right bar.
 
 # Priority 0: release blockers
 
-These must be fixed before the release ships. **Recommended fix order (ascending effort and risk, quick
-correctness wins first): B1, then B3, then B2.** B1 is a small self-contained import-detection fix; B3 adds a
-detector plus a badge and turns the most visibly-broken numbers honest, and its result-annotation plumbing
-paves the way for B2; B2 is the largest, a feature with its own design doc, a new exact-pinned compiler-stack
-dependency, and an oracle re-baseline. All three change a measured number, so each needs an `ANALYZER_REVISION`
-bump; on this pre-release branch, bump once when the batch lands.
-
-### B1: An all-inline-`type` named import is measured as the whole package, not erased
-**Status: Blocker** · Wrong number (a large over-count) · Found in the 2026-07-16 module audit (D8), verified against the pinned oxc source
-
-`import { type Config } from "tailwindcss";`, a braced import whose every specifier carries the inline `type`
-modifier, is fully erased by TypeScript to zero runtime cost (the emitted JS imports the package not at all).
-Import Lens instead reports it as `ImportKind::Namespace`, an `import * as ... from "tailwindcss"`, builds the
-package's entire namespace, shows that size on the line, and sums it into the file's Combined Import Cost. This
-is a large over-count, not a floor and not a badge, and it hits a common TypeScript pattern.
-
-**Root cause** (`daemon/src/document/imports.rs`). oxc marks the statement's `ImportEntry.is_type = true`
-(inline type on the specifier), so the static-import loop's `!entry.is_type` filter (line 162) drops it before
-it can register in the `elided_statements` guard (line 176). oxc separately marks the same statement's
-`RequestedModule.is_type = false` ("type is on the specifier, not the module request"), so the namespace
-fallback (lines 199-231) passes its filter (line 207), finds the statement key in neither `binding_imports`
-nor `elided_statements` (line 217), and pushes `ImportGroup { has_namespace: true }`, which becomes
-`ImportKind::Namespace`. The module's own comment (lines 152-157) describes exactly this trap; the guard
-simply does not cover the keyword-less inline-type spelling. Confirmed against the pinned
-`oxc_syntax-0.139.0/src/module_record.rs` (ImportEntry `is_type` at line 181, RequestedModule `is_type` at
-line 414) and reproduced against the real oxc 0.139.0 analyzer.
-
-**Scope.** Only the all-inline-type statement is affected. A bare `import "pkg"` (no entries) still correctly
-becomes a namespace import. A mixed statement such as `import Def, { val, type T } from "pkg"` is unaffected:
-the surviving value binding lands the key in `binding_imports` and suppresses the fallback.
-
-**What would fix it.** Stop silently dropping `is_type` entries in the static-import loop; instead register
-their statement key in `elided_statements` so the namespace fallback is suppressed for an all-type statement,
-without breaking bare `import "pkg"` or mixed imports. Add a regression test that pins an all-inline-type
-statement to zero detected runtime imports, and bump `ANALYZER_REVISION` (this changes a measured number, so
-pre-fix cached namespace measurements must be invalidated on read).
+These must be fixed before the release ships. B1 (the all-inline-`type` over-count) and B3 (native-binary
+mislabeling) have landed and moved to Resolved below; the single `ANALYZER_REVISION` bump to `rolldown-1.1.x+4`
+covers both. B2 is the one blocker still open, and the largest by far, so it lands as its **own pull request**
+before the release ships and will bump `ANALYZER_REVISION` again when it does.
 
 ### B2: The Import Cost ignores shipped non-JS asset bytes (CSS, wasm, fonts)
-**Status: Blocker** · Correctness (a systematic undercount) · Full design: [asset-counting-design.md](asset-counting-design.md)
+**Status: Blocker (lands in its own pull request, before release)** · Correctness (a systematic undercount) · Full design: [asset-counting-design.md](asset-counting-design.md)
 
 A package's real cost is not only its JavaScript. UI kits ship CSS; some packages ship wasm or fonts. The
 engine measures the JS chunk and records a reachable stylesheet's raw bytes as an `uncounted_asset` (disclosed
@@ -94,41 +62,6 @@ and the esbuild oracle plus badge baselines re-baseline.
 **Not this issue.** A native binary leaf in the graph (a `.node` addon, an unfollowable dynamic `require`) is a
 different failure, tracked as D6. That leaf fails the entire build so the package reports nothing; it is not a
 shipped-asset undercount.
-
-### B3: Native-binary-backed packages are mismeasured (blank or a stub number) instead of labelled
-**Status: Blocker** · A misleading number, or a bare "unavailable", for a growing category of tools
-
-A growing class of dev tools ship a thin JS shim (or nothing at all) plus a platform-specific native binary
-distributed as `optionalDependencies` (the `@scope/cli-win32-x64` and `pkg-linux-x64` pattern): Biome,
-TypeScript 7 (the native rewrite), esbuild, and others. The native binary is spawned at runtime by the
-package's `bin`, so it never enters the import graph.
-
-**What actually happens.**
-- **No importable JS entry.** `@biomejs/biome` declares only `bin` (no `main`/`module`/`exports`); the real
-  tool is `@biomejs/cli-win32-x64` (a native binary). The build fails at `entry_resolution` and the package
-  renders a bare **"unavailable"**, which reads like a size or build problem rather than "there is nothing to
-  import."
-- **A stub `.` entry.** `typescript@7`'s `exports["."]` is `lib/version.cjs`, a 113 byte version stub
-  (`exports.version = version`); the real compiler is the `@typescript/typescript-win32-x64` native binary. The
-  daemon measures the stub and shows a confident **~867 B**, which reads as "typescript is tiny." That is a
-  misleading number for a whole category of packages, so it meets the wrong-number bar.
-
-B2's asset counting does not help here: it counts assets reachable in the import graph, and the native binary is
-a separate out-of-graph package. Counting the binary's own bytes would be wrong in the other direction anyway
-(you do not bundle a dev CLI into your app), so neither the stub size nor the binary size is the "import cost."
-
-**The fix: detect and label, do not count.** Recognize the native-binary pattern from platform-suffixed
-`optionalDependencies` at the resolver and package-classification boundary, then:
-- **No importable JS entry** goes to a **"native binary only"** badge (the same shape as the existing "types
-  only" badge), instead of "unavailable".
-- **A JS entry that resolves** (a shim or a real API) still shows its measured JS size, but with a **"native
-  binary"** flag beside it, so a stub like typescript's 867 B reads as "the JS shim; the real tool is a native
-  binary" rather than the whole cost.
-
-Do it at the boundary so it covers every such package by construction; do not special-case biome, typescript, or
-esbuild by name. Residual cases stay non-blocking and are tracked under D6: a native package that does not
-follow the platform-`optionalDependencies` convention (so the detector misses it), and the unresolvable-leaf
-packages (`jest`, `eslint-plugin-autofix`) that are a different failure mode.
 
 ---
 
@@ -671,6 +604,29 @@ problem, the tuning simply did not pay off here.
 
 Kept for the record.
 
+### B1: An all-inline-`type` named import was measured as the whole package
+**Status: Resolved (2026-07-16)** · Fixed by `fix(daemon): stop sizing an all-inline-type import as the whole package`
+
+`import { type Config } from "tailwindcss";`, a braced import whose every specifier carried the inline `type`
+modifier, is erased by TypeScript to zero runtime cost, but was reported as an `import * as ...` namespace of
+the whole package and summed into the file's Combined Import Cost. oxc marks the specifier entry `is_type` while
+leaving the module request `is_type = false`, so the static-import loop dropped the entry and the
+`requested_modules` fallback resurrected the statement as a namespace. The loop now registers such a statement
+in `elided_statements` so the fallback cannot resurrect it; a regression test pins an all-inline-type import to
+zero detected runtime imports. `ANALYZER_REVISION` moved to `rolldown-1.1.x+4`.
+
+### B3: Native-binary-backed packages were mismeasured instead of labelled
+**Status: Resolved (2026-07-16)** · Fixed by `fix(analysis): label native-binary packages rather than mismeasure them`
+
+A package that ships a platform-specific native binary as `optionalDependencies` (Biome, the TypeScript 7
+native rewrite, esbuild) either showed a bare "unavailable" (no importable JS entry) or a confident,
+misleadingly tiny size for a JS shim (TypeScript 7's 113 byte version stub, measured at roughly 867 bytes). The
+daemon now detects the platform-suffixed `optionalDependencies` convention at the resolver boundary and labels
+rather than counts: a package with no importable JS entry is a measured zero with a "native binary only" badge;
+one whose entry resolves keeps its measured size with a "native binary" flag beside it. Requiring the manifest
+to declare no entry field keeps a broken install honestly "unavailable". `ANALYZER_REVISION` moved to
+`rolldown-1.1.x+4`.
+
 ### K1: The `sideEffects` badge fix is invisible on a warm cache until `ANALYZER_REVISION` moves
 **Status: Resolved (2026-07-15)** · Task 14 bumped `ANALYZER_REVISION` to `rolldown-1.1.x+3`
 
@@ -693,7 +649,7 @@ the disk schema stays at 8 meanwhile.
 which lands with every measurement-affecting change on this branch. Every entry computed by the pre-fix daemon
 now fails the `analyzer_version` check on read and is re-measured, so the corrected badge reaches existing
 installs, not only brand-new caches. This was the hard dependency the whole batch of badge and size fixes rode
-on; it is discharged. (Note: the B1 fix will bump this revision again, for the same reason.)
+on; it is discharged. (The B1 and B3 fixes bumped it again, to `rolldown-1.1.x+4`; B2 will bump it once more when it lands in its own pull request.)
 
 ### U1: `a6cae06` did not get an adversarial review
 **Status: Resolved (2026-07-16)** · Covered by the module audit's D2 review
