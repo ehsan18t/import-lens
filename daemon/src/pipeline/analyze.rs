@@ -529,16 +529,20 @@ pub(crate) fn analyze_with_rolldown_engine(
     // entry itself is already captured at read time by the plugin, so it is filtered out here
     // rather than being re-hashed post-build, which would widen the window the read-time capture
     // exists to close.
-    let fingerprinted: HashSet<&str> = artifact
+    // Compare the SAME spelling on both sides: `FileFingerprint.path` is forward-slashed
+    // (`cache::key` normalizes it), while a captured read path is a raw canonical `PathBuf`
+    // (`\\?\C:\…` on Windows). Comparing them as-is never matches, so the filter silently did
+    // nothing and every stylesheet was re-hashed after the build anyway.
+    let fingerprinted: HashSet<String> = artifact
         .read_time_fingerprints
         .iter()
-        .map(|fingerprint| fingerprint.path.as_str())
+        .map(|fingerprint| fingerprint.path.clone())
         .collect();
     stat_paths.extend(
         assets
             .read_paths
             .iter()
-            .filter(|path| !fingerprinted.contains(path.to_string_lossy().as_ref()))
+            .filter(|path| !fingerprinted.contains(&path.to_string_lossy().replace('\\', "/")))
             .cloned(),
     );
     let freshness = FingerprintSource::ReadTime {

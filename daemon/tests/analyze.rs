@@ -2613,10 +2613,16 @@ fn a_workspace_linked_package_answers_with_what_rolldown_retained() {
 #[test]
 fn analyze_a_css_shipping_package_counts_its_stylesheet_in_the_import_cost() {
     let workspace = temp_workspace();
+    // `sideEffects: ["*.css"]` is what a real CSS-shipping package declares, and it is load-bearing
+    // here rather than decoration: it is the declaration that makes a bundler RETAIN the stylesheet,
+    // so counting those bytes is correct. A fixture declaring `sideEffects: false` would be the one
+    // shape where a bundler DROPS the CSS and this number would be wrong (see known-issues D7), so
+    // pinning B2 on that shape would pin the defect. The JS entry still matches no glob, so it stays
+    // non-effectful and the confidence assertion below means what it says.
     write_package(
         &workspace,
         "styled-lib",
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
         "import './styles.css';\nexport const widget = () => 'widget';\n",
     );
     write_package_file(
@@ -2646,7 +2652,7 @@ fn analyze_a_css_shipping_package_counts_its_stylesheet_in_the_import_cost() {
     write_package(
         &workspace,
         "plain-lib",
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
         "export const widget = () => 'widget';\n",
     );
     let plain = analyze_import(

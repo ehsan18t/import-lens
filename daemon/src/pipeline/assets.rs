@@ -21,7 +21,7 @@
 
 use crate::engine::{AssetKind, CollectedAsset, UncountedAsset, diagnostic_stage};
 use crate::ipc::protocol::{AssetContribution, ImportDiagnostic, MeasuredSizes};
-use crate::pipeline::compress::compress_all_bytes;
+use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
 use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider};
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions};
 use lightningcss::targets::Targets;
@@ -29,16 +29,42 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// How many files one `@import` tree may pull in, and how many bytes of them.
+///
+/// The JavaScript graph has [`crate::engine::limits`]; a stylesheet's `@import` children are never
+/// graph modules, so nothing bounded them at all. That matters more here than it looks: Lightning
+/// CSS recurses per `@import`, and a deep enough chain overflows the stack — around 800 in a release
+/// build — which is NOT catchable. `catch_unwind` never runs and the daemon dies with every in-flight
+/// request. The canonicalizing `resolve` below kills the cycle that makes depth unbounded; this
+/// bounds the honest-but-absurd tree that remains, well under the depth where the stack gives out.
+///
+/// Breaching either is not a wrong number: the set falls back to raw-byte disclosure, which is the
+/// pre-B2 behaviour and the floor this feature promised never to go below.
+///
+/// 64 is deliberately far below the depth where any build's stack gives out, not just release's:
+/// a debug build's frames are several times larger, so a budget tuned to release would let the test
+/// suite itself overflow. It is also far above any real `@import` tree — a published stylesheet
+/// pulls in a handful of files, not dozens — so the bound costs real packages nothing.
+const MAX_STYLESHEET_FILES: usize = 64;
+const MAX_STYLESHEET_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct ReadBudget {
+    files: usize,
+    bytes: usize,
+}
+
 /// A `SourceProvider` that reads from disk like the built-in `FileProvider` but records every path
-/// it opens, and can serve one synthetic in-memory entry. The bundler drives the `@import` graph
-/// with `rayon`, so the provider must be `Send + Sync`; the capture set is a `Mutex`, never a
-/// `RefCell`.
+/// it opens, bounds what one `@import` tree may pull in, and can serve one synthetic in-memory
+/// entry. The bundler drives the `@import` graph with `rayon`, so the provider must be
+/// `Send + Sync`; its state is behind `Mutex`, never a `RefCell`.
 struct TrackingProvider {
     inner: FileProvider,
     /// A virtual entry that `@import`s each reachable stylesheet by absolute path, so N stylesheets
     /// bundle into ONE artifact. `None` when there is a single real entry to bundle directly.
     synthetic: Option<(PathBuf, String)>,
     read_paths: Mutex<HashSet<PathBuf>>,
+    budget: Mutex<ReadBudget>,
 }
 
 impl TrackingProvider {
@@ -47,6 +73,7 @@ impl TrackingProvider {
             inner: FileProvider::new(),
             synthetic: None,
             read_paths: Mutex::new(HashSet::new()),
+            budget: Mutex::new(ReadBudget::default()),
         }
     }
 
@@ -55,7 +82,26 @@ impl TrackingProvider {
             inner: FileProvider::new(),
             synthetic: Some((path, content)),
             read_paths: Mutex::new(HashSet::new()),
+            budget: Mutex::new(ReadBudget::default()),
         }
+    }
+
+    /// Charge one file against the tree's budget, refusing once it is spent.
+    fn charge(&self, bytes: usize) -> Result<(), std::io::Error> {
+        let mut budget = self
+            .budget
+            .lock()
+            .expect("css read budget should not be poisoned");
+        budget.files += 1;
+        budget.bytes += bytes;
+
+        if budget.files > MAX_STYLESHEET_FILES || budget.bytes > MAX_STYLESHEET_BYTES {
+            return Err(std::io::Error::other(format!(
+                "stylesheet @import tree exceeds the {MAX_STYLESHEET_FILES} file / \
+                 {MAX_STYLESHEET_BYTES} byte limit"
+            )));
+        }
+        Ok(())
     }
 
     /// The set of real files Lightning CSS read — the entries plus every resolved `@import` child.
@@ -86,11 +132,13 @@ impl SourceProvider for TrackingProvider {
 
         // Canonicalize so a cache key is stable across `..` / symlink spellings of the same file.
         let key = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let source = self.inner.read(file)?;
+        self.charge(source.len())?;
         self.read_paths
             .lock()
             .expect("css read-path set should not be poisoned")
             .insert(key);
-        self.inner.read(file)
+        Ok(source)
     }
 
     fn resolve(
@@ -98,14 +146,45 @@ impl SourceProvider for TrackingProvider {
         specifier: &str,
         originating_file: &Path,
     ) -> Result<ResolveResult, Self::Error> {
+        // A REMOTE `@import` (`@import url("https://fonts.googleapis.com/…")`) has no file behind it
+        // and is not ours to inline — a real bundler leaves it in the sheet as an import, and so do
+        // we. Reporting it as external keeps the rest of the stylesheet counted; treating it as a
+        // resolve failure would sink the whole set to raw disclosure over a shape ordinary packages
+        // ship.
+        if is_remote_specifier(specifier) {
+            return Ok(ResolveResult::External(specifier.to_owned()));
+        }
+
         // The synthetic entry `@import`s absolute paths; resolve those directly. `FileProvider`'s
         // own resolve is a naive relative join and would mangle them.
         let candidate = Path::new(specifier);
-        if candidate.is_absolute() {
-            return Ok(ResolveResult::File(candidate.to_path_buf()));
-        }
-        self.inner.resolve(specifier, originating_file)
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            match self.inner.resolve(specifier, originating_file)? {
+                ResolveResult::File(path) => path,
+                external @ ResolveResult::External(_) => return Ok(external),
+            }
+        };
+
+        // CANONICALIZE, and not for tidiness: Lightning CSS cycle-detects on the very PathBuf
+        // spelling this returns, and `FileProvider::resolve` is a naive `with_file_name` join that
+        // never normalizes `..`. A cycle that crosses a `../` therefore hands back a LONGER, DISTINCT
+        // key for the SAME file on every hop, the dedup never fires, and the recursion overflows the
+        // stack — which `catch_unwind` cannot catch, so the daemon dies outright rather than failing
+        // one import. `node_modules` is untrusted input and an `@import` cycle is silent in browsers
+        // and in every real bundler (they dedupe on a resolved URL), so a package can ship one and
+        // never know. Canonicalizing makes the key an identity, and the cycle terminates.
+        Ok(ResolveResult::File(
+            std::fs::canonicalize(&resolved).unwrap_or(resolved),
+        ))
     }
+}
+
+/// An `@import` that names a network resource rather than a file on disk.
+fn is_remote_specifier(specifier: &str) -> bool {
+    let lower = specifier.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("//")
 }
 
 /// A reachable stylesheet set processed as it ships: the bundled bytes before and after
@@ -165,15 +244,31 @@ fn synthetic_entry(entries: &[PathBuf]) -> (PathBuf, String) {
     let content = entries
         .iter()
         .map(|entry| {
-            // Forward slashes: a backslash is an escape character inside a CSS string, so a Windows
-            // path spelled with them would be mangled before `resolve` ever saw it.
-            let specifier = entry.to_string_lossy().replace('\\', "/");
-            format!("@import \"{specifier}\";")
+            format!(
+                "@import \"{}\";",
+                css_string_escape(&entry.to_string_lossy())
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
 
     (path, content)
+}
+
+/// Escape a path for use inside a CSS string.
+///
+/// Backslash and double-quote are the only characters that can end the string or start an escape, so
+/// escaping them is the whole job — and it is not theoretical: a package is free to ship a file whose
+/// name contains a quote (POSIX allows it), which would otherwise close the string and inject rules
+/// into the sheet we are about to measure. `node_modules` is untrusted input.
+///
+/// This replaces a blanket `\` -> `/` rewrite, which was wrong twice over: it corrupted a legitimate
+/// POSIX path containing a literal backslash, and on Windows it turned a verbatim `\\?\C:\…` prefix
+/// into `//?/C:/…`, which is NOT verbatim — silently switching off the `..` normalization that
+/// `PathBuf` applies to verbatim paths, and with it the only thing keeping an `@import` cycle from
+/// recursing forever. Backslashes are kept and escaped instead.
+fn css_string_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// The provider must outlive the `StyleSheet` (it borrows source strings held inside it), so all
@@ -335,23 +430,69 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
         return;
     }
 
-    let bundled = bundle_css_set(&entries).and_then(|bundle| {
-        compress_all_bytes(&bundle.minified_bytes)
-            .map_err(|error| format!("failed to compress the bundled stylesheet: {error}"))
-            .map(|compressed| (bundle, compressed))
-    });
+    // One artifact for the whole set is the right answer (it is how CSS ships, and it dedupes what
+    // two sheets share) — but it is all-or-nothing, and a set fails as a unit. A package that ships
+    // one `.scss`, or one sheet with a bare `@import` Lightning CSS cannot resolve, would take every
+    // other stylesheet down with it, and in the File Cost's combined build that set spans every
+    // import in the runtime group. So if the union fails, retry per sheet: the ones that parse are
+    // still counted and only the offender falls back. Sheets that share an `@import` are no longer
+    // deduped in that degraded mode, which is a smaller and rarer error than dropping them all.
+    let bundled = bundle_css_set(&entries)
+        .and_then(compress_bundle)
+        .map(|counted| vec![counted])
+        .or_else(|union_error| {
+            if entries.len() == 1 {
+                return Err(union_error);
+            }
+            processed.failures.push(format!(
+                "bundling the stylesheets as one artifact failed, so each was measured on its own \
+                 and shared @imports are counted once per sheet: {union_error}"
+            ));
+            let counted: Vec<_> = entries
+                .iter()
+                .filter_map(|entry| match bundle_css(entry).and_then(compress_bundle) {
+                    Ok(counted) => Some(counted),
+                    Err(error) => {
+                        processed.failures.push(error);
+                        processed.uncounted.push(UncountedAsset {
+                            path: entry.clone(),
+                            bytes: assets
+                                .iter()
+                                .find(|asset| &asset.path == entry)
+                                .map_or(0, |asset| asset.raw_bytes),
+                        });
+                        None
+                    }
+                })
+                .collect();
+            if counted.is_empty() {
+                Err(union_error)
+            } else {
+                Ok(counted)
+            }
+        });
 
     match bundled {
-        Ok((bundle, compressed)) => {
-            processed.contributions.push(AssetContribution {
+        Ok(counted) => {
+            // One row for the kind however many artifacts produced it: each was compressed on its
+            // own, so their numbers add (ADR-0005).
+            let mut css = AssetContribution {
                 kind: AssetKind::Css,
-                raw_bytes: bundle.raw_bytes.len() as u64,
-                minified_bytes: bundle.minified_bytes.len() as u64,
-                gzip_bytes: compressed.gzip_bytes,
-                brotli_bytes: compressed.brotli_bytes,
-                zstd_bytes: compressed.zstd_bytes,
-            });
-            processed.read_paths.extend(bundle.read_paths);
+                raw_bytes: 0,
+                minified_bytes: 0,
+                gzip_bytes: 0,
+                brotli_bytes: 0,
+                zstd_bytes: 0,
+            };
+            for (bundle, compressed) in counted {
+                css.raw_bytes += bundle.raw_bytes.len() as u64;
+                css.minified_bytes += bundle.minified_bytes.len() as u64;
+                css.gzip_bytes += compressed.gzip_bytes;
+                css.brotli_bytes += compressed.brotli_bytes;
+                css.zstd_bytes += compressed.zstd_bytes;
+                processed.read_paths.extend(bundle.read_paths);
+            }
+            processed.contributions.push(css);
         }
         Err(message) => {
             processed.failures.push(message);
@@ -366,6 +507,14 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
             );
         }
     }
+}
+
+/// Compress a bundled stylesheet as its own artifact — never concatenated with anything else first,
+/// because it ships as its own file (ADR-0005).
+fn compress_bundle(bundle: CssBundle) -> Result<(CssBundle, CompressionSizes), String> {
+    compress_all_bytes(&bundle.minified_bytes)
+        .map_err(|error| format!("failed to compress the bundled stylesheet: {error}"))
+        .map(|compressed| (bundle, compressed))
 }
 
 fn process_binary_kind(
@@ -487,6 +636,155 @@ mod tests {
                 .any(|path| path.ends_with("child.css")),
             "the @import child must be captured: {:?}",
             bundle.read_paths,
+        );
+    }
+
+    /// **The daemon-killer.** Lightning CSS cycle-detects on the very path spelling `resolve` hands
+    /// back, and the built-in resolver's naive `with_file_name` join never normalizes `..` — so a
+    /// cycle crossing a `../` used to yield a longer, distinct key for the same file on every hop,
+    /// the dedup never fired, and the recursion overflowed the stack. That is not catchable:
+    /// `catch_unwind` never runs, the process `__fastfail`s, and every in-flight request dies with
+    /// it. A package can ship such a cycle without knowing — browsers and real bundlers dedupe on a
+    /// resolved URL, so it is silent everywhere else.
+    ///
+    /// If this test ever hangs or aborts the runner rather than failing, THAT is the regression.
+    #[test]
+    fn a_dot_dot_crossing_import_cycle_terminates_instead_of_killing_the_process() {
+        let dir = temp_dir("cycle");
+        let components = dir.join("components");
+        let theme = dir.join("theme");
+        fs::create_dir_all(&components).expect("components");
+        fs::create_dir_all(&theme).expect("theme");
+        let button = components.join("button.css");
+        let tokens = theme.join("tokens.css");
+        // A mutual cycle that crosses `../` in both directions.
+        fs::write(
+            &button,
+            "@import \"../theme/tokens.css\";\n.button { color: red }\n",
+        )
+        .expect("button");
+        fs::write(
+            &tokens,
+            "@import \"../components/button.css\";\n:root { --x: 1 }\n",
+        )
+        .expect("tokens");
+        let other = dir.join("other.css");
+        fs::write(&other, ".other { color: teal }\n").expect("other");
+
+        // The multi-entry path is the exposed one: it is what the synthetic entry serves.
+        let canonical = |path: &Path| std::fs::canonicalize(path).expect("canonicalize");
+        let result = bundle_css_set(&[canonical(&button), canonical(&other)]);
+        fs::remove_dir_all(&dir).ok();
+
+        // Terminating at all is the whole assertion: reaching this line means the process survived.
+        let bundle = result.expect("a cyclic @import must terminate, not overflow the stack");
+        let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
+        // The sheets NOT caught in the cycle are still counted, so one package's broken CSS cannot
+        // sink the set. Lightning CSS drops the cyclic sheet's own rules, which undercounts that one
+        // stylesheet — pathological input, and still strictly better than before B2, when a
+        // CSS-shipping package contributed zero either way. Recorded in known-issues.
+        assert!(
+            css.contains(".other"),
+            "a stylesheet outside the cycle must still be counted: {css}"
+        );
+    }
+
+    /// The tree is bounded even without a cycle: Lightning CSS recurses per `@import`, and a deep
+    /// enough chain overflows the stack, which nothing can catch. Assets are never graph modules, so
+    /// the JS limits never applied to them.
+    #[test]
+    fn an_unreasonably_deep_import_chain_is_refused_rather_than_recursed() {
+        let dir = temp_dir("deep");
+        let depth = MAX_STYLESHEET_FILES + 8;
+        for index in 0..depth {
+            let next = if index + 1 < depth {
+                format!("@import \"./sheet{}.css\";\n", index + 1)
+            } else {
+                String::new()
+            };
+            fs::write(
+                dir.join(format!("sheet{index}.css")),
+                format!("{next}.rule{index} {{ color: red }}\n"),
+            )
+            .expect("sheet");
+        }
+
+        let result = bundle_css(&dir.join("sheet0.css"));
+        fs::remove_dir_all(&dir).ok();
+
+        let error = result.expect_err("a tree past the file budget must be refused");
+        assert!(error.contains("limit"), "{error}");
+    }
+
+    /// A remote `@import` has no file behind it. A real bundler leaves it in the sheet; treating it
+    /// as a resolve failure would sink every stylesheet in the set to raw disclosure over a shape
+    /// ordinary packages ship.
+    #[test]
+    fn a_remote_import_is_external_and_does_not_sink_the_stylesheet() {
+        let dir = temp_dir("remote");
+        let entry = dir.join("index.css");
+        fs::write(
+            &entry,
+            "@import url(\"https://fonts.googleapis.com/css2?family=Inter\");\n.a { color: red }\n",
+        )
+        .expect("entry");
+
+        let result = bundle_css(&entry);
+        fs::remove_dir_all(&dir).ok();
+
+        let bundle = result.expect("a remote @import must not fail the stylesheet");
+        let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
+        assert!(
+            css.contains(".a"),
+            "the local rules must still be counted: {css}"
+        );
+    }
+
+    /// One unprocessable sheet must not take the others down with it. In the File Cost's combined
+    /// build the set spans every import in the runtime group, so all-or-nothing meant one package's
+    /// `.scss` silently reverted CSS counting for all of them.
+    #[test]
+    fn one_unparseable_stylesheet_does_not_sink_the_rest_of_the_set() {
+        let dir = temp_dir("isolation");
+        let good = dir.join("good.css");
+        let bad = dir.join("bad.scss");
+        fs::write(&good, ".good { color: red }\n").expect("good");
+        // Real preprocessor syntax: Lightning CSS parses plain CSS only.
+        fs::write(
+            &bad,
+            "$brand: red;\n@mixin thing { color: $brand }\n.bad { @include thing }\n",
+        )
+        .expect("bad");
+        let assets = vec![
+            CollectedAsset {
+                path: good.clone(),
+                kind: AssetKind::Css,
+                raw_bytes: fs::metadata(&good).map(|meta| meta.len()).unwrap_or(0),
+            },
+            CollectedAsset {
+                path: bad.clone(),
+                kind: AssetKind::Css,
+                raw_bytes: fs::metadata(&bad).map(|meta| meta.len()).unwrap_or(0),
+            },
+        ];
+
+        let processed = process_assets(&assets);
+        fs::remove_dir_all(&dir).ok();
+
+        let css = processed
+            .contributions
+            .iter()
+            .find(|contribution| contribution.kind == AssetKind::Css)
+            .expect("the parseable stylesheet must still be counted");
+        assert!(css.brotli_bytes > 0, "{css:?}");
+        assert_eq!(
+            processed
+                .uncounted
+                .iter()
+                .map(|asset| &asset.path)
+                .collect::<Vec<_>>(),
+            vec![&bad],
+            "only the offender falls back to disclosure: {processed:?}",
         );
     }
 
