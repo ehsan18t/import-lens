@@ -50,7 +50,19 @@ test("formatImportSizePrimary supports minimal, standard, and verbose display mo
 test("formatImportSizePrimary shows unavailable and applies compression and confidence", () => {
   assert.equal(
     formatImportSizePrimary(
-      { ...result, error: "parse failed" },
+      // Unmeasured (ADR-0006): no size, and a stage that says why. The render path asks whether
+      // there is a size, not whether there is an error, so a hypothetical result that somehow had
+      // one without the other could not slip a number onto the screen.
+      {
+        ...result,
+        raw_bytes: null,
+        minified_bytes: null,
+        gzip_bytes: null,
+        brotli_bytes: null,
+        zstd_bytes: null,
+        error: "parse failed",
+        unmeasured_stage: "parse",
+      },
       { display: "standard", compression: "brotli", showWarnings: true },
     ),
     "Size unavailable",
@@ -115,4 +127,41 @@ test("declaration-only packages report zero primary bytes and a types-only tag",
     "0 B br",
   );
   assert.deepEqual(importHintTagLabels(typesOnly, true, "component"), ["types only"]);
+});
+
+test("native-binary-only packages report a native-binary-only tag", () => {
+  const nativeBinaryOnly: ImportResult = {
+    ...result,
+    raw_bytes: 0,
+    minified_bytes: 0,
+    gzip_bytes: 0,
+    brotli_bytes: 0,
+    zstd_bytes: 0,
+    diagnostics: [
+      {
+        stage: "native_binary_only",
+        message: "package ships only a native binary; nothing is imported into the bundle",
+        details: [],
+      },
+    ],
+  };
+
+  assert.deepEqual(importHintTagLabels(nativeBinaryOnly, true, "component"), [
+    "native binary only",
+  ]);
+});
+
+test("a native-binary-backed package keeps its size and carries a native-binary tag", () => {
+  const nativeBinary: ImportResult = {
+    ...result,
+    diagnostics: [
+      {
+        stage: "native_binary",
+        message: "package is backed by a platform-specific native binary",
+        details: [],
+      },
+    ],
+  };
+
+  assert.deepEqual(importHintTagLabels(nativeBinary, true, "component"), ["native binary"]);
 });

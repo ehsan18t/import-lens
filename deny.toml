@@ -21,6 +21,7 @@ allow = [
   "Unicode-3.0",
   "Zlib",
   # Permissive licenses present in the current transitive tree.
+  "BSD-2-Clause",         # arrayref, fast-glob (rolldown's transitive tree)
   "BSD-3-Clause",         # brotli, alloc-no-stdlib/alloc-stdlib, subtle
   "ISC",                  # rustls, ring, rustls-webpki, untrusted, hmac-sha1-compact
   "CDLA-Permissive-2.0",  # webpki-roots (Mozilla CA bundle data)

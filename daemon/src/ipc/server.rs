@@ -3,26 +3,29 @@ use crate::{
     ipc::{
         codec::{decode_payload, message_frame_codec, payload_bytes},
         protocol::{
-            AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
-            AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-            BatchResponse, CacheListRequest, CacheListResponse, CacheRemoveRequest,
-            CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest, CacheStatusResponse,
-            ClientMessage, CompleteImportMembersRequest, CompleteImportMembersResponse,
-            FileSizeDocumentRequest, FileSizeDocumentResponse, FreshnessKind, ImportDiagnostic,
-            PROTOCOL_VERSION, RefreshRegistryHintsResponse, RefreshedResultsResponse,
-            RegistryHintResult, WorkspaceReportRequest, WorkspaceReportResponse,
-            WorkspaceReportSummary, is_supported_protocol_version,
+            AnalyzeDocumentRequest, AnalyzePackageJsonRequest, AnalyzePackageJsonResponse,
+            AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse, CacheListRequest,
+            CacheListResponse, CacheRemoveRequest, CacheRemoveResponse, CacheRemoveScope,
+            CacheStatusRequest, CacheStatusResponse, ClientMessage, CompleteImportMembersRequest,
+            CompleteImportMembersResponse, FreshnessKind, ImportDiagnostic, PROTOCOL_VERSION,
+            RefreshRegistryHintsResponse, RefreshedResultsResponse, RegistryHintResult,
+            WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
+            is_supported_protocol_version,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
     logging::{self, parse_log_level, set_log_level},
+    pipeline::analyze::AnalysisContext,
     prefetch::Prefetcher,
     service::{
-        ImportLensService, protocol_error_batch_response, protocol_error_exports_response,
-        protocol_error_file_size_response,
+        ImportLensService, StreamedDocumentAnalysis, protocol_error_analyze_document_response,
+        protocol_error_batch_response, protocol_error_exports_response,
+        protocol_error_file_size_document_response, protocol_error_file_size_response,
     },
 };
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     error::Error,
@@ -43,6 +46,20 @@ const LIFECYCLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// cold-open analysis burst settle first (see `spawn_cache_maintenance`).
 const CACHE_MAINTENANCE_DELAY: Duration = Duration::from_secs(60);
 
+/// How long shutdown, an idle recycle, or a lost connection waits for the tasks it has already
+/// asked to stop (SRS FR-004c).
+///
+/// It has to be a *bound*, not a plain join, because one class of task cannot be asked to stop: a
+/// build already inside Rolldown runs until its own `BUILD_TIMEOUT` (8s) and nothing can cancel it.
+/// The extension force-kills the daemon 5s after sending `shutdown`
+/// (`extension/src/daemon/processLifecycle.ts`), so an unbounded join hands the process to the
+/// killer *before* `flush_cache` ever runs — and the flush is the whole point of a graceful
+/// shutdown. Waiting 2s and flushing anyway trades the one thing an abandoned build can cost (its
+/// own result is not persisted, so it is rebuilt next session — and a build that hit the timeout
+/// was never cacheable anyway, FR-026c) against the thing losing the flush costs: every entry the
+/// session computed.
+const TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Aborts the wrapped task when dropped (connection end, or replacement by a
 /// post-Hello respawn).
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -61,7 +78,7 @@ impl Drop for AbortOnDrop {
 /// network fetch — a superseded/abandoned block skips its remaining fetches, with
 /// no error surfaced for the skipped work.
 ///
-/// Keying per source (mirroring `SwrRefreshLifecycle`, decision-log D9) is what
+/// Keying per source (mirroring `DocumentTaskLifecycle`, decision-log D9) is what
 /// keeps a cold-cache multi-manifest prewarm honest: refreshing `backend/
 /// package.json` must not cancel the still-in-flight `web/package.json` block,
 /// which would otherwise strand every not-yet-fetched target with a fabricated
@@ -91,23 +108,39 @@ impl RegistryRefreshLifecycle {
         }
         flag
     }
-}
 
-impl Drop for RegistryRefreshLifecycle {
-    fn drop(&mut self) {
-        // Connection ended (disconnect, idle recycle, shutdown): cancel every
-        // source's still-draining block so its queued jobs skip remaining fetches.
+    /// Cancel every source's block. `Drop` does this too, but `Drop` runs when the connection
+    /// function RETURNS — which on the shutdown path is after the join it was supposed to shorten.
+    fn cancel_all(&self) {
         for active in self.active_by_source.values() {
             active.store(true, Ordering::Release);
         }
     }
 }
 
-struct SwrRefreshLifecycle {
+impl Drop for RegistryRefreshLifecycle {
+    fn drop(&mut self) {
+        // Connection ended (disconnect, idle recycle, shutdown): cancel every
+        // source's still-draining block so its queued jobs skip remaining fetches.
+        self.cancel_all();
+    }
+}
+
+/// Per-document cancellation for work a request left running or has not started yet: the SWR
+/// revalidation after a stale size read, the pending-import builds a streamed document analysis
+/// handed off, and the combined file-size build a queued size read has not entered yet. A newer
+/// request for the SAME document flips the previous flag (the work is for a document state the
+/// user has already replaced); the connection ending flips all of them.
+///
+/// One instance per KIND of background work, never one shared between them: the extension sends
+/// `AnalyzeDocument` and then `FileSizeDocument` for the same document, so a shared instance
+/// would have the file-size request cancel the very builds the analysis had just handed off, and
+/// the document's imports would sit at "Calculating…" forever.
+struct DocumentTaskLifecycle {
     active_by_document: HashMap<String, Arc<AtomicBool>>,
 }
 
-impl SwrRefreshLifecycle {
+impl DocumentTaskLifecycle {
     fn new() -> Self {
         Self {
             active_by_document: HashMap::new(),
@@ -115,30 +148,142 @@ impl SwrRefreshLifecycle {
     }
 
     fn start_document(&mut self, workspace_root: &str, document_path: &str) -> Arc<AtomicBool> {
-        let key = swr_document_key(workspace_root, document_path);
+        let key = document_key(workspace_root, document_path);
         let flag = Arc::new(AtomicBool::new(false));
         if let Some(previous) = self.active_by_document.insert(key, Arc::clone(&flag)) {
             previous.store(true, Ordering::Release);
         }
         flag
     }
-}
 
-impl Drop for SwrRefreshLifecycle {
-    fn drop(&mut self) {
+    /// Cancel every document's work. `Drop` does this too, but `Drop` runs when the connection
+    /// function RETURNS — which on the shutdown path is after the join it was supposed to shorten,
+    /// making it useless exactly when it matters most.
+    fn cancel_all(&self) {
         for active in self.active_by_document.values() {
             active.store(true, Ordering::Release);
         }
     }
 }
 
-fn swr_document_key(workspace_root: &str, document_path: &str) -> String {
+impl Drop for DocumentTaskLifecycle {
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
+/// At most ONE combined file-size build per document at a time.
+///
+/// The combined build (one Rolldown build per runtime, for the file's own totals) is the one piece
+/// of engine work with neither supersession nor single-flight of its own — `FileSizeDocument` is
+/// sent on every keystroke's analysis, and since the connection loop became a multiplexer those
+/// handlers run CONCURRENTLY. Nothing then stopped a user typing in an Astro file from stacking
+/// combined builds against the two-permit engine pool, each holding a permit for up to
+/// `BUILD_TIMEOUT`, while the per-import builds of every other document queued behind them.
+///
+/// The gate serializes them per document. Paired with the supersession flag it forms
+/// [`CombinedBuildBound`], which is what the interactive size reads run under, and which is where
+/// the whole bound is described.
+struct DocumentBuildGate {
+    gates: HashMap<String, Arc<tokio::sync::Semaphore>>,
+}
+
+impl DocumentBuildGate {
+    fn new() -> Self {
+        Self {
+            gates: HashMap::new(),
+        }
+    }
+
+    fn gate_for(
+        &mut self,
+        workspace_root: &str,
+        document_path: &str,
+    ) -> Arc<tokio::sync::Semaphore> {
+        // A gate nobody holds or waits on (`strong_count == 1`: only this map) is inert, so
+        // dropping it loses nothing and keeps the map the size of the documents actually in
+        // flight rather than of every document the session ever sized.
+        self.gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+
+        Arc::clone(
+            self.gates
+                .entry(document_key(workspace_root, document_path))
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1))),
+        )
+    }
+}
+
+/// The bound an INTERACTIVE combined file-size build runs under: wait for the document's in-flight
+/// one, then build only if a newer size read has not replaced this one in the meantime.
+///
+/// Only a size read tagged with the analysis generation it belongs to gets one, because only those
+/// can stack: the extension sends one per keystroke. The "Show current file size" command and
+/// `importlens check` send a size read that is the user's whole request — a human cannot stack them,
+/// nothing supersedes them, and making them queue behind a parked build (up to `BUILD_TIMEOUT`, on
+/// top of their own) would turn a slow answer into the client's request timeout, which is no answer
+/// at all.
+struct CombinedBuildBound {
+    gate: Arc<tokio::sync::Semaphore>,
+    superseded: Arc<AtomicBool>,
+}
+
+fn document_key(workspace_root: &str, document_path: &str) -> String {
     format!("{workspace_root}\0{document_path}")
+}
+
+/// Every piece of background work one connection owns that can be ASKED to stop.
+///
+/// Grouped so the teardown cannot forget one of them: there is a single `cancel_all`, and the one
+/// function that ends a connection calls it. What cancellation cannot reach — a build already
+/// inside Rolldown — is what [`TASK_JOIN_TIMEOUT`] is for.
+struct ConnectionLifecycles {
+    /// Cancels the in-flight bulk registry-refresh block, per source manifest.
+    registry_refresh: RegistryRefreshLifecycle,
+    /// Cancels the pending-import builds a superseded document analysis handed off. Separate from
+    /// the SWR lifecycle on purpose — see [`DocumentTaskLifecycle`].
+    document_stream: DocumentTaskLifecycle,
+    /// Cancels the background revalidation a stale size read armed.
+    swr_refresh: DocumentTaskLifecycle,
+    /// Drops the combined file-size build of a size read a newer one has replaced.
+    size_builds: DocumentTaskLifecycle,
+}
+
+impl ConnectionLifecycles {
+    fn new() -> Self {
+        Self {
+            registry_refresh: RegistryRefreshLifecycle::new(),
+            document_stream: DocumentTaskLifecycle::new(),
+            swr_refresh: DocumentTaskLifecycle::new(),
+            size_builds: DocumentTaskLifecycle::new(),
+        }
+    }
+
+    /// Stop every background job this connection owns that CAN be stopped, before the connection
+    /// waits for the ones that cannot.
+    ///
+    /// Cancellation here is cooperative and cheap: a superseded/abandoned build, revalidation or
+    /// registry fetch checks its flag before it starts and skips. What it cannot reach is a build
+    /// already inside Rolldown — hence [`TASK_JOIN_TIMEOUT`] — and the prefetch jobs, which are
+    /// abandoned rather than joined (NFR-004c).
+    ///
+    /// `Drop` does this too, but `Drop` runs when the connection function RETURNS — which is after
+    /// the join it was supposed to shorten, making it useless exactly when it matters most.
+    fn cancel_all(&self, prefetcher: &Prefetcher) {
+        prefetcher.cancel();
+        self.registry_refresh.cancel_all();
+        self.document_stream.cancel_all();
+        self.swr_refresh.cancel_all();
+        self.size_builds.cancel_all();
+    }
 }
 
 #[cfg(test)]
 #[path = "../../tests/unit/ipc_server_swr.rs"]
 mod ipc_server_swr_tests;
+
+#[cfg(test)]
+#[path = "../../tests/unit/ipc_server_teardown.rs"]
+mod ipc_server_teardown_tests;
 
 /// Schedules ONE cache-maintenance pass (byte-budget eviction + compaction +
 /// registry retention + orphan-shard sweep) a short delay after Hello, then
@@ -167,37 +312,89 @@ fn spawn_cache_maintenance(service: std::sync::Arc<ImportLensService>) -> AbortO
     }))
 }
 
-enum ServerOutboundMessage {
-    RefreshRegistryHints(RefreshRegistryHintsResponse),
-    WorkspaceReport(WorkspaceReportResponse),
-    RefreshedResults(RefreshedResultsResponse),
-    Batch(BatchResponse),
-    AnalyzePackageJson(AnalyzePackageJsonResponse),
+/// One frame, already encoded, waiting for the connection's single writer.
+///
+/// **Every** response and every push leaves the daemon through this channel — never through the
+/// connection loop's own body. That is what makes the loop a pure multiplexer: it reads frames,
+/// hands each request to a task, and writes whatever the tasks queue. Nothing an individual
+/// handler does — a combined file-size build that parks for the full `BUILD_TIMEOUT` included —
+/// can stall the delivery of a frame that belongs to somebody else.
+///
+/// It did before. Each request arm used to `.await` its handler inline, so while that await was
+/// pending the loop sat suspended INSIDE the arm rather than in its `select!`, and the outbound
+/// arm never ran. Streamed import results were computed on time and then simply not written to
+/// the socket: the extension sends `AnalyzeDocument` and immediately `FileSizeDocument` for the
+/// same document, and one parked combined build held every push behind it for the whole build
+/// timeout — long enough for the next analysis to blow its deadline and for the client to discard
+/// the entire document, cache hits included. That is the very loss the streaming design exists to
+/// close.
+type OutboundFrame = Bytes;
+
+/// Encode one message and queue it for the connection's writer. Encoding happens on the producing
+/// task, so the writer only ever moves bytes.
+///
+/// A failed encode is logged and dropped rather than killing the connection: it can only come from
+/// a malformed response value, the client's own request timeout already covers a missing reply,
+/// and tearing the connection down would take the warm cache and every other in-flight request
+/// with it.
+fn queue_outbound<T: Serialize>(outbound: &mpsc::UnboundedSender<OutboundFrame>, message: &T) {
+    match payload_bytes(message) {
+        Ok(frame) => {
+            let _ = outbound.send(frame);
+        }
+        Err(error) => logging::log_warn(
+            "ipc",
+            format!("dropping an outbound frame that failed to encode: {error}"),
+        ),
+    }
 }
 
-async fn send_outbound_message<S>(
+/// Run one request's handler off the connection loop and queue its response on the outbound
+/// channel, like any push.
+///
+/// `on_error` builds the request-scoped protocol error when the handler's blocking task panics or
+/// is cancelled — the same contract the arms had when they awaited `response_from_join` inline.
+fn spawn_request<T, R>(
+    active_tasks: &mut Vec<JoinHandle<()>>,
+    outbound: &mpsc::UnboundedSender<OutboundFrame>,
+    request_for_error: R,
+    on_error: impl FnOnce(&R, String) -> T + Send + 'static,
+    handler: impl FnOnce() -> T + Send + 'static,
+) where
+    T: Serialize + Send + 'static,
+    R: Send + Sync + 'static,
+{
+    let outbound = outbound.clone();
+    let handle = tokio::spawn(async move {
+        let response = response_from_join(
+            tokio::task::spawn_blocking(handler),
+            &request_for_error,
+            on_error,
+        )
+        .await;
+        queue_outbound(&outbound, &response);
+    });
+    track_active_task(active_tasks, handle);
+}
+
+/// Write whatever is still queued before the connection closes on *our* terms (a `Shutdown`
+/// message, an idle recycle). A response a handler finished just as the client asked us to stop is
+/// still owed to the client; a client that vanished is not, so the disconnect path does not drain.
+async fn drain_outbound<S>(
     framed: &mut Framed<S, LengthDelimitedCodec>,
-    message: ServerOutboundMessage,
-) -> Result<(), Box<dyn std::error::Error>>
-where
+    outbound_rx: &mut mpsc::UnboundedReceiver<OutboundFrame>,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    match message {
-        ServerOutboundMessage::RefreshRegistryHints(response) => {
-            framed.send(payload_bytes(&response)?).await?
-        }
-        ServerOutboundMessage::WorkspaceReport(response) => {
-            framed.send(payload_bytes(&response)?).await?
-        }
-        ServerOutboundMessage::RefreshedResults(response) => {
-            framed.send(payload_bytes(&response)?).await?
-        }
-        ServerOutboundMessage::Batch(response) => framed.send(payload_bytes(&response)?).await?,
-        ServerOutboundMessage::AnalyzePackageJson(response) => {
-            framed.send(payload_bytes(&response)?).await?
+    while let Ok(frame) = outbound_rx.try_recv() {
+        if let Err(error) = framed.send(frame).await {
+            logging::log_warn(
+                "ipc",
+                format!("failed to flush a queued frame before closing: {error}"),
+            );
+            return;
         }
     }
-    Ok(())
 }
 
 fn workspace_report_protocol_error(
@@ -283,45 +480,60 @@ where
     // has no storage). Aborted on drop when the connection ends.
     let mut _maintenance_task: Option<AbortOnDrop> = None;
     let mut lifecycle = LifecycleState::new();
-    // Cancels the in-flight bulk registry-refresh block when a newer bulk
-    // request supersedes it or when this connection ends (its `Drop`).
-    let mut registry_refresh_lifecycle = RegistryRefreshLifecycle::new();
-    let mut swr_refresh_lifecycle = SwrRefreshLifecycle::new();
+    // Every cancellable background job this connection owns, in one place so the teardown cannot
+    // miss one. Each is superseded per document / per source while the connection runs, and all of
+    // them are cancelled when it ends.
+    let mut lifecycles = ConnectionLifecycles::new();
+    // Bounds the combined file-size build: one per document at a time (the gate), and a queued one
+    // a newer size read has replaced never runs at all (the `size_builds` lifecycle flag).
+    let mut size_build_gate = DocumentBuildGate::new();
     let lifecycle_storage_path = storage_path;
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ServerOutboundMessage>();
-    let mut active_streams: Vec<JoinHandle<()>> = Vec::new();
-
-    macro_rules! send_message {
-        ($message:expr) => {
-            let bytes = payload_bytes(&$message)?;
-            if let Err(error) = framed.send(bytes).await {
-                prefetcher.cancel();
-                wait_for_active_streams(&mut active_streams).await;
-                return Err(Box::new(error));
-            }
-        };
-    }
+    // Unbounded on purpose, and bounded in practice. The loop is the socket's only writer, so a
+    // client that stops reading backs the write up in the outbound arm — and while the loop is
+    // suspended there it is not reading frames either, so no NEW request can be admitted. What can
+    // still accumulate is the work already in flight: one response per in-flight request, plus one
+    // push per still-building import of the documents already being analysed. That is bounded by
+    // the requests the client itself issued, not by anything the daemon does on its own. A bounded
+    // channel would instead make a slow client able to stall a *producer* — the very coupling this
+    // channel exists to remove.
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<OutboundFrame>();
+    // Every task this connection spawns: request handlers, streamed-import builds, SWR
+    // revalidations. Shutdown and idle-recycle join them, so nothing is still writing to the cache
+    // after the flush.
+    let mut active_tasks: Vec<JoinHandle<()>> = Vec::new();
 
     loop {
         let payload = tokio::select! {
             outbound = outbound_rx.recv() => {
-                if let Some(message) = outbound {
-                    let outbound_result = send_outbound_message(&mut framed, message)
-                        .await
-                        .map_err(|error| error.to_string());
-                    if let Err(message) = outbound_result {
-                        prefetcher.cancel();
-                        wait_for_active_streams(&mut active_streams).await;
-                        return Err(Box::new(std::io::Error::other(message)));
-                    }
+                // The loop itself holds a sender, so `recv` cannot return None here.
+                if let Some(frame) = outbound
+                    && let Err(error) = framed.send(frame).await
+                {
+                    // The socket failed under us. The client is not owed the rest of its queue, but
+                    // the cache is owed everything this session measured.
+                    close_connection(
+                        &service,
+                        &prefetcher,
+                        &lifecycles,
+                        &mut active_tasks,
+                        &mut _maintenance_task,
+                    )
+                    .await;
+                    return Err(Box::new(error));
                 }
                 continue;
             }
             payload = framed.next() => match payload.transpose() {
                 Ok(payload) => payload,
                 Err(error) => {
-                    prefetcher.cancel();
-                    wait_for_active_streams(&mut active_streams).await;
+                    close_connection(
+                        &service,
+                        &prefetcher,
+                        &lifecycles,
+                        &mut active_tasks,
+                        &mut _maintenance_task,
+                    )
+                    .await;
                     return Err(Box::new(error));
                 }
             },
@@ -333,18 +545,29 @@ where
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
-                    &mut active_streams,
+                    &mut active_tasks,
+                    &mut _maintenance_task,
                 )
                 .await
                 {
+                    drain_outbound(&mut framed, &mut outbound_rx).await;
                     return Ok(());
                 }
                 continue;
             }
         };
+        // EOF: the client is gone — it closed the pipe, or the extension host crashed without ever
+        // sending `shutdown`. There is nobody left to answer, and every import this session
+        // measured is still owed to the cache.
         let Some(payload) = payload else {
-            prefetcher.cancel();
-            wait_for_active_streams(&mut active_streams).await;
+            close_connection(
+                &service,
+                &prefetcher,
+                &lifecycles,
+                &mut active_tasks,
+                &mut _maintenance_task,
+            )
+            .await;
             break;
         };
 
@@ -461,10 +684,12 @@ where
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
-                    &mut active_streams,
+                    &mut active_tasks,
+                    &mut _maintenance_task,
                 )
                 .await
                 {
+                    drain_outbound(&mut framed, &mut outbound_rx).await;
                     return Ok(());
                 }
             }
@@ -480,28 +705,24 @@ where
                             let _ = partial_tx.send(partial);
                         })
                     });
-                    track_streaming_forwarder(
-                        &mut active_streams,
+                    track_active_task(
+                        &mut active_tasks,
                         spawn_streaming_forwarder(
                             &outbound_tx,
                             partial_rx,
                             response_handle,
                             request_for_error,
                             protocol_error_batch_response,
-                            ServerOutboundMessage::Batch,
                         ),
                     );
                 } else {
-                    let request_for_error = request.clone();
-                    let response_handle =
-                        tokio::task::spawn_blocking(move || svc.handle_batch(request));
-                    let response = response_from_join(
-                        response_handle,
-                        &request_for_error,
+                    spawn_request(
+                        &mut active_tasks,
+                        &outbound_tx,
+                        request.clone(),
                         protocol_error_batch_response,
-                    )
-                    .await;
-                    send_message!(response);
+                        move || svc.handle_batch(request),
+                    );
                 }
 
                 if recycle_if_needed(
@@ -509,45 +730,46 @@ where
                     lifecycle_storage_path.as_deref(),
                     &prefetcher,
                     &service,
-                    &mut active_streams,
+                    &mut active_tasks,
+                    &mut _maintenance_task,
                 )
                 .await
                 {
+                    drain_outbound(&mut framed, &mut outbound_rx).await;
                     return Ok(());
                 }
             }
             ClientMessage::Batch(request) => {
-                let response = protocol_error_batch_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_batch_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::AnalyzeDocument(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
-                let svc = std::sync::Arc::clone(&service);
-                let request_for_error = request.clone();
-                let response_handle = tokio::task::spawn_blocking(move || {
-                    svc.handle_analyze_document(
-                        request,
-                        &crate::document::IgnoreRuleResolver::default(),
-                    )
-                });
-                let response = response_from_join(
-                    response_handle,
-                    &request_for_error,
-                    protocol_error_analyze_document_response,
-                )
-                .await;
-                send_message!(response);
+                // A newer analysis of the same document supersedes this one: its still-queued
+                // builds stop before they start. Keyed per document, like the SWR lifecycle, so
+                // analyzing one file never cancels another's pending imports.
+                let superseded = lifecycles
+                    .document_stream
+                    .start_document(&request.workspace_root, &request.active_document_path);
+                track_active_task(
+                    &mut active_tasks,
+                    spawn_document_analysis(&service, &outbound_tx, request, superseded),
+                );
             }
             ClientMessage::AnalyzeDocument(request) => {
-                let response = protocol_error_analyze_document_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_analyze_document_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::AnalyzePackageJson(request) if hello_received => {
                 prefetcher.cancel();
@@ -561,59 +783,61 @@ where
                             let _ = partial_tx.send(partial);
                         })
                     });
-                    track_streaming_forwarder(
-                        &mut active_streams,
+                    track_active_task(
+                        &mut active_tasks,
                         spawn_streaming_forwarder(
                             &outbound_tx,
                             partial_rx,
                             response_handle,
                             request_for_error,
                             protocol_error_analyze_package_json_response,
-                            ServerOutboundMessage::AnalyzePackageJson,
                         ),
                     );
                 } else {
-                    let request_for_error = request.clone();
-                    let response_handle = tokio::task::spawn_blocking(move || {
-                        svc.handle_analyze_package_json(request)
-                    });
-                    let response = response_from_join(
-                        response_handle,
-                        &request_for_error,
+                    spawn_request(
+                        &mut active_tasks,
+                        &outbound_tx,
+                        request.clone(),
                         protocol_error_analyze_package_json_response,
-                    )
-                    .await;
-                    send_message!(response);
+                        move || svc.handle_analyze_package_json(request),
+                    );
                 }
             }
             ClientMessage::AnalyzePackageJson(request) => {
-                let response = protocol_error_analyze_package_json_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_analyze_package_json_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::AnalyzeSpecifiers(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
-                let request_for_error = request.clone();
-                let response_handle =
-                    tokio::task::spawn_blocking(move || svc.handle_analyze_specifiers(request));
-                let response = response_from_join(
-                    response_handle,
-                    &request_for_error,
+                // NOT streamed, deliberately (SRS FR-004b): both callers are one-shot commands
+                // with no per-import rows for a push to merge into, and a comparison assembled
+                // from half-measured imports is worse than "comparison failed". It therefore
+                // still waits for every engine miss it names — the one request in the daemon that
+                // does — and its total time is bounded only by `BUILD_TIMEOUT` per build. What it
+                // no longer does is hold the connection: it runs as a task like everything else.
+                spawn_request(
+                    &mut active_tasks,
+                    &outbound_tx,
+                    request.clone(),
                     protocol_error_analyze_specifiers_response,
-                )
-                .await;
-                send_message!(response);
+                    move || svc.handle_analyze_specifiers(request),
+                );
             }
             ClientMessage::AnalyzeSpecifiers(request) => {
-                let response = protocol_error_analyze_specifiers_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_analyze_specifiers_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::CacheInvalidate(message) if hello_received => {
                 prefetcher.cancel();
@@ -624,62 +848,93 @@ where
                 service.invalidate_all();
             }
             ClientMessage::CacheStatus(request) if hello_received => {
-                let response = service.cache_status(request);
-                send_message!(response);
+                let svc = std::sync::Arc::clone(&service);
+                spawn_request(
+                    &mut active_tasks,
+                    &outbound_tx,
+                    request.clone(),
+                    protocol_error_cache_status_response,
+                    move || svc.cache_status(request),
+                );
             }
             ClientMessage::CacheStatus(request) => {
-                let response = protocol_error_cache_status_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_cache_status_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::CacheList(request) if hello_received => {
-                let response = service.list_cache(request);
-                send_message!(response);
+                let svc = std::sync::Arc::clone(&service);
+                spawn_request(
+                    &mut active_tasks,
+                    &outbound_tx,
+                    request.clone(),
+                    protocol_error_cache_list_response,
+                    move || svc.list_cache(request),
+                );
             }
             ClientMessage::CacheList(request) => {
-                let response = protocol_error_cache_list_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_cache_list_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::CacheRemove(request) if hello_received => {
                 prefetcher.cancel();
-                let remove_legacy_cache = matches!(request.scope, CacheRemoveScope::All);
-                let mut response = service.remove_cache(request);
-                if remove_legacy_cache
-                    && let Some(storage_path) = lifecycle_storage_path.as_deref()
-                    && let Some(result) = remove_legacy_central_cache(storage_path)
-                {
-                    log_legacy_cache_removal(&result);
-                    if result.removed {
-                        response.removed.push(result);
-                    } else {
-                        response.failed.push(result);
-                    }
-                }
-                send_message!(response);
+                let svc = std::sync::Arc::clone(&service);
+                let storage_path = lifecycle_storage_path.clone();
+                spawn_request(
+                    &mut active_tasks,
+                    &outbound_tx,
+                    request.clone(),
+                    protocol_error_cache_remove_response,
+                    move || {
+                        let remove_legacy_cache = matches!(request.scope, CacheRemoveScope::All);
+                        let mut response = svc.remove_cache(request);
+                        if remove_legacy_cache
+                            && let Some(storage_path) = storage_path.as_deref()
+                            && let Some(result) = remove_legacy_central_cache(storage_path)
+                        {
+                            log_legacy_cache_removal(&result);
+                            if result.removed {
+                                response.removed.push(result);
+                            } else {
+                                response.failed.push(result);
+                            }
+                        }
+                        response
+                    },
+                );
             }
             ClientMessage::CacheRemove(request) => {
-                let response = protocol_error_cache_remove_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_cache_remove_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::RefreshRegistryHints(request) if hello_received => {
                 if !is_supported_protocol_version(request.version) {
                     let message = format!("unsupported protocol version {}", request.version);
-                    send_message!(RefreshRegistryHintsResponse {
-                        version: request.version.min(PROTOCOL_VERSION),
-                        request_id: request.request_id,
-                        results: Vec::new(),
-                        indexes: None,
-                        error: Some(message.clone()),
-                        diagnostics: vec![ImportDiagnostic::for_stage("protocol", &message)],
-                    });
+                    queue_outbound(
+                        &outbound_tx,
+                        &RefreshRegistryHintsResponse {
+                            version: request.version.min(PROTOCOL_VERSION),
+                            request_id: request.request_id,
+                            results: Vec::new(),
+                            indexes: None,
+                            error: Some(message.clone()),
+                            diagnostics: vec![ImportDiagnostic::for_stage("protocol", &message)],
+                        },
+                    );
                     continue;
                 }
 
@@ -699,7 +954,7 @@ where
                 // Absent source (older client) → all share the empty-key bucket,
                 // preserving the pre-D10 connection-global supersede for them.
                 let source = request.source.clone().unwrap_or_default();
-                let cancelled = registry_refresh_lifecycle.start_new_block(&source);
+                let cancelled = lifecycles.registry_refresh.start_new_block(&source);
                 let final_targets = targets.clone();
                 let target_count = targets.len();
 
@@ -718,7 +973,10 @@ where
                 );
                 let flush_service = std::sync::Arc::clone(&service);
 
-                tokio::spawn(async move {
+                // Tracked like every other task (FR-004c): it owns the client's response AND the
+                // registry snapshot flush, so a shutdown that did not join it could exit with the
+                // fetched metadata unwritten and the response unsent.
+                let forwarder = tokio::spawn(async move {
                     let mut ordered_results = vec![None; target_count];
                     while let Some((index, result)) = partial_rx.recv().await {
                         let mut indexes = vec![index];
@@ -730,8 +988,9 @@ where
                         for (index, result) in indexes.iter().zip(results.iter()) {
                             ordered_results[*index] = Some(result.clone());
                         }
-                        let _ = outbound.send(ServerOutboundMessage::RefreshRegistryHints(
-                            RefreshRegistryHintsResponse {
+                        queue_outbound(
+                            &outbound,
+                            &RefreshRegistryHintsResponse {
                                 version,
                                 request_id,
                                 results,
@@ -739,7 +998,7 @@ where
                                 error: None,
                                 diagnostics: Vec::new(),
                             },
-                        ));
+                        );
                     }
                     // All refresh workers have finished or been skipped; persist
                     // any fetched metadata in one snapshot write.
@@ -760,8 +1019,9 @@ where
                         })
                         .collect();
 
-                    let _ = outbound.send(ServerOutboundMessage::RefreshRegistryHints(
-                        RefreshRegistryHintsResponse {
+                    queue_outbound(
+                        &outbound,
+                        &RefreshRegistryHintsResponse {
                             version,
                             request_id,
                             results,
@@ -769,20 +1029,24 @@ where
                             error: None,
                             diagnostics: Vec::new(),
                         },
-                    ));
+                    );
                 });
+                track_active_task(&mut active_tasks, forwarder);
                 continue;
             }
             ClientMessage::RefreshRegistryHints(request) => {
                 let message = "hello message not received".to_owned();
-                send_message!(RefreshRegistryHintsResponse {
-                    version: request.version.min(PROTOCOL_VERSION),
-                    request_id: request.request_id,
-                    results: Vec::new(),
-                    indexes: None,
-                    error: Some(message.clone()),
-                    diagnostics: vec![ImportDiagnostic::for_stage("protocol", &message)],
-                });
+                queue_outbound(
+                    &outbound_tx,
+                    &RefreshRegistryHintsResponse {
+                        version: request.version.min(PROTOCOL_VERSION),
+                        request_id: request.request_id,
+                        results: Vec::new(),
+                        indexes: None,
+                        error: Some(message.clone()),
+                        diagnostics: vec![ImportDiagnostic::for_stage("protocol", &message)],
+                    },
+                );
             }
             ClientMessage::WorkspaceReport(request) if hello_received => {
                 prefetcher.cancel();
@@ -791,22 +1055,24 @@ where
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 service.spawn_workspace_report(request, response_tx);
                 let outbound = outbound_tx.clone();
-                tokio::spawn(async move {
+                // Tracked like every other task (FR-004c).
+                let forwarder = tokio::spawn(async move {
                     let response = response_rx.await.unwrap_or_else(|_| {
                         workspace_report_protocol_error(
                             &request_for_error,
                             "workspace report worker stopped before sending a response",
                         )
                     });
-                    let _ = outbound.send(ServerOutboundMessage::WorkspaceReport(response));
+                    queue_outbound(&outbound, &response);
                 });
+                track_active_task(&mut active_tasks, forwarder);
                 continue;
             }
             ClientMessage::WorkspaceReport(request) => {
-                send_message!(workspace_report_protocol_error(
-                    &request,
-                    "hello message not received"
-                ));
+                queue_outbound(
+                    &outbound_tx,
+                    &workspace_report_protocol_error(&request, "hello message not received"),
+                );
             }
             ClientMessage::PrewarmPackageJson(message) if hello_received => {
                 prefetcher.prewarm_package_json(
@@ -816,7 +1082,12 @@ where
                 );
             }
             ClientMessage::NodeModulesChanged(message) if hello_received => {
-                if service.invalidate_package_json_paths(&message.package_json_paths) {
+                // Both halves always run: `|` and not `||`, because a batch can carry an install AND
+                // a tsconfig edit, and short-circuiting would drop the second.
+                let invalidated = service
+                    .invalidate_package_json_paths(&message.package_json_paths)
+                    | service.invalidate_workspace_config_paths(&message.tsconfig_paths);
+                if invalidated {
                     prefetcher.cancel();
                 }
             }
@@ -824,145 +1095,114 @@ where
                 prefetcher.cancel();
                 lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
-                let request_for_error = request.clone();
-                let response_handle =
-                    tokio::task::spawn_blocking(move || svc.enumerate_exports(request));
-                let response = response_from_join(
-                    response_handle,
-                    &request_for_error,
+                spawn_request(
+                    &mut active_tasks,
+                    &outbound_tx,
+                    request.clone(),
                     protocol_error_exports_response,
-                )
-                .await;
-                send_message!(response);
+                    move || svc.enumerate_exports(request),
+                );
             }
             ClientMessage::EnumerateExports(request) => {
-                let response = protocol_error_exports_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_exports_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::FileSize(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
-                let request_for_error = request.clone();
-                let response_handle =
-                    tokio::task::spawn_blocking(move || svc.handle_file_size(request));
-                let response = response_from_join(
-                    response_handle,
-                    &request_for_error,
+                spawn_request(
+                    &mut active_tasks,
+                    &outbound_tx,
+                    request.clone(),
                     protocol_error_file_size_response,
-                )
-                .await;
-                send_message!(response);
+                    move || svc.handle_file_size(request),
+                );
             }
             ClientMessage::FileSize(request) => {
-                let response = protocol_error_file_size_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_file_size_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::FileSizeDocument(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
-                let swr_cancelled = swr_refresh_lifecycle
+                let swr_cancelled = lifecycles
+                    .swr_refresh
                     .start_document(&request.workspace_root, &request.active_document_path);
-                let svc = std::sync::Arc::clone(&service);
-                let request_for_error = request.clone();
-                let response_handle =
-                    tokio::task::spawn_blocking(move || svc.handle_file_size_document(request));
-                let response = response_from_join(
-                    response_handle,
-                    &request_for_error,
-                    protocol_error_file_size_document_response,
-                )
-                .await;
-                // SWR: any served size flagged Stale was served from a changed cache
-                // entry. Recompute ONLY those imports fresh in the background (a fresh
-                // sibling must not be re-analyzed) and push the refreshed results to the
-                // client (the request/response has already closed, so delivery rides the
-                // outbound channel like registry hints).
-                let stale_specifiers = response
-                    .imports
-                    .iter()
-                    .filter(|result| matches!(result.freshness.kind, FreshnessKind::Stale))
-                    .map(|result| result.specifier.clone())
-                    .collect::<std::collections::HashSet<_>>();
-                send_message!(response);
-                if !stale_specifiers.is_empty() {
-                    let svc = std::sync::Arc::clone(&service);
-                    let outbound = outbound_tx.clone();
-                    // F3-B pre-recompute cancellation is scoped to this document:
-                    // a newer size read for the same document supersedes the push,
-                    // while unrelated prefetch/file-size work must not starve SWR.
-                    tokio::task::spawn_blocking(move || {
-                        if let Some((workspace_root, document_path, results, identities)) = svc
-                            .revalidate_document_sizes(
-                                &request_for_error,
-                                &stale_specifiers,
-                                || !swr_cancelled.load(Ordering::Acquire),
-                            )
-                        {
-                            let _ = outbound.send(ServerOutboundMessage::RefreshedResults(
-                                RefreshedResultsResponse {
-                                    message_type: "refreshed_results".to_owned(),
-                                    version: PROTOCOL_VERSION,
-                                    workspace_root,
-                                    document_path,
-                                    results,
-                                    identities,
-                                    // Echo the generation so the client can drop this push if a
-                                    // newer analysis has since superseded the one it was computed for.
-                                    generation: request_for_error.analysis_generation,
-                                },
-                            ));
-                        }
-                    });
-                }
+                // Only an interactive size read is bounded, and only those need to be: see
+                // `CombinedBuildBound`.
+                let combined_build = request.analysis_generation.map(|_| CombinedBuildBound {
+                    gate: size_build_gate
+                        .gate_for(&request.workspace_root, &request.active_document_path),
+                    superseded: lifecycles
+                        .size_builds
+                        .start_document(&request.workspace_root, &request.active_document_path),
+                });
+                track_active_task(
+                    &mut active_tasks,
+                    spawn_file_size_document(
+                        &service,
+                        &outbound_tx,
+                        request,
+                        swr_cancelled,
+                        combined_build,
+                    ),
+                );
             }
             ClientMessage::FileSizeDocument(request) => {
-                let response = protocol_error_file_size_document_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_file_size_document_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::CompleteImportMembers(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
                 let svc = std::sync::Arc::clone(&service);
-                let request_for_error = request.clone();
-                let response_handle =
-                    tokio::task::spawn_blocking(move || svc.complete_import_members(request));
-                let response = response_from_join(
-                    response_handle,
-                    &request_for_error,
+                spawn_request(
+                    &mut active_tasks,
+                    &outbound_tx,
+                    request.clone(),
                     protocol_error_complete_import_members_response,
-                )
-                .await;
-                send_message!(response);
+                    move || svc.complete_import_members(request),
+                );
             }
             ClientMessage::CompleteImportMembers(request) => {
-                let response = protocol_error_complete_import_members_response(
-                    &request,
-                    "hello message not received".to_owned(),
+                queue_outbound(
+                    &outbound_tx,
+                    &protocol_error_complete_import_members_response(
+                        &request,
+                        "hello message not received".to_owned(),
+                    ),
                 );
-                send_message!(response);
             }
             ClientMessage::Shutdown(_) => {
-                prefetcher.cancel();
-                wait_for_active_streams(&mut active_streams).await;
-                // Drain pending disk inserts (not just recency touches) so a
-                // clean shutdown never relies on Drop running before the process
-                // exits, mirroring the recycle path.
-                if let Err(error) = service.flush_cache() {
-                    logging::log_warn(
-                        "lifecycle",
-                        format!("failed to flush cache on shutdown: {error}"),
-                    );
-                }
+                close_connection(
+                    &service,
+                    &prefetcher,
+                    &lifecycles,
+                    &mut active_tasks,
+                    &mut _maintenance_task,
+                )
+                .await;
+                // Anything those tasks queued on their way out — a response, a last streamed
+                // import — is still owed to a client that asked us to stop on its own terms, and
+                // the loop is no longer in the select that would have written it. A client that
+                // vanished is owed nothing, so the paths above do not drain.
+                drain_outbound(&mut framed, &mut outbound_rx).await;
                 return Ok(());
             }
             ClientMessage::PrewarmPackageJson(_)
@@ -975,50 +1215,308 @@ where
     Ok(())
 }
 
-/// Awaits an analysis worker's join handle and, when the worker panics or is
-/// cancelled, produces the request-scoped protocol error via `on_error`. One
-/// generic replaces the per-request join wrappers each message type used to
-/// carry verbatim.
-fn track_streaming_forwarder(active_streams: &mut Vec<JoinHandle<()>>, handle: JoinHandle<()>) {
-    active_streams.retain(|active| !active.is_finished());
-    active_streams.push(handle);
+/// Registers a task the connection owns. Finished handles are pruned on each push, so a long-lived
+/// connection does not accumulate them.
+fn track_active_task(active_tasks: &mut Vec<JoinHandle<()>>, handle: JoinHandle<()>) {
+    reap_finished_tasks(active_tasks);
+    active_tasks.push(handle);
 }
 
-async fn wait_for_active_streams(active_streams: &mut Vec<JoinHandle<()>>) {
-    while let Some(handle) = active_streams.pop() {
-        if let Err(error) = handle.await {
-            logging::log_warn("ipc", format!("streaming forwarder failed: {error}"));
+/// Drop the handles of tasks that have already finished.
+///
+/// It is not only housekeeping: `recycle_if_needed` reads `active_tasks.is_empty()` as "this
+/// connection has nothing in flight", and a finished handle is indistinguishable from a running one
+/// to `is_empty`. Since every request now runs as a task, a connection that has served ANY request
+/// carries handles for ever, so without this the first recycle check always found work, deferred,
+/// and the recycle waited a further 60s tick for no reason.
+fn reap_finished_tasks(active_tasks: &mut Vec<JoinHandle<()>>) {
+    active_tasks.retain(|active| !active.is_finished());
+}
+
+/// Join the tasks this connection spawned, giving up after [`TASK_JOIN_TIMEOUT`]. Returns whether
+/// every one of them finished; the handles that did not are left in `active_tasks`.
+///
+/// Callers must cancel what they can BEFORE calling this (see `cancel_background_work`) — the wait
+/// is for work that cannot be cancelled, not a substitute for cancelling.
+async fn wait_for_active_tasks(active_tasks: &mut Vec<JoinHandle<()>>) -> bool {
+    let deadline = tokio::time::Instant::now() + TASK_JOIN_TIMEOUT;
+    let mut unfinished = Vec::new();
+
+    for mut handle in std::mem::take(active_tasks) {
+        match tokio::time::timeout_at(deadline, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                logging::log_warn("ipc", format!("connection task failed: {error}"));
+            }
+            // Past the deadline. `timeout_at` returns immediately for every remaining handle, so
+            // the whole loop costs the bound once, not once per task.
+            Err(_) => unfinished.push(handle),
         }
+    }
+
+    if !unfinished.is_empty() {
+        logging::log_warn(
+            "ipc",
+            format!(
+                "{} connection task(s) did not finish within {}s; continuing without them",
+                unfinished.len(),
+                TASK_JOIN_TIMEOUT.as_secs()
+            ),
+        );
+    }
+
+    let finished = unfinished.is_empty();
+    *active_tasks = unfinished;
+    finished
+}
+
+/// The ONE way a connection stops serving, whichever end it comes to: the client's `shutdown`, the
+/// client vanishing (EOF), or the socket failing.
+///
+/// Cancel → join under a deadline → **flush the cache unconditionally** (SRS FR-004c). It is one
+/// function because it was three, and only one of them flushed: an extension host that crashed
+/// (no `shutdown` — the daemon just reads EOF) took every import that session had measured with it.
+/// The cache does not care WHY the connection ended.
+///
+/// Unconditional, even when a task outlived the join: whatever that task would have added is worth
+/// one rebuild, and everything already computed is worth the session. And it does not rely on `Drop`
+/// running before the process exits — `Drop` reaches only the entries already queued for the batched
+/// commit, never a dirty one whose insert failed, nor the recency a session's cache hits earned.
+async fn close_connection(
+    service: &ImportLensService,
+    prefetcher: &Prefetcher,
+    lifecycles: &ConnectionLifecycles,
+    active_tasks: &mut Vec<JoinHandle<()>>,
+    maintenance_task: &mut Option<AbortOnDrop>,
+) {
+    // Abort the pending maintenance pass first: it is scheduled, not started, and a pass that
+    // begins while we are flushing is compacting the shards the flush is writing to.
+    *maintenance_task = None;
+    lifecycles.cancel_all(prefetcher);
+    // Bounded: a build already inside Rolldown cannot be cancelled and runs to `BUILD_TIMEOUT`,
+    // which is LONGER than the extension's force-kill grace — so joining it without a bound is how
+    // a graceful shutdown loses its flush entirely.
+    wait_for_active_tasks(active_tasks).await;
+
+    if let Err(error) = service.flush_cache() {
+        logging::log_warn(
+            "lifecycle",
+            format!("failed to flush cache while closing the connection: {error}"),
+        );
     }
 }
 
+/// Answer a document analysis from the cache, then build its misses and push each one as it lands.
+///
+/// Both halves run in ONE task, off the connection loop, which is what preserves the only ordering
+/// this design depends on: the response goes out first — carrying every import the cache could
+/// answer and a `loading` placeholder for the rest — and a pushed result can only update an import
+/// state that response created. The outbound channel is FIFO per sender, so nothing can reorder
+/// them.
+///
+/// Tracked by the caller, not detached: a client that disconnects mid-flight must not leave a build
+/// still writing to the cache after the shutdown flush.
+fn spawn_document_analysis(
+    service: &std::sync::Arc<ImportLensService>,
+    outbound_tx: &mpsc::UnboundedSender<OutboundFrame>,
+    request: AnalyzeDocumentRequest,
+    superseded: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let service = std::sync::Arc::clone(service);
+    let outbound = outbound_tx.clone();
+
+    tokio::spawn(async move {
+        let request_for_error = request.clone();
+        let analysis_service = std::sync::Arc::clone(&service);
+        let analysis_handle = tokio::task::spawn_blocking(move || {
+            analysis_service.handle_analyze_document_streaming(
+                request,
+                &crate::document::IgnoreRuleResolver::default(),
+            )
+        });
+        let analysis =
+            response_from_join(analysis_handle, &request_for_error, |request, message| {
+                StreamedDocumentAnalysis::settled(protocol_error_analyze_document_response(
+                    request, message,
+                ))
+            })
+            .await;
+
+        queue_outbound(&outbound, &analysis.response);
+
+        if analysis.pending.is_empty() {
+            return;
+        }
+
+        let request = request_for_error;
+        let build = tokio::task::spawn_blocking(move || {
+            let context = AnalysisContext {
+                workspace_root: PathBuf::from(&request.workspace_root),
+                active_document_path: PathBuf::from(&request.active_document_path),
+            };
+            service.complete_pending_imports(
+                &context,
+                analysis.measured,
+                analysis.pending,
+                || !superseded.load(Ordering::Acquire),
+                |results, identities| {
+                    queue_outbound(
+                        &outbound,
+                        &RefreshedResultsResponse {
+                            message_type: "refreshed_results".to_owned(),
+                            version: PROTOCOL_VERSION,
+                            workspace_root: request.workspace_root.clone(),
+                            document_path: request.active_document_path.clone(),
+                            results,
+                            identities,
+                            // The analysis request id IS the client's freshness generation for this
+                            // document, so a push computed for a document the user has since edited
+                            // is dropped by the same guard that drops a superseded SWR refresh.
+                            generation: Some(request.request_id),
+                        },
+                    );
+                },
+            );
+        });
+        if let Err(error) = build.await {
+            logging::log_warn("ipc", format!("streamed import build failed: {error}"));
+        }
+    })
+}
+
+/// Size a document, then — if anything was served stale — revalidate it in the background and push
+/// the fresh results. One task, off the connection loop: the combined build this runs is the one
+/// that used to hold the loop hostage while every streamed import queued up behind it.
+///
+/// Off the loop, but not unbounded — for an interactive read. `combined_build` admits ONE combined
+/// build per document at a time and drops the build of a size read a newer keystroke has already
+/// replaced. Without it, every keystroke in a document with imports stacked another combined build
+/// against the two-permit engine pool, since the day the handlers started running concurrently. See
+/// [`CombinedBuildBound`].
+fn spawn_file_size_document(
+    service: &std::sync::Arc<ImportLensService>,
+    outbound_tx: &mpsc::UnboundedSender<OutboundFrame>,
+    request: crate::ipc::protocol::FileSizeDocumentRequest,
+    swr_cancelled: Arc<AtomicBool>,
+    combined_build: Option<CombinedBuildBound>,
+) -> JoinHandle<()> {
+    let service = std::sync::Arc::clone(service);
+    let outbound = outbound_tx.clone();
+
+    tokio::spawn(async move {
+        let request_for_error = request.clone();
+        // Waiting HERE, and not in the engine, is the point: an engine permit is daemon-wide, so a
+        // combined build queued for one is not holding anything back — right up until it gets one,
+        // after which it holds it for as long as its build takes.
+        let mut permit = None;
+
+        if let Some(bound) = combined_build {
+            let Ok(acquired) = Arc::clone(&bound.gate).acquire_owned().await else {
+                // The gate is never closed; unreachable in practice.
+                return;
+            };
+            permit = Some(acquired);
+
+            if bound.superseded.load(Ordering::Acquire) {
+                // The user typed past this size read while it waited. Building now would measure a
+                // document state nobody is looking at, so it is answered with an error instead —
+                // which the client drops on the same generation guard that drops a superseded push
+                // (FR-004a), and which costs it nothing: the newer read behind us in the queue is
+                // about to produce the number it will actually show.
+                queue_outbound(
+                    &outbound,
+                    &protocol_error_file_size_document_response(
+                        &request_for_error,
+                        "superseded by a newer size read for this document".to_owned(),
+                    ),
+                );
+                return;
+            }
+        }
+
+        let size_service = std::sync::Arc::clone(&service);
+        // Streaming: the file's own totals still come from a real combined build, but the
+        // per-import states are served from the cache and the misses come back `loading`.
+        // The `AnalyzeDocument` the extension sent first is already building them.
+        // A force-fresh request (CI) is served complete by this same call.
+        let response_handle = tokio::task::spawn_blocking(move || {
+            size_service.handle_file_size_document_streaming(request)
+        });
+        let response = response_from_join(
+            response_handle,
+            &request_for_error,
+            protocol_error_file_size_document_response,
+        )
+        .await;
+        // SWR: any served size flagged Stale was served from a changed cache entry. Recompute ONLY
+        // those imports fresh in the background (a fresh sibling must not be re-analyzed) and push
+        // the refreshed results to the client.
+        let stale_specifiers = response
+            .imports
+            .iter()
+            .filter(|result| matches!(result.freshness.kind, FreshnessKind::Stale))
+            .map(|result| result.specifier.clone())
+            .collect::<std::collections::HashSet<_>>();
+        queue_outbound(&outbound, &response);
+        // The combined build is done; the next size read for this document may start. What follows
+        // is per-import revalidation, which has supersession and single-flight of its own.
+        drop(permit);
+
+        if stale_specifiers.is_empty() {
+            return;
+        }
+
+        // F3-B pre-recompute cancellation is scoped to this document: a newer size read for the
+        // same document supersedes the push, while unrelated prefetch/file-size work must not
+        // starve SWR.
+        let revalidation = tokio::task::spawn_blocking(move || {
+            if let Some((workspace_root, document_path, results, identities)) = service
+                .revalidate_document_sizes(&request_for_error, &stale_specifiers, || {
+                    !swr_cancelled.load(Ordering::Acquire)
+                })
+            {
+                queue_outbound(
+                    &outbound,
+                    &RefreshedResultsResponse {
+                        message_type: "refreshed_results".to_owned(),
+                        version: PROTOCOL_VERSION,
+                        workspace_root,
+                        document_path,
+                        results,
+                        identities,
+                        // Echo the generation so the client can drop this push if a newer analysis
+                        // has since superseded the one it was computed for.
+                        generation: request_for_error.analysis_generation,
+                    },
+                );
+            }
+        });
+        if let Err(error) = revalidation.await {
+            logging::log_warn("ipc", format!("size revalidation failed: {error}"));
+        }
+    })
+}
+
 fn spawn_streaming_forwarder<T, R>(
-    outbound_tx: &mpsc::UnboundedSender<ServerOutboundMessage>,
+    outbound_tx: &mpsc::UnboundedSender<OutboundFrame>,
     mut partial_rx: mpsc::UnboundedReceiver<T>,
     response_handle: JoinHandle<T>,
     request_for_error: R,
     on_error: impl FnOnce(&R, String) -> T + Send + 'static,
-    into_outbound: impl Fn(T) -> ServerOutboundMessage + Send + 'static,
 ) -> JoinHandle<()>
 where
-    T: Send + 'static,
+    T: Serialize + Send + 'static,
     R: Send + Sync + 'static,
 {
     let outbound = outbound_tx.clone();
     tokio::spawn(async move {
-        let mut outbound_open = true;
         while let Some(partial) = partial_rx.recv().await {
-            if outbound_open && outbound.send(into_outbound(partial)).is_err() {
-                outbound_open = false;
-                break;
-            }
+            queue_outbound(&outbound, &partial);
         }
 
         let final_response =
             response_from_join(response_handle, &request_for_error, on_error).await;
-        if outbound_open {
-            let _ = outbound.send(into_outbound(final_response));
-        }
+        queue_outbound(&outbound, &final_response);
     })
 }
 
@@ -1035,19 +1533,6 @@ pub async fn response_from_join<T, R>(
 
 fn join_error_message(error: tokio::task::JoinError) -> String {
     format!("analysis worker failed: {error}")
-}
-
-fn protocol_error_analyze_document_response(
-    request: &AnalyzeDocumentRequest,
-    message: String,
-) -> AnalyzeDocumentResponse {
-    AnalyzeDocumentResponse {
-        version: request.version.min(PROTOCOL_VERSION),
-        request_id: request.request_id,
-        imports: Vec::new(),
-        error: Some(message.clone()),
-        diagnostics: protocol_diagnostics(message),
-    }
 }
 
 fn protocol_error_analyze_package_json_response(
@@ -1073,25 +1558,6 @@ fn protocol_error_analyze_specifiers_response(
         version: request.version.min(PROTOCOL_VERSION),
         request_id: request.request_id,
         imports: Vec::new(),
-        error: Some(message.clone()),
-        diagnostics: protocol_diagnostics(message),
-    }
-}
-
-fn protocol_error_file_size_document_response(
-    request: &FileSizeDocumentRequest,
-    message: String,
-) -> FileSizeDocumentResponse {
-    FileSizeDocumentResponse {
-        version: request.version.min(PROTOCOL_VERSION),
-        request_id: request.request_id,
-        raw_bytes: 0,
-        minified_bytes: 0,
-        gzip_bytes: 0,
-        brotli_bytes: 0,
-        zstd_bytes: 0,
-        imports: Vec::new(),
-        states: Vec::new(),
         error: Some(message.clone()),
         diagnostics: protocol_diagnostics(message),
     }
@@ -1187,17 +1653,25 @@ async fn recycle_if_needed(
     storage_path: Option<&Path>,
     prefetcher: &Prefetcher,
     service: &ImportLensService,
-    active_streams: &mut Vec<JoinHandle<()>>,
+    active_tasks: &mut Vec<JoinHandle<()>>,
+    maintenance_task: &mut Option<AbortOnDrop>,
 ) -> bool {
     let Some(reason) = lifecycle.should_recycle(Instant::now()) else {
         return false;
     };
 
     prefetcher.cancel();
-    if !active_streams.is_empty() {
-        wait_for_active_streams(active_streams).await;
+    // A finished handle is not work in flight. Reap first, or a connection that has served any
+    // request at all looks busy for ever and every recycle costs an extra 60s tick.
+    reap_finished_tasks(active_tasks);
+    if !active_tasks.is_empty() {
+        wait_for_active_tasks(active_tasks).await;
         return false;
     }
+
+    // Nothing is in flight, so nothing is competing with the flush — but the maintenance pass is
+    // still scheduled, and a pass that starts during the flush compacts the shards it is writing.
+    *maintenance_task = None;
 
     if let Err(error) = service.flush_cache() {
         logging::log_warn(
@@ -1232,8 +1706,130 @@ fn restrict_unix_socket_permissions(pipe_name: &str) -> Result<(), Box<dyn Error
 
 #[cfg(test)]
 mod tests {
-    use super::RegistryRefreshLifecycle;
+    use super::{
+        DocumentBuildGate, DocumentTaskLifecycle, RegistryRefreshLifecycle, TASK_JOIN_TIMEOUT,
+        reap_finished_tasks, wait_for_active_tasks,
+    };
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::task::JoinHandle;
+
+    /// Shutdown must not be hostage to a build it cannot cancel.
+    ///
+    /// A build already inside Rolldown runs to `BUILD_TIMEOUT` (8s) whatever the daemon wants,
+    /// and the extension force-kills the daemon 5s after asking it to stop — so a join that waits
+    /// for that build is a join that ends with the process being killed before it flushes. The wait
+    /// is therefore bounded, and the handles it gave up on are reported, not silently dropped.
+    #[tokio::test]
+    async fn waiting_for_active_tasks_gives_up_on_a_task_that_outlives_the_bound() {
+        let parked = TASK_JOIN_TIMEOUT * 15;
+        let mut active_tasks: Vec<JoinHandle<()>> = vec![tokio::spawn(async move {
+            // Stands in for a build parked inside the bundler: far longer than the bound, and
+            // nothing here can cancel it.
+            tokio::time::sleep(parked).await;
+        })];
+
+        let started_at = std::time::Instant::now();
+        let finished = wait_for_active_tasks(&mut active_tasks).await;
+
+        assert!(
+            !finished,
+            "a task that outlives the bound must be reported as unfinished, not waited out"
+        );
+        assert!(
+            started_at.elapsed() < parked / 2,
+            "the wait must end at the bound, not at the task: waited {:?}",
+            started_at.elapsed()
+        );
+        assert_eq!(
+            active_tasks.len(),
+            1,
+            "the handle it gave up on is kept, so a later pass can still join it"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_for_active_tasks_joins_the_tasks_that_do_finish() {
+        let mut active_tasks: Vec<JoinHandle<()>> =
+            vec![tokio::spawn(async {}), tokio::spawn(async {})];
+
+        assert!(wait_for_active_tasks(&mut active_tasks).await);
+        assert!(active_tasks.is_empty());
+    }
+
+    /// `recycle_if_needed` reads `active_tasks.is_empty()` as "nothing in flight". Now that every
+    /// request runs as a task, a connection that served ONE request keeps its handle for ever
+    /// unless finished handles are reaped — so the recycle check would find work that had long
+    /// since completed and defer the recycle by a whole 60s tick, every time.
+    #[tokio::test]
+    async fn finished_task_handles_are_reaped() {
+        let finished = tokio::spawn(async {});
+        let running = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        finished.await.expect("the finished task cannot panic");
+        // `await` above consumed the handle, so re-create the pair the loop would be holding.
+        let mut active_tasks: Vec<JoinHandle<()>> = vec![tokio::spawn(async {}), running];
+        tokio::task::yield_now().await;
+
+        reap_finished_tasks(&mut active_tasks);
+
+        assert_eq!(
+            active_tasks.len(),
+            1,
+            "only the still-running task may be left"
+        );
+        assert!(!active_tasks[0].is_finished());
+    }
+
+    /// The combined file-size build's bound: one gate per document, shared by every size read of
+    /// that document, and a separate one for every other document (a build for `a.ts` must never
+    /// wait on a build for `b.ts`).
+    #[test]
+    fn the_document_build_gate_is_shared_per_document_and_pruned_when_idle() {
+        let mut gate = DocumentBuildGate::new();
+
+        let first = gate.gate_for("C:/ws", "C:/ws/a.ts");
+        let same_document = gate.gate_for("C:/ws", "C:/ws/a.ts");
+        let other_document = gate.gate_for("C:/ws", "C:/ws/b.ts");
+
+        assert!(
+            Arc::ptr_eq(&first, &same_document),
+            "two size reads of the same document must queue on the SAME gate"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &other_document),
+            "a size read of another document must not wait behind this one"
+        );
+
+        // The map must not grow by one entry per document the session ever sized.
+        drop(first);
+        drop(same_document);
+        drop(other_document);
+        let _fresh = gate.gate_for("C:/ws", "C:/ws/c.ts");
+        assert_eq!(
+            gate.gates.len(),
+            1,
+            "gates nobody holds are inert and must be pruned"
+        );
+    }
+
+    /// Shutdown cancels before it joins. `Drop` cannot do this job: it runs when the connection
+    /// function RETURNS, which is after the join it was meant to shorten.
+    #[test]
+    fn cancelling_a_document_lifecycle_flips_every_documents_flag() {
+        let mut lifecycle = DocumentTaskLifecycle::new();
+        let first = lifecycle.start_document("C:/ws", "C:/ws/a.ts");
+        let second = lifecycle.start_document("C:/ws", "C:/ws/b.ts");
+        assert!(!first.load(Ordering::Acquire));
+        assert!(!second.load(Ordering::Acquire));
+
+        lifecycle.cancel_all();
+
+        assert!(first.load(Ordering::Acquire));
+        assert!(second.load(Ordering::Acquire));
+    }
 
     #[test]
     fn registry_refresh_lifecycle_supersedes_only_within_the_same_source() {

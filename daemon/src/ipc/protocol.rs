@@ -16,7 +16,12 @@ pub enum ImportKind {
     Dynamic,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// `Ord` lets combined file sizing group entries by runtime in a stable order
+// (`file_size.rs`); the derived order is over the variants, not the wire form, so
+// it does not affect serialization.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportRuntime {
     #[default]
@@ -178,14 +183,73 @@ impl ResultFreshness {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImportResult {
-    pub specifier: String,
+/// The five sizes of a build that **succeeded**.
+///
+/// The only way to put a size on an [`ImportResult`] (ADR-0006, invariant 1: *a size exists if
+/// and only if a build succeeded*). A failing path cannot reach for one, because the constructor
+/// that takes it — [`ImportResult::measured`] — is the one that does not take a failure stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MeasuredSizes {
     pub raw_bytes: u64,
     pub minified_bytes: u64,
     pub gzip_bytes: u64,
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
+}
+
+impl MeasuredSizes {
+    /// A genuine zero. Reserved for a package that really does ship no runtime bytes — a
+    /// declarations-only package (`pipeline::types_only`), which is Measured, not Unmeasured:
+    /// the build did not fail, there was simply nothing to build.
+    pub const ZERO: Self = Self {
+        raw_bytes: 0,
+        minified_bytes: 0,
+        gzip_bytes: 0,
+        brotli_bytes: 0,
+        zstd_bytes: 0,
+    };
+}
+
+/// One import's analysis, in exactly one of the two states a *response* can carry (ADR-0006).
+/// The third — Loading — is not an `ImportResult` at all: it is
+/// [`ImportAnalysisItem`] with `status: Loading` and no result.
+///
+/// * **Measured** — the five sizes are `Some`, `unmeasured_stage` is `None`, `error` is `None`.
+/// * **Unmeasured** — the five sizes are `None`, `unmeasured_stage` names the stage that could
+///   not answer, and `error` carries its message.
+///
+/// The size fields are **private**, and the only two constructors are [`Self::measured`] and
+/// [`Self::unmeasured`]. That is what makes the **fabricated** state unrepresentable: there is no
+/// way to put a size on a result except by declaring that a build produced it, so a failing path
+/// cannot reach for one. Read a size back through [`Self::sizes`] or [`Self::brotli_bytes`] and the
+/// compiler asks the only question a consumer is allowed to ask: **is there a size?** — never "is
+/// there an error?".
+///
+/// What is **not** unrepresentable — and was claimed to be — is *a size together with a transient
+/// stage*. That shape is REAL: a measurement whose full-package comparison build timed out has
+/// genuine sizes and an untrustworthy `truly_treeshakeable` (`pipeline::analyze`). Deleting it to
+/// satisfy a slogan would delete the only evidence that the tree-shaking verdict is fabricated, and
+/// no type can stop it anyway — `diagnostics` is an open list of open structs whose `stage` is a
+/// `String`. So it is representable, it is named ([`Self::is_transient`]), and the invariant that
+/// keeps it out of every store is enforced **at the stores**, by [`Self::is_durable`], not by a
+/// convention at the call sites.
+///
+/// Serde note: the sizes are plain `Option<u64>` with **no** `skip_serializing_if` — and neither
+/// have `module_breakdown` or `shared_bytes`, for the same reason. The dominant `Option` pattern in
+/// this file breaks the disk cache for any field that sits mid-struct: the L2 encoding is positional
+/// (`rmp_serde::to_vec`), so a skipped field shortens the msgpack array and every field after it
+/// decodes off by one. An Unmeasured result carries `module_breakdown: None` beside a
+/// `shared_bytes: Some(0)` that `annotate_shared_bytes` stamps on every result, measured or not —
+/// exactly that shape. A plain `Option` writes a `nil` placeholder and keeps the array length.
+/// `cache::disk` guards this. Only `freshness`, which is the LAST serialized field, may skip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportResult {
+    pub specifier: String,
+    raw_bytes: Option<u64>,
+    minified_bytes: Option<u64>,
+    gzip_bytes: Option<u64>,
+    brotli_bytes: Option<u64>,
+    zstd_bytes: Option<u64>,
     pub cache_hit: bool,
     pub side_effects: bool,
     pub truly_treeshakeable: bool,
@@ -195,10 +259,22 @@ pub struct ImportResult {
     #[serde(default)]
     pub confidence_reasons: Vec<String>,
     pub error: Option<String>,
+    /// The stage that could not answer, when there is no size. `None` on a measurement.
+    ///
+    /// Present so a consumer can ask **why** there is no size, not merely whether — the CI gate
+    /// must tell a flaky box (`timeout`) apart from a broken package (`parse`), and
+    /// `should_cache_result` must cache the second and refuse the first. Plain `Option`, no
+    /// `skip_serializing_if`, for the positional-msgpack reason above.
+    #[serde(default)]
+    unmeasured_stage: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Plain `Option`, NO `skip_serializing_if`: mid-struct, and the L2 encoding is positional.
+    /// See the struct's serde note.
+    #[serde(default)]
     pub module_breakdown: Option<Vec<ModuleContribution>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Plain `Option`, NO `skip_serializing_if`: mid-struct, and the L2 encoding is positional.
+    /// See the struct's serde note.
+    #[serde(default)]
     pub shared_bytes: Option<u64>,
     /// Freshness of this served value. `#[serde(default)]` so old disk entries decode
     /// as `Fresh`; `skip_serializing_if = is_fresh` so the DISK (positional msgpack)
@@ -209,6 +285,204 @@ pub struct ImportResult {
     pub freshness: ResultFreshness,
     #[serde(default, skip)]
     pub internal_contributions: Vec<ModuleContribution>,
+}
+
+impl ImportResult {
+    /// **Measured**: a build succeeded and produced these bytes.
+    pub fn measured(specifier: impl Into<String>, sizes: MeasuredSizes) -> Self {
+        Self {
+            specifier: specifier.into(),
+            raw_bytes: Some(sizes.raw_bytes),
+            minified_bytes: Some(sizes.minified_bytes),
+            gzip_bytes: Some(sizes.gzip_bytes),
+            brotli_bytes: Some(sizes.brotli_bytes),
+            zstd_bytes: Some(sizes.zstd_bytes),
+            cache_hit: false,
+            side_effects: false,
+            truly_treeshakeable: false,
+            is_cjs: false,
+            confidence: ConfidenceLevel::Low,
+            confidence_reasons: Vec::new(),
+            error: None,
+            unmeasured_stage: None,
+            diagnostics: Vec::new(),
+            module_breakdown: None,
+            shared_bytes: None,
+            freshness: ResultFreshness::fresh(),
+            internal_contributions: Vec::new(),
+        }
+    }
+
+    /// **Unmeasured**: the build could not answer. No size, ever — not a zero, not an estimate of
+    /// the directory on disk, not the entry file measured alone. The stage says whether that is a
+    /// property of the package's bytes (deterministic: `parse`, `link`, `output_shape`, …) or of
+    /// this moment's scheduling (transient: `timeout`, `panic`, `engine_gone`).
+    pub fn unmeasured(
+        specifier: impl Into<String>,
+        stage: &str,
+        message: impl Into<String>,
+        details: Vec<String>,
+    ) -> Self {
+        let message = message.into();
+        Self {
+            specifier: specifier.into(),
+            raw_bytes: None,
+            minified_bytes: None,
+            gzip_bytes: None,
+            brotli_bytes: None,
+            zstd_bytes: None,
+            cache_hit: false,
+            // Nothing was linked, so nothing can be certified free of side effects or
+            // tree-shaken away. The conservative reading is the only honest one.
+            side_effects: true,
+            truly_treeshakeable: false,
+            is_cjs: false,
+            confidence: ConfidenceLevel::Low,
+            confidence_reasons: vec![
+                "Analysis failed before a bundle size could be measured.".to_owned(),
+            ],
+            error: Some(message.clone()),
+            unmeasured_stage: Some(stage.to_owned()),
+            diagnostics: vec![ImportDiagnostic {
+                stage: stage.to_owned(),
+                message,
+                details,
+            }],
+            module_breakdown: None,
+            shared_bytes: None,
+            freshness: ResultFreshness::fresh(),
+            internal_contributions: Vec::new(),
+        }
+    }
+
+    /// The sizes, if a build produced them. `None` is the whole point: it is the question every
+    /// consumer must ask, and the compiler will not let it be skipped.
+    pub fn sizes(&self) -> Option<MeasuredSizes> {
+        Some(MeasuredSizes {
+            raw_bytes: self.raw_bytes?,
+            minified_bytes: self.minified_bytes?,
+            gzip_bytes: self.gzip_bytes?,
+            brotli_bytes: self.brotli_bytes?,
+            zstd_bytes: self.zstd_bytes?,
+        })
+    }
+
+    pub fn raw_bytes(&self) -> Option<u64> {
+        self.raw_bytes
+    }
+
+    pub fn minified_bytes(&self) -> Option<u64> {
+        self.minified_bytes
+    }
+
+    pub fn gzip_bytes(&self) -> Option<u64> {
+        self.gzip_bytes
+    }
+
+    pub fn brotli_bytes(&self) -> Option<u64> {
+        self.brotli_bytes
+    }
+
+    pub fn zstd_bytes(&self) -> Option<u64> {
+        self.zstd_bytes
+    }
+
+    /// The stage that could not answer, on an Unmeasured result.
+    pub fn unmeasured_stage(&self) -> Option<&str> {
+        self.unmeasured_stage.as_deref()
+    }
+
+    /// This result describes **this run of the daemon** rather than the package: either the build
+    /// itself was cancelled/unwound/orphaned, or a secondary build (the full-package comparison)
+    /// was, which fabricates `truly_treeshakeable: false` on an otherwise sound measurement.
+    ///
+    /// Both are reasons no durable store may take it (ADR-0006, invariant 3) — but they are not the
+    /// only ones, so this is not the gate. [`Self::is_durable`] is.
+    pub fn is_transient(&self) -> bool {
+        self.unmeasured_stage
+            .as_deref()
+            .is_some_and(crate::engine::stage::is_transient)
+            || self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| crate::engine::stage::is_transient(&diagnostic.stage))
+    }
+
+    /// **The gate every durable store applies** (ADR-0006, invariant 3). A store that outlives the
+    /// request — the L1 memory cache, the L2 disk cache, the extension's histories — may take this
+    /// result only if this is true, and each of those stores asks *itself*, at the insert, rather
+    /// than trusting its callers to have asked.
+    ///
+    /// It is an ALLOWLIST over stages, not a denylist of the three transient ones
+    /// (`pipeline::stage::may_enter_a_durable_store` explains why: `entry_metadata` is a bare
+    /// `fs::metadata` failure — transient in fact, and absent from every list of the engine's
+    /// transient stages). Both places a stage can hide are checked:
+    ///
+    /// * the result's own `unmeasured_stage` — the build that could not answer;
+    /// * every diagnostic — which is how a **successful** measurement whose full-package comparison
+    ///   build merely parked is caught, since its `truly_treeshakeable: false` was fabricated by
+    ///   that park and would otherwise be cached as a fact about a healthy package.
+    ///
+    /// A Measured result with no failure diagnostics is durable, which is the overwhelmingly common
+    /// case and the one that must stay fast.
+    pub fn is_durable(&self) -> bool {
+        let stage_is_durable =
+            |stage: &str| crate::pipeline::stage::may_enter_a_durable_store(stage);
+
+        self.unmeasured_stage
+            .as_deref()
+            .is_none_or(&stage_is_durable)
+            && self
+                .diagnostics
+                .iter()
+                .all(|diagnostic| stage_is_durable(&diagnostic.stage))
+    }
+
+    /// A **declarations-only** package: a package that resolves to no runtime entry *because it
+    /// ships no runtime code*, and is answered Measured — a genuine zero, at High confidence
+    /// ([`crate::pipeline::types_only`]).
+    ///
+    /// The distinction this exists to draw is "resolved to nothing because there is nothing" versus
+    /// "could not be resolved". They look identical to [`crate::pipeline::resolver`], which returns
+    /// `Err` for both, and the aggregate must tell them apart: a types-only import contributes zero
+    /// bytes as a **fact**, so it leaves the file's total complete. Treating it as a gap instead
+    /// made every file importing an `@types/…` package a permanent floor — never cached, never
+    /// persisted, exit 3 from `importlens check` — which is a large fraction of real TypeScript.
+    ///
+    /// The sizes must be present: the zero is an *answer*, and an answer has a size.
+    pub fn is_types_only(&self) -> bool {
+        self.sizes().is_some()
+            && self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == crate::pipeline::stage::TYPES_ONLY)
+    }
+
+    /// A **native-binary-only** package: it ships a platform-specific native binary and no
+    /// importable JS entry, so it is answered Measured at zero ([`crate::pipeline::native_binary`]).
+    /// Like [`Self::is_types_only`], the zero is a fact rather than a gap, so the aggregate leaves
+    /// the file's total complete rather than turning it into a permanent floor. The sizes must be
+    /// present: the zero is an *answer*, and an answer has a size.
+    pub fn is_native_binary_only(&self) -> bool {
+        self.sizes().is_some()
+            && self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == crate::pipeline::stage::NATIVE_BINARY_ONLY)
+    }
+
+    /// A **native-binary-backed** package whose JS entry resolved and was measured. An informational
+    /// flag on a real measurement (the measured size is the JS shim; the tool's work is in the
+    /// native binary), so — unlike [`Self::is_native_binary_only`] — the size may be non-zero. The
+    /// sizes must be present: the flag only ever rides a successful measurement
+    /// ([`crate::pipeline::native_binary::annotate_native_binary`] enforces the same on the way in).
+    pub fn is_native_binary(&self) -> bool {
+        self.sizes().is_some()
+            && self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == crate::pipeline::stage::NATIVE_BINARY)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +615,30 @@ pub struct FileSizeDocumentResponse {
     pub zstd_bytes: u64,
     pub imports: Vec<ImportResult>,
     pub states: Vec<ImportAnalysisItem>,
+    /// These totals are a **floor**, not the file's size: an import that belongs in them was not
+    /// measured — its own build had not landed when the sum was taken (`status: "loading"`), or a
+    /// transient engine failure fabricated the number it carries
+    /// ([`crate::pipeline::file_size::FileSizeComputation::incomplete`]).
+    ///
+    /// It is on the wire because the client has durable stores of its own (the bundle-impact
+    /// history), and neither of the other two fields can tell it this: `error` is `None` — the sum
+    /// succeeded, it just summed less than the file — and the diagnostics that DO name the missing
+    /// import are stage-tagged `file_size_fallback`, which a deterministic per-import failure (a
+    /// real, cacheable fact, and no reason to distrust the total) carries too. SRS FR-024a/FR-026c.
+    #[serde(default)]
+    pub incomplete: bool,
+    /// The file's **own combined build** failed, so these totals are not the file's — whatever the
+    /// state of its imports ([`crate::pipeline::file_size::FileSizeComputation::degraded`]).
+    ///
+    /// The second half of ADR-0006's invariant 4, and the one `incomplete` structurally cannot see:
+    /// a combined build is strictly larger than any single import's build, so it is the likeliest
+    /// thing in the system to hit `BUILD_TIMEOUT` — and when it does, every contributor may still be
+    /// perfectly Measured, leaving `incomplete: false`, `error: None`, and an un-deduplicated
+    /// per-import SUM on the wire. That sum is a Combined Import Cost, a different quantity from a
+    /// File Cost (ADR-0004), and an OVER-count rather than a floor. It must be shown, and it must
+    /// never be stored, compared, or judged.
+    #[serde(default)]
+    pub degraded: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }
@@ -349,12 +647,25 @@ pub struct FileSizeDocumentResponse {
 /// NOT unique — two imports of the same package differ by import kind / named
 /// exports but share a specifier — so each pushed result is paired with this to
 /// disambiguate variants on the client.
+///
+/// `runtime` is part of the identity because **it is part of the import**. An Astro document can
+/// import the same package, with the same kind and the same named exports, from its frontmatter
+/// (Server) and from a client `<script>` (Client), and those are two rows with two different sizes
+/// — the two runtimes resolve dependencies under materially different conditions ([ADR-0005]).
+/// Without it the two variants collide on one key and the client collapses them into a single row,
+/// in the one document shape the runtime split exists for.
+///
+/// Additive and `#[serde(default)]`, so it needs no protocol-version bump: an older client ignores
+/// the extra field, and a payload without it decodes to the default (`Component`) — which is the
+/// runtime of every non-Astro document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshedImportIdentity {
     pub specifier: String,
     pub import_kind: ImportKind,
     #[serde(default)]
     pub named: Vec<String>,
+    #[serde(default)]
+    pub runtime: ImportRuntime,
 }
 
 /// Unsolicited server→client push carrying freshly-recomputed sizes for a document
@@ -472,13 +783,19 @@ pub struct RefreshRegistryHintsResponse {
     pub diagnostics: Vec<ImportDiagnostic>,
 }
 
+/// The budgets the workspace report can judge, which is the **per-import** one and only that.
+///
+/// A per-file budget is judged against a **File Cost** — one bundle over all a file's imports, so a
+/// module two of them reach is counted once (ADR-0004) — and the report has no such build behind a
+/// row. It used to sum each file's per-import brotli and warn off THAT: an upper bound that
+/// double-counts every shared module, and a verdict the editor and `importlens check` (which both
+/// measure the File Cost) contradicted on the same file under the same budget. The field is gone so
+/// that nothing can be judged against a number the report does not have (SRS FR-036i, FR-036q).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceReportBudgets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_import_brotli_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub per_file_brotli_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +810,11 @@ pub struct WorkspaceReportRequest {
     pub budgets: WorkspaceReportBudgets,
 }
 
+/// One row of the workspace report.
+///
+/// The four size fields are `Option` for the same reason [`ImportResult`]'s are: an import the
+/// engine could not measure has no size, and `.unwrap_or_default()` here would print **"0 B"** —
+/// the sentinel zero this model exists to abolish, in the one surface a user exports and shares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceReportRow {
@@ -501,10 +823,10 @@ pub struct WorkspaceReportRow {
     pub source_file: String,
     pub line: u32,
     pub runtime: String,
-    pub minified_bytes: u64,
-    pub gzip_bytes: u64,
-    pub brotli_bytes: u64,
-    pub zstd_bytes: u64,
+    pub minified_bytes: Option<u64>,
+    pub gzip_bytes: Option<u64>,
+    pub brotli_bytes: Option<u64>,
+    pub zstd_bytes: Option<u64>,
     pub shared_bytes: u64,
     pub confidence: String,
     pub confidence_reasons: String,
@@ -524,31 +846,73 @@ pub struct WorkspaceReportTreemapItem {
     pub confidence: String,
 }
 
+/// Every import of one specifier across the workspace, and what they cost **together** — three files
+/// importing `react` is three Reacts (see [`WorkspaceReportSummary::combined_import_cost_brotli_bytes`]).
+/// The field was `total_brotli_bytes`, and a "total" of fifty Reacts is a number no project ships.
+/// Under the honest label the panel is finally saying the thing it exists to say.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateImportGroup {
     pub specifier: String,
     pub count: u64,
-    pub total_brotli_bytes: u64,
+    pub combined_import_cost_brotli_bytes: u64,
     pub source_files: Vec<String>,
 }
 
+/// One module, and the imports that reach it.
+///
+/// **A module has a size, and its importing sites have a combined cost, and they are two different
+/// numbers.** This group carried one field, `total_bytes` — the module's bytes added up once per
+/// importing row — and the report rendered it under the header "Total Bytes". So
+/// `react-dom/index.js`, which **is 100 kB** and is reached by three imports (`react-dom`,
+/// `react-dom/client`, `react-dom/server`), was reported as **300 kB**. That is a *Combined Import
+/// Cost* wearing the one word [ADR-0004] exists to abolish, one table below the headline that was
+/// relabelled for exactly this reason.
+///
+/// - [`Self::module_bytes`] — what the module **is**: the largest single rendered contribution seen
+///   across the builds that reached it. (Two builds may tree-shake it differently, so it need not be
+///   one number; the largest is the module at its fullest, and it is a byte count that really came
+///   out of a build rather than an average of two that did not.)
+/// - [`Self::combined_import_cost_bytes`] — what the **sites** pay: that module counted once per
+///   importing site. An **upper bound**, because each import is priced as though the application
+///   were otherwise empty, and never a size.
+///
+/// [ADR-0004]: ../../../docs/adr/0004-import-lens-measures-imports-not-bundles.md
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateModuleGroup {
     pub module_path: String,
     pub basename: String,
+    /// The number of imports that reach this module.
     pub count: u64,
-    pub total_bytes: u64,
+    /// The module's own rendered size.
+    pub module_bytes: u64,
+    /// The module counted once per importing site: a Combined Import Cost, an upper bound.
+    pub combined_import_cost_bytes: u64,
     pub specifiers: Vec<String>,
     pub vendored: bool,
 }
 
+/// The report's headline figure is a **Combined Import Cost**: the sum of independent Import Costs,
+/// each priced as though the application were otherwise empty ([ADR-0004]).
+///
+/// It counts a dependency at **every site it is imported from** — `react` in fifty files is fifty
+/// Reacts, and a single `import React, { useState } from "react"` is **two imports** and is counted
+/// **twice**. That is not an error to be corrected: subtracting the overlap would assert a
+/// project-level bundle quantity this product deliberately does not model, and compressed sizes are
+/// not additive anyway, so the sum is an **upper bound**. It **ranks** imports and **apportions
+/// blame**; it is never a size.
+///
+/// It was called `total_brotli_bytes` and rendered as "Total Brotli", which every reader takes to
+/// mean *what my project ships*. The arithmetic was right; the word was the defect. The treemap's
+/// percentages are shares of this figure, not of a bundle.
+///
+/// [ADR-0004]: ../../../docs/adr/0004-import-lens-measures-imports-not-bundles.md
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceReportSummary {
     pub import_count: u64,
-    pub total_brotli_bytes: u64,
+    pub combined_import_cost_brotli_bytes: u64,
     pub low_confidence_count: u64,
     pub medium_confidence_count: u64,
     pub conservative_count: u64,
@@ -669,12 +1033,25 @@ pub struct PrewarmPackageJsonMessage {
     pub active_document_path: String,
 }
 
+/// The watcher's "something the daemon memoized is no longer true" message.
+///
+/// It carries two kinds of path because two kinds of file feed the resolvers, and both were only
+/// ever half-watched: a `node_modules/<pkg>/package.json` (an install / uninstall) and a
+/// `tsconfig.json` / `jsconfig.json` (the workspace's **alias table**, the sole discriminator
+/// between a path alias and a package that is not installed). The second is new; without it the
+/// alias table the daemon parsed at startup was the one it used until it died, and the repair the
+/// SRS prescribes for an unrecognized alias — add the `paths` entry — had no effect at all.
+///
+/// `tsconfig_paths` is `#[serde(default)]`, so an older client that sends only
+/// `package_json_paths` still decodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeModulesChangedMessage {
     #[serde(rename = "type")]
     #[serde(default = "node_modules_changed_message_type")]
     pub message_type: String,
     pub package_json_paths: Vec<String>,
+    #[serde(default)]
+    pub tsconfig_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,6 +1067,14 @@ pub struct EnumerateExportsRequest {
     #[serde(rename = "package")]
     pub package_name: String,
     pub package_version: String,
+    /// The import's UTF-16 cursor offset in `active_document_path`, when the caller has
+    /// one. The daemon classifies it into a runtime (`document::runtime_at_offset`) so the
+    /// enumeration resolves under the same conditions the size will — an import in Astro
+    /// frontmatter (Server) must be enumerated under node conditions, not browser. Absent
+    /// (a plain file, or an older client), the classifier default is `Component`.
+    /// `#[serde(default)]` keeps an older client that omits it decoding.
+    #[serde(default)]
+    pub cursor_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -724,6 +1109,20 @@ pub struct FileSizeResponse {
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
     pub imports: Vec<ImportResult>,
+    /// These totals are a **floor**, not the file's size — the same flag, and the same meaning, as
+    /// [`FileSizeDocumentResponse::incomplete`].
+    ///
+    /// It was missing here, which made this the one surface where a floor and a measurement are
+    /// indistinguishable: the legacy `file_size` request answers with the same
+    /// [`crate::pipeline::file_size::FileSizeComputation`] and simply dropped the one field that
+    /// says the number is short. Additive and `#[serde(default)]`, so an older client that ignores
+    /// it is no worse off than it was.
+    #[serde(default)]
+    pub incomplete: bool,
+    /// The file's own combined build failed — the same flag, and the same meaning, as
+    /// [`FileSizeDocumentResponse::degraded`]. Missing here for the same reason `incomplete` was.
+    #[serde(default)]
+    pub degraded: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }

@@ -43,6 +43,18 @@ export const showNamedExportCandidates = async (
     return;
   }
 
+  // The daemon owns runtime classification (ADR-0002); we only tell it WHERE the import is.
+  // The offset of the import statement lands in whichever script region the daemon then
+  // classifies — Server for Astro frontmatter, Component for a plain file — so the exports we
+  // enumerate resolve under the same conditions their size does.
+  const document = await vscode.workspace.openTextDocument(uri);
+  const cursorOffset = document.offsetAt(
+    new vscode.Position(
+      detected.specifierRange.start.line,
+      detected.specifierRange.start.character,
+    ),
+  );
+
   const response = await daemon.enumerateExports({
     type: "enumerate_exports",
     version: protocolVersion,
@@ -52,6 +64,7 @@ export const showNamedExportCandidates = async (
     specifier: detected.specifier,
     package: request.package,
     package_version: request.version,
+    cursor_offset: cursorOffset,
   });
 
   if (!response || response.error) {

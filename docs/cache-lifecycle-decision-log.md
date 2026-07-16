@@ -235,6 +235,105 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   only_within_the_same_source` (cross-source isolation + same-source supersede + drop-cancels-all)
   and extension `refresh sends the document key as the request source`.
 
+### D12 — Post-cutover fingerprints re-read loaded paths after analysis; the analysis-time-hash guarantee is retired with the graph · 2026-07-11
+- **Context:** The bundler-redesign Phase 3 cutover deleted the custom module graph, whose
+  analysis-time content hashes let `dependency_fingerprints` pair a result with the exact
+  bytes the analysis read (the old "Finding 4" TOCTOU guard and its
+  `analyze_and_cache_fetches_module_graph_once` test died with it). The Rolldown engine's
+  public output exposes loaded paths but not load-time content hashes, so fingerprints are
+  now computed by re-reading each loaded path *after* the build.
+- **Decision:** Accept the re-opened window (a dependency edited between engine load and
+  fingerprinting can pair a stale result with fresh-looking fingerprints) rather than
+  re-hashing inside the plugin's load path.
+- **Rationale:** the window is milliseconds-to-seconds per import and requires an edit to a
+  transitively loaded file exactly inside it; watched `node_modules` changes still invalidate
+  via the pre-analysis generation gate, and the L1/L2 re-verify TTLs bound residual staleness
+  to one window. Hashing in the plugin would double file reads on every build to close a
+  race that eviction already bounds. Related: the old first-party CJS cached-module-set
+  freshness (D6) is superseded, not lost — the engine failure fallback measures only the
+  entry file, so its manifest+entry fingerprints now cover exactly the inputs of the cached
+  computation.
+- **Consequences / status:** lands with the Phase 3 cutover commit. Also removed in the same
+  commit: the named→namespace cache alias (`cache_full_variant_alias`), whose premise —
+  side-effectful packages size identically for named and namespace imports — was only true of
+  the old engine's conservative full-graph inclusion; Rolldown shakes pure unused exports
+  under `sideEffects: true`, so each import kind now computes its own entry.
+
+### D13 — A transiently-degraded result is never cached, but IS pushed · 2026-07-13
+- **Context:** the streaming redesign (`AnalyzeDocument` answers from cache and pushes each
+  import as its build lands) deleted the per-request engine budget. Both the budget's
+  abandoned builds and a real `BUILD_TIMEOUT` / `panic` / `engine_gone` leave the pipeline
+  with only the conservative static fallback — which carries `error: None` and a plausible
+  byte count, and so passed the old `should_cache_result` (`error.is_none()`) unchallenged.
+  That is how one parked build taught the cache that a healthy 17,550-byte package weighs 58
+  bytes, for a whole cache generation.
+- **Decision (cache):** every cache and memo gates on the failure STAGE, not merely on
+  `error`. `engine::stage::is_transient` (`timeout` | `panic` | `engine_gone`) is the single
+  source of truth; `should_cache_result` and `FileSizeComputation::is_cacheable` consult it,
+  covering L1 memory, L2 disk, and the L1 aggregate file-size cache. The full-package and
+  export-list build memos and the dependency-path index need no gate — they are written only
+  on the success path. A DETERMINISTIC failure (`parse`, `link`, `module_graph_limit`, a
+  minify failure) is still cached: it is a fact about the code, and re-deriving it costs a
+  full build to learn the same thing. The full-package comparison now reports its failure
+  under the stage it failed at rather than a `full_package_comparison` literal, which is both
+  what §12 asks for and what lets this gate see it — a `truly_treeshakeable: false` produced
+  by a build that merely parked is as fabricated as a fabricated size.
+- **Decision (push) — amends D8:** D8 coupled the SWR push to cacheability so display and
+  cache can never disagree. That coupling holds for SWR and is now strictly stronger (a
+  transiently-degraded revalidation is dropped, so a good stale size on screen survives a
+  parked rebuild). It deliberately does NOT hold for the streaming push: an import the
+  response answered `loading` has no previous value to protect, and withholding its result
+  would leave it reading "Calculating…" for the rest of the session. So the streaming push
+  delivers whatever the build produced, and the client-side merge carries the distinction
+  instead — an errored/degraded result may FILL a state with no result, and may never REPLACE
+  one that has (`mergeRefreshedResults`).
+- **Consequences / status:** the degraded value is displayed (low confidence, with its stage
+  diagnostic) but is not persisted, so the next read of that import recomputes rather than
+  serving the accident back. Lands with the streaming-redesign commit; SRS FR-026c.
+
+### D14 — The transience gate extends to the EXTENSION's persisted stores · 2026-07-13
+- **Context:** D13 gated every cache the daemon writes. It did not gate the two stores the
+  *extension* writes, because nothing had ever gated them: the import-cost history
+  (`globalState`) and the bundle-impact history (`globalState`). Both are strictly worse
+  places for a fabrication than any daemon cache — no TTL, no cache generation, not cleared by
+  either Clear Caches command, and one row per identity. A daemon cache serves the accident
+  back for a generation; these two *overwrite the import's real baseline for good*, and every
+  later trend insight is then measured against a number that never happened. This is the same
+  defect for the fourth time, in the fourth place.
+- **Decision:** both stores gate on the daemon's own evidence, not on `error` (which a
+  degraded result does not carry). `analysis/transience.ts` mirrors `stage::is_transient` and
+  is the single funnel: `importCostHistoryItemsForStates` drops an import whose diagnostics
+  name a transient stage, and `bundleImpactHistoryItemForResponse` refuses a total that is
+  transiently degraded *or* `incomplete`. A drift check
+  (`scripts/test/engine-stage-coordination.test.mjs`) fails the build if the Rust and TS stage
+  lists disagree.
+- **Decision (protocol):** `FileSizeDocumentResponse` gains `incomplete` on the wire.
+  `FileSizeComputation::incomplete` already existed daemon-side (it is what keeps a floor out
+  of the L1 aggregate cache), and the client cannot re-derive it: the diagnostic naming a
+  still-`loading` import is stage-tagged `file_size_fallback`, exactly like the diagnostic for
+  a deterministic per-import failure, which is a real fact and no reason to distrust the total.
+  Additive, `#[serde(default)]`, no protocol-version bump.
+- **Consequences / status:** an estimate is still shown ("· estimate"), with no delta against
+  the previous run — comparing an honest total to a floor invents a regression — and is simply
+  never written down. SRS FR-026c.
+
+### D15 — Shutdown flushes under a bound; a build it cannot cancel is abandoned · 2026-07-13
+- **Context:** shutdown joined every task the connection spawned before flushing. One class of
+  task cannot be cancelled: a build already inside Rolldown runs to `BUILD_TIMEOUT` (8s). The
+  extension force-kills the daemon 5s after sending `shutdown`, so the unbounded join
+  *guaranteed* the kill landed first and `flush_cache` never ran — the graceful shutdown lost
+  the session's unwritten cache to wait on one build whose result, if it timed out, D13 would
+  have refused to cache anyway.
+- **Decision:** cancel everything cancellable first (prefetch, registry blocks, streamed-import
+  builds, SWR, queued combined builds, the scheduled maintenance pass — via explicit
+  `cancel_all`, because `Drop` runs *after* the join it was meant to shorten), then join under
+  `TASK_JOIN_TIMEOUT` (2s, comfortably inside the 5s kill), then flush unconditionally. A task
+  still running at the deadline is abandoned and its result is recomputed next session.
+- **Consequences / status:** the "no build is still writing to the cache after the flush"
+  guarantee is downgraded to what is actually true and stated as such in FR-004c. Worst case, a
+  late build writes to `papaya` after the flush and the process exits before it is persisted:
+  one rebuild lost, against the whole session's cache saved.
+
 ---
 
 ## Parked / deferred

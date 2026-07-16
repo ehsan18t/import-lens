@@ -1,9 +1,9 @@
-use super::SwrRefreshLifecycle;
+use super::DocumentTaskLifecycle;
 use std::sync::atomic::Ordering;
 
 #[test]
 fn swr_lifecycle_cancels_only_the_superseded_document() {
-    let mut lifecycle = SwrRefreshLifecycle::new();
+    let mut lifecycle = DocumentTaskLifecycle::new();
 
     let first = lifecycle.start_document("C:/workspace", "C:/workspace/src/a.ts");
     let other = lifecycle.start_document("C:/workspace", "C:/workspace/src/b.ts");

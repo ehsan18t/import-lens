@@ -1,8 +1,8 @@
 import * as vscode from "vscode";
-import { formatCurrentFileSizeSummary } from "../analysis/fileSize.js";
+import { currentFileSizeReport } from "../analysis/fileSize.js";
 import {
   type BundleImpactHistoryItem,
-  bundleImpactHistoryDeltaLabel,
+  bundleImpactHistoryItemForResponse,
   bundleImpactHistoryKey,
   previousBundleImpactForFile,
   recordBundleImpactHistory,
@@ -76,42 +76,31 @@ export const showCurrentFileSize = async (
       return;
     }
 
-    if (response.states.length === 0) {
-      await vscode.window.showInformationMessage("Current file: no runtime package imports found.");
-      return;
-    }
-
-    if (response.imports.length === 0) {
-      await vscode.window.showWarningMessage(
-        "Import Lens could not resolve any runtime package imports in the current file.",
-      );
-      return;
-    }
-
-    const currentHistoryItem: BundleImpactHistoryItem = {
-      timestamp: Date.now(),
-      fileName: document.fileName,
-      rawBytes: response.raw_bytes,
-      minifiedBytes: response.minified_bytes,
-      gzipBytes: response.gzip_bytes,
-      brotliBytes: response.brotli_bytes,
-      zstdBytes: response.zstd_bytes,
-      importCount: response.imports.length,
-    };
+    // `undefined` when the totals are not this file's: an import still being measured or unmeasured
+    // (a floor), or the file's own combined build having failed (an un-deduplicated per-import sum).
+    // Such a number is worth SHOWING (a floor beats a blank) and must never be recorded — the
+    // history has no TTL and keeps one row per file, so it would become that file's baseline and
+    // make the next honest sizing read as a regression.
+    const currentHistoryItem = bundleImpactHistoryItemForResponse(response, document.fileName);
     const previous = previousBundleImpactForFile(
       context.globalState.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []),
       document.fileName,
     );
-    await recordBundleImpactHistory(context.globalState, currentHistoryItem);
+    const report = currentFileSizeReport(response, config.compression, {
+      current: currentHistoryItem,
+      previous,
+    });
 
-    const skipped = response.states.length - response.imports.length;
-    const skippedSuffix = skipped > 0 ? ` · ${skipped} skipped` : "";
-    const diffSuffix = previous
-      ? ` · ${bundleImpactHistoryDeltaLabel(currentHistoryItem, previous)}`
-      : "";
-    await vscode.window.showInformationMessage(
-      `${formatCurrentFileSizeSummary(response, config.compression)}${skippedSuffix}${diffSuffix}`,
-    );
+    if (report.kind === "no-imports") {
+      await vscode.window.showInformationMessage("Current file: no runtime package imports found.");
+      return;
+    }
+
+    // Offered unconditionally: the store applies the gate itself and keeps nothing when the totals
+    // are not the file's, so a caller cannot record a floor by forgetting to ask.
+    await recordBundleImpactHistory(context.globalState, response, document.fileName);
+
+    await vscode.window.showInformationMessage(report.message);
   } catch (error) {
     logger.warn(
       `Current-file size request failed: ${error instanceof Error ? error.message : String(error)}`,

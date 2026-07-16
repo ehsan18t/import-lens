@@ -1,5 +1,5 @@
 import type { ImportResult } from "../ipc/protocol.js";
-import { formatBytes } from "./format.js";
+import { formatBytes, type MeasuredSizes, measuredSizes } from "./format.js";
 
 export interface CompareImportQuickPickItem {
   label: string;
@@ -21,12 +21,16 @@ export const compareImportItemsForResults = (
     };
   }
 
+  // A comparison is an ordering of sizes, so only an import that HAS one can be in it. Filtering on
+  // `!result.error` let a fabricated size into the ranking, where it sorted as the cheapest option
+  // and recommended itself.
   const items = results
-    .filter((result) => !result.error)
-    .sort((left, right) => left.brotli_bytes - right.brotli_bytes)
-    .map((result) => ({
-      label: `${result.specifier}: ${formatBytes(result.brotli_bytes)} br`,
-      detail: `${formatBytes(result.minified_bytes)} min · ${formatBytes(result.gzip_bytes)} gz · ${formatBytes(result.zstd_bytes)} zstd`,
+    .map((result): [ImportResult, MeasuredSizes | null] => [result, measuredSizes(result)])
+    .filter((pair): pair is [ImportResult, MeasuredSizes] => pair[1] !== null)
+    .sort(([, left], [, right]) => left.brotli_bytes - right.brotli_bytes)
+    .map(([result, sizes]) => ({
+      label: `${result.specifier}: ${formatBytes(sizes.brotli_bytes)} br`,
+      detail: `${formatBytes(sizes.minified_bytes)} min · ${formatBytes(sizes.gzip_bytes)} gz · ${formatBytes(sizes.zstd_bytes)} zstd`,
     }));
 
   if (items.length === 0) {

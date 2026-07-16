@@ -16,4 +16,5 @@ pub use package_json::{
     PackageJsonDependencyEntry, PackageJsonDependencySection, package_json_dependency_entries,
     package_json_dependency_sections,
 };
+pub use script_regions::runtime_at_offset;
 pub use specifier::{get_package_name, is_runtime_package_specifier};

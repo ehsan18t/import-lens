@@ -119,6 +119,49 @@ test("packageJsonDependencyHintLabel shows types only instead of zero-byte sizes
   );
 });
 
+test("packageJsonDependencyHintLabel shows native binary only for a no-entry native package", () => {
+  assert.equal(
+    packageJsonDependencyHintLabel(
+      {
+        name: "@biomejs/biome",
+        section: "devDependencies",
+        status: "ready",
+        result: result({
+          raw_bytes: 0,
+          minified_bytes: 0,
+          gzip_bytes: 0,
+          brotli_bytes: 0,
+          zstd_bytes: 0,
+          diagnostics: [
+            { stage: "native_binary_only", message: "native binary only", details: [] },
+          ],
+        }),
+        registryHint: { latestVersion: "2.5.3", isLatest: true },
+      },
+      config(),
+    ),
+    "native binary only · latest",
+  );
+});
+
+test("packageJsonDependencyHintLabel flags a native-binary-backed shim beside its size", () => {
+  assert.equal(
+    packageJsonDependencyHintLabel(
+      {
+        name: "typescript",
+        section: "devDependencies",
+        status: "ready",
+        result: result({
+          diagnostics: [{ stage: "native_binary", message: "native binary", details: [] }],
+        }),
+        registryHint: { latestVersion: "7.0.2", isLatest: true },
+      },
+      config(),
+    ),
+    "1.5 kB br · native binary · latest",
+  );
+});
+
 test("packageJsonDependencyHintLabel omits sparkle from inline decorations", () => {
   assert.equal(
     packageJsonDependencyHintLabel(
@@ -234,7 +277,42 @@ test("packageJsonSectionSummaryLabel totals measured dependencies and problem co
 
   assert.equal(
     packageJsonSectionSummaryLabel("dependencies", states, config()),
-    "2/3 measured · 2.0 kB br · 1 not installed",
+    "2/3 measured · 2.0 kB br combined · 1 not installed",
+  );
+});
+
+// A bare byte count beside "3/3 measured" reads as *what this package costs*. It is not.
+//
+// react (6.2 kB br), react-dom (45 kB br) and @mui/material (90 kB br) each measured ALONE, on an
+// otherwise-empty app, and added up: 141.2 kB. But react-dom pulls react's whole graph and
+// @mui/material pulls emotion's, and in any real build those graphs are shared — so the figure
+// counts them at every site. It is a **Combined Import Cost**: an upper bound that ranks and
+// apportions blame, and never a size (ADR-0004). The word "combined" is what says so.
+test("the package.json section summary names its sum a combined cost, not a size", () => {
+  const states: PackageJsonDependencyHintState[] = [
+    {
+      name: "react",
+      section: "dependencies",
+      status: "ready",
+      result: result({ brotli_bytes: 6_200 }),
+    },
+    {
+      name: "react-dom",
+      section: "dependencies",
+      status: "ready",
+      result: result({ brotli_bytes: 45_000 }),
+    },
+    {
+      name: "@mui/material",
+      section: "dependencies",
+      status: "ready",
+      result: result({ brotli_bytes: 90_000 }),
+    },
+  ];
+
+  assert.equal(
+    packageJsonSectionSummaryLabel("dependencies", states, config()),
+    "3/3 measured · 141.2 kB br combined",
   );
 });
 

@@ -1,4 +1,4 @@
-use crate::pipeline::graph::is_node_builtin_specifier;
+use crate::pipeline::node_builtins::is_node_builtin_specifier;
 
 pub fn get_package_name(specifier: &str) -> String {
     if specifier.starts_with('@') {

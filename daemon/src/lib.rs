@@ -1,6 +1,7 @@
 pub mod analysis_flight;
 pub mod cache;
 pub mod document;
+pub mod engine;
 pub mod ipc;
 pub mod lifecycle;
 pub mod logging;

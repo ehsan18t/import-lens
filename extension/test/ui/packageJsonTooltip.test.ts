@@ -296,10 +296,20 @@ test("tooltipForResultMarkdown renders conservative sizing without em dash", () 
   assert.doesNotMatch(markdown, /—/u);
 });
 
-test("tooltipForResultMarkdown renders compact diagnostics for errored results", () => {
+test("tooltipForResultMarkdown renders compact diagnostics for an unmeasured result", () => {
   const markdown = tooltipForResultMarkdown(
+    // **Unmeasured** (ADR-0006): no size, ever. The fixture used to carry an error AND all five
+    // sizes — the fabricated shape, which is exactly what made the tooltip's `if (result.error)`
+    // gate look like it worked. The tooltip asks for the size now, so the fixture must be honest
+    // about not having one, or the test would be checking a state the daemon cannot produce.
     result({
+      raw_bytes: null,
+      minified_bytes: null,
+      gzip_bytes: null,
+      brotli_bytes: null,
+      zstd_bytes: null,
       error: "failed to resolve package",
+      unmeasured_stage: "resolve",
       confidence: "low",
       confidence_reasons: ["Resolver returned no entry."],
       diagnostics: [

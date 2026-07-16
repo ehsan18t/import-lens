@@ -37,4 +37,4 @@ if (probe.status !== 0) {
   );
 }
 
-run("cargo", ["llvm-cov", "--workspace", "--fail-under-lines", "70"]);
+run("cargo", ["llvm-cov", "--workspace", "--locked", "--fail-under-lines", "70"]);

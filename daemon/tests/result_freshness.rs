@@ -1,28 +1,22 @@
 use import_lens_daemon::cache::key::{FileFingerprint, content_hash};
 use import_lens_daemon::cache::memory::{ImportCache, bump_cache_generation};
-use import_lens_daemon::ipc::protocol::{FreshnessKind, ImportResult, ResultFreshness};
+use import_lens_daemon::ipc::protocol::{
+    FreshnessKind, ImportResult, MeasuredSizes, ResultFreshness,
+};
 
 fn base_result() -> ImportResult {
-    ImportResult {
-        specifier: "lib".to_owned(),
-        raw_bytes: 10,
-        minified_bytes: 8,
-        gzip_bytes: 6,
-        brotli_bytes: 5,
-        zstd_bytes: 5,
-        cache_hit: false,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: Default::default(),
-        confidence_reasons: Vec::new(),
-        error: None,
-        diagnostics: Vec::new(),
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-        freshness: ResultFreshness::fresh(),
-    }
+    let mut result = ImportResult::measured(
+        "lib",
+        MeasuredSizes {
+            raw_bytes: 10,
+            minified_bytes: 8,
+            gzip_bytes: 6,
+            brotli_bytes: 5,
+            zstd_bytes: 5,
+        },
+    );
+    result.truly_treeshakeable = true;
+    result
 }
 
 #[test]

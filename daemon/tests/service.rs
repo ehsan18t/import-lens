@@ -8,9 +8,6 @@ use import_lens_daemon::{
     },
     pipeline::file_size::FileSizeComputation,
     pipeline::file_size_cache::shared_file_size_cache,
-    pipeline::graph::{
-        build_module_graph_cached, clear_module_graph_cache, peek_cached_module_paths,
-    },
     pipeline::resolver::shared_resolvers,
     registry::service::RegistryHintService,
     service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
@@ -23,7 +20,9 @@ use std::{
 
 mod common;
 
-static GRAPH_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+// Serializes tests that touch process-global freshness state (the engine's
+// dependency-path index and the L1 file-size cache).
+static SHARED_INDEX_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn temp_workspace() -> PathBuf {
     common::temp_workspace("import-lens-service")
@@ -230,44 +229,6 @@ fn write_shared_packages(workspace: &Path) {
     }
 }
 
-fn write_shared_packages_with_many_unique_modules(workspace: &Path) {
-    let util_root = workspace.join("node_modules").join("shared-small-util");
-    fs::create_dir_all(&util_root).expect("shared util root should be created");
-    fs::write(
-        util_root.join("package.json"),
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
-    )
-    .expect("shared util manifest should be written");
-    fs::write(util_root.join("index.js"), "export const util = 'u';")
-        .expect("shared util entry should be written");
-
-    for package_name in ["left-wide-lib", "right-wide-lib"] {
-        let package_root = workspace.join("node_modules").join(package_name);
-        fs::create_dir_all(&package_root).expect("package root should be created");
-        fs::write(
-            package_root.join("package.json"),
-            r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
-        )
-        .expect("package manifest should be written");
-
-        let export_name = package_name.replace("-wide-lib", "").replace('-', "_");
-        let mut entry = "import { util } from 'shared-small-util';\n".to_owned();
-        for index in 0..11 {
-            entry.push_str(&format!("import './local-{index}.js';\n"));
-            fs::write(
-                package_root.join(format!("local-{index}.js")),
-                format!(
-                    "globalThis.__importLensLocal{index} = '{}';",
-                    "x".repeat(120)
-                ),
-            )
-            .expect("local side-effect module should be written");
-        }
-        entry.push_str(&format!("export const {export_name} = util;"));
-        fs::write(package_root.join("index.js"), entry).expect("package entry should be written");
-    }
-}
-
 fn write_effectful_package(workspace: &Path) {
     let package_root = workspace.join("node_modules").join("effectful-lib");
     fs::create_dir_all(&package_root).expect("package root should be created");
@@ -281,33 +242,6 @@ fn write_effectful_package(workspace: &Path) {
         "export const value = 1;\nexport const other = 2;",
     )
     .expect("entry should be written");
-}
-
-fn write_array_graph_effects_package(workspace: &Path) {
-    let package_root = workspace
-        .join("node_modules")
-        .join("array-graph-effects-lib");
-    fs::create_dir_all(package_root.join("dist").join("polyfill").join("browser"))
-        .expect("package root should be created");
-    fs::write(
-        package_root.join("package.json"),
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":["**/polyfill/**/*.js"]}"#,
-    )
-    .expect("package manifest should be written");
-    fs::write(
-        package_root.join("index.js"),
-        "export const value = 1;\nexport { setup } from './dist/polyfill/browser/setup.js';",
-    )
-    .expect("entry should be written");
-    fs::write(
-        package_root
-            .join("dist")
-            .join("polyfill")
-            .join("browser")
-            .join("setup.js"),
-        "globalThis.__importLensSideEffect = 'kept';\nexport const setup = 'polyfill';",
-    )
-    .expect("side-effect module should be written");
 }
 
 fn write_cjs_file_size_package(workspace: &Path) {
@@ -365,32 +299,6 @@ fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -
         imports: vec![ImportRequest {
             specifier: "effectful-lib".to_owned(),
             package_name: "effectful-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: if matches!(import_kind, ImportKind::Named) {
-                vec!["value".to_owned()]
-            } else {
-                Vec::new()
-            },
-            import_kind,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
-    }
-}
-
-fn graph_effects_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -> BatchRequest {
-    BatchRequest {
-        version: 1,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "array-graph-effects-lib".to_owned(),
-            package_name: "array-graph-effects-lib".to_owned(),
             version: "1.0.0".to_owned(),
             named: if matches!(import_kind, ImportKind::Named) {
                 vec!["value".to_owned()]
@@ -515,38 +423,6 @@ fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
     }
 }
 
-fn wide_shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
-    BatchRequest {
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![
-            ImportRequest {
-                specifier: "left-wide-lib".to_owned(),
-                package_name: "left-wide-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec!["left".to_owned()],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            },
-            ImportRequest {
-                specifier: "right-wide-lib".to_owned(),
-                package_name: "right-wide-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec!["right".to_owned()],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            },
-        ],
-        streaming: false,
-    }
-}
-
 fn file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
     let batch = shared_batch(workspace, request_id);
 
@@ -562,6 +438,12 @@ fn file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
 
 #[test]
 fn handle_file_size_populates_and_reuses_aggregate_cache() {
+    // It asserts on the process-wide L1 cache, and other tests in this binary CLEAR it (a cache
+    // remove, a workspace-config invalidation). Serialize against them.
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let workspace = temp_workspace();
     write_shared_packages(&workspace);
     let service = ImportLensService::new(None, false);
@@ -605,28 +487,6 @@ fn cjs_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
     }
 }
 
-fn graph_effects_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
-    FileSizeRequest {
-        message_type: "file_size".to_owned(),
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "array-graph-effects-lib".to_owned(),
-            package_name: "array-graph-effects-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["value".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-    }
-}
-
 fn enumerate_exports_request(workspace: &Path, request_id: u64) -> EnumerateExportsRequest {
     EnumerateExportsRequest {
         message_type: "enumerate_exports".to_owned(),
@@ -641,6 +501,7 @@ fn enumerate_exports_request(workspace: &Path, request_id: u64) -> EnumerateExpo
         specifier: "exports-lib".to_owned(),
         package_name: "exports-lib".to_owned(),
         package_version: "1.0.0".to_owned(),
+        cursor_offset: None,
     }
 }
 
@@ -738,6 +599,995 @@ fn service_computes_file_size_from_document_source() {
             .all(|result| result.shared_bytes.is_some_and(|bytes| bytes > 0)),
         "{response:?}",
     );
+}
+
+/// A workspace manifest naming `tiny-lib`, plus whatever else the caller declares.
+fn write_workspace_manifest(workspace: &Path, extra_dependencies: &str) {
+    fs::write(
+        workspace.join("package.json"),
+        format!(r#"{{"name":"app","version":"1.0.0","dependencies":{{"tiny-lib":"1.0.0"{extra_dependencies}}}}}"#),
+    )
+    .expect("workspace manifest should be written");
+}
+
+/// A `tsconfig.json` mapping `@app/*` at first-party source, and the source file it points at — the
+/// ordinary shape of a real TypeScript project, and the thing that makes `@app/components` an ALIAS
+/// rather than a missing package.
+fn write_tsconfig_alias(workspace: &Path) {
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("tsconfig should be written");
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+    fs::write(
+        workspace.join("src").join("components.ts"),
+        "export const Button = 1;\n",
+    )
+    .expect("aliased source should be written");
+}
+
+fn file_size_document_request(
+    workspace: &Path,
+    request_id: u64,
+    source: &str,
+) -> FileSizeDocumentRequest {
+    file_size_document_request_for(workspace, "src/index.ts", request_id, source)
+}
+
+/// A file-size request for a caller-chosen document, so the same import can be asked from a `.ts`,
+/// a `.vue`, a `.svelte` and an `.astro` file — which is the whole question in
+/// `file_size_document_recognizes_a_path_alias_from_every_supported_document_type`.
+fn file_size_document_request_for(
+    workspace: &Path,
+    document_relative_path: &str,
+    request_id: u64,
+    source: &str,
+) -> FileSizeDocumentRequest {
+    let mut document = workspace.to_path_buf();
+    for segment in document_relative_path.split('/') {
+        document.push(segment);
+    }
+
+    FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document.to_string_lossy().to_string(),
+        source: source.to_owned(),
+        force_fresh: true,
+        analysis_generation: None,
+    }
+}
+
+/// **FR-024a, bullet 4 — the fix that nothing could detect.**
+///
+/// An import of a package that is not installed has no `ImportRequest` (a request carries the
+/// installed version), so it is not an entry of the file's combined build and contributes no bytes to
+/// any total. It used to be `filter_map`ped out of the aggregate's input in
+/// `file_size_document_response` before it could say so: the file's total silently omitted a whole
+/// dependency, and — carrying `incomplete: false` — was cached for the L1 TTL, persisted to the
+/// no-TTL bundle-impact history as this file's permanent baseline, and passed by `importlens check`
+/// with exit 0.
+///
+/// The fix is one line (`map` over `filter_map`), and reverting it left the entire daemon suite
+/// green, because every existing test hands `compute_file_size` a `SizedImport` list that was built
+/// by hand. This one goes through the handler, which is where the list is BUILT.
+#[test]
+fn file_size_document_flags_an_uninstalled_import_as_a_floor() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    // `ghost-lib` is declared and was never installed: a missing DEPENDENCY, whose bytes belong in
+    // this file's total.
+    write_workspace_manifest(&workspace, r#","ghost-lib":"^2.0.0""#);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_file_size_document(file_size_document_request(
+        &workspace,
+        331,
+        "import { value } from 'tiny-lib';\nimport { gone } from 'ghost-lib';",
+    ));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.error, None, "{response:?}");
+    assert_eq!(
+        response.states.len(),
+        2,
+        "test setup: BOTH imports are detected; the question is what the aggregate does with the \
+         uninstalled one: {response:?}"
+    );
+    assert!(
+        response.incomplete,
+        "an import whose package is not installed leaves this total short by its whole weight - it \
+         is a FLOOR, and must never be cached, persisted, or judged: {response:?}"
+    );
+    assert!(
+        response.diagnostics.iter().any(|item| item
+            .details
+            .iter()
+            .any(|detail| detail == "specifier: ghost-lib")),
+        "the user is owed the specifier whose bytes are missing: {response:?}"
+    );
+}
+
+/// **FR-024a bullet 4 says "not installed", and it means it: DECLARATION IS NOT THE DISCRIMINATOR.**
+///
+/// An earlier attempt at the alias fix used "is the package declared in a `package.json`?" to tell an
+/// alias from a missing dependency, and had to narrow this bullet to fit — an import of a package
+/// neither declared nor installed (a typo, a stale import after a `pnpm remove`) was then read as an
+/// alias and flagged nothing, so a total missing that package's entire weight was cached, persisted
+/// as the file's baseline, and passed by `importlens check`. That is the exact silent pass ADR-0006
+/// exists to abolish, and declaration cannot justify it: `import _ from 'lodash'` omits the same
+/// bytes whether or not `package.json` names lodash.
+///
+/// So the discriminator is POSITIVE evidence of first-party source (it RESOLVES, through tsconfig
+/// `paths`, to a file outside `node_modules`) — never the absence of a declaration. A specifier that
+/// resolves to nothing is a floor. This test is what fails if anyone reaches for the declaration
+/// again.
+#[test]
+fn file_size_document_flags_an_undeclared_uninstalled_import_as_a_floor() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    // NOT declared, NOT installed, and NOT an alias: nothing in the project mentions `ghost-lib`.
+    // A tsconfig with a real alias table is present, and it does not map this specifier either.
+    write_workspace_manifest(&workspace, "");
+    write_tsconfig_alias(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_file_size_document(file_size_document_request(
+        &workspace,
+        333,
+        "import { value } from 'tiny-lib';\nimport { gone } from 'ghost-lib';",
+    ));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.error, None, "{response:?}");
+    assert!(
+        response.incomplete,
+        "an undeclared, uninstalled import omits exactly the bytes a declared one does - it is a \
+         FLOOR too, and treating it as an alias is a silent pass on a total missing a whole \
+         package: {response:?}"
+    );
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|item| item.stage == "package_resolution"
+                && item
+                    .details
+                    .iter()
+                    .any(|detail| detail == "specifier: ghost-lib")),
+        "and it is reported as what it is - an unresolvable package, not an alias: {response:?}"
+    );
+}
+
+/// **The regression the fix above caused, and the reason it needs a discriminator.**
+///
+/// A tsconfig PATH ALIAS (`@app/components`) also has no installed package and therefore no request —
+/// and it is not a missing dependency at all. It points at first-party source, which Import Lens does
+/// not measure (ADR-0004), exactly like a relative import. Reading it as a missing dependency made
+/// **every file that uses path aliases a permanent floor**: the combined build re-ran on every size
+/// request, nothing was ever cached or persisted, and `importlens check` refused to judge the file.
+/// Path aliases are ordinary in real TypeScript projects.
+///
+/// (`@/…` and `~/…` never reach here — `document::specifier` drops them before detection. It is the
+/// alias forms that look like package names, `@app/…`, that were misread.)
+#[test]
+fn file_size_document_does_not_flag_a_path_alias_as_a_missing_package() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    // `@app/*` is an alias in `tsconfig.json` resolving to `src/*`, and it is NOT declared as a
+    // dependency. It RESOLVES to first-party source, and that is the whole difference from the two
+    // tests above.
+    write_workspace_manifest(&workspace, "");
+    write_tsconfig_alias(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let response = service.handle_file_size_document(file_size_document_request(
+        &workspace,
+        332,
+        "import { value } from 'tiny-lib';\nimport { Button } from '@app/components';",
+    ));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(response.error, None, "{response:?}");
+    assert!(
+        !response.incomplete,
+        "a path alias is first-party source, not an unmeasured dependency: flagging it makes every \
+         aliased file a permanent floor - never cached, never persisted, never judged: {response:?}"
+    );
+    assert!(!response.degraded, "{response:?}");
+    assert!(
+        response.raw_bytes > 0,
+        "the installed package is still measured: {response:?}"
+    );
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|item| item.stage == "path_alias"),
+        "the user is still told why that specifier contributes nothing: {response:?}"
+    );
+}
+
+/// The same import (`@app/components`), the same project, the same `tsconfig.json` — asked from each
+/// of the four document types the extension activates on. **The answer must not depend on which one
+/// asks.**
+///
+/// It did, and that is why the alias fix was dead for half the languages Import Lens supports. The
+/// resolution ran through `resolve_file`, which drives `TsconfigDiscovery::Auto`: oxc walks up to the
+/// nearest tsconfig that **claims the document** through `files` / `include` / `exclude`, and
+/// TypeScript's default `include` claims no `.vue`, `.svelte` or `.astro` file. So the alias resolved
+/// from a `.ts` document and resolved to *nothing* from the other three — which the aggregate reads
+/// as a package that is not installed. For every Vue, Svelte and Astro user, **every file using a
+/// path alias stayed a permanent floor**: never cached, never persisted, and refused a verdict by
+/// `importlens check`. Only the `.ts` case was ever tested, which is exactly how it survived.
+///
+/// "Is this specifier first-party?" is a question about the WORKSPACE'S ALIAS TABLE, not about the
+/// document that happens to contain the import. The config is now handed to oxc explicitly, so its
+/// `paths` apply whatever the document's extension.
+#[test]
+fn file_size_document_recognizes_a_path_alias_from_every_supported_document_type() {
+    // One tsconfig, no `include` — the ordinary shape, and the one whose TypeScript default claims
+    // `.ts` and nothing else. It is what made three of these four documents floors.
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    write_workspace_manifest(&workspace, "");
+    write_tsconfig_alias(&workspace);
+    let service = ImportLensService::new(None, false);
+
+    let documents = [
+        (
+            "src/app.ts",
+            "import { value } from 'tiny-lib';\nimport { Button } from '@app/components';\n"
+                .to_owned(),
+        ),
+        (
+            "src/app.vue",
+            "<script setup lang=\"ts\">\nimport { value } from 'tiny-lib';\nimport { Button } from \
+             '@app/components';\n</script>\n<template><div /></template>\n"
+                .to_owned(),
+        ),
+        (
+            "src/app.svelte",
+            "<script lang=\"ts\">\nimport { value } from 'tiny-lib';\nimport { Button } from \
+             '@app/components';\n</script>\n<div></div>\n"
+                .to_owned(),
+        ),
+        (
+            "src/app.astro",
+            "---\nimport { value } from 'tiny-lib';\nimport { Button } from \
+             '@app/components';\n---\n<div></div>\n"
+                .to_owned(),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (index, (document, source)) in documents.iter().enumerate() {
+        let response = service.handle_file_size_document(file_size_document_request_for(
+            &workspace,
+            document,
+            400 + index as u64,
+            source,
+        ));
+
+        let alias_stage = response
+            .diagnostics
+            .iter()
+            .find(|item| {
+                item.details
+                    .iter()
+                    .any(|detail| detail == "specifier: @app/components")
+            })
+            .map(|item| item.stage.clone())
+            .unwrap_or_else(|| "<no diagnostic>".to_owned());
+
+        failures.push(format!(
+            "{document}: stage={alias_stage} incomplete={} states={}",
+            response.incomplete,
+            response.states.len()
+        ));
+
+        assert_eq!(
+            response.states.len(),
+            2,
+            "test setup: both imports must be detected in {document}: {response:?}"
+        );
+        assert!(
+            !response.incomplete,
+            "{document}: a path alias resolves to first-party source from EVERY document type. \
+             Flagging it here makes every aliased Vue/Svelte/Astro file a permanent floor - never \
+             cached, never persisted, never judged. Measured: {failures:?}"
+        );
+        assert_eq!(
+            alias_stage, "path_alias",
+            "{document}: the alias must be reported as an alias, not as an unresolvable package. \
+             Measured: {failures:?}"
+        );
+        assert!(
+            !response.degraded,
+            "{document}: the combined build must still succeed: {response:?}"
+        );
+        assert!(
+            response.raw_bytes > 0,
+            "{document}: the installed package is still measured: {response:?}"
+        );
+    }
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+// ------------------------------------------------------------------------------------------------
+// The alias matrix: CONFIG SHAPE x IMPORTING DOCUMENT.
+//
+// "Does this specifier map, through some `paths` table the workspace reaches, to a first-party file
+// that EXISTS?" is one question with one answer, and neither half of this matrix may change it. The
+// previous fix proved that both halves can silently break: keying the resolution on the document
+// killed `.vue` / `.svelte` / `.astro`, and the repair for THAT (`TsconfigDiscovery::Manual`) killed
+// the solution-style config — the literal create-vue and create-astro scaffold — from every document
+// type, `.ts` included.
+//
+// A row per config shape is what makes this a PROPERTY test rather than four examples: add a way of
+// spelling an alias table and the matrix demands it work from all four languages, or go red.
+// ------------------------------------------------------------------------------------------------
+
+/// One way real projects spell their alias table. Every shape below maps `@app/*` at a real
+/// `components.ts` outside `node_modules`, so every shape must answer identically.
+///
+/// `write` takes the FIXTURE directory and returns the **workspace root** — the directory the client
+/// opened. They are the same for every shape but the monorepo one, where the workspace root is one
+/// package (`packages/web`) and the alias target sits *above* it.
+struct AliasConfigShape {
+    name: &'static str,
+    write: fn(&Path) -> PathBuf,
+}
+
+/// The first-party file every alias in this matrix points at. It EXISTING is the positive evidence
+/// that makes the specifier an alias rather than a floor.
+fn write_alias_target(workspace: &Path) {
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+    fs::write(
+        workspace.join("src").join("components.ts"),
+        "export const Button = 1;\n",
+    )
+    .expect("aliased source should be written");
+}
+
+/// The ordinary shape: one `tsconfig.json`, no `include`. TypeScript's default `include` claims
+/// `.ts` and nothing else, which is what made the other three documents floors once.
+fn write_flat_tsconfig(workspace: &Path) -> PathBuf {
+    write_alias_target(workspace);
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("tsconfig should be written");
+    workspace.to_path_buf()
+}
+
+/// The Astro scaffold: an explicit `"include": ["**/*"]`, which claims every document type.
+fn write_flat_tsconfig_including_everything(workspace: &Path) -> PathBuf {
+    write_alias_target(workspace);
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"include":["**/*"],"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("tsconfig should be written");
+    workspace.to_path_buf()
+}
+
+/// **The monorepo opened at ONE package** — an extremely ordinary way to open one. The workspace root
+/// is `packages/web`; its `paths` reach a sibling package **above** the root, and the target that
+/// makes the specifier first-party (`packages/shared/components.ts`) is therefore outside the opened
+/// workspace entirely.
+///
+/// It is still the user's own source: it exists, it is not inside `node_modules`, and it ships no
+/// npm-package bytes, so it must flag nothing. A previous revision required the target to sit inside
+/// the workspace root and made every file using a cross-package alias a **permanent floor**.
+fn write_monorepo_package_tsconfig(fixture: &Path) -> PathBuf {
+    let shared = fixture.join("packages").join("shared");
+    fs::create_dir_all(&shared).expect("shared package should be created");
+    fs::write(shared.join("components.ts"), "export const Button = 1;\n")
+        .expect("sibling package source should be written");
+
+    let workspace = fixture.join("packages").join("web");
+    fs::create_dir_all(workspace.join("src")).expect("web src should be created");
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["../shared/*"]}}}"#,
+    )
+    .expect("package tsconfig should be written");
+    workspace
+}
+
+/// The literal create-vue scaffold: a root `tsconfig.json` that is nothing but `references`, with
+/// the real `paths` in a referenced `tsconfig.app.json` and a sibling `tsconfig.node.json` that has
+/// none. Both referenced projects sit at the workspace root, so a resolver that picks the project
+/// whose base directory *contains* the document has nothing to choose on and takes the first — which
+/// is why the reference ORDER is a row of its own below.
+fn write_solution_style_tsconfig(workspace: &Path, references: &[&str]) -> PathBuf {
+    write_alias_target(workspace);
+    let references = references
+        .iter()
+        .map(|path| format!(r#"{{"path":"{path}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::write(
+        workspace.join("tsconfig.json"),
+        format!(r#"{{"files":[],"references":[{references}]}}"#),
+    )
+    .expect("root tsconfig should be written");
+    fs::write(
+        workspace.join("tsconfig.app.json"),
+        r#"{"include":["env.d.ts","src/**/*","src/**/*.vue"],"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("app tsconfig should be written");
+    fs::write(
+        workspace.join("tsconfig.node.json"),
+        r#"{"include":["vite.config.*"],"compilerOptions":{"composite":true}}"#,
+    )
+    .expect("node tsconfig should be written");
+    workspace.to_path_buf()
+}
+
+fn write_solution_style_paths_project_first(workspace: &Path) -> PathBuf {
+    write_solution_style_tsconfig(workspace, &["./tsconfig.app.json", "./tsconfig.node.json"])
+}
+
+/// The order create-vue actually ships: the project WITHOUT `paths` is listed first.
+fn write_solution_style_paths_project_last(workspace: &Path) -> PathBuf {
+    write_solution_style_tsconfig(workspace, &["./tsconfig.node.json", "./tsconfig.app.json"])
+}
+
+/// **A solution-style config with a STALE reference.** `tsconfig.node.json` was deleted and nobody
+/// updated the `references` list — not exotic, and it used to cost the workspace *every* alias table:
+/// the enumeration asked oxc to resolve the root config with its references, which fails whole if any
+/// one of them cannot be read, so the `tsconfig.app.json` that owns the only `paths` table was never
+/// asked. A bad reference must cost that project's table and no other.
+fn write_solution_style_with_a_dangling_reference(workspace: &Path) -> PathBuf {
+    write_solution_style_tsconfig(workspace, &["./tsconfig.node.json", "./tsconfig.app.json"]);
+    fs::remove_file(workspace.join("tsconfig.node.json")).expect("node tsconfig should be removed");
+    workspace.to_path_buf()
+}
+
+/// A JavaScript project declares its aliases in `jsconfig.json` and in nothing else.
+fn write_jsconfig(workspace: &Path) -> PathBuf {
+    write_alias_target(workspace);
+    fs::write(
+        workspace.join("jsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("jsconfig should be written");
+    workspace.to_path_buf()
+}
+
+/// The `paths` live in a base config the project `extends`.
+fn write_extending_tsconfig(workspace: &Path) -> PathBuf {
+    write_alias_target(workspace);
+    fs::write(
+        workspace.join("tsconfig.base.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("base tsconfig should be written");
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"extends":"./tsconfig.base.json"}"#,
+    )
+    .expect("tsconfig should be written");
+    workspace.to_path_buf()
+}
+
+const ALIAS_CONFIG_SHAPES: [AliasConfigShape; 8] = [
+    AliasConfigShape {
+        name: "flat tsconfig, default include",
+        write: write_flat_tsconfig,
+    },
+    AliasConfigShape {
+        name: "flat tsconfig, include **/*",
+        write: write_flat_tsconfig_including_everything,
+    },
+    AliasConfigShape {
+        name: "solution-style, paths project first",
+        write: write_solution_style_paths_project_first,
+    },
+    AliasConfigShape {
+        name: "solution-style, paths project last",
+        write: write_solution_style_paths_project_last,
+    },
+    AliasConfigShape {
+        name: "solution-style, dangling reference",
+        write: write_solution_style_with_a_dangling_reference,
+    },
+    AliasConfigShape {
+        name: "jsconfig",
+        write: write_jsconfig,
+    },
+    AliasConfigShape {
+        name: "extends a base config",
+        write: write_extending_tsconfig,
+    },
+    AliasConfigShape {
+        name: "monorepo, target above the root",
+        write: write_monorepo_package_tsconfig,
+    },
+];
+
+/// The same import, asked from each of the four document types the extension activates on: a `.ts`,
+/// a `.vue`, a `.svelte` and an `.astro` file. Every one of them also imports the installed
+/// `tiny-lib`, so the file always has a real combined build to be a total OF.
+fn documents_importing(specifier: &str) -> [(&'static str, String); 4] {
+    [
+        (
+            "src/app.ts",
+            format!(
+                "import {{ value }} from 'tiny-lib';\nimport {{ Button }} from '{specifier}';\n"
+            ),
+        ),
+        (
+            "src/app.vue",
+            format!(
+                "<script setup lang=\"ts\">\nimport {{ value }} from 'tiny-lib';\nimport {{ Button \
+                 }} from '{specifier}';\n</script>\n<template><div /></template>\n"
+            ),
+        ),
+        (
+            "src/app.svelte",
+            format!(
+                "<script lang=\"ts\">\nimport {{ value }} from 'tiny-lib';\nimport {{ Button }} \
+                 from '{specifier}';\n</script>\n<div></div>\n"
+            ),
+        ),
+        (
+            "src/app.astro",
+            format!(
+                "---\nimport {{ value }} from 'tiny-lib';\nimport {{ Button }} from \
+                 '{specifier}';\n---\n<div></div>\n"
+            ),
+        ),
+    ]
+}
+
+/// The stage the aggregate reported for `specifier` — `path_alias` (first-party source, flags
+/// nothing) or `package_resolution` (a floor). The one fact this whole matrix is about.
+fn stage_for_specifier(
+    response: &import_lens_daemon::ipc::protocol::FileSizeDocumentResponse,
+    specifier: &str,
+) -> String {
+    response
+        .diagnostics
+        .iter()
+        .find(|item| {
+            item.details
+                .iter()
+                .any(|detail| detail == &format!("specifier: {specifier}"))
+        })
+        .map(|item| item.stage.clone())
+        .unwrap_or_else(|| "<no diagnostic>".to_owned())
+}
+
+/// **The matrix. Eight config shapes x four document types, and the answer must be the same in all
+/// thirty-two cells.**
+///
+/// An earlier fix handed the nearest config to oxc with `TsconfigDiscovery::Manual` — which is right,
+/// and is what makes the `paths` apply regardless of what `include` claims — but left oxc to CHOOSE a
+/// project out of `references` (`TsconfigReferences::Auto`). With `include` no longer distinguishing
+/// them, that choice falls back to "the first referenced project whose base directory contains the
+/// document", and in a solution-style config every referenced project sits at the workspace root, so
+/// all of them contain it and the tie breaks on **`references` list order**. The create-vue scaffold
+/// lists `tsconfig.node.json` first; it has no `paths`; the alias resolved to nothing from every
+/// document type, `.ts` included. The SRS, the commit message and two doc comments all claimed
+/// solution-style configs worked, and **no test covered a `references` config at all**.
+///
+/// The question is document-independent and project-independent: *does this specifier map, through
+/// ANY `paths` table the workspace reaches, to a first-party file that exists?* So the daemon asks
+/// every reachable table and stops asking oxc to pick one.
+///
+/// Two rows are here because the answer must not depend on the workspace being *whole*, either:
+/// a **stale `references` entry** (the deleted project every scaffold eventually accumulates) must
+/// cost only its own table, and a **monorepo opened at one package** must still see an alias target
+/// that sits above the root — it is the user's own source, and it weighs nothing.
+#[test]
+fn a_path_alias_resolves_from_every_config_shape_and_every_document_type() {
+    let mut measured = Vec::new();
+    let mut failures = Vec::new();
+
+    for (shape_index, shape) in ALIAS_CONFIG_SHAPES.iter().enumerate() {
+        let fixture = temp_workspace();
+        // The workspace root is the directory the client opened, and it is NOT always the fixture
+        // root: the monorepo shape opens one package of it.
+        let workspace = (shape.write)(&fixture);
+        write_package(&workspace);
+        write_workspace_manifest(&workspace, "");
+        let service = ImportLensService::new(None, false);
+
+        for (document_index, (document, source)) in
+            documents_importing("@app/components").iter().enumerate()
+        {
+            let response = service.handle_file_size_document(file_size_document_request_for(
+                &workspace,
+                document,
+                500 + (shape_index * 10 + document_index) as u64,
+                source,
+            ));
+
+            let stage = stage_for_specifier(&response, "@app/components");
+            let cell = format!(
+                "{:<36} x {:<14} stage={:<20} incomplete={:<5} degraded={:<5} states={}",
+                shape.name,
+                document,
+                stage,
+                response.incomplete,
+                response.degraded,
+                response.states.len()
+            );
+            let ok = !response.incomplete
+                && !response.degraded
+                && stage == "path_alias"
+                && response.states.len() == 2
+                && response.raw_bytes > 0;
+            if !ok {
+                failures.push(cell.clone());
+            }
+            measured.push(cell);
+        }
+
+        fs::remove_dir_all(&fixture).expect("temp workspace should be removed");
+    }
+
+    println!("alias matrix:\n{}", measured.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "an alias must resolve from EVERY config shape and EVERY document type - a cell that does \
+         not is a file permanently refused a cache entry, a persisted baseline and a verdict.\n\
+         FAILED:\n{}\n\nFULL MATRIX:\n{}",
+        failures.join("\n"),
+        measured.join("\n")
+    );
+}
+
+/// One specifier that must stay a **floor**, and the workspace shape that makes it one.
+struct FloorCase {
+    name: &'static str,
+    write: fn(&Path),
+    specifier: &'static str,
+    /// Whether the workspace's `package.json` declares the specifier. Declaration is **not** the
+    /// discriminator and must change nothing: `import _ from 'lodash'` omits the same bytes whether
+    /// or not the manifest names lodash.
+    declared: bool,
+}
+
+/// An alias table that is real and simply does not map this specifier.
+fn write_flat_tsconfig_for_floor(workspace: &Path) {
+    let _workspace_root = write_flat_tsconfig(workspace);
+}
+
+/// No `tsconfig.json`, no `jsconfig.json`: nothing the daemon can read, so there is no positive
+/// evidence to be had and a bare specifier that is not installed is a floor.
+fn write_no_config(workspace: &Path) {
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+}
+
+/// The alias PATTERN matches (`@app/*`), and the file it points at does not exist. Positive evidence
+/// is the file, not the pattern.
+fn write_flat_tsconfig_without_the_target(workspace: &Path) {
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("tsconfig should be written");
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+}
+
+const FLOOR_CASES: [FloorCase; 5] = [
+    FloorCase {
+        name: "not installed, declared",
+        write: write_flat_tsconfig_for_floor,
+        specifier: "ghost-lib",
+        declared: true,
+    },
+    FloorCase {
+        name: "not installed, undeclared",
+        write: write_flat_tsconfig_for_floor,
+        specifier: "phantom-lib",
+        declared: false,
+    },
+    FloorCase {
+        name: "typo of an installed package",
+        write: write_flat_tsconfig_for_floor,
+        specifier: "tiny-lob",
+        declared: false,
+    },
+    FloorCase {
+        name: "alias whose target does not exist",
+        write: write_flat_tsconfig_without_the_target,
+        specifier: "@app/missing",
+        declared: false,
+    },
+    FloorCase {
+        name: "no config at all",
+        write: write_no_config,
+        specifier: "ghost-lib",
+        declared: false,
+    },
+];
+
+/// **The other half of the matrix, and the half that must never soften.** Widening what counts as an
+/// alias is exactly how the silent pass ADR-0006 abolishes gets reintroduced: a total short a whole
+/// package, cached, persisted as the file's baseline, and passed by `importlens check` with exit 0.
+///
+/// So every one of these — a package that is simply not installed (declared or not), a typo, an alias
+/// whose target file does not exist, a bare specifier in a project with no config at all — must stay
+/// a FLOOR from every document type. The discriminator is positive evidence of first-party SOURCE:
+/// a file that **exists** and is **not under `node_modules`**. That is the whole test — the target
+/// does *not* have to sit inside the workspace root, because a monorepo alias (`"@shared/*":
+/// ["../shared/*"]`) points at a sibling package above the opened root and that is still the user's
+/// own code — which is what the alias matrix's "monorepo, target above the root" row is for. A
+/// pattern that matches is not evidence, and a missing declaration is not evidence of anything at
+/// all.
+#[test]
+fn an_unresolvable_specifier_stays_a_floor_from_every_document_type() {
+    let mut measured = Vec::new();
+    let mut failures = Vec::new();
+
+    for (case_index, case) in FLOOR_CASES.iter().enumerate() {
+        let workspace = temp_workspace();
+        write_package(&workspace);
+        write_workspace_manifest(
+            &workspace,
+            if case.declared {
+                r#","ghost-lib":"^2.0.0""#
+            } else {
+                ""
+            },
+        );
+        (case.write)(&workspace);
+        let service = ImportLensService::new(None, false);
+
+        for (document_index, (document, source)) in
+            documents_importing(case.specifier).iter().enumerate()
+        {
+            let response = service.handle_file_size_document(file_size_document_request_for(
+                &workspace,
+                document,
+                600 + (case_index * 10 + document_index) as u64,
+                source,
+            ));
+
+            let stage = stage_for_specifier(&response, case.specifier);
+            let cell = format!(
+                "{:<36} x {:<14} specifier={:<16} stage={:<20} incomplete={}",
+                case.name, document, case.specifier, stage, response.incomplete
+            );
+            let ok =
+                response.incomplete && stage == "package_resolution" && response.states.len() == 2;
+            if !ok {
+                failures.push(cell.clone());
+            }
+            measured.push(cell);
+        }
+
+        fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    }
+
+    println!("floor matrix:\n{}", measured.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "a specifier that resolves to no first-party file is a FLOOR from every document type. \
+         Reading one as an alias caches a total that is missing a whole package, persists it as the \
+         file's baseline, and passes it in CI - the silent pass ADR-0006 exists to abolish.\n\
+         FAILED:\n{}\n\nFULL MATRIX:\n{}",
+        failures.join("\n"),
+        measured.join("\n")
+    );
+}
+
+/// **The remedy the SRS prescribes must actually work — and the memo that can still hide it.**
+///
+/// A file whose alias the daemon cannot resolve is a floor, and the SRS tells the developer to repair
+/// it by adding the `paths` entry to `tsconfig.json`. They did — and nothing happened, for the rest of
+/// the daemon's life, because the alias resolvers were memoized and `oxc_resolver` memoizes the parsed
+/// config in a resolver's FS cache. Two things fix that, and they are not the same thing:
+///
+/// **Part 1 — the config itself is re-read per query.** The alias resolvers are built fresh for each
+/// question and memoize no filesystem fact (that is what stops a floor being sticky, FR-024a), so a
+/// `paths` edit lands on the next request with **no message at all**. This half goes red the moment
+/// anyone memoizes a resolver again.
+///
+/// **Part 2 — the `references` GRAPH is memoized, and only the watcher can drop it.** Which configs
+/// the workspace reaches is walked once and cached per nearest-config path, so a config that starts
+/// **referencing** the project that owns the `paths` is invisible until `invalidate_shared_resolvers`
+/// runs. That is what the tsconfig watcher (FR-027a) still buys, and this half goes red without it.
+#[test]
+fn a_workspace_config_change_invalidates_the_memoized_alias_table() {
+    // Clearing the shared L1 aggregate cache is part of this invalidation, so serialize against the
+    // other tests that read it.
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    write_workspace_manifest(&workspace, "");
+    // A real tsconfig, and real first-party targets — but NO `@app/*` entry yet. This is the state
+    // the developer is in when the daemon tells them their file is a floor.
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+    fs::write(
+        workspace.join("src").join("components.ts"),
+        "export const Button = 1;\n",
+    )
+    .expect("aliased source should be written");
+    fs::write(
+        workspace.join("src").join("widget.ts"),
+        "export const Widget = 1;\n",
+    )
+    .expect("aliased source should be written");
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":"."}}"#,
+    )
+    .expect("tsconfig should be written");
+
+    let service = ImportLensService::new(None, false);
+    let source = "import { value } from 'tiny-lib';\nimport { Button } from '@app/components';";
+
+    // 1. Without the alias entry the specifier resolves to nothing, so the total is a floor. This is
+    //    correct, and it is also what USED to memoize the config in the resolver's cache.
+    let before =
+        service.handle_file_size_document(file_size_document_request(&workspace, 410, source));
+    assert!(
+        before.incomplete,
+        "test setup: with no `@app/*` entry the specifier resolves to nothing and the total is a \
+         floor: {before:?}"
+    );
+
+    // 2. The developer applies the exact repair the SRS prescribes — and it takes effect on the very
+    //    next request, with no watcher event at all, because nothing memoized the config.
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("tsconfig should be rewritten");
+
+    let repaired =
+        service.handle_file_size_document(file_size_document_request(&workspace, 411, source));
+    assert!(
+        !repaired.incomplete,
+        "the alias table changed on disk and the daemon must see it. It did not: the parsed config \
+         was memoized in the resolver's FS cache forever, so the repair the SRS prescribes did \
+         nothing at all: {repaired:?}"
+    );
+    assert!(
+        repaired
+            .diagnostics
+            .iter()
+            .any(|item| item.stage == "path_alias"),
+        "and the specifier is now reported as the alias it became: {repaired:?}"
+    );
+
+    // 3. Now a change no re-read can see: the project gains a REFERENCED project, and that project
+    //    owns the only table mapping `@lib/*`. Which configs the workspace reaches is memoized, so
+    //    this is invisible until the watcher says the config changed.
+    fs::write(
+        workspace.join("tsconfig.app.json"),
+        r#"{"include":["src/**/*"],"compilerOptions":{"baseUrl":".","paths":{"@lib/*":["src/*"]}}}"#,
+    )
+    .expect("app tsconfig should be written");
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"references":[{"path":"./tsconfig.app.json"}],"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("tsconfig should be rewritten");
+
+    let referenced_source =
+        "import { value } from 'tiny-lib';\nimport { Widget } from '@lib/widget';";
+    let invalidated = service.invalidate_workspace_config_paths(&[workspace
+        .join("tsconfig.json")
+        .to_string_lossy()
+        .to_string()]);
+    let after = service.handle_file_size_document(file_size_document_request(
+        &workspace,
+        412,
+        referenced_source,
+    ));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(invalidated, "a non-empty config batch must invalidate");
+    assert!(
+        !after.incomplete,
+        "the workspace now REACHES a config it did not reach before, and the reachable-config walk \
+         is memoized: without the watcher dropping the shared resolvers, the referenced project's \
+         alias table is never asked and the file is a floor forever: {after:?}"
+    );
+    assert!(
+        after
+            .diagnostics
+            .iter()
+            .any(|item| item.stage == "path_alias"),
+        "and the referenced project's alias is reported as an alias: {after:?}"
+    );
+}
+
+/// **THE FLOOR MUST NOT BE STICKY, and no message can lift this one.**
+///
+/// A developer writes `import { Button } from '@app/components'` before creating
+/// `src/components.ts` — the ordinary order in which code gets written. The alias resolves to nothing,
+/// so the file is correctly a floor. Then they create the file.
+///
+/// The floor stayed, for the rest of the daemon's life. The alias resolvers were memoized per config,
+/// and `oxc_resolver` negative-caches a missing path in the resolver's filesystem cache: the daemon's
+/// first answer for that specifier was its answer forever. **A cached negative that nothing
+/// invalidates** — the same defect as the tsconfig the daemon read exactly once, one level down, and
+/// worse, because nothing watches first-party source, so there is no message that could lift it.
+/// The file was never cached, never persisted, and refused a verdict by `importlens check`.
+///
+/// So the alias resolvers are built per query and memoize no filesystem fact. **This test creates the
+/// target mid-flight and asserts the floor lifts with no invalidation and no restart** — the same
+/// `ImportLensService`, the same process.
+#[test]
+fn creating_the_alias_target_lifts_the_floor_without_any_invalidation() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    write_workspace_manifest(&workspace, "");
+    // A real alias table, pointing at a file that does not exist yet.
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+    )
+    .expect("tsconfig should be written");
+
+    let service = ImportLensService::new(None, false);
+    let source = "import { value } from 'tiny-lib';\nimport { Button } from '@app/components';";
+
+    // 1. The import is written before the component. The specifier resolves to nothing, so the file
+    //    is a floor — correct, and it is also what used to memoize the miss.
+    let before =
+        service.handle_file_size_document(file_size_document_request(&workspace, 420, source));
+    assert!(
+        before.incomplete,
+        "test setup: the alias target does not exist yet, so there is no positive evidence and the \
+         total is a floor: {before:?}"
+    );
+
+    // 2. They create it. No `invalidate_workspace_config_paths`, no `node_modules_changed`, no
+    //    restart — nothing watches first-party source, so nothing could tell the daemon anyway.
+    fs::write(
+        workspace.join("src").join("components.ts"),
+        "export const Button = 1;\n",
+    )
+    .expect("aliased source should be written");
+
+    let after =
+        service.handle_file_size_document(file_size_document_request(&workspace, 421, source));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(
+        !after.incomplete,
+        "creating the alias target must lift the floor. It did not: the miss was cached inside the \
+         memoized resolver's filesystem cache, so this file stayed a floor for the daemon's life - \
+         never cached, never persisted, and refused a verdict by `importlens check`: {after:?}"
+    );
+    assert!(
+        after
+            .diagnostics
+            .iter()
+            .any(|item| item.stage == "path_alias"),
+        "and the specifier is now reported as the alias it became: {after:?}"
+    );
+    assert!(
+        after.raw_bytes > 0,
+        "the installed package is still measured: {after:?}"
+    );
+}
+
+/// The other half of the invalidation contract: an EMPTY batch is a no-op. Without this, "invalidate
+/// on anything" would pass the test above while dropping every resolver on every unrelated watcher
+/// event.
+#[test]
+fn an_empty_workspace_config_batch_invalidates_nothing() {
+    let service = ImportLensService::new(None, false);
+    assert!(!service.invalidate_workspace_config_paths(&[]));
 }
 
 #[test]
@@ -1035,8 +1885,18 @@ fn revalidate_document_sizes_bails_when_superseded() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
+/// The SWR push and the cache write are gated by the SAME predicate (`should_cache_result`), and
+/// under ADR-0006 that predicate means one thing: **is this outcome durable?** So the push now
+/// carries exactly what the cache took.
+///
+/// A DETERMINISTIC failure is both. The import genuinely cannot be sized — it will fail the same
+/// way every time — so the daemon caches it, and the client is owed the fact: withholding the
+/// push would leave a stale number on screen for code that no longer produces one. It arrives with
+/// **no size**, which is what makes that safe; before this change the same push would have carried
+/// a fabricated one. (A TRANSIENT failure is neither cached nor pushed — the property test in
+/// `service.rs` quantifies that over every transient stage.)
 #[test]
-fn revalidate_document_sizes_omits_non_cacheable_results() {
+fn revalidate_document_sizes_pushes_a_deterministic_failure_carrying_no_size() {
     use std::collections::HashSet;
 
     let workspace = temp_workspace();
@@ -1054,14 +1914,18 @@ fn revalidate_document_sizes_omits_non_cacheable_results() {
     };
     let stale = HashSet::from(["missing-effectful-lib".to_owned()]);
 
-    assert!(
-        service
-            .revalidate_document_sizes(&request, &stale, || true)
-            .is_none(),
-        "SWR must not push request-specific diagnostics over a good stale value"
-    );
+    let (_, _, results, _) = service
+        .revalidate_document_sizes(&request, &stale, || true)
+        .expect("a deterministic failure is durable, so it is cached and pushed");
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].sizes(),
+        None,
+        "the push may not carry a size the engine never measured: {results:?}",
+    );
+    assert_eq!(results[0].unmeasured_stage(), Some("missing_export"));
 }
 
 #[test]
@@ -1410,7 +2274,7 @@ fn service_invalidates_packages_from_node_modules_package_json_paths() {
 
 #[test]
 fn service_bulk_invalidation_is_scoped_to_changed_packages() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
@@ -1459,7 +2323,7 @@ fn service_bulk_invalidation_is_scoped_to_changed_packages() {
 
 #[test]
 fn service_skips_unmappable_package_json_paths_and_targets_only_mappable_ones() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
@@ -1502,7 +2366,7 @@ fn service_skips_unmappable_package_json_paths_and_targets_only_mappable_ones() 
 
 #[test]
 fn service_invalidates_all_when_every_package_json_path_is_unmappable() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
@@ -1540,7 +2404,7 @@ fn node_modules_change_reclaims_uninstalled_package_entries() {
     // manifest PATH STRING, so it still targets the right package after the manifest is
     // gone (it never stats or reads the deleted file). A sibling package that is still
     // installed must survive, proving the reclaim is targeted, not a workspace nuke.
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let workspace = temp_workspace();
@@ -1619,7 +2483,7 @@ fn service_does_not_reuse_same_package_version_across_workspaces() {
     fs::remove_dir_all(right_workspace).expect("right workspace should be removed");
     assert!(!left.imports[0].cache_hit);
     assert!(!right.imports[0].cache_hit);
-    assert_ne!(left.imports[0].raw_bytes, right.imports[0].raw_bytes);
+    assert_ne!(left.imports[0].raw_bytes(), right.imports[0].raw_bytes());
 }
 
 #[test]
@@ -1634,7 +2498,10 @@ fn service_does_not_reuse_cache_across_runtime_profiles() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!component.imports[0].cache_hit);
     assert!(!server.imports[0].cache_hit);
-    assert_ne!(component.imports[0].raw_bytes, server.imports[0].raw_bytes);
+    assert_ne!(
+        component.imports[0].raw_bytes(),
+        server.imports[0].raw_bytes()
+    );
 }
 
 #[test]
@@ -1653,7 +2520,7 @@ fn service_cache_invalidation_removes_matching_package_entries() {
 
 #[test]
 fn service_reports_and_removes_per_project_cache_shards() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let storage = common::temp_workspace("import-lens-service-cache-storage");
@@ -1711,7 +2578,7 @@ fn service_reports_and_removes_per_project_cache_shards() {
 
 #[test]
 fn cache_status_reports_total_budget_registry_and_per_project_counts() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
     let storage = common::temp_workspace("import-lens-service-cache-status-observability");
@@ -1920,8 +2787,8 @@ fn remove_registry_scope_clears_only_registry() {
 }
 
 #[test]
-fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
+fn remove_all_clears_registry_resolvers_and_l1_even_when_no_shard_removed() {
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .expect("graph cache test lock should be available");
 
@@ -1954,16 +2821,6 @@ fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
     assert!(
         shared_file_size_cache().contains_path(&l1_path),
         "L1 aggregate should be seeded before the clear"
-    );
-
-    // Seed the module-graph cache under a unique entry that exists on disk.
-    let graph_workspace = temp_workspace();
-    let graph_entry = graph_workspace.join("entry.ts");
-    fs::write(&graph_entry, "export const value = 1;\n").expect("graph entry should be written");
-    let _ = build_module_graph_cached(&graph_entry).expect("module graph should build");
-    assert!(
-        peek_cached_module_paths(&graph_entry, ImportRuntime::Component).is_some(),
-        "module graph should be seeded before the clear"
     );
 
     let before_resolvers = shared_resolvers();
@@ -2002,11 +2859,6 @@ fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
         !shared_file_size_cache().contains_path(&l1_path),
         "All must clear the L1 file-size cache even when no shard was removed"
     );
-    // Module-graph cache cleared even though no shard was removed (X-21).
-    assert!(
-        peek_cached_module_paths(&graph_entry, ImportRuntime::Component).is_none(),
-        "All must clear the module-graph cache even when no shard was removed"
-    );
     // Generation bumped (X-17).
     assert!(
         import_lens_daemon::cache::memory::cache_generation() > before_gen,
@@ -2014,42 +2866,6 @@ fn remove_all_clears_registry_resolvers_l1_graph_even_when_no_shard_removed() {
     );
 
     fs::remove_dir_all(&l1_workspace).expect("l1 workspace should be removed");
-    fs::remove_dir_all(&graph_workspace).expect("graph workspace should be removed");
-}
-
-#[test]
-fn service_cache_miss_preserves_existing_module_graph_cache() {
-    let _graph_cache_guard = GRAPH_CACHE_TEST_LOCK
-        .lock()
-        .expect("graph cache test lock should be available");
-    let workspace = temp_workspace();
-    let package_root = workspace.join("node_modules").join("graph-cache-lib");
-    fs::create_dir_all(&package_root).expect("package root should be created");
-    fs::write(
-        package_root.join("package.json"),
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
-    )
-    .expect("package manifest should be written");
-    fs::write(package_root.join("index.js"), "export const value = 1;")
-        .expect("entry should be written");
-    let entry_path = workspace
-        .join("node_modules")
-        .join("graph-cache-lib")
-        .join("index.js");
-    clear_module_graph_cache();
-    let cached_before = build_module_graph_cached(&entry_path).expect("graph should build");
-    let service = ImportLensService::new(None, false);
-
-    let response = service.handle_batch(package_batch(&workspace, 3, "graph-cache-lib", "value"));
-    let cached_after = build_module_graph_cached(&entry_path).expect("graph should stay cached");
-
-    clear_module_graph_cache();
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert_eq!(response.imports[0].error, None);
-    assert!(
-        Arc::ptr_eq(&cached_before, &cached_after),
-        "service cache misses should reuse valid module graph cache entries",
-    );
 }
 
 #[test]
@@ -2076,7 +2892,7 @@ fn service_revalidates_cache_when_relative_dependency_changes() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
     assert!(!second.imports[0].cache_hit);
-    assert_ne!(first.imports[0].raw_bytes, second.imports[0].raw_bytes);
+    assert_ne!(first.imports[0].raw_bytes(), second.imports[0].raw_bytes());
 }
 
 #[test]
@@ -2103,11 +2919,15 @@ fn service_revalidates_cache_when_transitive_package_dependency_changes() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
     assert!(!second.imports[0].cache_hit);
-    assert_ne!(first.imports[0].raw_bytes, second.imports[0].raw_bytes);
+    assert_ne!(first.imports[0].raw_bytes(), second.imports[0].raw_bytes());
 }
 
+/// A manifest the resolver cannot use leaves the import with no cache KEY — the key is derived
+/// from the resolved package — so it is re-analyzed every time and never cached. That has not
+/// changed. What has is the answer: it used to be the package directory's bytes on disk, dressed
+/// up as five compressed sizes. It is Unmeasured now (ADR-0006 §1).
 #[test]
-fn service_does_not_cache_manifest_fallback_results() {
+fn service_reports_an_unusable_manifest_as_unmeasured_and_caches_nothing() {
     let workspace = temp_workspace();
     write_versionless_package(&workspace);
     let service = ImportLensService::new(None, false);
@@ -2121,68 +2941,62 @@ fn service_does_not_cache_manifest_fallback_results() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
     assert!(!second.imports[0].cache_hit);
-    assert!(
-        first.imports[0]
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "manifest_fallback"),
+    assert_eq!(first.imports[0].sizes(), None, "{first:?}");
+    assert_eq!(
+        first.imports[0].unmeasured_stage(),
+        Some("package_manifest"),
         "{first:?}",
     );
 }
 
+// The pre-cutover engine aliased a Named result into the Namespace cache key
+// for side-effectful packages because it sized both identically. Rolldown
+// still shakes pure unused exports under `sideEffects: true`, so the sizes
+// legitimately differ and each import kind must compute its own entry.
 #[test]
-fn service_caches_full_package_variant_for_conservative_named_imports() {
+fn service_does_not_alias_named_results_to_namespace_cache() {
     let workspace = temp_workspace();
     write_effectful_package(&workspace);
     let service = ImportLensService::new(None, false);
 
     let named = service.handle_batch(effectful_batch(&workspace, 1, ImportKind::Named));
     let namespace = service.handle_batch(effectful_batch(&workspace, 2, ImportKind::Namespace));
+    let namespace_again =
+        service.handle_batch(effectful_batch(&workspace, 3, ImportKind::Namespace));
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!named.imports[0].cache_hit);
-    assert!(namespace.imports[0].cache_hit);
-    assert_eq!(named.imports[0].raw_bytes, namespace.imports[0].raw_bytes);
-}
-
-#[test]
-fn service_does_not_alias_graph_only_side_effect_result_to_namespace_cache() {
-    let workspace = temp_workspace();
-    write_array_graph_effects_package(&workspace);
-    let service = ImportLensService::new(None, false);
-
-    let named = service.handle_batch(graph_effects_batch(&workspace, 1, ImportKind::Named));
-    let namespace = service.handle_batch(graph_effects_batch(&workspace, 2, ImportKind::Namespace));
-
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert!(!named.imports[0].cache_hit);
-    assert!(named.imports[0].side_effects, "{named:?}");
     assert!(!namespace.imports[0].cache_hit);
+    assert!(namespace_again.imports[0].cache_hit);
+    assert!(namespace.imports[0].raw_bytes() >= named.imports[0].raw_bytes());
 }
 
 #[test]
-fn service_does_not_alias_missing_export_result_to_namespace_cache() {
+fn service_caches_a_deterministic_missing_export_failure() {
     let workspace = temp_workspace();
     write_missing_export_effectful_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let named = service.handle_batch(missing_effectful_batch(&workspace, 1, ImportKind::Named));
-    let namespace = service.handle_batch(missing_effectful_batch(
-        &workspace,
-        2,
-        ImportKind::Namespace,
-    ));
+    let first = service.handle_batch(missing_effectful_batch(&workspace, 1, ImportKind::Named));
+    // The SAME request again. A `missing_export` failure is a property of the package's bytes: it
+    // will fail identically every time, so it is cached (ADR-0006, invariant 3) and this second
+    // request must be answered without re-entering the engine.
+    let second = service.handle_batch(missing_effectful_batch(&workspace, 2, ImportKind::Named));
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert!(!named.imports[0].cache_hit);
-    assert!(
-        named.imports[0]
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "exports"),
-        "{named:?}",
+    assert!(!first.imports[0].cache_hit);
+    assert_eq!(first.imports[0].sizes(), None, "{first:?}");
+    assert_eq!(
+        first.imports[0].unmeasured_stage(),
+        Some("missing_export"),
+        "{first:?}",
     );
-    assert!(!namespace.imports[0].cache_hit);
+    assert!(
+        second.imports[0].cache_hit,
+        "a deterministic failure is cached; refusing it would re-enter the engine for a broken \
+         package on every analysis, forever, on one of only two permits: {second:?}",
+    );
+    assert_eq!(second.imports[0].sizes(), None, "{second:?}");
 }
 
 #[test]
@@ -2246,33 +3060,77 @@ fn service_marks_shared_transitive_modules_in_batch_results() {
     );
 }
 
+/// On a cold document EVERY import arrives by push, so if the streamed builds do not annotate
+/// shared bytes, the shared-dependency insight silently never appears on a first analysis —
+/// exactly the documents the user just opened.
+///
+/// It cannot be annotated per push: `shared_bytes` is a relation between two imports of the same
+/// file, so it is not knowable until the last one has been measured. Each import is therefore
+/// delivered the moment its own number lands, and the stream closes with one correction push
+/// carrying the shared figures for the whole document.
 #[test]
-fn service_marks_shared_bytes_outside_public_top_ten_breakdown() {
+fn streamed_imports_get_their_shared_bytes_when_the_document_closes() {
+    use import_lens_daemon::document::IgnoreRuleResolver;
+    use import_lens_daemon::pipeline::analyze::AnalysisContext;
+    use std::collections::HashMap;
+
     let workspace = temp_workspace();
-    write_shared_packages_with_many_unique_modules(&workspace);
+    write_shared_packages(&workspace);
     let service = ImportLensService::new(None, false);
+    let source = "import { left } from 'left-lib';\nimport { right } from 'right-lib';";
 
-    let response = service.handle_batch(wide_shared_batch(&workspace, 24));
+    let analysis = service.handle_analyze_document_streaming(
+        AnalyzeDocumentRequest {
+            message_type: "analyze_document".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 71,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            active_document_path: active_document_path(&workspace),
+            source: source.to_owned(),
+        },
+        &IgnoreRuleResolver::default(),
+    );
+    assert_eq!(
+        analysis.pending.len(),
+        2,
+        "a cold document defers every import"
+    );
 
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert_eq!(response.imports.len(), 2);
-    for result in &response.imports {
-        assert_eq!(
-            result.module_breakdown.as_ref().map(Vec::len),
-            Some(10),
-            "{result:?}",
-        );
+    let context = AnalysisContext {
+        workspace_root: PathBuf::from(workspace.to_string_lossy().to_string()),
+        active_document_path: PathBuf::from(active_document_path(&workspace)),
+    };
+    let pushed = Mutex::new(Vec::new());
+    service.complete_pending_imports(
+        &context,
+        analysis.measured,
+        analysis.pending,
+        || true,
+        |results, identities| {
+            pushed
+                .lock()
+                .expect("pushes")
+                .extend(identities.into_iter().zip(results));
+        },
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    // Later pushes supersede earlier ones for the same import, exactly as the client's merge does.
+    let delivered = pushed
+        .into_inner()
+        .expect("pushes")
+        .into_iter()
+        .map(|(identity, result)| (identity.specifier, result.shared_bytes))
+        .collect::<HashMap<_, _>>();
+
+    for specifier in ["left-lib", "right-lib"] {
         assert!(
-            !result.module_breakdown.as_ref().is_some_and(|modules| {
-                modules
-                    .iter()
-                    .any(|module| module.path.contains("shared-small-util"))
-            }),
-            "{result:?}",
-        );
-        assert!(
-            result.shared_bytes.is_some_and(|bytes| bytes > 0),
-            "{result:?}",
+            delivered
+                .get(specifier)
+                .copied()
+                .flatten()
+                .is_some_and(|bytes| bytes > 0),
+            "{specifier} must end up carrying the bytes it shares with its sibling: {delivered:?}"
         );
     }
 }
@@ -2290,7 +3148,7 @@ fn service_computes_file_size_with_shared_module_deduplication() {
     let summed_raw = batch
         .imports
         .iter()
-        .map(|result| result.raw_bytes)
+        .filter_map(|result| result.raw_bytes())
         .sum::<u64>();
     assert_eq!(file_size.request_id, 23);
     assert_eq!(file_size.error, None);
@@ -2310,7 +3168,7 @@ fn service_computes_file_size_with_shared_module_deduplication() {
 }
 
 #[test]
-fn service_computes_file_size_for_commonjs_only_imports_conservatively() {
+fn service_computes_file_size_for_commonjs_imports() {
     let workspace = temp_workspace();
     write_cjs_file_size_package(&workspace);
     let service = ImportLensService::new(None, false);
@@ -2323,34 +3181,7 @@ fn service_computes_file_size_for_commonjs_only_imports_conservatively() {
     assert!(file_size.raw_bytes > 0, "{file_size:?}");
     assert!(file_size.minified_bytes > 0, "{file_size:?}");
     assert_eq!(file_size.imports.len(), 1);
-    assert!(
-        file_size.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "file_size" && diagnostic.message.contains("CommonJS")
-        }),
-        "{file_size:?}",
-    );
-}
-
-#[test]
-fn service_file_size_includes_graph_only_side_effect_modules() {
-    let workspace = temp_workspace();
-    write_array_graph_effects_package(&workspace);
-    let service = ImportLensService::new(None, false);
-
-    let response = service.handle_file_size(graph_effects_file_size_request(&workspace, 26));
-
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert_eq!(response.error, None);
-    assert_eq!(response.imports.len(), 1);
-    assert_eq!(response.raw_bytes, response.imports[0].raw_bytes);
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic.stage == "side_effects"
-            && diagnostic.details.iter().any(|detail| {
-                detail
-                    .replace('\\', "/")
-                    .contains("dist/polyfill/browser/setup.js")
-            })
-    }));
+    assert!(file_size.imports[0].is_cjs, "{file_size:?}");
 }
 
 #[test]
@@ -2385,7 +3216,11 @@ fn protocol_error_batch_response_rejects_all_imports_without_analysis() {
         Some("hello message not received")
     );
     assert_eq!(response.imports[0].diagnostics[0].stage, "protocol");
-    assert_eq!(response.imports[0].raw_bytes, 0);
+    assert_eq!(
+        response.imports[0].sizes(),
+        None,
+        "a request rejected before any build ran has no size — not a zero"
+    );
 }
 
 #[test]
@@ -2437,5 +3272,58 @@ fn package_json_analysis_includes_cached_registry_hints_when_requested() {
             .as_ref()
             .and_then(|hint| hint.latest_version.as_deref()),
         Some("1.1.0")
+    );
+}
+
+/// A cached DETERMINISTIC failure must expire against the bytes it was derived from — the whole
+/// graph, not just the entry the caller named.
+///
+/// ADR-0006 widened the cache to take a deterministic failure, on the reasoning that it is a
+/// property of the package's bytes and "the cache is keyed by those bytes' fingerprints, so it
+/// expires exactly when the answer would change". That promise is only true if the failure is
+/// fingerprinted against the graph. A first-party workspace package whose entry merely RE-EXPORTS
+/// the module that fails to parse would otherwise serve the cached failure forever after the user
+/// fixed it: nothing the cache was watching moved. The engine reports what it had loaded when it
+/// gave up, and that is what the failure is keyed on.
+#[test]
+fn a_cached_deterministic_failure_expires_when_the_module_that_caused_it_is_fixed() {
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("broken-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+    )
+    .expect("manifest should be written");
+    // The entry is fine. The module it re-exports is not — so a fingerprint set built from the
+    // entry and the manifest alone would never notice the fix below.
+    fs::write(
+        package_root.join("index.js"),
+        "export { value } from './broken.js';\n",
+    )
+    .expect("entry should be written");
+    fs::write(package_root.join("broken.js"), "export const value = ;\n")
+        .expect("broken module should be written");
+
+    let service = ImportLensService::new(None, false);
+    let broken = service.handle_batch(package_batch(&workspace, 1, "broken-lib", "value"));
+
+    assert_eq!(
+        broken.imports[0].sizes(),
+        None,
+        "the premise: a package whose transitive module cannot be parsed has no size",
+    );
+    assert_eq!(broken.imports[0].unmeasured_stage(), Some("parse"));
+
+    // The user fixes the module the entry re-exports. The entry itself never changes.
+    fs::write(package_root.join("broken.js"), "export const value = 1;\n")
+        .expect("fixed module should be written");
+
+    let fixed = service.handle_batch(package_batch(&workspace, 2, "broken-lib", "value"));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(
+        fixed.imports[0].sizes().is_some(),
+        "the cached failure must expire against the module that caused it, not the entry: {fixed:?}",
     );
 }

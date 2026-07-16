@@ -1,0 +1,194 @@
+import { compilerStackConfig } from "./compiler-stack.config.mjs";
+
+const semverPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
+
+const exactPin = (crate, cargoToml) => {
+  const match = cargoToml.match(new RegExp(`^${crate}\\s*=\\s*"(=[^"]+)"$`, "mu"));
+  return match?.[1].slice(1);
+};
+
+export const validateCurrentStack = (cargoToml) => {
+  if (/^oxc_mangler\s*=/mu.test(cargoToml)) {
+    throw new Error("oxc_mangler must not be present in daemon/Cargo.toml");
+  }
+
+  const crateVersions = compilerStackConfig.oxcCrates.map((crate) => {
+    const version = exactPin(crate, cargoToml);
+    if (!version) {
+      throw new Error(`Missing exact pin (=) for OXC crate: ${crate}`);
+    }
+    return version;
+  });
+  const uniqueCrateVersions = new Set(crateVersions);
+  if (uniqueCrateVersions.size !== 1) {
+    throw new Error(
+      `Current OXC crate versions are not coordinated: ${[...uniqueCrateVersions].join(", ")}`,
+    );
+  }
+
+  if (!exactPin("oxc_resolver", cargoToml)) {
+    throw new Error("Missing exact pin (=) for oxc_resolver");
+  }
+
+  // The daemon and Rolldown must read one `sideEffects` array through ONE matcher.
+  // A floating range here would let Cargo hand the daemon a different copy from the
+  // one rolldown_utils got, and the two would disagree in silence.
+  if (!exactPin(compilerStackConfig.globMatcherCrate, cargoToml)) {
+    throw new Error(`Missing exact pin (=) for ${compilerStackConfig.globMatcherCrate}`);
+  }
+
+  // The engine is production (spec §11 Phase 2): the rolldown family is an
+  // unconditional exact-pinned dependency, like the OXC crates.
+  for (const crate of rolldownFamilyCrates()) {
+    if (!exactPin(crate, cargoToml)) {
+      throw new Error(`Missing exact pin (=) for ${crate}`);
+    }
+  }
+  if (/^\s*rolldown[^=]*=\s*\{[^}]*optional\s*=\s*true/mu.test(cargoToml)) {
+    throw new Error("rolldown-family dependencies must not regress to optional");
+  }
+};
+
+export const rolldownFamilyCrates = () => [
+  compilerStackConfig.rolldownCrate,
+  ...compilerStackConfig.rolldownSupportCrates,
+];
+
+export const validateVersion = (label, version) => {
+  if (!semverPattern.test(version)) {
+    throw new Error(`Invalid ${label} version: ${version}`);
+  }
+};
+
+export const validateAvailableVersions = async (
+  fetchJson,
+  { rolldownVersion, oxcVersion, resolverVersion },
+) => {
+  await Promise.all(
+    rolldownFamilyCrates().map((crate) =>
+      crateVersion(fetchJson, crate, rolldownVersion).catch((error) => {
+        throw new Error(`Unavailable ${crate} version ${rolldownVersion}: ${error.message}`);
+      }),
+    ),
+  );
+
+  // Cargo's probe resolution proves the umbrella graph, but not that every
+  // retained DIRECT crate exists at the monorepo version -- the umbrella does
+  // not depend on all of them.
+  await Promise.all(
+    compilerStackConfig.oxcCrates.map((crate) =>
+      crateVersion(fetchJson, crate, oxcVersion).catch((error) => {
+        throw new Error(`Unavailable OXC crate ${crate}@${oxcVersion}: ${error.message}`);
+      }),
+    ),
+  );
+
+  await crateVersion(fetchJson, "oxc_resolver", resolverVersion).catch((error) => {
+    throw new Error(`Unavailable oxc_resolver version ${resolverVersion}: ${error.message}`);
+  });
+};
+
+export const latestCrateVersion = async (fetchJson, crate) => {
+  const payload = await fetchJson(`https://crates.io/api/v1/crates/${crate}`);
+  const version = payload?.crate?.max_stable_version ?? payload?.crate?.newest_version;
+  if (!version) {
+    throw new Error(`Could not resolve latest crate version for ${crate}`);
+  }
+  return version;
+};
+
+export const updateCargoToml = (
+  cargoToml,
+  { rolldownVersion, oxcVersion, resolverVersion, globMatcherVersion },
+) => {
+  let next = cargoToml;
+  for (const crate of compilerStackConfig.oxcCrates) {
+    next = next.replace(
+      new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"),
+      `${crate} = "=${oxcVersion}"`,
+    );
+  }
+  next = next.replace(/^oxc_resolver\s*=\s*"[^"]+"$/gmu, `oxc_resolver = "=${resolverVersion}"`);
+  for (const crate of rolldownFamilyCrates()) {
+    next = next.replace(
+      new RegExp(`^${crate}\\s*=\\s*"[^"]+"$`, "gmu"),
+      `${crate} = "=${rolldownVersion}"`,
+    );
+  }
+  const globMatcher = compilerStackConfig.globMatcherCrate;
+  return next.replace(
+    new RegExp(`^${escapeRegExp(globMatcher)}\\s*=\\s*"[^"]+"$`, "gmu"),
+    `${globMatcher} = "=${globMatcherVersion}"`,
+  );
+};
+
+export const updateManifest = (manifest) => {
+  const next = structuredClone(manifest);
+
+  next.scripts = {
+    ...(next.scripts ?? {}),
+    "deps:update:compiler": "node scripts/update-compiler-stack.mjs",
+    // General refresh stays range-respecting, but success now requires the
+    // recorded compiler stack to survive it, so it is a script that restores
+    // and validates rather than a bare `pnpm update && cargo update` chain.
+    "deps:update:safe": "node scripts/deps-update-safe.mjs",
+  };
+
+  return `${JSON.stringify(next, null, 2)}\n`;
+};
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+export const replaceKnownVersions = (content, { rolldownVersion, oxcVersion, resolverVersion }) => {
+  // Replace all three pinned versions in a single word-boundary pass. Word
+  // boundaries keep a version that is only a substring of a longer number (a
+  // build id, an unrelated figure) intact, and a single pass means replacing
+  // one version can never corrupt another's needle - a hazard of chained
+  // replaceAll if one version string ever contained another.
+  const replacements = new Map([
+    [compilerStackConfig.currentRolldownVersion, rolldownVersion],
+    [compilerStackConfig.currentOxcVersion, oxcVersion],
+    [compilerStackConfig.currentResolverVersion, resolverVersion],
+  ]);
+  const needles = [...replacements.keys()]
+    .sort((left, right) => right.length - left.length)
+    .map(escapeRegExp);
+  const pattern = new RegExp(`\\b(?:${needles.join("|")})\\b`, "gu");
+
+  return content.replace(pattern, (match) => replacements.get(match) ?? match);
+};
+
+export const updateConfig = (
+  content,
+  { rolldownVersion, oxcVersion, resolverVersion, globMatcherVersion },
+) =>
+  content
+    .replace(/currentRolldownVersion:\s*"[^"]+"/u, `currentRolldownVersion: "${rolldownVersion}"`)
+    .replace(/currentOxcVersion:\s*"[^"]+"/u, `currentOxcVersion: "${oxcVersion}"`)
+    .replace(/currentResolverVersion:\s*"[^"]+"/u, `currentResolverVersion: "${resolverVersion}"`)
+    .replace(
+      /currentGlobMatcherVersion:\s*"[^"]+"/u,
+      `currentGlobMatcherVersion: "${globMatcherVersion}"`,
+    );
+
+export const formatCompilerUpdateResult = ({
+  dryRun,
+  rolldownVersion,
+  oxcVersion,
+  resolverVersion,
+  globMatcherVersion,
+  changedFiles,
+}) => {
+  const mode = dryRun ? "Dry run" : "Updated";
+  const files =
+    changedFiles.length === 0 ? "No file edits needed." : `Files: ${changedFiles.join(", ")}`;
+  return `${mode}: rolldown ${rolldownVersion}, OXC ${oxcVersion}, oxc_resolver ${resolverVersion}, ${compilerStackConfig.globMatcherCrate} ${globMatcherVersion}\n${files}\n`;
+};
+
+const crateVersion = async (fetchJson, crate, version) => {
+  const payload = await fetchJson(`https://crates.io/api/v1/crates/${crate}/${version}`);
+  const returnedVersion = payload?.version?.num;
+  if (returnedVersion !== version) {
+    throw new Error(`crates.io returned ${returnedVersion ?? "no version"}`);
+  }
+};

@@ -1,4 +1,9 @@
 import type { ImportResult, RefreshedImportIdentity } from "../ipc/protocol.js";
+import {
+  importIdentityKey,
+  importIdentityOf,
+  refreshedImportIdentityOf,
+} from "./importIdentity.js";
 import type { ImportAnalysisState } from "./state.js";
 
 export interface RefreshMergeOutcome {
@@ -9,10 +14,11 @@ export interface RefreshMergeOutcome {
 export interface RefreshMergeOptions {
   /**
    * Per-result import identity, index-aligned with `results` (the SWR push carries
-   * it). Present -> results are keyed by full identity (specifier + kind + named)
-   * so two imports of the same package differing only by import kind / named
-   * exports each receive their OWN refreshed size. Absent or length-mismatched
-   * (older daemon) -> specifier-only keying, preserving legacy behavior.
+   * it). Present -> results are keyed by full identity (specifier + kind + named +
+   * runtime) so two imports of the same package differing only by import kind /
+   * named exports / runtime each receive their OWN refreshed size. Absent or
+   * length-mismatched (older daemon) -> specifier-only keying, preserving legacy
+   * behavior.
    */
   identities?: readonly RefreshedImportIdentity[];
   /**
@@ -25,25 +31,28 @@ export interface RefreshMergeOptions {
   isCurrent?: boolean;
 }
 
-// A stable, order-independent key for one import. specifier alone is NOT unique
-// (same-specifier variants differ by kind / named), so the full identity keys the
-// merge. NUL/SOH separators keep field boundaries unambiguous (a specifier or
-// export name cannot contain them), and `named` is sorted so a differing source
-// order still yields the same key.
-const identityKey = (specifier: string, importKind: string, named: readonly string[]): string =>
-  `${specifier}\u0000${importKind}\u0000${[...named].sort().join("\u0001")}`;
-
 /**
- * Pure merge of background-refreshed sizes (the daemon's stale-while-revalidate
- * push) into a document's states, matched by a stable per-import identity. Order
- * is preserved; unmatched states pass through untouched. Insights are dropped on a
- * match: they were computed against the replaced (stale) result, so carrying them
- * over would caption the fresh size with the old value's commentary — the next
- * full analysis recomputes them.
+ * Pure merge of pushed import results into a document's states, matched by a stable
+ * per-import identity ({@link importIdentityKey} — specifier alone is NOT unique, and the
+ * two variants of `import React, { useState } from "react"` would otherwise collide on one
+ * key and collapse into a single row). Two kinds of push arrive here and both are merged the
+ * same way: a background stale-while-revalidate refresh, and an import the daemon answered
+ * `loading` because its engine build had not run when the response went out.
  *
- * A superseded batch (`options.isCurrent === false`) is dropped wholesale so a
- * refresh computed against an old document state cannot overwrite the current
- * (post-edit) states — mirroring `listener.ts`'s `freshness.isCurrent` gate.
+ * Order is preserved; unmatched states pass through untouched. Insights are dropped on
+ * a match: they were computed against the replaced result, so carrying them over would
+ * caption a fresh size with the old value's commentary. The caller recomputes them.
+ *
+ * A superseded batch (`options.isCurrent === false`) is dropped wholesale so a refresh
+ * computed against an old document state cannot overwrite the current (post-edit)
+ * states — mirroring `listener.ts`'s `freshness.isCurrent` gate.
+ *
+ * **An errored result may fill a state that has no result, and may never replace one
+ * that has.** The two pushes need opposite things from an error, and the state says
+ * which: a revalidation that failed must not throw away a good (if stale) size the user
+ * is looking at, while a `loading` import whose build genuinely failed has nothing to
+ * protect and would otherwise sit at "Calculating..." for ever — the failure IS its
+ * answer.
  *
  * Kept vscode-free (the store wraps it) so the merge semantics are unit-testable
  * under the repo's plain `node --test` harness.
@@ -65,18 +74,11 @@ export const mergeRefreshedResults = (
   // than silently matching nothing). Same-specifier collisions are impossible once
   // a valid identity set is present.
   const useIdentity = identities !== undefined && identities.length === results.length;
-  const cacheableResults = results
-    .map((result, index) => ({ result, index }))
-    .filter(({ result }) => result.error === null);
 
   const byKey = new Map<string, ImportResult>(
-    cacheableResults.map(({ result, index }) => {
+    results.map((result, index) => {
       const key = useIdentity
-        ? identityKey(
-            identities[index].specifier,
-            identities[index].import_kind,
-            identities[index].named,
-          )
+        ? importIdentityKey(refreshedImportIdentityOf(identities[index]))
         : result.specifier;
       return [key, result];
     }),
@@ -85,11 +87,16 @@ export const mergeRefreshedResults = (
   let changed = false;
   const next = existing.map((state) => {
     const key = useIdentity
-      ? identityKey(state.detected.specifier, state.detected.importKind, state.detected.named)
+      ? importIdentityKey(importIdentityOf(state.detected))
       : state.detected.specifier;
     const refreshed = byKey.get(key);
 
     if (!refreshed) {
+      return state;
+    }
+
+    // Never downgrade a measurement to a failure; an import that has none takes what lands.
+    if (refreshed.error !== null && state.result !== undefined) {
       return state;
     }
 

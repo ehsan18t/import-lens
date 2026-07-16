@@ -13,7 +13,7 @@ use std::{
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CURRENT_SCHEMA_VERSION: u64 = 7;
+const CURRENT_SCHEMA_VERSION: u64 = 8;
 
 mod common;
 
@@ -65,30 +65,28 @@ fn opening_a_stale_schema_db_recreates_it_empty() {
 }
 
 fn result(specifier: &str) -> ImportResult {
-    ImportResult {
-        freshness: import_lens_daemon::ipc::protocol::ResultFreshness::fresh(),
-        specifier: specifier.to_owned(),
-        raw_bytes: 10,
-        minified_bytes: 8,
-        gzip_bytes: 7,
-        brotli_bytes: 6,
-        zstd_bytes: 5,
-        cache_hit: false,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: ConfidenceLevel::High,
-        confidence_reasons: vec!["test fixture confidence".to_owned()],
-        error: None,
-        diagnostics: vec![ImportDiagnostic {
-            stage: "test".to_owned(),
-            message: "cached".to_owned(),
-            details: Vec::new(),
-        }],
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    }
+    let mut result = ImportResult::measured(
+        specifier,
+        import_lens_daemon::ipc::protocol::MeasuredSizes {
+            raw_bytes: 10,
+            minified_bytes: 8,
+            gzip_bytes: 7,
+            brotli_bytes: 6,
+            zstd_bytes: 5,
+        },
+    );
+    result.truly_treeshakeable = true;
+    result.confidence = ConfidenceLevel::High;
+    result.confidence_reasons = vec!["test fixture confidence".to_owned()];
+    result.diagnostics = vec![ImportDiagnostic {
+        // A real informational stage. A fabricated one ("test") is now REFUSED by every durable
+        // store — an unclassified stage is not durable (`pipeline::stage`) — so a fixture that used
+        // one was building a result the cache correctly declines to keep.
+        stage: import_lens_daemon::engine::diagnostic_stage::EXTERNAL.to_owned(),
+        message: "cached".to_owned(),
+        details: Vec::new(),
+    }];
+    result
 }
 
 fn read_schema_version(storage_path: &Path) -> u64 {
@@ -487,6 +485,68 @@ fn cached(specifier: &str) -> CachedImport {
         last_seq: Arc::new(AtomicU64::new(1)),
         persisted_seq: Arc::new(AtomicU64::new(1)),
     }
+}
+
+/// **The L2 WRITE gate, which nothing detected.** (ADR-0006, invariant 3: "the gate lives inside
+/// each durable store".)
+///
+/// `DiskCache` gates a non-durable result on the way **in** *and* on the way **out**, and only the
+/// read gate had a test — so the write gate could be deleted with the whole suite green. That is a
+/// guard nobody is guarding: the two are not redundant, they cover different windows. The read gate
+/// evicts a bad row that is *already on disk*; the write gate is what stops a transient outcome
+/// reaching disk **at all**, which matters because redb outlives the process and because every future
+/// reader of that row (a scan, a rollup, a byte-budget eviction, a `load_recent` prewarm) is one more
+/// path that has to remember to ask.
+///
+/// So this asserts on the **raw redb table**, past both gates: a `panic` result — transient, a
+/// property of this moment's scheduling and not of the package's bytes — must never become a row.
+/// The measured result beside it must, or the assertion would pass on an empty database.
+#[test]
+fn a_transient_result_never_reaches_the_disk_table() {
+    use import_lens_daemon::engine::stage;
+    use redb::ReadableTableMetadata;
+
+    let storage = temp_storage();
+    fs::create_dir_all(&storage).expect("storage dir");
+
+    {
+        let disk = DiskCache::new(Some(storage.clone()), true);
+
+        let mut transient = cached("flaky-lib@1::default");
+        transient.result = ImportResult::unmeasured(
+            "flaky-lib",
+            stage::PANIC,
+            "the build unwound into the boundary's catch_unwind",
+            Vec::new(),
+        );
+        disk.insert("flaky-lib@1::default", &transient)
+            .expect("a refused insert is a no-op, never an error");
+
+        // The control: a real measurement, which MUST land, or an empty table would prove nothing.
+        disk.insert("solid-lib@1::default", &cached("solid-lib@1::default"))
+            .expect("a measured result is durable");
+
+        disk.flush_pending_inserts();
+    }
+
+    let db = Database::open(db_path(&storage)).expect("reopen");
+    let read = db.begin_read().expect("read");
+    let table = read.open_table(CACHE_TABLE).expect("cache table");
+
+    assert!(
+        table.get("solid-lib@1::default").expect("read").is_some(),
+        "test setup: a measured result must reach the disk table, or this test proves nothing"
+    );
+    assert!(
+        table.get("flaky-lib@1::default").expect("read").is_none(),
+        "a transient result must never become a row. The read gate would evict it on the way out, \
+         but L2 outlives the process and every other reader of the table - the byte-budget scan, \
+         the rollup, the prewarm's load_recent - is one more path that has to remember to ask"
+    );
+    assert_eq!(table.len().expect("len"), 1);
+
+    drop(db);
+    fs::remove_dir_all(storage).expect("cleanup");
 }
 
 #[test]

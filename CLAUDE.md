@@ -8,6 +8,17 @@ Project instructions for agents working in this repository.
 - Use `pnpm` as the npm package manager. Do not use `npm` or `yarn` for project scripts or dependency changes.
 - Windows is the primary supported platform right now. Keep Windows compilation and packaging working before broadening to other targets.
 - The SRS is the source of truth for intended behavior: `docs/ImportLens-SRS.md`.
+- Known issues we have decided **not** to fix live in `docs/known-issues.md`. **Read it before reporting or "fixing" something** — it may already be a recorded, deliberate decision (some of them were "fixed" once and the fix was worse than the issue).
+
+## Deciding What To Fix Now
+
+A finding being **real** is not the same as it being **blocking**.
+
+> **Fix it in the current piece of work only if it (a) shows the user a WRONG NUMBER, or (b) can WEDGE the system or lose data.**
+
+Everything else gets an entry in `docs/known-issues.md` — stating what actually happens and why it is not fixed — and goes back in the queue. Add the entry when you **decide** not to fix something, not when you find it.
+
+If a fix chains into a third round on the same sub-item, stop and re-check it against the plan. Do not let the next review report decide your priorities for you.
 
 ## File And Formatting Rules
 
@@ -47,9 +58,9 @@ Anything else is an **Echo**: a copy of a config file that throws when the copy 
 Drift and Echo look identical from a distance — both read a config and assert something about it. The discriminator is where the expected value comes from:
 
 ```js
-// Drift: the expectation is derived. Bump the version in oxc-stack.config.mjs,
+// Drift: the expectation is derived. Bump the version in compiler-stack.config.mjs,
 // forget daemon/Cargo.toml, and this fails. It knows something the file doesn't.
-assert.match(cargoToml, new RegExp(`oxc_parser = "~${oxcStackConfig.currentOxcVersion}"`));
+assert.match(cargoToml, new RegExp(`oxc_parser = "=${compilerStackConfig.currentOxcVersion}"`));
 
 // Echo: the expectation is a literal. The only way to make this red is to edit
 // the Dockerfile, at which point you already know what you changed.
@@ -60,7 +71,7 @@ assert.match(dockerfile, /^FROM node:24-bookworm$/mu);
 
 **Prefer making drift impossible over testing for drift.** A Drift check is a consolation prize for two sources of truth you could not merge. Before writing one, try to delete the second source. Keep the check only where duplication is genuinely forced — `cli/importlens.mjs` and `extension/src/daemon/platform.ts` each redeclare `daemonRoot` because neither can import `scripts/targets.mjs` at runtime.
 
-**Never assert a dependency version in a test, except oxc coordination.** oxc is the only dependency where a version bump can silently break the app. Do not assert versions of GitHub Actions, pnpm, Node, the Rust toolchain, `@types/vscode`, or any dev tooling. A break there is caught by CI before it ships.
+**Never assert a dependency version in a test, except compiler-stack coordination.** The coordinated compiler stack (rolldown, the OXC monorepo crates, and oxc_resolver) is the only set of dependencies where a version bump can silently break the app. Do not assert versions of GitHub Actions, pnpm, Node, the Rust toolchain, `@types/vscode`, or any dev tooling. A break there is caught by CI before it ships.
 
 Do not:
 
@@ -93,6 +104,8 @@ pnpm package:win32-x64
 - Never commit to `main`. Branch first — including for design and plan documents.
 - Follow Conventional Commits: `type(scope)!: subject` (<=72 chars, no trailing period). Types: `feat fix perf docs refactor style test chore ci build` (kept in sync with `cliff.toml`).
 - A commit body (description) is REQUIRED and must explain the user-visible change and important technical rationale — it feeds the AI changelog. The `commit-msg` hook enforces this locally; CI enforces it on pull requests.
+- **Do NOT hard-wrap commit message bodies.** Write each paragraph as one continuous line and separate paragraphs with a single blank line. Never insert line breaks inside a paragraph to fit an assumed column width; viewers and tooling soft-wrap. A body is a handful of single-line paragraphs, not a block of fixed-width lines. (Pass each paragraph as its own `-m` argument, which produces exactly this shape.)
+- **A history rewrite bypasses the `commit-msg` hook.** `git commit-tree`, `filter-branch`, and non-interactive replay scripts write commits without running the hook, so nothing checks the new messages until CI (which validates every commit on the PR). Before moving the branch, self-verify every rewritten message — run `scripts/check-commit-msg.mjs` over each one, or confirm each subject header is `<=72` chars with a body and no hard-wrapping. Do NOT loosen the `<=72` limit to make a red check pass; shorten the subject. (Five over-length squash subjects reached CI exactly this way.)
 - Do not revert user changes unless explicitly asked.
 - Before committing, check `git status --short` and review the staged diff.
 - Hooks are lefthook-managed and installed by `pnpm install`. pre-commit runs Biome (auto-format + re-stage) and TypeScript check, plus clippy and cargo-deny for Rust changes; pre-push runs `pnpm test`. Bypass only in a genuine emergency with `--no-verify` (CI still enforces).

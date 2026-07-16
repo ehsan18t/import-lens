@@ -38,6 +38,23 @@ pub fn bump_cache_generation() {
     CACHE_GENERATION.fetch_add(1, Ordering::Release);
 }
 
+/// Serializes the lib tests that touch [`CACHE_GENERATION`] against the ones that assume it holds
+/// still while they run.
+///
+/// The generation is process-global and the test binary is multi-threaded, so a test that bumps it
+/// can slip between any other test's two reads of it — turning a single-flight follower into its
+/// own leader (`service::analyze_and_cache`, which re-reads the generation per call) or making two
+/// L1 signatures taken moments apart disagree. Neither is a product defect, and both are a coin
+/// flip that comes up tails only when the schedule happens to interleave them, which is the worst
+/// kind of red.
+#[cfg(test)]
+pub(crate) fn hold_cache_generation_steady() -> std::sync::MutexGuard<'static, ()> {
+    static GENERATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GENERATION_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 fn current_cache_generation() -> u64 {
     CACHE_GENERATION.load(Ordering::Acquire)
 }
@@ -655,6 +672,12 @@ impl ImportCache {
     /// analyzed bytes) rather than the generation at insert time. If an
     /// invalidation bumped the generation during analysis, the entry is born
     /// "must re-verify" and cannot be served on the fast path.
+    ///
+    /// **The transience gate lives here**, in the store, not at the call sites (ADR-0006,
+    /// invariant 3). It used to be a predicate — `should_cache_result` — that every caller had to
+    /// remember, while this method took any `ImportResult` at all; the next caller who forgot it
+    /// would write a timed-out build straight into L1 and L2, and nothing would have failed. A
+    /// store that cannot be misused does not depend on anyone remembering.
     pub fn insert_with_fingerprints_at_generation(
         &self,
         key: String,
@@ -662,6 +685,30 @@ impl ImportCache {
         dependency_fingerprints: Vec<FileFingerprint>,
         verified_generation: u64,
     ) {
+        if !result.is_durable() {
+            // Logged, never silent. A refused *failure* is routine (a timeout, a locked file), so
+            // it is debug. A refused **measurement** is not: the sizes are real, and the only thing
+            // keeping them out is a stage `pipeline::stage` has not classified — a misclassification
+            // costs this package its cache forever, so it must be visible. Refusing loudly is the
+            // price of an allowlist, and it is the right way round: the alternative failure mode is
+            // a wrong number nobody ever sees.
+            let stage = result.unmeasured_stage().unwrap_or("none");
+            if result.sizes().is_some() {
+                crate::logging::log_warn(
+                    "cache",
+                    format!(
+                        "refusing to cache a MEASURED result for {key}: a diagnostic carries a \
+                         stage no durable store accepts (see pipeline::stage)"
+                    ),
+                );
+            } else {
+                crate::logging::log_debug(
+                    "cache",
+                    format!("refusing to cache a non-durable result for {key} (stage: {stage})"),
+                );
+            }
+            return;
+        }
         // A freshly computed value is the definitive reset point for this key's
         // `Unknown` graduation window (§4.3.1): clearing here means a later transient
         // error starts a NEW window instead of inheriting a stale `first_seen`/`attempts`
@@ -1068,26 +1115,18 @@ mod tests {
     use super::*;
 
     fn minimal_result(specifier: &str) -> ImportResult {
-        ImportResult {
-            specifier: specifier.to_owned(),
-            raw_bytes: 1,
-            minified_bytes: 1,
-            gzip_bytes: 1,
-            brotli_bytes: 1,
-            zstd_bytes: 1,
-            cache_hit: false,
-            side_effects: false,
-            truly_treeshakeable: true,
-            is_cjs: false,
-            confidence: Default::default(),
-            confidence_reasons: Vec::new(),
-            error: None,
-            diagnostics: Vec::new(),
-            module_breakdown: None,
-            shared_bytes: None,
-            freshness: ResultFreshness::fresh(),
-            internal_contributions: Vec::new(),
-        }
+        let mut result = ImportResult::measured(
+            specifier,
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 1,
+                minified_bytes: 1,
+                gzip_bytes: 1,
+                brotli_bytes: 1,
+                zstd_bytes: 1,
+            },
+        );
+        result.truly_treeshakeable = true;
+        result
     }
 
     fn last_seq_of(cache: &ImportCache, key: &str) -> u64 {

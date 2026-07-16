@@ -60,7 +60,7 @@ export interface AnalysisTransport {
   requestWorkspaceReport(request: WorkspaceReportRequest): Promise<WorkspaceReportResponse | null>;
   invalidatePackage(packageName: string): void;
   invalidateAll(): void;
-  nodeModulesChanged(packageJsonPaths: readonly string[]): void;
+  nodeModulesChanged(packageJsonPaths: readonly string[], tsconfigPaths?: readonly string[]): void;
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void;
   shutdown(): Promise<void>;
   dispose(): void | Promise<void>;
@@ -206,8 +206,11 @@ export class TransportCoordinator implements AnalysisTransport {
     this.#activeTransport?.invalidateAll();
   }
 
-  nodeModulesChanged(packageJsonPaths: readonly string[]): void {
-    this.#activeTransport?.nodeModulesChanged(packageJsonPaths);
+  nodeModulesChanged(
+    packageJsonPaths: readonly string[],
+    tsconfigPaths: readonly string[] = [],
+  ): void {
+    this.#activeTransport?.nodeModulesChanged(packageJsonPaths, tsconfigPaths);
   }
 
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {

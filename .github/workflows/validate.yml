@@ -15,6 +15,11 @@ on:
         required: false
         default: false
         type: boolean
+      run_candidate_packages:
+        description: "Run the real-package qualification suite (installs the pinned fixtures)."
+        required: false
+        default: false
+        type: boolean
       run_performance:
         description: "Run the performance smoke test."
         required: false
@@ -99,7 +104,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
 
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2.0.20
@@ -109,6 +114,72 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+      # `daemon/tests/candidate_packages.rs` carries the correctness gates the
+      # bundler redesign exists for -- zero dangling `__il_` bindings on
+      # css-tree, tree-shaken modules present in `loaded_paths` on date-fns.
+      # Every row is `#[ignore]`d and needs installed fixtures, so `pnpm test`
+      # (`cargo test --workspace`, no `--ignored`) never reaches them. These two
+      # steps are the only place they run automatically.
+      - name: Install candidate fixtures
+        if: ${{ inputs.run_candidate_packages }}
+        run: |
+          # The default runner shell is `bash -e`, without pipefail: a failed
+          # install piped into `tail` would exit 0 and leave the gate running
+          # against a workspace that was never created.
+          set -o pipefail
+          # The script shells out to `pnpm install` with inherited stdio, so the
+          # workspace path is its LAST stdout line, not its only one. Network
+          # access is confined to this step; the Rust suite below is offline.
+          workspace="$(node scripts/prepare-candidate-fixtures.mjs "$RUNNER_TEMP/candidate-fixtures" | tail -n 1)"
+          if [ -z "$workspace" ]; then
+            echo "candidate fixture preparation printed no workspace path" >&2
+            exit 1
+          fi
+          echo "IMPORT_LENS_FIXTURES_WORKSPACE=$workspace" >> "$GITHUB_ENV"
+          echo "Candidate fixtures workspace: $workspace"
+
+      - name: Run real-package qualification tests
+        if: ${{ inputs.run_candidate_packages }}
+        run: cargo test -p import-lens-daemon --locked --test candidate_packages -- --ignored
+
+      # `daemon/tests/candidate_badges.rs` is the only place any real package's CLAIMS are
+      # asserted: `side_effects`, `truly_treeshakeable` and `confidence` live on `ImportResult`,
+      # which the engine-level suite above never builds, and the accuracy oracle compares bytes and
+      # nothing else.
+      - name: Run real-package badge baseline
+        if: ${{ inputs.run_candidate_packages }}
+        run: cargo test -p import-lens-daemon --release --locked --test candidate_badges -- --ignored --nocapture
+
+      # The §10.6 absolute performance and memory gates: cold import p95, daemon startup, cache-hit
+      # response, idle RSS, and the 20-import batch -- every one of them read from the SHIPPED
+      # DAEMON BINARY over the real IPC transport. They are `#[ignore]`d and need the same installed
+      # fixtures as the steps above -- and until now NOTHING invoked them, so the suite written to
+      # protect this engine had never run once. `Run performance smoke test` below is a DIFFERENT
+      # file (the legacy synthetic suite) and is not a substitute; it is also gated on
+      # `run_performance`, which only `build.yml`'s workflow_dispatch ever sets. This step is gated
+      # on `run_candidate_packages`, which `ci.yml` sets on every pull request -- which is the whole
+      # point. `--release`: a debug-build timing gate is meaningless.
+      - name: Run real-package performance gates
+        if: ${{ inputs.run_candidate_packages }}
+        env:
+          # 2, not the 8 this used to be. 8 turned "cold import p95 <= 500 ms" (NFR-003) into 4000 ms
+          # and "cache hit < 50 ms" (NFR-002, Critical) into 400 ms -- numbers no requirement asked
+          # for and no regression could trip.
+          #
+          # 2 is the smallest multiplier backed by a measurement. With the suite pinned to 4 logical
+          # cores (this runner is 4 vCPU) and those cores 2x oversubscribed with competing load --
+          # harsher than a dedicated runner -- the cold-import p95 measured 406 ms against the
+          # literal 500 ms gate: it holds, but 19% margin is a gate that flakes, and a flaky gate
+          # gets switched off. 2 puts that worst measured case 2.5x inside the gate while staying 4x
+          # tighter than 8, and only 2x looser than the SRS number.
+          #
+          # It scales the cold-import and startup gates only. The cache-hit gate (19 ms measured
+          # under the same hostile load, against 50 ms) and both memory gates are ABSOLUTE: they hold
+          # on this hardware, so they are enforced as written.
+          IMPORT_LENS_PERF_MULTIPLIER: 2
+        # --test-threads=1: timing gates that contend with each other are noisy gates.
+        run: cargo test -p import-lens-daemon --release --locked --test candidate_performance -- --ignored --nocapture --test-threads=1
 
       - name: Run performance smoke test
         if: ${{ inputs.run_performance }}

@@ -8,11 +8,18 @@ import {
   type CompressionFormat,
   formatBytes,
   labelForCompression,
+  type MeasuredSizes,
+  measuredSizes,
 } from "./format.js";
-import { isTypesOnlyResult } from "./resultDiagnostics.js";
+import {
+  isNativeBinaryOnlyResult,
+  isNativeBinaryResult,
+  isTypesOnlyResult,
+} from "./resultDiagnostics.js";
 
+// "This size may include unused exports" is a caveat ABOUT a size, so it needs one.
 export const isConservativeEstimate = (result: ImportResult): boolean =>
-  !result.error && (result.side_effects || !result.truly_treeshakeable);
+  measuredSizes(result) !== null && (result.side_effects || !result.truly_treeshakeable);
 
 export const conservativeSizingMarkdown = (result: ImportResult): string | null =>
   isConservativeEstimate(result)
@@ -26,11 +33,11 @@ const compressionTitles: Record<Exclude<CompressionFormat, "all">, string> = {
 };
 
 const selectedCompressionSize = (
-  result: ImportResult,
+  sizes: MeasuredSizes,
   compression: CompressionFormat,
 ): { label: string; value: string } => ({
   label: compression === "all" ? "Brotli" : compressionTitles[compression],
-  value: `${formatBytes(bytesForCompression(result, compression))} ${labelForCompression(compression)}`,
+  value: `${formatBytes(bytesForCompression(sizes, compression))} ${labelForCompression(compression)}`,
 });
 
 export const copyDiagnosticsMarkdown = (result: ImportResult): string => {
@@ -41,20 +48,32 @@ export const copyDiagnosticsMarkdown = (result: ImportResult): string => {
 export const resultHasDiagnosticsLink = (result: ImportResult): boolean =>
   Boolean(result.error) || result.diagnostics.length > 0;
 
+/**
+ * The hover's size block — or the honest absence of one.
+ *
+ * It was ungated: an import with no size rendered five rows of **"NaN kB"** under a bold "Size"
+ * heading. The size block is the one thing a hover cannot fake.
+ */
 export const importResultSizeMarkdown = (
   result: ImportResult,
   compression: CompressionFormat,
 ): string => {
-  const selected = selectedCompressionSize(result, compression);
+  const sizes = measuredSizes(result);
+
+  if (!sizes) {
+    return ["**Size**", "- Size unavailable: this import could not be measured."].join("\n");
+  }
+
+  const selected = selectedCompressionSize(sizes, compression);
 
   return [
     "**Size**",
     `- Selected ${selected.label}: **${selected.value}**`,
-    `- Raw: ${formatBytes(result.raw_bytes)}`,
-    `- Minified: ${formatBytes(result.minified_bytes)}`,
-    `- Gzip: ${formatBytes(result.gzip_bytes)}`,
-    `- Brotli: ${formatBytes(result.brotli_bytes)}`,
-    `- Zstd: ${formatBytes(result.zstd_bytes)}`,
+    `- Raw: ${formatBytes(sizes.raw_bytes)}`,
+    `- Minified: ${formatBytes(sizes.minified_bytes)}`,
+    `- Gzip: ${formatBytes(sizes.gzip_bytes)}`,
+    `- Brotli: ${formatBytes(sizes.brotli_bytes)}`,
+    `- Zstd: ${formatBytes(sizes.zstd_bytes)}`,
   ].join("\n");
 };
 
@@ -87,6 +106,12 @@ const analysisMarkdown = (
     rows.push("- Type-only package: yes");
   }
 
+  if (isNativeBinaryOnlyResult(result)) {
+    rows.push("- Native binary only: yes (no importable JavaScript entry)");
+  } else if (isNativeBinaryResult(result)) {
+    rows.push("- Native binary: yes (the measured size is the JavaScript entry only)");
+  }
+
   return rows.join("\n");
 };
 
@@ -94,7 +119,9 @@ const errorDiagnosticsMarkdown = (result: ImportResult, confidenceBadge: string)
   const rows = [
     "**Diagnostics**",
     "Import Lens could not compute this import size.",
-    `- Error: ${result.error}`,
+    // A result with no size normally carries the reason; a still-building one carries none, and the
+    // tooltip says what it knows rather than printing `null`.
+    `- Error: ${result.error ?? "no size was produced for this import"}`,
     `- Confidence: **${confidenceBadge}**`,
     ...result.confidence_reasons.map((reason) => `- ${reason}`),
     `- ${copyDiagnosticsMarkdown(result)}`,
@@ -112,7 +139,10 @@ export const tooltipForResultMarkdown = (
   const parts: string[] = [`**${result.specifier}**`];
   const confidence = confidenceVisualFor(result.confidence);
 
-  if (result.error) {
+  // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). Everything below this
+  // renders a number; the check that decides whether to render one has to be the check for whether
+  // there IS one.
+  if (!measuredSizes(result)) {
     parts.push(errorDiagnosticsMarkdown(result, confidence.badge));
     return parts.filter(Boolean).join("\n\n");
   }

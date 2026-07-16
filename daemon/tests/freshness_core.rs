@@ -4,7 +4,6 @@ use import_lens_daemon::cache::memory::{
     CachedImport, ImportCache, bump_cache_generation, cache_generation,
 };
 use import_lens_daemon::ipc::protocol::ImportRuntime;
-use import_lens_daemon::pipeline::graph::build_module_graph_cached_with_runtime;
 use std::fs;
 use std::sync::{Arc, Mutex, atomic::AtomicU64};
 
@@ -33,129 +32,21 @@ fn lock_generation_race_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[test]
-fn module_graph_carries_content_hash_for_loaded_modules() {
-    let dir = temp_dir("graphhash");
-    let entry = dir.join("entry.mjs");
-    // The dependency is `.ts` (not `.mjs`) so its prepared/parsed source is NOT
-    // byte-identical to its raw source: `module_needs_transform` routes `.ts`
-    // through `transform_module_source`, which strips the `: number` type
-    // annotation below. That makes this a real tripwire for a regression that
-    // hashes the transformed output instead of the raw file bytes — with an
-    // `.mjs`-only fixture, raw == prepared and such a regression would slip
-    // through undetected.
-    let dep = dir.join("dep.ts");
-    let dep_raw: &[u8] = b"export const value: number = 41;\n";
-    fs::write(&dep, dep_raw).expect("dep");
-    fs::write(
-        &entry,
-        "import { value } from './dep';\nexport const total = value + 1;\n",
-    )
-    .expect("entry");
-
-    let graph =
-        build_module_graph_cached_with_runtime(&entry, ImportRuntime::Component).expect("graph");
-
-    // Every loaded module has a non-zero content hash captured from its raw
-    // bytes, matching the RAW (pre-transform) source, not the prepared one.
-    let dep_hash = graph.content_hash_for(&dep).expect("dep hash present");
-    assert_ne!(dep_hash, 0);
-    assert_eq!(
-        dep_hash,
-        import_lens_daemon::cache::key::content_hash(dep_raw)
-    );
-
-    fs::remove_dir_all(dir).ok();
-}
-
-#[test]
-fn fingerprints_capture_read_time_len_not_post_analysis_stat() {
-    // Regression for the residual TOCTOU: value-side fingerprints must reflect the
-    // len+mtime of the bytes read DURING analysis, not a stat taken afterward. If a
-    // dep changes between graph-build and fingerprinting, storing the post-change
-    // len+mtime lets `check_fingerprint`'s mtime+len pre-filter mask the change and
-    // serve a result computed from the old bytes as `Fresh`.
-    let dir = temp_dir("readtime");
-    let entry = dir.join("entry.mjs");
-    let dep = dir.join("dep.mjs");
-    let dep_v1: &[u8] = b"export const value = 41;\n";
-    fs::write(&dep, dep_v1).expect("dep v1");
-    fs::write(
-        &entry,
-        "import { value } from './dep.mjs';\nexport const total = value + 1;\n",
-    )
-    .expect("entry");
-
-    // Build the graph — reads dep_v1 now, capturing its content hash + read-time
-    // len/mtime.
-    let graph =
-        build_module_graph_cached_with_runtime(&entry, ImportRuntime::Component).expect("graph");
-    let len_v1 = fs::metadata(&dep).expect("meta v1").len();
-
-    // Simulate a change landing AFTER analysis, before fingerprinting: different
-    // content AND a clearly different length, so the assertion is deterministic and
-    // independent of filesystem mtime resolution.
-    fs::write(&dep, b"export const value = 999999999999;\n").expect("dep v2");
-    let len_v2 = fs::metadata(&dep).expect("meta v2").len();
-    assert_ne!(len_v1, len_v2, "test setup: v2 must differ in length");
-
-    // Build the value-side fingerprints off the (warm) graph.
-    let fingerprints = import_lens_daemon::pipeline::graph::fingerprints_with_content_hashes(
-        vec![entry.clone(), dep.clone()],
-        &graph,
-    );
-    let dep_fp = fingerprints
-        .iter()
-        .find(|fp| fp.path.ends_with("dep.mjs"))
-        .expect("dep fingerprint present");
-
-    // Must reflect the READ-TIME len (v1), not the post-analysis stat (v2).
-    assert_eq!(
-        dep_fp.len, len_v1,
-        "fingerprint len must be captured at read time, not from a post-analysis stat"
-    );
-    assert_eq!(
-        dep_fp.content_hash,
-        Some(import_lens_daemon::cache::key::content_hash(dep_v1)),
-        "fingerprint carries the analyzed (v1) content hash"
-    );
-
-    // The change must be detectable: stored len/mtime are v1 while disk is v2, so the
-    // mtime+len pre-filter misses and the hash mismatch yields Stale — not a false Fresh.
-    assert!(
-        matches!(
-            import_lens_daemon::cache::key::check_fingerprint(dep_fp),
-            import_lens_daemon::cache::key::Freshness::Stale
-        ),
-        "a post-analysis content change must read as Stale, not laundered to Fresh"
-    );
-
-    fs::remove_dir_all(dir).ok();
-}
-
 fn sample_result(specifier: &str) -> import_lens_daemon::ipc::protocol::ImportResult {
-    // Mirror the helper in tests/memory_cache.rs (full field set).
-    use import_lens_daemon::ipc::protocol::ImportResult;
-    ImportResult {
-        freshness: import_lens_daemon::ipc::protocol::ResultFreshness::fresh(),
-        specifier: specifier.to_owned(),
-        raw_bytes: 10,
-        minified_bytes: 8,
-        gzip_bytes: 6,
-        brotli_bytes: 5,
-        zstd_bytes: 5,
-        cache_hit: false,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: Default::default(),
-        confidence_reasons: Vec::new(),
-        error: None,
-        diagnostics: Vec::new(),
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    }
+    // Mirror the helper in tests/memory_cache.rs.
+    use import_lens_daemon::ipc::protocol::{ImportResult, MeasuredSizes};
+    let mut result = ImportResult::measured(
+        specifier,
+        MeasuredSizes {
+            raw_bytes: 10,
+            minified_bytes: 8,
+            gzip_bytes: 6,
+            brotli_bytes: 5,
+            zstd_bytes: 5,
+        },
+    );
+    result.truly_treeshakeable = true;
+    result
 }
 
 fn cached_import(

@@ -11,24 +11,30 @@ path = "src/main.rs"
 [dependencies]
 brotli = "^8"
 bytes = "^1"
+# Coordinated compiler stack, exact-pinned: this is the matcher Rolldown itself
+# reads `sideEffects` globs with (`rolldown_common`, `rolldown_utils`). Its whole
+# purpose is to AGREE with the bundler that owns retention, so resolving it to a
+# different version than rolldown got would break that agreement silently. Moved
+# only by `pnpm deps:update:compiler`, which derives it from rolldown's own graph.
+fast-glob = "=1.0.1"
 flate2 = "^1.1"
 futures-util = { version = "^0.3", default-features = false, features = ["sink", "std"] }
 httpdate = "^1"
-oxc_allocator = "~0.139.0"
-oxc_ast = "~0.139.0"
-oxc_ast_visit = "~0.139.0"
-oxc_codegen = "~0.139.0"
-oxc_minifier = "~0.139.0"
-oxc_parser = "~0.139.0"
-oxc_resolver = "~11.23.0"
-oxc_semantic = "~0.139.0"
-oxc_span = "~0.139.0"
-oxc_syntax = "~0.139.0"
-oxc_transformer = "~0.139.0"
+oxc_allocator = "=0.139.0"
+oxc_codegen = "=0.139.0"
+oxc_minifier = "=0.139.0"
+oxc_parser = "=0.139.0"
+oxc_resolver = "=11.23.0"
+oxc_semantic = "=0.139.0"
+oxc_span = "=0.139.0"
+oxc_syntax = "=0.139.0"
 papaya = "^0.2"
 rayon = "^1.12"
 redb = "^4"
 rmp-serde = "^1.3"
+rolldown = "=1.1.5"
+rolldown_common = "=1.1.5"
+rolldown_error = "=1.1.5"
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
 tokio = { version = "^1.52", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }

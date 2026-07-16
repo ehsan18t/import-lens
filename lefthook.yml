@@ -17,7 +17,7 @@ pre-commit:
       # `*Cargo.toml` (not the literal `Cargo.toml`) so a nested manifest such as
       # daemon/Cargo.toml also triggers the gate; lefthook's `*` crosses `/`.
       glob: ["*.rs", "*Cargo.toml", "*Cargo.lock", "clippy.toml"]
-      run: cargo clippy --workspace --all-targets
+      run: cargo clippy --workspace --all-targets --locked
     - name: rust-deny
       glob: ["*Cargo.toml", "*Cargo.lock", "deny.toml"]
       run: cargo deny check

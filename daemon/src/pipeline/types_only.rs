@@ -1,6 +1,6 @@
 use crate::{
     ipc::protocol::{
-        ConfidenceLevel, ImportDiagnostic, ImportRequest, ImportResult, ResultFreshness,
+        ConfidenceLevel, ImportDiagnostic, ImportRequest, ImportResult, MeasuredSizes,
     },
     pipeline::{resolver::find_package_root, util::should_skip_package_directory},
 };
@@ -35,36 +35,27 @@ pub fn declaration_only_package_result(
         return None;
     }
 
-    Some(ImportResult {
-        freshness: ResultFreshness::fresh(),
-        specifier: request.specifier.clone(),
-        raw_bytes: 0,
-        minified_bytes: 0,
-        gzip_bytes: 0,
-        brotli_bytes: 0,
-        zstd_bytes: 0,
-        cache_hit: false,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: ConfidenceLevel::High,
-        confidence_reasons: vec![
-            "Package contains declaration files only and no runtime source files.".to_owned(),
+    // MEASURED, not Unmeasured (ADR-0006). A declarations-only package genuinely ships zero
+    // runtime bytes: nothing failed, there was simply nothing to build. `Some(0)` stays
+    // unambiguous because the `types_only` diagnostic stage identifies it — this is the one place
+    // in the daemon where a zero is an answer rather than the absence of one.
+    let mut result = ImportResult::measured(request.specifier.clone(), MeasuredSizes::ZERO);
+    result.truly_treeshakeable = true;
+    result.confidence = ConfidenceLevel::High;
+    result.confidence_reasons =
+        vec!["Package contains declaration files only and no runtime source files.".to_owned()];
+    result.diagnostics = vec![ImportDiagnostic {
+        stage: crate::pipeline::stage::TYPES_ONLY.to_owned(),
+        message: "package contains declarations only; zero runtime cost".to_owned(),
+        details: vec![
+            format!("specifier: {}", request.specifier),
+            format!("package: {}", request.package_name),
+            format!("package_root: {}", package_root.display()),
         ],
-        error: None,
-        diagnostics: vec![ImportDiagnostic {
-            stage: "types_only".to_owned(),
-            message: "package contains declarations only; zero runtime cost".to_owned(),
-            details: vec![
-                format!("specifier: {}", request.specifier),
-                format!("package: {}", request.package_name),
-                format!("package_root: {}", package_root.display()),
-            ],
-        }],
-        module_breakdown: Some(Vec::new()),
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    })
+    }];
+    result.module_breakdown = Some(Vec::new());
+
+    Some(result)
 }
 
 fn scan_declaration_only_package(package_root: &Path) -> DeclarationOnlyScan {

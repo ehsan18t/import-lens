@@ -21,8 +21,65 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
 /// (`v{N}:`) derives from this, so a schema bump is a one-line change here with
 /// no type renames.
 const CACHE_KEY_VERSION: u32 = 4;
-pub const ANALYZER_REVISION: &str = "graph2";
-pub const ANALYZER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+graph2");
+
+/// The analyzer revision, in ONE place.
+///
+/// `ANALYZER_VERSION` has to be built with `concat!`, which only accepts literals, so
+/// the revision used to be spelled twice — and bumping one without the other would
+/// leave half the cache accepting entries the other half rejects. A macro keeps the
+/// literal single: there is nothing left to keep in sync.
+///
+/// **Bump this whenever a change can alter a reported size.** Every cached entry
+/// records the revision it was computed under and is rejected when it differs, which
+/// is the only thing standing between a user and a size measured by the old code.
+///
+/// Format: `<engine>-<minor line>.x+<revision>`. The minor line (patch held as a wildcard `x`) names
+/// the engine without churning on every patch — a bare `rolldown3` reads as "Rolldown v3" when the
+/// crate is pinned in the 1.1.x line. A Rolldown patch that does NOT move numbers needs no edit here;
+/// a patch that does — or any of our own number-moving changes — bumps the trailing `+<revision>`; a
+/// minor or major bump changes the line itself (`rolldown-1.2.x+1`). Kept in step with
+/// `daemon/Cargo.toml`'s pin by the `compiler-stack-upgrade` skill.
+///
+/// `rolldown2` (2026-07-12): post-cutover correctness fixes moved real numbers.
+/// Rolldown's `//#region` debug comments are no longer billed as package cost (N2);
+/// the platform is `Neutral`, so the Server runtime stopped resolving `browser`
+/// export conditions and no `NODE_ENV` define is injected (N3); mixed-runtime files
+/// are grouped per runtime, which was swinging a file's size by two orders of
+/// magnitude depending on import order (I15); and type-position-only TypeScript
+/// imports are elided (W4).
+///
+/// `rolldown-1.1.x+3` (2026-07-15): the release-review fixes moved numbers again, so every entry
+/// computed under `rolldown2` must be rejected on read. A Windows verbatim (extended-length) entry path broke
+/// Rolldown's path relativization, so a slash-bearing `sideEffects` pattern could never match and
+/// side-effectful modules were dropped — `refractor` under-reported 3.7x (30 kB vs 113 kB real, 1%
+/// off esbuild once fixed); array-form `sideEffects` matched with `fast_glob` now retains them
+/// (Task 4). The three fabricated-size fallbacks are deleted: an unbuildable import reports no size,
+/// never an invented one, and a transient failure is no longer cached (Tasks 5/6). Mixed-runtime
+/// files compress per runtime and sum, ending a ~49% under-report from concatenating payloads that
+/// never ship together (Task 8). The failure stage is ranked deterministically rather than decided
+/// by a parse-vs-resolve race and then cached (Task 7). And export enumeration resolves under the
+/// import's runtime, so an entry cached under the old hardcoded `Component` runtime no longer means
+/// what it did (Task 10).
+///
+/// `rolldown-1.1.x+4` (2026-07-16): the release-blocker batch moves numbers again, so every entry
+/// computed under `rolldown-1.1.x+3` must be rejected on read. An all-inline-`type` named import
+/// (`import { type X } from "pkg"`, every specifier carrying the inline `type` keyword) was sized as a
+/// namespace import of the whole package: oxc marks the entry `is_type` but leaves the module request
+/// `is_type = false`, so the static-import loop dropped it while the `requested_modules` fallback
+/// resurrected it as `import * as ...`. It is now registered as an elided statement and costs zero,
+/// matching TypeScript's erasure (B1). And native-binary-backed packages (a platform-specific binary
+/// shipped as `optionalDependencies`: Biome, TypeScript 7, esbuild) are no longer mismeasured — one
+/// with no importable JS entry is answered as a native-binary-only zero instead of a bare failure, and
+/// one whose JS entry is a thin shim keeps its measured size with a native-binary flag beside it — so
+/// entries cached as `entry_resolution` failures or as confident shim sizes must be recomputed (B3).
+macro_rules! analyzer_revision {
+    () => {
+        "rolldown-1.1.x+4"
+    };
+}
+
+pub const ANALYZER_REVISION: &str = analyzer_revision!();
+pub const ANALYZER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", analyzer_revision!());
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {
@@ -421,9 +478,21 @@ pub fn file_fingerprint_reading_hash(path: impl AsRef<Path>) -> Option<FileFinge
 /// hash still decides).
 pub fn read_time_len_mtime(path: impl AsRef<Path>) -> (u64, u64) {
     match fs::metadata(path.as_ref()) {
-        Ok(metadata) => (metadata.len(), modified_millis(&metadata)),
+        Ok(metadata) => read_time_len_mtime_of(&metadata),
         Err(_) => (0, 0),
     }
+}
+
+/// Same, from a stat the caller already took.
+///
+/// The stat MUST be the one taken *before* the bytes were read. Stat-after-read
+/// records the post-edit len+mtime against a hash of the pre-edit bytes, and
+/// `check_fingerprint` short-circuits to `Fresh` on a len+mtime match without
+/// hashing — so a file rewritten during the read would be served from the bytes
+/// that were replaced, forever. Stat-before-read fails safe: a mismatch merely
+/// falls through to the hash comparison, which is correct in both directions.
+pub fn read_time_len_mtime_of(metadata: &std::fs::Metadata) -> (u64, u64) {
+    (metadata.len(), modified_millis(metadata))
 }
 
 /// Build a fingerprint from values captured at analysis read-time (len+mtime from

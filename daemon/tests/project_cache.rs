@@ -27,26 +27,20 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cac
 const SHARD_METADATA_FILE_NAME: &str = "importlens-project-cache.json";
 
 fn result(specifier: &str) -> ImportResult {
-    ImportResult {
-        freshness: import_lens_daemon::ipc::protocol::ResultFreshness::fresh(),
-        specifier: specifier.to_owned(),
-        raw_bytes: 10,
-        minified_bytes: 8,
-        gzip_bytes: 7,
-        brotli_bytes: 6,
-        zstd_bytes: 5,
-        cache_hit: false,
-        side_effects: false,
-        truly_treeshakeable: true,
-        is_cjs: false,
-        confidence: ConfidenceLevel::High,
-        confidence_reasons: vec!["test fixture confidence".to_owned()],
-        error: None,
-        diagnostics: Vec::new(),
-        module_breakdown: None,
-        shared_bytes: None,
-        internal_contributions: Vec::new(),
-    }
+    let mut result = ImportResult::measured(
+        specifier,
+        import_lens_daemon::ipc::protocol::MeasuredSizes {
+            raw_bytes: 10,
+            minified_bytes: 8,
+            gzip_bytes: 7,
+            brotli_bytes: 6,
+            zstd_bytes: 5,
+        },
+    );
+    result.truly_treeshakeable = true;
+    result.confidence = ConfidenceLevel::High;
+    result.confidence_reasons = vec!["test fixture confidence".to_owned()];
+    result
 }
 
 fn cached(specifier: &str) -> CachedImport {

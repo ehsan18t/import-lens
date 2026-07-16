@@ -41,6 +41,12 @@ const SUMMARY_MAX_SEQ: &str = "max_seq";
 // so ascending iteration is exactly ascending-by-seq order.
 const SEQ_INDEX_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("seq_index");
 
+// v8: `ImportResult`'s five size fields became `Option<u64>` (ADR-0006). A v7 row does NOT fail
+// to decode into the new struct — msgpack is happy to read the old `17550` as `Some(17550)` — and
+// that is exactly the danger: every fabricated size a v7 daemon wrote (a manifest fallback's
+// on-disk directory bytes, a timed-out build's entry file measured alone) would come back as a
+// GENUINE measurement, indistinguishable from one, with nothing left in the record to say it was
+// invented. The wipe is total, so it is sufficient: no fabricated size survives the upgrade.
 // v7: adds SUMMARY_TABLE (O(1) rollup) and SEQ_INDEX_TABLE (by-`last_seq`
 // secondary index), both maintained in the SAME write transaction as every
 // CACHE_TABLE mutation so a crash can't tear accounting from data.
@@ -50,7 +56,7 @@ const SEQ_INDEX_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("
 // existing recreate-on-mismatch path (v5 did the same for the identity-v4 key
 // change). The retired `cache_recents` table from pre-v5 builds is never
 // opened; it is harmless dead space reclaimed by the compactor.
-const CURRENT_SCHEMA_VERSION: u64 = 7;
+const CURRENT_SCHEMA_VERSION: u64 = 8;
 const INSERT_FLUSH_BATCH: usize = 64;
 /// Compact a shard when more than this fraction of its `.redb` file is
 /// reclaimable free space (redb reuses freed pages rather than shrinking).
@@ -264,6 +270,24 @@ impl DiskCache {
             self.remove(key);
             return None;
         };
+        // **The durability gate is on the READ too, not only on `insert_at_generation`**
+        // (ADR-0006, invariant 3). A write-side gate protects a store from what it is handed
+        // today; it does nothing about what is already on disk. L2 outlives the process, so a row
+        // written by a build that predates the gate — or by any future path that reaches redb some
+        // other way — would be decoded, served, and re-promoted into L1 forever, and every read
+        // path (`get_with_freshness`, and the prewarm's `load_recent`) goes through here. Refusing
+        // and removing it costs one rebuild.
+        if !cached.result.is_durable() {
+            crate::logging::log_debug(
+                "cache",
+                format!(
+                    "evicting a non-durable disk entry for {key} (stage: {})",
+                    cached.result.unmeasured_stage().unwrap_or("none")
+                ),
+            );
+            self.remove(key);
+            return None;
+        }
         // First-party-ness is key-derived; stamp it once at hydration so the
         // per-hit gate never has to re-decode the identity.
         cached.first_party = crate::cache::key::cache_key_is_first_party(key);
@@ -313,6 +337,12 @@ impl DiskCache {
     /// snapshot and pass it here: a `clear()` landing between the snapshot and the
     /// enqueue then bumps the generation, and this entry — still carrying the old one —
     /// is dropped by `flush_pending_inserts` instead of resurrecting the wiped shard.
+    ///
+    /// **The transience gate is applied here too**, and not merely upstream in `ImportCache`
+    /// (ADR-0006, invariant 3). L2 is a store in its own right — it outlives the process, which is
+    /// the worst place for a scheduling accident to land — and "the caller already checked" is the
+    /// assumption that produced this defect six times. A refused insert is a no-op, not an error:
+    /// `Err` here marks the key dirty for a flush replay, which would defeat the refusal.
     pub fn insert_at_generation(
         &self,
         key: &str,
@@ -322,6 +352,44 @@ impl DiskCache {
         if self.db_read().is_none() {
             return Ok(());
         }
+        if !cached.result.is_durable() {
+            crate::logging::log_debug(
+                "cache",
+                format!(
+                    "refusing to persist a non-durable result for {key} (stage: {})",
+                    cached.result.unmeasured_stage().unwrap_or("none")
+                ),
+            );
+            return Ok(());
+        }
+
+        self.write_at_generation(key, cached, generation)
+    }
+
+    /// The write, with the durability gate already applied — or, in a test, deliberately not.
+    ///
+    /// The gate protects L2 from what it is handed *today*. It says nothing about a row a build
+    /// that predates it already wrote, and that row is on real users' disks right now. This is the
+    /// only way to put one there, and it is `#[cfg(test)]` so it stays the only way.
+    #[cfg(test)]
+    pub(crate) fn write_ungated_for_test(
+        &self,
+        key: &str,
+        cached: &CachedImport,
+    ) -> Result<(), String> {
+        if self.db_read().is_none() {
+            return Ok(());
+        }
+
+        self.write_at_generation(key, cached, self.clear_generation())
+    }
+
+    fn write_at_generation(
+        &self,
+        key: &str,
+        cached: &CachedImport,
+        generation: u64,
+    ) -> Result<(), String> {
         #[cfg(test)]
         {
             test_support::record_insert_attempt(key);
@@ -1562,32 +1630,13 @@ fn cache_warn(message: String) {
 #[cfg(test)]
 mod tests {
     use super::{SEQ_PREFIX_LEN, compare_recent_keys, decode_cached_result, decode_last_seq};
+    use crate::cache::memory::CachedImport;
 
-    fn sample_cached(last_seq: u64) -> crate::cache::memory::CachedImport {
-        use crate::cache::memory::CachedImport;
+    fn cached_with(result: crate::ipc::protocol::ImportResult, last_seq: u64) -> CachedImport {
         use std::sync::{Arc, atomic::AtomicU64};
 
         CachedImport {
-            result: crate::ipc::protocol::ImportResult {
-                specifier: "react".to_owned(),
-                raw_bytes: 1,
-                minified_bytes: 1,
-                gzip_bytes: 1,
-                brotli_bytes: 1,
-                zstd_bytes: 1,
-                cache_hit: false,
-                side_effects: false,
-                truly_treeshakeable: true,
-                is_cjs: false,
-                confidence: Default::default(),
-                confidence_reasons: Vec::new(),
-                error: None,
-                diagnostics: Vec::new(),
-                module_breakdown: None,
-                shared_bytes: None,
-                freshness: crate::ipc::protocol::ResultFreshness::fresh(),
-                internal_contributions: Vec::new(),
-            },
+            result,
             dependency_fingerprints: Vec::new(),
             verified_generation: 0,
             verified_at: None,
@@ -1597,8 +1646,136 @@ mod tests {
         }
     }
 
+    fn sample_cached(last_seq: u64) -> CachedImport {
+        let mut result = crate::ipc::protocol::ImportResult::measured(
+            "react",
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 1,
+                minified_bytes: 1,
+                gzip_bytes: 1,
+                brotli_bytes: 1,
+                zstd_bytes: 1,
+            },
+        );
+        result.truly_treeshakeable = true;
+        cached_with(result, last_seq)
+    }
+
     fn value_bytes(last_seq: u64) -> Vec<u8> {
         super::encode_cache_value(sample_cached(last_seq)).expect("value should serialize")
+    }
+
+    /// **Guard.** The L2 envelope is encoded with `rmp_serde::to_vec` — *positional* msgpack, an
+    /// array with no field names. `ImportResult`'s size fields sit in the middle of that array, so
+    /// the crate's dominant `Option` idiom, `#[serde(default, skip_serializing_if =
+    /// "Option::is_none")]`, would omit them on an Unmeasured result, shorten the array, and every
+    /// field after them would decode off by one — measured, not theorised: it fails with
+    /// `invalid type: boolean \`false\`, expected u64`. A plain `Option` writes a `nil`
+    /// placeholder and keeps the array length.
+    ///
+    /// This test is the only thing standing between a future contributor "tidying up" those five
+    /// attributes and a silently unreadable disk cache for every user who has ever seen a package
+    /// the engine could not build.
+    #[test]
+    fn an_unmeasured_result_round_trips_through_the_positional_disk_encoding() {
+        let unmeasured = crate::ipc::protocol::ImportResult::unmeasured(
+            "swiper",
+            crate::engine::stage::PARSE,
+            "unexpected token",
+            vec!["entry_path: C:/ws/node_modules/swiper/swiper.mjs".to_owned()],
+        );
+        let encoded = super::encode_cache_value(cached_with(unmeasured.clone(), 9))
+            .expect("an unmeasured result must serialize");
+
+        let decoded = decode_cached_result(&encoded)
+            .expect("an unmeasured result must survive the positional msgpack round trip");
+
+        assert_eq!(
+            decoded.result.sizes(),
+            None,
+            "no size went in; none comes out"
+        );
+        assert_eq!(decoded.result, unmeasured);
+    }
+
+    /// **Guard**, and the shape the test above does NOT catch. The five sizes were the *only* fields
+    /// protected from the `skip_serializing_if` idiom, but `module_breakdown` and `shared_bytes` sit
+    /// mid-struct too — and the daemon really does build this exact pair: an Unmeasured result has
+    /// `module_breakdown: None` (skipped, under the old attributes) beside the `shared_bytes:
+    /// Some(0)` that `annotate_shared_bytes` stamps on **every** result, measured or not. The
+    /// skipped `None` shortened the array, `shared_bytes`'s `0` slid into its slot, and the decode
+    /// failed with `invalid type: integer, expected a sequence` — an unreadable disk entry for every
+    /// package the engine could not build.
+    ///
+    /// It was latent only because the annotation runs on the response, one call site away from the
+    /// value that is cached. Latent is not fixed.
+    #[test]
+    fn a_result_with_no_breakdown_but_a_shared_byte_count_round_trips() {
+        let mut result = crate::ipc::protocol::ImportResult::unmeasured(
+            "swiper",
+            crate::engine::stage::LINK,
+            "Bundling CSS is no longer supported",
+            Vec::new(),
+        );
+        assert_eq!(result.module_breakdown, None, "the premise: no breakdown");
+        result.shared_bytes = Some(0);
+
+        let encoded = super::encode_cache_value(cached_with(result.clone(), 3))
+            .expect("the shape must serialize");
+        let decoded = decode_cached_result(&encoded).expect(
+            "a None field mid-struct must write a nil placeholder, not shorten the array and slide \
+             every field after it one slot to the left",
+        );
+
+        assert_eq!(decoded.result, result);
+        assert_eq!(decoded.result.shared_bytes, Some(0));
+    }
+
+    /// **Guard.** `internal_contributions` is `#[serde(skip)]` on `ImportResult` — it is the FULL
+    /// module set, far too large for the wire, and only the top 10 go out as `module_breakdown`. The
+    /// L2 envelope therefore carries it explicitly as `full_contributions` and restores it on
+    /// decode. Nothing pinned that, and the field it protects is now load-bearing twice over:
+    /// `annotate_shared_bytes` prefers `internal_contributions` over `module_breakdown`, so if a
+    /// cache hit came back without it, every shared-byte figure in the system would silently be
+    /// computed from the truncated top-10 list instead of the real graph — a smaller, wrong number,
+    /// on exactly the results that hit cache (i.e. almost all of them).
+    ///
+    /// Delete `full_contributions` from the envelope, or trust `#[serde(skip)]` to round-trip it,
+    /// and this goes red.
+    #[test]
+    fn the_full_module_set_survives_the_l2_round_trip_even_though_the_wire_drops_it() {
+        use crate::ipc::protocol::ModuleContribution;
+
+        let mut result = crate::ipc::protocol::ImportResult::measured(
+            "react",
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 100,
+                minified_bytes: 80,
+                gzip_bytes: 40,
+                brotli_bytes: 30,
+                zstd_bytes: 35,
+            },
+        );
+        // The wire carries the top 10; the graph had more, and the extras are what a shared-byte
+        // count needs.
+        result.internal_contributions = (0..14)
+            .map(|index| ModuleContribution {
+                path: format!("/workspace/node_modules/react/module-{index:02}.js"),
+                bytes: 10 + index,
+            })
+            .collect();
+        result.module_breakdown = Some(result.internal_contributions[..10].to_vec());
+
+        let encoded =
+            super::encode_cache_value(cached_with(result.clone(), 5)).expect("encode the envelope");
+        let decoded = decode_cached_result(&encoded).expect("decode the envelope");
+
+        assert_eq!(
+            decoded.result.internal_contributions, result.internal_contributions,
+            "the full module set must come back off disk: `#[serde(skip)]` drops it from the wire, \
+             so the L2 envelope has to carry it, and `annotate_shared_bytes` reads it"
+        );
+        assert_eq!(decoded.result.module_breakdown, result.module_breakdown);
     }
 
     #[test]
@@ -1641,6 +1818,101 @@ mod tests {
 
         drop(disk);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The gate is on the READ too** (ADR-0006, invariant 3).
+    ///
+    /// The write-side gate protects L2 from what it is handed today. It does nothing about a row a
+    /// build that predates it already wrote — and L2 outlives the process, so those rows are on real
+    /// users' disks right now. Left alone, a `timeout` result would be decoded, served as a cache
+    /// hit, and re-promoted into L1 on every access, for as long as the package's bytes did not
+    /// change: a transient condition producing a durable wrong answer, which is the one disease this
+    /// model exists to end.
+    #[test]
+    fn a_non_durable_row_already_on_disk_is_refused_on_read_and_evicted() {
+        use super::DiskCache;
+
+        let dir = std::env::temp_dir().join(format!(
+            "il-l2-hydration-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let disk = DiskCache::new(Some(dir.clone()), true);
+
+        // A MEASURED result whose full-package comparison build timed out: real sizes, a transient
+        // diagnostic, and `error: None`. The shape every negative-`error` check waves through, and
+        // the one a store must refuse.
+        let mut degraded = crate::ipc::protocol::ImportResult::measured(
+            "react",
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 17_550,
+                minified_bytes: 9_000,
+                gzip_bytes: 3_000,
+                brotli_bytes: 2_500,
+                zstd_bytes: 2_400,
+            },
+        );
+        degraded.diagnostics = vec![crate::ipc::protocol::ImportDiagnostic::for_stage(
+            crate::engine::stage::TIMEOUT,
+            "comparison build did not complete within 8s",
+        )];
+        assert!(
+            !degraded.is_durable(),
+            "test setup: this is precisely a result no store may hold"
+        );
+
+        // The gate refuses it on the way in, which is why writing it needs the test-only door.
+        disk.insert("v4:react:degraded", &cached_with(degraded, 7))
+            .expect("the write gate refuses it, and refusing is not an error");
+        disk.flush_pending_inserts();
+        assert!(
+            disk.get("v4:react:degraded").is_none(),
+            "premise: the write gate already holds"
+        );
+
+        disk.write_ungated_for_test("v4:react:legacy", &cached_with(legacy_degraded(), 7))
+            .expect("simulate a row written before the gate existed");
+        disk.flush_pending_inserts();
+
+        assert!(
+            disk.get("v4:react:legacy").is_none(),
+            "a non-durable row already on disk must be refused on READ, not served and re-promoted"
+        );
+        assert!(
+            disk.get("v4:react:legacy").is_none(),
+            "and evicted, so the next read does not pay to decode it again"
+        );
+
+        // Control: a healthy row written the same way is still served. Without this the fix could be
+        // "made to pass" by refusing everything.
+        disk.write_ungated_for_test("v4:react:healthy", &sample_cached(8))
+            .expect("write a healthy row");
+        disk.flush_pending_inserts();
+        assert!(
+            disk.get("v4:react:healthy").is_some(),
+            "a durable row must still hydrate"
+        );
+
+        drop(disk);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn legacy_degraded() -> crate::ipc::protocol::ImportResult {
+        let mut result = crate::ipc::protocol::ImportResult::measured(
+            "react",
+            crate::ipc::protocol::MeasuredSizes {
+                raw_bytes: 17_550,
+                minified_bytes: 9_000,
+                gzip_bytes: 3_000,
+                brotli_bytes: 2_500,
+                zstd_bytes: 2_400,
+            },
+        );
+        result.diagnostics = vec![crate::ipc::protocol::ImportDiagnostic::for_stage(
+            crate::engine::stage::TIMEOUT,
+            "comparison build did not complete within 8s",
+        )];
+        result
     }
 
     #[test]

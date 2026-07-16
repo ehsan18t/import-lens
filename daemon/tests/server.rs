@@ -2,12 +2,13 @@ use import_lens_daemon::{
     ipc::{
         codec::{FrameDecoder, decode_payload, encode_frame},
         protocol::{
-            AnalyzePackageJsonRequest, AnalyzePackageJsonResponse, BatchRequest, BatchResponse,
-            CacheStatusRequest, CacheStatusResponse, FileSizeDocumentRequest,
-            FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse, FreshnessKind,
-            HelloMessage, ImportAnalysisStatus, ImportKind, ImportRequest, ImportRuntime,
-            PROTOCOL_VERSION, RefreshRegistryHintsRequest, RefreshRegistryHintsResponse,
-            RefreshedResultsResponse, RegistryHintMode, RegistryHintTarget, ShutdownMessage,
+            AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
+            AnalyzePackageJsonResponse, BatchRequest, BatchResponse, CacheStatusRequest,
+            CacheStatusResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
+            FileSizeRequest, FileSizeResponse, FreshnessKind, HelloMessage, ImportAnalysisStatus,
+            ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION,
+            RefreshRegistryHintsRequest, RefreshRegistryHintsResponse, RefreshedResultsResponse,
+            RegistryHintMode, RegistryHintTarget, ShutdownMessage,
         },
         server::{handle_connection, response_from_join},
     },
@@ -797,6 +798,42 @@ impl RawFrameReader {
     }
 }
 
+fn analyze_document(
+    workspace: &Path,
+    document: &Path,
+    source: &str,
+    request_id: u64,
+) -> AnalyzeDocumentRequest {
+    AnalyzeDocumentRequest {
+        message_type: "analyze_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: document.to_string_lossy().to_string(),
+        source: source.to_owned(),
+    }
+}
+
+/// Read `count` streamed import results, the way the extension does: the analysis response comes
+/// back with `loading` placeholders and each import arrives afterwards on its own push.
+async fn collect_streamed_imports(
+    reader: &mut RawFrameReader,
+    stream: &mut DuplexStream,
+    count: usize,
+) -> Vec<RefreshedResultsResponse> {
+    let mut pushes = Vec::new();
+    while pushes.len() < count {
+        let push: RefreshedResultsResponse = tokio::time::timeout(Duration::from_secs(10), async {
+            decode_payload(&reader.next_payload(stream).await)
+                .expect("a streamed import push should decode")
+        })
+        .await
+        .expect("every loading import must arrive on the push channel");
+        pushes.push(push);
+    }
+    pushes
+}
+
 fn file_size_document(
     workspace: &Path,
     document: &Path,
@@ -815,6 +852,117 @@ fn file_size_document(
         // resulting SWR push echoes it back for the client's supersession guard.
         analysis_generation: Some(request_id),
     }
+}
+
+/// The whole point of the redesign, end to end.
+///
+/// A cold document's imports are not in the cache, and the response does not wait for them: it
+/// comes back at once with a `loading` placeholder per import, and each import arrives afterwards
+/// on the push channel as its build lands. Before this, the response carried every import or
+/// none — so one package that parked the bundler pushed the response past the extension's 10s
+/// deadline and the client discarded the ENTIRE document, cached hits included.
+///
+/// The placeholders are what make the pushes deliverable: the client rebuilds a document's state
+/// from `imports`, and a push can only update a state that exists.
+#[tokio::test]
+async fn a_cold_document_answers_at_once_and_streams_each_import_as_it_lands() {
+    let workspace = temp_workspace();
+    write_tiny_package(&workspace);
+    write_heavy_package(&workspace);
+    let document = workspace.join("src").join("index.ts");
+    let source = "import { value } from 'tiny-stream-lib';\n\
+                  import * as heavy from 'heavy-stream-lib';\n\
+                  export const total = [value, heavy];\n";
+    fs::write(&document, source).expect("document should be written");
+
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new(None, false)),
+            Prefetcher::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = RawFrameReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+    client_stream
+        .write_all(
+            &encode_frame(&analyze_document(&workspace, &document, source, 7))
+                .expect("request should encode"),
+        )
+        .await
+        .expect("request should be written");
+
+    let response: AnalyzeDocumentResponse =
+        decode_payload(&reader.next_payload(&mut client_stream).await)
+            .expect("analysis response should decode");
+    assert_eq!(response.request_id, 7);
+    assert_eq!(response.error, None);
+    assert_eq!(response.imports.len(), 2);
+    assert!(
+        response
+            .imports
+            .iter()
+            .all(|item| item.status == ImportAnalysisStatus::Loading && item.result.is_none()),
+        "a cold document must answer with placeholders, not wait for the engine: {:?}",
+        response.imports
+    );
+    assert!(
+        response
+            .imports
+            .iter()
+            .all(|item| item.request.is_some() && item.message.is_none()),
+        "a loading import still carries its resolved request, and is not an error"
+    );
+
+    // Every one of them then arrives on the push channel, addressed by identity and stamped with
+    // the analysis generation the client uses to drop a superseded batch.
+    let pushes = collect_streamed_imports(&mut reader, &mut client_stream, 2).await;
+    let mut delivered = pushes
+        .iter()
+        .flat_map(|push| {
+            assert_eq!(push.message_type, "refreshed_results");
+            assert_eq!(push.document_path, document.to_string_lossy());
+            assert_eq!(push.generation, Some(7));
+            assert_eq!(push.results.len(), push.identities.len());
+            push.identities
+                .iter()
+                .zip(&push.results)
+                .map(|(identity, result)| {
+                    assert!(result.error.is_none(), "{result:?}");
+                    assert!(
+                        result.brotli_bytes().is_some_and(|bytes| bytes > 0),
+                        "a streamed import carries a real size"
+                    );
+                    identity.specifier.clone()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    delivered.sort();
+    assert_eq!(delivered, vec!["heavy-stream-lib", "tiny-stream-lib"]);
+
+    client_stream
+        .write_all(
+            &encode_frame(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("shutdown should encode"),
+        )
+        .await
+        .expect("shutdown should be written");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should exit cleanly");
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
 #[tokio::test]
@@ -843,7 +991,20 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
         .await
         .expect("hello should be written");
 
-    // First request populates the cache with a Fresh entry.
+    // Seed the cache the way the editor does: the document analysis is what builds a document's
+    // imports (the file-size read only sizes the file), and its results land on the push channel.
+    client_stream
+        .write_all(
+            &encode_frame(&analyze_document(&workspace, &document, source, 0))
+                .expect("request should encode"),
+        )
+        .await
+        .expect("request should be written");
+    let _: AnalyzeDocumentResponse = decode_payload(&reader.next_payload(&mut client_stream).await)
+        .expect("analysis response should decode");
+    collect_streamed_imports(&mut reader, &mut client_stream, 1).await;
+
+    // The first size read now hits that warm cache with a Fresh entry.
     client_stream
         .write_all(
             &encode_frame(&file_size_document(&workspace, &document, source, 1))
@@ -855,6 +1016,11 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
         decode_payload(&reader.next_payload(&mut client_stream).await)
             .expect("first response should decode");
     assert_eq!(first.request_id, 1);
+    assert_eq!(
+        first.imports.len(),
+        1,
+        "the size read serves the import the analysis already built: {first:?}"
+    );
 
     // Change the resolved dependency so the cached entry is stale, and bump the cache
     // generation so the next read takes the slow (re-validating) path.
@@ -944,6 +1110,144 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
         .expect("server task should join")
         .expect("server should exit cleanly");
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
+/// A streamed import must reach the socket WHILE a slow request is still being handled.
+///
+/// This is the whole point of the streaming design, and the connection loop used to defeat it. The
+/// extension sends `AnalyzeDocument` and then immediately `FileSizeDocument` for the same document.
+/// The analysis answers at once with `loading` placeholders and starts the per-import builds — but
+/// the loop then `.await`ed the file-size handler INLINE, so it sat suspended inside that arm
+/// instead of in its `select!`, and every import result that landed during the combined build was
+/// computed on time and then simply never written. The client's analysis deadline is absolute, so a
+/// combined build that parks for the full BUILD_TIMEOUT loses the whole document — the loss the
+/// placeholders exist to prevent.
+///
+/// The two requests are written in ONE chunk on purpose: that is what the extension does, and it is
+/// what makes the failure deterministic rather than a race. When the loop returns to its `select!`
+/// after answering the analysis, the file-size frame is already buffered and no push exists yet, so
+/// an inline-awaiting loop is guaranteed to disappear into the file-size arm before the first
+/// import lands.
+///
+/// Two things are asserted, and together they are the multiplexer:
+///
+/// * a streamed import reaches the socket BEFORE the file-size response. The combined build cannot
+///   even start until the per-import builds free an engine permit, so at least one push always
+///   precedes it in real time; a loop that writes its own responses straight to the socket from
+///   inside an arm puts the response on the wire first anyway, and the pushes queue up behind it;
+/// * a request sent WHILE that build is in flight is still answered before it. A loop suspended
+///   inside a handler cannot even read the frame.
+#[tokio::test]
+async fn a_streamed_import_is_delivered_while_a_file_size_build_is_in_flight() {
+    let workspace = temp_workspace();
+    write_tiny_package(&workspace);
+    write_heavy_package(&workspace);
+    let document = workspace.join("src").join("index.ts");
+    let source = "import { value } from 'tiny-stream-lib';\n\
+                  import * as heavy from 'heavy-stream-lib';\n\
+                  export const total = [value, heavy];\n";
+    fs::write(&document, source).expect("document should be written");
+
+    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        handle_connection(
+            server_stream,
+            None,
+            Arc::new(ImportLensService::new(None, false)),
+            Prefetcher::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    let mut reader = RawFrameReader::new();
+
+    client_stream
+        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .await
+        .expect("hello should be written");
+
+    let mut pipelined = encode_frame(&analyze_document(&workspace, &document, source, 21))
+        .expect("analysis request should encode");
+    pipelined.extend_from_slice(
+        &encode_frame(&file_size_document(&workspace, &document, source, 22))
+            .expect("file-size request should encode"),
+    );
+    client_stream
+        .write_all(&pipelined)
+        .await
+        .expect("both requests should be written in one chunk");
+
+    let analysis: AnalyzeDocumentResponse =
+        decode_payload(&reader.next_payload(&mut client_stream).await)
+            .expect("analysis response should decode");
+    assert_eq!(analysis.request_id, 21);
+    assert_eq!(analysis.imports.len(), 2);
+
+    // The combined build is now in flight. Nothing orders it behind the per-import builds: the
+    // file-size handler and the analysis handler are spawned independently and their builds race for
+    // the engine permits. With two permits, the trivial `tiny-stream-lib` build can even be starved
+    // while the combined build and the heavy per-import build hold both — so whether a per-import
+    // push reaches the socket before the file-size response is a scheduling coin toss, not a
+    // guarantee. Do NOT assert that ordering (an earlier version did, and it flaked in CI under
+    // different core counts). Assert instead the property the loop actually owes and the old
+    // inline-`.await` broke: it stays live while the build runs. Ask a fresh, trivial question now.
+    client_stream
+        .write_all(
+            &encode_frame(&cache_status(&workspace, 23)).expect("cache status should encode"),
+        )
+        .await
+        .expect("cache status should be written");
+
+    // Read frames until the file-size response arrives, recording what got delivered ahead of it.
+    let mut pushes_before_size_response = 0_usize;
+    let mut answered_a_new_request = false;
+    let file_size: FileSizeDocumentResponse =
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let payload = reader.next_payload(&mut client_stream).await;
+                // Only the push carries `message_type`, and only the cache-status response carries
+                // `project_count`, so the three shapes are unambiguous under MessagePack's named
+                // encoding.
+                if let Ok(push) = decode_payload::<RefreshedResultsResponse>(&payload) {
+                    assert_eq!(push.message_type, "refreshed_results");
+                    pushes_before_size_response += push.results.len();
+                    continue;
+                }
+                if let Ok(status) = decode_payload::<CacheStatusResponse>(&payload) {
+                    assert_eq!(status.request_id, 23);
+                    answered_a_new_request = true;
+                    continue;
+                }
+                return decode_payload::<FileSizeDocumentResponse>(&payload).expect(
+                    "every frame must be a push, a cache status, or the file-size response",
+                );
+            }
+        })
+        .await
+        .expect("the file-size response must arrive");
+
+    assert_eq!(file_size.request_id, 22);
+    // The deterministic proof that the loop was never suspended inside the file-size arm: a request
+    // that arrived AFTER the combined build began was still read, dispatched, and answered BEFORE
+    // that build's own response. `cache_status` needs no engine permit, so in a healthy loop it
+    // always overtakes the slow 8 MB build; under the old inline `.await` the loop could not even
+    // read the frame until the build finished. (That the imports stream at all is proven
+    // deterministically by `a_cold_document_answers_at_once_and_streams_each_import_as_it_lands`; and
+    // that none are dropped is proven below. What is NOT asserted is a per-import push arriving
+    // before the file-size response — that is a permit race, see above.)
+    assert!(
+        answered_a_new_request,
+        "a request sent while the file-size build was in flight must still be answered before it; \
+         the connection loop could not even read the frame"
+    );
+
+    // And the rest still arrive: nothing was dropped on the way.
+    let remaining = 2 - pushes_before_size_response.min(2);
+    if remaining > 0 {
+        collect_streamed_imports(&mut reader, &mut client_stream, remaining).await;
+    }
+
+    shutdown_server(&mut client_stream, server, workspace).await;
 }
 
 #[tokio::test]

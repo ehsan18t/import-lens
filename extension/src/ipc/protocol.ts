@@ -42,13 +42,27 @@ export interface ImportRequest {
   runtime: ImportRuntime;
 }
 
+/**
+ * One import's analysis, in exactly one of the two states a response can carry (ADR-0006).
+ * The third — Loading — is not an `ImportResult` at all: it is an `ImportAnalysisItem` with
+ * `status: "loading"` and no result.
+ *
+ * - **Measured**: every size is a `number`, `unmeasured_stage` is absent, `error` is `null`.
+ * - **Unmeasured**: every size is `null`, `unmeasured_stage` names the stage that could not
+ *   answer, and `error` carries its message.
+ *
+ * A size is `number | null` and NOT optional, because the question a consumer must ask is
+ * **"is there a size?"** — never "is there an error?". A degraded result used to carry
+ * `error: null` PLUS a fabricated size, so every `!result.error` check in this codebase waved it
+ * through; there is no size to misuse now. Use `measuredSizes()` in `ui/format.ts` to ask.
+ */
 export interface ImportResult {
   specifier: string;
-  raw_bytes: number;
-  minified_bytes: number;
-  gzip_bytes: number;
-  brotli_bytes: number;
-  zstd_bytes: number;
+  raw_bytes: number | null;
+  minified_bytes: number | null;
+  gzip_bytes: number | null;
+  brotli_bytes: number | null;
+  zstd_bytes: number | null;
   cache_hit: boolean;
   side_effects: boolean;
   truly_treeshakeable: boolean;
@@ -56,6 +70,10 @@ export interface ImportResult {
   confidence: ConfidenceLevel;
   confidence_reasons: string[];
   error: string | null;
+  // The stage that could not answer, when there is no size. `null` on a measurement. It is what
+  // tells a broken package (`parse` — a permanent fact) from a flaky daemon (`timeout` — a fact
+  // about nothing at all).
+  unmeasured_stage?: string | null;
   diagnostics: ImportDiagnostic[];
   module_breakdown?: ModuleContribution[];
   shared_bytes?: number;
@@ -156,6 +174,21 @@ export interface FileSizeDocumentResponse {
   zstd_bytes: number;
   imports: ImportResult[];
   states: ImportAnalysisItem[];
+  // The totals are a FLOOR, not the file's size: an import that belongs in them was never
+  // measured — its own build had not landed (`status: "loading"`), or a transient engine failure
+  // fabricated the size it carries. Safe to show with the diagnostics that say so (FR-024a),
+  // never safe to record as a historical data point (FR-026c). Absent from an older daemon, which
+  // is why it is optional; read it as `incomplete === true`.
+  incomplete?: boolean;
+  // The file's OWN combined build failed, so these totals are an un-deduplicated sum of the
+  // per-import costs — a *different quantity* from a File Cost (ADR-0004), and an OVER-count.
+  //
+  // `incomplete` structurally cannot see this: a combined build is the biggest build in the system,
+  // so it is the likeliest to hit the daemon's build timeout — and when it does, every one of the
+  // file's imports may still be perfectly Measured. The response then carries `incomplete: false`,
+  // `error: null`, a size on every import, and a number the file never had. Show it, never store it,
+  // never judge a budget against it (ADR-0006, invariants 4 and 5).
+  degraded?: boolean;
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }
@@ -163,10 +196,16 @@ export interface FileSizeDocumentResponse {
 // A stable per-import identity for the SWR refresh push: the specifier alone is
 // NOT unique (two imports of the same package differ by kind / named exports but
 // share a specifier), so pushes carry this alongside each result to disambiguate.
+//
+// `runtime` is part of the identity because it is part of the import: an Astro document can import
+// the same package, with the same kind and the same named exports, from its frontmatter (server)
+// and from a client <script>, and those are two rows with two different sizes (ADR-0005). Without
+// it the two variants collide on one key and the client collapses them into a single row.
 export interface RefreshedImportIdentity {
   specifier: string;
   import_kind: ImportKind;
   named: string[];
+  runtime: ImportRuntime;
 }
 
 // Unsolicited server->client push: freshly-recomputed sizes for a document after a
@@ -313,9 +352,18 @@ export interface PrewarmPackageJsonMessage {
   active_document_path: string;
 }
 
+/**
+ * Something the daemon memoized is no longer true. Two kinds of path, because two kinds of file
+ * feed its resolvers: a `node_modules/<pkg>/package.json` (an install or uninstall), and a
+ * `tsconfig.json` / `jsconfig.json` — the workspace's alias table, which is the only thing that
+ * tells a path alias apart from a package that is not installed. The daemon read that table once
+ * and never again, so adding the `paths` entry that repairs an unrecognized alias did nothing for
+ * the rest of the daemon's life.
+ */
 export interface NodeModulesChangedMessage {
   type: "node_modules_changed";
   package_json_paths: string[];
+  tsconfig_paths: string[];
 }
 
 export interface EnumerateExportsRequest {
@@ -327,6 +375,10 @@ export interface EnumerateExportsRequest {
   specifier: string;
   package: string;
   package_version: string;
+  // The import's UTF-16 offset in the document. The daemon classifies it into a runtime so the
+  // enumeration resolves under the same conditions the size does (an import in Astro frontmatter
+  // is Server, not Component). Omit for a document with no runtime-bearing regions.
+  cursor_offset?: number;
 }
 
 export interface EnumerateExportsResponse {
@@ -356,6 +408,11 @@ export interface FileSizeResponse {
   brotli_bytes: number;
   zstd_bytes: number;
   imports: ImportResult[];
+  // The same two flags, with the same meanings, as on `FileSizeDocumentResponse`. The daemon has
+  // always computed them for this surface too; omitting them here made it the one response where a
+  // floor and a measurement are indistinguishable.
+  incomplete?: boolean;
+  degraded?: boolean;
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }
@@ -478,9 +535,17 @@ export interface WorkspaceReportRequest {
   budgets?: WorkspaceReportBudgets;
 }
 
+/**
+ * The budgets the workspace report can judge: the **per-import** one, and only that.
+ *
+ * A per-file budget is judged against a File Cost — one bundle over all a file's imports (ADR-0004)
+ * — and the report has no combined build behind a row, only a sum of per-import costs, which counts
+ * a shared module twice. It used to warn off that sum, and disagreed with the editor and
+ * `importlens check` about the same file under the same budget. The per-file budget is theirs; it
+ * is not on this request, so nothing here can be judged against a number the report does not have.
+ */
 export interface WorkspaceReportBudgets {
   perImportBrotliBytes?: number;
-  perFileBrotliBytes?: number;
 }
 
 export interface WorkspaceReportRow {
@@ -489,10 +554,12 @@ export interface WorkspaceReportRow {
   sourceFile: string;
   line: number;
   runtime: string;
-  minifiedBytes: number;
-  gzipBytes: number;
-  brotliBytes: number;
-  zstdBytes: number;
+  // `null` when the import could not be measured. Not zero: an exported report that prints "0 B"
+  // for a package the engine could not build is the sentinel this model exists to abolish.
+  minifiedBytes: number | null;
+  gzipBytes: number | null;
+  brotliBytes: number | null;
+  zstdBytes: number | null;
   sharedBytes: number;
   confidence: ConfidenceLevel | "unknown";
   confidenceReasons: string;
@@ -510,25 +577,53 @@ export interface WorkspaceReportTreemapItem {
   confidence: ConfidenceLevel | "unknown";
 }
 
+/**
+ * Every import of one specifier across the workspace, and what they cost **together**: three files
+ * importing `react` is three Reacts. It was `totalBrotliBytes`, and a "total" of three Reacts is a
+ * number no project ships — under the honest label the panel finally says what it exists to say.
+ */
 export interface DuplicateImportGroup {
   specifier: string;
   count: number;
-  totalBrotliBytes: number;
+  combinedImportCostBrotliBytes: number;
   sourceFiles: string[];
 }
 
+/**
+ * One module, and the imports that reach it — **two** numbers, because the module's size and what
+ * its importing sites pay are two different quantities (ADR-0004).
+ *
+ * It carried one, `totalBytes`: the module's bytes added up once per importing row, rendered under
+ * the header "Total Bytes". `react-dom/index.js` **is 100 kB** and is reached by three imports, and
+ * the panel said **300 kB**.
+ */
 export interface DuplicateModuleGroup {
   modulePath: string;
   basename: string;
+  /** The number of imports that reach this module. */
   count: number;
-  totalBytes: number;
+  /** The module's own rendered size — the largest contribution seen across the builds that reached it. */
+  moduleBytes: number;
+  /** The module counted once per importing site: a Combined Import Cost, an upper bound. */
+  combinedImportCostBytes: number;
   specifiers: string[];
   vendored: boolean;
 }
 
+/**
+ * The report's headline is a **Combined Import Cost**: the sum of independent Import Costs, each
+ * priced as though the application were otherwise empty (ADR-0004).
+ *
+ * It counts a dependency at every site it is imported from — `react` in fifty files is fifty Reacts,
+ * and one `import React, { useState } from "react"` is TWO imports, counted twice. Subtracting the
+ * overlap would assert a project-level bundle quantity this product does not model, and compressed
+ * sizes are not additive regardless, so the figure is an upper bound. It ranks imports and
+ * apportions blame; it is never a size. It was `totalBrotliBytes`, rendered "Total Brotli" — the
+ * arithmetic was right and the word was the defect. The treemap's percentages are shares of it.
+ */
 export interface WorkspaceReportSummary {
   importCount: number;
-  totalBrotliBytes: number;
+  combinedImportCostBrotliBytes: number;
   lowConfidenceCount: number;
   mediumConfidenceCount: number;
   conservativeCount: number;

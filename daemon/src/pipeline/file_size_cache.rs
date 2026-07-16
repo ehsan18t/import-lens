@@ -3,11 +3,11 @@ use crate::{
         key::{cache_key_for_resolved_import, path_is_definitely_gone},
         memory::cache_generation,
     },
+    engine::dependency_paths::cached_loaded_paths,
     ipc::protocol::{ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
-        file_size::FileSizeComputation,
-        graph::peek_cached_module_paths,
+        file_size::{FileSizeComputation, SizedImport, SizedPackage},
         resolver::{ResolvedPackage, resolve_package_entry},
     },
 };
@@ -24,18 +24,19 @@ use std::{
 
 // One aggregate-size entry per document path. Editing a file overwrites its
 // single slot in place, so repeated edits never accumulate orphaned entries.
-// Distinct files are bounded by LRU eviction, mirroring GRAPH_CACHE.
+// Distinct files are bounded by LRU eviction.
 const MAX_CACHED_FILE_SIZES: usize = 64;
 
 // Bound how long an aggregate is served without any freshness signal. Per import
 // the signature folds the package's manifest plus a content token: for node_modules
-// imports just the entry stat, for first-party imports a stat per cached-graph
-// module (see `resolved_import_token`). It never re-reads the transitive bundle. A
+// imports just the entry stat, for first-party imports a stat per cached loaded
+// path (see `resolved_import_token`). It never re-reads the transitive bundle. A
 // node_modules content change with no watcher event (e.g. a watcher-excluded
-// folder), or a first-party deep edit while that package's graph is not cached (the
-// fallback stats only the entry), is reflected in the L2 per-import cache after its
-// own re-verify window but would otherwise never reach L1. This TTL gives L1 the
-// same backstop as `memory::REVERIFY_TTL`, capping staleness to one window.
+// folder), or a first-party deep edit while that package's loaded paths are not
+// cached (the fallback stats only the entry), is reflected in the L2 per-import
+// cache after its own re-verify window but would otherwise never reach L1. This
+// TTL gives L1 the same backstop as `memory::REVERIFY_TTL`, capping staleness to
+// one window.
 const REVERIFY_TTL_MS: u64 = 30_000;
 
 #[derive(Debug)]
@@ -71,7 +72,26 @@ impl FileSizeCache {
         Some(entry.computation.clone())
     }
 
+    /// Store a file's totals — **if they are the file's totals**.
+    ///
+    /// The gate is here, in the store (ADR-0006, invariants 3 and 4). A floor — a total missing an
+    /// import that was Loading or Unmeasured — is a real number and not this file's, and a 30-second
+    /// TTL is long enough for it to become the file's reported size, its persisted baseline, and its
+    /// CI verdict. Refusing at the insert means a future caller cannot reintroduce that by
+    /// forgetting a predicate.
     pub fn insert(&self, path: PathBuf, signature: u64, computation: FileSizeComputation) {
+        if !computation.is_cacheable() {
+            crate::logging::log_debug(
+                "file_size_cache",
+                format!(
+                    "refusing to cache a non-measurement for {} (incomplete: {})",
+                    path.display(),
+                    computation.incomplete
+                ),
+            );
+            return;
+        }
+
         let pinned = self.entries.pin();
         let now = crate::time::unix_millis_now();
         pinned.insert(
@@ -85,8 +105,8 @@ impl FileSizeCache {
         );
 
         // Bound files-opened-then-closed by evicting the least-recently-used
-        // entry, mirroring GRAPH_CACHE. Editing the same file never triggers
-        // this because it overwrites one slot rather than adding a new key.
+        // entry. Editing the same file never triggers this because it
+        // overwrites one slot rather than adding a new key.
         if pinned.len() > MAX_CACHED_FILE_SIZES
             && let Some(oldest) = pinned
                 .iter()
@@ -146,11 +166,25 @@ pub fn shared_file_size_cache() -> &'static FileSizeCache {
 /// requests contribute a stable request-shape token. Sorting makes it
 /// order-independent, matching `compute_file_size` which combines all imports
 /// regardless of order.
-pub fn file_size_signature(context: &AnalysisContext, requests: &[ImportRequest]) -> u64 {
-    let mut tokens = requests
+pub fn file_size_signature(context: &AnalysisContext, imports: &[SizedImport]) -> u64 {
+    let mut tokens = imports
         .iter()
-        .map(
-            |request| match resolve_package_entry(&context.active_document_path, request) {
+        .map(|import| {
+            // An import with no request has no resolved entry to fingerprint, and it still belongs
+            // in the signature. The two kinds get DIFFERENT tokens, because they mean opposite
+            // things to the total and the user can move an import between them: a package that is
+            // not installed makes the total a floor (FR-024a) — installing it, or adding the
+            // tsconfig `paths` entry that makes the daemon see a specifier as first-party, must move
+            // the signature so the total is recomputed rather than served from L1.
+            let request = match &import.package {
+                SizedPackage::Installed(request) => request,
+                SizedPackage::NotInstalled => {
+                    return format!("not_installed:{}", import.specifier);
+                }
+                SizedPackage::PathAlias => return format!("path_alias:{}", import.specifier),
+            };
+
+            match resolve_package_entry(&context.active_document_path, request) {
                 Ok(resolved) => resolved_import_token(request, &resolved),
                 Err(_) => format!(
                     "unresolved:{}:{}:{}:{:?}:{:?}:{}",
@@ -161,8 +195,8 @@ pub fn file_size_signature(context: &AnalysisContext, requests: &[ImportRequest]
                     request.import_kind,
                     request.named.join(",")
                 ),
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     tokens.sort();
 
@@ -201,20 +235,17 @@ fn resolved_import_token(request: &ImportRequest, resolved: &ResolvedPackage) ->
     format!("{key}|{content_token}|{manifest_token}")
 }
 
-/// Stat token covering every first-party module reachable from `entry_path`. Peeks
-/// the cached module graph for the package's module path set — or, for a CommonJS
-/// package (which produces no ESM graph, RB-5), the cached CJS module set — and folds
-/// a `stat_token` per module, so a deep-module edit — which changes neither the cache
-/// key nor the entry stat — moves the L1 signature. Neither peek ever builds. Any
+/// Stat token covering every first-party path loaded by the latest engine build.
+/// A deep-module edit — which changes neither the cache key nor the entry stat — moves
+/// the L1 signature. This index lookup never builds. Any
 /// `node_modules` modules a first-party package pulls in are skipped: they invalidate
 /// via `cache_generation`, not mtime, and re-stat'ing them every poll is the cost the
 /// node_modules branch deliberately avoids. With nothing cached yet, falls back to the
-/// entry stat alone; a later poll, once L2 has populated a graph / CJS module set,
+/// entry stat alone; a later poll, once L2 has populated the dependency-path index,
 /// upgrades to full coverage. The tokens are sorted so the result is stable regardless
 /// of module order.
 fn first_party_module_token(entry_path: &Path, runtime: ImportRuntime) -> String {
-    let module_paths = peek_cached_module_paths(entry_path, runtime)
-        .or_else(|| crate::pipeline::cjs::peek_cjs_module_paths(entry_path, runtime));
+    let module_paths = cached_loaded_paths(entry_path, runtime);
     let Some(module_paths) = module_paths else {
         return stat_token(entry_path);
     };
@@ -261,11 +292,22 @@ mod tests {
     use crate::cache::memory::bump_cache_generation;
     use crate::ipc::protocol::{ImportKind, ImportRuntime};
 
+    /// `file_size_signature` folds the process-global cache generation, so every test here that
+    /// compares two signatures — and the one that deliberately bumps it — must serialize against
+    /// the rest of the binary. See `cache::memory::hold_cache_generation_steady`.
+    use crate::cache::memory::hold_cache_generation_steady as hold_generation_steady;
+
     fn computation(minified: u64) -> FileSizeComputation {
         FileSizeComputation {
             minified_bytes: minified,
             ..FileSizeComputation::default()
         }
+    }
+
+    /// An import whose own size the caller already knows nothing about; the signature only
+    /// reads the request, so the measurement is irrelevant here.
+    fn sized(request: ImportRequest) -> SizedImport {
+        SizedImport::installed(request, None)
     }
 
     #[test]
@@ -377,6 +419,7 @@ mod tests {
 
     #[test]
     fn file_size_signature_changes_when_entry_bytes_change() {
+        let _generation = hold_generation_steady();
         // Real node_modules fixture so resolve_package_entry succeeds and the
         // Ok(resolved) arm folds in the entry+manifest fingerprint.
         let ws = std::env::temp_dir().join(format!("il-l1-sig-{}", std::process::id()));
@@ -393,20 +436,20 @@ mod tests {
             workspace_root: ws.clone(),
             active_document_path: ws.join("src").join("index.ts"),
         };
-        let requests = vec![ImportRequest {
+        let imports = vec![sized(ImportRequest {
             specifier: "l1-lib".to_owned(),
             package_name: "l1-lib".to_owned(),
             version: "1.0.0".to_owned(),
             named: Vec::new(),
             import_kind: ImportKind::Namespace,
             runtime: ImportRuntime::Component,
-        }];
+        })];
 
-        let sig1 = file_size_signature(&context, &requests);
+        let sig1 = file_size_signature(&context, &imports);
         // Change the entry's content+length; the signature must change even though
         // the cache key no longer carries entry fingerprints.
         std::fs::write(pkg.join("index.js"), "export const a = 222222;").expect("entry v2");
-        let sig2 = file_size_signature(&context, &requests);
+        let sig2 = file_size_signature(&context, &imports);
 
         assert_ne!(
             sig1, sig2,
@@ -417,9 +460,10 @@ mod tests {
 
     #[test]
     fn signature_is_order_independent() {
+        let _generation = hold_generation_steady();
         let ctx = unresolvable_context();
-        let a = named_request("alpha", &["x"]);
-        let b = named_request("beta", &["y"]);
+        let a = sized(named_request("alpha", &["x"]));
+        let b = sized(named_request("beta", &["y"]));
         assert_eq!(
             file_size_signature(&ctx, &[a.clone(), b.clone()]),
             file_size_signature(&ctx, &[b, a])
@@ -428,25 +472,42 @@ mod tests {
 
     #[test]
     fn signature_changes_when_named_exports_change() {
+        let _generation = hold_generation_steady();
         let ctx = unresolvable_context();
         assert_ne!(
-            file_size_signature(&ctx, &[named_request("alpha", &["x"])]),
-            file_size_signature(&ctx, &[named_request("alpha", &["x", "y"])])
+            file_size_signature(&ctx, &[sized(named_request("alpha", &["x"]))]),
+            file_size_signature(&ctx, &[sized(named_request("alpha", &["x", "y"]))])
+        );
+    }
+
+    /// A not-installed import is part of the file's identity: it is what makes the total a floor
+    /// (FR-024a), and a signature that cannot see it would serve the L1 entry computed before the
+    /// import was added. Fails if the import is dropped from the token list.
+    #[test]
+    fn signature_sees_an_import_whose_package_is_not_installed() {
+        let _generation = hold_generation_steady();
+        let ctx = unresolvable_context();
+        let installed = sized(named_request("alpha", &["x"]));
+
+        assert_ne!(
+            file_size_signature(&ctx, std::slice::from_ref(&installed)),
+            file_size_signature(&ctx, &[installed, SizedImport::not_installed("ghost")]),
         );
     }
 
     #[test]
     fn signature_changes_when_generation_bumps() {
+        let _generation = hold_generation_steady();
         let ctx = unresolvable_context();
-        let reqs = [named_request("alpha", &["x"])];
-        let before = file_size_signature(&ctx, &reqs);
+        let imports = [sized(named_request("alpha", &["x"]))];
+        let before = file_size_signature(&ctx, &imports);
         bump_cache_generation();
-        assert_ne!(before, file_size_signature(&ctx, &reqs));
+        assert_ne!(before, file_size_signature(&ctx, &imports));
     }
 
     #[test]
     fn resolved_import_token_folds_first_party_deep_module_stat() {
-        use crate::pipeline::graph::build_module_graph_cached_with_runtime;
+        use crate::engine::dependency_paths::{clear, record_loaded_paths};
         use crate::pipeline::resolver::SideEffectsMode;
 
         // A first-party fixture lives OUTSIDE node_modules: entry imports a deep
@@ -488,23 +549,23 @@ mod tests {
             runtime: ImportRuntime::Component,
         };
 
-        // Cache the module graph so the first-party branch can peek its module set.
-        // Rebuilt immediately before each token so a concurrent LRU eviction/clear in
-        // the process-shared GRAPH_CACHE cannot drop it mid-test.
-        build_module_graph_cached_with_runtime(&entry_path, ImportRuntime::Component)
-            .expect("graph should build");
+        clear();
+        record_loaded_paths(
+            entry_path.clone(),
+            ImportRuntime::Component,
+            vec![entry_path.clone(), pkg.join("deep.js")],
+        );
         let token_before = resolved_import_token(&request, &resolved);
 
         // Edit the DEEP module only (not the entry, not the manifest): its len+mtime move.
         std::fs::write(pkg.join("deep.js"), "export const d = 22222222;\n").expect("deep v2");
-        build_module_graph_cached_with_runtime(&entry_path, ImportRuntime::Component)
-            .expect("graph should rebuild");
         let token_after = resolved_import_token(&request, &resolved);
 
         assert_ne!(
             token_before, token_after,
             "editing a deep first-party module must change the L1 token"
         );
+        clear();
         std::fs::remove_dir_all(&root).ok();
     }
 
