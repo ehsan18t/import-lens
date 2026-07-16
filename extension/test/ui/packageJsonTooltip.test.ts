@@ -259,6 +259,50 @@ test("importResultSizeMarkdown renders sectioned size rows", () => {
       "- Brotli: 1.5 kB",
       "- Zstd: 1.7 kB",
     ].join("\n"),
+    "an import that ships no assets renders no breakdown at all",
+  );
+});
+
+test("importResultSizeMarkdown names the assets folded into the size", () => {
+  // The bytes are already IN the number above; this says how it is composed, so a UI kit's cost
+  // reads as part JavaScript and part stylesheet rather than one opaque figure (B2).
+  assert.equal(
+    importResultSizeMarkdown(
+      result({
+        asset_breakdown: [
+          {
+            kind: "css",
+            raw_bytes: 8000,
+            minified_bytes: 5000,
+            gzip_bytes: 1200,
+            brotli_bytes: 900,
+            zstd_bytes: 1000,
+          },
+          {
+            kind: "font",
+            raw_bytes: 4000,
+            minified_bytes: 4000,
+            gzip_bytes: 3900,
+            brotli_bytes: 3800,
+            zstd_bytes: 3850,
+          },
+        ],
+      }),
+      "brotli",
+    ),
+    [
+      "**Size**",
+      "- Selected Brotli: **1.5 kB br**",
+      "- Raw: 12.0 kB",
+      "- Minified: 4.6 kB",
+      "- Gzip: 2.1 kB",
+      "- Brotli: 1.5 kB",
+      "- Zstd: 1.7 kB",
+      "",
+      "**Included assets**",
+      "- CSS: 900 B",
+      "- Fonts: 3.8 kB",
+    ].join("\n"),
   );
 });
 

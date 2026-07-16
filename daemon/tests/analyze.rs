@@ -1,3 +1,4 @@
+use import_lens_daemon::engine::AssetKind;
 use import_lens_daemon::ipc::protocol::{
     ConfidenceLevel, ImportKind, ImportRequest, ImportRuntime, MeasuredSizes,
 };
@@ -2692,4 +2693,22 @@ fn analyze_a_css_shipping_package_counts_its_stylesheet_in_the_import_cost() {
             .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
         "a counted stylesheet must not also be disclosed as uncounted: {result:?}",
     );
+
+    // The number says how it is composed, so the stylesheet's share is legible rather than folded
+    // invisibly into one figure.
+    let css = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Css)
+        .expect("a CSS-shipping package must report what its stylesheet contributed");
+    assert!(css.brotli_bytes > 0 && css.minified_bytes > 0, "{css:?}");
+    assert_eq!(
+        sizes.brotli_bytes - plain_sizes.brotli_bytes,
+        css.brotli_bytes,
+        "the reported CSS contribution must be exactly the difference the stylesheet makes",
+    );
+
+    // With its bytes counted, nothing is uncounted, so the stylesheet no longer costs the package
+    // its confidence — the diagnostic that held it at Medium is only emitted on a failure now.
+    assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
 }

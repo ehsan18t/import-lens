@@ -56,6 +56,22 @@ export interface ImportRequest {
  * `error: null` PLUS a fabricated size, so every `!result.error` check in this codebase waved it
  * through; there is no size to misuse now. Use `measuredSizes()` in `ui/format.ts` to ask.
  */
+/** What a non-JavaScript asset ships as. Mirrors the daemon's `engine::AssetKind` (snake_case). */
+export type AssetKind = "css" | "wasm" | "font";
+
+/**
+ * One asset kind's contribution to an import's size (B2): every artifact of that kind, each
+ * compressed on its own and summed. Mirrors the daemon's `AssetContribution`.
+ */
+export interface AssetContribution {
+  kind: AssetKind;
+  raw_bytes: number;
+  minified_bytes: number;
+  gzip_bytes: number;
+  brotli_bytes: number;
+  zstd_bytes: number;
+}
+
 export interface ImportResult {
   specifier: string;
   raw_bytes: number | null;
@@ -77,6 +93,10 @@ export interface ImportResult {
   diagnostics: ImportDiagnostic[];
   module_breakdown?: ModuleContribution[];
   shared_bytes?: number;
+  // What each kind of non-JavaScript asset contributed to the five sizes above (B2). Empty for an
+  // import that ships none, which is the common case. These bytes are already IN the sizes: this
+  // says how the number is composed, it does not add to it.
+  asset_breakdown?: AssetContribution[];
   // Data-layer freshness of this served value. Omitted by the daemon when Fresh
   // (skip_serializing_if), so an absent field means Fresh. No consumer reads it yet.
   freshness?: ResultFreshness;

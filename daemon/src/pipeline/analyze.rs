@@ -564,6 +564,10 @@ pub(crate) fn analyze_with_rolldown_engine(
     result.confidence_reasons = confidence_reasons;
     result.diagnostics = diagnostics;
     result.module_breakdown = Some(top_module_contributions(&contributions));
+    // How the number above is composed: these bytes are already IN the five sizes, and this says
+    // which of them are stylesheet, wasm, or font, so a UI kit's cost is legible rather than a
+    // single opaque figure (B2).
+    result.asset_breakdown = assets.contributions;
     result.internal_contributions = contributions;
 
     Ok((result, loaded_paths, freshness))

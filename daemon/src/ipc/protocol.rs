@@ -210,6 +210,24 @@ impl MeasuredSizes {
     };
 }
 
+/// What one kind of non-JavaScript asset contributes to an import's size (B2).
+///
+/// Every artifact of that kind, each compressed on its own and summed (ADR-0005). These bytes are
+/// **already inside** the result's five sizes — this is the composition of a number, not an
+/// addendum to it, which is exactly what the old `uncounted_assets` disclosure was not.
+///
+/// Flat rather than nesting a [`MeasuredSizes`], because the disk cache encoding is positional and
+/// a flat row of `u64`s is the shape both sides read most plainly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetContribution {
+    pub kind: crate::engine::AssetKind,
+    pub raw_bytes: u64,
+    pub minified_bytes: u64,
+    pub gzip_bytes: u64,
+    pub brotli_bytes: u64,
+    pub zstd_bytes: u64,
+}
+
 /// One import's analysis, in exactly one of the two states a *response* can carry (ADR-0006).
 /// The third — Loading — is not an `ImportResult` at all: it is
 /// [`ImportAnalysisItem`] with `status: Loading` and no result.
@@ -276,6 +294,15 @@ pub struct ImportResult {
     /// See the struct's serde note.
     #[serde(default)]
     pub shared_bytes: Option<u64>,
+    /// What each kind of non-JavaScript asset contributed to the five sizes above (B2). Empty when
+    /// the import ships none, which is the common case.
+    ///
+    /// These bytes are already IN the sizes; this says how they are composed, so a reader can see
+    /// that a UI kit's number is part JavaScript and part stylesheet. Plain `Vec`, no
+    /// `skip_serializing_if`, for the positional-msgpack reason above; `#[serde(default)]` so the
+    /// field is simply empty for anything that predates it.
+    #[serde(default)]
+    pub asset_breakdown: Vec<AssetContribution>,
     /// Freshness of this served value. `#[serde(default)]` so old disk entries decode
     /// as `Fresh`; `skip_serializing_if = is_fresh` so the DISK (positional msgpack)
     /// never emits it (disk only stores `Fresh`), keeping the array aligned past the
@@ -308,6 +335,7 @@ impl ImportResult {
             diagnostics: Vec::new(),
             module_breakdown: None,
             shared_bytes: None,
+            asset_breakdown: Vec::new(),
             freshness: ResultFreshness::fresh(),
             internal_contributions: Vec::new(),
         }
@@ -350,6 +378,7 @@ impl ImportResult {
             }],
             module_breakdown: None,
             shared_bytes: None,
+            asset_breakdown: Vec::new(),
             freshness: ResultFreshness::fresh(),
             internal_contributions: Vec::new(),
         }

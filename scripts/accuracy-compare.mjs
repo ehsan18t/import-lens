@@ -13,6 +13,11 @@
 //     - date-fns: deep zero-dependency ESM graph.
 //     - lodash:   the CommonJS path -- `SourceType::cjs()` and the `;(() => {…})();`
 //                 wrapper that `pipeline/cjs.rs` builds.
+//     - refractor: a sideEffects glob anchored at the package root.
+//     - @uiw/react-md-editor: the only real package whose published ESM entry actually
+//                 does `import "./index.css"`, so it is the one benchmark that compares
+//                 ASSET COUNTING (B2) against the oracle -- both sides must fold in the
+//                 same stylesheet, or a missed `@import` / double count shows up here.
 //
 // NOT covered: the `.js`-containing-JSX retry path (`graph.rs`), which is a
 // parse-failure fallback; and the mangler's exported-destructuring handling, which
@@ -62,6 +67,17 @@ const realFixtures = [
     package: "refractor",
     named: "refractor",
     label: "refractor (sideEffects glob anchored at the package root)",
+  },
+  // The ONLY real package in the set whose published ESM entry actually does `import "./index.css"`
+  // — react-toastify, react-datepicker, swiper and react-loading-skeleton all *ship* a stylesheet
+  // but none imports one from published JavaScript, so none would exercise this at all. It is what
+  // gates asset counting (B2) against the oracle: both sides must fold in the same stylesheet, so a
+  // missed `@import`, a double count, or an asymmetric inline shows up here as a delta rather than
+  // as a wrong number in the product.
+  {
+    package: "@uiw/react-md-editor",
+    named: "headingExecute",
+    label: "@uiw/react-md-editor (ESM entry imports CSS: asset counting vs the oracle)",
   },
 ];
 
@@ -496,15 +512,29 @@ const esbuildNamedSize = async (workspace, activeDocumentPath) => {
     treeShaking: true,
     logLevel: "silent",
   });
-  const output = result.outputFiles[0]?.contents;
 
-  if (!output) {
-    throw new Error("esbuild did not produce an output file");
+  // When the bundled graph imports CSS, esbuild gathers it into a SIBLING `.css` output beside the
+  // JS chunk, so `outputFiles` holds more than one entry and the JS is not guaranteed to be at
+  // index 0. The daemon counts those stylesheet bytes now (B2), so the oracle must too, or the two
+  // would be measuring different things and the comparison would be meaningless.
+  //
+  // Classify by extension and compress each artifact ON ITS OWN before summing — never concatenate
+  // first — because that is exactly what the daemon does (ADR-0005: they are separate files that
+  // ship separately). `reduce` over an empty CSS list is zero, so a pure-JS benchmark is unchanged.
+  const javascript = result.outputFiles.filter((file) => file.path.endsWith(".js"));
+  const stylesheets = result.outputFiles.filter((file) => file.path.endsWith(".css"));
+
+  if (javascript.length === 0) {
+    throw new Error("esbuild did not produce a JavaScript output file");
   }
 
+  const bytesOf = (files) => files.reduce((bytes, file) => bytes + file.contents.length, 0);
+  const brotliBytesOf = (files) =>
+    files.reduce((bytes, file) => bytes + brotliSize(file.contents), 0);
+
   return {
-    brotliBytes: brotliSize(output),
-    minifiedBytes: output.length,
+    brotliBytes: brotliBytesOf(javascript) + brotliBytesOf(stylesheets),
+    minifiedBytes: bytesOf(javascript) + bytesOf(stylesheets),
   };
 };
 

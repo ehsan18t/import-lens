@@ -20,7 +20,7 @@
 //! ([ADR-0006](../../../docs/adr/0006-the-result-model.md)).
 
 use crate::engine::{AssetKind, CollectedAsset, UncountedAsset, diagnostic_stage};
-use crate::ipc::protocol::{ImportDiagnostic, MeasuredSizes};
+use crate::ipc::protocol::{AssetContribution, ImportDiagnostic, MeasuredSizes};
 use crate::pipeline::compress::compress_all_bytes;
 use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider};
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions};
@@ -234,14 +234,6 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<(Vec<u8>, Ve
     Ok((raw_bytes, minified_bytes))
 }
 
-/// One asset kind's counted contribution: every artifact of that kind, each compressed on its own
-/// and summed (ADR-0005).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssetContribution {
-    pub kind: AssetKind,
-    pub sizes: MeasuredSizes,
-}
-
 /// What the reachable assets really cost, ready to fold into the Import Cost.
 #[derive(Debug, Default)]
 pub struct ProcessedAssets {
@@ -263,11 +255,11 @@ impl ProcessedAssets {
     pub fn total(&self) -> MeasuredSizes {
         let mut total = MeasuredSizes::ZERO;
         for contribution in &self.contributions {
-            total.raw_bytes += contribution.sizes.raw_bytes;
-            total.minified_bytes += contribution.sizes.minified_bytes;
-            total.gzip_bytes += contribution.sizes.gzip_bytes;
-            total.brotli_bytes += contribution.sizes.brotli_bytes;
-            total.zstd_bytes += contribution.sizes.zstd_bytes;
+            total.raw_bytes += contribution.raw_bytes;
+            total.minified_bytes += contribution.minified_bytes;
+            total.gzip_bytes += contribution.gzip_bytes;
+            total.brotli_bytes += contribution.brotli_bytes;
+            total.zstd_bytes += contribution.zstd_bytes;
         }
         total
     }
@@ -353,13 +345,11 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
         Ok((bundle, compressed)) => {
             processed.contributions.push(AssetContribution {
                 kind: AssetKind::Css,
-                sizes: MeasuredSizes {
-                    raw_bytes: bundle.raw_bytes.len() as u64,
-                    minified_bytes: bundle.minified_bytes.len() as u64,
-                    gzip_bytes: compressed.gzip_bytes,
-                    brotli_bytes: compressed.brotli_bytes,
-                    zstd_bytes: compressed.zstd_bytes,
-                },
+                raw_bytes: bundle.raw_bytes.len() as u64,
+                minified_bytes: bundle.minified_bytes.len() as u64,
+                gzip_bytes: compressed.gzip_bytes,
+                brotli_bytes: compressed.brotli_bytes,
+                zstd_bytes: compressed.zstd_bytes,
             });
             processed.read_paths.extend(bundle.read_paths);
         }
@@ -418,9 +408,14 @@ fn process_binary_kind(
     }
 
     if counted {
-        processed
-            .contributions
-            .push(AssetContribution { kind, sizes });
+        processed.contributions.push(AssetContribution {
+            kind,
+            raw_bytes: sizes.raw_bytes,
+            minified_bytes: sizes.minified_bytes,
+            gzip_bytes: sizes.gzip_bytes,
+            brotli_bytes: sizes.brotli_bytes,
+            zstd_bytes: sizes.zstd_bytes,
+        });
     }
 }
 
@@ -567,7 +562,7 @@ mod tests {
         let contribution = &processed.contributions[0];
         assert_eq!(contribution.kind, AssetKind::Css);
         assert!(
-            contribution.sizes.brotli_bytes > 0 && contribution.sizes.minified_bytes > 0,
+            contribution.brotli_bytes > 0 && contribution.minified_bytes > 0,
             "a stylesheet must contribute real bytes: {contribution:?}",
         );
         assert!(processed.uncounted.is_empty(), "{processed:?}");
@@ -579,7 +574,7 @@ mod tests {
             "the @import child must reach freshness: {:?}",
             processed.read_paths,
         );
-        assert_eq!(processed.total(), contribution.sizes);
+        assert_eq!(processed.total().brotli_bytes, contribution.brotli_bytes);
     }
 
     /// The fallback that keeps B2 from ever being worse than what it replaced.
@@ -639,9 +634,9 @@ mod tests {
             .find(|contribution| contribution.kind == AssetKind::Wasm)
             .expect("wasm contribution");
         // A binary has nothing to minify: its pre-compression size is its bytes.
-        assert_eq!(wasm_contribution.sizes.raw_bytes, 4096);
-        assert_eq!(wasm_contribution.sizes.minified_bytes, 4096);
-        assert!(wasm_contribution.sizes.brotli_bytes > 0);
+        assert_eq!(wasm_contribution.raw_bytes, 4096);
+        assert_eq!(wasm_contribution.minified_bytes, 4096);
+        assert!(wasm_contribution.brotli_bytes > 0);
         assert_eq!(processed.total().raw_bytes, 4096 + 2048);
         assert!(processed.uncounted.is_empty(), "{processed:?}");
     }

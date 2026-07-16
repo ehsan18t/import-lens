@@ -20,6 +20,7 @@
 //!     --test candidate_badges -- --ignored --nocapture
 //! ```
 
+use import_lens_daemon::engine::AssetKind;
 use import_lens_daemon::ipc::protocol::{ConfidenceLevel, ImportResult, ImportRuntime};
 use std::collections::BTreeSet;
 use std::fs;
@@ -140,7 +141,10 @@ const EXPECTATIONS: &[BadgeExpectation] = &[
         confidence: ConfidenceLevel::Medium,
         derivation: "declares no `sideEffects`, so it reports conservatively — and its ESM entry \
                      does `import \"./index.css\"`, which is why it is in the set at all (see \
-                     `a_css_shipping_real_package_is_measured_and_discloses_its_stylesheet`)",
+                     `a_css_shipping_real_package_counts_its_stylesheet_into_its_size`). It stays \
+                     Medium because it declares side effects, NOT because of its stylesheet: those \
+                     bytes are counted now (B2), so the asset disclosure no longer holds anything \
+                     below High",
     },
     BadgeExpectation {
         package: "refractor",
@@ -273,16 +277,16 @@ fn real_package_badges_hold() {
 /// deleted size-fabricator hid it behind a plausible number.
 ///
 /// `@uiw/react-md-editor` is the set's first package whose published ESM entry really does
-/// `import "./index.css"`. It must produce a **size** (its JavaScript, measured exactly) plus an
-/// `uncounted_assets` diagnostic naming the bytes that size does not include — never an Unmeasured
-/// row.
+/// `import "./index.css"`. Its stylesheet's bytes are now COUNTED into the Import Cost (B2), so it
+/// must produce a size that includes them and report what the CSS contributed — never an Unmeasured
+/// row, and no longer a disclosure of bytes the number left out.
 ///
 /// (Checked before pinning it: react-toastify, react-datepicker, swiper and react-loading-skeleton
 /// all *ship* a stylesheet but none of them **imports** one from published JavaScript, so none of
 /// them would exercise this path at all.)
 #[test]
 #[ignore = "requires installed fixtures (scripts/prepare-candidate-fixtures.mjs); qualification-only"]
-fn a_css_shipping_real_package_is_measured_and_discloses_its_stylesheet() {
+fn a_css_shipping_real_package_counts_its_stylesheet_into_its_size() {
     let workspace = common::engine_fixtures::fixtures_workspace();
     let result = common::pipeline_fixtures::analyze_named_import(
         &workspace,
@@ -294,20 +298,30 @@ fn a_css_shipping_real_package_is_measured_and_discloses_its_stylesheet() {
     let sizes = common::measured_sizes(&result);
     assert!(sizes.brotli_bytes > 0, "{}", describe(&result));
 
-    let disclosure = result
-        .diagnostics
+    let css = result
+        .asset_breakdown
         .iter()
-        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
+        .find(|contribution| contribution.kind == AssetKind::Css)
         .unwrap_or_else(|| {
             panic!(
-                "a package whose entry imports a stylesheet must disclose the bytes its size omits: {}",
+                "a real package whose entry imports a stylesheet must count it and say what it \
+                 contributed: {}",
                 describe(&result)
             )
         });
     assert!(
-        disclosure.message.contains(".css"),
-        "the uncounted bytes must be named: {}",
-        disclosure.message
+        css.brotli_bytes > 0 && css.minified_bytes > 0,
+        "the stylesheet must contribute real bytes to the size: {css:?}",
+    );
+    // The disclosure is the FALLBACK now. Seeing it here would mean Lightning CSS could not process
+    // a real published stylesheet, which is the one thing this fixture exists to catch.
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "a real stylesheet must process, not fall back to disclosure: {}",
+        describe(&result)
     );
 }
 

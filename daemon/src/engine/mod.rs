@@ -77,7 +77,13 @@ pub struct UncountedAsset {
 ///
 /// CSS needs a processor (Lightning CSS resolves its `@import` tree and minifies it). A wasm or
 /// font has none: its shipped size is its raw bytes, and compressing them is the whole answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// This crosses the wire inside [`crate::ipc::protocol::AssetContribution`], so the snake_case
+/// spellings here are the contract the extension matches on.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum AssetKind {
     Css,
     Wasm,

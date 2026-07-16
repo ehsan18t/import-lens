@@ -72,9 +72,20 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// with no importable JS entry is answered as a native-binary-only zero instead of a bare failure, and
 /// one whose JS entry is a thin shim keeps its measured size with a native-binary flag beside it — so
 /// entries cached as `entry_resolution` failures or as confident shim sizes must be recomputed (B3).
+///
+/// `rolldown-1.1.x+5` (2026-07-17): asset counting moves the number for a whole category of packages,
+/// so every entry computed under `rolldown-1.1.x+4` must be rejected on read. A package's shipped
+/// CSS, wasm, and font bytes are now folded INTO the Import Cost instead of being disclosed beside a
+/// number that excluded them: stylesheets are bundled and minified by Lightning CSS (one artifact per
+/// import, `@import`s inlined and deduped), wasm and fonts are counted raw, and each artifact is
+/// compressed on its own and summed (ADR-0005). Every CSS-shipping package therefore reports a LARGER
+/// and correct size where it previously undercounted, and one whose only uncounted bytes were assets
+/// can now reach High confidence, because the `uncounted_assets` diagnostic that held it at Medium is
+/// emitted only when an asset cannot be processed. The result also carries a per-kind
+/// `asset_breakdown`, which no `+4` entry has (B2).
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+4"
+        "rolldown-1.1.x+5"
     };
 }
 
