@@ -1,9 +1,15 @@
 # Design: counting non-JS asset bytes (CSS, wasm, fonts)
 
-**Status: Design — not yet implemented.** This is the agreed shape for closing
-[known issue D1](known-issues.md). It will be refined during implementation, and graduates to its own
-spec + plan when built. It is post-release work: today's behaviour (disclose, never fabricate) is
-honest, so this is a coverage/UX upgrade, not a correctness fix.
+**Status: Design, not yet implemented. RELEASE BLOCKER.** This is the agreed shape for
+closing [known issue B2](known-issues.md). It will be refined during implementation and graduates to its own
+spec plus plan when built.
+
+**Why it blocks the release.** Today the engine measures a package's JS chunk and only discloses its non-JS
+asset bytes (CSS, wasm, fonts) beside the result, never folding them into the Import Cost. So the headline
+number shown under the "Import Cost" label is materially smaller than what the import really ships, for a whole
+category of packages (every UI kit that ships CSS, every package that ships wasm or fonts). Disclosing the
+shortfall does not make the headline correct. That is a wrong number, so this is a correctness fix, not the
+coverage nicety it was first filed as, and it must land before release.
 
 ## Why
 
@@ -41,11 +47,13 @@ hands them back to rolldown untouched.
    JS number stays exact.
 
 2. **Process, post-build.**
-   - **CSS** → **Lightning CSS** (`lightningcss` crate — Parcel's engine, and what the JS
-     `@tsdown/css` plugin is built on). Its `Bundler` resolves and inlines `@import`s (rolldown never
-     traversed them, since CSS was stubbed), then minify. All reachable CSS becomes **one**
-     stylesheet artifact — mirroring how CSS ships (a single file per entry), and letting Lightning
-     CSS dedupe shared `@import`s.
+   - **CSS** goes to **Lightning CSS** (the `lightningcss` Rust crate: Parcel's engine, and what the JS
+     `@tsdown/css` plugin is itself built on). The JS `@tsdown/css` wrapper is not usable here, because the
+     daemon embeds the Rust rolldown crate rather than the JS tsdown toolchain, so we call `lightningcss`
+     directly at the interception point the plugin already has. Its `Bundler` resolves and inlines `@import`s
+     (rolldown never traversed them, since CSS was stubbed), then minifies. All reachable CSS becomes **one**
+     stylesheet artifact, mirroring how CSS ships (a single file per entry), and letting Lightning CSS dedupe
+     shared `@import`s.
    - **wasm / fonts** → no processor. The shipped size is the raw file bytes. (woff2 is already
      brotli-internally; it will barely shrink further, which is correct.)
 
