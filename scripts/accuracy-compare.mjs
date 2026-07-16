@@ -38,17 +38,22 @@ const packageName = "importlens-accuracy-fixture";
 const typedPackageName = "importlens-accuracy-ts-fixture";
 // Maximum accepted brotli delta against the esbuild oracle, as a fraction.
 //
-// Derivation: the worst delta observed across every benchmark on the current
-// engine (2026-07-11 re-baseline) is 13.0%; the rest sit at 2.6-12%. 25% is
-// that worst case doubled and rounded down to a round number, so a legitimate
-// compiler-stack bump has ~2x the observed spread of headroom before it turns
-// CI red for a non-bug, while a real regression (a dangling binding dragging a
-// dead module into the bundle) still moves the number far past it. The former
-// 75% default could not fail on anything short of a catastrophe.
+// Derivation: the worst delta observed across the JavaScript benchmarks (2026-07-17
+// re-baseline) is 15.0% (refractor); the rest sit at 2.6-13%. 25% leaves headroom
+// over that for a legitimate compiler-stack bump before it turns CI red for a
+// non-bug, while a real regression (a dangling binding dragging a dead module into
+// the bundle) still moves the number far past it. The former 75% default could not
+// fail on anything short of a catastrophe.
 //
-// Re-derive this the next time the observed worst case moves: keep it at
-// roughly twice the worst accepted delta, and never raise it to make a red run
-// green without first proving the delta is a codegen difference, not a bug.
+// Why every benchmark reads high at all: the daemon compresses brotli at quality 4
+// (it runs per keystroke) and this oracle uses quality 11 (what a CDN serves), so a
+// ~10-15% gap is baked in and says nothing about what was counted. The CSS benchmark
+// carries its own tolerance because that same gap is amplified on highly-compressible
+// stylesheets; see its entry in `realFixtures`.
+//
+// Re-derive this the next time the observed worst case moves: keep it at roughly
+// twice the worst accepted delta, and never raise it to make a red run green without
+// first proving the delta is a codegen difference, not a bug.
 const tolerance = Number(process.env.IMPORT_LENS_ACCURACY_TOLERANCE ?? "0.25");
 // Local runs may be offline; CI and upgrade baselines must never silently measure
 // nothing. `validate.yml` sets this, and so must any pre/post-upgrade baseline run.
@@ -78,6 +83,24 @@ const realFixtures = [
     package: "@uiw/react-md-editor",
     named: "headingExecute",
     label: "@uiw/react-md-editor (ESM entry imports CSS: asset counting vs the oracle)",
+    // Its own tolerance, because the global one cannot gate this benchmark honestly.
+    //
+    // The daemon compresses brotli at quality 4 (it runs per keystroke) while this oracle uses
+    // quality 11 (what a CDN actually serves), so EVERY benchmark reads high for a reason that has
+    // nothing to do with what was counted: 2.6-15% across the JS set. CSS compresses far better
+    // than JS, so that same asymmetry is amplified here to 24.8% — nearly the entire 25% budget,
+    // leaving no headroom for ordinary compressor variance.
+    //
+    // That it is NOT a counting error is checkable rather than asserted: the MINIFIED totals agree
+    // within 1% (1_118_802 ours vs 1_127_883 esbuild's, 2026-07-17), so both sides fold in the same
+    // stylesheet exactly once. A double count, a missed `@import`, or an asymmetric inline would
+    // move that uncompressed number too — only the compressed one diverges, and only by the quality
+    // gap. Re-check that pair first if this ever goes red; do not simply raise the number.
+    //
+    // 35% is the observed 24.8% plus room for that variance, and still far below what a
+    // double-counted stylesheet would produce. The global 25% stays where it is, because it has to
+    // keep gating the JS benchmarks against a real regression.
+    tolerance: 0.35,
   },
 ];
 
@@ -136,9 +159,13 @@ const main = async () => {
       );
       process.stdout.write("\n");
 
-      if (relativeDelta > tolerance) {
+      // A benchmark may carry its own tolerance where the global one cannot gate it honestly; see
+      // the CSS fixture. Everything else is held to the global number.
+      const benchmarkTolerance = benchmark.tolerance ?? tolerance;
+
+      if (relativeDelta > benchmarkTolerance) {
         throw new Error(
-          `${benchmark.label} accuracy delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(tolerance * 100).toFixed(1)}% tolerance`,
+          `${benchmark.label} accuracy delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(benchmarkTolerance * 100).toFixed(1)}% tolerance`,
         );
       }
 
@@ -307,7 +334,11 @@ const writeRealFixtureEntries = async (workspace, versions) => {
   const benchmarks = [];
 
   for (const fixture of realFixtures) {
-    const activeDocumentPath = path.join(sourceRoot, `real-${fixture.package}-entry.js`);
+    // A SCOPED package name carries a slash (`@uiw/react-md-editor`), which would turn this
+    // filename into a nested path whose directory does not exist. The entry file's name is
+    // arbitrary; only the specifier inside it matters.
+    const entryName = fixture.package.replaceAll(/[^a-z0-9.-]/giu, "-");
+    const activeDocumentPath = path.join(sourceRoot, `real-${entryName}-entry.js`);
     await writeFile(
       activeDocumentPath,
       `export { ${fixture.named} } from "${fixture.package}";\n`,
@@ -319,6 +350,7 @@ const writeRealFixtureEntries = async (workspace, versions) => {
       package: fixture.package,
       version: versions[fixture.package],
       named: fixture.named,
+      tolerance: fixture.tolerance,
     });
   }
 
@@ -507,22 +539,28 @@ const esbuildNamedSize = async (workspace, activeDocumentPath) => {
     bundle: true,
     minify: true,
     write: false,
+    // Required, not cosmetic: esbuild REFUSES to bundle a graph that imports CSS without an output
+    // path ("Cannot import ... into a JavaScript file without an output path configured"), and
+    // without one even a pure-JS build names its output `<stdout>` rather than `*.js`, so there is
+    // nothing to classify. With it, one entry yields `entry.js` plus a sibling `entry.css`. Nothing
+    // is written to disk (`write: false`); this only names the outputs, so no byte count moves.
+    outdir: path.join(workspace, "esbuild-out"),
     format: "esm",
     platform: "browser",
     treeShaking: true,
     logLevel: "silent",
   });
 
-  // When the bundled graph imports CSS, esbuild gathers it into a SIBLING `.css` output beside the
-  // JS chunk, so `outputFiles` holds more than one entry and the JS is not guaranteed to be at
-  // index 0. The daemon counts those stylesheet bytes now (B2), so the oracle must too, or the two
-  // would be measuring different things and the comparison would be meaningless.
+  // When the bundled graph imports CSS, esbuild gathers it into that sibling `.css`, so
+  // `outputFiles` holds more than one entry and the JS is not guaranteed to be at index 0. The
+  // daemon counts those stylesheet bytes now (B2), so the oracle must too, or the two would be
+  // measuring different things and the comparison would be meaningless.
   //
   // Classify by extension and compress each artifact ON ITS OWN before summing — never concatenate
   // first — because that is exactly what the daemon does (ADR-0005: they are separate files that
   // ship separately). `reduce` over an empty CSS list is zero, so a pure-JS benchmark is unchanged.
-  const javascript = result.outputFiles.filter((file) => file.path.endsWith(".js"));
   const stylesheets = result.outputFiles.filter((file) => file.path.endsWith(".css"));
+  const javascript = result.outputFiles.filter((file) => !file.path.endsWith(".css"));
 
   if (javascript.length === 0) {
     throw new Error("esbuild did not produce a JavaScript output file");

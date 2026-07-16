@@ -85,10 +85,18 @@ falls back to today's disclosure, never below it).
   condition ships no CSS import). It is already pinned in `scripts/accuracy-fixtures/package.json@4.0.8`; verify
   `react-dom` (its peer) is in the committed lockfile. Add a Drift guard asserting its ESM entry still contains
   `import "./index.css"`.
-- **Tolerance:** re-derive **empirically** after landing (the derivation comment's own rule). Keep `0.25` if the
-  new worst-case relative delta stays under ~12.5%; else re-derive to ~2x the worst accepted delta and rewrite
-  the comment with proof it is a Lightning-CSS-vs-esbuild codegen gap, not a missed/asymmetric `@import`. Do not
-  loosen the global tolerance to hide a JS regression; add a `cssTolerance` if one number cannot gate both.
+- **Tolerance (measured 2026-07-17):** the CSS benchmark lands at **24.8%**, and it is **not** a counting error:
+  the MINIFIED totals agree within 1% (1,118,802 ours vs 1,127,883 esbuild's), so both sides fold in the same
+  stylesheet exactly once — a double count or a missed `@import` would move that uncompressed number too. Only
+  the compressed figure diverges, because the daemon compresses brotli at **quality 4** (it runs per keystroke)
+  while the oracle uses **quality 11**; that asymmetry costs every JS benchmark 2.6-15% and is amplified on
+  highly-compressible CSS. So the global 25% stays (it still has to gate the JS set against a real regression)
+  and the CSS fixture carries its own documented 35%, exactly as this plan required rather than loosening the
+  shared gate. The JS worst case moved 13.0% -> 15.0% (refractor) for unrelated reasons and is recorded.
+- **`outdir` is required, not cosmetic:** esbuild REFUSES to bundle a CSS-importing graph without an output path
+  ("Cannot import ... into a JavaScript file without an output path configured"), and without one even a pure-JS
+  build names its output `<stdout>`, so there is nothing to classify by extension. Setting it (with
+  `write: false`) is what makes the sibling `entry.js` + `entry.css` pair appear.
 - **Badge tests (`daemon/tests/candidate_badges.rs`):** flip
   `a_css_shipping_real_package_is_measured_and_discloses_its_stylesheet` from asserting an `uncounted_assets`
   diagnostic to asserting the counted CSS contribution; re-check the `@uiw/react-md-editor` row (Medium may move
