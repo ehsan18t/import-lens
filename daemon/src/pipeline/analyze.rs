@@ -9,6 +9,7 @@ use crate::{
         fallback::source_excerpt_detail,
         full_package,
         minify::minify_source,
+        native_binary::{annotate_native_binary, native_binary_only_package_result},
         resolver::{ResolvedPackage, SideEffectsMode, resolve_package_entry},
         types_only::declaration_only_package_result,
     },
@@ -244,6 +245,15 @@ fn analyze_import_inner(
                 return Ok(result);
             }
 
+            // A native-binary-only package (a `bin` plus a platform-specific native binary as
+            // `optionalDependencies`, no importable JS entry) is likewise MEASURED at zero and
+            // labelled, rather than shown as a bare "unavailable" (B3).
+            if let Some(result) =
+                native_binary_only_package_result(&context.active_document_path, request)
+            {
+                return Ok(result);
+            }
+
             return Err(error);
         }
         Err(error) => return Err(error),
@@ -288,6 +298,7 @@ fn analyze_import_inner_resolved(
     let entry_path = resolved.entry_path;
     let package_root = resolved.package_root;
     let is_cjs = resolved.is_cjs;
+    let package_json = resolved.package_json;
 
     // A stat failure is an IO condition, not a fact about the package (a lock, a permission blip, a
     // drive that blinked), so `entry_metadata` is NOT durable — see `pipeline::stage`. It used to be
@@ -325,7 +336,7 @@ fn analyze_import_inner_resolved(
     // A failed engine build is Unmeasured. It used to degrade to that same entry-file-alone
     // sizing, which carried `error: None` plus a plausible byte count — the fabricated state
     // every `!result.error` check in the system waves through.
-    let (result, loaded_paths, freshness) = analyze_with_rolldown_engine(
+    let (mut result, loaded_paths, freshness) = analyze_with_rolldown_engine(
         context,
         request,
         &entry_path,
@@ -333,6 +344,10 @@ fn analyze_import_inner_resolved(
         &side_effects_mode,
         is_cjs,
     )?;
+    // A package whose JS entry resolved but which is backed by a platform-specific native binary
+    // keeps its measured JS size and carries a `native_binary` flag beside it, so a thin shim (the
+    // TypeScript 7 version stub) is not read as the whole cost (B3).
+    annotate_native_binary(&mut result, &package_json);
     record_loaded_paths(entry_path, request.runtime, loaded_paths);
     Ok((result, Some(freshness)))
 }

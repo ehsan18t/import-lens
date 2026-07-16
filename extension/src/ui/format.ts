@@ -1,6 +1,10 @@
 import type { ConfidenceLevel, ImportResult, ImportRuntime } from "../ipc/protocol.js";
 import type { InlineHintTone } from "./inlineHintVisuals.js";
-import { isTypesOnlyResult } from "./resultDiagnostics.js";
+import {
+  isNativeBinaryOnlyResult,
+  isNativeBinaryResult,
+  isTypesOnlyResult,
+} from "./resultDiagnostics.js";
 
 export type DisplayMode = "minimal" | "standard" | "verbose" | "inlayHint";
 
@@ -124,6 +128,12 @@ export const importHintTagLabels = (
 
   if (isTypesOnlyResult(result)) {
     tags.push("types only");
+  }
+
+  if (isNativeBinaryOnlyResult(result)) {
+    tags.push("native binary only");
+  } else if (isNativeBinaryResult(result)) {
+    tags.push("native binary");
   }
 
   if (showWarnings && result.is_cjs) {

@@ -913,6 +913,137 @@ fn analyze_declaration_only_detection_requires_declaration_files() {
 }
 
 #[test]
+fn analyze_native_binary_only_package_is_measured_at_zero_and_labelled() {
+    // A `bin`-only package whose real tool ships as a platform-specific native binary in
+    // `optionalDependencies` (the Biome shape). It has no importable JS entry, so it is MEASURED at
+    // zero and labelled `native_binary_only`, not shown as a bare "unavailable" (B3).
+    let workspace = temp_workspace();
+    write_package_file(
+        &workspace,
+        "native-cli",
+        "package.json",
+        r#"{"version":"1.0.0","bin":{"native-cli":"bin/native-cli"},"optionalDependencies":{"@scope/native-cli-win32-x64":"1.0.0","@scope/native-cli-linux-x64-musl":"1.0.0"}}"#,
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "native-cli".to_owned(),
+        package_name: "native-cli".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: Vec::new(),
+        import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "{result:?}");
+    assert_eq!(
+        result.sizes(),
+        Some(MeasuredSizes::ZERO),
+        "a native-binary-only package is MEASURED at zero, not shown unavailable: {result:?}",
+    );
+    assert!(result.is_native_binary_only(), "{result:?}");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "native_binary_only"),
+        "{result:?}",
+    );
+}
+
+#[test]
+fn analyze_native_binary_backed_package_with_a_js_entry_keeps_its_size_and_is_flagged() {
+    // A native-binary-backed package whose JS entry DOES resolve — a thin shim (the TypeScript 7
+    // version stub shape). Its measured JS size stands, with a `native_binary` flag beside it, so
+    // the number is not read as the whole cost (B3).
+    let workspace = temp_workspace();
+    write_package_file(
+        &workspace,
+        "shim-lib",
+        "package.json",
+        r#"{"version":"1.0.0","main":"index.js","optionalDependencies":{"@scope/shim-lib-win32-x64":"1.0.0"}}"#,
+    );
+    write_package_file(
+        &workspace,
+        "shim-lib",
+        "index.js",
+        "export const version = \"1.2.3\";\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "shim-lib".to_owned(),
+        package_name: "shim-lib".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: Vec::new(),
+        import_kind: ImportKind::Namespace,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "{result:?}");
+    assert!(
+        result.sizes().is_some_and(|sizes| sizes.raw_bytes > 0),
+        "the resolved JS shim keeps its measured size: {result:?}",
+    );
+    assert!(
+        result.is_native_binary(),
+        "a native-backed package with a JS entry must carry the native-binary flag: {result:?}",
+    );
+    assert!(!result.is_native_binary_only(), "{result:?}");
+}
+
+#[test]
+fn analyze_native_backed_package_with_a_broken_declared_entry_stays_unavailable() {
+    // The package DECLARES a JS entry (`main`) that does not exist — a broken or partial install —
+    // and also lists a platform native optional dep. It must NOT be flattened to a confident zero;
+    // it stays Unmeasured at `entry_resolution`, the honest answer for something we could not
+    // measure (B3 review finding: the native-binary-only zero requires no DECLARED entry).
+    let workspace = temp_workspace();
+    write_package_file(
+        &workspace,
+        "broken-native",
+        "package.json",
+        r#"{"version":"1.0.0","main":"missing.js","optionalDependencies":{"@scope/broken-native-win32-x64":"1.0.0"}}"#,
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "broken-native".to_owned(),
+        package_name: "broken-native".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: Vec::new(),
+        import_kind: ImportKind::Default,
+        runtime: ImportRuntime::Component,
+    };
+
+    let result = analyze_import(&context, &request);
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(
+        result.sizes(),
+        None,
+        "a package with a broken declared entry must stay Unmeasured, not be zeroed: {result:?}",
+    );
+    assert!(!result.is_native_binary_only(), "{result:?}");
+    assert_eq!(
+        result.diagnostics[0].stage, "entry_resolution",
+        "{result:?}"
+    );
+}
+
+#[test]
 fn analyze_import_resolves_dotted_nestjs_style_subpath() {
     let workspace = temp_workspace();
     write_package(

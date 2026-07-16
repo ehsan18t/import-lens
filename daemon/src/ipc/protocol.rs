@@ -457,6 +457,32 @@ impl ImportResult {
                 .iter()
                 .any(|diagnostic| diagnostic.stage == crate::pipeline::stage::TYPES_ONLY)
     }
+
+    /// A **native-binary-only** package: it ships a platform-specific native binary and no
+    /// importable JS entry, so it is answered Measured at zero ([`crate::pipeline::native_binary`]).
+    /// Like [`Self::is_types_only`], the zero is a fact rather than a gap, so the aggregate leaves
+    /// the file's total complete rather than turning it into a permanent floor. The sizes must be
+    /// present: the zero is an *answer*, and an answer has a size.
+    pub fn is_native_binary_only(&self) -> bool {
+        self.sizes().is_some()
+            && self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == crate::pipeline::stage::NATIVE_BINARY_ONLY)
+    }
+
+    /// A **native-binary-backed** package whose JS entry resolved and was measured. An informational
+    /// flag on a real measurement (the measured size is the JS shim; the tool's work is in the
+    /// native binary), so — unlike [`Self::is_native_binary_only`] — the size may be non-zero. The
+    /// sizes must be present: the flag only ever rides a successful measurement
+    /// ([`crate::pipeline::native_binary::annotate_native_binary`] enforces the same on the way in).
+    pub fn is_native_binary(&self) -> bool {
+        self.sizes().is_some()
+            && self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == crate::pipeline::stage::NATIVE_BINARY)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

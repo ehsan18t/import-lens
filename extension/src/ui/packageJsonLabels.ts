@@ -9,7 +9,11 @@ import {
   measuredSizes,
 } from "./format.js";
 import type { PackageJsonPrimaryTone, PackageJsonSuffixTone } from "./packageJsonHintVisuals.js";
-import { isTypesOnlyResult } from "./resultDiagnostics.js";
+import {
+  isNativeBinaryOnlyResult,
+  isNativeBinaryResult,
+  isTypesOnlyResult,
+} from "./resultDiagnostics.js";
 
 export type { PackageJsonDependencyHintState } from "../guidance/packageJsonState.js";
 
@@ -134,8 +138,21 @@ export const packageJsonDependencyHintParts = (
     };
   }
 
+  // No importable JS entry — the tool is a native binary. A badge, not a byte size, the same shape
+  // as "types only" (B3).
+  if (isNativeBinaryOnlyResult(state.result)) {
+    return {
+      primary: "native binary only",
+      primaryTone: "neutral",
+      ...packageJsonDependencyVersionStatusSuffix(state),
+    };
+  }
+
   const confidencePrefix = state.result.confidence === "low" ? "~" : "";
-  const primary = `${confidencePrefix}${formatBytes(bytesForCompression(sizes, config.compression))} ${labelForCompression(config.compression)}`;
+  // The JS entry resolved but the tool is backed by a native binary: keep the measured size and
+  // flag it, so a thin shim's number is not read as the whole cost (B3).
+  const nativeBinarySuffix = isNativeBinaryResult(state.result) ? " · native binary" : "";
+  const primary = `${confidencePrefix}${formatBytes(bytesForCompression(sizes, config.compression))} ${labelForCompression(config.compression)}${nativeBinarySuffix}`;
 
   return {
     primary,

@@ -128,3 +128,40 @@ test("declaration-only packages report zero primary bytes and a types-only tag",
   );
   assert.deepEqual(importHintTagLabels(typesOnly, true, "component"), ["types only"]);
 });
+
+test("native-binary-only packages report a native-binary-only tag", () => {
+  const nativeBinaryOnly: ImportResult = {
+    ...result,
+    raw_bytes: 0,
+    minified_bytes: 0,
+    gzip_bytes: 0,
+    brotli_bytes: 0,
+    zstd_bytes: 0,
+    diagnostics: [
+      {
+        stage: "native_binary_only",
+        message: "package ships only a native binary; nothing is imported into the bundle",
+        details: [],
+      },
+    ],
+  };
+
+  assert.deepEqual(importHintTagLabels(nativeBinaryOnly, true, "component"), [
+    "native binary only",
+  ]);
+});
+
+test("a native-binary-backed package keeps its size and carries a native-binary tag", () => {
+  const nativeBinary: ImportResult = {
+    ...result,
+    diagnostics: [
+      {
+        stage: "native_binary",
+        message: "package is backed by a platform-specific native binary",
+        details: [],
+      },
+    ],
+  };
+
+  assert.deepEqual(importHintTagLabels(nativeBinary, true, "component"), ["native binary"]);
+});

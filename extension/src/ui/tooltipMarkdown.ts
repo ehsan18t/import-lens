@@ -11,7 +11,11 @@ import {
   type MeasuredSizes,
   measuredSizes,
 } from "./format.js";
-import { isTypesOnlyResult } from "./resultDiagnostics.js";
+import {
+  isNativeBinaryOnlyResult,
+  isNativeBinaryResult,
+  isTypesOnlyResult,
+} from "./resultDiagnostics.js";
 
 // "This size may include unused exports" is a caveat ABOUT a size, so it needs one.
 export const isConservativeEstimate = (result: ImportResult): boolean =>
@@ -100,6 +104,12 @@ const analysisMarkdown = (
 
   if (isTypesOnlyResult(result)) {
     rows.push("- Type-only package: yes");
+  }
+
+  if (isNativeBinaryOnlyResult(result)) {
+    rows.push("- Native binary only: yes (no importable JavaScript entry)");
+  } else if (isNativeBinaryResult(result)) {
+    rows.push("- Native binary: yes (the measured size is the JavaScript entry only)");
   }
 
   return rows.join("\n");

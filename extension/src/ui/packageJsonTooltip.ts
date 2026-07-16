@@ -12,7 +12,11 @@ import {
   refreshPackageJsonRegistryHintCommand,
   refreshPackageJsonRegistryHintsCommand,
 } from "./packageJsonRegistryCommands.js";
-import { isTypesOnlyResult } from "./resultDiagnostics.js";
+import {
+  isNativeBinaryOnlyResult,
+  isNativeBinaryResult,
+  isTypesOnlyResult,
+} from "./resultDiagnostics.js";
 import {
   conservativeSizingMarkdown,
   copyDiagnosticsMarkdown,
@@ -121,8 +125,15 @@ export const packageJsonDependencyTooltipMarkdown = (
   if (state.result && sizes) {
     if (isTypesOnlyResult(state.result)) {
       parts.push("Type-only package: yes");
+    } else if (isNativeBinaryOnlyResult(state.result)) {
+      parts.push("Native binary only: yes (no importable JavaScript entry)");
     } else {
       parts.push(importResultSizeMarkdown(state.result, config.compression));
+
+      if (isNativeBinaryResult(state.result)) {
+        parts.push("Native binary: the measured size is the JavaScript entry only.");
+      }
+
       const conservativeSizing = conservativeSizingMarkdown(state.result);
 
       if (conservativeSizing) {

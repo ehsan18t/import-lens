@@ -67,7 +67,11 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// namespace import of the whole package: oxc marks the entry `is_type` but leaves the module request
 /// `is_type = false`, so the static-import loop dropped it while the `requested_modules` fallback
 /// resurrected it as `import * as ...`. It is now registered as an elided statement and costs zero,
-/// matching TypeScript's erasure (B1).
+/// matching TypeScript's erasure (B1). And native-binary-backed packages (a platform-specific binary
+/// shipped as `optionalDependencies`: Biome, TypeScript 7, esbuild) are no longer mismeasured — one
+/// with no importable JS entry is answered as a native-binary-only zero instead of a bare failure, and
+/// one whose JS entry is a thin shim keeps its measured size with a native-binary flag beside it — so
+/// entries cached as `entry_resolution` failures or as confident shim sizes must be recomputed (B3).
 macro_rules! analyzer_revision {
     () => {
         "rolldown-1.1.x+4"

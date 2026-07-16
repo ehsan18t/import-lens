@@ -72,6 +72,18 @@ pub const FILE_SIZE_FALLBACK: &str = "file_size_fallback";
 /// a Measured result, so it must be durable or every `@types`-shaped package would be re-analyzed
 /// forever.
 pub const TYPES_ONLY: &str = "types_only";
+/// A **native-binary-only** package: it ships no importable JS entry — only a `bin` plus a
+/// platform-specific native binary declared as `optionalDependencies` (the `@scope/cli-win32-x64`
+/// pattern) — so there is nothing to import and nothing to size. A **measurement** of zero runtime
+/// JS bytes, like `types_only`: carried on a Measured result, so it must be durable or every such
+/// tool (Biome, the TypeScript 7 native rewrite, esbuild's CLI) would be re-analyzed forever.
+pub const NATIVE_BINARY_ONLY: &str = "native_binary_only";
+/// A package whose JS entry resolves (a thin shim, or a real API) but which is **backed by** a
+/// platform-specific native binary shipped as `optionalDependencies`. An informational flag that
+/// rides a SUCCESSFUL measurement — the JS size is real; the flag says the tool's work lives in the
+/// native binary — so, like `external` / `uncounted_assets`, refusing to cache it would refuse to
+/// cache a healthy package.
+pub const NATIVE_BINARY: &str = "native_binary";
 
 /// Every stage this module declares, so the property test below can quantify over the whole
 /// vocabulary rather than over the subset someone remembered to list.
@@ -88,6 +100,8 @@ pub const ALL: &[&str] = &[
     PROTOCOL,
     FILE_SIZE_FALLBACK,
     TYPES_ONLY,
+    NATIVE_BINARY_ONLY,
+    NATIVE_BINARY,
 ];
 
 /// Whether an outcome carrying `stage` may be written to a store that outlives the request.
@@ -126,6 +140,11 @@ pub fn may_enter_a_durable_store(stage: &str) -> bool {
             | MINIFY
             // A real measurement of zero.
             | TYPES_ONLY
+            // A native-binary-only package: a real measurement of zero JS bytes, and a package's
+            // manifest is a property of its bytes, so both are durable.
+            | NATIVE_BINARY_ONLY
+            // The native-binary flag rides a successful measurement, like `external`.
+            | NATIVE_BINARY
     )
 }
 

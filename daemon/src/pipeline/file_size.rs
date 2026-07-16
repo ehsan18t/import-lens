@@ -389,6 +389,24 @@ fn compute_file_size_with(
                     vec![specifier],
                 ));
             }
+            // A **native-binary-only** package resolves to `Err` for the same reason — it ships no
+            // importable JS entry — and `pipeline::native_binary` answers it MEASURED at zero. It is
+            // not an entry of any build and contributes no bytes, both facts, so the total stays
+            // complete rather than becoming a floor.
+            Err(_)
+                if import
+                    .result
+                    .as_ref()
+                    .is_some_and(ImportResult::is_native_binary_only) =>
+            {
+                diagnostics.push(diagnostic(
+                    crate::pipeline::stage::NATIVE_BINARY_ONLY,
+                    "package ships only a native binary; it contributes zero runtime bytes to this \
+                     file, which is a measurement and not a gap"
+                        .to_owned(),
+                    vec![specifier],
+                ));
+            }
             Err(error) => {
                 // This import is not an ENTRY of any group, so its bytes are missing from the
                 // totals however cleanly the combined builds go — the one non-Measured contributor
@@ -969,6 +987,19 @@ mod tests {
             self
         }
 
+        /// A native-binary-only package: a manifest with a `bin` and a platform-specific native
+        /// binary in `optionalDependencies`, and NO runtime entry. It resolves to `Err` by design.
+        fn native_binary_only_package(&self, name: &str) -> &Self {
+            let package_root = self.root.join("node_modules").join(name);
+            std::fs::create_dir_all(&package_root).expect("package dir");
+            std::fs::write(
+                package_root.join("package.json"),
+                r#"{"version":"1.0.0","bin":{"x":"bin/x"},"optionalDependencies":{"@scope/x-win32-x64":"1.0.0"}}"#,
+            )
+            .expect("manifest");
+            self
+        }
+
         fn context(&self) -> AnalysisContext {
             AnalysisContext {
                 workspace_root: self.root.clone(),
@@ -989,6 +1020,18 @@ mod tests {
         result.diagnostics = vec![ImportDiagnostic {
             stage: crate::pipeline::stage::TYPES_ONLY.to_owned(),
             message: "package contains declarations only; zero runtime cost".to_owned(),
+            details: Vec::new(),
+        }];
+        result
+    }
+
+    /// The MEASURED zero a native-binary-only package is answered with
+    /// (`pipeline::native_binary`).
+    fn native_binary_only_result(specifier: &str) -> ImportResult {
+        let mut result = ImportResult::measured(specifier, MeasuredSizes::ZERO);
+        result.diagnostics = vec![ImportDiagnostic {
+            stage: crate::pipeline::stage::NATIVE_BINARY_ONLY.to_owned(),
+            message: "package ships only a native binary; zero runtime cost".to_owned(),
             details: Vec::new(),
         }];
         result
@@ -1039,6 +1082,54 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|item| item.stage == crate::pipeline::stage::TYPES_ONLY),
+            "the user is still told why that import contributes nothing: {:?}",
+            totals.diagnostics
+        );
+    }
+
+    /// The native-binary-only twin of the check above. A `bin`-only package (Biome) resolves to
+    /// `Err` because it ships no importable JS entry, but it is answered Measured at zero, so it
+    /// contributes a genuine ZERO and must leave the file complete — not a permanent floor.
+    #[test]
+    fn a_native_binary_only_import_is_a_measurement_and_leaves_its_file_complete() {
+        let fixture = Fixture::new("native-binary-only");
+        fixture
+            .package("real-lib", "export const value = 41 + 1;\n")
+            .native_binary_only_package("native-lib");
+
+        let totals = compute_file_size(
+            &fixture.context(),
+            &[
+                SizedImport::installed(request("real-lib"), Some(result("real-lib", 10))),
+                SizedImport::installed(
+                    request("native-lib"),
+                    Some(native_binary_only_result("native-lib")),
+                ),
+            ],
+        );
+
+        assert!(
+            totals.error.is_none(),
+            "the real package builds; nothing failed: {:?}",
+            totals.diagnostics
+        );
+        assert!(
+            !totals.incomplete,
+            "a native-binary-only import contributes a genuine ZERO, not an unknown: {:?}",
+            totals.diagnostics
+        );
+        assert!(!totals.degraded, "the combined build succeeded");
+        assert!(
+            totals.is_cacheable(),
+            "a file whose only unresolvable import is native-binary-only is fully measured, and \
+             must be cached"
+        );
+        assert!(totals.raw_bytes > 0, "the real package's bytes are counted");
+        assert!(
+            totals
+                .diagnostics
+                .iter()
+                .any(|item| item.stage == crate::pipeline::stage::NATIVE_BINARY_ONLY),
             "the user is still told why that import contributes nothing: {:?}",
             totals.diagnostics
         );

@@ -119,6 +119,49 @@ test("packageJsonDependencyHintLabel shows types only instead of zero-byte sizes
   );
 });
 
+test("packageJsonDependencyHintLabel shows native binary only for a no-entry native package", () => {
+  assert.equal(
+    packageJsonDependencyHintLabel(
+      {
+        name: "@biomejs/biome",
+        section: "devDependencies",
+        status: "ready",
+        result: result({
+          raw_bytes: 0,
+          minified_bytes: 0,
+          gzip_bytes: 0,
+          brotli_bytes: 0,
+          zstd_bytes: 0,
+          diagnostics: [
+            { stage: "native_binary_only", message: "native binary only", details: [] },
+          ],
+        }),
+        registryHint: { latestVersion: "2.5.3", isLatest: true },
+      },
+      config(),
+    ),
+    "native binary only · latest",
+  );
+});
+
+test("packageJsonDependencyHintLabel flags a native-binary-backed shim beside its size", () => {
+  assert.equal(
+    packageJsonDependencyHintLabel(
+      {
+        name: "typescript",
+        section: "devDependencies",
+        status: "ready",
+        result: result({
+          diagnostics: [{ stage: "native_binary", message: "native binary", details: [] }],
+        }),
+        registryHint: { latestVersion: "7.0.2", isLatest: true },
+      },
+      config(),
+    ),
+    "1.5 kB br · native binary · latest",
+  );
+});
+
 test("packageJsonDependencyHintLabel omits sparkle from inline decorations", () => {
   assert.equal(
     packageJsonDependencyHintLabel(
