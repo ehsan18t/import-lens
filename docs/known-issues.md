@@ -169,9 +169,17 @@ depth from where the bound is applied. 256 stops the walk roughly three times sh
 stack gives out, and is far more than any real stylesheet's tree. It cannot simply be raised on the grounds that
 a flat set of many sheets carries no stack risk: the bound cannot tell breadth from depth, and giving the walk
 its own larger stack does not help either, because Lightning CSS drives the `@import` graph on `rayon` workers
-whose stacks it does not own. A set past the bound therefore degrades into the per-sheet path, where sheets
-sharing an `@import` are counted once each, which over-counts the shared part and is disclosed as
-`imprecise_assets`.
+whose stacks it does not own. A set past the bound therefore degrades into the per-sheet path, which is
+disclosed as `imprecise_assets` and drops the result off High confidence.
+
+That degraded number reads HIGH for two reasons, and the smaller one is the obvious one. Sheets sharing an
+`@import` inline it once each. But each sheet is also compressed on its own, so no sheet's compressor can use
+what the others contain, and that term dominates: 300 tiny stylesheets sharing no `@import` at all, which is the
+shape that actually breaches a 256 file bound, sum to roughly 40x the union's gzip and 57x its brotli, because
+every stream restarts its window and pays its own header. Real stylesheets are larger and fewer, so the real
+factor is far smaller, but the direction is the same and it is not a small correction. This is why the
+disclosure fires on the union having failed rather than on the sheets provably sharing bytes: disjoint sheets
+are the worst case here, not the safe one.
 
 The byte half of the budget is charged after each file is read, because the provider is handed the source rather
 than a handle, so it bounds a tree's total rather than any single file's peak memory. The 20 MB guard on module

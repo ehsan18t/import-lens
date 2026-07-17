@@ -413,12 +413,18 @@ pub fn uncounted_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
     })
 }
 
-/// The disclosure for assets that ARE counted but whose bytes may be counted TWICE.
+/// The disclosure for assets that ARE counted but whose bytes are counted more than once.
 ///
-/// The stylesheet set is bundled as one artifact precisely so that an `@import` two sheets share is
-/// counted once. When that union fails the set is measured a sheet at a time, every sheet still
-/// counts, and the shared bytes are then inlined into each — so the size reads high and has to say
-/// so. `None` in the normal case, where the union held.
+/// The union buys TWO things, and losing it costs both: it dedupes an `@import` two sheets share,
+/// AND it puts the whole set through ONE compression stream. When it fails, each sheet is measured
+/// and compressed alone, so shared bytes are inlined into each and no sheet's compressor can reach
+/// what the others contain. The second term dominates, by a lot: 300 tiny sheets sharing no
+/// `@import` at all — the shape that actually breaches the file budget — sum to ~40x the union's
+/// gzip and ~57x its brotli, because every stream restarts its window and pays its own header.
+///
+/// That is why this fires on the union having failed, not on the sheets provably sharing bytes.
+/// Sheets that share nothing are not the safe case to stay quiet about; they are the worst one.
+/// `None` in the normal case, where the union held.
 ///
 /// This is separate from [`uncounted_assets_diagnostic`] because it reports a different fact: bytes
 /// present but over-counted, not bytes missing. Folding it into that one is what hid it — that
@@ -428,9 +434,9 @@ pub fn imprecise_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
 
     Some(ImportDiagnostic {
         stage: diagnostic_stage::IMPRECISE_ASSETS.to_owned(),
-        message: "the stylesheets could not be bundled as one artifact, so each was measured on \
-                  its own and any bytes they share are counted once per sheet: this size may read \
-                  HIGH"
+        message: "the stylesheets could not be bundled as one artifact, so each was measured and \
+                  compressed on its own: bytes two sheets share are counted once per sheet, and \
+                  no sheet's compression can use what the others contain, so this size reads HIGH"
             .to_owned(),
         details: vec![reason.clone()],
     })
