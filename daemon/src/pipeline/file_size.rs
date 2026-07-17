@@ -5,7 +5,7 @@ use crate::{
     },
     pipeline::{
         analyze::{AnalysisContext, engine_selection},
-        assets::{process_assets, uncounted_assets_diagnostic},
+        assets::{asset_diagnostics, process_assets},
         compress::{CompressionSizes, compress_all},
         minify::minify_source,
         resolver::resolve_package_entry,
@@ -551,11 +551,11 @@ fn compute_file_size_with(
         // (ADR-0005); an asset that cannot be processed falls back to disclosure and is reported.
         let assets = process_assets(&artifact.assets);
         let asset_sizes = assets.total();
-        if let Some(uncounted) = uncounted_assets_diagnostic(&assets) {
+        for disclosure in asset_diagnostics(&assets) {
             diagnostics.push(diagnostic(
-                &uncounted.stage,
-                uncounted.message,
-                uncounted.details,
+                &disclosure.stage,
+                disclosure.message,
+                disclosure.details,
             ));
         }
 

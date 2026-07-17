@@ -370,6 +370,21 @@ pub mod diagnostic_stage {
     /// carries no `~` prefix in the UI (that is reserved for Low), so a correctly-measured CSS
     /// package reads as a plain number with a stated caveat, which is exactly what it is.
     pub const UNCOUNTED_ASSETS: &str = "uncounted_assets";
+    /// Assets that ARE in the number, but whose bytes may be counted more than once.
+    ///
+    /// The stylesheet set bundles into ONE artifact because that is how it ships, and that union is
+    /// what dedupes an `@import` two sheets share. The union is all-or-nothing, so when it fails the
+    /// set is retried one sheet at a time: every sheet is still counted (nothing is
+    /// [`UNCOUNTED_ASSETS`]), but bytes two sheets share are now inlined into both and counted
+    /// twice, so the size reads **high**.
+    ///
+    /// This exists because that degradation had no way to be said. `uncounted_assets` is the only
+    /// consumer of the per-asset failure list, and it returns `None` the moment nothing is
+    /// uncounted — so a set that degraded and then measured every sheet successfully produced an
+    /// over-count with NO diagnostic, which `engine_confidence` reads as **High** and `is_durable`
+    /// then writes to disk. An over-count that says so is a disclosed limit; a silent one is the
+    /// overclaim this model exists to stop.
+    pub const IMPRECISE_ASSETS: &str = "imprecise_assets";
 }
 
 /// `stage` is one of [`stage::ALL`].

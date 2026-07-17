@@ -348,6 +348,14 @@ pub struct ProcessedAssets {
     pub uncounted: Vec<UncountedAsset>,
     /// Why each of those fell back, for the diagnostic.
     pub failures: Vec<String>,
+    /// Why the stylesheet set could not be bundled as ONE artifact, when it could not.
+    ///
+    /// Every sheet is still counted, so this leaves `uncounted` EMPTY — which is exactly why it is
+    /// its own field instead of a line in `failures`. `failures` is read only as the detail of the
+    /// `uncounted` disclosure, so a degradation with no uncounted asset had nothing to hang from
+    /// and was dropped on the floor, taking a silent, High-confidence, cacheable over-count with
+    /// it. Every channel here now has one consumer and its own trigger.
+    pub stylesheets_measured_separately: Option<String>,
 }
 
 impl ProcessedAssets {
@@ -405,6 +413,42 @@ pub fn uncounted_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
     })
 }
 
+/// The disclosure for assets that ARE counted but whose bytes may be counted TWICE.
+///
+/// The stylesheet set is bundled as one artifact precisely so that an `@import` two sheets share is
+/// counted once. When that union fails the set is measured a sheet at a time, every sheet still
+/// counts, and the shared bytes are then inlined into each — so the size reads high and has to say
+/// so. `None` in the normal case, where the union held.
+///
+/// This is separate from [`uncounted_assets_diagnostic`] because it reports a different fact: bytes
+/// present but over-counted, not bytes missing. Folding it into that one is what hid it — that
+/// function returns early when nothing is uncounted, which is exactly the degraded case.
+pub fn imprecise_assets_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
+    let reason = processed.stylesheets_measured_separately.as_ref()?;
+
+    Some(ImportDiagnostic {
+        stage: diagnostic_stage::IMPRECISE_ASSETS.to_owned(),
+        message: "the stylesheets could not be bundled as one artifact, so each was measured on \
+                  its own and any bytes they share are counted once per sheet: this size may read \
+                  HIGH"
+            .to_owned(),
+        details: vec![reason.clone()],
+    })
+}
+
+/// Every disclosure the processed assets owe the user, so a caller cannot fold in the bytes and
+/// forget one. Both call sites take the whole list rather than naming the diagnostics one by one:
+/// a future asset caveat is then disclosed by construction instead of by memory.
+pub fn asset_diagnostics(processed: &ProcessedAssets) -> Vec<ImportDiagnostic> {
+    [
+        uncounted_assets_diagnostic(processed),
+        imprecise_assets_diagnostic(processed),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// Process every reachable asset the build collected, the way each really ships.
 ///
 /// Never fails: an asset it cannot process falls back to the raw-byte disclosure that was the whole
@@ -424,6 +468,17 @@ pub fn process_assets(assets: &[CollectedAsset]) -> ProcessedAssets {
         .contributions
         .sort_by_key(|contribution| contribution.kind);
     processed
+}
+
+/// The settled result of bundling the stylesheet set, named rather than a bare tuple so that the
+/// degraded flag cannot be dropped on its way out of the retry.
+struct StylesheetOutcome {
+    counted: Vec<(CssBundle, CompressionSizes)>,
+    /// Why individual sheets fell back, one per entry in `uncounted`.
+    failures: Vec<String>,
+    uncounted: Vec<UncountedAsset>,
+    /// `Some(union error)` when the set was measured one sheet at a time.
+    degraded: Option<String>,
 }
 
 fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAssets) {
@@ -448,19 +503,27 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
     // disclosed every stylesheet TWICE and the diagnostic doubled its own count and byte total. The
     // per-sheet results are gathered locally and committed once, which removes that shape rather than
     // patching it.
+    //
+    // The degradation is recorded as its own state, NOT as a line in `failures`. `failures` is read
+    // only as the detail of the uncounted disclosure, which goes silent when every sheet counts —
+    // the common outcome here, since the union's usual reason to fail is the whole set breaching a
+    // budget that each sheet is well inside. That silence made this path report an over-count at
+    // High confidence and cache it.
     let bundled = bundle_css_set(&entries)
         .and_then(compress_bundle)
-        .map(|counted| (vec![counted], Vec::new(), Vec::new()))
+        .map(|counted| StylesheetOutcome {
+            counted: vec![counted],
+            failures: Vec::new(),
+            uncounted: Vec::new(),
+            degraded: None,
+        })
         .or_else(|union_error| {
             if entries.len() == 1 {
                 return Err(union_error);
             }
 
             let mut counted = Vec::new();
-            let mut failures = vec![format!(
-                "bundling the stylesheets as one artifact failed, so each was measured on its own \
-                 and shared @imports are counted once per sheet: {union_error}"
-            )];
+            let mut failures = Vec::new();
             let mut uncounted = Vec::new();
 
             for entry in &entries {
@@ -484,13 +547,26 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
             if counted.is_empty() {
                 return Err(union_error);
             }
-            Ok((counted, failures, uncounted))
+            Ok(StylesheetOutcome {
+                counted,
+                failures,
+                uncounted,
+                // Sheets DID count here, so `uncounted` may well be empty and the uncounted
+                // disclosure silent. This is what makes the over-count speakable.
+                degraded: Some(union_error),
+            })
         });
 
     match bundled {
-        Ok((counted, failures, uncounted)) => {
+        Ok(StylesheetOutcome {
+            counted,
+            failures,
+            uncounted,
+            degraded,
+        }) => {
             processed.failures.extend(failures);
             processed.uncounted.extend(uncounted);
+            processed.stylesheets_measured_separately = degraded;
             // One row for the kind however many artifacts produced it: each was compressed on its
             // own, so their numbers add (ADR-0005).
             let mut css = AssetContribution {
@@ -707,8 +783,10 @@ mod tests {
     }
 
     /// The tree is bounded: assets are never graph modules, so none of the engine's limits ever
-    /// applied to them. The bound is on BREADTH, which is what it can honestly measure — depth is
-    /// answered by giving the walk its own stack, not by counting files.
+    /// applied to them. The file count bounds BOTH breadth and depth, because it is the only bound
+    /// available: giving the walk its own big stack does NOT work, since Lightning CSS recurses on
+    /// rayon workers whose stacks it does not own. 256 is far below where a build's stack gives out
+    /// and far above any real stylesheet's `@import` tree.
     #[test]
     fn a_stylesheet_tree_past_the_file_budget_is_refused_rather_than_read_forever() {
         let dir = temp_dir("budget");
@@ -880,6 +958,96 @@ mod tests {
             .collect();
         disclosed.sort();
         assert_eq!(disclosed, vec![&first, &second], "{processed:?}");
+    }
+
+    /// The union can fail for a reason NO individual sheet fails for — it is the only thing charged
+    /// for the whole set — and then every sheet counts and `uncounted` is empty. That combination
+    /// used to produce a size that was over-counted (a shared `@import` inlined into each sheet),
+    /// carried NO diagnostic, and therefore read as High confidence and was written to disk. The
+    /// over-count is the accepted cost of degrading; being silent about it was not.
+    #[test]
+    fn a_set_that_degrades_to_per_sheet_still_discloses_that_it_may_read_high() {
+        let dir = temp_dir("degraded");
+        // Each sheet's own tree is well inside the budget; only the two together breach it, which
+        // is what makes the union fail while each sheet on its own succeeds.
+        let per_sheet_leaves = 140;
+        let shared = dir.join("shared.css");
+        fs::write(&shared, ".shared { color: red }\n").expect("shared");
+
+        let entries: Vec<PathBuf> = ["a", "b"]
+            .iter()
+            .map(|name| {
+                let mut source = String::from("@import \"./shared.css\";\n");
+                for index in 0..per_sheet_leaves {
+                    let leaf = format!("{name}{index}.css");
+                    fs::write(
+                        dir.join(&leaf),
+                        format!(".r{name}{index} {{ color: red }}\n"),
+                    )
+                    .expect("leaf");
+                    source.push_str(&format!("@import \"./{leaf}\";\n"));
+                }
+                let entry = dir.join(format!("{name}.css"));
+                fs::write(&entry, source).expect("entry");
+                entry
+            })
+            .collect();
+
+        let assets: Vec<CollectedAsset> = entries
+            .iter()
+            .map(|path| CollectedAsset {
+                path: path.clone(),
+                kind: AssetKind::Css,
+                raw_bytes: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+            })
+            .collect();
+
+        // Guard the premise: if this ever stops being the shape under test, the assertions below
+        // would pass for the wrong reason.
+        assert!(
+            bundle_css_set(&entries).is_err(),
+            "the premise is a set whose union breaches the budget",
+        );
+        assert!(
+            bundle_css(&entries[0]).is_ok(),
+            "the premise is that each sheet on its own is well inside the budget",
+        );
+
+        let processed = process_assets(&assets);
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            processed
+                .contributions
+                .iter()
+                .any(|contribution| contribution.kind == AssetKind::Css
+                    && contribution.raw_bytes > 0),
+            "every sheet still counts when the union degrades: {processed:?}",
+        );
+        assert!(
+            processed.uncounted.is_empty(),
+            "nothing failed, so nothing is uncounted - which is exactly why the uncounted \
+             disclosure cannot be what reports this: {processed:?}",
+        );
+        assert!(
+            uncounted_assets_diagnostic(&processed).is_none(),
+            "there is nothing uncounted to report: {processed:?}",
+        );
+
+        let disclosure =
+            imprecise_assets_diagnostic(&processed).expect("the over-count must be disclosed");
+        assert_eq!(disclosure.stage, diagnostic_stage::IMPRECISE_ASSETS);
+        assert!(
+            !disclosure.details.is_empty(),
+            "the disclosure must carry why the union failed: {disclosure:?}",
+        );
+        // The disclosure is what drops confidence off High, so a caller taking every diagnostic is
+        // what makes the number honest.
+        assert_eq!(
+            asset_diagnostics(&processed).len(),
+            1,
+            "exactly one disclosure, never zero and never doubled: {processed:?}",
+        );
     }
 
     #[test]

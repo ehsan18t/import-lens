@@ -5,7 +5,7 @@ use crate::{
         ModuleContribution,
     },
     pipeline::{
-        assets::{process_assets, uncounted_assets_diagnostic},
+        assets::{asset_diagnostics, process_assets},
         compress::compress_all,
         fallback::source_excerpt_detail,
         full_package,
@@ -430,7 +430,7 @@ pub(crate) fn analyze_with_rolldown_engine(
         .collect();
     // An asset that could not be processed keeps the old disclosure: its bytes are real, they ship,
     // and they are NOT in the number — which is exactly what this stage has always meant.
-    diagnostics.extend(uncounted_assets_diagnostic(&assets));
+    diagnostics.extend(asset_diagnostics(&assets));
 
     // Full-package comparison (§8.4/§6.3): a second engine build measures the
     // complete surface; failure degrades to "not treeshakeable", never an

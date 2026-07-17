@@ -109,7 +109,7 @@ pub const ALL: &[&str] = &[
 /// True only for a stage that is a **property of the package's bytes** — so the cache, which is
 /// keyed by those bytes' fingerprints, expires it exactly when the answer would change — or for a
 /// purely informational stage that rides along on a successful measurement (`external`,
-/// `uncounted_assets`, `types_only`).
+/// `uncounted_assets`, `imprecise_assets`, `types_only`).
 ///
 /// False for everything else, **including a stage this function has never heard of**. That default
 /// is the whole design: a new stage is refused until someone classifies it, so the failure mode of
@@ -127,10 +127,15 @@ pub fn may_enter_a_durable_store(stage: &str) -> bool {
             | engine_stage::MODULE_GRAPH_LIMIT
             | engine_stage::MISSING_EXPORT
             | engine_stage::AMBIGUOUS_EXPORT
-            // Informational stages an engine build emits on the SUCCESS path. Refusing one of
-            // these would refuse to cache a healthy package.
+            // Stages that ride a SUCCESSFUL measurement and disclose its limits. Refusing one
+            // would refuse to cache a healthy package. Each is a property of the package's bytes —
+            // which modules are external, which assets the processors could not take, whether the
+            // stylesheet set unions — so the fingerprints expire them exactly when the answer
+            // changes. (A transient read error can also land in `uncounted_assets`; it is disclosed
+            // and lands on the pre-B2 floor, never below it. Recorded in known-issues.)
             | diagnostic_stage::EXTERNAL
             | diagnostic_stage::UNCOUNTED_ASSETS
+            | diagnostic_stage::IMPRECISE_ASSETS
             // Pipeline failures that are a property of the package's bytes.
             | PACKAGE_VALIDATION
             | PACKAGE_RESOLUTION
