@@ -170,7 +170,48 @@ stack gives out, and is far more than any real stylesheet's tree. It cannot simp
 a flat set of many sheets carries no stack risk: the bound cannot tell breadth from depth, and giving the walk
 its own larger stack does not help either, because Lightning CSS drives the `@import` graph on `rayon` workers
 whose stacks it does not own. A set past the bound therefore degrades into the per-sheet path, where sheets
-sharing an `@import` are counted once each, which over-counts the shared part and is disclosed.
+sharing an `@import` are counted once each, which over-counts the shared part and is disclosed as
+`imprecise_assets`.
+
+The byte half of the budget is charged after each file is read, because the provider is handed the source rather
+than a handle, so it bounds a tree's total rather than any single file's peak memory. The 20 MB guard on module
+source does not cover `@import` children, since they are never graph modules. No real package ships a stylesheet
+large enough for that to matter, and a tree that breaches the budget is refused rather than mismeasured, so this
+is recorded as a property of the bound rather than treated as a hole in it.
+
+### D11: An asset the daemon could not read is disclosed, and that disclosure is cached
+**Status: Accepted** · A disclosed undercount that outlives its cause · Found by the B2 branch review
+
+Wasm and font bytes are read from disk after the build. A read that fails for a reason that has nothing to do
+with the package, an antivirus scanner holding the file, or a concurrent `pnpm install` replacing it, puts that
+asset in the uncounted list: its bytes leave the number, a diagnostic says so, and confidence drops to Medium.
+That part is correct and is exactly the pre-B2 floor.
+
+What is imperfect is how long it lasts. `uncounted_assets` may enter a durable store, because the usual reason
+an asset is uncounted is a property of the package's bytes (a `.scss` no CSS parser will take), and refusing to
+cache that would refuse to cache a healthy package forever. A transient read error is indistinguishable from it
+at the point the decision is made, so the undercount is written to disk, and the file's fingerprint still
+matches once the lock clears, so it is served until the analyzer revision moves.
+
+It is recorded rather than fixed because the number is disclosed, not silent, and it is never below what the
+same import reported before B2. Telling the two apart means classifying the io::ErrorKind at the read site and
+refusing only the transient ones from the cache, which is worth doing on its own rather than inside asset
+counting.
+
+### D12: A file total that omits an unreadable asset is not flagged as a floor
+**Status: Accepted** · Pre-B2 parity, not a regression · Found by the B2 branch review
+
+In the File Cost aggregate, an asset that cannot be processed contributes nothing and the group still reports
+`incomplete: false`. So the total is cacheable and `importlens check` exits 0 against a number that is missing
+real bytes, where `SizedPackage::NotInstalled` raises the floor flag for the same shape (real bytes absent from
+a total).
+
+The reason it is not fixed here is that it is a tie with the old behaviour, not a regression: before B2 the
+combined build stubbed every stylesheet and its bytes vanished from a total that was equally cacheable and
+equally unflagged. B2 made that number strictly better, and ADR-0006 asks for a floor beating a blank, not for
+every disclosure to also become a floor. Raising `incomplete` here would newly refuse to cache any file
+importing a package with one unparseable `.scss`, which is a real cost for a number that is already disclosed
+at the import level. Worth deciding deliberately, alongside D4, rather than as a side effect of B2.
 
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003

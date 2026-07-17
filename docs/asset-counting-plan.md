@@ -38,9 +38,9 @@ falls back to today's disclosure, never below it).
      (`TrackingProvider`) wrapping `FileProvider`:
      - `read()` records each opened path (entry + every resolved `@import` child) into a `Mutex<HashSet<PathBuf>>`
        (canonicalized) — this is the freshness watch set.
-     - `resolve()` delegates to `FileProvider` for relative imports; if a bare `@import "pkg"` appears (rare in
-       published dist CSS), delegate to `oxc_resolver` (already in the stack) and wrap its error to satisfy the
-       `std::error::Error + Send + Sync` bound. **Decision:** for >1 reachable top-level CSS import, bundle via a
+     - `resolve()` delegates to `FileProvider` for relative imports. (An `oxc_resolver` fallback for a bare
+       `@import "pkg"` was planned here and **not built** — such a sheet falls back to raw-byte disclosure on its
+       own, which is the pre-B2 floor. See Risks, and D8 in known-issues.) **Decision:** for >1 reachable top-level CSS import, bundle via a
        synthetic entry that `@import`s each real path (so Lightning CSS inlines and dedupes into one sheet);
        for exactly one, bundle it directly. The provider must outlive the `StyleSheet`, and must be `Send + Sync`
        (the bundler uses `rayon`); do all consumption (bytes + captured paths) inside that scope.
