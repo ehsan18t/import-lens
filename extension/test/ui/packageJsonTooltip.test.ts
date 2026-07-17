@@ -266,25 +266,30 @@ test("importResultSizeMarkdown renders sectioned size rows", () => {
 test("importResultSizeMarkdown names the assets folded into the size", () => {
   // The bytes are already IN the number above; this says how it is composed, so a UI kit's cost
   // reads as part JavaScript and part stylesheet rather than one opaque figure (B2).
+  //
+  // So every kind here has to FIT INSIDE the totals in `result()`, on all five axes. An earlier
+  // version of this fixture declared 4,700 B of brotli assets inside a 1,500 B brotli total, which
+  // taught the exact opposite of the invariant the comment above states. The font barely compresses
+  // (woff2 is brotli inside already) and the CSS compresses well, which is why their ratios differ.
   assert.equal(
     importResultSizeMarkdown(
       result({
         asset_breakdown: [
           {
             kind: "css",
-            raw_bytes: 8000,
-            minified_bytes: 5000,
-            gzip_bytes: 1200,
-            brotli_bytes: 900,
-            zstd_bytes: 1000,
+            raw_bytes: 3000,
+            minified_bytes: 1000,
+            gzip_bytes: 400,
+            brotli_bytes: 320,
+            zstd_bytes: 350,
           },
           {
             kind: "font",
-            raw_bytes: 4000,
-            minified_bytes: 4000,
-            gzip_bytes: 3900,
-            brotli_bytes: 3800,
-            zstd_bytes: 3850,
+            raw_bytes: 300,
+            minified_bytes: 300,
+            gzip_bytes: 295,
+            brotli_bytes: 290,
+            zstd_bytes: 292,
           },
         ],
       }),
@@ -299,9 +304,9 @@ test("importResultSizeMarkdown names the assets folded into the size", () => {
       "- Brotli: 1.5 kB",
       "- Zstd: 1.7 kB",
       "",
-      "**Included assets**",
-      "- CSS: 900 B",
-      "- Fonts: 3.8 kB",
+      "**Included assets** (Brotli)",
+      "- CSS: 320 B",
+      "- Fonts: 290 B",
     ].join("\n"),
   );
 });

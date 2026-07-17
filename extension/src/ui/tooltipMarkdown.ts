@@ -74,7 +74,7 @@ export const importResultSizeMarkdown = (
     `- Gzip: ${formatBytes(sizes.gzip_bytes)}`,
     `- Brotli: ${formatBytes(sizes.brotli_bytes)}`,
     `- Zstd: ${formatBytes(sizes.zstd_bytes)}`,
-    ...assetBreakdownRows(result, compression),
+    ...assetBreakdownRows(result, compression, selected.label),
   ].join("\n");
 };
 
@@ -90,8 +90,16 @@ const assetKindLabels: Readonly<Record<AssetKind, string>> = {
  * These bytes are already inside the number — a UI kit's cost is part JS and part stylesheet — so
  * this names the parts rather than adding to the total. Nothing is rendered for the common case of
  * an import that ships no assets.
+ *
+ * The heading names the compression these rows are in. Five differently-compressed figures are
+ * listed directly above them, so an unlabelled `- CSS: 12.3 kB` invites being read as the raw
+ * number when it is the selected one.
  */
-const assetBreakdownRows = (result: ImportResult, compression: CompressionFormat): string[] => {
+const assetBreakdownRows = (
+  result: ImportResult,
+  compression: CompressionFormat,
+  compressionLabel: string,
+): string[] => {
   const breakdown = result.asset_breakdown ?? [];
 
   if (breakdown.length === 0) {
@@ -100,7 +108,7 @@ const assetBreakdownRows = (result: ImportResult, compression: CompressionFormat
 
   return [
     "",
-    "**Included assets**",
+    `**Included assets** (${compressionLabel})`,
     ...breakdown.map(
       (contribution) =>
         `- ${assetKindLabels[contribution.kind]}: ${formatBytes(
