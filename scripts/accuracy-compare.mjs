@@ -17,11 +17,17 @@
 //     - @uiw/react-md-editor: the only real package whose published ESM entry actually
 //                 does `import "./index.css"`, so it is the one benchmark that compares
 //                 ASSET COUNTING (B2) against the oracle -- both sides must fold in the
-//                 same stylesheet, or a missed `@import` / double count shows up here.
+//                 same stylesheet exactly once, which `minifiedTolerance` is what checks.
 //
 // NOT covered: the `.js`-containing-JSX retry path (`graph.rs`), which is a
-// parse-failure fallback; and the mangler's exported-destructuring handling, which
-// `pipeline/bundle.rs` puts out of reach by stripping `export ` before minification.
+// parse-failure fallback; the mangler's exported-destructuring handling, which
+// `pipeline/bundle.rs` puts out of reach by stripping `export ` before minification;
+// and -- despite what this file used to claim -- Lightning CSS's `@import` handling.
+// The CSS fixture's whole reachable stylesheet graph contains ZERO `@import`
+// statements (checked 2026-07-17): it aggregates CSS through JS `import "./x.css"`
+// instead. So the `@import` tree walk, the cycle canonicalization and the synthetic
+// entry -- the most intricate part of B2 -- are covered by the unit tests in
+// `daemon/src/pipeline/assets.rs`, and by nothing here.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -76,31 +82,44 @@ const realFixtures = [
   // The ONLY real package in the set whose published ESM entry actually does `import "./index.css"`
   // — react-toastify, react-datepicker, swiper and react-loading-skeleton all *ship* a stylesheet
   // but none imports one from published JavaScript, so none would exercise this at all. It is what
-  // gates asset counting (B2) against the oracle: both sides must fold in the same stylesheet, so a
-  // missed `@import`, a double count, or an asymmetric inline shows up here as a delta rather than
-  // as a wrong number in the product.
+  // gates asset counting (B2) against the oracle: both sides must fold in the same stylesheet
+  // exactly once, so a double count or a dropped stylesheet shows up here as a delta rather than as
+  // a wrong number in the product. Its own stylesheets contain no `@import`, so that part of B2 is
+  // the unit tests' job, not this benchmark's.
   {
     package: "@uiw/react-md-editor",
     named: "headingExecute",
     label: "@uiw/react-md-editor (ESM entry imports CSS: asset counting vs the oracle)",
-    // Its own tolerance, because the global one cannot gate this benchmark honestly.
+    // Its own tolerances, because the global one cannot gate this benchmark honestly.
     //
     // The daemon compresses brotli at quality 4 (it runs per keystroke) while this oracle uses
     // quality 11 (what a CDN actually serves), so EVERY benchmark reads high for a reason that has
     // nothing to do with what was counted: 2.6-15% across the JS set. CSS compresses far better
     // than JS, so that same asymmetry is amplified here to 24.8% — nearly the entire 25% budget,
-    // leaving no headroom for ordinary compressor variance.
+    // leaving no headroom for ordinary compressor variance. Hence 35% on brotli.
     //
-    // That it is NOT a counting error is checkable rather than asserted: the MINIFIED totals agree
-    // within 1% (1_118_802 ours vs 1_127_883 esbuild's, 2026-07-17), so both sides fold in the same
-    // stylesheet exactly once. A double count, a missed `@import`, or an asymmetric inline would
-    // move that uncompressed number too — only the compressed one diverges, and only by the quality
-    // gap. Re-check that pair first if this ever goes red; do not simply raise the number.
+    // But that brotli number gates NOTHING about the stylesheet, and it is important not to pretend
+    // otherwise: this package's CSS is ~1.7% of the compressed total while the compressor gap is
+    // ~25%, a 14:1 noise-to-signal ratio. Measured 2026-07-17, holding our CSS at q4 and varying
+    // only the fold count: folding it ZERO times reads 22.7%, ONCE 24.8%, TWICE 26.9%. All three
+    // sit under 35% — this fixture would stay green if asset counting were deleted outright. (An
+    // earlier version of this comment claimed 35% was "far below what a double-counted stylesheet
+    // would produce". That was simply false, and it is why the check below now exists.)
     //
-    // 35% is the observed 24.8% plus room for that variance, and still far below what a
-    // double-counted stylesheet would produce. The global 25% stays where it is, because it has to
-    // keep gating the JS benchmarks against a real regression.
+    // The MINIFIED pair is where the signal is, because neither side compresses it and the CSS is
+    // ~3% of that total rather than ~1.7%. Measured the same way: fold ZERO reads 3.80%, ONCE
+    // 0.81%, TWICE 2.19%.
+    //
+    // 1.5% sits between those, deliberately: it is nearly 2x the honest reading and a third below a
+    // double count, so both failure directions are caught with room, and it is what makes this
+    // fixture gate B2 at all. (2% would also catch a double count, but by under 10% — thin enough
+    // that a small real drift could hide one.) Our JS reads 0.8% LOW against esbuild's minifier,
+    // which is why the band is not centred on zero. Both minifiers are exact-pinned and
+    // upgrade-gated, so this only moves on a deliberate re-baseline. If it goes red, a stylesheet's
+    // fold count changed; do not raise the number.
     tolerance: 0.35,
+    minifiedTolerance: 0.015,
+    expectsStylesheet: true,
   },
 ];
 
@@ -145,7 +164,11 @@ const main = async () => {
 
     for (const [index, benchmark] of benchmarks.entries()) {
       const importLens = await importLensNamedSize(daemon, workspace, benchmark, index + 1);
-      const esbuildSize = await esbuildNamedSize(workspace, benchmark.activeDocumentPath);
+      const esbuildSize = await esbuildNamedSize(
+        workspace,
+        benchmark.activeDocumentPath,
+        benchmark.expectsStylesheet ?? false,
+      );
       const delta = Math.abs(importLens.brotliBytes - esbuildSize.brotliBytes);
       const relativeDelta = delta / Math.max(esbuildSize.brotliBytes, 1);
 
@@ -167,6 +190,22 @@ const main = async () => {
         throw new Error(
           `${benchmark.label} accuracy delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(benchmarkTolerance * 100).toFixed(1)}% tolerance`,
         );
+      }
+
+      // The brotli delta above cannot gate WHAT WAS COUNTED on a benchmark whose assets are a small
+      // share of a compressed total, because both sides' compressors disagree by far more than the
+      // assets weigh (see the CSS fixture). Where a benchmark says so, hold the MINIFIED totals too:
+      // neither side compresses them, so the compressor gap is absent and the only thing left to
+      // explain a delta is a difference in what got folded in.
+      if (benchmark.minifiedTolerance !== undefined) {
+        const minifiedDelta = Math.abs(importLens.minifiedBytes - esbuildSize.minifiedBytes);
+        const relativeMinifiedDelta = minifiedDelta / Math.max(esbuildSize.minifiedBytes, 1);
+
+        if (relativeMinifiedDelta > benchmark.minifiedTolerance) {
+          throw new Error(
+            `${benchmark.label} minified delta ${(relativeMinifiedDelta * 100).toFixed(2)}% exceeds ${(benchmark.minifiedTolerance * 100).toFixed(2)}% tolerance. This is the axis that gates what was COUNTED: a stylesheet folded in twice, or not at all, moves it. Do not raise this number to make it green.`,
+          );
+        }
       }
 
       if (
@@ -326,6 +365,32 @@ const assertRealFixturePreconditions = async (workspace) => {
     );
   }
 
+  // @uiw/react-md-editor is here for ONE property: its published ESM entry really does
+  // `import "./index.css"`. That is the whole reason it is the only real package in this suite that
+  // exercises asset counting (B2) against an independent bundler — react-toastify, react-datepicker,
+  // swiper and react-loading-skeleton all SHIP a stylesheet but none imports one from published
+  // JavaScript, so none would exercise it at all.
+  //
+  // If a future version drops that import, both sides fold in no CSS, every delta stays inside
+  // tolerance, and this benchmark silently degrades into a second pure-JS one while still claiming
+  // in its label to gate asset counting. That is the exact shape the refractor guard above exists to
+  // prevent, so it is guarded rather than assumed.
+  const editorPackage = "@uiw/react-md-editor";
+  const editorManifest = manifests[editorPackage];
+  const editorEntry =
+    editorManifest.exports?.["."]?.import ?? editorManifest.module ?? editorManifest.main;
+  const editorEntrySource = await readFile(
+    path.join(workspace, "node_modules", editorPackage, editorEntry),
+    "utf8",
+  );
+  if (!/import\s*["'][^"']+\.css["']/u.test(editorEntrySource)) {
+    throw new Error(
+      `${editorPackage} fixture's ESM entry (${editorEntry}) no longer imports a stylesheet; ` +
+        "no benchmark now compares asset counting against the oracle, and the CSS fixture has " +
+        "quietly become a duplicate JS one",
+    );
+  }
+
   return versions;
 };
 
@@ -351,6 +416,8 @@ const writeRealFixtureEntries = async (workspace, versions) => {
       version: versions[fixture.package],
       named: fixture.named,
       tolerance: fixture.tolerance,
+      minifiedTolerance: fixture.minifiedTolerance,
+      expectsStylesheet: fixture.expectsStylesheet,
     });
   }
 
@@ -532,7 +599,7 @@ const importLensNamedSize = async (daemon, workspace, benchmark, requestId) => {
   };
 };
 
-const esbuildNamedSize = async (workspace, activeDocumentPath) => {
+const esbuildNamedSize = async (workspace, activeDocumentPath, expectsStylesheet = false) => {
   const result = await esbuild.build({
     absWorkingDir: workspace,
     entryPoints: [activeDocumentPath],
@@ -564,6 +631,16 @@ const esbuildNamedSize = async (workspace, activeDocumentPath) => {
 
   if (javascript.length === 0) {
     throw new Error("esbuild did not produce a JavaScript output file");
+  }
+
+  // The other half of the CSS fixture's precondition: the entry importing a stylesheet is what makes
+  // the ORACLE emit one. If it ever stops, both sides fold in no CSS, the deltas stay green, and the
+  // benchmark compares JS to JS while claiming to gate asset counting.
+  if (expectsStylesheet && stylesheets.length === 0) {
+    throw new Error(
+      "esbuild emitted no stylesheet for a benchmark whose entire purpose is comparing counted " +
+        "CSS against the oracle; the fixture is no longer exercising asset counting",
+    );
   }
 
   const bytesOf = (files) => files.reduce((bytes, file) => bytes + file.contents.length, 0);
