@@ -196,6 +196,53 @@ naturally. Building each import separately and adding up the results would count
 dependency once per importer — which is the wrong number, and the reason the bundler is never
 asked to build the same document's imports as independent bundles.
 
+### Non-JavaScript files the package ships
+
+A package's cost is not only its JavaScript. UI kits ship CSS; some packages ship wasm or fonts.
+Those bytes are **in** the reported number, and the reason is simple: the headline claims to be what
+the import costs, so a stylesheet the entry pulls is part of that cost or the claim is false.
+
+This stays inside the "measure an import, not a bundle" rule. Counting a package's own CSS is still
+measuring *that import's* weight; it is not modelling how a project would chunk its output.
+
+**Classified at the load boundary.** When the bundler asks for a module's bytes, the file is
+classified before anything else looks at it:
+
+| Class | Files | What happens |
+| --- | --- | --- |
+| **Counted** | `.css` and preprocessor sources, `.wasm`, fonts | Stubbed to an empty module, processed afterwards, folded into the number |
+| **Unmeasured** | images, SVG, icons, media | Stubbed to an empty module, bytes **disclosed** rather than counted |
+| Anything else | `.js`, `.ts`, unknown extensions | Handed back to the bundler untouched |
+
+Stubbing is not an optimisation, it is what makes the JavaScript number exact — and for several of
+these it is the difference between a number and nothing at all. Rolldown 1.1.5 refuses to bundle CSS
+and fails the *entire* build at link, so every package whose entry does `import "./styles.css"` was
+once unmeasurable. A `.png` is not UTF-8 and dies in the loader; an `.svg` **is** valid UTF-8, so it
+reaches the JavaScript parser and dies there instead. One such import used to cost the whole package
+its number.
+
+The Unmeasured list is deliberately an allowlist. An unknown extension still falls through to the
+bundler, because stubbing something we cannot name might stub real JavaScript.
+
+**Processed the way each really ships.** After the build, every reachable stylesheet is bundled by
+Lightning CSS into **one** artifact — its `@import` tree resolved and inlined, then minified —
+because that is how CSS ships and it is what dedupes a sheet two imports share. Wasm and fonts have
+no processor: their shipped size is their bytes. Each artifact is then compressed **on its own** and
+the sizes are added (§10). Never concatenate the JavaScript chunk and a stylesheet before
+compressing; they are separate files that ship separately, and compressing them together reports a
+number no browser downloads.
+
+**A stylesheet's own references are followed.** Lightning CSS reports every `url()` against the file
+that declared it, and each one resolves to exactly one outcome — counted, disclosed at its real size,
+named as an omission, or external. Nothing is dropped silently, which is the failure this part was
+built to end: a shipped image once left through a single unhandled branch, taking its bytes out of a
+number that still claimed to be complete.
+
+**Failure falls back, never below.** Anything the pipeline cannot process reverts to raw-byte
+disclosure with a diagnostic. That is the pre-asset behaviour, so the result is a strict improvement
+or a tie — and a package that discloses anything is held at Medium confidence, because a number that
+omits bytes the user's bundle carries is not a High-confidence measurement of that package.
+
 ---
 
 ## 5. What actually happens during a build

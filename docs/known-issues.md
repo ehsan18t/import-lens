@@ -177,8 +177,10 @@ longer threatens the daemon (that wedge is fixed and pinned by a regression test
 edge on broken input, and still strictly better than before B2, when the package contributed zero CSS either
 way.
 
-The `asset-counting-plan.md` claim that the provider falls back to `oxc_resolver` for a bare `@import` describes
-work that was not built; the plan is corrected rather than the gap papered over.
+A since-deleted plan claimed the provider falls back to `oxc_resolver` for a bare `@import`. It never did, and
+resolving CSS with the JavaScript resolver would be worse than not resolving it: that profile has no `style`
+main field, no `style` condition and no `.css` extension, so it would answer `pkg/base` with `pkg/base.js` and
+measure the wrong file. Doing it properly needs a purpose-built CSS resolver profile.
 
 ### D9: A stylesheet's own `@import` tree is bounded at 256 files
 **Status: Accepted** · A bound where there was none · Found by the B2 adversarial review
