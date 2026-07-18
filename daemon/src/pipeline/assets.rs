@@ -1395,7 +1395,10 @@ fn process_stylesheets(
                 // Only a TRANSIENT failure makes the result request-local. A missing file is a
                 // deterministic fact about the package and stays cacheable.
                 let had_asset_io = bundle.failed_paths.iter().any(|failed| !failed.missing)
-                    || !bundle.referenced_failures.is_empty();
+                    || bundle
+                        .referenced_failures
+                        .iter()
+                        .any(|failure| failure.kind != std::io::ErrorKind::NotFound);
                 css.raw_bytes += bundle.raw_bytes.len() as u64;
                 css.minified_bytes += bundle.minified_bytes.len() as u64;
                 css.gzip_bytes += compressed.gzip_bytes;
@@ -1414,10 +1417,16 @@ fn process_stylesheets(
                 referenced_assets.extend(bundle.referenced_assets);
                 for failure in bundle.referenced_failures {
                     processed.read_paths.push(failure.path.clone());
-                    processed.failed_paths.push(FailedRead {
-                        path: failure.path.clone(),
-                        missing: false,
-                    });
+                    // Classify by the REAL reason. A `url()` target that is simply absent is a
+                    // deterministic fact about the package: it takes the absent-state sentinel and
+                    // stays cacheable, so supplying the file is what invalidates the result. Forcing
+                    // every one of these to "not missing" made such a package permanently
+                    // unverifiable — rebuilt on every keystroke over a file nobody was going to
+                    // create — and put a second, conflicting sentinel on any path the snapshot half
+                    // had already recorded correctly.
+                    processed
+                        .failed_paths
+                        .push(FailedRead::new(failure.path.clone(), failure.kind));
                     processed.failures.push(failure.message);
                     processed.uncounted.push(UncountedAsset {
                         path: failure.path,
@@ -1873,6 +1882,126 @@ mod tests {
             bundle_css(&fixture.path("sheet0.css")).expect("an ordinary chain must bundle");
         let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
         assert!(css.contains(".rule0") && css.contains(".rule23"), "{css}");
+    }
+
+    /// A protocol-relative `url()` names a CDN, exactly like the `https://` form. Classifying it as
+    /// an unlocatable LOCAL file kept the number correct but labelled it a floor and dropped its
+    /// budget verdict — the `@import` half already knew this shape, the `url()` half did not.
+    #[test]
+    fn a_protocol_relative_url_is_external_rather_than_an_unlocatable_local_file() {
+        let fixture = Fixture::new(
+            "protocol-relative",
+            &[(
+                "index.css",
+                "@font-face { src: url(\"//fonts.gstatic.com/s/roboto/v30/x.woff2\") }\n",
+            )],
+        );
+
+        let bundle = bundle_css(&fixture.path("index.css")).expect("the sheet must still bundle");
+        assert_eq!(
+            bundle.dependency_external.len(),
+            1,
+            "a protocol-relative resource is fetched at runtime: {bundle:?}"
+        );
+        assert!(
+            bundle.dependency_omissions.is_empty(),
+            "an exact measurement must not be turned into a floor: {bundle:?}"
+        );
+
+        let mut processed = ProcessedAssets::default();
+        processed
+            .css_dependency_external
+            .extend(bundle.dependency_external);
+        processed
+            .css_dependency_omissions
+            .extend(bundle.dependency_omissions);
+        assert!(
+            !processed.has_uncounted_assets(),
+            "runtime-fetched weight must keep the size exact and budgetable"
+        );
+    }
+
+    /// Percent-escapes that do not decode to UTF-8 (a CP-1252 export) once left through the same
+    /// silent arm as a `data:` payload, so a whole font face vanished from the total while the
+    /// result stayed Measured at High confidence — cached, budgeted, and never invalidated by
+    /// supplying the file. Nothing may leave without a trace.
+    #[test]
+    fn a_url_whose_escapes_are_not_utf8_is_named_rather_than_dropped() {
+        let fixture = Fixture::new(
+            "undecodable-url",
+            &[(
+                "index.css",
+                "@font-face { src: url(\"Ubuntu-R%E9gular.woff2\") }\n",
+            )],
+        );
+
+        let bundle = bundle_css(&fixture.path("index.css")).expect("the sheet must still bundle");
+        assert_eq!(
+            bundle.dependency_omissions.len(),
+            1,
+            "an uninterpretable reference is an omission, never a silent drop: {bundle:?}"
+        );
+        assert!(
+            bundle.dependency_omissions[0].contains("Ubuntu-R%E9gular.woff2"),
+            "the disclosure must name the reference it could not interpret: {bundle:?}"
+        );
+
+        let mut processed = ProcessedAssets::default();
+        processed
+            .css_dependency_omissions
+            .extend(bundle.dependency_omissions);
+        assert!(
+            processed.has_uncounted_assets(),
+            "missing bytes of unknown size make the result a floor"
+        );
+        assert!(
+            uncounted_assets_diagnostic(&processed).is_some()
+                || omitted_css_resources_diagnostic(&processed).is_some(),
+            "the floor must be disclosed to the user: {processed:?}"
+        );
+    }
+
+    /// A `url()` target that is simply absent is a deterministic fact about the package, not a fact
+    /// about this machine. Recording it as a transient failure made the package permanently
+    /// unverifiable — rebuilt on every keystroke over a file nobody was going to create — and told
+    /// the user the result reflected "a changing or unavailable filesystem".
+    #[test]
+    fn a_missing_url_target_is_recorded_as_absent_not_as_transient_io() {
+        let fixture = Fixture::new(
+            "missing-url-target",
+            &[(
+                "index.css",
+                "@font-face { src: url(\"./missing.woff2\") }\n",
+            )],
+        );
+
+        let bundle = bundle_css(&fixture.path("index.css")).expect("the sheet must still bundle");
+        assert_eq!(
+            bundle.referenced_failures.len(),
+            1,
+            "the unreadable target must be recorded: {bundle:?}"
+        );
+        assert_eq!(
+            bundle.referenced_failures[0].kind,
+            std::io::ErrorKind::NotFound,
+            "the reason must survive to the caller, which is what selects the sentinel: {bundle:?}"
+        );
+
+        // The sentinel the caller derives from that reason: absent, not unverifiable. Absent is
+        // fresh only while the file stays missing and goes stale the moment it appears.
+        let mut processed = ProcessedAssets::default();
+        for failure in &bundle.referenced_failures {
+            processed
+                .failed_paths
+                .push(FailedRead::new(failure.path.clone(), failure.kind));
+        }
+        let fingerprints = processed.freshness_fingerprints();
+        assert_eq!(fingerprints.len(), 1, "{fingerprints:?}");
+        assert_eq!(
+            fingerprints[0],
+            crate::cache::key::absent_file_fingerprint(bundle.referenced_failures[0].path.clone()),
+            "a missing target takes the absent-state sentinel: {fingerprints:?}"
+        );
     }
 
     /// A remote `@import` has no file behind it. A real bundler leaves it in the sheet; treating it

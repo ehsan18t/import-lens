@@ -146,9 +146,21 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// such a package is a cached DURABLE `resolve` failure that would keep being served as
 /// "unavailable" for a package that now has a number, so every one must be rejected on read. The
 /// boundary is disclosed on `external`, so the size states what it excludes.
+/// `rolldown-1.2.x+16` (2026-07-19): every `url()` in a counted stylesheet now resolves to exactly
+/// one recorded outcome, and three of them used to be wrong. A reference whose percent-escapes do not
+/// decode to UTF-8 left through the same silent arm as a `data:` payload, so a whole font face
+/// vanished from the total while the result stayed Measured at High confidence — a `+15` entry for
+/// such a package is a short number that was cached, budgeted, and could not be invalidated by
+/// supplying the file. A protocol-relative `//cdn/x.woff2` was classified as an unlocatable LOCAL
+/// file, so an exact size was labelled a floor and lost its budget verdict. And a target that is
+/// simply absent was recorded as a transient I/O failure, which made the package permanently
+/// unverifiable and re-measured on every keystroke; it now takes the absent-state sentinel and goes
+/// stale the moment the file appears. References abandoned when the walk stops early are named
+/// rather than dropped. Numbers, floors and durability all move, so every `+15` entry must be
+/// rejected on read.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.2.x+15"
+        "rolldown-1.2.x+16"
     };
 }
 
