@@ -149,3 +149,25 @@ test("a transient stage on the aggregate makes the total a floor", () => {
     imprecise: false,
   });
 });
+
+/**
+ * Both axes at once, which the per-sheet retry produces routinely: it counts the sheets it can and
+ * discloses the one it cannot, so `uncounted_assets` and `imprecise_assets` arrive on one response.
+ *
+ * They point in OPPOSITE directions, and single-branch precedence made each surface pick one and
+ * drop the other — the extension returned on `short` and called it a floor (the true cost is
+ * HIGHER), while `importlens check` tested the non-budgetable stages first and called it an upper
+ * bound (the true cost is LOWER). One number, two surfaces of one product, contradicting each other
+ * on the same run. `fileCostQuality.ts` states the rule this broke in its own comment: "Folding an
+ * over-count into a floor would tell the user the true cost is higher when it is lower."
+ */
+test("a total that is both short and imprecise claims neither direction", () => {
+  const both = quality(flags({ incomplete: true, diagnostics: imprecise }));
+
+  assert.deepEqual(both, { quantity: "file-cost", short: true, imprecise: true });
+  assert.equal(fileCostQuantityName(both), "File Cost, bound in neither direction");
+  assert.equal(
+    fileCostBecause(both),
+    "bytes that belong in this file's total were not measured and shared asset bytes were counted more than once, so the number is neither a floor nor an upper bound",
+  );
+});

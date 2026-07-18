@@ -222,14 +222,19 @@ const unmeasurableLine = ({
     return `${relative}: could not measure this file (${error}) - budget not evaluated`;
   }
 
-  if (
-    diagnostics.some((diagnostic) => nonBudgetableResultStages.has(diagnostic.stage)) ||
-    blockedImports.some((item) => item.stage.split("/").includes("imprecise_assets"))
-  ) {
-    return `${relative}: asset processing produced a disclosed upper bound, so budgets were not evaluated`;
-  }
-
-  const quality = fileCostQuality({ incomplete, degraded, diagnostics });
+  // The imprecise signal is now an AXIS on the quality model rather than an early return. Returning
+  // here tested the non-budgetable stages BEFORE deriving quality, so a response that was also short
+  // printed only the upper-bound sentence — asserting the true cost is LOWER while the status bar,
+  // reading the same response, called it a floor and asserted the opposite. It also silently dropped
+  // the unmeasured-import count and stage detail the line would otherwise carry.
+  //
+  // An imprecise stage can arrive on a blocked IMPORT rather than on the file's own diagnostics, and
+  // the file-level model cannot see that, so it is folded in here.
+  const impreciseImport = blockedImports.some((item) =>
+    item.stage.split("/").includes("imprecise_assets"),
+  );
+  const fileQuality = fileCostQuality({ incomplete, degraded, diagnostics });
+  const quality = impreciseImport ? { ...fileQuality, imprecise: true } : fileQuality;
 
   // The file's OWN total is sound — its combined build succeeded and nothing is missing from it —
   // and a SEPARATE per-import build failed transiently, so it is that import's budget that cannot be
@@ -438,15 +443,25 @@ export const fileCostQuality = (response) => ({
     response.incomplete === true ||
     (response.degraded !== true &&
       (response.diagnostics ?? []).some((item) => transientStages.has(item.stage))),
+  // The third axis, which this mirror simply did not have. Without it `importlens check` could only
+  // ever describe an over-count, so a response carrying BOTH stages was called an upper bound here
+  // and a floor by the status bar — the same number, described in opposite directions by two
+  // surfaces of one product, on the same run.
+  imprecise: (response.diagnostics ?? []).some((item) => nonBudgetableResultStages.has(item.stage)),
 });
 
-export const isFileCost = (quality) => quality.quantity === "file-cost" && !quality.short;
+export const isFileCost = (quality) =>
+  quality.quantity === "file-cost" && !quality.short && !quality.imprecise;
 
 export const fileCostBecause = (quality) => {
   const missingBytes =
     "bytes that belong in this file's total were not measured, so the number is a floor and not the file's size";
   const combinedBuildFailed =
     "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size";
+  const assetUpperBound =
+    "asset processing produced a disclosed upper bound, so budgets were not evaluated";
+  const neitherBound =
+    "bytes that belong in this file's total were not measured and shared asset bytes were counted more than once, so the number is neither a floor nor an upper bound";
 
   if (quality.quantity === "combined-import-cost") {
     return quality.short
@@ -454,7 +469,15 @@ export const fileCostBecause = (quality) => {
       : combinedBuildFailed;
   }
 
-  return quality.short ? missingBytes : "this file's imports built as one bundle";
+  if (quality.short && quality.imprecise) {
+    return neitherBound;
+  }
+
+  if (quality.short) {
+    return missingBytes;
+  }
+
+  return quality.imprecise ? assetUpperBound : "this file's imports built as one bundle";
 };
 
 // Mirrors `TRANSIENT_ANALYSIS_STAGES` in daemon/src/pipeline/stage.rs (and

@@ -385,10 +385,58 @@ test("an imprecise asset upper bound produces no CLI budget verdict", async () =
     });
 
     assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
+    // The imprecise signal is an axis on the quality model now, not an early return, so this line
+    // also carries the unmeasured-import count and stage the early return used to drop.
     assert.deepEqual(output, [
-      "app.ts: asset processing produced a disclosed upper bound, so budgets were not evaluated",
+      "app.ts: asset processing produced a disclosed upper bound, so budgets were not evaluated (1 unmeasured import; stage: imprecise_assets) - budget not evaluated",
       "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
     ]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+// A response carrying BOTH disclosure axes, which the per-sheet retry produces routinely: it counts
+// the sheets it can and discloses the one it cannot. The two point in opposite directions, and this
+// CLI's quality mirror had no `imprecise` axis at all, so it tested the non-budgetable stages first
+// and printed only the upper-bound sentence — asserting the true cost is LOWER while the status bar,
+// reading the same response, called it a floor and asserted the opposite.
+test("a total that is both short and imprecise claims neither direction", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "importlens-cli-both-axes-"));
+  const filePath = path.join(workspace, "app.ts");
+  writeFileSync(filePath, "import 'asset-lib';\n");
+  const daemon = {
+    request: async () => ({
+      request_id: 1,
+      brotli_bytes: 2500,
+      error: null,
+      incomplete: true,
+      degraded: false,
+      diagnostics: [
+        { stage: "uncounted_assets", message: "an image ships uncounted", details: [] },
+        { stage: "imprecise_assets", message: "measured sheet by sheet", details: [] },
+      ],
+      imports: [],
+    }),
+  };
+
+  try {
+    const analyzedFile = await analyzeFileWithDaemon(filePath, workspace, daemon);
+    const output = [];
+    const exitCode = await runImportLensCheck({
+      cwd: workspace,
+      budgets: { perImportBrotliBytes: 1000, perFileBrotliBytes: 1000 },
+      changedFiles: async () => ["app.ts"],
+      analyzeFile: async () => analyzedFile,
+      writeLine: (line) => output.push(line),
+    });
+
+    assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
+    assert.equal(
+      output[0],
+      "app.ts: bytes that belong in this file's total were not measured and shared asset bytes were counted more than once, so the number is neither a floor nor an upper bound - budget not evaluated",
+      "the CLI must describe both axes in the same words the extension uses, and claim neither direction",
+    );
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }

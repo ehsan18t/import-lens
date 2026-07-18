@@ -86,6 +86,14 @@ export const fileCostQuantityName = (quality: FileCostQuality): string => {
     return "Combined Import Cost";
   }
 
+  // Both axes at once is a real, reachable state: the per-sheet retry counts the sheets it can and
+  // discloses the one it cannot, so `uncounted_assets` and `imprecise_assets` arrive together. They
+  // point in OPPOSITE directions, and returning on `short` first asserted a floor — telling the user
+  // the true cost is higher when the over-count may put it lower. Name neither direction.
+  if (quality.short && quality.imprecise) {
+    return "File Cost, bound in neither direction";
+  }
+
   if (quality.short) {
     return "File Cost floor";
   }
@@ -110,12 +118,20 @@ export const fileCostBecause = (quality: FileCostQuality): string => {
     "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size";
   const assetUpperBound =
     "asset processing produced a disclosed upper bound, so budgets were not evaluated";
+  const neitherBound =
+    "bytes that belong in this file's total were not measured and shared asset bytes were counted more than once, so the number is neither a floor nor an upper bound";
   const builtAsOneBundle = "this file's imports built as one bundle";
 
   if (quality.quantity === "combined-import-cost") {
     return quality.short
       ? `${combinedBuildFailed}, and bytes that belong in it were not measured either`
       : combinedBuildFailed;
+  }
+
+  // Checked before either single-axis arm: whichever came first would have described one direction
+  // and silently dropped the other, which is the contradiction this model exists to prevent.
+  if (quality.short && quality.imprecise) {
+    return neitherBound;
   }
 
   if (quality.short) {
