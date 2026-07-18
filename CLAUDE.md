@@ -29,6 +29,41 @@ If a fix chains into a third round on the same sub-item, stop and re-check it ag
 - In TypeScript, prefer arrow functions where practical.
 - Do not use double casting or unnecessary cast chains.
 
+## Keeping The Core Small
+
+The asset feature reached ~9,000 lines before anyone counted. No single change was unreasonable; the
+growth came from adding beside instead of replacing. These rules target that specific failure, and
+each one has a trigger you can check in review rather than an aspiration.
+
+- **One mechanism per concern. A second way to do something the codebase already does is a defect.**
+  Four provider constructors, two read ledgers, and an `Option<Context>` that made production safety
+  bypassable were all added this way — each one locally sensible, none of them replacing what it
+  duplicated. If a variant is needed, change the existing thing; if it genuinely cannot bend, say in
+  the commit why not.
+- **Adding without deleting is the thing to be suspicious of.** A change that is pure addition should
+  name what it replaced, or say why nothing could be. This is a prompt to look, not a prohibition.
+- **No speculative surface.** An item with no caller is deleted, not kept for later. `AssetKind::ALL`
+  and `as_str` sat unused through three reviews.
+- **Tests use production entry points.** A test-only code path doubles the code and measures a system
+  that does not ship. Supply test *data* and test *limits*, never a parallel path — the asset tests
+  bypassed the resource ledger for weeks and hid a real production limit while doing it.
+- **State that must be interpreted together belongs together.** Six correlated collections that three
+  functions each re-read is the shape that produces both bloat and disagreement between surfaces.
+- **Roughly 700 lines is where a source file needs a reason.** Not a hard limit and nothing enforces
+  it; it is the point at which "should this be two things?" is worth asking out loud rather than
+  drifting past. The daemon has several files well over it that grew there unnoticed.
+
+**Performance: measure it, do not assert it.** "Optimized" is not a property you can review. Brotli
+quality was assumed too slow to raise for a year; measuring took ten minutes and showed quality 11
+costs 35x (disqualifying) while quality 9 halves the error for +33 ms — a real option nobody had
+costed. Claims about speed or size in a commit message should carry the number that supports them.
+
+**Where this stops.** Correctness outranks size, always. This product's whole value is a number the
+user can trust, so never trade a disclosed-correct result, a freshness guarantee, or a gate for
+fewer lines. Shorter code that is harder to verify is not smaller — the review cost moved, it did not
+go away. When a reduction and a guarantee genuinely conflict, keep the guarantee and record the
+larger size honestly.
+
 ## Orchestration Default
 
 - **lean-orchestration is the default execution mode — no `/lean` needed.** Start every non-trivial task (feature, bug hunt, review/audit, design critique, refactor, mixed prompt) by invoking the `lean-orchestration` skill and following its routing. Step 0 of the skill still governs small work: quick lookups, tight debug loops, and small single-file changes stay inline. Full multi-agent/Workflow fan-outs only when explicitly requested. The skill and role agents live under `.claude/`; see `docs/lean-orchestration-setup.md`.
