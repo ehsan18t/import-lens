@@ -161,16 +161,18 @@ which is its own piece of work.
 
 A stylesheet's `@import` children are never graph modules, so none of the engine's limits ever applied to them.
 Lightning CSS recurses per `@import`, and a deep enough chain overflows the stack, which is NOT catchable: the
-process dies rather than the import failing. One tree is therefore bounded to 256 files and 8 MB. Breaching it
-is not a wrong number: the set falls back to the per-sheet path, and failing that to raw-byte disclosure.
+process dies rather than the import failing. One attempt is therefore bounded to 256 files and 8 MB, inside the
+AC-03 build-wide 512-read/16 MiB ledger. A production union that consumes the per-attempt limit can exhaust that
+shared ledger during retry and end as the typed `module_graph_limit`; the unbounded processor helper still
+exercises raw/per-sheet fallback in isolation.
 
 The file count doubles as the depth bound, because a chain of N files costs N reads and nothing else can see
 depth from where the bound is applied. 256 stops the walk roughly three times short of where a release build's
 stack gives out, and is far more than any real stylesheet's tree. It cannot simply be raised on the grounds that
 a flat set of many sheets carries no stack risk: the bound cannot tell breadth from depth, and giving the walk
 its own larger stack does not help either, because Lightning CSS drives the `@import` graph on `rayon` workers
-whose stacks it does not own. A set past the bound therefore degrades into the per-sheet path, which is
-disclosed as `imprecise_assets` and drops the result off High confidence.
+whose stacks it does not own. Early structural union failures can still degrade into the per-sheet path, which
+is disclosed as `imprecise_assets` and drops the result off High confidence.
 
 That degraded number reads HIGH for two reasons, and the smaller one is the obvious one. Sheets sharing an
 `@import` inline it once each. But each sheet is also compressed on its own, so no sheet's compressor can use
@@ -181,11 +183,16 @@ factor is far smaller, but the direction is the same and it is not a small corre
 disclosure fires on the union having failed rather than on the sheets provably sharing bytes: disjoint sheets
 are the worst case here, not the safe one.
 
-The byte half of the budget is charged after each file is read, because the provider is handed the source rather
-than a handle, so it bounds a tree's total rather than any single file's peak memory. The 20 MB guard on module
-source does not cover `@import` children, since they are never graph modules. No real package ships a stylesheet
-large enough for that to matter, and a tree that breaches the budget is refused rather than mismeasured, so this
-is recorded as a property of the bound rather than treated as a hole in it.
+The upper bound remains deterministic, cacheable, and useful to show, but it is no longer treated as exact by
+any budget surface. Editor diagnostics, the workspace report, and `importlens check` share a coordinated
+non-budgetable-stage list; `imprecise_assets` produces no pass or failure, and CI exits with its distinct
+"could not evaluate" result instead of reporting a false regression.
+
+The byte half of the budget is reserved from metadata before each read and reconciled with the exact bytes
+afterward, so it bounds a tree's total rather than any single file's peak memory. The 20 MB guard on module source
+does not cover `@import` children, since they are never graph modules. No real package ships a stylesheet large
+enough for that to matter, and a tree that breaches the budget is refused rather than mismeasured, so this is
+recorded as a property of the bound rather than treated as a hole in it.
 
 ### D11: An asset the daemon could not read is disclosed, and that disclosure is cached
 **Status: Resolved 2026-07-18** · Request-local asset failures never enter durable stores · Found by the B2 branch review

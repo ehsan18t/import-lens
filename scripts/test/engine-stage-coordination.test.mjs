@@ -17,6 +17,7 @@ const repoFile = (relativePath) =>
 const engineStages = repoFile("daemon/src/engine/mod.rs");
 const pipelineStages = repoFile("daemon/src/pipeline/stage.rs");
 const extensionTransience = repoFile("extension/src/analysis/transience.ts");
+const extensionBudgetability = repoFile("extension/src/analysis/budgetability.ts");
 const cli = repoFile("cli/importlens.mjs");
 
 const resolvedStage = (qualifiedConstant) => {
@@ -63,6 +64,17 @@ const daemonDurableStages = () => {
     .sort();
 };
 
+const daemonNonBudgetableStages = () => {
+  const declaration = /pub const NON_BUDGETABLE_RESULT_STAGES: &\[&str\] = &\[([^\]]*)\]/u.exec(
+    pipelineStages,
+  );
+  assert.ok(declaration, "daemon must declare its deterministic non-budgetable stages");
+  return [...declaration[1].matchAll(/\bdiagnostic_stage::[A-Z][A-Z_]+\b/gu)]
+    .map((match) => match[0])
+    .map(resolvedStage)
+    .sort();
+};
+
 /** The stage strings the extension refuses to record. */
 const extensionTransientStages = () => {
   const declaration = /transientAnalysisStages: readonly string\[\] = \[([^\]]*)\]/u.exec(
@@ -81,6 +93,14 @@ const extensionDurableStages = () => {
   return [...declaration[1].matchAll(/"([^"]+)"/gu)].map((match) => match[1]).sort();
 };
 
+const extensionNonBudgetableStages = () => {
+  const declaration = /nonBudgetableResultStages: readonly string\[\] = \[([^\]]*)\]/u.exec(
+    extensionBudgetability,
+  );
+  assert.ok(declaration, "the extension must export its deterministic non-budgetable stages");
+  return [...declaration[1].matchAll(/"([^"]+)"/gu)].map((match) => match[1]).sort();
+};
+
 /** The stage strings the CI gate refuses to reach a verdict from. */
 const cliTransientStages = () => {
   const declaration = /const transientStages = new Set\(\[([^\]]*)\]\)/u.exec(cli);
@@ -92,6 +112,12 @@ const cliTransientStages = () => {
 const cliDurableStages = () => {
   const declaration = /const durableResultStages = new Set\(\[([^\]]*)\]\)/u.exec(cli);
   assert.ok(declaration, "cli/importlens.mjs must declare its durable stage set");
+  return [...declaration[1].matchAll(/"([^"]+)"/gu)].map((match) => match[1]).sort();
+};
+
+const cliNonBudgetableStages = () => {
+  const declaration = /const nonBudgetableResultStages = new Set\(\[([^\]]*)\]\)/u.exec(cli);
+  assert.ok(declaration, "the CLI must declare its deterministic non-budgetable stages");
   return [...declaration[1].matchAll(/"([^"]+)"/gu)].map((match) => match[1]).sort();
 };
 
@@ -133,4 +159,11 @@ test("measured-result stores mirror the daemon's durability allowlist", () => {
     daemon,
     "the CLI must default an unclassified measured diagnostic to no verdict",
   );
+});
+
+test("budget verdicts reject the same deterministic upper-bound stages everywhere", () => {
+  const daemon = daemonNonBudgetableStages();
+  assert.ok(daemon.length > 0, "at least one durable result must be classified as non-budgetable");
+  assert.deepEqual(extensionNonBudgetableStages(), daemon);
+  assert.deepEqual(cliNonBudgetableStages(), daemon);
 });

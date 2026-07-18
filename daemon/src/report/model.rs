@@ -112,7 +112,7 @@ fn is_import_budget_violation(
 fn budgetable_brotli(item: &WorkspaceReportItem) -> Option<u64> {
     item.result
         .as_ref()
-        .filter(|result| result.is_durable())
+        .filter(|result| result.is_budgetable())
         .and_then(ImportResult::brotli_bytes)
 }
 
@@ -528,6 +528,32 @@ mod tests {
         assert!(
             !row_set.rows[0].warning.contains("Budget exceeded"),
             "the report may show the disclosed floor but must not judge it"
+        );
+    }
+
+    #[test]
+    fn an_imprecise_asset_upper_bound_does_not_produce_a_report_budget_verdict() {
+        let mut upper_bound = ok_result("asset-lib", 20);
+        upper_bound
+            .diagnostics
+            .push(crate::ipc::protocol::ImportDiagnostic {
+                stage: crate::engine::diagnostic_stage::IMPRECISE_ASSETS.to_owned(),
+                message: "stylesheets were measured separately, so this size may read high"
+                    .to_owned(),
+                details: Vec::new(),
+            });
+        let items = vec![report_item("asset-lib", 0, "src/a.ts", Some(upper_bound))];
+        let budgets = WorkspaceReportBudgets {
+            per_import_brotli_bytes: Some(10),
+        };
+
+        let row_set = build_report_rows(&items, &budgets);
+        let summary = build_report_summary(&row_set);
+
+        assert_eq!(summary.budget_violation_count, 0);
+        assert!(
+            !row_set.rows[0].warning.contains("Budget exceeded"),
+            "the report may show the disclosed upper bound but must not judge it"
         );
     }
 

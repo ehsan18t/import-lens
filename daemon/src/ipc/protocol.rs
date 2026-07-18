@@ -464,6 +464,18 @@ impl ImportResult {
                 .all(|diagnostic| stage_is_durable(&diagnostic.stage))
     }
 
+    /// Whether this result is precise enough for a budget verdict.
+    ///
+    /// Budgetability is deliberately stricter than durability. A deterministic upper bound can be
+    /// cached and shown again, but comparing it with a threshold can produce a false failure.
+    pub fn is_budgetable(&self) -> bool {
+        self.sizes().is_some()
+            && self.is_durable()
+            && self.diagnostics.iter().all(|diagnostic| {
+                !crate::pipeline::stage::prevents_budget_verdict(&diagnostic.stage)
+            })
+    }
+
     /// Whether a successful build disclosed supported asset bytes that are absent from its five
     /// sizes. The result may still be reusable when the omission is deterministic, but the number
     /// is a floor and cannot stand in for a complete File Cost.

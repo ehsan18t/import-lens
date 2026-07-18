@@ -340,6 +340,60 @@ test("a measured request-local asset floor produces no CLI import-budget verdict
   }
 });
 
+test("an imprecise asset upper bound produces no CLI budget verdict", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "importlens-cli-imprecise-assets-"));
+  const filePath = path.join(workspace, "app.ts");
+  writeFileSync(filePath, "import 'asset-lib';\n");
+  const diagnostic = {
+    stage: "imprecise_assets",
+    message: "stylesheets were measured separately, so this size may read high",
+    details: [],
+  };
+  const daemon = {
+    request: async () => ({
+      request_id: 1,
+      brotli_bytes: 2500,
+      error: null,
+      incomplete: false,
+      degraded: false,
+      diagnostics: [diagnostic],
+      imports: [
+        {
+          specifier: "asset-lib",
+          brotli_bytes: 2500,
+          diagnostics: [diagnostic],
+        },
+      ],
+    }),
+  };
+
+  try {
+    const analyzedFile = await analyzeFileWithDaemon(filePath, workspace, daemon);
+    assert.deepEqual(
+      analyzedFile.imports,
+      [],
+      "the upper bound must not reach the list that can produce an import verdict",
+    );
+
+    const output = [];
+    const exitCode = await runImportLensCheck({
+      cwd: workspace,
+      budgets: { perImportBrotliBytes: 1000, perFileBrotliBytes: 1000 },
+      changedFiles: async () => ["app.ts"],
+      analyzeFile: async () => analyzedFile,
+      writeLine: (line) => output.push(line),
+    });
+
+    assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
+    assert.deepEqual(output, [
+      "app.ts: asset processing produced a disclosed upper bound, so budgets were not evaluated",
+      "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
+    ]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 // One file whose AGGREGATE failed outright (`error: Some` — no bytes at all) used to throw out of
 // `analyzeFileWithDaemon`, which `main` catches into exit 2 — abandoning the whole run, and taking
 // every other changed file's budget with it. Exit 2 also means "the CLI broke", not the exit 3
@@ -442,6 +496,21 @@ test("isUsableFileSize refuses every shape that is not this file's size", () => 
     ),
     false,
     "an asset-read floor must not produce a CI verdict",
+  );
+  assert.equal(
+    isUsableFileSize(
+      response({
+        diagnostics: [
+          {
+            stage: "imprecise_assets",
+            message: "stylesheets were measured separately",
+            details: [],
+          },
+        ],
+      }),
+    ),
+    false,
+    "a disclosed asset upper bound must not produce a false CI failure",
   );
   // A DETERMINISTIC stage on the aggregate is not, by itself, a reason to refuse: a `types_only`
   // diagnostic rides on a perfectly complete total. `degraded` is what says the build failed.

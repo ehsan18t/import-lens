@@ -4,11 +4,11 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-// DRIFT. "Is this file's total a measurement of THIS FILE?" is one wire-visible quality rule, and
-// three processes have to answer it: the daemon before it offers the total to its cache, the
-// extension before it persists a bundle-impact row, and `importlens check` before it issues a CI
-// verdict — which ADR-0006 invariant 3 calls a durable store like any other. The daemon cache also
-// owns private fingerprint evidence that can make it stricter without changing the result's quality.
+// DRIFT. "Is this file's total a measurement of THIS FILE?" is the shared base quality rule used by
+// the daemon cache, extension history, and `importlens check`. The CLI's budget gate is deliberately
+// stricter for deterministic upper bounds; `engine-stage-coordination.test.mjs` pins that additional
+// stage list. The daemon cache also owns private fingerprint evidence that can make it stricter
+// without changing the result's wire-visible quality.
 //
 // It is written three times because it must be. The CLI ships standalone and cannot import the
 // extension's TypeScript; neither can import the daemon's Rust. That is the same forced duplication
@@ -69,7 +69,7 @@ const cliGate = bodyBetween(
 // "daemon-only" filter would let a future public field drift silently.
 const daemonPrivateCacheFields = new Set(["dependency_fingerprints"]);
 
-test("the daemon, the extension and the CLI judge a file's totals by the same fields", () => {
+test("the daemon, extension and CLI read the same base File Cost quality fields", () => {
   const daemonFields = fieldsRead(daemonGate, "self");
   const daemonWireFields = new Set(
     [...daemonFields].filter((field) => !daemonPrivateCacheFields.has(field)),
@@ -89,9 +89,8 @@ quality fields than daemon FileSizeComputation::is_cacheable",
   assert.deepEqual(
     [...cliFields].sort(),
     [...daemonWireFields].sort(),
-    "cli/importlens.mjs::isUsableFileSize consults different wire-visible quality fields than the \
-daemon. The CLI issues a PASS/FAIL from this number, so it must interpret every public quality \
-signal the daemon sends",
+    "cli/importlens.mjs::isUsableFileSize consults different base quality fields than the daemon. \
+Its additional deterministic upper-bound refinement is pinned by the stage coordination test",
   );
 
   // And the set is not empty, so a gate emptied of every check cannot "agree" its way to green.

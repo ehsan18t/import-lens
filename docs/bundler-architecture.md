@@ -486,7 +486,9 @@ that it could not process: `uncounted_assets` makes that otherwise-successful Fi
 Loading, Unmeasured, or measured-with-uncounted-assets contributor makes that fallback short too.
 The known bytes remain worth showing, but no verdict may be drawn from them: a budget judged against
 a floor is neither passed nor failed, it is *not evaluated*. `imprecise_assets` is intentionally
-different: separately processed stylesheets can read high while still counting every sheet.
+different: separately processed stylesheets can read high while still counting every sheet. That
+deterministic upper bound remains cacheable, but it is not budgetable: its compression-boundary
+inflation can produce a false failure just as a floor can produce a false pass.
 
 And a gate that cannot measure **must never report success**. `importlens check` exits non-zero
 with a code distinct from a real budget failure, so a flaky CI machine is diagnosable and is
@@ -595,7 +597,8 @@ And the five that exist because ignoring them produced the same defect seven tim
 12. **An aggregate is only as complete as its inputs.** Any Loading or Unmeasured contributor
     makes the total a **floor**, and **no verdict may be drawn from a floor** — a budget judged
     against one is not failed, it is *not evaluated*. **A gate that cannot measure must never
-    report success.**
+    report success.** A deterministic `imprecise_assets` upper bound is cacheable but equally
+    non-budgetable, because a verdict from it can falsely fail.
 13. **A runtime is an artifact boundary.** Compressed bytes may be summed across one and never
     within one. Nothing is ever deduplicated across a runtime, because each runtime genuinely
     ships its own copy.

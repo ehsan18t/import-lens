@@ -165,6 +165,14 @@ pub fn may_enter_a_durable_store(stage: &str) -> bool {
     DURABLE_RESULT_STAGES.contains(&stage)
 }
 
+/// Deterministic results that remain useful in caches and history but are not precise enough for a
+/// pass/fail budget verdict. The extension and standalone CLI mirror this list under a drift test.
+pub const NON_BUDGETABLE_RESULT_STAGES: &[&str] = &[diagnostic_stage::IMPRECISE_ASSETS];
+
+pub fn prevents_budget_verdict(stage: &str) -> bool {
+    NON_BUDGETABLE_RESULT_STAGES.contains(&stage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +227,13 @@ mod tests {
     fn an_unclassified_stage_is_refused() {
         assert!(!may_enter_a_durable_store("a_stage_nobody_has_classified"));
         assert!(!may_enter_a_durable_store(""));
+    }
+
+    #[test]
+    fn an_imprecise_asset_result_is_durable_but_not_budgetable() {
+        assert!(may_enter_a_durable_store(
+            diagnostic_stage::IMPRECISE_ASSETS
+        ));
+        assert!(prevents_budget_verdict(diagnostic_stage::IMPRECISE_ASSETS));
     }
 }

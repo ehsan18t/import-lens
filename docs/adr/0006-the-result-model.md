@@ -52,7 +52,9 @@ fabricated size, silently passing, so the regression merges.
    pass/fail verdict**. A deterministic outcome **may** be cached — it is a property of the
    bytes, and the cache is already keyed by those bytes' fingerprints, so it expires exactly
    when the answer would change. Not caching it would re-enter the engine for a broken package
-   on every analysis, forever, burning one of only two permits.
+   on every analysis, forever, burning one of only two permits. Cacheability is necessary but not
+   sufficient for a verdict: a deterministic `imprecise_assets` upper bound is reusable and worth
+   showing, but it is not precise enough to pass or fail a threshold.
 4. **An aggregate is only as sound as its own build, and — when it has no build — only as
    complete as its inputs.**
 
@@ -81,10 +83,12 @@ fabricated size, silently passing, so the regression merges.
    does, every contributor is still perfectly Measured, so a check that inspects only the
    contributors sees nothing wrong. And a **types-only** import resolves to "no entry" *by design*
    and is **Measured** (a genuine zero); it is not a gap, and must not flag anything.
-5. **No verdict from a floor.** A budget is never judged against an incomplete number — whether
+5. **No verdict from a floor or an upper bound.** A budget is never judged against an incomplete number — whether
    incompleteness is a wire flag (including deterministic `uncounted_assets`) or an
    `asset_io`/`compression` disclosure — not
-   "pass", not "fail". *"Not evaluated."* And **a gate that cannot measure must never report
+   "pass", not "fail". A disclosed `imprecise_assets` result is the opposite error: separately
+   processed stylesheets can make it read high, so it can falsely fail a budget. It is also *not
+   evaluated* while remaining cacheable. And **a gate that cannot measure must never report
    success**: `importlens check` exits non-zero with a distinct code, so a flaky CI box is
    diagnosable and is never confused with a genuine regression. A silent pass is the worst
    outcome available, because it merges the regression.

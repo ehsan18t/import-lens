@@ -263,7 +263,7 @@ The audit did not refile these as new defects:
 | --- | --- |
 | D7: CSS declared droppable can still be counted | Deferred; rare wrong-number package shape |
 | D8: parser/bare-import fallback and cyclic CSS undercount | Accepted fallback limit |
-| D9: 256-file/8 MiB CSS tree and per-sheet overcount | Accepted bounded degradation |
+| D9: 256-file/8 MiB CSS tree and per-sheet overcount | Accepted bound; disclosed upper bounds are cacheable but no longer budgetable |
 | D10: Brotli quality 4 reads high | Deferred product-wide compression trade-off |
 | D11: transient asset read failure can be cached | Fixed; typed `asset_io`/`compression` causes are never durable |
 | D12: File Cost omits an asset without structurally becoming a floor | Fixed; every `uncounted_assets` aggregate is `incomplete` |
