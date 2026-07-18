@@ -2986,6 +2986,130 @@ fn analyze_measures_a_package_whose_graph_reaches_a_native_addon() {
     );
 }
 
+/// **One refused subpath must not discard a whole package's measurement.**
+///
+/// A package that ships a file and declines to export it makes oxc_resolver answer
+/// `PackagePathNotExported`, not `NotFound` — and Rolldown's leniency keys on the error VARIANT, so
+/// the denial fell to the catch-all and killed the entire build. That is why `jest` and
+/// `eslint-plugin-autofix` reported nothing: each asks for a deep subpath of another package from a
+/// branch that never executes (a `try` whose `catch` holds an older spelling; a version test against
+/// an eslint that is not installed), and the file is right there on disk behind an `exports` map.
+///
+/// The edge is now an import boundary and the graph that did bundle is measured — and the boundary
+/// is DISCLOSED, because the bytes behind it are absent from the number.
+#[test]
+fn analyze_keeps_measuring_when_a_package_refuses_to_export_a_subpath() {
+    let workspace = temp_workspace();
+    // The host really ships the file, and really does not export it. Both halves matter.
+    write_package(
+        &workspace,
+        "host-lib",
+        r#"{"version":"1.0.0","main":"index.js","exports":{".":"./index.js","./package.json":"./package.json"}}"#,
+        "module.exports.open = () => 'host';\n",
+    );
+    write_package_file(
+        &workspace,
+        "host-lib",
+        "internal/secret.js",
+        "module.exports.secret = () => 'secret';\n",
+    );
+    write_package(
+        &workspace,
+        "consumer-lib",
+        r#"{"version":"1.0.0","main":"index.js"}"#,
+        "let helper;\ntry { helper = require('host-lib/internal/secret'); } catch (e) { helper = null; }\nconst payload = 'x'.repeat(4096);\nmodule.exports.run = () => (helper ? helper.secret() : payload);\n",
+    );
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "consumer-lib",
+            "consumer-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["run"],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(
+        result.error, None,
+        "a subpath the host refuses to export must not discard the package: {result:?}"
+    );
+    assert!(
+        common::measured_sizes(&result).raw_bytes > 0,
+        "the graph that did bundle must still be measured: {result:?}"
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "external"
+                && diagnostic.message.contains("host-lib/internal/secret")
+                && diagnostic.message.contains("NOT in this size")
+        }),
+        "the boundary must be disclosed, never silently crossed: {result:?}"
+    );
+}
+
+/// **A package with nothing at its root should say so, not recite what it probed.**
+///
+/// `@next/font` declares no `main`, `module`, `browser` or `exports` — its code is subpath-only. The
+/// resolver's last resort is a literal `index.js`, and when that misses too the failure was reported
+/// by listing every spelling it had tried (`index.js.js`, `index.js.mjs`, `index.js/index.js`),
+/// which reads as a resolver malfunction rather than as the simple fact that there is nothing there.
+#[test]
+fn analyze_names_the_reason_a_subpath_only_package_has_no_root_entry() {
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("subpath-only");
+    fs::create_dir_all(package_root.join("google")).expect("subpath directory should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","types":"dist/types.d.ts"}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("google").join("index.js"),
+        "export const font = () => 'font';\n",
+    )
+    .expect("subpath entry should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "subpath-only",
+            "subpath-only",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    let message = result
+        .error
+        .as_deref()
+        .expect("a package with no root entry stays Unmeasured");
+    assert!(
+        message.contains("declares no importable entry"),
+        "the message must name the reason: {message}"
+    );
+    assert!(
+        message.contains("./google"),
+        "and point at where the code actually is: {message}"
+    );
+    assert!(
+        !message.contains("index.js.mjs"),
+        "reciting probed spellings reads as a resolver malfunction: {message}"
+    );
+}
+
 /// **An alternative-specifier probe must not cost the package its cache.**
 ///
 /// napi-rs writes one `require` per platform triple and ships exactly one of the files, inside

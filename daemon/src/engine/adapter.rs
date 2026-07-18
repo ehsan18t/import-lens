@@ -254,6 +254,20 @@ fn translate(
             message: format!("external module kept as an import boundary: {import}"),
         });
     }
+    // A boundary the package did not ask for. Rolldown externalizes an unresolvable bare specifier
+    // it answers `NotFound`, and the plugin extends that to the denial variants so one refused
+    // subpath cannot discard a whole package's measurement. Saying so is not optional: the graph
+    // behind such an edge is absent from the number, and an undisclosed absence is the one failure
+    // this product cannot have.
+    for specifier in state.unresolved_externals() {
+        diagnostics.push(ImportDiagnostic {
+            stage: diagnostic_stage::EXTERNAL.to_owned(),
+            message: format!(
+                "could not resolve '{specifier}'; kept as an import boundary, so anything it would \
+                 have pulled in is NOT in this size"
+            ),
+        });
+    }
     // There used to be a `side_effects` diagnostic here, pushed for EVERY glob declaration: "matched
     // paths are unavailable from public bundler metadata, so side-effect confidence is
     // conservative". Its premise was retracted (§10.7) and the daemon now matches the entry with

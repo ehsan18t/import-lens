@@ -136,9 +136,19 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// `UNLOADABLE_DEPENDENCY` because the addon's bytes are not UTF-8 — and would keep being served as
 /// "unavailable" for a package that now has a number. `@vscode/vsce` and `ovsx` are the packages
 /// this was observed on; the rule is the extension, not the package.
+/// `rolldown-1.2.x+15` (2026-07-19): a cross-package subpath the resolver refuses is now an import
+/// boundary instead of a fatal error, so packages that reported nothing now report a number. Rolldown
+/// already externalized an unresolvable bare specifier it answered `NotFound` — that is why `tsdown`
+/// measured — but the denial variants never reached that arm: a package that ships a file and
+/// declines to export it makes oxc_resolver answer `PackagePathNotExported`, which killed the whole
+/// build. `jest` (4,422,177 B) and `eslint-plugin-autofix` (3,402,095 B) are the packages this was
+/// observed on, each asking for a deep subpath from a branch that never executes. A `+14` entry for
+/// such a package is a cached DURABLE `resolve` failure that would keep being served as
+/// "unavailable" for a package that now has a number, so every one must be rejected on read. The
+/// boundary is disclosed on `external`, so the size states what it excludes.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.2.x+14"
+        "rolldown-1.2.x+15"
     };
 }
 

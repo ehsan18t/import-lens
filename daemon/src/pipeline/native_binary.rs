@@ -135,7 +135,7 @@ fn read_manifest_json(package_root: &Path) -> Option<Value> {
 /// only `bin`) from one that DECLARES a JS entry which merely failed to resolve — a broken or
 /// partial install. Only the former is a real zero; the latter must stay "unavailable" rather than
 /// be flattened to a confident zero it does not have.
-fn manifest_declares_no_js_entry(package_json: &Value) -> bool {
+pub(crate) fn manifest_declares_no_js_entry(package_json: &Value) -> bool {
     !["main", "module", "browser", "exports"]
         .iter()
         .any(|field| package_json.get(*field).is_some())

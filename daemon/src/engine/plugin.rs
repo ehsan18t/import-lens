@@ -5,7 +5,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -75,6 +75,9 @@ pub(super) struct BuildState {
     /// Directly imported files that ship but are outside the measured taxonomy — an image, an icon.
     /// Stubbed so they cannot fail the build, and disclosed so their bytes are not silently absent.
     unmeasured_assets: Mutex<BTreeMap<PathBuf, UncountedAsset>>,
+    /// Bare specifiers this build turned into an import boundary because the resolver refused them.
+    /// Disclosed, never silent: the graph behind such an edge is not in the number.
+    unresolved_externals: Mutex<BTreeSet<String>>,
 }
 
 impl BuildState {
@@ -158,6 +161,23 @@ impl BuildState {
         if failure == AssetInputFailure::Unreadable {
             *slot = AssetInputFailure::Unreadable;
         }
+    }
+
+    fn record_unresolved_external(&self, specifier: String) {
+        self.unresolved_externals
+            .lock()
+            .expect("unresolved-external set should not be poisoned")
+            .insert(specifier);
+    }
+
+    /// Sorted for a stable disclosure — a package's own module order is a concurrency race.
+    pub(super) fn unresolved_externals(&self) -> Vec<String> {
+        self.unresolved_externals
+            .lock()
+            .expect("unresolved-external set should not be poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Only the UNREADABLE ones. This drives the `asset_io` diagnostic and the `asset_io` failure
@@ -338,6 +358,37 @@ fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Opt
     }
     let parent = importer.parent()?;
     Some(parent.join(specifier_path))
+}
+
+/// A specifier that names a subpath of ANOTHER package rather than a file inside this one.
+///
+/// Path-like specifiers are deliberately excluded. A package that cannot find its own relative file
+/// really is broken, and failing is the honest answer; a BARE specifier names something across a
+/// package boundary, and a boundary we cannot cross is a boundary, not a fatality.
+///
+/// Rolldown already reasons exactly this way — an unresolvable bare import answered `NotFound` is
+/// externalized with a warning, which is why `tsdown` measures where esbuild refuses. But that arm
+/// keys on the error VARIANT, not the specifier's shape, and the interesting failures never reach
+/// it: when a package ships a file and declines to export it, oxc_resolver answers
+/// `PackagePathNotExported`, which falls to the catch-all and kills the whole build.
+/// `jest-resolve/build/defaultResolver` and `eslint/lib/rules` are both that — real files on disk,
+/// behind an `exports` map — and each is requested from a branch that never executes (a `try` whose
+/// `catch` has the older spelling, a version test against an eslint that is not installed).
+///
+/// Restricting this to subpaths keeps the extra resolver call off the common path: a bare ROOT
+/// specifier that is simply not installed is the `NotFound` case Rolldown already handles.
+fn is_bare_subpath_specifier(specifier: &str) -> bool {
+    if specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || specifier.starts_with('/')
+        || specifier.starts_with('#')
+        || Path::new(specifier).is_absolute()
+    {
+        return false;
+    }
+    // `@scope/pkg/sub` needs three segments to be a subpath; `pkg/sub` needs two.
+    let required = if specifier.starts_with('@') { 3 } else { 2 };
+    specifier.split('/').filter(|part| !part.is_empty()).count() >= required
 }
 
 /// A read that failed because the file is not there is a fact about the package; anything else —
@@ -680,6 +731,40 @@ impl Plugin for ImportLensPlugin {
                     return Ok(None);
                 }
             }
+        }
+
+        // A cross-package subpath the resolver refuses is an import BOUNDARY, not a fatality — see
+        // [`is_bare_subpath_specifier`]. Externalizing it measures the graph that did bundle instead
+        // of discarding a whole package over one edge, and the specifier is recorded so the result
+        // discloses the boundary rather than pretending the edge was never there.
+        if let Some(importer) = args.importer
+            && is_bare_subpath_specifier(args.specifier)
+        {
+            let resolved = ctx
+                .resolve(
+                    args.specifier,
+                    Some(importer),
+                    Some(PluginContextResolveOptions {
+                        import_kind: args.kind,
+                        is_entry: args.is_entry,
+                        skip_self: true,
+                        custom: Arc::clone(&args.custom),
+                    }),
+                )
+                .await?;
+            return match resolved {
+                // Hand back the id we already paid for rather than returning `None` and making
+                // Rolldown resolve the same specifier a second time.
+                Ok(resolved) => Ok(Some(HookResolveIdOutput::from_resolved_id(resolved))),
+                Err(_) => {
+                    self.state
+                        .record_unresolved_external(args.specifier.to_owned());
+                    Ok(Some(HookResolveIdOutput {
+                        external: Some(true.into()),
+                        ..HookResolveIdOutput::from_id(args.specifier.to_owned())
+                    }))
+                }
+            };
         }
         Ok(None)
     }

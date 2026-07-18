@@ -234,8 +234,55 @@ fn resolve_legacy_fallback(
             .map(|path| classify_resolved_entry(manifest, path, false));
     }
 
+    // The CommonJS default, and it is genuinely right for the many packages that ship an `index.js`
+    // and declare nothing. When it is wrong, though, the failure used to be reported by listing what
+    // was probed — `index.js`, `index.js.js`, `index.js.mjs`, `index.js/index.js` — which reads as a
+    // resolver malfunction. For a package that declares NO entry field at all the truth is simpler
+    // and worth saying plainly: there is nothing at the root to import, and the code is under
+    // subpaths. `@next/font` is the case in hand; its entries are `./google` and `./local`.
     resolve_file_candidate(&manifest.root.join("index.js"))
         .map(|path| classify_resolved_entry(manifest, path, false))
+        .map_err(|probed| {
+            if !crate::pipeline::native_binary::manifest_declares_no_js_entry(&manifest.json) {
+                return probed;
+            }
+            let subpaths = importable_subpaths(&manifest.root);
+            let hint = if subpaths.is_empty() {
+                String::new()
+            } else {
+                format!("; importable subpaths include {}", subpaths.join(", "))
+            };
+            format!(
+                "package '{}' declares no importable entry (no main, module, browser or exports) \
+                 and has no index.js{hint}",
+                request.package_name
+            )
+        })
+}
+
+/// Immediate subdirectories that are themselves importable, so a "no entry" message can say where
+/// the code actually is instead of only what is missing.
+///
+/// Deliberately shallow and bounded: this runs on a failure path to improve one sentence, and a deep
+/// walk of a package root is not worth a diagnostic. Directory order is filesystem order, so it is
+/// sorted — a message that reorders itself between runs reads as instability.
+fn importable_subpaths(package_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(package_root) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| {
+            ["index.js", "index.mjs", "index.cjs"]
+                .iter()
+                .any(|name| entry.path().join(name).is_file())
+        })
+        .filter_map(|entry| entry.file_name().to_str().map(|name| format!("./{name}")))
+        .take(8)
+        .collect();
+    found.sort();
+    found
 }
 
 fn validate_declared_entry_resolution(

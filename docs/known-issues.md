@@ -82,22 +82,27 @@ addon nobody has hit yet are one line in `classify_asset_class`, not three excep
 `@vscode/vsce` reports 4,636,409 B raw / 448,379 B brotli and `ovsx` 4,783,340 B / 466,764 B, each at Medium
 confidence disclosing `keytar.node` at 707,584 B, where both previously reported nothing at all.
 
-**What is left in D6 is two resolver-side classes.** A shipped asset, and then a native addon, each used to be
-a trigger for the same symptom; neither contributes to D6 any more. What remains needs the universal
-external-boundary fix described below, at the resolver seam:
+**The unresolvable-specifier half is closed too (2026-07-19).** A bare specifier naming a subpath of ANOTHER
+package is now externalized when the resolver refuses it, so the graph that did bundle is measured and the
+edge is disclosed on `external` rather than discarding the package. Rolldown already reasoned this way for
+`NotFound` — that is why `tsdown` measured — but its leniency keys on the error VARIANT, and the interesting
+failures never reached it: a package that ships a file and declines to export it makes oxc_resolver answer
+`PackagePathNotExported`, which fell to the catch-all and killed the build. `jest` now reports 4,422,177 B and
+`eslint-plugin-autofix` 3,402,095 B, each disclosing the two specifiers it could not cross. Path-like
+specifiers are deliberately NOT covered: a package that cannot find its own relative file really is broken,
+and failing is the honest answer.
 
-1. **the unresolvable specifier** — a deep-path `require` (`jest`, `eslint-plugin-autofix`) that poisons the
-   whole build;
-2. **no importable entry** — a package that declares no `main`/`module`/`exports`/`browser` at all, confirmed
-   on `@next/font` on 2026-07-19. The daemon falls back to a literal `index.js` guess and then appends
-   extensions to it, so the user is shown a candidate list containing `index.js.js` and `index.js.mjs`, which
-   reads as a resolver malfunction when the truth is simply that the package is subpath-only. Two probes for
-   this shape already exist on the `entry_resolution` failure branch and both answer with a **labelled
-   Measured zero** (`types_only`, and `native_binary_only` for B3), but neither claims this case: a zero would
-   be wrong here, because importing such a specifier does not cost nothing, it does not resolve at all. The
-   honest answer is a labelled Unmeasured naming the reason — which is what the universal fix below already
-   prescribes ("no importable entry"). Note `native_binary_only` ships with no SRS requirement behind it; if
-   this class is taken up, charter both in the SRS at the same time.
+**What is left in D6 is the no-importable-entry class, and it is now honest rather than confusing.** A package
+declaring no `main`/`module`/`exports`/`browser` at all (confirmed on `@next/font`, 2026-07-19) is still
+**Unmeasured** — correctly, because importing such a specifier does not cost nothing, it does not resolve at
+all, so a zero would be a fabricated number. What changed is the message: the resolver used to report the
+literal `index.js` guess by listing every spelling it probed (`index.js.js`, `index.js.mjs`,
+`index.js/index.js`), which reads as a malfunction; it now says the package declares no importable entry and
+names the subpaths that ARE importable (`./google`, `./local`). What remains open is only the UI half of D6's
+"labelled reason": the stage is still the generic `entry_resolution`, so the badge cannot distinguish this
+from a broken install. Two probes on that same branch already answer with a labelled Measured zero
+(`types_only`, and `native_binary_only` for B3) — note `native_binary_only` ships with no SRS requirement
+behind it; if a dedicated stage is added here, charter both in the SRS at the same time.
 
 **What the user sees.** In a real `package.json`, a growing fraction of dependencies render **unavailable**,
 and not only native CLIs. The bigger the project, the more of them, which reads as "the build was too big." It
@@ -111,9 +116,9 @@ accuracy oracle) on the installed packages, every failure is fast (4 to 300 ms, 
 | `@vscode/vsce` | imports `keytar.node` (a compiled native addon) | native leaf — **fixed 2026-07-19**, measures with the addon disclosed |
 | `ovsx` | `keytar.node` plus `@node-rs/crc32`'s `.node` | native leaf — **fixed 2026-07-19**, measures with the addon disclosed |
 | `@biomejs/biome` | no importable entry (`bin` only); real tool is a native binary. Now handled by **B3** | native binary (B3) |
-| `jest` | `jest-pnp-resolver` does `require('jest-resolve/build/defaultResolver')`, unresolvable, so `[resolve]` fails the whole build | unresolvable leaf |
-| `eslint-plugin-autofix` | does `require('eslint/lib/built-in-rules-index')` (eslint's non-exported internals), unresolvable, so `[resolve]` fails the whole build | unresolvable leaf |
-| `@next/font` | **confirmed 2026-07-19**: declares no `main`/`module`/`exports`/`browser` at all (only `types`); its real code is subpath-only (`google/`, `local/`), so the root has no importable entry and the fallback guesses `index.js`, then `index.js.js`, `index.js.mjs`, … | no importable entry |
+| `jest` | `jest-pnp-resolver` does `require('jest-resolve/build/defaultResolver')`, which `jest-resolve` ships but does not export | unresolvable leaf — **fixed 2026-07-19**, 4,422,177 B with the boundary disclosed |
+| `eslint-plugin-autofix` | does `require('eslint/lib/rules')` (eslint's non-exported internals) from a dead version branch | unresolvable leaf — **fixed 2026-07-19**, 3,402,095 B with the boundary disclosed |
+| `@next/font` | **confirmed 2026-07-19**: declares no `main`/`module`/`exports`/`browser` at all (only `types`); its real code is subpath-only (`google/`, `local/`), so the root has no importable entry | no importable entry — still Unmeasured, but the message now names the reason and the real subpaths |
 
 Confirmed 2026-07-16: `jest` and `eslint-plugin-autofix` are not "pure JS that should measure and does not."
 Each fails because one transitive `require` targets a deep internal subpath of another package that the
