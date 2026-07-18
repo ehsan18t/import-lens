@@ -769,13 +769,15 @@ impl Plugin for ImportLensPlugin {
             }));
         }
 
-        // A file that ships but is outside the measured taxonomy — an image, an icon, a media file.
+        // A file that ships but is outside the measured taxonomy — an image, an icon, a media file,
+        // a compiled native addon.
         //
         // It is intercepted for the same reason a font is: left to Rolldown, ONE of these makes the
         // whole package unmeasurable. A `.png` is not UTF-8, so its loader fails on `InvalidData`;
         // an `.svg` IS valid UTF-8, so it is handed to OXC and parsed as JavaScript, which fails
-        // differently and just as fatally. The user saw "unavailable" for a package whose
-        // JavaScript we could measure perfectly.
+        // differently and just as fatally; a `.node` addon fails as the `.png` does, which is what
+        // took `@vscode/vsce` and `ovsx` down over one `keytar.node`. The user saw "unavailable"
+        // for a package whose JavaScript we could measure perfectly.
         //
         // Stubbing it to `Empty` lets the JS graph measure exactly, and the bytes are DISCLOSED
         // rather than dropped: they ship, so a size that omits them is a floor and has to say so.

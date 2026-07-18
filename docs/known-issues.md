@@ -58,7 +58,7 @@ Real work, queued rather than abandoned. None of these is a wrong number or a we
 release, but each is worth turning into a task.
 
 ### D6: "Unavailable" is one label for several causes, and one unbundleable leaf discards the whole package
-**Status: Deferred — ENGINE scope. The asset half is closed (2026-07-18)** · The most visible gap in real projects · Fix universally, never per-package
+**Status: Deferred — RESOLVER scope. The asset half is closed (2026-07-18); the native-addon half is closed (2026-07-19)** · The most visible gap in real projects · Fix universally, never per-package
 
 **The asset half is closed.** A directly imported image, icon or media file was one of these fatal leaves and
 is no longer: `import logo from './logo.png'` failed rolldown's loader with `InvalidData` because a PNG is not
@@ -71,11 +71,33 @@ counted — so the JavaScript measures exactly and the shipped bytes are not sil
 The allowlist is deliberately an allowlist. An unknown extension still falls through to Rolldown, because
 intercepting something we cannot name would stub a module that might have been real JavaScript.
 
-The native-addon and unresolvable-specifier leaves in the table below are unchanged and still fatal. **They are
-not asset-counting work.** A `.node` addon and a deep-path `require` that cannot resolve are engine and
-resolver concerns that happen to share this entry because a shipped asset used to be a third trigger for the
-same symptom. Asset counting no longer contributes to D6 at all; what remains needs the universal
-external-boundary fix described below, at the engine seam.
+**The native-addon half is closed too (2026-07-19).** A compiled `.node` addon is now classified
+`AssetClass::Unmeasured` alongside an image: stubbed to `ModuleType::Empty` so the JavaScript graph measures,
+its bytes charged against the graph budget, and **disclosed** rather than counted — the addon ships as its own
+file beside the chunk and is outside the processed taxonomy, so the size omits it and has to say so, exactly
+as it does for an image. It earns its place on the interception allowlist by the strongest form of the allowlist's own
+argument: Node resolves the extension through `process.dlopen`, so a `.node` file cannot be JavaScript by
+definition of its name. The rule is the extension, never the package — `keytar`, `@node-rs/crc32` and every
+addon nobody has hit yet are one line in `classify_asset_class`, not three exceptions. Measured after the fix:
+`@vscode/vsce` reports 4,636,409 B raw / 448,379 B brotli and `ovsx` 4,783,340 B / 466,764 B, each at Medium
+confidence disclosing `keytar.node` at 707,584 B, where both previously reported nothing at all.
+
+**What is left in D6 is two resolver-side classes.** A shipped asset, and then a native addon, each used to be
+a trigger for the same symptom; neither contributes to D6 any more. What remains needs the universal
+external-boundary fix described below, at the resolver seam:
+
+1. **the unresolvable specifier** — a deep-path `require` (`jest`, `eslint-plugin-autofix`) that poisons the
+   whole build;
+2. **no importable entry** — a package that declares no `main`/`module`/`exports`/`browser` at all, confirmed
+   on `@next/font` on 2026-07-19. The daemon falls back to a literal `index.js` guess and then appends
+   extensions to it, so the user is shown a candidate list containing `index.js.js` and `index.js.mjs`, which
+   reads as a resolver malfunction when the truth is simply that the package is subpath-only. Two probes for
+   this shape already exist on the `entry_resolution` failure branch and both answer with a **labelled
+   Measured zero** (`types_only`, and `native_binary_only` for B3), but neither claims this case: a zero would
+   be wrong here, because importing such a specifier does not cost nothing, it does not resolve at all. The
+   honest answer is a labelled Unmeasured naming the reason — which is what the universal fix below already
+   prescribes ("no importable entry"). Note `native_binary_only` ships with no SRS requirement behind it; if
+   this class is taken up, charter both in the SRS at the same time.
 
 **What the user sees.** In a real `package.json`, a growing fraction of dependencies render **unavailable**,
 and not only native CLIs. The bigger the project, the more of them, which reads as "the build was too big." It
@@ -86,24 +108,25 @@ accuracy oracle) on the installed packages, every failure is fast (4 to 300 ms, 
 
 | Package | Real cause (confirmed 2026-07-16) | Class |
 | --- | --- | --- |
-| `@vscode/vsce` | imports `keytar.node` (a compiled native addon) | native leaf |
-| `ovsx` | `keytar.node` plus `@node-rs/crc32`'s `.node` | native leaf |
+| `@vscode/vsce` | imports `keytar.node` (a compiled native addon) | native leaf — **fixed 2026-07-19**, measures with the addon disclosed |
+| `ovsx` | `keytar.node` plus `@node-rs/crc32`'s `.node` | native leaf — **fixed 2026-07-19**, measures with the addon disclosed |
 | `@biomejs/biome` | no importable entry (`bin` only); real tool is a native binary. Now handled by **B3** | native binary (B3) |
 | `jest` | `jest-pnp-resolver` does `require('jest-resolve/build/defaultResolver')`, unresolvable, so `[resolve]` fails the whole build | unresolvable leaf |
 | `eslint-plugin-autofix` | does `require('eslint/lib/built-in-rules-index')` (eslint's non-exported internals), unresolvable, so `[resolve]` fails the whole build | unresolvable leaf |
-| `@next/font` | still unconfirmed (no diagnostic captured yet) | needs the daemon's stage |
+| `@next/font` | **confirmed 2026-07-19**: declares no `main`/`module`/`exports`/`browser` at all (only `types`); its real code is subpath-only (`google/`, `local/`), so the root has no importable entry and the fallback guesses `index.js`, then `index.js.js`, `index.js.mjs`, … | no importable entry |
 
 Confirmed 2026-07-16: `jest` and `eslint-plugin-autofix` are not "pure JS that should measure and does not."
 Each fails because one transitive `require` targets a deep internal subpath of another package that the
 resolver cannot resolve, which is the "one leaf poisons the whole build" case below, not a hidden measurement
 bug. `@biomejs/biome` is native-binary-backed and moves to the B3 blocker.
 
-**The universal defect: one leaf poisons the whole number.** A single unbundleable edge (a `.node` addon, a
-dynamic `require`, an unresolvable specifier) anywhere in the graph fails the ENTIRE package build, so a 2 MB
-JS graph with one native leaf reports nothing instead of "at least 2 MB, excluding a native addon." Import
-Lens ALREADY does the right thing for one class: it externalizes an unresolvable bare import (`tsdown` measured
-at 134.7 kB where esbuild refused on `@tsdown/css`). The gap is that this leniency does not extend to `.node`
-files or unfollowable dynamic requires.
+**The universal defect: one leaf poisons the whole number.** A single unbundleable edge (a dynamic `require`,
+an unresolvable specifier) anywhere in the graph fails the ENTIRE package build, so a 2 MB
+JS graph with one such leaf reports nothing instead of "at least 2 MB, excluding it." Import Lens ALREADY does
+the right thing for two classes: it externalizes an unresolvable bare import (`tsdown` measured at 134.7 kB
+where esbuild refused on `@tsdown/css`), and since 2026-07-19 it stubs and discloses a `.node` addon. The
+remaining gap is that this leniency does not extend to an unresolvable **deep-path** `require` or an
+unfollowable dynamic one.
 
 **The universal fix (never per-package).** At the engine/resolver boundary, treat every unbundleable leaf as
 an external boundary rather than a hard failure: measure the JS graph that did bundle as a **floor**, and
@@ -123,6 +146,38 @@ native-binary packages that used to sit here (for example `@biomejs/biome`) are 
 project's whole dependency set and buckets each "unavailable" by its actual stage (native-leaf, no-entry,
 unresolved, dynamic-require, graph-limit, timeout, parse) sizes the fix and surfaces any genuine bug. Build
 that first.
+
+### D20: A `.node` specifier that does not resolve is recorded as an unreadable asset input, not an absent one
+**Status: Deferred — ENGINE scope. Found by the adversarial review of the `.node` fix (2026-07-19)** · Proven by executed repro against the pinned Rolldown 1.1.5 · No wrong number, no wedge
+
+`ImportLensPlugin::resolve_id` treats any asset-classified specifier whose `ctx.resolve` fails as a **failed
+asset input** (`record_failed_asset_input`, `plugin.rs`), which is the right call for a file that exists but
+could not be read and the wrong one for a file that was never there. The CSS path already draws that
+distinction — `asset_budget.rs`'s `record_failed_path(missing)` selects `absent_file_fingerprint` — and the
+plugin has no equivalent. Admitting `.node` to the classifier (2026-07-19) did not create this mechanism; it
+gave it a **high-frequency trigger**, which is why it is recorded now and was not before.
+
+**What actually happens, on two paths.** napi-rs generates roughly twenty platform-relative requires per
+package (`./crc32.win32-x64-msvc.node`, `./crc32.darwin-arm64.node`, …) inside `try`/`catch`, and ships at
+most one of them; Rolldown issues `resolveId` for every one regardless of the `createRequire` reassignment and
+the `catch`. So on the **success** path a perfectly good build (`@node-rs/crc32` measured, chunk intact) now
+carries ~20 recorded failures, which emits the `asset_io` diagnostic — "supported asset input(s) could not be
+read during this analysis; retry after the filesystem settles" — on a successful analysis where nothing needs
+retrying, and stamps `unverifiable_asset_fingerprints` (len/mtime `u64::MAX`) into the artifact, so
+`fingerprints_are_reusable` is false and every cache refuses the result **permanently**: a full rebuild per
+request for the whole napi-rs family. On the **failure** path, a statically imported `.node` that genuinely
+does not exist (un-run `node-gyp`, absent platform binary) used to fail `UNRESOLVED_IMPORT` → `resolve`, which
+is in `DURABLE_RESULT_STAGES` and cached once; it now short-circuits to `asset_io`, which is deliberately not
+durable, so a permanent failure is re-derived on every request under a message calling it transient.
+
+**Why it is not fixed here.** Neither path shows a wrong number — the five sizes stay correct on the success
+path and there is no number at all on the failure path — and neither can wedge or lose data. It is a false
+transient message plus lost cacheability, which is exactly the "everything else" the fix-now bar defers.
+
+**The fix, when it is taken.** Split absent from unreadable at the plugin's resolve boundary the way the CSS
+path already does, and reuse `absent_file_fingerprint` rather than inventing a second ledger — an absent
+optional platform binary is a deterministic, cacheable fact about the package, not a filesystem hiccup. Do it
+at the boundary so it covers every asset kind at once; do not special-case napi-rs or `.node`.
 
 ### D7: A stylesheet its own package declares droppable is counted anyway
 **Status: Accepted** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the B2 adversarial review

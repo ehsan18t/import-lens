@@ -1,6 +1,6 @@
 import type { ImportAnalysisInsight } from "../analysis/state.js";
 import type { ImportLensConfig } from "../config.js";
-import type { AssetKind, ImportResult, ImportRuntime } from "../ipc/protocol.js";
+import type { ImportResult, ImportRuntime } from "../ipc/protocol.js";
 import { confidenceVisualFor } from "./confidenceVisuals.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import {

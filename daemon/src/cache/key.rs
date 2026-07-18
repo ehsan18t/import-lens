@@ -129,9 +129,16 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// served beside newly measured ones, making two packages incomparable for the reason least visible
 /// to the user. Measured: q4 reads 16.0% high against a CDN at q11, q9 reads 7.5% high, and the cost
 /// is +33 ms per artifact against q11 own +928 ms.
+/// `rolldown-1.1.x+13` (2026-07-19): a compiled native addon (`.node`) is classified and stubbed
+/// like any other shipped-but-unmeasured file, so a package whose graph reaches one now measures
+/// its JavaScript and discloses the addon instead of failing outright. A `+12` entry for such a
+/// package is a cached DURABLE `resolve` failure — rolldown's own loader answered
+/// `UNLOADABLE_DEPENDENCY` because the addon's bytes are not UTF-8 — and would keep being served as
+/// "unavailable" for a package that now has a number. `@vscode/vsce` and `ovsx` are the packages
+/// this was observed on; the rule is the extension, not the package.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+12"
+        "rolldown-1.1.x+13"
     };
 }
 

@@ -2904,6 +2904,88 @@ fn analyze_measures_a_package_that_directly_imports_an_image() {
     );
 }
 
+/// **One compiled addon used to cost the whole package its number.**
+///
+/// A `.node` file is a native addon Node loads through `process.dlopen`; its bytes are not UTF-8,
+/// so Rolldown's own loader answered `UNLOADABLE_DEPENDENCY` and the entire build died. That is
+/// what `@vscode/vsce` and `ovsx` reported "unavailable" for — one `keytar.node` behind a graph of
+/// perfectly measurable JavaScript. The addon is now stubbed like any other shipped-but-unmeasured
+/// file: the JS measures, and the addon's bytes are disclosed rather than folded in (it is
+/// dlopen'd from disk, not carried in the bundle, so counting it would overstate the import).
+///
+/// The fixture mirrors the real shape — a nested module reaching a `.node` by deep relative
+/// path — because that, not a top-level import, is how every native package spells it.
+#[test]
+fn analyze_measures_a_package_whose_graph_reaches_a_native_addon() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "native-lib",
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+        "import { open } from './lib/binding.js';\nexport const unlock = () => open();\n",
+    );
+    write_package_file(
+        &workspace,
+        "native-lib",
+        "lib/binding.js",
+        "import addon from '../build/Release/addon.node';\nexport const open = () => addon;\n",
+    );
+    // ELF magic then filler: a real addon is not UTF-8, which is the whole reason it used to be fatal.
+    let addon_dir = workspace
+        .join("node_modules")
+        .join("native-lib")
+        .join("build")
+        .join("Release");
+    fs::create_dir_all(&addon_dir).expect("addon directory should be created");
+    fs::write(
+        addon_dir.join("addon.node"),
+        vec![0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]
+            .into_iter()
+            .chain(std::iter::repeat_n(0xff, 24_568))
+            .collect::<Vec<u8>>(),
+    )
+    .expect("native addon fixture should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "native-lib",
+            "native-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["unlock"],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(
+        result.error, None,
+        "a native addon must not take the package's JavaScript with it: {result:?}"
+    );
+    assert!(
+        common::measured_sizes(&result).raw_bytes > 0,
+        "the JavaScript graph must still be measured: {result:?}"
+    );
+    let disclosure = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
+        .expect("a shipped native addon the size omits must be disclosed");
+    assert!(
+        disclosure.message.contains("addon.node"),
+        "the disclosure must name the addon: {disclosure:?}"
+    );
+    assert_ne!(
+        result.confidence,
+        ConfidenceLevel::High,
+        "a size that omits a shipped addon cannot claim High confidence: {result:?}"
+    );
+}
+
 /// The headline claims to be the import's full cost. An image is outside the counted taxonomy, and
 /// the closed `AssetKind` set used to drop it through a bare `None`: out of the number, out of every
 /// disclosure, still High confidence — a package advertising a total it was short by. Disclosing it
