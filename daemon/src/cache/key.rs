@@ -138,7 +138,7 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// this was observed on; the rule is the extension, not the package.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+13"
+        "rolldown-1.2.x+14"
     };
 }
 

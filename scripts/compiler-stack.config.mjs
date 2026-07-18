@@ -1,7 +1,7 @@
 export const compilerStackConfig = {
-  currentRolldownVersion: "1.1.5",
-  currentOxcVersion: "0.139.0",
-  currentResolverVersion: "11.23.0",
+  currentRolldownVersion: "1.2.0",
+  currentOxcVersion: "0.140.0",
+  currentResolverVersion: "11.24.2",
   // The glob matcher Rolldown itself reads `sideEffects` with
   // (`rolldown_common`, `rolldown_utils`, and oxc_resolver). The daemon matches
   // the entry against the declared patterns to decide the Side-Effectful badge,
