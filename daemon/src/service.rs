@@ -170,6 +170,7 @@ const SLOW_CACHE_LOOKUP_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 struct ComputedAnalysis {
     result: ImportResult,
     dependency_fingerprints: Vec<FileFingerprint>,
+    dependencies_are_reusable: bool,
 }
 
 /// F1 trailing-re-check decision for the background SWR revalidation. After a
@@ -2729,14 +2730,20 @@ impl ImportLensService {
                 } else {
                     Vec::new()
                 };
+                let dependencies_are_reusable =
+                    crate::cache::key::fingerprints_are_reusable(&dependency_fingerprints);
 
                 ComputedAnalysis {
                     result,
                     dependency_fingerprints,
+                    dependencies_are_reusable,
                 }
             });
 
-        if should_cache_result(&computed.result) && should_store() {
+        if should_cache_result(&computed.result)
+            && computed.dependencies_are_reusable
+            && should_store()
+        {
             cache.insert_with_fingerprints_at_generation(
                 key,
                 computed.result.clone(),
@@ -3104,7 +3111,7 @@ fn dependency_fingerprints(
     resolved: &ResolvedPackage,
     source: Option<&crate::pipeline::analyze::FingerprintSource>,
 ) -> Vec<crate::cache::key::FileFingerprint> {
-    use crate::cache::key::file_fingerprint_reading_hash;
+    use crate::cache::key::{file_fingerprint_reading_hash, sort_and_dedup_fingerprints};
     use crate::pipeline::analyze::FingerprintSource;
 
     let mut fingerprints = match source {
@@ -3137,8 +3144,7 @@ fn dependency_fingerprints(
 
     // Two ids can canonicalize to the same real path (a symlinked workspace dep), so
     // dedup is load-bearing, not cosmetic.
-    fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
-    fingerprints.dedup_by(|left, right| left.path == right.path);
+    sort_and_dedup_fingerprints(&mut fingerprints);
     fingerprints
 }
 /// Lives here rather than in `ipc::server` because the streaming document handler builds one
@@ -3492,6 +3498,7 @@ mod analyze_and_cache_single_flight_tests {
                     ComputedAnalysis {
                         result: cacheable_result("pkg-flight"),
                         dependency_fingerprints: Vec::new(),
+                        dependencies_are_reusable: true,
                     }
                 })
         });

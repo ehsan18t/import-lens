@@ -16,7 +16,6 @@ use crate::{
     },
 };
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -513,43 +512,24 @@ pub(crate) fn analyze_with_rolldown_engine(
         })
         .collect();
 
-    // §8.3: freshness comes from the fingerprints the plugin captured as it read each
-    // module, so they describe the exact bytes this size was measured from. Two kinds
-    // of input have no read-time capture and must still be hashed: the package
-    // manifest, which drives resolution and side-effect classification but is not a
-    // graph module, and any binary module the plugin handed back to Rolldown. Hashing
-    // those after the build does not reopen the staleness window the read-time capture
-    // closes — a manifest is an input to resolution, not a source of measured bytes.
+    // §8.3: freshness comes from fingerprints captured by the same reads that supplied every
+    // measured byte. The plugin owns JavaScript and directly imported asset snapshots; the asset
+    // processor owns CSS `@import` children and local resources discovered through `url()`.
     let mut stat_paths = artifact.unhashed_paths;
     stat_paths.push(package_root.join("package.json"));
     stat_paths.extend(first_party_manifests(context, &artifact.loaded_paths));
-    // A stylesheet's `@import` children are real inputs to the measured size, but they were never
-    // graph modules — Rolldown never saw them, Lightning CSS resolved them after the build — so
-    // nothing has fingerprinted them and an edit to one would not invalidate the size it fed. The
-    // entry itself is already captured at read time by the plugin, so it is filtered out here
-    // rather than being re-hashed post-build, which would widen the window the read-time capture
-    // exists to close.
-    // Compare the SAME spelling on both sides: `FileFingerprint.path` is forward-slashed
-    // (`cache::key` normalizes it), while a captured read path is a raw canonical `PathBuf`
-    // (`\\?\C:\…` on Windows). Comparing them as-is never matches, so the filter silently did
-    // nothing and every stylesheet was re-hashed after the build anyway.
-    let fingerprinted: HashSet<String> = artifact
-        .read_time_fingerprints
-        .iter()
-        .map(|fingerprint| fingerprint.path.clone())
-        .collect();
-    stat_paths.extend(
-        assets
-            .read_paths
-            .iter()
-            .filter(|path| !fingerprinted.contains(&path.to_string_lossy().replace('\\', "/")))
-            .cloned(),
-    );
+
+    let mut fingerprints = artifact.read_time_fingerprints.clone();
+    fingerprints.extend(assets.freshness_fingerprints());
+    crate::cache::key::sort_and_dedup_fingerprints(&mut fingerprints);
     let freshness = FingerprintSource::ReadTime {
-        fingerprints: artifact.read_time_fingerprints.clone(),
+        fingerprints,
         stat_paths,
     };
-    let loaded_paths = artifact.loaded_paths;
+    let mut loaded_paths = artifact.loaded_paths;
+    loaded_paths.extend(assets.read_paths.iter().cloned());
+    loaded_paths.sort();
+    loaded_paths.dedup();
 
     let mut result = ImportResult::measured(
         request.specifier.clone(),

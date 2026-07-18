@@ -1653,6 +1653,89 @@ fn file_size_document_force_fresh_bypasses_serve_stale() {
 }
 
 #[test]
+fn force_fresh_file_cost_tracks_css_children_and_local_assets_immediately() {
+    let _shared = SHARED_INDEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    shared_file_size_cache().clear();
+
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("font-cost-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "import './styles.css';\nexport const value = 1;\n",
+    )
+    .expect("entry should be written");
+    fs::write(
+        package_root.join("styles.css"),
+        "@import './child.css';\n.entry { color: blue; }\n",
+    )
+    .expect("stylesheet should be written");
+    fs::write(
+        package_root.join("child.css"),
+        "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n\
+         .child { color: red; font-family: Probe; }\n",
+    )
+    .expect("child stylesheet should be written");
+    fs::write(package_root.join("probe.woff2"), vec![0x21; 1024]).expect("font should be written");
+
+    let service = ImportLensService::new(None, false);
+    let source = "import { value } from 'font-cost-lib';";
+    let first =
+        service.handle_file_size_document(file_size_document_request(&workspace, 501, source));
+    let first_font = first.imports[0]
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == import_lens_daemon::engine::AssetKind::Font)
+        .expect("the initial font should be counted");
+    assert_eq!(first_font.raw_bytes, 1024, "{first:?}");
+
+    // Only the successfully bundled child changes. It is not a Rolldown graph module, so this
+    // specifically guards the exact CSS-provider observations used by the File Cost L1 cache.
+    fs::write(
+        package_root.join("child.css"),
+        "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n\
+         .child { color: rebeccapurple; font-family: Probe; padding: 12345px; margin: 67890px; }\n",
+    )
+    .expect("child stylesheet should be updated");
+    let after_child =
+        service.handle_file_size_document(file_size_document_request(&workspace, 502, source));
+    assert!(
+        after_child.raw_bytes > first.raw_bytes,
+        "File Cost must immediately include a successful child stylesheet edit: first={first:?}, after_child={after_child:?}"
+    );
+
+    fs::write(package_root.join("probe.woff2"), vec![0x43; 5 * 1024])
+        .expect("font should be updated");
+    let after_font =
+        service.handle_file_size_document(file_size_document_request(&workspace, 503, source));
+    let after_font_contribution = after_font.imports[0]
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == import_lens_daemon::engine::AssetKind::Font)
+        .expect("the refreshed font should be counted");
+
+    shared_file_size_cache().clear();
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(
+        after_font_contribution.raw_bytes,
+        5 * 1024,
+        "force-fresh import analysis must see the edited font: {after_font:?}"
+    );
+    assert_eq!(
+        after_font.raw_bytes.checked_sub(after_child.raw_bytes),
+        Some(4 * 1024),
+        "File Cost must not serve its old L1 value after the asset changed: after_child={after_child:?}, after_font={after_font:?}"
+    );
+}
+
+#[test]
 fn file_size_document_force_fresh_recomputes_on_unknown_dependency() {
     // §4.5 / Finding 13b: the force-fresh (CI / `importlens check`) path serves cache
     // via the evicting `get`, which on `Freshness::Unknown` (a transient stat/read
@@ -3327,5 +3410,126 @@ fn a_cached_deterministic_failure_expires_when_the_module_that_caused_it_is_fixe
     assert!(
         fixed.imports[0].sizes().is_some(),
         "the cached failure must expire against the module that caused it, not the entry: {fixed:?}",
+    );
+}
+
+/// A failed CSS `@import` child is an input to the cached fallback just as surely as a parsed
+/// JavaScript dependency is an input to a cached engine failure. Losing the provider's observations
+/// on `Err` leaves the child outside freshness, so fixing only that file keeps serving the old
+/// `uncounted_assets` result.
+#[test]
+fn fixing_only_a_broken_css_import_child_invalidates_the_cached_fallback() {
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("broken-css-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "import './styles.css';\nexport const value = 1;\n",
+    )
+    .expect("entry should be written");
+    fs::write(
+        package_root.join("styles.css"),
+        "@import './broken.css';\n.entry { color: blue; }\n",
+    )
+    .expect("stylesheet should be written");
+    fs::write(
+        package_root.join("broken.css"),
+        "$brand: red;\n@mixin thing { color: $brand }\n.bad { @include thing }\n",
+    )
+    .expect("broken child should be written");
+
+    let service = ImportLensService::new(None, false);
+    let broken = service.handle_batch(package_batch(&workspace, 1, "broken-css-lib", "value"));
+    assert!(
+        broken.imports[0].asset_breakdown.is_empty(),
+        "the premise: the broken stylesheet cannot be counted: {broken:?}"
+    );
+    assert!(
+        broken.imports[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "the fallback must be disclosed: {broken:?}"
+    );
+
+    // Only the imported child changes; the JavaScript entry and top-level stylesheet stay put.
+    fs::write(
+        package_root.join("broken.css"),
+        ".fixed { color: rebeccapurple; padding: 12345px; }\n",
+    )
+    .expect("child should be fixed");
+    let fixed = service.handle_batch(package_batch(&workspace, 2, "broken-css-lib", "value"));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(
+        fixed.imports[0]
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == import_lens_daemon::engine::AssetKind::Css),
+        "fixing the child must invalidate the cached fallback and count CSS: {fixed:?}"
+    );
+    assert!(
+        !fixed.imports[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "the stale fallback disclosure must disappear after the fix: {fixed:?}"
+    );
+}
+
+#[test]
+fn creating_a_missing_css_import_child_invalidates_the_cached_fallback() {
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("missing-css-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "import './styles.css';\nexport const value = 1;\n",
+    )
+    .expect("entry should be written");
+    fs::write(
+        package_root.join("styles.css"),
+        "@import './created-later.css';\n.entry { color: blue; }\n",
+    )
+    .expect("stylesheet should be written");
+
+    let service = ImportLensService::new(None, false);
+    let missing = service.handle_batch(package_batch(&workspace, 1, "missing-css-lib", "value"));
+    assert!(
+        missing.imports[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "the missing child must produce the disclosed CSS fallback: {missing:?}"
+    );
+
+    fs::write(
+        package_root.join("created-later.css"),
+        ".created { color: green; padding: 9876px; }\n",
+    )
+    .expect("missing child should be created");
+    let created = service.handle_batch(package_batch(&workspace, 2, "missing-css-lib", "value"));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(
+        created.imports[0]
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == import_lens_daemon::engine::AssetKind::Css),
+        "creating the previously missing child must force a fresh CSS measurement: {created:?}"
+    );
+    assert!(
+        !created.imports[0].cache_hit,
+        "an unreadable input must never make its fallback look fresh: {created:?}"
     );
 }

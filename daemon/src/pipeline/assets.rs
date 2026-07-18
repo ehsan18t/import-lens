@@ -20,7 +20,13 @@
 //! bytes, which is exactly today's behaviour: never below it
 //! ([ADR-0006](../../../docs/adr/0006-the-result-model.md)).
 
-use crate::engine::{AssetKind, CollectedAsset, UncountedAsset, diagnostic_stage};
+use crate::cache::key::{
+    FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
+    sort_and_dedup_fingerprints,
+};
+use crate::engine::{
+    AssetKind, CollectedAsset, UncountedAsset, diagnostic_stage, read_collected_asset,
+};
 use crate::ipc::protocol::{AssetContribution, ImportDiagnostic, MeasuredSizes};
 use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
 use crate::pipeline::css_dependencies::collect_referenced_assets;
@@ -69,28 +75,47 @@ struct ReadBudget {
 /// `Send + Sync`; its state is behind `Mutex`, never a `RefCell`.
 struct TrackingProvider {
     inner: FileProvider,
+    /// Top-level stylesheets already captured by the engine. Serving these bytes makes a
+    /// `BundleArtifact` immutable: processing never reopens an entry behind its fingerprint.
+    preloaded: BTreeMap<PathBuf, CollectedAsset>,
     /// A virtual entry that `@import`s each reachable stylesheet by absolute path, so N stylesheets
     /// bundle into ONE artifact. `None` when there is a single real entry to bundle directly.
     synthetic: Option<(PathBuf, String)>,
     read_paths: Mutex<HashSet<PathBuf>>,
+    read_time_fingerprints: Mutex<Vec<FileFingerprint>>,
+    failed_paths: Mutex<HashSet<PathBuf>>,
     budget: Mutex<ReadBudget>,
 }
 
 impl TrackingProvider {
-    fn new() -> Self {
+    fn new(entries: &[CollectedAsset]) -> Self {
         Self {
             inner: FileProvider::new(),
+            preloaded: entries
+                .iter()
+                .cloned()
+                .map(|asset| (asset.path.clone(), asset))
+                .collect(),
             synthetic: None,
             read_paths: Mutex::new(HashSet::new()),
+            read_time_fingerprints: Mutex::new(Vec::new()),
+            failed_paths: Mutex::new(HashSet::new()),
             budget: Mutex::new(ReadBudget::default()),
         }
     }
 
-    fn with_synthetic(path: PathBuf, content: String) -> Self {
+    fn with_synthetic(entries: &[CollectedAsset], path: PathBuf, content: String) -> Self {
         Self {
             inner: FileProvider::new(),
+            preloaded: entries
+                .iter()
+                .cloned()
+                .map(|asset| (asset.path.clone(), asset))
+                .collect(),
             synthetic: Some((path, content)),
             read_paths: Mutex::new(HashSet::new()),
+            read_time_fingerprints: Mutex::new(Vec::new()),
+            failed_paths: Mutex::new(HashSet::new()),
             budget: Mutex::new(ReadBudget::default()),
         }
     }
@@ -115,7 +140,7 @@ impl TrackingProvider {
 
     /// The set of real files Lightning CSS read — the entries plus every resolved `@import` child.
     /// Consumed after bundling is done (the provider must outlive the `StyleSheet`).
-    fn into_read_paths(self) -> Vec<PathBuf> {
+    fn into_read_inputs(self) -> CssReadInputs {
         let mut paths: Vec<PathBuf> = self
             .read_paths
             .into_inner()
@@ -123,7 +148,43 @@ impl TrackingProvider {
             .into_iter()
             .collect();
         paths.sort();
-        paths
+        let mut fingerprints = self
+            .read_time_fingerprints
+            .into_inner()
+            .expect("CSS read-time fingerprint list should not be poisoned");
+        sort_and_dedup_fingerprints(&mut fingerprints);
+        let mut failed_paths = self
+            .failed_paths
+            .into_inner()
+            .expect("CSS failed-path set should not be poisoned")
+            .into_iter()
+            .collect::<Vec<_>>();
+        failed_paths.sort();
+        CssReadInputs {
+            paths,
+            fingerprints,
+            failed_paths,
+        }
+    }
+
+    fn record_read(&self, path: PathBuf, fingerprint: Option<FileFingerprint>) {
+        self.read_paths
+            .lock()
+            .expect("CSS read-path set should not be poisoned")
+            .insert(path);
+        if let Some(fingerprint) = fingerprint {
+            self.read_time_fingerprints
+                .lock()
+                .expect("CSS read-time fingerprint list should not be poisoned")
+                .push(fingerprint);
+        }
+    }
+
+    fn record_failed_read(&self, path: PathBuf) {
+        self.failed_paths
+            .lock()
+            .expect("CSS failed-path set should not be poisoned")
+            .insert(path);
     }
 }
 
@@ -141,12 +202,52 @@ impl SourceProvider for TrackingProvider {
 
         // Canonicalize so a cache key is stable across `..` / symlink spellings of the same file.
         let key = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-        let source = self.inner.read(file)?;
+        // Record the ATTEMPT before any fallible operation. A missing/broken child is part of why
+        // processing fell back and must not disappear from freshness merely because it had no
+        // bytes to hash.
+        self.record_read(key.clone(), None);
+        let source = match self.preloaded.get(&key) {
+            Some(asset) => {
+                self.record_read(key.clone(), Some(asset.fingerprint.clone()));
+                std::str::from_utf8(asset.bytes()).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("stylesheet {} is not UTF-8: {error}", key.display()),
+                    )
+                })?
+            }
+            None => {
+                // Stat BEFORE reading. If the file changes during the read, this pre-read metadata
+                // can only cause a conservative hash check later; post-read metadata could match
+                // the replacement and falsely bless old bytes forever.
+                let metadata = match std::fs::metadata(&key) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        self.record_failed_read(key);
+                        return Err(error);
+                    }
+                };
+                let source = match self.inner.read(&key) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.record_failed_read(key);
+                        return Err(error);
+                    }
+                };
+                let (len, modified_millis) = read_time_len_mtime_of(&metadata);
+                self.record_read(
+                    key.clone(),
+                    Some(file_fingerprint_from_read_time(
+                        &key,
+                        len,
+                        modified_millis,
+                        content_hash(source.as_bytes()),
+                    )),
+                );
+                source
+            }
+        };
         self.charge(source.len())?;
-        self.read_paths
-            .lock()
-            .expect("css read-path set should not be poisoned")
-            .insert(key);
         Ok(source)
     }
 
@@ -205,9 +306,13 @@ pub struct CssBundle {
     /// The `@import`-inlined, minified stylesheet: what actually ships, and what gets compressed.
     pub minified_bytes: Vec<u8>,
     pub read_paths: Vec<PathBuf>,
+    pub read_time_fingerprints: Vec<FileFingerprint>,
+    failed_paths: Vec<PathBuf>,
     /// Supported local artifacts referenced by the CSS that survives minification. They are
     /// separate emitted files, so the caller processes and compresses them independently.
     pub referenced_assets: Vec<CollectedAsset>,
+    /// Local supported resources that survived CSS minification but could not be read.
+    pub(crate) referenced_failures: Vec<crate::pipeline::css_dependencies::CssDependencyFailure>,
     /// Dependency analysis is metadata-only and must never discard an otherwise valid CSS size.
     /// When it cannot inspect every URL (for example an ambiguous relative URL in a custom
     /// property), the caller keeps the CSS contribution and discloses that referenced assets may
@@ -215,15 +320,50 @@ pub struct CssBundle {
     pub dependency_failures: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct CssReadInputs {
+    paths: Vec<PathBuf>,
+    fingerprints: Vec<FileFingerprint>,
+    failed_paths: Vec<PathBuf>,
+}
+
+impl CssReadInputs {
+    fn extend(&mut self, other: Self) {
+        self.paths.extend(other.paths);
+        self.fingerprints.extend(other.fingerprints);
+        self.failed_paths.extend(other.failed_paths);
+    }
+}
+
+#[derive(Debug)]
+struct CssProcessingError {
+    message: String,
+    inputs: CssReadInputs,
+}
+
 /// Bundle one stylesheet the way it ships: resolve its `@import` tree from disk into one
 /// stylesheet, minify with deterministic (target-free) output, and print. Returns the bytes and the
 /// set of files read. Any failure is an `Err`; the caller falls back to raw-byte disclosure so the
 /// result never drops below today's behavior.
 pub fn bundle_css(entry: &Path) -> Result<CssBundle, String> {
-    let provider = TrackingProvider::new();
-    let mut bundle = bundle_with(&provider, entry)?;
-    bundle.read_paths = provider.into_read_paths();
-    Ok(bundle)
+    let asset = read_collected_asset(entry, AssetKind::Css)
+        .map_err(|error| format!("failed to read stylesheet {}: {error}", entry.display()))?;
+    bundle_collected_css(&asset).map_err(|error| error.message)
+}
+
+fn bundle_collected_css(entry: &CollectedAsset) -> Result<CssBundle, CssProcessingError> {
+    let provider = TrackingProvider::new(std::slice::from_ref(entry));
+    let result = bundle_with(&provider, &entry.path);
+    let inputs = provider.into_read_inputs();
+    match result {
+        Ok(mut bundle) => {
+            bundle.read_paths = inputs.paths;
+            bundle.read_time_fingerprints = inputs.fingerprints;
+            bundle.failed_paths = inputs.failed_paths;
+            Ok(bundle)
+        }
+        Err(message) => Err(CssProcessingError { message, inputs }),
+    }
 }
 
 /// Bundle EVERY reachable stylesheet into one artifact, which is how CSS ships and how the esbuild
@@ -231,15 +371,41 @@ pub fn bundle_css(entry: &Path) -> Result<CssBundle, String> {
 /// that `@import`s each, so Lightning CSS inlines and dedupes them into one sheet rather than us
 /// summing overlapping copies.
 pub fn bundle_css_set(entries: &[PathBuf]) -> Result<CssBundle, String> {
+    let entries = entries
+        .iter()
+        .map(|entry| {
+            read_collected_asset(entry, AssetKind::Css)
+                .map_err(|error| format!("failed to read stylesheet {}: {error}", entry.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    bundle_collected_css_set(&entries).map_err(|error| error.message)
+}
+
+fn bundle_collected_css_set(entries: &[CollectedAsset]) -> Result<CssBundle, CssProcessingError> {
     match entries {
-        [] => Err("no stylesheets to bundle".to_owned()),
-        [single] => bundle_css(single),
+        [] => Err(CssProcessingError {
+            message: "no stylesheets to bundle".to_owned(),
+            inputs: CssReadInputs::default(),
+        }),
+        [single] => bundle_collected_css(single),
         many => {
-            let (path, content) = synthetic_entry(many);
-            let provider = TrackingProvider::with_synthetic(path.clone(), content);
-            let mut bundle = bundle_with(&provider, &path)?;
-            bundle.read_paths = provider.into_read_paths();
-            Ok(bundle)
+            let paths = many
+                .iter()
+                .map(|asset| asset.path.clone())
+                .collect::<Vec<_>>();
+            let (path, content) = synthetic_entry(&paths);
+            let provider = TrackingProvider::with_synthetic(many, path.clone(), content);
+            let result = bundle_with(&provider, &path);
+            let inputs = provider.into_read_inputs();
+            match result {
+                Ok(mut bundle) => {
+                    bundle.read_paths = inputs.paths;
+                    bundle.read_time_fingerprints = inputs.fingerprints;
+                    bundle.failed_paths = inputs.failed_paths;
+                    Ok(bundle)
+                }
+                Err(message) => Err(CssProcessingError { message, inputs }),
+            }
         }
     }
 }
@@ -327,7 +493,7 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
     // measured artifact. `to_css` borrows immutably; the ordinary print below still emits the real
     // minified stylesheet. Analyze after minification so a resource removed from shipped CSS is not
     // counted.
-    let (referenced_assets, dependency_failures) = stylesheet
+    let (referenced_assets, referenced_failures, dependency_failures) = stylesheet
         .to_css(PrinterOptions {
             minify: true,
             targets: Targets::default(),
@@ -336,10 +502,15 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
         })
         .map(|result| {
             let dependencies = collect_referenced_assets(result.dependencies.unwrap_or_default());
-            (dependencies.assets, dependencies.unresolved)
+            (
+                dependencies.assets,
+                dependencies.failures,
+                dependencies.unresolved,
+            )
         })
         .unwrap_or_else(|error| {
             (
+                Vec::new(),
                 Vec::new(),
                 vec![format!(
                     "lightningcss could not inspect resource URLs in {}: {error:?}",
@@ -367,7 +538,10 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
         raw_bytes,
         minified_bytes,
         read_paths: Vec::new(),
+        read_time_fingerprints: Vec::new(),
+        failed_paths: Vec::new(),
         referenced_assets,
+        referenced_failures,
         dependency_failures,
     })
 }
@@ -381,6 +555,11 @@ pub struct ProcessedAssets {
     /// children and supported local `url()` artifacts. Without these in freshness, editing one
     /// would not invalidate the size it fed.
     pub read_paths: Vec<PathBuf>,
+    /// Fingerprints captured by the same reads that supplied every measured asset byte.
+    pub read_time_fingerprints: Vec<FileFingerprint>,
+    /// Paths whose read failed during any attempt. A later success in the same union/retry flow
+    /// does not erase the failure: that mixed observation cannot produce a reusable cache entry.
+    failed_paths: Vec<PathBuf>,
     /// Assets that could NOT be processed, disclosed with their raw bytes exactly as before.
     pub uncounted: Vec<UncountedAsset>,
     /// Why each of those fell back, for the diagnostic.
@@ -415,6 +594,36 @@ impl ProcessedAssets {
 
     pub fn is_empty(&self) -> bool {
         self.contributions.is_empty()
+    }
+
+    /// Exact asset fingerprints plus never-fresh sentinels for attempted paths that supplied no
+    /// bytes. Both Import Cost and File Cost consume this one normalization so neither can silently
+    /// drop an unreadable CSS child or resource from freshness.
+    pub fn freshness_fingerprints(&self) -> Vec<FileFingerprint> {
+        let mut fingerprints = self.read_time_fingerprints.clone();
+        let fingerprinted = fingerprints
+            .iter()
+            .map(|fingerprint| fingerprint.path.clone())
+            .collect::<HashSet<_>>();
+        let mut failed_paths = self.failed_paths.clone();
+        // Defensive inference for any future processor that records an attempted path but forgets
+        // to classify the failed read explicitly. Explicit failures remain even if another attempt
+        // later fingerprinted the same path.
+        failed_paths.extend(
+            self.read_paths
+                .iter()
+                .filter(|path| !fingerprinted.contains(&path.to_string_lossy().replace('\\', "/")))
+                .cloned(),
+        );
+        failed_paths.sort();
+        failed_paths.dedup();
+        fingerprints.extend(
+            failed_paths
+                .into_iter()
+                .map(crate::cache::key::unverifiable_file_fingerprint),
+        );
+        sort_and_dedup_fingerprints(&mut fingerprints);
+        fingerprints
     }
 }
 
@@ -528,9 +737,23 @@ pub fn process_assets(assets: &[CollectedAsset]) -> ProcessedAssets {
         .collect();
     for asset in referenced_assets {
         processed.read_paths.push(asset.path.clone());
+        // Count one emitted file per path, but retain every observation. If the same resource
+        // changed between a direct graph load and CSS dependency analysis (or between per-sheet
+        // retries), the conflicting fingerprints make this run non-reusable instead of silently
+        // blessing whichever snapshot won the byte deduplication.
+        processed
+            .read_time_fingerprints
+            .push(asset.fingerprint.clone());
         assets_by_path.entry(asset.path.clone()).or_insert(asset);
     }
     let all_assets: Vec<CollectedAsset> = assets_by_path.into_values().collect();
+
+    processed
+        .read_paths
+        .extend(all_assets.iter().map(|asset| asset.path.clone()));
+    processed
+        .read_time_fingerprints
+        .extend(all_assets.iter().map(|asset| asset.fingerprint.clone()));
 
     for kind in [AssetKind::Wasm, AssetKind::Font] {
         process_binary_kind(&all_assets, kind, &mut processed);
@@ -541,6 +764,7 @@ pub fn process_assets(assets: &[CollectedAsset]) -> ProcessedAssets {
         .sort_by_key(|contribution| contribution.kind);
     processed.read_paths.sort();
     processed.read_paths.dedup();
+    sort_and_dedup_fingerprints(&mut processed.read_time_fingerprints);
     processed
 }
 
@@ -551,6 +775,8 @@ struct StylesheetOutcome {
     /// Why individual sheets fell back, one per entry in `uncounted`.
     failures: Vec<String>,
     uncounted: Vec<UncountedAsset>,
+    /// Inputs observed by failed union/per-sheet attempts. Successful bundles carry their own.
+    observed_inputs: CssReadInputs,
     /// `Some(union error)` when the set was measured one sheet at a time.
     degraded: Option<String>,
 }
@@ -559,10 +785,10 @@ fn process_stylesheets(
     assets: &[CollectedAsset],
     processed: &mut ProcessedAssets,
 ) -> Vec<CollectedAsset> {
-    let entries: Vec<PathBuf> = assets
+    let entries: Vec<CollectedAsset> = assets
         .iter()
         .filter(|asset| asset.kind == AssetKind::Css)
-        .map(|asset| asset.path.clone())
+        .cloned()
         .collect();
     if entries.is_empty() {
         return Vec::new();
@@ -586,12 +812,13 @@ fn process_stylesheets(
     // the common outcome here, since the union's usual reason to fail is the whole set breaching a
     // budget that each sheet is well inside. That silence made this path report an over-count at
     // High confidence and cache it.
-    let bundled = bundle_css_set(&entries)
+    let bundled = bundle_collected_css_set(&entries)
         .and_then(compress_bundle)
         .map(|counted| StylesheetOutcome {
             counted: vec![counted],
             failures: Vec::new(),
             uncounted: Vec::new(),
+            observed_inputs: CssReadInputs::default(),
             degraded: None,
         })
         .or_else(|union_error| {
@@ -599,21 +826,23 @@ fn process_stylesheets(
                 return Err(union_error);
             }
 
+            let CssProcessingError {
+                message: union_message,
+                inputs: mut observed_inputs,
+            } = union_error;
             let mut counted = Vec::new();
             let mut failures = Vec::new();
             let mut uncounted = Vec::new();
 
             for entry in &entries {
-                match bundle_css(entry).and_then(compress_bundle) {
+                match bundle_collected_css(entry).and_then(compress_bundle) {
                     Ok(bundled) => counted.push(bundled),
                     Err(error) => {
-                        failures.push(error);
+                        failures.push(error.message);
+                        observed_inputs.extend(error.inputs);
                         uncounted.push(UncountedAsset {
-                            path: entry.clone(),
-                            bytes: assets
-                                .iter()
-                                .find(|asset| &asset.path == entry)
-                                .map_or(0, |asset| asset.raw_bytes),
+                            path: entry.path.clone(),
+                            bytes: entry.raw_bytes(),
                         });
                     }
                 }
@@ -622,15 +851,19 @@ fn process_stylesheets(
             // Every sheet failed, so this is simply the pre-B2 fallback: hand back the union's error
             // and let the one disclosure below cover them, exactly once each.
             if counted.is_empty() {
-                return Err(union_error);
+                return Err(CssProcessingError {
+                    message: union_message,
+                    inputs: observed_inputs,
+                });
             }
             Ok(StylesheetOutcome {
                 counted,
                 failures,
                 uncounted,
+                observed_inputs,
                 // Sheets DID count here, so `uncounted` may well be empty and the uncounted
                 // disclosure silent. This is what makes the over-count speakable.
-                degraded: Some(union_error),
+                degraded: Some(union_message),
             })
         });
 
@@ -640,8 +873,14 @@ fn process_stylesheets(
             counted,
             failures,
             uncounted,
+            observed_inputs,
             degraded,
         }) => {
+            processed.read_paths.extend(observed_inputs.paths);
+            processed
+                .read_time_fingerprints
+                .extend(observed_inputs.fingerprints);
+            processed.failed_paths.extend(observed_inputs.failed_paths);
             processed.failures.extend(failures);
             processed.uncounted.extend(uncounted);
             processed.stylesheets_measured_separately = degraded;
@@ -662,22 +901,40 @@ fn process_stylesheets(
                 css.brotli_bytes += compressed.brotli_bytes;
                 css.zstd_bytes += compressed.zstd_bytes;
                 processed.read_paths.extend(bundle.read_paths);
+                processed
+                    .read_time_fingerprints
+                    .extend(bundle.read_time_fingerprints);
+                processed.failed_paths.extend(bundle.failed_paths);
                 referenced_assets.extend(bundle.referenced_assets);
+                for failure in bundle.referenced_failures {
+                    processed.read_paths.push(failure.path.clone());
+                    processed.failed_paths.push(failure.path.clone());
+                    processed.failures.push(failure.message);
+                    processed.uncounted.push(UncountedAsset {
+                        path: failure.path,
+                        bytes: failure.raw_bytes,
+                    });
+                }
                 processed
                     .css_dependency_failures
                     .extend(bundle.dependency_failures);
             }
             processed.contributions.push(css);
         }
-        Err(message) => {
-            processed.failures.push(message);
+        Err(error) => {
+            processed.read_paths.extend(error.inputs.paths);
+            processed
+                .read_time_fingerprints
+                .extend(error.inputs.fingerprints);
+            processed.failed_paths.extend(error.inputs.failed_paths);
+            processed.failures.push(error.message);
             processed.uncounted.extend(
                 assets
                     .iter()
                     .filter(|asset| asset.kind == AssetKind::Css)
                     .map(|asset| UncountedAsset {
                         path: asset.path.clone(),
-                        bytes: asset.raw_bytes,
+                        bytes: asset.raw_bytes(),
                     }),
             );
         }
@@ -688,10 +945,29 @@ fn process_stylesheets(
 
 /// Compress a bundled stylesheet as its own artifact — never concatenated with anything else first,
 /// because it ships as its own file (ADR-0005).
-fn compress_bundle(bundle: CssBundle) -> Result<(CssBundle, CompressionSizes), String> {
-    compress_all_bytes(&bundle.minified_bytes)
-        .map_err(|error| format!("failed to compress the bundled stylesheet: {error}"))
-        .map(|compressed| (bundle, compressed))
+fn compress_bundle(bundle: CssBundle) -> Result<(CssBundle, CompressionSizes), CssProcessingError> {
+    match compress_all_bytes(&bundle.minified_bytes) {
+        Ok(compressed) => Ok((bundle, compressed)),
+        Err(error) => {
+            let mut inputs = CssReadInputs {
+                paths: bundle.read_paths,
+                fingerprints: bundle.read_time_fingerprints,
+                failed_paths: bundle.failed_paths,
+            };
+            for asset in bundle.referenced_assets {
+                inputs.paths.push(asset.path.clone());
+                inputs.fingerprints.push(asset.fingerprint);
+            }
+            for failure in bundle.referenced_failures {
+                inputs.paths.push(failure.path.clone());
+                inputs.failed_paths.push(failure.path);
+            }
+            Err(CssProcessingError {
+                message: format!("failed to compress the bundled stylesheet: {error}"),
+                inputs,
+            })
+        }
+    }
 }
 
 fn process_binary_kind(
@@ -703,15 +979,9 @@ fn process_binary_kind(
     let mut counted = false;
 
     for asset in assets.iter().filter(|asset| asset.kind == kind) {
-        let measured = std::fs::read(&asset.path)
-            .map_err(|error| format!("failed to read {}: {error}", asset.path.display()))
-            .and_then(|bytes| {
-                compress_all_bytes(&bytes)
-                    .map_err(|error| {
-                        format!("failed to compress {}: {error}", asset.path.display())
-                    })
-                    .map(|compressed| (bytes.len() as u64, compressed))
-            });
+        let measured = compress_all_bytes(asset.bytes())
+            .map_err(|error| format!("failed to compress {}: {error}", asset.path.display()))
+            .map(|compressed| (asset.raw_bytes(), compressed));
 
         match measured {
             Ok((length, compressed)) => {
@@ -727,7 +997,7 @@ fn process_binary_kind(
                 processed.failures.push(message);
                 processed.uncounted.push(UncountedAsset {
                     path: asset.path.clone(),
-                    bytes: asset.raw_bytes,
+                    bytes: asset.raw_bytes(),
                 });
             }
         }
@@ -763,11 +1033,7 @@ mod tests {
     }
 
     fn css_asset(path: &Path) -> CollectedAsset {
-        CollectedAsset {
-            path: path.to_path_buf(),
-            kind: AssetKind::Css,
-            raw_bytes: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
-        }
+        read_collected_asset(path, AssetKind::Css).expect("stylesheet snapshot")
     }
 
     #[test]
@@ -828,7 +1094,7 @@ mod tests {
         .expect("entry");
         fs::write(&font, [0x5a; 32]).expect("font");
 
-        let expected_font = fs::canonicalize(&font).unwrap_or_else(|_| font.clone());
+        let expected_font = read_collected_asset(&font, AssetKind::Font).expect("font snapshot");
         let bundle = bundle_css(&entry).expect("a valid stylesheet should bundle");
         fs::remove_dir_all(&dir).ok();
 
@@ -837,14 +1103,7 @@ mod tests {
             css.contains("probe.woff2"),
             "dependency-analysis placeholders must never enter the measured artifact: {css}"
         );
-        assert_eq!(
-            bundle.referenced_assets,
-            vec![CollectedAsset {
-                path: expected_font,
-                kind: AssetKind::Font,
-                raw_bytes: 32,
-            }]
-        );
+        assert_eq!(bundle.referenced_assets, vec![expected_font]);
         assert!(bundle.dependency_failures.is_empty());
     }
 
@@ -1002,18 +1261,8 @@ mod tests {
             "$brand: red;\n@mixin thing { color: $brand }\n.bad { @include thing }\n",
         )
         .expect("bad");
-        let assets = vec![
-            CollectedAsset {
-                path: good.clone(),
-                kind: AssetKind::Css,
-                raw_bytes: fs::metadata(&good).map(|meta| meta.len()).unwrap_or(0),
-            },
-            CollectedAsset {
-                path: bad.clone(),
-                kind: AssetKind::Css,
-                raw_bytes: fs::metadata(&bad).map(|meta| meta.len()).unwrap_or(0),
-            },
-        ];
+        let assets = vec![css_asset(&good), css_asset(&bad)];
+        let expected_bad = assets[1].path.clone();
 
         let processed = process_assets(&assets);
         fs::remove_dir_all(&dir).ok();
@@ -1030,7 +1279,7 @@ mod tests {
                 .iter()
                 .map(|asset| &asset.path)
                 .collect::<Vec<_>>(),
-            vec![&bad],
+            vec![&expected_bad],
             "only the offender falls back to disclosure: {processed:?}",
         );
     }
@@ -1057,12 +1306,12 @@ mod tests {
         .expect("two");
         let assets: Vec<CollectedAsset> = [&first, &second]
             .iter()
-            .map(|path| CollectedAsset {
-                path: (*path).clone(),
-                kind: AssetKind::Css,
-                raw_bytes: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
-            })
+            .map(|path| css_asset(path))
             .collect();
+        let expected_paths = assets
+            .iter()
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>();
 
         let processed = process_assets(&assets);
         fs::remove_dir_all(&dir).ok();
@@ -1082,7 +1331,11 @@ mod tests {
             .map(|asset| &asset.path)
             .collect();
         disclosed.sort();
-        assert_eq!(disclosed, vec![&first, &second], "{processed:?}");
+        assert_eq!(
+            disclosed,
+            expected_paths.iter().collect::<Vec<_>>(),
+            "{processed:?}"
+        );
     }
 
     /// The union can fail for a reason NO individual sheet fails for — it is the only thing charged
@@ -1118,14 +1371,7 @@ mod tests {
             })
             .collect();
 
-        let assets: Vec<CollectedAsset> = entries
-            .iter()
-            .map(|path| CollectedAsset {
-                path: path.clone(),
-                kind: AssetKind::Css,
-                raw_bytes: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
-            })
-            .collect();
+        let assets: Vec<CollectedAsset> = entries.iter().map(|path| css_asset(path)).collect();
 
         // Guard the premise: if this ever stops being the shape under test, the assertions below
         // would pass for the wrong reason.
@@ -1193,6 +1439,40 @@ mod tests {
         assert!(
             result.is_err(),
             "a dangling @import must be an Err: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_css_read_remains_unverifiable_after_a_later_success() {
+        let dir = temp_dir("failed-then-readable");
+        let child = dir.join("created.css");
+        let provider = TrackingProvider::new(&[]);
+
+        assert!(provider.read(&child).is_err(), "the first read is missing");
+        fs::write(&child, ".created { color: red }").expect("create child");
+        assert!(provider.read(&child).is_ok(), "the retry can read it");
+
+        let inputs = provider.into_read_inputs();
+        let processed = ProcessedAssets {
+            read_paths: inputs.paths,
+            read_time_fingerprints: inputs.fingerprints,
+            failed_paths: inputs.failed_paths,
+            ..ProcessedAssets::default()
+        };
+        let freshness = processed.freshness_fingerprints();
+        fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            freshness
+                .iter()
+                .any(crate::cache::key::fingerprint_is_unverifiable),
+            "a later success must not make a mixed failure/success run cacheable: {freshness:?}"
+        );
+        assert!(
+            freshness
+                .iter()
+                .any(|fingerprint| fingerprint.content_hash.is_some()),
+            "the successful retry should still retain its exact snapshot: {freshness:?}"
         );
     }
 
@@ -1271,6 +1551,8 @@ mod tests {
         let asset = css_asset(&entry);
 
         let processed = process_assets(std::slice::from_ref(&asset));
+        let expected_path = asset.path.clone();
+        let expected_bytes = asset.raw_bytes();
         fs::remove_dir_all(&dir).ok();
 
         assert!(
@@ -1280,8 +1562,8 @@ mod tests {
         assert_eq!(
             processed.uncounted,
             vec![UncountedAsset {
-                path: asset.path,
-                bytes: asset.raw_bytes
+                path: expected_path,
+                bytes: expected_bytes
             }],
             "it must be disclosed with its raw bytes, exactly as before B2: {processed:?}",
         );
@@ -1297,16 +1579,8 @@ mod tests {
         fs::write(&wasm, vec![7_u8; 4096]).expect("wasm");
         fs::write(&font, vec![9_u8; 2048]).expect("font");
         let assets = vec![
-            CollectedAsset {
-                path: wasm,
-                kind: AssetKind::Wasm,
-                raw_bytes: 4096,
-            },
-            CollectedAsset {
-                path: font,
-                kind: AssetKind::Font,
-                raw_bytes: 2048,
-            },
+            read_collected_asset(&wasm, AssetKind::Wasm).expect("wasm snapshot"),
+            read_collected_asset(&font, AssetKind::Font).expect("font snapshot"),
         ];
 
         let processed = process_assets(&assets);

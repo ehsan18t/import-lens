@@ -5,6 +5,7 @@
 
 mod adapter;
 mod asset_classifier;
+mod asset_input;
 pub mod boundary;
 pub(crate) mod dependency_paths;
 mod entry;
@@ -17,6 +18,8 @@ use std::path::PathBuf;
 pub use crate::ipc::protocol::ImportRuntime;
 pub use adapter::RolldownEngine;
 pub(crate) use asset_classifier::classify_asset;
+pub use asset_input::CollectedAsset;
+pub(crate) use asset_input::read_collected_asset;
 
 #[derive(Debug, Clone)]
 pub struct BundleRequest {
@@ -104,18 +107,6 @@ impl AssetKind {
             Self::Font => "font",
         }
     }
-}
-
-/// A reachable non-JavaScript artifact discovered either at the JavaScript load boundary or through
-/// a local CSS `url()`. Its bytes really do ship, so the pipeline processes it the way it ships and
-/// folds the result into the Import Cost (B2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollectedAsset {
-    pub path: PathBuf,
-    pub kind: AssetKind,
-    /// The file's size on disk. Used for the raw-byte fallback when processing fails, never as the
-    /// shipped size of a stylesheet (which is only known after Lightning CSS bundles it).
-    pub raw_bytes: u64,
 }
 
 #[derive(Debug, Clone)]

@@ -1,4 +1,8 @@
 use crate::{
+    cache::key::{
+        FileFingerprint, fingerprints_are_reusable, sort_and_dedup_fingerprints,
+        unverifiable_file_fingerprint,
+    },
     engine::{BundleEntry, BundlePurpose, BundleRequest, boundary},
     ipc::protocol::{
         ImportDiagnostic, ImportRequest, ImportResult, ImportRuntime, ModuleContribution,
@@ -153,6 +157,9 @@ pub struct FileSizeComputation {
     pub degraded: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
+    /// Exact inputs of the combined build, retained only for the process-local File Cost cache.
+    /// This is not part of the wire or disk schema.
+    pub(crate) dependency_fingerprints: Vec<FileFingerprint>,
 }
 
 impl FileSizeComputation {
@@ -178,6 +185,7 @@ impl FileSizeComputation {
         self.error.is_none()
             && !self.incomplete
             && !self.degraded
+            && fingerprints_are_reusable(&self.dependency_fingerprints)
             && !self
                 .diagnostics
                 .iter()
@@ -551,6 +559,18 @@ fn compute_file_size_with(
         // (ADR-0005); an asset that cannot be processed falls back to disclosure and is reported.
         let assets = process_assets(&artifact.assets);
         let asset_sizes = assets.total();
+        totals
+            .dependency_fingerprints
+            .extend(artifact.read_time_fingerprints.iter().cloned());
+        totals
+            .dependency_fingerprints
+            .extend(assets.freshness_fingerprints());
+        totals.dependency_fingerprints.extend(
+            artifact
+                .unhashed_paths
+                .iter()
+                .map(unverifiable_file_fingerprint),
+        );
         for disclosure in asset_diagnostics(&assets) {
             diagnostics.push(diagnostic(
                 &disclosure.stage,
@@ -578,6 +598,8 @@ fn compute_file_size_with(
             diagnostics,
         );
     }
+
+    sort_and_dedup_fingerprints(&mut totals.dependency_fingerprints);
 
     FileSizeComputation {
         diagnostics,
@@ -826,6 +848,29 @@ mod tests {
         assert!(
             totals.is_cacheable(),
             "every import was really measured, so the sum IS this file's size"
+        );
+    }
+
+    #[test]
+    fn conflicting_dependency_snapshots_are_not_cacheable() {
+        let mut totals = FileSizeComputation::default();
+        let first = FileFingerprint {
+            path: "/pkg/font.woff2".to_owned(),
+            len: 4,
+            modified_millis: 10,
+            content_hash: Some(crate::cache::key::content_hash(b"aaaa")),
+        };
+        totals.dependency_fingerprints = vec![
+            first.clone(),
+            FileFingerprint {
+                content_hash: Some(crate::cache::key::content_hash(b"bbbb")),
+                ..first
+            },
+        ];
+
+        assert!(
+            !totals.is_cacheable(),
+            "no on-disk file can validate two different known snapshots of one path"
         );
     }
 

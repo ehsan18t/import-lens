@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use lightningcss::dependencies::{Dependency, ImportDependency, UrlDependency};
 
-use crate::engine::{AssetKind, CollectedAsset, classify_asset};
+use crate::engine::{AssetKind, CollectedAsset, classify_asset, read_collected_asset};
 
 /// Resolve the supported local files referenced by `url()` in a bundled stylesheet.
 ///
@@ -13,22 +13,40 @@ use crate::engine::{AssetKind, CollectedAsset, classify_asset};
 /// Unsupported resource kinds remain CSS text and are outside the current CSS/wasm/font scope.
 pub(super) struct CssDependencyAssets {
     pub assets: Vec<CollectedAsset>,
+    pub failures: Vec<CssDependencyFailure>,
     pub unresolved: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CssDependencyFailure {
+    pub path: PathBuf,
+    pub raw_bytes: u64,
+    pub message: String,
+}
+
+enum SupportedAsset {
+    Collected(CollectedAsset),
+    Unreadable(CssDependencyFailure),
+    Unresolved(String),
 }
 
 pub(super) fn collect_referenced_assets(
     dependencies: impl IntoIterator<Item = Dependency>,
 ) -> CssDependencyAssets {
     let mut assets = BTreeMap::new();
+    let mut failures = BTreeMap::new();
     let mut unresolved = BTreeSet::new();
 
     for dependency in dependencies {
         match dependency {
             Dependency::Url(dependency) => match collect_supported_asset(dependency) {
-                Some(Ok(asset)) => {
+                Some(SupportedAsset::Collected(asset)) => {
                     assets.entry(asset.path.clone()).or_insert(asset);
                 }
-                Some(Err(message)) => {
+                Some(SupportedAsset::Unreadable(failure)) => {
+                    failures.insert(failure.path.clone(), failure);
+                }
+                Some(SupportedAsset::Unresolved(message)) => {
                     unresolved.insert(message);
                 }
                 None => {}
@@ -43,6 +61,7 @@ pub(super) fn collect_referenced_assets(
 
     CssDependencyAssets {
         assets: assets.into_values().collect(),
+        failures: failures.into_values().collect(),
         unresolved: unresolved.into_iter().collect(),
     }
 }
@@ -67,7 +86,7 @@ fn unresolved_import(dependency: ImportDependency) -> Option<String> {
     ))
 }
 
-fn collect_supported_asset(dependency: UrlDependency) -> Option<Result<CollectedAsset, String>> {
+fn collect_supported_asset(dependency: UrlDependency) -> Option<SupportedAsset> {
     let resource_path = resource_path(&dependency.url)?;
     let kind = classify_asset(Path::new(&resource_path))?;
     if !matches!(kind, AssetKind::Wasm | AssetKind::Font) {
@@ -77,7 +96,7 @@ fn collect_supported_asset(dependency: UrlDependency) -> Option<Result<Collected
     let source_file = Path::new(&dependency.loc.file_path);
     let resource = Path::new(&resource_path);
     if has_url_scheme(dependency.url.trim()) || resource.has_root() || !source_file.is_absolute() {
-        return Some(Err(format!(
+        return Some(SupportedAsset::Unresolved(format!(
             "CSS resource `{}` in {} is not a package-relative file and cannot be measured",
             dependency.url,
             source_file.display()
@@ -87,11 +106,14 @@ fn collect_supported_asset(dependency: UrlDependency) -> Option<Result<Collected
     let path = source_file.parent()?.join(resource);
     let path = fs::canonicalize(&path).unwrap_or(path);
     let raw_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    Some(Ok(CollectedAsset {
-        path,
-        kind,
-        raw_bytes,
-    }))
+    Some(match read_collected_asset(&path, kind) {
+        Ok(asset) => SupportedAsset::Collected(asset),
+        Err(error) => SupportedAsset::Unreadable(CssDependencyFailure {
+            message: format!("failed to read CSS resource {}: {error}", path.display()),
+            path,
+            raw_bytes,
+        }),
+    })
 }
 
 /// Extract the filesystem-looking portion of a CSS resource URL. Query strings and fragments name

@@ -23,7 +23,7 @@ use rolldown_common::{ModuleInfo, NormalModule};
 
 use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
 use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
-use super::{AssetKind, CollectedAsset, classify_asset};
+use super::{CollectedAsset, classify_asset};
 use crate::cache::key::{
     FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
 };
@@ -45,7 +45,7 @@ pub(super) struct BuildState {
     limit_breach: Mutex<Option<String>>,
     /// Classified non-JavaScript modules the graph imported, keyed by canonical path. See
     /// [`ImportLensPlugin::load`]; the pipeline processes them and counts their shipped bytes (B2).
-    assets: Mutex<HashMap<PathBuf, (AssetKind, u64)>>,
+    assets: Mutex<HashMap<PathBuf, CollectedAsset>>,
 }
 
 impl BuildState {
@@ -91,14 +91,7 @@ impl BuildState {
             .assets
             .lock()
             .expect("asset map should not be poisoned");
-        let mut sorted: Vec<CollectedAsset> = assets
-            .iter()
-            .map(|(path, (kind, raw_bytes))| CollectedAsset {
-                path: path.clone(),
-                kind: *kind,
-                raw_bytes: *raw_bytes,
-            })
-            .collect();
+        let mut sorted: Vec<CollectedAsset> = assets.values().cloned().collect();
         sorted.sort_by(|left, right| left.path.cmp(&right.path));
         sorted
     }
@@ -153,6 +146,26 @@ impl BuildState {
             Some(recorded) if recorded <= message => {}
             _ => *breach = Some(message.to_owned()),
         }
+    }
+
+    fn record_asset(&self, asset: CollectedAsset) {
+        let path = asset.path.clone();
+        // Duplicate imports may reach this hook concurrently. Derive the fingerprint from the
+        // snapshot that actually won the asset-map entry so the two maps can never describe
+        // different reads of the same path.
+        let fingerprint = self
+            .assets
+            .lock()
+            .expect("asset map should not be poisoned")
+            .entry(path.clone())
+            .or_insert(asset)
+            .fingerprint
+            .clone();
+        self.read_time
+            .lock()
+            .expect("read-time fingerprint map should not be poisoned")
+            .entry(path)
+            .or_insert(fingerprint);
     }
 }
 
@@ -305,6 +318,22 @@ impl ImportLensPlugin {
         std::io::Error::other(message)
     }
 
+    fn charge_source_bytes(&self, source_bytes: usize, path: &Path) -> Result<(), std::io::Error> {
+        let total_bytes = self
+            .state
+            .total_source_bytes
+            .fetch_add(source_bytes, Ordering::Relaxed)
+            + source_bytes;
+        let max_graph_source_bytes = *MAX_GRAPH_SOURCE_BYTES;
+        if total_bytes > max_graph_source_bytes {
+            return Err(self.breach(format!(
+                "module graph exceeds the {max_graph_source_bytes} byte total source limit after reading {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Capture len+mtime from the stat taken BEFORE the read, paired with a hash of the bytes we
     /// actually read, so freshness describes the bytes the size was measured from (§8.3).
     fn record_read_time(&self, canonical: &Path, len: u64, modified_millis: u64, bytes: &[u8]) {
@@ -397,7 +426,10 @@ impl Plugin for ImportLensPlugin {
         // bound memory, so reading first would blow the very bound being enforced.
         // `module_parsed` still enforces it on the transformed source, which also
         // covers modules this hook hands back to Rolldown below.
-        let metadata = match tokio::fs::metadata(path).await {
+        // Resolve the identity BEFORE the stat/read pair. Canonicalizing after the read can pair
+        // bytes from an old symlink target with the path of a newly-retargeted one.
+        let canonical = self.state.canonical_path(path);
+        let metadata = match tokio::fs::metadata(&canonical).await {
             Ok(metadata) => metadata,
             // Not a readable file (or vanished): let Rolldown produce its own error.
             Err(_) => return Ok(None),
@@ -406,7 +438,7 @@ impl Plugin for ImportLensPlugin {
             return Err(self
                 .breach(format!(
                     "module {} exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit",
-                    path.display()
+                    canonical.display()
                 ))
                 .into());
         }
@@ -418,10 +450,9 @@ impl Plugin for ImportLensPlugin {
         // which is the very failure this hook exists to prevent.
         let (len, modified_millis) = read_time_len_mtime_of(&metadata);
 
-        let Ok(bytes) = tokio::fs::read(path).await else {
+        let Ok(bytes) = tokio::fs::read(&canonical).await else {
             return Ok(None);
         };
-        let canonical = self.state.canonical_path(path);
 
         // A non-JavaScript ASSET the package's own entry imports, intercepted BEFORE the UTF-8
         // conversion below — a wasm or font is not UTF-8, and handing one back to Rolldown lets it
@@ -437,14 +468,13 @@ impl Plugin for ImportLensPlugin {
         // it really ships and folds those bytes into the Import Cost (B2) — they are neither
         // fabricated into the JS number nor thrown away with it.
         if let Some(kind) = classify_asset(path) {
-            // Fingerprint it like any other module we read: an edit to a stylesheet, wasm, or font
-            // must invalidate the size it contributed to. Binary bytes hash the same as text.
-            self.record_read_time(&canonical, len, modified_millis, &bytes);
+            // Asset bytes stay attached to this read-time fingerprint all the way through
+            // post-processing. Charge them before retaining the snapshot; otherwise moving bytes
+            // into the artifact would turn the existing aggregate-limit bypass into unbounded
+            // retained memory.
+            self.charge_source_bytes(bytes.len(), &canonical)?;
             self.state
-                .assets
-                .lock()
-                .expect("asset map should not be poisoned")
-                .insert(canonical, (kind, len));
+                .record_asset(CollectedAsset::from_read(canonical, kind, &metadata, bytes));
 
             return Ok(Some(HookLoadOutput {
                 code: String::new().into(),
@@ -494,19 +524,7 @@ impl Plugin for ImportLensPlugin {
                 .into());
         }
 
-        let total_bytes = self
-            .state
-            .total_source_bytes
-            .fetch_add(source_bytes, Ordering::Relaxed)
-            + source_bytes;
-        let max_graph_source_bytes = *MAX_GRAPH_SOURCE_BYTES;
-        if total_bytes > max_graph_source_bytes {
-            return Err(self
-                .breach(format!(
-                    "module graph exceeds the {max_graph_source_bytes} byte total source limit"
-                ))
-                .into());
-        }
+        self.charge_source_bytes(source_bytes, path)?;
 
         let canonical = self.state.canonical_path(path);
         let module_count = {

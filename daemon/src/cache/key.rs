@@ -4,7 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -83,9 +83,17 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// can now reach High confidence, because the `uncounted_assets` diagnostic that held it at Medium is
 /// emitted only when an asset cannot be processed. The result also carries a per-kind
 /// `asset_breakdown`, which no `+4` entry has (B2).
+///
+/// `rolldown-1.1.x+6` (2026-07-18): asset measurements and freshness now use the exact same read.
+/// Direct assets, CSS entrypoints, imported stylesheets, and local CSS resources are retained as
+/// immutable snapshots with read-time content hashes; failed and missing CSS dependencies also
+/// participate in freshness instead of leaving a reusable fallback. Combined File Cost entries
+/// validate those exact fingerprints before reuse. Entries computed under `+5` can contain bytes
+/// from one read paired with a later fingerprint, or remain cached after a CSS dependency changes,
+/// and therefore must be rejected.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+5"
+        "rolldown-1.1.x+6"
     };
 }
 
@@ -318,9 +326,58 @@ pub fn fingerprints_for_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<F
         .into_iter()
         .filter_map(file_fingerprint)
         .collect::<Vec<_>>();
-    fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
-    fingerprints.dedup_by(|left, right| left.path == right.path);
+    sort_and_dedup_fingerprints(&mut fingerprints);
     fingerprints
+}
+
+/// Put fingerprint sets in deterministic cache-key order while preserving conflicting snapshots.
+///
+/// Two identical observations of one path collapse. Two different hashes for one path must both
+/// remain: no current file can satisfy both, so their coexistence safely makes an analysis that saw
+/// a mid-flight edit non-reusable. Deduplicating only by path silently chose one snapshot and could
+/// bless a size derived from the other.
+pub fn sort_and_dedup_fingerprints(fingerprints: &mut Vec<FileFingerprint>) {
+    fingerprints.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.len.cmp(&right.len))
+            .then_with(|| left.modified_millis.cmp(&right.modified_millis))
+            .then_with(|| left.content_hash.cmp(&right.content_hash))
+    });
+    fingerprints.dedup();
+}
+
+/// Whether one analysis observed mutually incompatible snapshots for the same path.
+///
+/// A hashless observation is compatible with a hashed one when their metadata agrees; it simply
+/// knows less. Different metadata, or two different known hashes, means the file changed while the
+/// answer was being assembled. No single on-disk state can validate that answer, so it must not be
+/// admitted to a cache even on the node_modules metadata fast path.
+pub fn fingerprints_have_conflicting_snapshots(fingerprints: &[FileFingerprint]) -> bool {
+    let mut observed: HashMap<&str, (u64, u64, Option<u64>)> = HashMap::new();
+    for fingerprint in fingerprints {
+        match observed.entry(&fingerprint.path) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((
+                    fingerprint.len,
+                    fingerprint.modified_millis,
+                    fingerprint.content_hash,
+                ));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (len, modified_millis, known_hash) = entry.get_mut();
+                if *len != fingerprint.len || *modified_millis != fingerprint.modified_millis {
+                    return true;
+                }
+                match (*known_hash, fingerprint.content_hash) {
+                    (Some(left), Some(right)) if left != right => return true,
+                    (None, Some(hash)) => *known_hash = Some(hash),
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +538,34 @@ pub fn file_fingerprint_reading_hash(path: impl AsRef<Path>) -> Option<FileFinge
     }
 }
 
+/// Represent a path that analysis attempted but could not read.
+///
+/// There are no bytes whose hash could make this state `Fresh`. Maximal len/mtime values guarantee
+/// an accessible file misses the metadata pre-filter and, with no content hash, classifies Stale;
+/// a still-missing file classifies Gone. Either outcome refuses the cached fallback, which keeps a
+/// machine-dependent read failure out of durable use without changing the serialized fingerprint
+/// schema to add an absence variant.
+pub fn unverifiable_file_fingerprint(path: impl AsRef<Path>) -> FileFingerprint {
+    FileFingerprint {
+        path: normalize_identity_path(path),
+        len: u64::MAX,
+        modified_millis: u64::MAX,
+        content_hash: None,
+    }
+}
+
+pub fn fingerprint_is_unverifiable(fingerprint: &FileFingerprint) -> bool {
+    fingerprint.len == u64::MAX
+        && fingerprint.modified_millis == u64::MAX
+        && fingerprint.content_hash.is_none()
+}
+
+/// Whether a dependency set represents one complete, internally consistent observation.
+pub fn fingerprints_are_reusable(fingerprints: &[FileFingerprint]) -> bool {
+    !fingerprints.iter().any(fingerprint_is_unverifiable)
+        && !fingerprints_have_conflicting_snapshots(fingerprints)
+}
+
 /// Len + mtime captured at the moment a module's bytes are read during analysis,
 /// using the same mtime derivation as `check_fingerprint` so a later probe of an
 /// unchanged file hits the `Fresh` pre-filter. Returns `(len, modified_millis)`;
@@ -638,6 +723,60 @@ mod tests {
         );
         // Same length, different content — the case mtime+len can miss.
         assert_ne!(content_hash(b"aaaa"), content_hash(b"bbbb"));
+    }
+
+    #[test]
+    fn fingerprint_normalization_keeps_conflicting_snapshots_of_one_path() {
+        let first = FileFingerprint {
+            path: "/pkg/styles.css".to_owned(),
+            len: 4,
+            modified_millis: 10,
+            content_hash: Some(content_hash(b"aaaa")),
+        };
+        let conflicting = FileFingerprint {
+            content_hash: Some(content_hash(b"bbbb")),
+            ..first.clone()
+        };
+        let mut fingerprints = vec![conflicting.clone(), first.clone(), first.clone()];
+
+        sort_and_dedup_fingerprints(&mut fingerprints);
+
+        assert_eq!(fingerprints.len(), 2, "exact duplicates should collapse");
+        assert!(fingerprints.contains(&first));
+        assert!(fingerprints.contains(&conflicting));
+        assert!(
+            fingerprints_have_conflicting_snapshots(&fingerprints),
+            "two known hashes for one metadata snapshot cannot both describe the answer"
+        );
+        assert!(!fingerprints_are_reusable(&fingerprints));
+
+        let mut compatible = first.clone();
+        compatible.content_hash = None;
+        assert!(
+            !fingerprints_have_conflicting_snapshots(&[first, compatible]),
+            "a stat-only observation may agree with a more precise hashed observation"
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_fingerprint_can_never_be_fresh() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-unverifiable-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let missing = dir.join("created-later.css");
+        let fingerprint = unverifiable_file_fingerprint(&missing);
+
+        assert!(!fingerprints_are_reusable(std::slice::from_ref(
+            &fingerprint
+        )));
+        assert_eq!(check_fingerprint(&fingerprint), Freshness::Gone);
+        std::fs::write(&missing, b".created { color: red }").expect("create missing input");
+        assert_eq!(check_fingerprint(&fingerprint), Freshness::Stale);
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
