@@ -17,7 +17,7 @@ const MAX_CSS_WORK_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AssetBudgetLimits {
     max_unique_files: usize,
-    max_total_bytes: usize,
+    max_input_bytes: usize,
     max_file_bytes: usize,
     max_css_work_reads: usize,
     max_css_work_bytes: usize,
@@ -27,7 +27,7 @@ impl AssetBudgetLimits {
     pub(crate) fn production() -> Self {
         Self {
             max_unique_files: MAX_GRAPH_MODULES,
-            max_total_bytes: *MAX_GRAPH_SOURCE_BYTES,
+            max_input_bytes: *MAX_GRAPH_SOURCE_BYTES,
             max_file_bytes: MAX_MODULE_SOURCE_BYTES,
             max_css_work_reads: MAX_CSS_WORK_READS,
             max_css_work_bytes: MAX_CSS_WORK_BYTES,
@@ -63,7 +63,7 @@ pub(crate) struct AssetBudgetFailure {
 #[cfg(test)]
 pub(crate) struct AssetBudgetUsage {
     pub(crate) unique_files: usize,
-    pub(crate) total_bytes: usize,
+    pub(crate) input_bytes: usize,
     pub(crate) css_work_reads: usize,
     pub(crate) css_work_bytes: usize,
     pub(crate) snapshots: usize,
@@ -74,7 +74,7 @@ struct BudgetState {
     unique_files: BTreeMap<PathBuf, usize>,
     graph_files: BTreeSet<PathBuf>,
     aliases: BTreeMap<PathBuf, PathBuf>,
-    total_bytes: usize,
+    input_bytes: usize,
     css_work_reads: usize,
     css_work_bytes: usize,
     snapshots: BTreeMap<PathBuf, CollectedAsset>,
@@ -133,7 +133,7 @@ impl AssetProcessingContext {
                 .iter()
                 .map(|asset| (asset.path.clone(), asset.path.clone()))
                 .collect(),
-            total_bytes: graph_source_bytes,
+            input_bytes: graph_source_bytes,
             css_work_reads: 0,
             css_work_bytes: 0,
             snapshots,
@@ -151,12 +151,12 @@ impl AssetProcessingContext {
                 limits.max_unique_files
             ));
         }
-        if state.total_bytes > limits.max_total_bytes {
+        if state.input_bytes > limits.max_input_bytes {
             record_limit(
                 &mut state,
                 format!(
                     "asset processing exceeds the {} byte total source limit",
-                    limits.max_total_bytes
+                    limits.max_input_bytes
                 ),
             );
         }
@@ -320,7 +320,7 @@ impl AssetProcessingContext {
         let state = self.lock_state();
         AssetBudgetUsage {
             unique_files: state.unique_files.len(),
-            total_bytes: state.total_bytes,
+            input_bytes: state.input_bytes,
             css_work_reads: state.css_work_reads,
             css_work_bytes: state.css_work_bytes,
             snapshots: state.snapshots.len(),
@@ -408,19 +408,19 @@ impl AssetProcessingContext {
                 .get(&reservation.path)
                 .expect("a completed asset read must have a metadata reservation");
             let additional_bytes = actual_bytes.saturating_sub(charged_bytes);
-            let reconciled = state.total_bytes.saturating_add(additional_bytes);
-            if reconciled > self.limits.max_total_bytes {
+            let reconciled = state.input_bytes.saturating_add(additional_bytes);
+            if reconciled > self.limits.max_input_bytes {
                 record_limit(
                     &mut state,
                     format!(
                         "asset processing exceeds the {} byte total source limit while reading {}",
-                        self.limits.max_total_bytes,
+                        self.limits.max_input_bytes,
                         reservation.path.display()
                     ),
                 );
                 return Err(limit_io_error(&state));
             }
-            state.total_bytes = reconciled;
+            state.input_bytes = reconciled;
             if actual_bytes > charged_bytes {
                 state
                     .unique_files
@@ -466,20 +466,20 @@ impl AssetProcessingContext {
             );
             return Err(limit_io_error(state));
         }
-        let total_bytes = state.total_bytes.saturating_add(bytes);
-        if total_bytes > self.limits.max_total_bytes {
+        let next_input_bytes = state.input_bytes.saturating_add(bytes);
+        if next_input_bytes > self.limits.max_input_bytes {
             record_limit(
                 state,
                 format!(
                     "asset processing exceeds the {} byte total source limit while loading {}",
-                    self.limits.max_total_bytes,
+                    self.limits.max_input_bytes,
                     path.display()
                 ),
             );
             return Err(limit_io_error(state));
         }
         state.unique_files.insert(path.to_path_buf(), bytes);
-        state.total_bytes = total_bytes;
+        state.input_bytes = next_input_bytes;
         Ok(())
     }
 
@@ -490,8 +490,10 @@ impl AssetProcessingContext {
         path: &Path,
     ) -> std::io::Result<()> {
         let reads = state.css_work_reads.saturating_add(1);
-        let total_bytes = state.css_work_bytes.saturating_add(bytes);
-        if reads > self.limits.max_css_work_reads || total_bytes > self.limits.max_css_work_bytes {
+        let next_css_work_bytes = state.css_work_bytes.saturating_add(bytes);
+        if reads > self.limits.max_css_work_reads
+            || next_css_work_bytes > self.limits.max_css_work_bytes
+        {
             record_limit(
                 state,
                 format!(
@@ -504,7 +506,7 @@ impl AssetProcessingContext {
             return Err(limit_io_error(state));
         }
         state.css_work_reads = reads;
-        state.css_work_bytes = total_bytes;
+        state.css_work_bytes = next_css_work_bytes;
         Ok(())
     }
 
@@ -626,7 +628,7 @@ mod tests {
     fn limits() -> AssetBudgetLimits {
         AssetBudgetLimits {
             max_unique_files: 4,
-            max_total_bytes: 16,
+            max_input_bytes: 16,
             max_file_bytes: 12,
             max_css_work_reads: 2,
             max_css_work_bytes: 8,
@@ -713,7 +715,7 @@ mod tests {
         fs::write(&css, [b'a'; 4]).expect("initial child");
         let limits = AssetBudgetLimits {
             max_unique_files: 4,
-            max_total_bytes: 10,
+            max_input_bytes: 10,
             max_file_bytes: 12,
             max_css_work_reads: 4,
             max_css_work_bytes: 64,
@@ -747,7 +749,7 @@ mod tests {
         fs::write(&css, [b'a'; 1]).expect("initial child");
         let limits = AssetBudgetLimits {
             max_unique_files: 4,
-            max_total_bytes: 64,
+            max_input_bytes: 64,
             max_file_bytes: 32,
             max_css_work_reads: 4,
             max_css_work_bytes: 5,

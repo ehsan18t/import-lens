@@ -193,15 +193,15 @@ impl TrackingProvider {
             .lock()
             .expect("css read budget should not be poisoned");
         let files = budget.files.saturating_add(1);
-        let total_bytes = budget.bytes.saturating_add(bytes);
-        if files > MAX_STYLESHEET_FILES || total_bytes > MAX_STYLESHEET_BYTES {
+        let next_bytes = budget.bytes.saturating_add(bytes);
+        if files > MAX_STYLESHEET_FILES || next_bytes > MAX_STYLESHEET_BYTES {
             return Err(std::io::Error::other(format!(
                 "stylesheet @import tree exceeds the {MAX_STYLESHEET_FILES} file / \
                  {MAX_STYLESHEET_BYTES} byte limit"
             )));
         }
         budget.files = files;
-        budget.bytes = total_bytes;
+        budget.bytes = next_bytes;
         Ok(ReadReservation { bytes })
     }
 
@@ -219,14 +219,14 @@ impl TrackingProvider {
             .bytes
             .checked_sub(reservation.bytes)
             .expect("CSS read bytes must have an existing reservation");
-        let total_bytes = without_reservation.saturating_add(actual_bytes);
-        if total_bytes > MAX_STYLESHEET_BYTES {
+        let reconciled_bytes = without_reservation.saturating_add(actual_bytes);
+        if reconciled_bytes > MAX_STYLESHEET_BYTES {
             return Err(std::io::Error::other(format!(
                 "stylesheet @import tree exceeds the {MAX_STYLESHEET_FILES} file / \
                  {MAX_STYLESHEET_BYTES} byte limit"
             )));
         }
-        budget.bytes = total_bytes;
+        budget.bytes = reconciled_bytes;
         Ok(())
     }
 
