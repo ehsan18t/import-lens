@@ -3574,10 +3574,9 @@ mod every_durable_store_rejects_a_non_durable_outcome {
     use crate::pipeline::stage as pipeline_stage;
     use std::path::PathBuf;
 
-    /// Every stage a durable store must REFUSE: the three transient engine stages, plus the ones
-    /// that are transient in fact without being the engine's (`entry_metadata` — a bare
-    /// `fs::metadata` failure — and `compression`). DERIVED from the allowlist rather than restated
-    /// beside it, so a stage that changes classification changes this list with it.
+    /// Every stage a durable store must REFUSE: request-local engine outcomes plus machine-local
+    /// pipeline work (`entry_metadata` and `compression`). DERIVED from the allowlist rather than
+    /// restated beside it, so a stage that changes classification changes this list with it.
     fn non_durable_stages() -> Vec<&'static str> {
         stage::ALL
             .iter()

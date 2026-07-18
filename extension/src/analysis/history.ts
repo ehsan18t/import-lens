@@ -9,8 +9,11 @@ import { isDurableFileSize, isDurableImportResult } from "./transience.js";
 // computed against a number that never happened. So both stores below take the raw daemon output and
 // apply the gate themselves; neither will accept a row (ADR-0006, invariant 3; SRS FR-026c).
 
-export const bundleImpactHistoryKey = "importLens.bundleImpactHistory";
-export const importCostHistoryKey = "importLens.importCostHistory";
+// Version 2 deliberately leaves pre-asset-durability rows behind. Version 1 rows carry no stage
+// metadata, so a request-local asset floor recorded before D11 cannot be distinguished from a real
+// baseline and must not participate in future trends.
+export const bundleImpactHistoryKey = "importLens.bundleImpactHistory.v2";
+export const importCostHistoryKey = "importLens.importCostHistory.v2";
 
 export interface BundleImpactHistoryItem {
   timestamp: number;

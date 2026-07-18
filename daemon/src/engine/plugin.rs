@@ -17,7 +17,7 @@ use rolldown::ModuleType;
 use rolldown::plugin::{
     HookLoadArgs, HookLoadOutput, HookLoadReturn, HookNoopReturn, HookResolveIdArgs,
     HookResolveIdOutput, HookResolveIdReturn, HookUsage, Plugin, PluginContext,
-    SharedLoadPluginContext,
+    PluginContextResolveOptions, SharedLoadPluginContext,
 };
 use rolldown_common::{ModuleInfo, NormalModule};
 
@@ -26,6 +26,7 @@ use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE
 use super::{CollectedAsset, classify_asset};
 use crate::cache::key::{
     FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
+    sort_and_dedup_fingerprints, unverifiable_file_fingerprint,
 };
 
 /// Per-build state shared with the adapter, which reads it after the bundler
@@ -46,6 +47,10 @@ pub(super) struct BuildState {
     /// Classified non-JavaScript modules the graph imported, keyed by canonical path. See
     /// [`ImportLensPlugin::load`]; the pipeline processes them and counts their shipped bytes (B2).
     assets: Mutex<HashMap<PathBuf, CollectedAsset>>,
+    /// Classified assets whose metadata or byte read failed in this plugin. Even if Rolldown later
+    /// succeeds through its own loader, that mixed observation describes this filesystem moment,
+    /// not a reusable fact about the package.
+    failed_asset_inputs: Mutex<HashSet<PathBuf>>,
 }
 
 impl BuildState {
@@ -94,6 +99,37 @@ impl BuildState {
         let mut sorted: Vec<CollectedAsset> = assets.values().cloned().collect();
         sorted.sort_by(|left, right| left.path.cmp(&right.path));
         sorted
+    }
+
+    fn record_failed_asset_input(&self, path: PathBuf) {
+        self.failed_asset_inputs
+            .lock()
+            .expect("failed asset-input set should not be poisoned")
+            .insert(path);
+    }
+
+    pub(super) fn failed_asset_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self
+            .failed_asset_inputs
+            .lock()
+            .expect("failed asset-input set should not be poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Never-fresh observations that keep a machine-dependent asset failure out of every cache.
+    pub(super) fn unverifiable_asset_fingerprints(&self) -> Vec<FileFingerprint> {
+        let mut fingerprints = self
+            .failed_asset_paths()
+            .into_iter()
+            .map(unverifiable_file_fingerprint)
+            .collect::<Vec<_>>();
+        sort_and_dedup_fingerprints(&mut fingerprints);
+        fingerprints
     }
 
     /// Canonicalize once per build. A path that no longer resolves (deleted
@@ -202,9 +238,43 @@ impl BuildState {
                 }
             }
         };
-        self.record_fingerprint(path, fingerprint);
+        self.record_fingerprint(path.clone(), fingerprint);
         inserted
     }
+}
+
+fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Option<PathBuf> {
+    let query = specifier.find('?');
+    // A leading `#` is a package-import specifier, not a URL fragment. A later `#` is still a
+    // loader-style fragment and is removed before extension classification.
+    let fragment = if let Some(package_import) = specifier.strip_prefix('#') {
+        package_import.find('#').map(|index| index + 1)
+    } else {
+        specifier.find('#')
+    };
+    let path_end = query
+        .into_iter()
+        .chain(fragment)
+        .min()
+        .unwrap_or(specifier.len());
+    let specifier_path = Path::new(&specifier[..path_end]);
+    classify_asset(specifier_path)?;
+    if specifier_path.is_absolute() {
+        return Some(specifier_path.to_path_buf());
+    }
+    let is_package_relative = specifier.starts_with("./") || specifier.starts_with("../");
+    if !is_package_relative {
+        // Bare/self-referential/aliased specifiers have no honest filesystem candidate until the
+        // configured resolver answers. The spelling is still useful in the disclosure, and the
+        // resulting unverifiable sentinel is rejected by identity rather than by probing this path.
+        return Some(specifier_path.to_path_buf());
+    }
+    let importer = Path::new(importer);
+    if !importer.is_absolute() {
+        return None;
+    }
+    let parent = importer.parent()?;
+    Some(parent.join(specifier_path))
 }
 
 /// Atomically reserve bytes without ever moving the counter past `limit` on rejection.
@@ -453,7 +523,7 @@ impl Plugin for ImportLensPlugin {
 
     async fn resolve_id(
         &self,
-        _ctx: &PluginContext,
+        ctx: &PluginContext,
         args: &HookResolveIdArgs<'_>,
     ) -> HookResolveIdReturn {
         if args.specifier == VIRTUAL_ENTRY_ID {
@@ -480,6 +550,40 @@ impl Plugin for ImportLensPlugin {
                 package_json_path: target.manifest_path.clone(),
                 ..HookResolveIdOutput::from_id(target.entry_path.to_string_lossy().into_owned())
             }));
+        }
+        if let Some(importer) = args.importer
+            && let Some(candidate) = supported_asset_observation_candidate(args.specifier, importer)
+        {
+            // Ask Rolldown's configured resolver (with this hook skipped) rather than joining a
+            // relative path ourselves. Client/Component builds apply package `browser` aliases
+            // here, and a raw join would silently measure the server asset or ignore a `false`
+            // mapping. Taking the successful result back through this hook still guarantees its
+            // final id reaches our observing `load`; retaining an asset-looking specifier on
+            // failure closes the resolve/load race for relative, absolute, bare, and aliased forms
+            // without changing resolver semantics.
+            let resolved = ctx
+                .resolve(
+                    args.specifier,
+                    Some(importer),
+                    Some(PluginContextResolveOptions {
+                        import_kind: args.kind,
+                        is_entry: args.is_entry,
+                        skip_self: true,
+                        custom: Arc::clone(&args.custom),
+                    }),
+                )
+                .await?;
+            match resolved {
+                Ok(resolved) => {
+                    return Ok(Some(HookResolveIdOutput::from_resolved_id(resolved)));
+                }
+                Err(_) => {
+                    self.state.record_failed_asset_input(candidate);
+                    // Let the normal resolver run once more so Rolldown retains its native resolve
+                    // diagnostic. `classify_failure` promotes our typed `asset_io` observation.
+                    return Ok(None);
+                }
+            }
         }
         Ok(None)
     }
@@ -525,8 +629,17 @@ impl Plugin for ImportLensPlugin {
         let canonical = self.state.canonical_path(path);
         let metadata = match tokio::fs::metadata(&canonical).await {
             Ok(metadata) => metadata,
-            // Not a readable file (or vanished): let Rolldown produce its own error.
-            Err(_) => return Ok(None),
+            Err(error) => {
+                if asset_kind.is_some() {
+                    self.state.record_failed_asset_input(canonical);
+                    // Do not let the default loader reopen a recovering/growing asset outside this
+                    // plugin's source-byte reservations. The adapter promotes the retained cause
+                    // to `asset_io`, while this error keeps the build from consuming unobserved
+                    // bytes on a second path.
+                    return Err(error.into());
+                }
+                return Ok(None);
+            }
         };
         if metadata.len() > MAX_MODULE_SOURCE_BYTES as u64 {
             self.state.record_stat_fingerprint(&canonical, &metadata);
@@ -563,9 +676,13 @@ impl Plugin for ImportLensPlugin {
 
         let bytes = match tokio::fs::read(&canonical).await {
             Ok(bytes) => bytes,
-            Err(_) => {
+            Err(error) => {
                 if let Some(reserved) = reserved_asset_bytes {
                     self.release_source_bytes(reserved);
+                }
+                if asset_kind.is_some() {
+                    self.state.record_failed_asset_input(canonical);
+                    return Err(error.into());
                 }
                 return Ok(None);
             }
@@ -696,6 +813,56 @@ impl Plugin for ImportLensPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supported_asset_specifiers_become_observation_candidates_without_reinterpreting_dot_names() {
+        let importer = std::env::temp_dir().join("pkg").join("index.js");
+        let importer_text = importer.to_string_lossy();
+        assert_eq!(
+            supported_asset_observation_candidate("./font.woff2?url", &importer_text),
+            Some(importer.parent().unwrap().join("font.woff2"))
+        );
+        assert!(supported_asset_observation_candidate("./helper.js", &importer_text).is_none());
+        assert_eq!(
+            supported_asset_observation_candidate("asset-pkg/font.woff2", &importer_text),
+            Some(PathBuf::from("asset-pkg/font.woff2"))
+        );
+        assert_eq!(
+            supported_asset_observation_candidate("#font.woff2", &importer_text),
+            Some(PathBuf::from("#font.woff2"))
+        );
+        assert!(supported_asset_observation_candidate("./font.woff2", "virtual:entry").is_none());
+        assert!(
+            supported_asset_observation_candidate(".font.woff2", &importer_text).is_some(),
+            "a bare hidden-name specifier stays bare; it is observed but never joined to importer"
+        );
+        assert_eq!(
+            supported_asset_observation_candidate(".font.woff2", &importer_text),
+            Some(PathBuf::from(".font.woff2"))
+        );
+        assert_eq!(
+            supported_asset_observation_candidate(".../font.woff2", &importer_text),
+            Some(PathBuf::from(".../font.woff2"))
+        );
+    }
+
+    #[test]
+    fn failed_asset_observations_are_never_reusable() {
+        let state = BuildState::default();
+        let failed_read = PathBuf::from("/pkg/read-failed.woff2");
+        state.record_failed_asset_input(failed_read.clone());
+
+        let observations = state.unverifiable_asset_fingerprints();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].path,
+            failed_read.to_string_lossy().replace('\\', "/")
+        );
+        assert!(
+            crate::cache::key::fingerprint_is_unverifiable(&observations[0]),
+            "a read failure must prevent cache admission"
+        );
+    }
 
     #[test]
     fn rejected_source_reservation_never_inflates_the_total() {

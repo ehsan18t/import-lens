@@ -92,8 +92,8 @@ export type CurrentFileSizeReport = { kind: "no-imports" } | { kind: "summary"; 
 export interface CurrentFileSizeHistory {
   /**
    * The bundle-impact row this response contributes, or `undefined` when its totals are a FLOOR
-   * rather than the file's size (an import still being measured, or one a transient engine failure
-   * sized for us). A floor is worth SHOWING — it beats a blank — and must never be recorded or
+   * rather than the file's size (an import or asset contribution is missing, or the combined build
+   * degraded). A floor is worth SHOWING — it beats a blank — and must never be recorded or
    * compared: the history has no TTL and keeps one row per file, so it would become that file's
    * baseline and make the next honest sizing read as a regression.
    */

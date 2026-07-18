@@ -459,7 +459,7 @@ It was never seven bugs. It was one missing model, replicated everywhere anyone 
 the question. The fix is not a seventh patch: it is to make the state **unrepresentable**. With
 no size to misuse, every one of those checks becomes correct by construction.
 
-### Deterministic and transient are not the same failure
+### Deterministic and request-local are not the same outcome
 
 This is the distinction the code never made, and it is the one everything else rests on.
 
@@ -469,11 +469,13 @@ cache is already keyed by those bytes' fingerprints, so it expires exactly when 
 change. Refusing to cache it would re-enter the bundler for a broken package on *every* analysis,
 permanently occupying one of only two build slots.
 
-A **transient** failure — a panic, a timeout, a lost engine — is a fact about **this moment's
-scheduling**. It says nothing whatsoever about the package. It may **never** be cached, never
-persisted, never compared against a baseline, and never turned into a pass/fail verdict. A
-transient failure that becomes durable is the single worst thing this system can do, because it
-converts a momentary accident into a permanently wrong answer that outlives the daemon.
+A **request-local** failure — a panic, timeout, lost engine, unreadable asset input, or failed
+compressor — is a fact about **this moment's scheduling, filesystem, or machine**. It says nothing
+reusable about the package. It may **never** be cached, persisted, compared against a baseline, or
+turned into a pass/fail verdict. Some request-local asset outcomes carry a disclosed partial size;
+the `asset_io`/`compression` diagnostic, not absence of a number, is what keeps that floor local.
+Making such an outcome durable converts a momentary accident into a wrong answer that outlives the
+daemon.
 
 ### Aggregates inherit the weakest input
 

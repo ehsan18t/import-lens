@@ -35,7 +35,9 @@ use std::{
     sync::{Mutex, atomic::AtomicU64, atomic::Ordering},
 };
 
-use crate::cache::key::{FileFingerprint, Freshness, check_fingerprints_strict};
+use crate::cache::key::{
+    FileFingerprint, Freshness, check_fingerprints_strict, fingerprints_are_reusable,
+};
 use crate::ipc::protocol::ImportRuntime;
 
 /// One entry per (entry file, runtime). A workspace touches few package entries per
@@ -139,7 +141,7 @@ impl<V: Clone> BuildMemo<V> {
         fingerprints: Vec<FileFingerprint>,
         generation: u64,
     ) {
-        if fingerprints.is_empty() {
+        if fingerprints.is_empty() || !fingerprints_are_reusable(&fingerprints) {
             return;
         }
 
@@ -170,6 +172,33 @@ impl<V: Clone> BuildMemo<V> {
                 stamp,
                 used_at,
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unreusable_build_observation_never_enters_the_memo() {
+        let memo = BuildMemo::<u64>::new();
+        let entry = Path::new("/pkg/index.js");
+        let fingerprints = vec![crate::cache::key::unverifiable_file_fingerprint(
+            "/pkg/unreadable.woff2",
+        )];
+
+        memo.insert(
+            entry,
+            ImportRuntime::Client,
+            42,
+            fingerprints,
+            crate::cache::memory::cache_generation(),
+        );
+
+        assert!(
+            memo.lock().is_empty(),
+            "a memo must not retain an observation it can never safely serve"
         );
     }
 }

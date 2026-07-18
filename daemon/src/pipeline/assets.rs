@@ -36,7 +36,7 @@ use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider
 use lightningcss::dependencies::DependencyOptions;
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions};
 use lightningcss::targets::Targets;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -77,12 +77,55 @@ struct ReadReservation {
     bytes: usize,
 }
 
+/// Append-only ownership for stylesheet strings read by [`TrackingProvider`]. Lightning CSS's
+/// `SourceProvider` returns `&str`, so every returned allocation must stay at a stable address until
+/// the provider is dropped. This is the same ownership model as Lightning CSS's `FileProvider`, but
+/// accepting bytes here lets us fingerprint the exact read before classifying invalid UTF-8.
+#[derive(Default)]
+struct RetainedSources {
+    inputs: Mutex<Vec<*mut String>>,
+}
+
+// SAFETY: pointers are inserted once behind the mutex, point to independently boxed strings, and
+// are exposed only as immutable `&str`. They are never removed or mutated until `Drop`, which
+// cannot run while a borrow of the provider is live.
+unsafe impl Send for RetainedSources {}
+unsafe impl Sync for RetainedSources {}
+
+impl RetainedSources {
+    fn retain(&self, source: String) -> &str {
+        let pointer = Box::into_raw(Box::new(source));
+        self.inputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(pointer);
+        // SAFETY: `pointer` remains owned by this append-only collection until `Drop`; the boxed
+        // allocation is stable even if the pointer vector reallocates.
+        unsafe { &*pointer }
+    }
+}
+
+impl Drop for RetainedSources {
+    fn drop(&mut self) {
+        let pointers = self
+            .inputs
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for pointer in pointers.drain(..) {
+            // SAFETY: every pointer was created exactly once by `retain` and is drained exactly
+            // once here, after no borrow of the provider can remain.
+            drop(unsafe { Box::from_raw(pointer) });
+        }
+    }
+}
+
 /// A `SourceProvider` that reads from disk like the built-in `FileProvider` but records every path
 /// it opens, bounds what one `@import` tree may pull in, and can serve one synthetic in-memory
 /// entry. The bundler drives the `@import` graph with `rayon`, so the provider must be
 /// `Send + Sync`; its state is behind `Mutex`, never a `RefCell`.
 struct TrackingProvider {
     inner: FileProvider,
+    retained_sources: RetainedSources,
     /// Top-level stylesheets already captured by the engine. Serving these bytes makes a
     /// `BundleArtifact` immutable: processing never reopens an entry behind its fingerprint.
     preloaded: BTreeMap<PathBuf, CollectedAsset>,
@@ -102,6 +145,7 @@ impl TrackingProvider {
     fn new(entries: &[CollectedAsset]) -> Self {
         Self {
             inner: FileProvider::new(),
+            retained_sources: RetainedSources::default(),
             preloaded: entries
                 .iter()
                 .cloned()
@@ -130,6 +174,7 @@ impl TrackingProvider {
         );
         Self {
             inner: FileProvider::new(),
+            retained_sources: RetainedSources::default(),
             preloaded,
             synthetic: None,
             read_paths: Mutex::new(HashSet::new()),
@@ -143,6 +188,7 @@ impl TrackingProvider {
     fn with_synthetic(entries: &[CollectedAsset], path: PathBuf, content: String) -> Self {
         Self {
             inner: FileProvider::new(),
+            retained_sources: RetainedSources::default(),
             preloaded: entries
                 .iter()
                 .cloned()
@@ -176,6 +222,7 @@ impl TrackingProvider {
         );
         Self {
             inner: FileProvider::new(),
+            retained_sources: RetainedSources::default(),
             preloaded,
             synthetic: Some((path, content)),
             read_paths: Mutex::new(HashSet::new()),
@@ -362,30 +409,34 @@ impl SourceProvider for TrackingProvider {
                     ))
                 })?;
                 let reservation = self.reserve(metadata_bytes)?;
-                let source = match self.inner.read(&key) {
-                    Ok(source) => source,
+                let bytes = match std::fs::read(&key) {
+                    Ok(bytes) => bytes,
                     Err(error) => {
                         self.record_failed_read(key);
                         return Err(error);
                     }
                 };
-                self.reconcile(reservation, source.len())?;
+                self.reconcile(reservation, bytes.len())?;
                 let (len, modified_millis) = read_time_len_mtime_of(&metadata);
                 let fingerprint = match (&self.context, shared_reservation) {
                     (Some(context), Some(reservation)) => {
-                        context
-                            .finish_css_read(reservation, source.as_bytes())?
-                            .fingerprint
+                        context.finish_css_read(reservation, &bytes)?.fingerprint
                     }
                     _ => file_fingerprint_from_read_time(
                         &key,
                         len,
                         modified_millis,
-                        content_hash(source.as_bytes()),
+                        content_hash(&bytes),
                     ),
                 };
                 self.record_read(key.clone(), Some(fingerprint));
-                source
+                let source = String::from_utf8(bytes).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("stylesheet {} is not UTF-8: {error}", key.display()),
+                    )
+                })?;
+                self.retained_sources.retain(source)
             }
         };
         self.check_deadline()?;
@@ -480,6 +531,29 @@ impl CssReadInputs {
 struct CssProcessingError {
     message: String,
     inputs: CssReadInputs,
+    non_durable_stages: BTreeSet<&'static str>,
+}
+
+impl CssProcessingError {
+    fn from_transform(message: String, inputs: CssReadInputs) -> Self {
+        let mut non_durable_stages = BTreeSet::new();
+        if !inputs.failed_paths.is_empty() {
+            non_durable_stages.insert(crate::engine::stage::ASSET_IO);
+        }
+        Self {
+            message,
+            inputs,
+            non_durable_stages,
+        }
+    }
+
+    fn from_compression(message: String, inputs: CssReadInputs) -> Self {
+        let mut error = Self::from_transform(message, inputs);
+        error
+            .non_durable_stages
+            .insert(crate::pipeline::stage::COMPRESSION);
+        error
+    }
 }
 
 /// Bundle one stylesheet the way it ships: resolve its `@import` tree from disk into one
@@ -513,7 +587,7 @@ fn bundle_collected_css_with_context(
             bundle.failed_paths = inputs.failed_paths;
             Ok(bundle)
         }
-        Err(message) => Err(CssProcessingError { message, inputs }),
+        Err(message) => Err(CssProcessingError::from_transform(message, inputs)),
     }
 }
 
@@ -544,6 +618,7 @@ fn bundle_collected_css_set_with_context(
         [] => Err(CssProcessingError {
             message: "no stylesheets to bundle".to_owned(),
             inputs: CssReadInputs::default(),
+            non_durable_stages: BTreeSet::new(),
         }),
         [single] => bundle_collected_css_with_context(single, context),
         many => {
@@ -567,7 +642,7 @@ fn bundle_collected_css_set_with_context(
                     bundle.failed_paths = inputs.failed_paths;
                     Ok(bundle)
                 }
-                Err(message) => Err(CssProcessingError { message, inputs }),
+                Err(message) => Err(CssProcessingError::from_transform(message, inputs)),
             }
         }
     }
@@ -760,6 +835,9 @@ pub struct ProcessedAssets {
     /// Dependency-analysis failures keep the valid CSS contribution but make it impossible to
     /// prove that every local font/wasm reference was discovered.
     pub css_dependency_failures: Vec<String>,
+    /// Machine/request-local causes retained structurally so neither cache admission nor wire
+    /// consumers have to infer durability from human-readable error text.
+    non_durable_stages: BTreeSet<&'static str>,
 }
 
 impl ProcessedAssets {
@@ -890,6 +968,38 @@ fn unresolved_css_dependencies_diagnostic(processed: &ProcessedAssets) -> Option
     })
 }
 
+fn asset_io_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
+    if processed.failed_paths.is_empty() {
+        return None;
+    }
+    let mut paths = processed.failed_paths.clone();
+    paths.sort();
+    paths.dedup();
+    Some(ImportDiagnostic {
+        stage: crate::engine::stage::ASSET_IO.to_owned(),
+        message: "one or more asset inputs could not be read during this analysis; the result \
+                  reflects a changing or unavailable filesystem and will not be reused"
+            .to_owned(),
+        details: paths
+            .iter()
+            .map(|path| format!("unreadable asset input: {}", path.display()))
+            .collect(),
+    })
+}
+
+fn asset_compression_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
+    processed
+        .non_durable_stages
+        .contains(crate::pipeline::stage::COMPRESSION)
+        .then(|| ImportDiagnostic {
+            stage: crate::pipeline::stage::COMPRESSION.to_owned(),
+            message: "an asset compressor failed during this analysis; the partial asset size is \
+                      request-local and will not be reused"
+                .to_owned(),
+            details: Vec::new(),
+        })
+}
+
 /// Every disclosure the processed assets owe the user, so a caller cannot fold in the bytes and
 /// forget one. Both call sites take the whole list rather than naming the diagnostics one by one:
 /// a future asset caveat is then disclosed by construction instead of by memory.
@@ -898,6 +1008,8 @@ pub fn asset_diagnostics(processed: &ProcessedAssets) -> Vec<ImportDiagnostic> {
         uncounted_assets_diagnostic(processed),
         imprecise_assets_diagnostic(processed),
         unresolved_css_dependencies_diagnostic(processed),
+        asset_io_diagnostic(processed),
+        asset_compression_diagnostic(processed),
     ]
     .into_iter()
     .flatten()
@@ -1045,8 +1157,17 @@ struct StylesheetOutcome {
     uncounted: Vec<UncountedAsset>,
     /// Inputs observed by failed union/per-sheet attempts. Successful bundles carry their own.
     observed_inputs: CssReadInputs,
+    /// A request-local cause stays sticky across the union/per-sheet retry. A later success must
+    /// not turn an earlier filesystem/compressor failure into a reusable package fact.
+    non_durable_stages: BTreeSet<&'static str>,
     /// `Some(union error)` when the set was measured one sheet at a time.
     degraded: Option<String>,
+}
+
+fn may_retry_stylesheets_separately(error: &CssProcessingError) -> bool {
+    !error
+        .non_durable_stages
+        .contains(crate::pipeline::stage::COMPRESSION)
 }
 
 fn process_stylesheets(
@@ -1088,6 +1209,7 @@ fn process_stylesheets(
             failures: Vec::new(),
             uncounted: Vec::new(),
             observed_inputs: CssReadInputs::default(),
+            non_durable_stages: BTreeSet::new(),
             degraded: None,
         })
         .or_else(|union_error| {
@@ -1100,6 +1222,12 @@ fn process_stylesheets(
             {
                 return Err(union_error);
             }
+            // Compression says nothing about whether the CSS union is structurally invalid.
+            // Splitting a valid artifact after a compressor failure changes the quantity and can
+            // produce a separately-compressed over-count, so fall back with the typed cause.
+            if !may_retry_stylesheets_separately(&union_error) {
+                return Err(union_error);
+            }
             if entries.len() == 1 {
                 return Err(union_error);
             }
@@ -1107,6 +1235,7 @@ fn process_stylesheets(
             let CssProcessingError {
                 message: union_message,
                 inputs: mut observed_inputs,
+                mut non_durable_stages,
             } = union_error;
             let mut counted = Vec::new();
             let mut failures = Vec::new();
@@ -1127,6 +1256,7 @@ fn process_stylesheets(
                     Err(error) => {
                         failures.push(error.message);
                         observed_inputs.extend(error.inputs);
+                        non_durable_stages.extend(error.non_durable_stages);
                         uncounted.push(UncountedAsset {
                             path: entry.path.clone(),
                             bytes: entry.raw_bytes(),
@@ -1141,6 +1271,7 @@ fn process_stylesheets(
                 return Err(CssProcessingError {
                     message: union_message,
                     inputs: observed_inputs,
+                    non_durable_stages,
                 });
             }
             Ok(StylesheetOutcome {
@@ -1148,6 +1279,7 @@ fn process_stylesheets(
                 failures,
                 uncounted,
                 observed_inputs,
+                non_durable_stages,
                 // Sheets DID count here, so `uncounted` may well be empty and the uncounted
                 // disclosure silent. This is what makes the over-count speakable.
                 degraded: Some(union_message),
@@ -1165,6 +1297,7 @@ fn process_stylesheets(
             failures,
             uncounted,
             observed_inputs,
+            non_durable_stages,
             degraded,
         }) => {
             processed.read_paths.extend(observed_inputs.paths);
@@ -1172,6 +1305,7 @@ fn process_stylesheets(
                 .read_time_fingerprints
                 .extend(observed_inputs.fingerprints);
             processed.failed_paths.extend(observed_inputs.failed_paths);
+            processed.non_durable_stages.extend(non_durable_stages);
             processed.failures.extend(failures);
             processed.uncounted.extend(uncounted);
             processed.stylesheets_measured_separately = degraded;
@@ -1186,6 +1320,8 @@ fn process_stylesheets(
                 zstd_bytes: 0,
             };
             for (bundle, compressed) in counted {
+                let had_asset_io =
+                    !bundle.failed_paths.is_empty() || !bundle.referenced_failures.is_empty();
                 css.raw_bytes += bundle.raw_bytes.len() as u64;
                 css.minified_bytes += bundle.minified_bytes.len() as u64;
                 css.gzip_bytes += compressed.gzip_bytes;
@@ -1196,6 +1332,11 @@ fn process_stylesheets(
                     .read_time_fingerprints
                     .extend(bundle.read_time_fingerprints);
                 processed.failed_paths.extend(bundle.failed_paths);
+                if had_asset_io {
+                    processed
+                        .non_durable_stages
+                        .insert(crate::engine::stage::ASSET_IO);
+                }
                 referenced_assets.extend(bundle.referenced_assets);
                 for failure in bundle.referenced_failures {
                     processed.read_paths.push(failure.path.clone());
@@ -1218,6 +1359,9 @@ fn process_stylesheets(
                 .read_time_fingerprints
                 .extend(error.inputs.fingerprints);
             processed.failed_paths.extend(error.inputs.failed_paths);
+            processed
+                .non_durable_stages
+                .extend(error.non_durable_stages);
             processed.failures.push(error.message);
             processed.uncounted.extend(
                 assets
@@ -1240,23 +1384,29 @@ fn compress_bundle(
     bundle: CssBundle,
     context: Option<&AssetProcessingContext>,
 ) -> Result<(CssBundle, CompressionSizes), CssProcessingError> {
+    compress_bundle_with(bundle, context, &compress_asset_bytes)
+}
+
+fn compress_asset_bytes(bytes: &[u8]) -> Result<CompressionSizes, String> {
+    compress_all_bytes(bytes).map_err(|error| error.to_string())
+}
+
+fn compress_bundle_with(
+    bundle: CssBundle,
+    context: Option<&AssetProcessingContext>,
+    compress: &dyn Fn(&[u8]) -> Result<CompressionSizes, String>,
+) -> Result<(CssBundle, CompressionSizes), CssProcessingError> {
     if let Some(context) = context {
-        context
-            .check_deadline()
-            .map_err(|error| CssProcessingError {
-                message: error.to_string(),
-                inputs: CssReadInputs::default(),
-            })?;
+        context.check_deadline().map_err(|error| {
+            CssProcessingError::from_transform(error.to_string(), CssReadInputs::default())
+        })?;
     }
-    match compress_all_bytes(&bundle.minified_bytes) {
+    match compress(&bundle.minified_bytes) {
         Ok(compressed) => {
             if let Some(context) = context {
-                context
-                    .check_deadline()
-                    .map_err(|error| CssProcessingError {
-                        message: error.to_string(),
-                        inputs: CssReadInputs::default(),
-                    })?;
+                context.check_deadline().map_err(|error| {
+                    CssProcessingError::from_transform(error.to_string(), CssReadInputs::default())
+                })?;
             }
             Ok((bundle, compressed))
         }
@@ -1274,10 +1424,10 @@ fn compress_bundle(
                 inputs.paths.push(failure.path.clone());
                 inputs.failed_paths.push(failure.path);
             }
-            Err(CssProcessingError {
-                message: format!("failed to compress the bundled stylesheet: {error}"),
+            Err(CssProcessingError::from_compression(
+                format!("failed to compress the bundled stylesheet: {error}"),
                 inputs,
-            })
+            ))
         }
     }
 }
@@ -1287,6 +1437,16 @@ fn process_binary_kind(
     kind: AssetKind,
     processed: &mut ProcessedAssets,
     context: Option<&AssetProcessingContext>,
+) -> Result<(), AssetBudgetFailure> {
+    process_binary_kind_with(assets, kind, processed, context, &compress_asset_bytes)
+}
+
+fn process_binary_kind_with(
+    assets: &[CollectedAsset],
+    kind: AssetKind,
+    processed: &mut ProcessedAssets,
+    context: Option<&AssetProcessingContext>,
+    compress: &dyn Fn(&[u8]) -> Result<CompressionSizes, String>,
 ) -> Result<(), AssetBudgetFailure> {
     let mut sizes = MeasuredSizes::ZERO;
     let mut counted = false;
@@ -1299,7 +1459,7 @@ fn process_binary_kind(
                 .failure()
                 .expect("an expired asset deadline must retain a typed failure"));
         }
-        let measured = compress_all_bytes(asset.bytes())
+        let measured = compress(asset.bytes())
             .map_err(|error| format!("failed to compress {}: {error}", asset.path.display()))
             .map(|compressed| (asset.raw_bytes(), compressed));
 
@@ -1314,6 +1474,9 @@ fn process_binary_kind(
                 sizes.zstd_bytes += compressed.zstd_bytes;
             }
             Err(message) => {
+                processed
+                    .non_durable_stages
+                    .insert(crate::pipeline::stage::COMPRESSION);
                 processed.failures.push(message);
                 processed.uncounted.push(UncountedAsset {
                     path: asset.path.clone(),
@@ -1408,6 +1571,45 @@ mod tests {
             "the @import child must be captured: {:?}",
             bundle.read_paths,
         );
+    }
+
+    #[test]
+    fn invalid_utf8_is_a_deterministic_css_input_whether_top_level_or_imported() {
+        let dir = temp_dir("invalid-utf8-css");
+        let child = dir.join("child.css");
+        let importing = dir.join("importing.css");
+        let top_level = dir.join("top-level.css");
+        fs::write(&child, [0xff, 0xfe, 0xfd]).expect("invalid imported stylesheet");
+        fs::write(&importing, "@import './child.css';\n.root { color: red; }")
+            .expect("importing stylesheet");
+        fs::write(&top_level, [0xff, 0xfe, 0xfd]).expect("invalid top-level stylesheet");
+
+        let imported_failure = process_assets(&[css_asset(&importing)]);
+        let top_level_failure = process_assets(&[css_asset(&top_level)]);
+        fs::remove_dir_all(&dir).ok();
+
+        for (label, processed) in [
+            ("imported child", imported_failure),
+            ("top-level entry", top_level_failure),
+        ] {
+            let diagnostics = asset_diagnostics(&processed);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.stage == diagnostic_stage::UNCOUNTED_ASSETS),
+                "{label}: invalid CSS is disclosed as a deterministic processor fallback"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.stage != crate::engine::stage::ASSET_IO),
+                "{label}: bytes were read exactly; invalid UTF-8 is not a filesystem failure"
+            );
+            assert!(
+                crate::cache::key::fingerprints_are_reusable(&processed.freshness_fingerprints()),
+                "{label}: the deterministic fallback should expire against the exact invalid bytes"
+            );
+        }
     }
 
     #[test]
@@ -1801,6 +2003,57 @@ mod tests {
                 .iter()
                 .any(|fingerprint| fingerprint.content_hash.is_some()),
             "the successful retry should still retain its exact snapshot: {freshness:?}"
+        );
+    }
+
+    #[test]
+    fn a_css_compressor_failure_is_typed_non_durable_and_does_not_split_the_artifact() {
+        let bundle = CssBundle {
+            raw_bytes: b".a { color: red }".to_vec(),
+            minified_bytes: b".a{color:red}".to_vec(),
+            read_paths: Vec::new(),
+            read_time_fingerprints: Vec::new(),
+            failed_paths: Vec::new(),
+            referenced_assets: Vec::new(),
+            referenced_failures: Vec::new(),
+            dependency_failures: Vec::new(),
+        };
+        let failure = compress_bundle_with(bundle, None, &|_| Err("injected failure".to_owned()))
+            .expect_err("the injected compressor must fail");
+
+        assert!(
+            failure
+                .non_durable_stages
+                .contains(crate::pipeline::stage::COMPRESSION),
+            "the cache gate must receive a typed cause, never parse this message: {failure:?}"
+        );
+        assert!(
+            !may_retry_stylesheets_separately(&failure),
+            "compressor failure says nothing about CSS structure and must not split one artifact"
+        );
+    }
+
+    #[test]
+    fn a_binary_compressor_failure_is_disclosed_and_non_durable() {
+        let dir = temp_dir("binary-compression-failure");
+        let path = dir.join("probe.woff2");
+        fs::write(&path, [0x51; 64]).expect("font");
+        let asset = read_collected_asset(&path, AssetKind::Font).expect("font snapshot");
+        let mut processed = ProcessedAssets::default();
+
+        process_binary_kind_with(&[asset], AssetKind::Font, &mut processed, None, &|_| {
+            Err("injected failure".to_owned())
+        })
+        .expect("a per-asset compressor failure falls back instead of aborting the stage");
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(processed.uncounted.len(), 1);
+        assert!(processed.contributions.is_empty());
+        assert!(
+            asset_diagnostics(&processed)
+                .iter()
+                .any(|diagnostic| diagnostic.stage == crate::pipeline::stage::COMPRESSION),
+            "the measured fallback must carry the cause that keeps it out of every store"
         );
     }
 

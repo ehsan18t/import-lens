@@ -48,7 +48,7 @@ pub const ENTRY_RESOLUTION: &str = "entry_resolution";
 /// **Not durable, and not deterministic.** This is an IO condition — a lock, a permission blip, a
 /// drive that went away — and the next attempt may well succeed. It is the one stage the old
 /// denylist got wrong, because it is transient in fact while being absent from
-/// [`engine_stage::is_transient`], whose three names describe the *engine*.
+/// [`engine_stage::is_transient`], whose names describe failures observed inside the *engine*.
 pub const ENTRY_METADATA: &str = "entry_metadata";
 /// The entry file is larger than the module source limit. A property of its bytes.
 pub const OVERSIZED_ENTRY: &str = "oversized_entry";
@@ -104,6 +104,22 @@ pub const ALL: &[&str] = &[
     NATIVE_BINARY,
 ];
 
+/// Every analysis stage that describes this request's machine/filesystem state rather than a fact
+/// about the package bytes. This is the product-wide list mirrored by the extension and CLI; unlike
+/// [`engine_stage::is_transient`], it also includes transient pipeline work around the engine.
+pub const TRANSIENT_ANALYSIS_STAGES: &[&str] = &[
+    engine_stage::PANIC,
+    engine_stage::TIMEOUT,
+    engine_stage::ENGINE_GONE,
+    engine_stage::ASSET_IO,
+    ENTRY_METADATA,
+    COMPRESSION,
+];
+
+pub fn is_transient(stage: &str) -> bool {
+    TRANSIENT_ANALYSIS_STAGES.contains(&stage)
+}
+
 /// Whether an outcome carrying `stage` may be written to a store that outlives the request.
 ///
 /// True only for a stage that is a **property of the package's bytes** — so the cache, which is
@@ -114,43 +130,39 @@ pub const ALL: &[&str] = &[
 /// False for everything else, **including a stage this function has never heard of**. That default
 /// is the whole design: a new stage is refused until someone classifies it, so the failure mode of
 /// forgetting is a rebuild, not a durable wrong answer.
+pub const DURABLE_RESULT_STAGES: &[&str] = &[
+    // Engine failures that are a property of the code being built. The request-local engine
+    // stages (`panic`, `timeout`, `engine_gone`, `asset_io`) are deliberately absent.
+    engine_stage::RESOLVE,
+    engine_stage::PARSE,
+    engine_stage::LINK,
+    engine_stage::GENERATE,
+    engine_stage::OUTPUT_SHAPE,
+    engine_stage::MODULE_GRAPH_LIMIT,
+    engine_stage::MISSING_EXPORT,
+    engine_stage::AMBIGUOUS_EXPORT,
+    // Stages that ride a SUCCESSFUL measurement and disclose its limits. Refusing one would
+    // refuse to cache a healthy package. A transient read error carries the separate `asset_io`
+    // stage, so it cannot borrow this durable classification merely by also landing in
+    // `uncounted_assets`.
+    diagnostic_stage::EXTERNAL,
+    diagnostic_stage::UNCOUNTED_ASSETS,
+    diagnostic_stage::IMPRECISE_ASSETS,
+    // Pipeline failures that are properties of package bytes.
+    PACKAGE_VALIDATION,
+    PACKAGE_RESOLUTION,
+    PACKAGE_MANIFEST,
+    ENTRY_RESOLUTION,
+    OVERSIZED_ENTRY,
+    MINIFY,
+    // Real measurements of zero and the informational native-binary flag.
+    TYPES_ONLY,
+    NATIVE_BINARY_ONLY,
+    NATIVE_BINARY,
+];
+
 pub fn may_enter_a_durable_store(stage: &str) -> bool {
-    matches!(
-        stage,
-        // Engine failures that are a property of the code being built. `is_transient`'s three —
-        // `panic`, `timeout`, `engine_gone` — are deliberately absent.
-        engine_stage::RESOLVE
-            | engine_stage::PARSE
-            | engine_stage::LINK
-            | engine_stage::GENERATE
-            | engine_stage::OUTPUT_SHAPE
-            | engine_stage::MODULE_GRAPH_LIMIT
-            | engine_stage::MISSING_EXPORT
-            | engine_stage::AMBIGUOUS_EXPORT
-            // Stages that ride a SUCCESSFUL measurement and disclose its limits. Refusing one
-            // would refuse to cache a healthy package. Each is a property of the package's bytes —
-            // which modules are external, which assets the processors could not take, whether the
-            // stylesheet set unions — so the fingerprints expire them exactly when the answer
-            // changes. (A transient read error can also land in `uncounted_assets`; it is disclosed
-            // and lands on the pre-B2 floor, never below it. Recorded in known-issues.)
-            | diagnostic_stage::EXTERNAL
-            | diagnostic_stage::UNCOUNTED_ASSETS
-            | diagnostic_stage::IMPRECISE_ASSETS
-            // Pipeline failures that are a property of the package's bytes.
-            | PACKAGE_VALIDATION
-            | PACKAGE_RESOLUTION
-            | PACKAGE_MANIFEST
-            | ENTRY_RESOLUTION
-            | OVERSIZED_ENTRY
-            | MINIFY
-            // A real measurement of zero.
-            | TYPES_ONLY
-            // A native-binary-only package: a real measurement of zero JS bytes, and a package's
-            // manifest is a property of its bytes, so both are durable.
-            | NATIVE_BINARY_ONLY
-            // The native-binary flag rides a successful measurement, like `external`.
-            | NATIVE_BINARY
-    )
+    DURABLE_RESULT_STAGES.contains(&stage)
 }
 
 #[cfg(test)]
@@ -179,6 +191,7 @@ mod tests {
                 engine_stage::PANIC,
                 engine_stage::TIMEOUT,
                 engine_stage::ENGINE_GONE,
+                engine_stage::ASSET_IO,
                 PATH_ALIAS,
                 ENTRY_METADATA,
                 COMPRESSION,
@@ -186,17 +199,11 @@ mod tests {
                 FILE_SIZE_FALLBACK,
             ],
             "a stage that reaches a durable store must be classified on purpose. Refused today: \
-             the three transient engine stages, plus the machine conditions (`entry_metadata`, \
-             `compression`) and the three stages that never ride an ImportResult (`path_alias`, \
-             `protocol`, `file_size_fallback`) — refusing an aggregate-only stage costs nothing, \
-             because no result carries one into a cache"
+             the transient analysis stages and the three stages that never ride an ImportResult \
+             (`path_alias`, `protocol`, `file_size_fallback`)"
         );
 
-        for stage in engine_stage::ALL
-            .iter()
-            .copied()
-            .filter(|stage| engine_stage::is_transient(stage))
-        {
+        for stage in TRANSIENT_ANALYSIS_STAGES {
             assert!(
                 !may_enter_a_durable_store(stage),
                 "`{stage}` is transient; no durable store may take it (ADR-0006, invariant 3)"

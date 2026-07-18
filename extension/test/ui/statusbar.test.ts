@@ -84,8 +84,8 @@ test("an incomplete total is a floor, and the status bar refuses to call it a Fi
   assert.equal(statusBarText(state), "IL: ~118.0 kB br");
   assert.equal(
     statusBarTooltip(state),
-    "Import Lens: File Cost floor (~118.0 kB br) — an import that belongs in this file's total was \
-not measured, so the number is a floor and not the file's size. Budget not evaluated.",
+    "Import Lens: File Cost floor (~118.0 kB br) — bytes that belong in this file's total were not \
+measured, so the number is a floor and not the file's size. Budget not evaluated.",
   );
 });
 

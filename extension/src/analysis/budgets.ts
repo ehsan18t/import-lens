@@ -2,7 +2,7 @@ import type { SourceRange } from "../ipc/protocol.js";
 import { formatBytes, measuredSizes } from "../ui/format.js";
 import type { DocumentFileCost } from "./fileSize.js";
 import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
-import { isDurableFileSize } from "./transience.js";
+import { isDurableFileSize, isDurableImportResult } from "./transience.js";
 
 export interface ImportLensBudgets {
   perImportBrotliBytes?: number;
@@ -51,7 +51,7 @@ export const budgetInsightForState = (
   budgets: ImportLensBudgets,
 ): ImportAnalysisInsight | null => {
   const limit = budgets.perImportBrotliBytes;
-  const sizes = measuredSizes(state.result);
+  const sizes = isDurableImportResult(state.result) ? measuredSizes(state.result) : null;
 
   if (limit === undefined || state.status !== "ready" || !sizes || sizes.brotli_bytes <= limit) {
     return null;
@@ -105,7 +105,7 @@ export const budgetViolationsForStates = (
   const fileLimit = budgets.perFileBrotliBytes;
 
   for (const state of states) {
-    const sizes = measuredSizes(state.result);
+    const sizes = isDurableImportResult(state.result) ? measuredSizes(state.result) : null;
 
     if (state.status !== "ready" || !sizes) {
       continue;

@@ -18,12 +18,11 @@ import { hasTransientStage } from "./transience.js";
  *   number*: the combined build failed, so what is on offer is the SUM of the per-import costs, and
  *   a module two imports reach is counted twice. ADR-0004 calls that a Combined Import Cost, an
  *   upper bound, and says it must never be presented as a size.
- * - **`short`** — an import that belongs in the number contributed nothing to it (still building,
- *   unmeasurable, not installed, or a transient failure that reached the aggregate WITHOUT degrading
- *   it — the defensive path), so the number is missing bytes. A transient failure that *degrades* the
- *   aggregate is not short: it is the `combined-import-cost` quantity above, the combined build's own
- *   failure, and the `degraded` axis already reports it. Reading it as short too would claim a missing
- *   contributor that a timed-out combined build does not have.
+ * - **`short`** — bytes that belong in the number are missing (an import is still building,
+ *   unmeasurable, or not installed; or an asset input was temporarily unreadable). A transient
+ *   failure that *degrades* the aggregate is not short: it is the `combined-import-cost` quantity
+ *   above, the combined build's own failure, and the `degraded` axis already reports it. Reading it
+ *   as short too would claim a missing contributor that a timed-out combined build does not have.
  *
  * Both at once is a real state and neither word alone describes it: a fallback sum that is *also*
  * short double-counts some imports and omits others, so it is a bound in neither direction.
@@ -33,7 +32,7 @@ export type FileCostQuantity = "file-cost" | "combined-import-cost";
 export interface FileCostQuality {
   /** The quantity the number IS — not what the surface wishes it were. */
   quantity: FileCostQuantity;
-  /** An import that belongs in the number contributed nothing to it. */
+  /** Some bytes that belong in the number contributed nothing to it. */
   short: boolean;
 }
 
@@ -82,16 +81,16 @@ export const fileCostQuantityName = (quality: FileCostQuality): string => {
  * called it a File Cost "built as one bundle".
  */
 export const fileCostBecause = (quality: FileCostQuality): string => {
-  const missingImport =
-    "an import that belongs in this file's total was not measured, so the number is a floor and not the file's size";
+  const missingBytes =
+    "bytes that belong in this file's total were not measured, so the number is a floor and not the file's size";
   const combinedBuildFailed =
     "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size";
 
   if (quality.quantity === "combined-import-cost") {
     return quality.short
-      ? `${combinedBuildFailed}, and an import that belongs in it was not measured either`
+      ? `${combinedBuildFailed}, and bytes that belong in it were not measured either`
       : combinedBuildFailed;
   }
 
-  return quality.short ? missingImport : "this file's imports built as one bundle";
+  return quality.short ? missingBytes : "this file's imports built as one bundle";
 };

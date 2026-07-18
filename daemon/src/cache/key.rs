@@ -96,9 +96,15 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// resource ceiling and a bounded execution deadline. Cached `+6` measurements may include CSS
 /// `@import` or `url()` resources that escaped the graph limit, so they must be recomputed under the
 /// unified admission rules.
+///
+/// `rolldown-1.1.x+8` (2026-07-18): asset I/O and asset-compressor failures are request-local, not
+/// package facts. Direct relative assets now resolve through the observing plugin, failed reads
+/// retain a never-reusable fingerprint and an `asset_io` stage, and CSS/binary compressor failures
+/// retain `compression`. Cached `+7` resolve failures and disclosed asset floors lack those causes
+/// and could otherwise outlive the filesystem/machine condition that produced them.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+7"
+        "rolldown-1.1.x+8"
     };
 }
 

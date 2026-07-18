@@ -243,14 +243,12 @@ pub struct AssetContribution {
 /// compiler asks the only question a consumer is allowed to ask: **is there a size?** — never "is
 /// there an error?".
 ///
-/// What is **not** unrepresentable — and was claimed to be — is *a size together with a transient
-/// stage*. That shape is REAL: a measurement whose full-package comparison build timed out has
-/// genuine sizes and an untrustworthy `truly_treeshakeable` (`pipeline::analyze`). Deleting it to
-/// satisfy a slogan would delete the only evidence that the tree-shaking verdict is fabricated, and
-/// no type can stop it anyway — `diagnostics` is an open list of open structs whose `stage` is a
-/// `String`. So it is representable, it is named ([`Self::is_transient`]), and the invariant that
-/// keeps it out of every store is enforced **at the stores**, by [`Self::is_durable`], not by a
-/// convention at the call sites.
+/// What is **not** unrepresentable — and was claimed to be — is *a size together with a
+/// request-local stage*. That shape is REAL: a full-package comparison can time out beside genuine
+/// primary sizes, or asset I/O/compression can leave a disclosed partial asset size. Deleting it
+/// would delete the only evidence that the numeric result or its tree-shaking verdict must not
+/// become durable, and no type can stop it anyway — `diagnostics` is an open list whose `stage` is a
+/// `String`. The invariant is therefore enforced **at the stores**, by [`Self::is_durable`].
 ///
 /// Serde note: the sizes are plain `Option<u64>` with **no** `skip_serializing_if` — and neither
 /// have `module_breakdown` or `shared_bytes`, for the same reason. The dominant `Option` pattern in
@@ -344,7 +342,7 @@ impl ImportResult {
     /// **Unmeasured**: the build could not answer. No size, ever — not a zero, not an estimate of
     /// the directory on disk, not the entry file measured alone. The stage says whether that is a
     /// property of the package's bytes (deterministic: `parse`, `link`, `output_shape`, …) or of
-    /// this moment's scheduling (transient: `timeout`, `panic`, `engine_gone`).
+    /// this request's machine/filesystem state (`timeout`, `panic`, `engine_gone`, `asset_io`, …).
     pub fn unmeasured(
         specifier: impl Into<String>,
         stage: &str,
@@ -421,20 +419,19 @@ impl ImportResult {
         self.unmeasured_stage.as_deref()
     }
 
-    /// This result describes **this run of the daemon** rather than the package: either the build
-    /// itself was cancelled/unwound/orphaned, or a secondary build (the full-package comparison)
-    /// was, which fabricates `truly_treeshakeable: false` on an otherwise sound measurement.
+    /// This result describes **this run of the daemon** rather than the package: a build was lost,
+    /// a secondary comparison failed, exact asset bytes were unavailable, or a compressor failed.
     ///
     /// Both are reasons no durable store may take it (ADR-0006, invariant 3) — but they are not the
     /// only ones, so this is not the gate. [`Self::is_durable`] is.
     pub fn is_transient(&self) -> bool {
         self.unmeasured_stage
             .as_deref()
-            .is_some_and(crate::engine::stage::is_transient)
+            .is_some_and(crate::pipeline::stage::is_transient)
             || self
                 .diagnostics
                 .iter()
-                .any(|diagnostic| crate::engine::stage::is_transient(&diagnostic.stage))
+                .any(|diagnostic| crate::pipeline::stage::is_transient(&diagnostic.stage))
     }
 
     /// **The gate every durable store applies** (ADR-0006, invariant 3). A store that outlives the
@@ -442,15 +439,15 @@ impl ImportResult {
     /// result only if this is true, and each of those stores asks *itself*, at the insert, rather
     /// than trusting its callers to have asked.
     ///
-    /// It is an ALLOWLIST over stages, not a denylist of the three transient ones
+    /// It is an ALLOWLIST over stages, not a denylist of the currently-known transient ones
     /// (`pipeline::stage::may_enter_a_durable_store` explains why: `entry_metadata` is a bare
     /// `fs::metadata` failure — transient in fact, and absent from every list of the engine's
     /// transient stages). Both places a stage can hide are checked:
     ///
     /// * the result's own `unmeasured_stage` — the build that could not answer;
-    /// * every diagnostic — which is how a **successful** measurement whose full-package comparison
-    ///   build merely parked is caught, since its `truly_treeshakeable: false` was fabricated by
-    ///   that park and would otherwise be cached as a fact about a healthy package.
+    /// * every diagnostic — which catches both a **successful** primary measurement whose
+    ///   full-package comparison merely parked and a partial asset measurement carrying
+    ///   `asset_io`/`compression`.
     ///
     /// A Measured result with no failure diagnostics is durable, which is the overwhelmingly common
     /// case and the one that must stay fast.
@@ -645,9 +642,10 @@ pub struct FileSizeDocumentResponse {
     pub imports: Vec<ImportResult>,
     pub states: Vec<ImportAnalysisItem>,
     /// These totals are a **floor**, not the file's size: an import that belongs in them was not
-    /// measured — its own build had not landed when the sum was taken (`status: "loading"`), or a
-    /// transient engine failure fabricated the number it carries
-    /// ([`crate::pipeline::file_size::FileSizeComputation::incomplete`]).
+    /// measured — its own build had not landed when the fallback sum was taken, or it was
+    /// Unmeasured ([`crate::pipeline::file_size::FileSizeComputation::incomplete`]). Request-local
+    /// asset omissions also make a displayed total a floor today, but are signalled by their
+    /// diagnostic; D12 tracks folding every asset omission into this structural flag.
     ///
     /// It is on the wire because the client has durable stores of its own (the bundle-impact
     /// history), and neither of the other two fields can tell it this: `error` is `None` — the sum

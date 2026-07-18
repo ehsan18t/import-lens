@@ -63,7 +63,7 @@ test("an incomplete total is a floor and is never named a File Cost", () => {
   assert.equal(fileCostQuantityName(floor), "File Cost floor");
   assert.equal(
     fileCostBecause(floor),
-    "an import that belongs in this file's total was not measured, so the number is a floor and not the file's size",
+    "bytes that belong in this file's total were not measured, so the number is a floor and not the file's size",
   );
 });
 
@@ -96,7 +96,7 @@ test("a degraded total that is also short says both things", () => {
   assert.equal(fileCostQuantityName(both), "Combined Import Cost");
   assert.equal(
     fileCostBecause(both),
-    "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size, and an import that belongs in it was not measured either",
+    "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size, and bytes that belong in it were not measured either",
   );
 });
 

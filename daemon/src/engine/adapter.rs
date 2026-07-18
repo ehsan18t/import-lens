@@ -19,6 +19,7 @@ use super::{
     BundleArtifact, BundleFailure, BundleRequest, ImportDiagnostic, ImportRuntime,
     ModuleContribution, UncountedAsset, diagnostic_stage, entry, stage,
 };
+use crate::cache::key::sort_and_dedup_fingerprints;
 use crate::pipeline::node_builtins::{NODE_BUILTIN_MODULES, NODE_PREFIX_ONLY_MODULES};
 use crate::pipeline::resolver::resolve_options as shared_resolve_options;
 
@@ -69,12 +70,14 @@ impl RolldownEngine {
         let state = plugin.state();
         let output = run_build(options, plugin, &state).await?;
         let chunk = single_chunk(&output, &state)?;
-        let (read_time_fingerprints, unhashed_paths) = state.read_time_fingerprints();
+        let (read_time_fingerprints, unhashed_paths) = build_observations(&state);
+        let mut diagnostics = contract_diagnostics(&output.warnings);
+        diagnostics.extend(asset_io_diagnostic(&state));
 
         Ok(ExportEnumeration {
             names: chunk.exports.iter().map(|name| name.to_string()).collect(),
             // A successful build's warnings used to be dropped on the floor.
-            diagnostics: contract_diagnostics(&output.warnings),
+            diagnostics,
             read_time_fingerprints,
             loaded_paths: state.sorted_loaded_paths(),
             unhashed_paths,
@@ -91,6 +94,34 @@ fn rolldown_entry_path(path: &Path) -> String {
         .strip_prefix("//?/")
         .unwrap_or(&normalized)
         .to_owned()
+}
+
+fn build_observations(
+    state: &BuildState,
+) -> (Vec<crate::cache::key::FileFingerprint>, Vec<PathBuf>) {
+    let (mut fingerprints, unhashed_paths) = state.read_time_fingerprints();
+    fingerprints.extend(state.unverifiable_asset_fingerprints());
+    sort_and_dedup_fingerprints(&mut fingerprints);
+    (fingerprints, unhashed_paths)
+}
+
+fn asset_io_diagnostic(state: &BuildState) -> Option<ImportDiagnostic> {
+    let paths = state.failed_asset_paths();
+    if paths.is_empty() {
+        return None;
+    }
+    let names = paths
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(ImportDiagnostic {
+        stage: stage::ASSET_IO.to_owned(),
+        message: format!(
+            "supported asset input(s) could not be read during this analysis; retry after the \
+             filesystem settles: {names}"
+        ),
+    })
 }
 
 /// Fixed build options (spec §7.1). Everything not set here intentionally
@@ -207,6 +238,7 @@ fn translate(
 
     let emitted = emitted_assets(&output);
     let mut diagnostics = contract_diagnostics(&output.warnings);
+    diagnostics.extend(asset_io_diagnostic(state));
     diagnostics.extend(uncounted_assets_diagnostic(&emitted));
     for import in &chunk.imports {
         diagnostics.push(ImportDiagnostic {
@@ -223,7 +255,7 @@ fn translate(
     // `reported_side_effects` nobody else read. Both are gone. Rolldown still owns retention
     // (FR-021); the daemon only reports what the package declared about the entry it measured.
 
-    let (read_time_fingerprints, unhashed_paths) = state.read_time_fingerprints();
+    let (read_time_fingerprints, unhashed_paths) = build_observations(state);
 
     Ok(BundleArtifact {
         code: chunk.code.clone(),
@@ -263,16 +295,29 @@ fn single_chunk(
         }
     }
     if chunks.len() != 1 {
-        return Err(BundleFailure {
-            stage: stage::OUTPUT_SHAPE.to_owned(),
-            message: format!(
+        let mut diagnostics = contract_diagnostics(&output.warnings);
+        let asset_io = asset_io_diagnostic(state);
+        diagnostics.extend(asset_io.clone());
+        let message = asset_io.map_or_else(
+            || {
+                format!(
                 "expected exactly one JavaScript chunk, got {}; a split graph cannot be measured \
                  from one chunk without under-reporting the rest",
                 chunks.len()
-            ),
-            diagnostics: contract_diagnostics(&output.warnings),
+                )
+            },
+            |diagnostic| diagnostic.message,
+        );
+        return Err(BundleFailure {
+            stage: if state.failed_asset_paths().is_empty() {
+                stage::OUTPUT_SHAPE.to_owned()
+            } else {
+                stage::ASSET_IO.to_owned()
+            },
+            message,
+            diagnostics,
             loaded_paths: state.sorted_loaded_paths(),
-            read_time_fingerprints: Vec::new(),
+            read_time_fingerprints: build_observations(state).0,
         });
     }
     Ok(chunks.remove(0))
@@ -337,7 +382,18 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
     // contain is the module that failed to parse — which is precisely the one a cached failure has
     // to expire against. The read-time map is populated in `load`, before Rolldown parses anything,
     // so it has every module whose bytes this build actually read.
-    let (read_time_fingerprints, _) = state.read_time_fingerprints();
+    let (read_time_fingerprints, _) = build_observations(state);
+    if let Some(asset_io) = asset_io_diagnostic(state) {
+        let mut diagnostics = contract_diagnostics(&diagnostics);
+        diagnostics.push(asset_io.clone());
+        return BundleFailure {
+            stage: stage::ASSET_IO.to_owned(),
+            message: asset_io.message,
+            diagnostics,
+            loaded_paths,
+            read_time_fingerprints,
+        };
+    }
     // A breach preempts every diagnostic below, and the ranking agrees: `MODULE_GRAPH_LIMIT` is the
     // first deterministic stage in `engine::stage`, because a blown graph limit is a fact about the
     // WHOLE build — it was too big to complete — and not about any one module in it. The two used to
@@ -369,6 +425,7 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
         .map(stage_for)
         .min_by_key(|candidate| stage::rank(candidate))
         .unwrap_or(stage::LINK);
+    let (read_time_fingerprints, _) = build_observations(state);
     // Rendered from the SAME ordering, for the same reason: the message and the diagnostic list are
     // durable values too, and a message whose lines are shuffled by task timing is a different
     // cached answer for unchanged bytes.

@@ -103,14 +103,17 @@ fn is_import_budget_violation(
     item: &WorkspaceReportItem,
     budgets: &WorkspaceReportBudgets,
 ) -> bool {
-    match (measured_brotli(item), budgets.per_import_brotli_bytes) {
+    match (budgetable_brotli(item), budgets.per_import_brotli_bytes) {
         (Some(brotli_bytes), Some(limit)) => brotli_bytes > limit,
         _ => false,
     }
 }
 
-fn measured_brotli(item: &WorkspaceReportItem) -> Option<u64> {
-    item.result.as_ref().and_then(ImportResult::brotli_bytes)
+fn budgetable_brotli(item: &WorkspaceReportItem) -> Option<u64> {
+    item.result
+        .as_ref()
+        .filter(|result| result.is_durable())
+        .and_then(ImportResult::brotli_bytes)
 }
 
 fn row_for_item(
@@ -198,7 +201,7 @@ fn warning_for_item(item: &WorkspaceReportItem, budgets: &WorkspaceReportBudgets
     }
     if is_import_budget_violation(item, budgets)
         && let (Some(brotli_bytes), Some(limit)) =
-            (measured_brotli(item), budgets.per_import_brotli_bytes)
+            (budgetable_brotli(item), budgets.per_import_brotli_bytes)
     {
         warnings.push(format!(
             "Budget exceeded: {brotli_bytes} B br > {limit} B br"
@@ -501,6 +504,31 @@ mod tests {
             .find(|row| row.specifier == "big")
             .expect("violating row");
         assert!(violating_row.warning.contains("Budget exceeded"));
+    }
+
+    #[test]
+    fn a_transient_asset_floor_does_not_produce_a_report_budget_verdict() {
+        let mut floor = ok_result("asset-lib", 20);
+        floor
+            .diagnostics
+            .push(crate::ipc::protocol::ImportDiagnostic {
+                stage: "asset_io".to_owned(),
+                message: "a stylesheet dependency could not be read".to_owned(),
+                details: Vec::new(),
+            });
+        let items = vec![report_item("asset-lib", 0, "src/a.ts", Some(floor))];
+        let budgets = WorkspaceReportBudgets {
+            per_import_brotli_bytes: Some(10),
+        };
+
+        let row_set = build_report_rows(&items, &budgets);
+        let summary = build_report_summary(&row_set);
+
+        assert_eq!(summary.budget_violation_count, 0);
+        assert!(
+            !row_set.rows[0].warning.contains("Budget exceeded"),
+            "the report may show the disclosed floor but must not judge it"
+        );
     }
 
     /// ADR-0006 §6: `.flatten().unwrap_or_default()` on these fields compiles and prints **"0 B"**

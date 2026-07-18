@@ -187,7 +187,7 @@ export const runImportLensCheck = async ({
       writeLine(unmeasurableLine(item));
     }
     writeLine(
-      "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+      "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
     );
     return EXIT_COULD_NOT_MEASURE;
   }
@@ -340,6 +340,12 @@ export const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => 
       const stage = item.unmeasured_stage ?? "unknown";
       return { specifier: item.specifier, stage, transient: transientStages.has(stage) };
     });
+  const nonDurableMeasurements = measured.flatMap((item) => {
+    const stages = nonDurableImportStages(item);
+    return stages.length === 0
+      ? []
+      : [{ specifier: item.specifier, stage: stages.join("/"), transient: true }];
+  });
 
   return {
     filePath,
@@ -353,11 +359,13 @@ export const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => 
     // And for "the file's own combined build failed", which `incomplete` cannot see at all.
     degraded: response.degraded === true,
     diagnostics: response.diagnostics ?? [],
-    unmeasured,
-    imports: measured.map((item) => ({
-      specifier: item.specifier,
-      brotliBytes: item.brotli_bytes,
-    })),
+    unmeasured: [...unmeasured, ...nonDurableMeasurements],
+    imports: measured
+      .filter((item) => nonDurableImportStages(item).length === 0)
+      .map((item) => ({
+        specifier: item.specifier,
+        brotliBytes: item.brotli_bytes,
+      })),
   };
 };
 
@@ -412,25 +420,68 @@ export const fileCostQuality = (response) => ({
 export const isFileCost = (quality) => quality.quantity === "file-cost" && !quality.short;
 
 export const fileCostBecause = (quality) => {
-  const missingImport =
-    "an import that belongs in this file's total was not measured, so the number is a floor and not the file's size";
+  const missingBytes =
+    "bytes that belong in this file's total were not measured, so the number is a floor and not the file's size";
   const combinedBuildFailed =
     "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size";
 
   if (quality.quantity === "combined-import-cost") {
     return quality.short
-      ? `${combinedBuildFailed}, and an import that belongs in it was not measured either`
+      ? `${combinedBuildFailed}, and bytes that belong in it were not measured either`
       : combinedBuildFailed;
   }
 
-  return quality.short ? missingImport : "this file's imports built as one bundle";
+  return quality.short ? missingBytes : "this file's imports built as one bundle";
 };
 
-// Mirrors `stage::is_transient` in daemon/src/engine/mod.rs (and `transientEngineStages` in
-// extension/src/analysis/transience.ts). The three of them are kept in step by the drift check in
+// Mirrors `TRANSIENT_ANALYSIS_STAGES` in daemon/src/pipeline/stage.rs (and
+// `transientAnalysisStages` in extension/src/analysis/transience.ts). The three copies are kept in
+// step by the drift check in
 // scripts/test/engine-stage-coordination.test.mjs: a stage the daemon will not cache is a stage
 // this gate must not judge from.
-const transientStages = new Set(["timeout", "panic", "engine_gone"]);
+const transientStages = new Set([
+  "panic",
+  "timeout",
+  "engine_gone",
+  "entry_metadata",
+  "asset_io",
+  "compression",
+]);
+
+// Mirrors `DURABLE_RESULT_STAGES` in daemon/src/pipeline/stage.rs and
+// `durableResultStages` in extension/src/analysis/transience.ts. This is an allowlist so a newly
+// introduced diagnostic cannot be persisted or judged until every process classifies it.
+const durableResultStages = new Set([
+  "resolve",
+  "parse",
+  "link",
+  "generate",
+  "output_shape",
+  "module_graph_limit",
+  "missing_export",
+  "ambiguous_export",
+  "external",
+  "uncounted_assets",
+  "imprecise_assets",
+  "package_validation",
+  "package_resolution",
+  "package_manifest",
+  "entry_resolution",
+  "oversized_entry",
+  "minify",
+  "types_only",
+  "native_binary_only",
+  "native_binary",
+]);
+
+const nonDurableImportStages = (result) =>
+  [
+    ...(typeof result.unmeasured_stage === "string" ? [result.unmeasured_stage] : []),
+    ...(result.diagnostics ?? []).map((diagnostic) => diagnostic.stage),
+  ]
+    .filter((stage) => !durableResultStages.has(stage))
+    .filter((stage, index, stages) => stages.indexOf(stage) === index)
+    .sort();
 
 const startDaemon = async (workspaceRoot) => {
   const target = platformTarget();

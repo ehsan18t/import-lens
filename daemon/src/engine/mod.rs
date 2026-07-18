@@ -201,13 +201,12 @@ pub mod stage {
     // DECLARATION ORDER IS RANK ORDER. Adding a stage means deciding where the build reaches it,
     // and nothing else; see `rank`.
     stages! {
-        // ---- The build did not happen. --------------------------------------------------------
+        // ---- The build produced no reusable answer. ------------------------------------------
         //
-        // These three are not stages the build reached — they are the build being LOST, and they
-        // preempt everything below because nothing below ever ran. Ranking them first is what makes
-        // it impossible for a deterministic failure to outrank a transient one and so present a
-        // scheduling accident as a fact about the package's bytes — the one that must be cacheable
-        // and the other that must never be (ADR-0006, invariant 3).
+        // The first three are not stages the build reached — they are the build being LOST. The
+        // fourth means a supported asset's exact bytes could not be observed. All four preempt a
+        // deterministic module diagnostic because presenting a request-local failure as a fact
+        // about the package's bytes would make it durable (ADR-0006, invariant 3).
         //
         // Today they cannot even compete: each is constructed in `boundary.rs` at a point where the
         // build's diagnostics do not exist (a panic unwinds straight past `classify_failure`; a
@@ -222,6 +221,10 @@ pub mod stage {
         TIMEOUT => "timeout",
         /// The engine runtime dropped the build without replying.
         ENGINE_GONE => "engine_gone",
+        /// A supported asset input could not be observed as exact readable bytes. A concurrent
+        /// install, file lock, permission blip, or missing file can all recover without any input
+        /// the failed build fingerprinted changing.
+        ASSET_IO => "asset_io",
 
         // ---- The build was abandoned. ----------------------------------------------------------
         //
@@ -284,13 +287,13 @@ pub mod stage {
     /// is ranked by where the build reaches it. We do not claim to know which failure a user would
     /// rather hear about.
     ///
-    /// **Four stages are not ranked by where the build reaches them, because the build never reached
-    /// them.** The three transients are the build being LOST and `module_graph_limit` is the build
-    /// being ABANDONED; none is a thing that happened *to a module*, and each is the reason there is
-    /// no answer at all. They lead the order for that reason, not because they occur early — the
-    /// breach is in fact *detected* in the `load` hook, after resolve. Ranking a module's diagnostic
-    /// ahead of one of them would report the shrapnel of a build that was never going to finish, and
-    /// hide the cause. Every other stage is a position in a build that was genuinely running.
+    /// **Five outcomes are ranked by whole-build meaning rather than module-phase order.** `panic`,
+    /// `timeout`, and `engine_gone` mean the build was LOST; `asset_io` means its exact asset inputs
+    /// were not observable; and `module_graph_limit` means it was ABANDONED. Each is the reason no
+    /// reusable answer exists. They lead the order for that reason, not because they occur early —
+    /// the asset read and graph breach are both detected in `load`, after resolve. Ranking a module
+    /// diagnostic ahead of one would report its shrapnel and hide the request-local/whole-build
+    /// cause. Every other stage is a position in a build that was genuinely running.
     ///
     /// A stage outside the vocabulary sorts last. `adapter::stage_for` can only return a declared
     /// one, so that arm is unreachable from the ranking's only caller; it is here so the order is
@@ -306,10 +309,9 @@ pub mod stage {
     ///
     /// A `parse`/`link`/`resolve`/`output_shape`/`module_graph_limit` failure is a property of
     /// the code being measured: it will fail the same way next time, so the degraded result it
-    /// produces is worth caching. These three are not. A build that was cancelled at the
-    /// deadline, unwound, or lost its runtime tells us nothing about the package, so storing what
-    /// it produced makes a scheduling accident durable — and durable is forever, next to a build
-    /// that would have succeeded on the retry nobody will now run.
+    /// produces is worth caching. These four are not. A build that was cancelled at the deadline,
+    /// unwound, lost its runtime, or could not observe an asset input tells us nothing reusable
+    /// about the package, so storing what it produced makes a machine/filesystem accident durable.
     ///
     /// This is the ENGINE's list, and it is not by itself the cache gate: a stage can be transient
     /// in fact without being an engine stage at all (`pipeline::stage::ENTRY_METADATA` is
@@ -322,7 +324,7 @@ pub mod stage {
     /// The list is mirrored in the extension and the CLI, which cannot import it, under a drift
     /// check (`scripts/test/engine-stage-coordination.test.mjs`).
     pub fn is_transient(stage: &str) -> bool {
-        matches!(stage, TIMEOUT | PANIC | ENGINE_GONE)
+        matches!(stage, TIMEOUT | PANIC | ENGINE_GONE | ASSET_IO)
     }
 }
 

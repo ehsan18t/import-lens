@@ -3512,6 +3512,14 @@ fn creating_a_missing_css_import_child_invalidates_the_cached_fallback() {
             .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
         "the missing child must produce the disclosed CSS fallback: {missing:?}"
     );
+    assert!(
+        missing.imports[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "asset_io"),
+        "the wire result must say that this fallback came from a non-durable filesystem failure: \
+         {missing:?}"
+    );
 
     fs::write(
         package_root.join("created-later.css"),
@@ -3531,5 +3539,183 @@ fn creating_a_missing_css_import_child_invalidates_the_cached_fallback() {
     assert!(
         !created.imports[0].cache_hit,
         "an unreadable input must never make its fallback look fresh: {created:?}"
+    );
+}
+
+/// A direct asset is read in the engine plugin before Rolldown sees it. If that read fails after
+/// metadata succeeded, handing the path back without retaining the failed observation lets the
+/// resulting fallback/failure cache against only the manifest and JavaScript entry. The read can
+/// recover without either changing, so that machine-dependent outcome must never become durable.
+#[test]
+fn a_direct_asset_read_failure_does_not_enter_the_import_cache() {
+    let workspace = temp_workspace();
+    let package_root = workspace
+        .join("node_modules")
+        .join("temporarily-unreadable-asset-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":true}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "import './font.woff2';\nexport const value = 1;\n",
+    )
+    .expect("entry should be written");
+
+    // A directory has readable metadata but cannot be read as file bytes on every supported OS.
+    // It deterministically exercises the stat-succeeds/read-fails race without permissions or an
+    // antivirus-specific test hook.
+    let font = package_root.join("font.woff2");
+    fs::create_dir(&font).expect("unreadable-as-a-file asset should be created");
+
+    let service = ImportLensService::new(None, false);
+    let first = service.handle_batch(package_batch(
+        &workspace,
+        1,
+        "temporarily-unreadable-asset-lib",
+        "value",
+    ));
+    let repeated = service.handle_batch(package_batch(
+        &workspace,
+        2,
+        "temporarily-unreadable-asset-lib",
+        "value",
+    ));
+    assert!(!first.imports[0].cache_hit, "{first:?}");
+    assert!(
+        !repeated.imports[0].cache_hit,
+        "a filesystem read failure describes this attempt, not package bytes: {repeated:?}"
+    );
+    assert!(
+        first.imports[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "asset_io"),
+        "the private failed-read fingerprint must also have a wire-visible durability signal: \
+         {first:?}"
+    );
+
+    fs::remove_dir(&font).expect("temporary directory asset should be removed");
+    fs::write(&font, [0x51; 64]).expect("readable font should replace it");
+    let recovered = service.handle_batch(package_batch(
+        &workspace,
+        3,
+        "temporarily-unreadable-asset-lib",
+        "value",
+    ));
+    let healthy_repeat = service.handle_batch(package_batch(
+        &workspace,
+        4,
+        "temporarily-unreadable-asset-lib",
+        "value",
+    ));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(!recovered.imports[0].cache_hit, "{recovered:?}");
+    assert!(
+        recovered.imports[0]
+            .asset_breakdown
+            .iter()
+            .any(|asset| asset.kind == import_lens_daemon::engine::AssetKind::Font),
+        "fixing only the failed asset read must recover immediately: {recovered:?}"
+    );
+    assert!(
+        healthy_repeat.imports[0].cache_hit,
+        "the regression must not pass by disabling this import's cache entirely: {healthy_repeat:?}"
+    );
+}
+
+/// Recording every asset-looking resolve candidate would poison a deterministic failure caused by
+/// some other module: the healthy asset has exact bytes and does not make the missing JavaScript
+/// dependency transient. Only an asset path whose own resolution/read failed may do that.
+#[test]
+fn a_healthy_asset_does_not_make_an_unrelated_resolve_failure_non_cacheable() {
+    let workspace = temp_workspace();
+    let package_root = workspace
+        .join("node_modules")
+        .join("healthy-asset-broken-js-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":true}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "import './font.woff2';\nimport './missing.js';\nexport const value = 1;\n",
+    )
+    .expect("entry should be written");
+    fs::write(package_root.join("font.woff2"), [0x51; 64]).expect("healthy font should be written");
+
+    let service = ImportLensService::new(None, false);
+    let first = service.handle_batch(package_batch(
+        &workspace,
+        1,
+        "healthy-asset-broken-js-lib",
+        "value",
+    ));
+    let repeated = service.handle_batch(package_batch(
+        &workspace,
+        2,
+        "healthy-asset-broken-js-lib",
+        "value",
+    ));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(first.imports[0].unmeasured_stage(), Some("resolve"));
+    assert!(
+        repeated.imports[0].cache_hit,
+        "a healthy asset must not make an unrelated deterministic JS resolve failure transient: \
+         {repeated:?}"
+    );
+    assert!(
+        !repeated.imports[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "asset_io"),
+        "only an actual asset failure earns the asset_io stage: {repeated:?}"
+    );
+}
+
+#[test]
+fn direct_asset_observation_preserves_the_client_browser_alias() {
+    let workspace = temp_workspace();
+    let package_root = workspace
+        .join("node_modules")
+        .join("browser-aliased-asset-lib");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":true,"browser":{"./font.woff2":"./font-browser.woff2"}}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "import './font.woff2';\nexport const value = 1;\n",
+    )
+    .expect("entry should be written");
+    fs::write(package_root.join("font.woff2"), [0x11; 64]).expect("server font should be written");
+    fs::write(package_root.join("font-browser.woff2"), [0x22; 4096])
+        .expect("browser font should be written");
+
+    let service = ImportLensService::new(None, false);
+    let response = service.handle_batch(package_batch(
+        &workspace,
+        1,
+        "browser-aliased-asset-lib",
+        "value",
+    ));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let font = response.imports[0]
+        .asset_breakdown
+        .iter()
+        .find(|asset| asset.kind == import_lens_daemon::engine::AssetKind::Font)
+        .expect("the browser-mapped font should be measured");
+    assert_eq!(
+        font.raw_bytes, 4096,
+        "the observing hook must delegate to the configured browser-aware resolver: {response:?}"
     );
 }

@@ -189,7 +189,7 @@ impl FileSizeComputation {
             && !self
                 .diagnostics
                 .iter()
-                .any(|item| crate::engine::stage::is_transient(&item.stage))
+                .any(|item| crate::pipeline::stage::is_transient(&item.stage))
     }
 
     /// Fold one runtime group's conservative per-import sum into the file's totals, and report
@@ -730,7 +730,7 @@ fn per_import_totals(
                 .unmeasured_stage()
                 .unwrap_or(crate::pipeline::stage::FILE_SIZE_FALLBACK);
             let mut details = vec![specifier];
-            details.push(if crate::engine::stage::is_transient(stage) {
+            details.push(if crate::pipeline::stage::is_transient(stage) {
                 "this import's own build failed transiently, so its bytes are unknown for this run \
                  and the file's total is a floor"
                     .to_owned()

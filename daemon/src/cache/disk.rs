@@ -277,7 +277,9 @@ impl DiskCache {
         // other way — would be decoded, served, and re-promoted into L1 forever, and every read
         // path (`get_with_freshness`, and the prewarm's `load_recent`) goes through here. Refusing
         // and removing it costs one rebuild.
-        if !cached.result.is_durable() {
+        if !cached.result.is_durable()
+            || !crate::cache::key::fingerprints_are_reusable(&cached.dependency_fingerprints)
+        {
             crate::logging::log_debug(
                 "cache",
                 format!(
@@ -352,7 +354,9 @@ impl DiskCache {
         if self.db_read().is_none() {
             return Ok(());
         }
-        if !cached.result.is_durable() {
+        if !cached.result.is_durable()
+            || !crate::cache::key::fingerprints_are_reusable(&cached.dependency_fingerprints)
+        {
             crate::logging::log_debug(
                 "cache",
                 format!(
@@ -1891,6 +1895,41 @@ mod tests {
         assert!(
             disk.get("v4:react:healthy").is_some(),
             "a durable row must still hydrate"
+        );
+
+        drop(disk);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreusable_dependency_observation_never_enters_or_leaves_l2() {
+        use super::DiskCache;
+
+        let dir = std::env::temp_dir().join(format!(
+            "il-l2-unverifiable-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let disk = DiskCache::new(Some(dir.clone()), true);
+        let mut cached = sample_cached(9);
+        cached.dependency_fingerprints = vec![crate::cache::key::unverifiable_file_fingerprint(
+            "/pkg/unreadable.woff2",
+        )];
+
+        disk.insert("v4:asset:current", &cached)
+            .expect("refusing an unverifiable write is not an error");
+        disk.flush_pending_inserts();
+        assert!(
+            disk.get("v4:asset:current").is_none(),
+            "the L2 write boundary must keep no request-local observation"
+        );
+
+        disk.write_ungated_for_test("v4:asset:legacy", &cached)
+            .expect("simulate a pre-fix row");
+        disk.flush_pending_inserts();
+        assert!(
+            disk.get("v4:asset:legacy").is_none(),
+            "the L2 read boundary must evict a pre-fix unverifiable observation"
         );
 
         drop(disk);

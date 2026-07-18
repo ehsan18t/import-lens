@@ -194,11 +194,10 @@ export interface FileSizeDocumentResponse {
   zstd_bytes: number;
   imports: ImportResult[];
   states: ImportAnalysisItem[];
-  // The totals are a FLOOR, not the file's size: an import that belongs in them was never
-  // measured — its own build had not landed (`status: "loading"`), or a transient engine failure
-  // fabricated the size it carries. Safe to show with the diagnostics that say so (FR-024a),
-  // never safe to record as a historical data point (FR-026c). Absent from an older daemon, which
-  // is why it is optional; read it as `incomplete === true`.
+  // The totals are a FLOOR, not the file's size: an import that belongs in a fallback sum was never
+  // measured. Request-local asset omissions are additionally refused through their diagnostic
+  // (D11); D12 tracks making every asset omission set this structural flag too. Safe to show, never
+  // safe to record as history (FR-026c). Optional for older daemons; read as `=== true`.
   incomplete?: boolean;
   // The file's OWN combined build failed, so these totals are an un-deduplicated sum of the
   // per-import costs — a *different quantity* from a File Cost (ADR-0004), and an OVER-count.

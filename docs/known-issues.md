@@ -188,31 +188,42 @@ large enough for that to matter, and a tree that breaches the budget is refused 
 is recorded as a property of the bound rather than treated as a hole in it.
 
 ### D11: An asset the daemon could not read is disclosed, and that disclosure is cached
-**Status: Accepted** · A disclosed undercount that outlives its cause · Found by the B2 branch review
+**Status: Resolved 2026-07-18** · Request-local asset failures never enter durable stores · Found by the B2 branch review
 
 Wasm and font bytes are read from disk after the build. A read that fails for a reason that has nothing to do
 with the package, an antivirus scanner holding the file, or a concurrent `pnpm install` replacing it, puts that
 asset in the uncounted list: its bytes leave the number, a diagnostic says so, and confidence drops to Medium.
 That part is correct and is exactly the pre-B2 floor.
 
-What is imperfect is how long it lasts. `uncounted_assets` may enter a durable store, because the usual reason
-an asset is uncounted is a property of the package's bytes (a `.scss` no CSS parser will take), and refusing to
-cache that would refuse to cache a healthy package forever. A transient read error is indistinguishable from it
-at the point the decision is made, so the undercount is written to disk, and the file's fingerprint still
-matches once the lock clears, so it is served until the analyzer revision moves.
+The durable `uncounted_assets` disclosure remains correct for deterministic processor limits, such as a syntax
+the CSS pipeline cannot accept. The fix gives request-local causes a second, typed stage instead of trying to
+infer durability from the disclosure or from `io::ErrorKind`:
 
-It is recorded rather than fixed because the number is disclosed, not silent, and it is never below what the
-same import reported before B2. Telling the two apart means classifying the io::ErrorKind at the read site and
-refusing only the transient ones from the cache, which is worth doing on its own rather than inside asset
-counting.
+- the engine plugin observes supported asset-looking resolution through Rolldown's self-skipping configured
+  resolver, so browser aliases remain intact and a target that vanishes cannot become a durable-looking
+  `resolve` failure;
+- every direct or CSS-dependency metadata/read failure retains an unverifiable fingerprint and emits
+  `asset_io`; the observation stays sticky even if a later CSS retry succeeds;
+- CSS, font, and wasm compressor failures emit `compression`, and a CSS compressor failure no longer triggers
+  the structurally unrelated per-sheet retry;
+- the daemon caches and build memos, extension histories and budgets, workspace report, and standalone CLI all
+  refuse those request-local stages. The persisted history keys moved to v2 because old rows carry no stage
+  metadata with which to distinguish a pre-fix floor;
+- analyzer revision `rolldown-1.1.x+8` makes pre-fix daemon cache entries unreachable.
 
-### D12: A file total that omits an unreadable asset is not flagged as a floor
-**Status: Accepted** · Pre-B2 parity, not a regression · Found by the B2 branch review
+Focused regressions cover direct-asset recovery followed by a healthy cache hit, missing CSS-child recovery,
+injected CSS/binary compressor failures, every durable-store boundary, histories, editor/report budgets, and a
+CLI run whose File Cost is clean while its per-import asset result is request-local.
+
+### D12: A file total that omits an asset is not structurally flagged as a floor
+**Status: Accepted** · Request-local durability fixed by D11; deterministic omissions remain · Found by the B2 branch review
 
 In the File Cost aggregate, an asset that cannot be processed contributes nothing and the group still reports
-`incomplete: false`. So the total is cacheable and `importlens check` exits 0 against a number that is missing
-real bytes, where `SizedPackage::NotInstalled` raises the floor flag for the same shape (real bytes absent from
-a total).
+`incomplete: false`. D11 now gives request-local read/compressor omissions an `asset_io`/`compression`
+diagnostic, so daemon caches, histories, and budget gates refuse those totals despite the missing wire flag.
+The structural gap remains for deterministic omissions such as unsupported or unparseable stylesheets: their
+durable `uncounted_assets` disclosure leaves the total cacheable and `importlens check` can evaluate a number
+that is missing real bytes, where `SizedPackage::NotInstalled` raises the floor flag for the same shape.
 
 The reason it is not fixed here is that it is a tie with the old behaviour, not a regression: before B2 the
 combined build stubbed every stylesheet and its bytes vanished from a total that was equally cacheable and

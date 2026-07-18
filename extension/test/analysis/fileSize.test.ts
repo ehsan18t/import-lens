@@ -97,7 +97,7 @@ test("a cold document reports the size the daemon measured, named as the floor i
   assert.deepEqual(report, {
     kind: "summary",
     message:
-      "File Cost floor: 1.5 kB br · 5.3 kB min · 2 imports · an import that belongs in this file's total was not measured, so the number is a floor and not the file's size",
+      "File Cost floor: 1.5 kB br · 5.3 kB min · 2 imports · bytes that belong in this file's total were not measured, so the number is a floor and not the file's size",
   });
 });
 

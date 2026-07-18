@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   type BundleImpactHistoryItem,
   bundleImpactHistoryDeltaLabel,
+  bundleImpactHistoryKey,
   bundleImpactHistoryLabel,
   type ImportCostHistoryItem,
   type ImportCostHistorySource,
@@ -62,9 +63,7 @@ test("recordBundleImpactHistory keeps newest entries first under the limit", asy
   await recordBundleImpactHistory(store, sizedDocument(900), "/workspace/src/c.ts", 1_800_000, 2);
 
   assert.deepEqual(
-    store
-      .get<BundleImpactHistoryItem[]>("importLens.bundleImpactHistory", [])
-      .map((entry) => entry.fileName),
+    store.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []).map((entry) => entry.fileName),
     ["/workspace/src/c.ts", "/workspace/src/b.ts"],
   );
 });

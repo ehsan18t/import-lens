@@ -2,21 +2,55 @@ import type { FileSizeDocumentResponse, ImportDiagnostic, ImportResult } from ".
 import { measuredSizes } from "../ui/format.js";
 
 /**
- * The engine failure stages that describe THIS RUN of the daemon rather than the code being
- * measured: a build cancelled at its own deadline, one that unwound, one whose runtime went away.
+ * The analysis stages that describe THIS RUN of the daemon rather than the code being measured: an
+ * engine that was lost, package bytes the filesystem could not expose, or a compressor that failed.
  *
- * Mirrors `stage::is_transient` in `daemon/src/engine/mod.rs`, which is the source of truth; the
- * two are kept in step by a drift check (`scripts/test/engine-stage-coordination.test.mjs`).
+ * Mirrors `TRANSIENT_ANALYSIS_STAGES` in `daemon/src/pipeline/stage.rs`, which is the source of
+ * truth; the two are kept in step by a drift check
+ * (`scripts/test/engine-stage-coordination.test.mjs`).
  *
- * Nothing substitutes a size any more — the fabricator is deleted, and a build these stages ended
- * produces no size at all, which is what makes the *first* shape below safe to detect by simply
- * asking whether there is a size. The stage still matters for the second shape: a result whose sizes
- * are REAL, and whose tree-shaking verdict was decided by a comparison build that timed out. There
- * the stage is the only evidence there is.
+ * Three wire shapes need the stage. A primary build can end with no size; a comparison build can
+ * fail after the primary size was measured; and asset I/O/compression can leave a disclosed partial
+ * size. The latter two still have numbers, so asking only whether a size exists is insufficient for
+ * persistence and budget verdicts.
  */
-export const transientEngineStages: readonly string[] = ["timeout", "panic", "engine_gone"];
+export const transientAnalysisStages: readonly string[] = [
+  "panic",
+  "timeout",
+  "engine_gone",
+  "entry_metadata",
+  "asset_io",
+  "compression",
+];
 
-const transientStages = new Set(transientEngineStages);
+const transientStages = new Set(transientAnalysisStages);
+
+/** Mirrors `pipeline::stage::DURABLE_RESULT_STAGES`. This is an allowlist on purpose: a future
+ * diagnostic is refused from history and budgets until all three processes classify it. */
+export const durableResultStages: readonly string[] = [
+  "resolve",
+  "parse",
+  "link",
+  "generate",
+  "output_shape",
+  "module_graph_limit",
+  "missing_export",
+  "ambiguous_export",
+  "external",
+  "uncounted_assets",
+  "imprecise_assets",
+  "package_validation",
+  "package_resolution",
+  "package_manifest",
+  "entry_resolution",
+  "oversized_entry",
+  "minify",
+  "types_only",
+  "native_binary_only",
+  "native_binary",
+];
+
+const durableStages = new Set(durableResultStages);
 
 /** Exported for {@link ../analysis/fileCostQuality.fileCostQuality}, which asks the same question of
  * an aggregate's diagnostics in order to NAME the number rather than to store it. One definition of
@@ -24,11 +58,11 @@ const transientStages = new Set(transientEngineStages);
 export const hasTransientStage = (diagnostics: readonly ImportDiagnostic[] | undefined): boolean =>
   (diagnostics ?? []).some((diagnostic) => transientStages.has(diagnostic.stage));
 
-const isTransientResult = (result: ImportResult): boolean =>
-  // Two shapes. The result's own failure stage — the build that could not answer. And a transient
-  // stage among the DIAGNOSTICS of an otherwise sound measurement: that is the full-package
-  // comparison build having parked, which fabricates `truly_treeshakeable: false` on a real size.
-  transientStages.has(result.unmeasured_stage ?? "") || hasTransientStage(result.diagnostics);
+const hasOnlyDurableStages = (result: ImportResult): boolean =>
+  (result.unmeasured_stage === null ||
+    result.unmeasured_stage === undefined ||
+    durableStages.has(result.unmeasured_stage)) &&
+  result.diagnostics.every((diagnostic) => durableStages.has(diagnostic.stage));
 
 /**
  * Whether an import result may be written to a store that OUTLIVES it — the persisted import-cost
@@ -38,12 +72,12 @@ const isTransientResult = (result: ImportResult): boolean =>
  * happened.
  *
  * Two refusals. A result with **no size** has nothing to record — the row IS five sizes. And a
- * result the daemon produced under a **transient** failure describes this moment's scheduling, not
+ * result produced under a **request-local** failure describes this machine/filesystem moment, not
  * the package; the daemon refuses to cache it for the same reason (FR-026c), and its caches at
  * least expire. Ours do not.
  */
 export const isDurableImportResult = (result: ImportResult | undefined): result is ImportResult =>
-  result !== undefined && measuredSizes(result) !== null && !isTransientResult(result);
+  result !== undefined && measuredSizes(result) !== null && hasOnlyDurableStages(result);
 
 /**
  * Whether a document's totals are a measurement of **this file**, and so may be written to a durable

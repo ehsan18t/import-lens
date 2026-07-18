@@ -189,6 +189,26 @@ test("the per-import budget is judged per import, File Cost or not", () => {
   );
 });
 
+test("a transient asset floor produces no per-import budget verdict", () => {
+  const state = ready("asset-lib", 2600, 2);
+  state.result?.diagnostics.push({
+    stage: "asset_io",
+    message: "a stylesheet dependency could not be read",
+    details: [],
+  });
+
+  assert.equal(
+    budgetInsightForState(state, { perImportBrotliBytes: 2000 }),
+    null,
+    "a missing asset can move the import to either side of the threshold on retry",
+  );
+  assert.deepEqual(
+    budgetViolationsForStates([state], { perImportBrotliBytes: 2000 }),
+    [],
+    "neither an inline badge nor a Problems-panel verdict may be drawn from the floor",
+  );
+});
+
 test("budgetInsightForState adds distinct inline and hover text for import budget violations", () => {
   assert.deepEqual(
     budgetInsightForState(ready("large-lib", 2600), { perImportBrotliBytes: 2000 }),
