@@ -78,6 +78,45 @@ pub struct UncountedAsset {
     pub bytes: u64,
 }
 
+/// The one sentence every uncounted-asset disclosure uses, wherever the assets came from.
+///
+/// Two producers reach this shape — the engine adapter (an asset Rolldown emitted beside the chunk)
+/// and the asset pipeline (a processor fallback, or a shipped kind outside the counted taxonomy) —
+/// and they had grown separate copies of the same sentence. One definition means the user reads the
+/// same words for the same fact, and a change to how this is phrased cannot land in only one of them.
+///
+/// An asset whose bytes could not be stat'd contributes 0 to the sum, so the total is qualified
+/// rather than stated flatly: understating the shortfall is the failure mode this wording exists to
+/// avoid, and "totalling 0 bytes" reads as though the omission does not matter when the truth is
+/// that its size is unknown.
+pub fn uncounted_assets_message(assets: &[UncountedAsset]) -> String {
+    let disclosed_bytes: u64 = assets.iter().map(|asset| asset.bytes).sum();
+    let total = if assets.iter().all(|asset| asset.bytes > 0) {
+        format!("totalling {disclosed_bytes} bytes")
+    } else if disclosed_bytes > 0 {
+        format!("totalling at least {disclosed_bytes} bytes")
+    } else {
+        "of unknown size".to_owned()
+    };
+    let names = assets
+        .iter()
+        .map(|asset| {
+            asset
+                .path
+                .file_name()
+                .unwrap_or(asset.path.as_os_str())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "package ships {} non-JavaScript asset(s) {total} that this size does NOT include: {names}",
+        assets.len()
+    )
+}
+
 /// What a non-JavaScript module ships as, which decides how it is processed (B2).
 ///
 /// CSS needs a processor (Lightning CSS resolves its `@import` tree and minifies it). A wasm or

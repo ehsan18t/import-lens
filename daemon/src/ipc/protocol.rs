@@ -662,6 +662,17 @@ pub struct FileSizeDocumentResponse {
     pub zstd_bytes: u64,
     pub imports: Vec<ImportResult>,
     pub states: Vec<ImportAnalysisItem>,
+    /// What the five totals above are made of, per non-JavaScript kind — bytes already INSIDE them.
+    ///
+    /// The per-import result has carried this since B2; the file total did not, so the status bar
+    /// and "Show Current File Size" began including stylesheet, wasm and font bytes with no surface
+    /// able to say so. A headline that changes meaning without a way to explain itself is the shape
+    /// this model exists to avoid, so the composition travels with the number.
+    ///
+    /// `#[serde(default)]` because the IPC wire is msgpack NAMED: the field is simply absent for a
+    /// daemon that predates it.
+    #[serde(default)]
+    pub asset_breakdown: Vec<AssetContribution>,
     /// These totals are a **floor**, not the file's size: an import that belongs in a fallback sum
     /// was not measured, or a successful import/combined build disclosed supported asset bytes
     /// that are absent from its five sizes (`uncounted_assets`; see

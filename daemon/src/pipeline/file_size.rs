@@ -5,7 +5,8 @@ use crate::{
     },
     engine::{BundleEntry, BundlePurpose, BundleRequest, boundary},
     ipc::protocol::{
-        ImportDiagnostic, ImportRequest, ImportResult, ImportRuntime, ModuleContribution,
+        AssetContribution, ImportDiagnostic, ImportRequest, ImportResult, ImportRuntime,
+        ModuleContribution,
     },
     pipeline::{
         analyze::{AnalysisContext, engine_selection},
@@ -113,6 +114,13 @@ pub struct FileSizeComputation {
     pub gzip_bytes: u64,
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
+    /// What the totals above are made of, per non-JavaScript kind — already INSIDE the five sizes.
+    ///
+    /// The file headline began including stylesheet, wasm and font bytes without any surface able to
+    /// say so, which is how a status-bar number silently changed meaning. One row per kind, summed
+    /// across every runtime group, because a runtime is an artifact boundary and each group's assets
+    /// were compressed on their own (ADR-0005).
+    pub asset_breakdown: Vec<AssetContribution>,
     /// Bytes that belong in these totals are absent: an import contributed no measurement, or a
     /// successful build disclosed supported `uncounted_assets`. The totals are then a LOWER BOUND
     /// on the file, not the file — safe to show beside the diagnostics that say so (FR-024a: a
@@ -216,7 +224,32 @@ impl FileSizeComputation {
         self.gzip_bytes += fallback.gzip_bytes;
         self.brotli_bytes += fallback.brotli_bytes;
         self.zstd_bytes += fallback.zstd_bytes;
+        self.absorb_asset_breakdown(&fallback.asset_breakdown);
         true
+    }
+
+    /// Merge one source of per-kind asset weight into the file's composition, summing by kind.
+    ///
+    /// Both routes feed this: a runtime group's own combined build, and the per-import fallback a
+    /// degraded group falls back to. A degraded file still has real asset bytes in its total, so
+    /// losing the breakdown exactly when the number is hardest to read would be the wrong trade.
+    fn absorb_asset_breakdown(&mut self, contributions: &[AssetContribution]) {
+        for contribution in contributions {
+            match self
+                .asset_breakdown
+                .iter_mut()
+                .find(|existing| existing.kind == contribution.kind)
+            {
+                Some(existing) => {
+                    existing.raw_bytes += contribution.raw_bytes;
+                    existing.minified_bytes += contribution.minified_bytes;
+                    existing.gzip_bytes += contribution.gzip_bytes;
+                    existing.brotli_bytes += contribution.brotli_bytes;
+                    existing.zstd_bytes += contribution.zstd_bytes;
+                }
+                None => self.asset_breakdown.push(*contribution),
+            }
+        }
     }
 }
 
@@ -599,6 +632,7 @@ fn compute_file_size_with(
             }
         };
         let asset_sizes = assets.total();
+        totals.absorb_asset_breakdown(&assets.contributions);
         totals
             .dependency_fingerprints
             .extend(artifact.read_time_fingerprints.iter().cloned());
@@ -679,6 +713,9 @@ struct PerImportTotals {
     gzip_bytes: u64,
     brotli_bytes: u64,
     zstd_bytes: u64,
+    /// The per-kind composition of the imports in this sum, so a degraded runtime group still tells
+    /// the user what its number is made of.
+    asset_breakdown: Vec<AssetContribution>,
 }
 
 /// A file-level request must degrade to conservative non-deduped per-import totals
@@ -783,6 +820,27 @@ fn per_import_totals(
         totals.gzip_bytes += sizes.gzip_bytes;
         totals.brotli_bytes += sizes.brotli_bytes;
         totals.zstd_bytes += sizes.zstd_bytes;
+        // These asset bytes are already inside `sizes`, so carrying the rows adds nothing to the
+        // total — it only makes the total say what it is made of. This sum does not deduplicate a
+        // stylesheet two imports share (that is precisely what the combined build it fell back FROM
+        // would have done), so the rows read high in the same way and by the same amount as the
+        // number they describe.
+        for contribution in &result.asset_breakdown {
+            match totals
+                .asset_breakdown
+                .iter_mut()
+                .find(|existing| existing.kind == contribution.kind)
+            {
+                Some(existing) => {
+                    existing.raw_bytes += contribution.raw_bytes;
+                    existing.minified_bytes += contribution.minified_bytes;
+                    existing.gzip_bytes += contribution.gzip_bytes;
+                    existing.brotli_bytes += contribution.brotli_bytes;
+                    existing.zstd_bytes += contribution.zstd_bytes;
+                }
+                None => totals.asset_breakdown.push(*contribution),
+            }
+        }
     }
 
     totals
@@ -841,6 +899,64 @@ mod tests {
     use crate::engine::stage;
     use crate::ipc::protocol::{ImportKind, MeasuredSizes};
     use std::path::PathBuf;
+
+    /// Two imports of the same UI kit pull ONE stylesheet, and the combined File Cost bundles it
+    /// once — so Combined Import Cost exceeds File Cost by that sheet. `shared_bytes` is the only
+    /// mechanism that explains such a gap, and it was blind to assets: a stylesheet links as an
+    /// EMPTY module, so the JS contribution walk dropped it and sharing never saw the bytes causing
+    /// the difference the user was looking at.
+    #[test]
+    fn a_stylesheet_two_imports_share_is_counted_as_shared_weight() {
+        let sheet = "/pkg/ui-kit/styles.css".to_owned();
+        let mut first = ImportResult::measured("ui-kit", MeasuredSizes::ZERO);
+        let mut second = ImportResult::measured("ui-kit", MeasuredSizes::ZERO);
+        for result in [&mut first, &mut second] {
+            result.internal_contributions = vec![ModuleContribution {
+                path: sheet.clone(),
+                bytes: 36_000,
+            }];
+        }
+
+        annotate_shared_bytes([
+            (ImportRuntime::Client, &mut first),
+            (ImportRuntime::Client, &mut second),
+        ]);
+
+        assert_eq!(
+            first.shared_bytes,
+            Some(36_000),
+            "a stylesheet both imports pull is shared weight, not weight each carries alone"
+        );
+        assert_eq!(second.shared_bytes, Some(36_000));
+    }
+
+    /// The counterpart: a runtime is an artifact boundary (ADR-0005), so a Server import and a
+    /// Client import each ship their own copy and share nothing. Without this the test above would
+    /// pass just as well on an implementation that ignored the runtime entirely.
+    #[test]
+    fn a_stylesheet_pulled_from_two_runtimes_is_not_shared() {
+        let sheet = "/pkg/ui-kit/styles.css".to_owned();
+        let mut client = ImportResult::measured("ui-kit", MeasuredSizes::ZERO);
+        let mut server = ImportResult::measured("ui-kit", MeasuredSizes::ZERO);
+        for result in [&mut client, &mut server] {
+            result.internal_contributions = vec![ModuleContribution {
+                path: sheet.clone(),
+                bytes: 36_000,
+            }];
+        }
+
+        annotate_shared_bytes([
+            (ImportRuntime::Client, &mut client),
+            (ImportRuntime::Server, &mut server),
+        ]);
+
+        assert_eq!(
+            client.shared_bytes,
+            Some(0),
+            "runtimes ship separate copies"
+        );
+        assert_eq!(server.shared_bytes, Some(0));
+    }
 
     fn request(specifier: &str) -> ImportRequest {
         ImportRequest {

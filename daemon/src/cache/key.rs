@@ -111,9 +111,15 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// exact size budgetable. Cached `+8` entries can therefore be short by an undisclosed image at
 /// High confidence, or carry an omission mislabelled as imprecision — both of which changed
 /// completeness, confidence, and budgetability — so they must be rejected on read.
+/// `rolldown-1.1.x+10` (2026-07-18): two stored values changed meaning. A module whose bytes were
+/// measured but whose read was never fingerprinted is now recorded as UNVERIFIABLE rather than
+/// deferred to a post-analysis stat, so a `+9` entry can pair a size measured from one revision of a
+/// binary module with a hash taken from a later one and answer Fresh forever. And every directly
+/// imported asset is now a module contribution, so `shared_bytes` — carried in the L2 envelope —
+/// accounts for a stylesheet several imports pull, which a `+9` entry computed without.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+9"
+        "rolldown-1.1.x+10"
     };
 }
 

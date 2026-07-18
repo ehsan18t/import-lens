@@ -84,6 +84,9 @@ struct ReadReservation {
 #[derive(Default)]
 struct RetainedSources {
     inputs: Mutex<Vec<*mut String>>,
+    /// Snapshot bytes kept alive for as long as the provider is, so a preloaded stylesheet can be
+    /// handed to Lightning CSS by reference instead of being copied into the arena above.
+    snapshots: Mutex<Vec<Arc<[u8]>>>,
 }
 
 // SAFETY: pointers are inserted once behind the mutex, point to independently boxed strings, and
@@ -101,6 +104,19 @@ impl RetainedSources {
             .push(pointer);
         // SAFETY: `pointer` remains owned by this append-only collection until `Drop`; the boxed
         // allocation is stable even if the pointer vector reallocates.
+        unsafe { &*pointer }
+    }
+
+    /// Borrow an already-read snapshot's bytes for the provider's lifetime, without copying them.
+    fn retain_snapshot(&self, bytes: Arc<[u8]>) -> &[u8] {
+        let pointer: *const [u8] = Arc::as_ptr(&bytes);
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(bytes);
+        // SAFETY: the `Arc` clone is moved into this append-only collection and dropped only with
+        // the provider, so the buffer outlives every borrow handed out here. The pointee is the
+        // Arc's own heap allocation, which does not move when the holding vector reallocates.
         unsafe { &*pointer }
     }
 }
@@ -161,17 +177,14 @@ impl TrackingProvider {
     }
 
     fn new_bounded(entries: &[CollectedAsset], context: Arc<AssetProcessingContext>) -> Self {
-        let mut preloaded = context
-            .snapshots()
-            .into_iter()
+        // Only this attempt's entries. Everything the ledger has already read is looked up ON
+        // DEMAND through the context — copying the whole snapshot map in here made each per-sheet
+        // retry pay for every read before it, which is quadratic in a set that degrades.
+        let preloaded = entries
+            .iter()
+            .cloned()
             .map(|asset| (asset.path.clone(), asset))
             .collect::<BTreeMap<_, _>>();
-        preloaded.extend(
-            entries
-                .iter()
-                .cloned()
-                .map(|asset| (asset.path.clone(), asset)),
-        );
         Self {
             inner: FileProvider::new(),
             retained_sources: RetainedSources::default(),
@@ -209,17 +222,14 @@ impl TrackingProvider {
         content: String,
         context: Arc<AssetProcessingContext>,
     ) -> Self {
-        let mut preloaded = context
-            .snapshots()
-            .into_iter()
+        // Only this attempt's entries. Everything the ledger has already read is looked up ON
+        // DEMAND through the context — copying the whole snapshot map in here made each per-sheet
+        // retry pay for every read before it, which is quadratic in a set that degrades.
+        let preloaded = entries
+            .iter()
+            .cloned()
             .map(|asset| (asset.path.clone(), asset))
             .collect::<BTreeMap<_, _>>();
-        preloaded.extend(
-            entries
-                .iter()
-                .cloned()
-                .map(|asset| (asset.path.clone(), asset)),
-        );
         Self {
             inner: FileProvider::new(),
             retained_sources: RetainedSources::default(),
@@ -372,14 +382,23 @@ impl SourceProvider for TrackingProvider {
         // processing fell back and must not disappear from freshness merely because it had no
         // bytes to hash.
         self.record_read(key.clone(), None);
-        let source = match self.preloaded.get(&key) {
+        // This attempt's own entry first, then anything an earlier attempt already read. Reusing the
+        // ledger's snapshot is what keeps a retry measuring the SAME bytes the union measured, and
+        // what stops it from charging the same file twice.
+        let snapshot = self.preloaded.get(&key).cloned().or_else(|| {
+            self.context
+                .as_ref()
+                .and_then(|context| context.snapshot_for(&key))
+        });
+        let source = match snapshot {
             Some(asset) => {
                 if let Some(context) = &self.context {
-                    context.charge_css_snapshot(asset)?;
+                    context.charge_css_snapshot(&asset)?;
                 }
                 self.reserve(asset.bytes().len())?;
                 self.record_read(key.clone(), Some(asset.fingerprint.clone()));
-                std::str::from_utf8(asset.bytes()).map_err(|error| {
+                let bytes = self.retained_sources.retain_snapshot(asset.bytes_arc());
+                std::str::from_utf8(bytes).map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("stylesheet {} is not UTF-8: {error}", key.display()),
@@ -944,28 +963,9 @@ pub fn uncounted_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
         return None;
     }
 
-    let total_bytes: u64 = processed.uncounted.iter().map(|asset| asset.bytes).sum();
-    let names = processed
-        .uncounted
-        .iter()
-        .map(|asset| {
-            asset
-                .path
-                .file_name()
-                .unwrap_or(asset.path.as_os_str())
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
     Some(ImportDiagnostic {
         stage: diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
-        message: format!(
-            "package ships {} non-JavaScript asset(s) totalling {total_bytes} bytes that could not \
-             be processed, so this size does NOT include them: {names}",
-            processed.uncounted.len()
-        ),
+        message: crate::engine::uncounted_assets_message(&processed.uncounted),
         details: processed.failures.clone(),
     })
 }

@@ -275,8 +275,14 @@ impl AssetProcessingContext {
         self.lock_state().snapshots.get(&canonical).cloned()
     }
 
-    pub(crate) fn snapshots(&self) -> Vec<CollectedAsset> {
-        self.lock_state().snapshots.values().cloned().collect()
+    /// One snapshot by canonical path, for a retry that needs the bytes an earlier attempt read.
+    ///
+    /// Deliberately not a bulk `snapshots()` accessor. Handing out the whole map made every
+    /// per-sheet retry clone every read before it — quadratic in exactly the degraded case the
+    /// retries exist to serve — and no caller ever needed more than the one path it was about to
+    /// open.
+    pub(crate) fn snapshot_for(&self, path: &Path) -> Option<CollectedAsset> {
+        self.lock_state().snapshots.get(path).cloned()
     }
 
     pub(crate) fn read_paths(&self) -> Vec<PathBuf> {
@@ -585,14 +591,14 @@ fn normalized_observations(observations: &[FileFingerprint]) -> Vec<FileFingerpr
     fingerprints
 }
 
+/// Keep the FIRST breach, which is the one that actually stopped the work.
+///
+/// This used to keep the lexicographically smallest message, so the reported limit could name a
+/// later breach that only happened because the first one had already been hit — telling the user
+/// about a symptom while the cause sat behind it. Ordering by content also made the answer depend on
+/// how the messages happened to be spelled.
 fn record_limit(state: &mut BudgetState, message: String) {
-    if state
-        .module_limit_message
-        .as_ref()
-        .is_none_or(|current| message < *current)
-    {
-        state.module_limit_message = Some(message);
-    }
+    state.module_limit_message.get_or_insert(message);
 }
 
 fn limit_io_error(state: &BudgetState) -> std::io::Error {

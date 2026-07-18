@@ -47,6 +47,13 @@ impl CollectedAsset {
         &self.bytes
     }
 
+    /// A second handle on the SAME bytes, for a consumer that must outlive this value without
+    /// copying it. The snapshot is immutable by construction, so sharing it cannot change what was
+    /// measured.
+    pub fn bytes_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
+    }
+
     pub fn raw_bytes(&self) -> u64 {
         self.bytes.len() as u64
     }

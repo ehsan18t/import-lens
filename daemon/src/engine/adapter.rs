@@ -352,27 +352,9 @@ fn uncounted_assets_diagnostic(assets: &[UncountedAsset]) -> Option<ImportDiagno
         return None;
     }
 
-    let total_bytes: u64 = assets.iter().map(|asset| asset.bytes).sum();
-    let names = assets
-        .iter()
-        .map(|asset| {
-            asset
-                .path
-                .file_name()
-                .unwrap_or(asset.path.as_os_str())
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
     Some(ImportDiagnostic {
         stage: diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
-        message: format!(
-            "package ships {} non-JavaScript asset(s) totalling {total_bytes} bytes that this \
-             size does NOT include: {names}",
-            assets.len()
-        ),
+        message: super::uncounted_assets_message(assets),
     })
 }
 

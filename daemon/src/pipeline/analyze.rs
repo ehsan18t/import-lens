@@ -519,7 +519,7 @@ pub(crate) fn analyze_with_rolldown_engine(
     }
 
     let (confidence, confidence_reasons) = engine_confidence(side_effects, &diagnostics);
-    let contributions: Vec<ModuleContribution> = artifact
+    let mut contributions: Vec<ModuleContribution> = artifact
         .contributions
         .iter()
         .map(|contribution| ModuleContribution {
@@ -527,21 +527,34 @@ pub(crate) fn analyze_with_rolldown_engine(
             bytes: contribution.rendered_bytes as u64,
         })
         .collect();
+    // Assets are contributors too, and leaving them out of this list cost two things.
+    //
+    // The breakdown stopped reconciling with its own headline: a stylesheet is linked as an EMPTY
+    // module, so its rendered length is 0 and the JS walk drops it — which is why a CSS-dominant
+    // package could show "top modules" summing to a fraction of the number printed beside them.
+    //
+    // And sharing went blind. `annotate_shared_bytes` unions on (runtime, contribution path), so a
+    // stylesheet two imports both pull was invisible to it, even though the combined File Cost
+    // bundles that sheet ONCE. The user saw Combined Import Cost exceed File Cost with no
+    // explanation, because the one mechanism that explains the gap could not see the bytes causing
+    // it. These rows flow into `internal_contributions`, which the L2 envelope already carries for
+    // exactly this reason, so a cached result shares identically to a freshly measured one.
+    contributions.extend(artifact.assets.iter().map(|asset| ModuleContribution {
+        path: asset.path.to_string_lossy().to_string(),
+        bytes: asset.raw_bytes(),
+    }));
 
     // §8.3: freshness comes from fingerprints captured by the same reads that supplied every
     // measured byte. The plugin owns JavaScript and directly imported asset snapshots; the asset
     // processor owns CSS `@import` children and local resources discovered through `url()`.
-    let mut stat_paths = artifact.unhashed_paths;
-    stat_paths.push(package_root.join("package.json"));
+    let mut stat_paths = vec![package_root.join("package.json")];
     stat_paths.extend(first_party_manifests(context, &artifact.loaded_paths));
-
-    let mut fingerprints = artifact.read_time_fingerprints.clone();
-    fingerprints.extend(assets.freshness_fingerprints());
-    crate::cache::key::sort_and_dedup_fingerprints(&mut fingerprints);
-    let freshness = FingerprintSource::ReadTime {
-        fingerprints,
+    let freshness = import_freshness(
+        artifact.read_time_fingerprints.clone(),
+        &artifact.unhashed_paths,
+        assets.freshness_fingerprints(),
         stat_paths,
-    };
+    );
     let mut loaded_paths = artifact.loaded_paths;
     loaded_paths.extend(assets.read_paths.iter().cloned());
     loaded_paths.sort();
@@ -649,6 +662,42 @@ fn asset_processing_error(
     error.freshness.loaded_paths.dedup();
     error.freshness.stat_paths = artifact.unhashed_paths.clone();
     error
+}
+
+/// §8.3: freshness comes from fingerprints captured by the same reads that supplied every measured
+/// byte. The plugin owns JavaScript and directly imported asset snapshots; the asset processor owns
+/// CSS `@import` children and local resources discovered through `url()`.
+///
+/// `unhashed_paths` are modules whose BYTES ARE IN THE NUMBER but whose read the plugin could not
+/// fingerprint — a binary module Rolldown loaded through its own loader. They are recorded as
+/// **unverifiable**, never as `stat_paths`. `stat_paths` are hashed AFTER the analysis, so a module
+/// rewritten inside the analysis window would pair a size measured from the OLD bytes with a hash of
+/// the NEW ones; every later probe would then match and answer Fresh, serving the stale size until
+/// the file changed again. An unverifiable fingerprint can never be fresh, which is the honest
+/// record for bytes we measured but cannot prove the identity of — and is already what the File Cost
+/// path and the full-package memo do with this same set.
+///
+/// A manifest is a different case and belongs in `stat_paths`: it is a resolution input, not bytes
+/// inside the measured chunk, so a post-analysis hash of it cannot contradict the size.
+fn import_freshness(
+    read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    unhashed_paths: &[PathBuf],
+    asset_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    stat_paths: Vec<PathBuf>,
+) -> FingerprintSource {
+    let mut fingerprints = read_time_fingerprints;
+    fingerprints.extend(
+        unhashed_paths
+            .iter()
+            .cloned()
+            .map(crate::cache::key::unverifiable_file_fingerprint),
+    );
+    fingerprints.extend(asset_fingerprints);
+    crate::cache::key::sort_and_dedup_fingerprints(&mut fingerprints);
+    FingerprintSource::ReadTime {
+        fingerprints,
+        stat_paths,
+    }
 }
 
 fn top_module_contributions(contributions: &[ModuleContribution]) -> Vec<ModuleContribution> {
@@ -761,6 +810,51 @@ fn error_with_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module whose bytes were measured but whose read was never fingerprinted must be recorded
+    /// as unverifiable, NOT deferred to a post-analysis stat.
+    ///
+    /// The stat happens after the analysis window, so if the module is rewritten inside that window
+    /// the stored size describes v1 while the stored hash describes v2 — and because the pair is
+    /// self-consistent, every later probe answers Fresh and serves the stale size until the file
+    /// changes AGAIN. An unverifiable fingerprint can never be fresh, so the result is simply
+    /// recomputed, which is the honest outcome for bytes whose identity we cannot prove.
+    #[test]
+    fn a_measured_but_unfingerprinted_module_is_unverifiable_not_stat_deferred() {
+        let unhashed = PathBuf::from("/pkg/native.node");
+        let manifest = PathBuf::from("/pkg/package.json");
+
+        let freshness = import_freshness(
+            Vec::new(),
+            std::slice::from_ref(&unhashed),
+            Vec::new(),
+            vec![manifest.clone()],
+        );
+
+        let FingerprintSource::ReadTime {
+            fingerprints,
+            stat_paths,
+        } = freshness;
+
+        assert!(
+            !stat_paths.contains(&unhashed),
+            "a measured module must never be deferred to a post-analysis hash: {stat_paths:?}"
+        );
+        assert_eq!(
+            stat_paths,
+            vec![manifest],
+            "only resolution inputs belong in stat_paths"
+        );
+
+        let recorded = fingerprints
+            .iter()
+            .find(|fingerprint| fingerprint.path.contains("native.node"))
+            .expect("the measured module must still reach freshness at all");
+        assert!(
+            crate::cache::key::fingerprint_is_unverifiable(recorded),
+            "it must be unverifiable so the result can never be served as fresh: {recorded:?}"
+        );
+    }
 
     /// Editing a first-party workspace dependency's manifest changes what the bundler
     /// resolves and retains, while none of its source files move. Without the manifest
