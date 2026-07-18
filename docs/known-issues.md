@@ -373,6 +373,82 @@ for zero-byte operations would be more machinery than the risk justifies. The pe
 copy that made retries quadratic **was** fixed: the ledger is now consulted one path at a time
 instead of being cloned per attempt.
 
+### D23: A ledger breach discards an import's JavaScript measurement
+**Status: Deferred** · Mechanism proven, no demonstrated trigger · Found 2026-07-19
+
+The asset resource ledger seeds `unique_files` with the whole JS graph and then checks asset reads
+against the same 2,000-file constant the graph itself is capped by (`asset_budget.rs`,
+`engine/limits.rs`). A package whose graph legally loaded, say, 1,995 modules therefore has five files
+of headroom, and a sixth `@import` child trips the file-count arm. `record_limit` poisons the context,
+so the stylesheet bundle fails at its next checkpoint, and `assets.rs` turns the live failure into an
+`Err` that no caller on the import path degrades — the JavaScript measurement, computed *before* the
+asset stage, is discarded and the import reports Unmeasured. `MODULE_GRAPH_LIMIT` is durable, so the
+verdict is cached.
+
+Not fixed now: two independent verification passes agreed on every mechanical link and neither could
+construct a triggering package — it needs a graph landing in the narrow band `(2000-K, 2000]`, and
+above 2,000 the build already fails identically. The user sees "Size unavailable" instead of a JS
+number plus a disclosure, which is deterministic given the bytes, so caching it is self-consistent
+rather than the transient-cached-durably defect. That is neither a wrong number nor a wedge, so it
+does not meet the fix-now bar — but it **is** below the pre-B2 floor FR-018a promises, which is why it
+is Deferred rather than Accepted. The fix is to disclose on breach instead of discarding, in the same
+place `file_size.rs` already degrades the File Cost aggregate.
+
+### D24: A non-asset loader suffix still fails the build
+**Status: Accepted** · Scope of the 2026-07-19 fix
+
+A module id carrying a loader suffix is stripped before classification only when the stripped path
+classifies as an asset. `./data.json?raw` or `./Component.svelte?raw` therefore still reach Rolldown
+as a literal path the filesystem rejects, and the package goes unmeasurable.
+
+Deliberate. Stripping unconditionally claims ids that Rolldown owns: its proxy and helper modules
+carry suffixed ids too, the file behind the stripped path exists, and the load hook then hands
+Rolldown source for a module it did not ask us to load. That regressed six file-size tests when
+attempted, which is how the narrowing was chosen. Revisit only with a way to tell a loader suffix from
+a bundler-internal one — the extension allowlist is that discriminator today.
+
+### D25: The status bar cannot say what its number is made of
+**Status: Deferred** · FR-018c requirement 1 · Found 2026-07-19
+
+`listener.ts` builds the status-bar state from `fileCostQuality(response)` alone, and that type carries
+no asset field, so `asset_breakdown` is dropped at the boundary. The always-on-screen total renders as
+a bare figure whose tooltip never mentions that part of it is stylesheet, while the import hover and
+the package.json hover both disclose composition. Clicking the item routes to the log command, so
+there is no affordance either; only the on-demand "Show Current File Size" command shows the
+breakdown.
+
+Nothing false is displayed — this is an incomplete explanation of a correct number, not a wrong one —
+so it is queued rather than fixed. The fix is to widen the status-bar state to carry the composition,
+which is a surface change rather than a model change.
+
+### D26: A lost wakeup can produce a spurious admission timeout
+**Status: Accepted** · Measured 2026-07-19
+
+Asset admission deadlines are absolute from each caller's entry, so concurrent callers hold different
+ones. A waiter woken by `notify_one` that finds its own deadline expired returns `AdmissionTimedOut`
+without re-notifying, and `wait_timeout`'s result is discarded, so a notification-driven wake is
+indistinguishable from a timeout. A second waiter can then sleep to its own deadline with a permit
+sitting free, and its import reports Unmeasured despite available capacity.
+
+Accepted: no permit is leaked — the next caller takes it — and the user gets a disclosed fallback
+rather than a wrong number, so this costs one import one measurement in a narrow interleaving. A
+`notify_all` on the timeout path would close it, at the cost of a thundering herd on a two-permit gate.
+
+### D27: The File Cost cache omits package manifests
+**Status: Deferred** · Pre-dates the asset feature · Found 2026-07-19
+
+The L1 File Cost freshness set carries `read_time_fingerprints`, asset fingerprints and unhashed
+paths, but no package manifests, while the per-import path hashes them via `first_party_manifests`.
+Editing a transitive first-party dependency's `package.json` — flipping `sideEffects`, repointing
+`exports` — changes the measured bytes but leaves the File Cost signature unchanged, and the watcher
+globs only `**/node_modules/*/package.json`, so a real path under `packages/` fires nothing. The stale
+total is served as the headline while the per-import number beside it updates.
+
+Bounded and self-healing: `computed_at_millis` is stamped once at insert and a hit updates only
+`last_used_millis`, so the disagreement lasts at most the 30 s re-verify TTL and cannot be extended by
+polling. Recorded here rather than fixed with the asset work because it is not an asset defect — the
+asset feature added `freshness_fingerprints()` to both paths symmetrically; this asymmetry predates it.
+
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
 
