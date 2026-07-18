@@ -5,7 +5,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -17,14 +17,16 @@ use rolldown::ModuleType;
 use rolldown::plugin::{
     HookLoadArgs, HookLoadOutput, HookLoadReturn, HookNoopReturn, HookResolveIdArgs,
     HookResolveIdOutput, HookResolveIdReturn, HookUsage, Plugin, PluginContext,
-    SharedLoadPluginContext,
+    PluginContextResolveOptions, SharedLoadPluginContext,
 };
 use rolldown_common::{ModuleInfo, NormalModule};
 
 use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
 use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
+use super::{AssetClass, CollectedAsset, UncountedAsset, classify_asset_class};
 use crate::cache::key::{
     FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
+    sort_and_dedup_fingerprints, unverifiable_file_fingerprint,
 };
 
 /// Per-build state shared with the adapter, which reads it after the bundler
@@ -42,9 +44,16 @@ pub(super) struct BuildState {
     canonical: Mutex<HashMap<PathBuf, PathBuf>>,
     total_source_bytes: AtomicUsize,
     limit_breach: Mutex<Option<String>>,
-    /// Non-JavaScript modules the graph imported, and their byte counts. See
-    /// [`ImportLensPlugin::load`] and [`super::diagnostic_stage::UNCOUNTED_ASSETS`].
-    uncounted_assets: Mutex<HashMap<PathBuf, u64>>,
+    /// Classified non-JavaScript modules the graph imported, keyed by canonical path. See
+    /// [`ImportLensPlugin::load`]; the pipeline processes them and counts their shipped bytes (B2).
+    assets: Mutex<HashMap<PathBuf, CollectedAsset>>,
+    /// Classified assets whose metadata or byte read failed in this plugin. Even if Rolldown later
+    /// succeeds through its own loader, that mixed observation describes this filesystem moment,
+    /// not a reusable fact about the package.
+    failed_asset_inputs: Mutex<HashSet<PathBuf>>,
+    /// Directly imported files that ship but are outside the measured taxonomy — an image, an icon.
+    /// Stubbed so they cannot fail the build, and disclosed so their bytes are not silently absent.
+    unmeasured_assets: Mutex<BTreeMap<PathBuf, UncountedAsset>>,
 }
 
 impl BuildState {
@@ -82,20 +91,69 @@ impl BuildState {
         (fingerprints, unhashed)
     }
 
-    /// The non-JavaScript modules this build's graph imported, with their byte counts, sorted for
-    /// a stable diagnostic. Their bytes are NOT in the measured size — the size is the JS chunk —
-    /// and they DO ship with the package, so the adapter discloses them.
-    pub(super) fn sorted_uncounted_assets(&self) -> Vec<(PathBuf, u64)> {
+    /// The classified non-JavaScript modules this build's graph imported, sorted for a stable
+    /// result. Their bytes are NOT in the JavaScript chunk and they DO ship with the package, so
+    /// the pipeline processes them the way they ship and folds the result into the size (B2).
+    pub(super) fn sorted_assets(&self) -> Vec<CollectedAsset> {
         let assets = self
-            .uncounted_assets
+            .assets
             .lock()
-            .expect("uncounted-asset map should not be poisoned");
-        let mut sorted: Vec<(PathBuf, u64)> = assets
-            .iter()
-            .map(|(path, bytes)| (path.clone(), *bytes))
-            .collect();
-        sorted.sort();
+            .expect("asset map should not be poisoned");
+        let mut sorted: Vec<CollectedAsset> = assets.values().cloned().collect();
+        sorted.sort_by(|left, right| left.path.cmp(&right.path));
         sorted
+    }
+
+    /// Returns whether this call is the one that claimed the path. `false` means a duplicate hook
+    /// invocation, whose byte reservation the caller must release — the counted asset map reports
+    /// the same thing for the same reason.
+    fn record_unmeasured_asset(&self, asset: UncountedAsset) -> bool {
+        self.unmeasured_assets
+            .lock()
+            .expect("unmeasured asset map should not be poisoned")
+            .insert(asset.path.clone(), asset)
+            .is_none()
+    }
+
+    /// Disclosed, deduplicated by path so two imports of the same icon are one disclosure.
+    pub(super) fn unmeasured_assets(&self) -> Vec<UncountedAsset> {
+        self.unmeasured_assets
+            .lock()
+            .expect("unmeasured asset map should not be poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn record_failed_asset_input(&self, path: PathBuf) {
+        self.failed_asset_inputs
+            .lock()
+            .expect("failed asset-input set should not be poisoned")
+            .insert(path);
+    }
+
+    pub(super) fn failed_asset_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self
+            .failed_asset_inputs
+            .lock()
+            .expect("failed asset-input set should not be poisoned")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Never-fresh observations that keep a machine-dependent asset failure out of every cache.
+    pub(super) fn unverifiable_asset_fingerprints(&self) -> Vec<FileFingerprint> {
+        let mut fingerprints = self
+            .failed_asset_paths()
+            .into_iter()
+            .map(unverifiable_file_fingerprint)
+            .collect::<Vec<_>>();
+        sort_and_dedup_fingerprints(&mut fingerprints);
+        fingerprints
     }
 
     /// Canonicalize once per build. A path that no longer resolves (deleted
@@ -129,6 +187,12 @@ impl BuildState {
             .take()
     }
 
+    /// Source bytes admitted by this build after every direct-asset reservation has been
+    /// reconciled with the bytes actually read.
+    pub(super) fn graph_source_bytes(&self) -> usize {
+        self.total_source_bytes.load(Ordering::Relaxed)
+    }
+
     /// Keeps the SMALLEST breach message, not the first one to arrive.
     ///
     /// These hooks run on concurrently-spawned module tasks, so "first" means "whichever module the
@@ -139,7 +203,7 @@ impl BuildState {
     /// the user is shown its message. The stage was never in doubt here; the message was. Ordering
     /// by content rather than by arrival makes the whole answer a function of the bytes, which is
     /// the same rule `engine::stage::rank` applies to the diagnostics beside it.
-    fn record_breach(&self, message: &str) {
+    pub(super) fn record_breach(&self, message: &str) {
         let mut breach = self
             .limit_breach
             .lock()
@@ -148,6 +212,135 @@ impl BuildState {
             Some(recorded) if recorded <= message => {}
             _ => *breach = Some(message.to_owned()),
         }
+    }
+
+    fn record_fingerprint(&self, path: PathBuf, fingerprint: FileFingerprint) {
+        self.read_time
+            .lock()
+            .expect("read-time fingerprint map should not be poisoned")
+            .entry(path)
+            .or_insert(fingerprint);
+    }
+
+    /// Record the exact stat snapshot that made a pre-read limit failure deterministic. A hash is
+    /// unnecessary here: an equal-length/equal-mtime rewrite cannot change whether the same byte
+    /// ceiling is breached, while any metadata change expires the cached failure.
+    fn record_stat_fingerprint(&self, canonical: &Path, metadata: &std::fs::Metadata) {
+        let (len, modified_millis) = read_time_len_mtime_of(metadata);
+        self.record_fingerprint(
+            canonical.to_path_buf(),
+            FileFingerprint {
+                path: canonical.to_string_lossy().replace('\\', "/"),
+                len,
+                modified_millis,
+                content_hash: None,
+            },
+        );
+    }
+
+    /// Returns whether this read won the canonical asset slot. Rolldown normally loads one module
+    /// identity once, but treating the map as the authority prevents a duplicate hook invocation
+    /// from leaving the aggregate source counter double-charged.
+    fn record_asset(&self, asset: CollectedAsset) -> bool {
+        let path = asset.path.clone();
+        // Duplicate imports may reach this hook concurrently. Derive the fingerprint from the
+        // snapshot that actually won the asset-map entry so the two maps can never describe
+        // different reads of the same path.
+        let (fingerprint, inserted) = {
+            let mut assets = self
+                .assets
+                .lock()
+                .expect("asset map should not be poisoned");
+            match assets.entry(path.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    (entry.get().fingerprint.clone(), false)
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let fingerprint = asset.fingerprint.clone();
+                    entry.insert(asset);
+                    (fingerprint, true)
+                }
+            }
+        };
+        self.record_fingerprint(path.clone(), fingerprint);
+        inserted
+    }
+}
+
+fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Option<PathBuf> {
+    let query = specifier.find('?');
+    // A leading `#` is a package-import specifier, not a URL fragment. A later `#` is still a
+    // loader-style fragment and is removed before extension classification.
+    let fragment = if let Some(package_import) = specifier.strip_prefix('#') {
+        package_import.find('#').map(|index| index + 1)
+    } else {
+        specifier.find('#')
+    };
+    let path_end = query
+        .into_iter()
+        .chain(fragment)
+        .min()
+        .unwrap_or(specifier.len());
+    let specifier_path = Path::new(&specifier[..path_end]);
+    classify_asset_class(specifier_path)?;
+    if specifier_path.is_absolute() {
+        return Some(specifier_path.to_path_buf());
+    }
+    let is_package_relative = specifier.starts_with("./") || specifier.starts_with("../");
+    if !is_package_relative {
+        // Bare/self-referential/aliased specifiers have no honest filesystem candidate until the
+        // configured resolver answers. The spelling is still useful in the disclosure, and the
+        // resulting unverifiable sentinel is rejected by identity rather than by probing this path.
+        return Some(specifier_path.to_path_buf());
+    }
+    let importer = Path::new(importer);
+    if !importer.is_absolute() {
+        return None;
+    }
+    let parent = importer.parent()?;
+    Some(parent.join(specifier_path))
+}
+
+/// Atomically reserve bytes without ever moving the counter past `limit` on rejection.
+///
+/// `fetch_add` is not suitable for a hard resource ceiling: it mutates first, so every rejected
+/// module permanently inflates the total and can manufacture follow-on breaches. `fetch_update`
+/// makes the check and increment one compare/exchange operation and leaves the counter untouched
+/// when the reservation does not fit.
+fn try_reserve_source_bytes(total: &AtomicUsize, bytes: usize, limit: usize) -> Result<(), usize> {
+    total
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current
+                .checked_add(bytes)
+                .filter(|candidate| *candidate <= limit)
+        })
+        .map(|_| ())
+}
+
+fn release_source_bytes(total: &AtomicUsize, bytes: usize) {
+    total
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(bytes)
+        })
+        .expect("released source bytes must have an existing reservation");
+}
+
+/// Replace a metadata reservation with the exact length returned by the read. A shrinking file
+/// releases capacity; a growing file must atomically acquire the difference before its bytes can
+/// enter the artifact.
+fn reconcile_source_bytes(
+    total: &AtomicUsize,
+    reserved: usize,
+    actual: usize,
+    limit: usize,
+) -> Result<(), usize> {
+    match actual.cmp(&reserved) {
+        std::cmp::Ordering::Less => {
+            release_source_bytes(total, reserved - actual);
+            Ok(())
+        }
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => try_reserve_source_bytes(total, actual - reserved, limit),
     }
 }
 
@@ -299,6 +492,52 @@ impl ImportLensPlugin {
         self.state.record_breach(&message);
         std::io::Error::other(message)
     }
+
+    fn reserve_source_bytes(&self, source_bytes: usize) -> Result<(), std::io::Error> {
+        let max_graph_source_bytes = *MAX_GRAPH_SOURCE_BYTES;
+        if try_reserve_source_bytes(
+            &self.state.total_source_bytes,
+            source_bytes,
+            max_graph_source_bytes,
+        )
+        .is_err()
+        {
+            return Err(self.breach(format!(
+                "module graph exceeds the {max_graph_source_bytes} byte total source limit"
+            )));
+        }
+        Ok(())
+    }
+
+    fn release_source_bytes(&self, source_bytes: usize) {
+        release_source_bytes(&self.state.total_source_bytes, source_bytes);
+    }
+
+    fn reconcile_source_bytes(&self, reserved: usize, actual: usize) -> Result<(), std::io::Error> {
+        if reconcile_source_bytes(
+            &self.state.total_source_bytes,
+            reserved,
+            actual,
+            *MAX_GRAPH_SOURCE_BYTES,
+        )
+        .is_err()
+        {
+            return Err(self.breach(format!(
+                "module graph exceeds the {} byte total source limit",
+                *MAX_GRAPH_SOURCE_BYTES
+            )));
+        }
+        Ok(())
+    }
+
+    /// Capture len+mtime from the stat taken BEFORE the read, paired with a hash of the bytes we
+    /// actually read, so freshness describes the bytes the size was measured from (§8.3).
+    fn record_read_time(&self, canonical: &Path, len: u64, modified_millis: u64, bytes: &[u8]) {
+        self.state.record_fingerprint(
+            canonical.to_path_buf(),
+            file_fingerprint_from_read_time(canonical, len, modified_millis, content_hash(bytes)),
+        );
+    }
 }
 
 impl Plugin for ImportLensPlugin {
@@ -308,7 +547,7 @@ impl Plugin for ImportLensPlugin {
 
     async fn resolve_id(
         &self,
-        _ctx: &PluginContext,
+        ctx: &PluginContext,
         args: &HookResolveIdArgs<'_>,
     ) -> HookResolveIdReturn {
         if args.specifier == VIRTUAL_ENTRY_ID {
@@ -335,6 +574,40 @@ impl Plugin for ImportLensPlugin {
                 package_json_path: target.manifest_path.clone(),
                 ..HookResolveIdOutput::from_id(target.entry_path.to_string_lossy().into_owned())
             }));
+        }
+        if let Some(importer) = args.importer
+            && let Some(candidate) = supported_asset_observation_candidate(args.specifier, importer)
+        {
+            // Ask Rolldown's configured resolver (with this hook skipped) rather than joining a
+            // relative path ourselves. Client/Component builds apply package `browser` aliases
+            // here, and a raw join would silently measure the server asset or ignore a `false`
+            // mapping. Taking the successful result back through this hook still guarantees its
+            // final id reaches our observing `load`; retaining an asset-looking specifier on
+            // failure closes the resolve/load race for relative, absolute, bare, and aliased forms
+            // without changing resolver semantics.
+            let resolved = ctx
+                .resolve(
+                    args.specifier,
+                    Some(importer),
+                    Some(PluginContextResolveOptions {
+                        import_kind: args.kind,
+                        is_entry: args.is_entry,
+                        skip_self: true,
+                        custom: Arc::clone(&args.custom),
+                    }),
+                )
+                .await?;
+            match resolved {
+                Ok(resolved) => {
+                    return Ok(Some(HookResolveIdOutput::from_resolved_id(resolved)));
+                }
+                Err(_) => {
+                    self.state.record_failed_asset_input(candidate);
+                    // Let the normal resolver run once more so Rolldown retains its native resolve
+                    // diagnostic. `classify_failure` promotes our typed `asset_io` observation.
+                    return Ok(None);
+                }
+            }
         }
         Ok(None)
     }
@@ -369,21 +642,39 @@ impl Plugin for ImportLensPlugin {
         if !path.is_absolute() {
             return Ok(None);
         }
+        let asset_class = classify_asset_class(path);
+        let asset_kind = match asset_class {
+            Some(AssetClass::Counted(kind)) => Some(kind),
+            _ => None,
+        };
 
         // §7.3: reject an oversized module BEFORE reading it. The limit exists to
         // bound memory, so reading first would blow the very bound being enforced.
         // `module_parsed` still enforces it on the transformed source, which also
         // covers modules this hook hands back to Rolldown below.
-        let metadata = match tokio::fs::metadata(path).await {
+        // Resolve the identity BEFORE the stat/read pair. Canonicalizing after the read can pair
+        // bytes from an old symlink target with the path of a newly-retargeted one.
+        let canonical = self.state.canonical_path(path);
+        let metadata = match tokio::fs::metadata(&canonical).await {
             Ok(metadata) => metadata,
-            // Not a readable file (or vanished): let Rolldown produce its own error.
-            Err(_) => return Ok(None),
+            Err(error) => {
+                if asset_class.is_some() {
+                    self.state.record_failed_asset_input(canonical);
+                    // Do not let the default loader reopen a recovering/growing asset outside this
+                    // plugin's source-byte reservations. The adapter promotes the retained cause
+                    // to `asset_io`, while this error keeps the build from consuming unobserved
+                    // bytes on a second path.
+                    return Err(error.into());
+                }
+                return Ok(None);
+            }
         };
-        if metadata.len() as usize > MAX_MODULE_SOURCE_BYTES {
+        if metadata.len() > MAX_MODULE_SOURCE_BYTES as u64 {
+            self.state.record_stat_fingerprint(&canonical, &metadata);
             return Err(self
                 .breach(format!(
                     "module {} exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit",
-                    path.display()
+                    canonical.display()
                 ))
                 .into());
         }
@@ -395,47 +686,81 @@ impl Plugin for ImportLensPlugin {
         // which is the very failure this hook exists to prevent.
         let (len, modified_millis) = read_time_len_mtime_of(&metadata);
 
-        let Ok(bytes) = tokio::fs::read(path).await else {
-            return Ok(None);
-        };
-        // Binary modules (wasm, assets) are not UTF-8. Rolldown handles those itself;
-        // the caller back-fills their fingerprints from `read_time_fingerprints`.
-        let Ok(source) = String::from_utf8(bytes.clone()) else {
-            return Ok(None);
+        // Direct assets become empty Rolldown modules, so `module_parsed` sees zero bytes for them.
+        // Reserve the stat length here, BEFORE reading, both to make the aggregate cap cover them
+        // and to keep a static oversized asset from allocating past the bound it is about to fail.
+        // The per-file check above makes this conversion safe on every supported architecture.
+        let reserved_asset_bytes = if asset_class.is_some() {
+            let metadata_bytes = usize::try_from(metadata.len())
+                .expect("a per-file-admitted asset length must fit usize");
+            if let Err(error) = self.reserve_source_bytes(metadata_bytes) {
+                self.state.record_stat_fingerprint(&canonical, &metadata);
+                return Err(error.into());
+            }
+            Some(metadata_bytes)
+        } else {
+            None
         };
 
-        let canonical = self.state.canonical_path(path);
-        self.state
-            .read_time
-            .lock()
-            .expect("read-time fingerprint map should not be poisoned")
-            .entry(canonical.clone())
-            .or_insert_with(|| {
-                file_fingerprint_from_read_time(
-                    &canonical,
-                    len,
-                    modified_millis,
-                    content_hash(&bytes),
-                )
-            });
+        let bytes = match tokio::fs::read(&canonical).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if let Some(reserved) = reserved_asset_bytes {
+                    self.release_source_bytes(reserved);
+                }
+                if asset_class.is_some() {
+                    self.state.record_failed_asset_input(canonical);
+                    return Err(error.into());
+                }
+                return Ok(None);
+            }
+        };
 
-        // A STYLESHEET the package's own entry imports. Rolldown 1.1.5 does not bundle CSS at all
-        // — it fails the whole build with `UNSUPPORTED_FEATURE: Bundling CSS is no longer
-        // supported` at the LINK stage — so every package whose ESM entry does `import
-        // './styles.css'` (most UI kits) could not be measured. Nobody saw it: the pipeline caught
-        // the failure and fabricated a size, and deleting that fabricator without this would send
-        // all of them to "Size unavailable".
+        // A non-JavaScript ASSET the package's own entry imports, intercepted BEFORE the UTF-8
+        // conversion below — a wasm or font is not UTF-8, and handing one back to Rolldown lets it
+        // perturb or fail the JS build, which is the number we need exact.
+        //
+        // Stylesheets have their own reason: Rolldown 1.1.5 does not bundle CSS at all (it fails
+        // the whole build with `UNSUPPORTED_FEATURE` at the LINK stage), so every package whose ESM
+        // entry does `import './styles.css'` (most UI kits) could not be measured.
         //
         // `ModuleType::Empty` makes the module link as nothing (and shims any binding imported from
-        // it, so `import styles from './x.css'` works too). The JS graph then measures exactly, and
-        // the stylesheet's bytes — real bytes, which really do ship — are recorded here and
-        // DISCLOSED rather than silently folded into the number or thrown away with it.
-        if is_stylesheet(path) {
-            self.state
-                .uncounted_assets
-                .lock()
-                .expect("uncounted-asset map should not be poisoned")
-                .insert(canonical, len);
+        // it, so `import styles from './x.css'` works too), so the JS graph measures exactly. The
+        // asset itself is recorded here with its kind, and the pipeline then processes it the way
+        // it really ships and folds those bytes into the Import Cost (B2) — they are neither
+        // fabricated into the JS number nor thrown away with it.
+        if let Some(kind) = asset_kind {
+            let reserved = reserved_asset_bytes
+                .expect("a classified asset must reserve its metadata length before reading");
+            let asset = CollectedAsset::from_read(canonical, kind, &metadata, bytes);
+            let actual = asset.bytes().len();
+
+            // A file may grow between metadata and read. The pre-read check is still the memory
+            // guard for stable files; this exact post-read check closes the concurrent-growth gap
+            // and fingerprints the bytes that made the deterministic failure true.
+            if actual > MAX_MODULE_SOURCE_BYTES {
+                self.state
+                    .record_fingerprint(asset.path.clone(), asset.fingerprint.clone());
+                self.release_source_bytes(reserved);
+                return Err(self
+                    .breach(format!(
+                        "module {} exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit",
+                        asset.path.display()
+                    ))
+                    .into());
+            }
+
+            if let Err(error) = self.reconcile_source_bytes(reserved, actual) {
+                self.state
+                    .record_fingerprint(asset.path.clone(), asset.fingerprint.clone());
+                // A failed growth reservation leaves the original metadata reservation intact.
+                self.release_source_bytes(reserved);
+                return Err(error.into());
+            }
+
+            if !self.state.record_asset(asset) {
+                self.release_source_bytes(actual);
+            }
 
             return Ok(Some(HookLoadOutput {
                 code: String::new().into(),
@@ -443,6 +768,73 @@ impl Plugin for ImportLensPlugin {
                 ..HookLoadOutput::default()
             }));
         }
+
+        // A file that ships but is outside the measured taxonomy — an image, an icon, a media file.
+        //
+        // It is intercepted for the same reason a font is: left to Rolldown, ONE of these makes the
+        // whole package unmeasurable. A `.png` is not UTF-8, so its loader fails on `InvalidData`;
+        // an `.svg` IS valid UTF-8, so it is handed to OXC and parsed as JavaScript, which fails
+        // differently and just as fatally. The user saw "unavailable" for a package whose
+        // JavaScript we could measure perfectly.
+        //
+        // Stubbing it to `Empty` lets the JS graph measure exactly, and the bytes are DISCLOSED
+        // rather than dropped: they ship, so a size that omits them is a floor and has to say so.
+        // Its length is charged against the graph's aggregate ceiling like any other asset, so
+        // stubbing cannot become a way to admit bytes no limit ever sees.
+        if asset_class == Some(AssetClass::Unmeasured) {
+            let reserved = reserved_asset_bytes
+                .expect("a classified asset must reserve its metadata length before reading");
+            let actual = bytes.len();
+
+            // Same post-read growth check the counted arm makes. The pre-read stat bounds a stable
+            // file; this closes the window where it grew between the stat and the read, and it
+            // fingerprints the bytes that made the deterministic failure true.
+            if actual > MAX_MODULE_SOURCE_BYTES {
+                self.record_read_time(&canonical, len, modified_millis, &bytes);
+                self.release_source_bytes(reserved);
+                return Err(self
+                    .breach(format!(
+                        "module {} exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit",
+                        canonical.display()
+                    ))
+                    .into());
+            }
+
+            if let Err(error) = self.reconcile_source_bytes(reserved, actual) {
+                // Record the fingerprint BEFORE returning, as the counted arm does: this failure is
+                // deterministic and cacheable, and without the fingerprint it would not expire when
+                // the file that caused it changes.
+                self.record_read_time(&canonical, len, modified_millis, &bytes);
+                self.release_source_bytes(reserved);
+                return Err(error.into());
+            }
+            self.record_read_time(&canonical, len, modified_millis, &bytes);
+
+            // Release on a DUPLICATE, exactly as the counted arm does. Two module ids can
+            // canonicalize to one path (a pnpm symlink layout is the ordinary shape), and both
+            // charge their length against the aggregate ceiling. Only the first is ever accounted
+            // for, so without this the counter drifts up for the rest of the build.
+            if !self.state.record_unmeasured_asset(UncountedAsset {
+                path: canonical,
+                bytes: actual as u64,
+            }) {
+                self.release_source_bytes(actual);
+            }
+
+            return Ok(Some(HookLoadOutput {
+                code: String::new().into(),
+                module_type: Some(ModuleType::Empty),
+                ..HookLoadOutput::default()
+            }));
+        }
+
+        // A binary module that is NOT a classified asset. Rolldown handles those itself; the caller
+        // back-fills their fingerprints from `read_time_fingerprints`.
+        let Ok(source) = String::from_utf8(bytes.clone()) else {
+            return Ok(None);
+        };
+
+        self.record_read_time(&canonical, len, modified_millis, &bytes);
 
         Ok(Some(HookLoadOutput {
             code: source.into(),
@@ -477,19 +869,7 @@ impl Plugin for ImportLensPlugin {
                 .into());
         }
 
-        let total_bytes = self
-            .state
-            .total_source_bytes
-            .fetch_add(source_bytes, Ordering::Relaxed)
-            + source_bytes;
-        let max_graph_source_bytes = *MAX_GRAPH_SOURCE_BYTES;
-        if total_bytes > max_graph_source_bytes {
-            return Err(self
-                .breach(format!(
-                    "module graph exceeds the {max_graph_source_bytes} byte total source limit"
-                ))
-                .into());
-        }
+        self.reserve_source_bytes(source_bytes)?;
 
         let canonical = self.state.canonical_path(path);
         let module_count = {
@@ -517,21 +897,103 @@ impl Plugin for ImportLensPlugin {
     }
 }
 
-/// A stylesheet the JavaScript graph imports.
-///
-/// Rolldown 1.1.5 removed CSS bundling outright, so any of these reaching it as a graph module
-/// fails the ENTIRE build (`UNSUPPORTED_FEATURE`, at the link stage) rather than merely going
-/// uncounted. The list is deliberately narrow: only what a published package's JS entry plausibly
-/// imports. Anything else non-JS (a `.wasm` or an image) is not UTF-8, so `load` already hands it
-/// back to Rolldown untouched.
-fn is_stylesheet(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|extension| {
-            matches!(
-                extension.as_str(),
-                "css" | "scss" | "sass" | "less" | "styl" | "stylus" | "pcss" | "postcss"
-            )
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_asset_specifiers_become_observation_candidates_without_reinterpreting_dot_names() {
+        let importer = std::env::temp_dir().join("pkg").join("index.js");
+        let importer_text = importer.to_string_lossy();
+        assert_eq!(
+            supported_asset_observation_candidate("./font.woff2?url", &importer_text),
+            Some(importer.parent().unwrap().join("font.woff2"))
+        );
+        assert!(supported_asset_observation_candidate("./helper.js", &importer_text).is_none());
+        assert_eq!(
+            supported_asset_observation_candidate("asset-pkg/font.woff2", &importer_text),
+            Some(PathBuf::from("asset-pkg/font.woff2"))
+        );
+        assert_eq!(
+            supported_asset_observation_candidate("#font.woff2", &importer_text),
+            Some(PathBuf::from("#font.woff2"))
+        );
+        assert!(supported_asset_observation_candidate("./font.woff2", "virtual:entry").is_none());
+        assert!(
+            supported_asset_observation_candidate(".font.woff2", &importer_text).is_some(),
+            "a bare hidden-name specifier stays bare; it is observed but never joined to importer"
+        );
+        assert_eq!(
+            supported_asset_observation_candidate(".font.woff2", &importer_text),
+            Some(PathBuf::from(".font.woff2"))
+        );
+        assert_eq!(
+            supported_asset_observation_candidate(".../font.woff2", &importer_text),
+            Some(PathBuf::from(".../font.woff2"))
+        );
+    }
+
+    #[test]
+    fn failed_asset_observations_are_never_reusable() {
+        let state = BuildState::default();
+        let failed_read = PathBuf::from("/pkg/read-failed.woff2");
+        state.record_failed_asset_input(failed_read.clone());
+
+        let observations = state.unverifiable_asset_fingerprints();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].path,
+            failed_read.to_string_lossy().replace('\\', "/")
+        );
+        assert!(
+            crate::cache::key::fingerprint_is_unverifiable(&observations[0]),
+            "a read failure must prevent cache admission"
+        );
+    }
+
+    #[test]
+    fn rejected_source_reservation_never_inflates_the_total() {
+        let total = AtomicUsize::new(8);
+
+        assert_eq!(try_reserve_source_bytes(&total, 3, 10), Err(8));
+        assert_eq!(total.load(Ordering::Relaxed), 8);
+
+        let near_overflow = AtomicUsize::new(usize::MAX - 1);
+        assert_eq!(
+            try_reserve_source_bytes(&near_overflow, 2, usize::MAX),
+            Err(usize::MAX - 1)
+        );
+        assert_eq!(near_overflow.load(Ordering::Relaxed), usize::MAX - 1);
+    }
+
+    #[test]
+    fn concurrent_source_reservations_never_cross_the_ceiling() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let accepted = (0..16)
+            .map(|_| {
+                let total = Arc::clone(&total);
+                std::thread::spawn(move || try_reserve_source_bytes(&total, 10, 50).is_ok())
+            })
+            .map(|worker| worker.join().expect("reservation worker should not panic"))
+            .filter(|was_accepted| *was_accepted)
+            .count();
+
+        assert_eq!(accepted, 5);
+        assert_eq!(total.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn metadata_reservation_reconciles_to_the_exact_read_length() {
+        let shrank = AtomicUsize::new(20);
+        assert_eq!(reconcile_source_bytes(&shrank, 8, 3, 25), Ok(()));
+        assert_eq!(shrank.load(Ordering::Relaxed), 15);
+
+        let grew = AtomicUsize::new(20);
+        assert_eq!(reconcile_source_bytes(&grew, 8, 10, 25), Ok(()));
+        assert_eq!(grew.load(Ordering::Relaxed), 22);
+
+        let rejected_growth = AtomicUsize::new(20);
+        assert_eq!(reconcile_source_bytes(&rejected_growth, 8, 14, 25), Err(20));
+        assert_eq!(rejected_growth.load(Ordering::Relaxed), 20);
+    }
 }

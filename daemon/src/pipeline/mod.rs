@@ -1,6 +1,10 @@
 pub mod analyze;
+mod asset_boundary;
+mod asset_budget;
+pub mod assets;
 mod build_memo;
 pub mod compress;
+mod css_dependencies;
 pub mod export_list;
 mod fallback;
 pub mod file_size;

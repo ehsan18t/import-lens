@@ -8,15 +8,35 @@
 //     - typescript package: the `graph.rs` TypeScript transform path, the only place
 //       the daemon transforms real TS. A lowered `enum` and `namespace` both codegen
 //       as IIFEs, so this doubles as coverage of the minifier's unused-IIFE analysis.
+//     - emitted asset: JS imports CSS whose surviving `url()` references a local WOFF2;
+//       esbuild and Import Lens must both emit/count that font exactly once. This reaches the
+//       font INDIRECTLY, through CSS — it does not cover a binary imported from JavaScript.
+//     - direct binary import: JS imports a `.wasm` AND a `.woff2` straight from source, the shape
+//       where the daemon stubs the module to `ModuleType::Empty` at the `load` hook and counts the
+//       file's raw bytes as a separate artifact. That stubbing deletes the URL reference code a
+//       real file-loader build emits, so it is a MODEL, and this is the only place the model is
+//       checked against an oracle rather than asserted. It is also the only benchmark whose
+//       payload is incompressible, hence the only one whose brotli axis gates anything.
 //   real packages (downloaded on demand, lockfile-pinned)
 //     - css-tree: deep ESM graph with transitive dependencies.
 //     - date-fns: deep zero-dependency ESM graph.
 //     - lodash:   the CommonJS path -- `SourceType::cjs()` and the `;(() => {…})();`
 //                 wrapper that `pipeline/cjs.rs` builds.
+//     - refractor: a sideEffects glob anchored at the package root.
+//     - @uiw/react-md-editor: the only real package whose published ESM entry actually
+//                 does `import "./index.css"`, so it is the one benchmark that compares
+//                 ASSET COUNTING (B2) against the oracle -- both sides must fold in the
+//                 same stylesheet exactly once, which `minifiedTolerance` is what checks.
 //
 // NOT covered: the `.js`-containing-JSX retry path (`graph.rs`), which is a
-// parse-failure fallback; and the mangler's exported-destructuring handling, which
-// `pipeline/bundle.rs` puts out of reach by stripping `export ` before minification.
+// parse-failure fallback; the mangler's exported-destructuring handling, which
+// `pipeline/bundle.rs` puts out of reach by stripping `export ` before minification;
+// and -- despite what this file used to claim -- Lightning CSS's `@import` handling.
+// The CSS fixture's whole reachable stylesheet graph contains ZERO `@import`
+// statements (checked 2026-07-17): it aggregates CSS through JS `import "./x.css"`
+// instead. So the `@import` tree walk, the cycle canonicalization and the synthetic
+// entry -- the most intricate part of B2 -- are covered by the unit tests in
+// `daemon/src/pipeline/assets.rs`, and by nothing here.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -31,19 +51,57 @@ import * as esbuild from "esbuild";
 const protocolVersion = 6;
 const packageName = "importlens-accuracy-fixture";
 const typedPackageName = "importlens-accuracy-ts-fixture";
+const assetPackageName = "importlens-accuracy-asset-fixture";
+const binaryPackageName = "importlens-accuracy-binary-fixture";
+const emittedFontBytes = 8 * 1024;
+// The direct-import fixture's two binaries. Deliberately DIFFERENT sizes from each other and from
+// `emittedFontBytes`, so a mixed-up artifact shows as a byte mismatch rather than a silent pass.
+const directWasmBytes = 6 * 1024;
+const directFontBytes = 10 * 1024;
+// Tolerances for the direct-import benchmark. Both are far TIGHTER than the global 25%, which is
+// the point: this is the only fixture with no compressor-gap noise to hide behind.
+//
+// Measured 2026-07-18. Import Lens 16446 B br / 16435 B minified; esbuild 16492 B br / 16480 B
+// minified. Delta 46 B br (0.28%) and 45 B minified (0.27%) — we read LOW on both axes, by the same
+// amount, and that amount is fully explained:
+//
+//   esbuild's JS chunk is 96 B and reads, in full:
+//     var o="./probe-QSYIHYBW.wasm";var r="./probe-CZGQ6QWY.woff2";var e=()=>o+r;export{e as widget};
+//   ours is 51 B, because the two modules are stubbed to `ModuleType::Empty` at the `load` hook.
+//   96 - 51 = 45 B. The binaries themselves (6144 + 10240 = 16384 B) are counted IDENTICALLY by
+//   both sides. So the neutral stubbing model agrees with the oracle to within the URL reference
+//   code it declines to emit, and nothing else.
+//
+// Both axes read the same because the payload is incompressible by construction (see
+// `incompressibleBytes`): it compresses to length+4 at quality 4 AND quality 11, so the q4-vs-q11
+// asymmetry that inflates every other benchmark to 2.6-24.8% is absent here. That is why brotli can
+// gate this fixture honestly when it cannot gate the CSS one.
+//
+// 1% on both: ~3.6x the honest 0.27%, so a codegen change that moved our stub chunk to zero bytes
+// (0.58%) or up to esbuild's size (0.00%) stays green, while every failure that matters is orders
+// of magnitude past it — dropping BOTH artifacts reads 99.7%, double-counting them 99%, and missing
+// just the wasm 37.6%. The per-artifact `expectedAssets` check below is what pins the counts
+// exactly; these two numbers gate the TOTAL. If either goes red, the shipping model changed. Do not
+// raise them.
+const binaryModelTolerances = { brotli: 0.01, minified: 0.01 };
 // Maximum accepted brotli delta against the esbuild oracle, as a fraction.
 //
-// Derivation: the worst delta observed across every benchmark on the current
-// engine (2026-07-11 re-baseline) is 13.0%; the rest sit at 2.6-12%. 25% is
-// that worst case doubled and rounded down to a round number, so a legitimate
-// compiler-stack bump has ~2x the observed spread of headroom before it turns
-// CI red for a non-bug, while a real regression (a dangling binding dragging a
-// dead module into the bundle) still moves the number far past it. The former
-// 75% default could not fail on anything short of a catastrophe.
+// Derivation: the worst delta observed across the JavaScript benchmarks (2026-07-17
+// re-baseline) is 15.0% (refractor); the rest sit at 2.6-13%. 25% leaves headroom
+// over that for a legitimate compiler-stack bump before it turns CI red for a
+// non-bug, while a real regression (a dangling binding dragging a dead module into
+// the bundle) still moves the number far past it. The former 75% default could not
+// fail on anything short of a catastrophe.
 //
-// Re-derive this the next time the observed worst case moves: keep it at
-// roughly twice the worst accepted delta, and never raise it to make a red run
-// green without first proving the delta is a codegen difference, not a bug.
+// Why every benchmark reads high at all: the daemon compresses brotli at quality 4
+// (it runs per keystroke) and this oracle uses quality 11 (what a CDN serves), so a
+// ~10-15% gap is baked in and says nothing about what was counted. The CSS benchmark
+// carries its own tolerance because that same gap is amplified on highly-compressible
+// stylesheets; see its entry in `realFixtures`.
+//
+// Re-derive this the next time the observed worst case moves: keep it at roughly
+// twice the worst accepted delta, and never raise it to make a red run green without
+// first proving the delta is a codegen difference, not a bug.
 const tolerance = Number(process.env.IMPORT_LENS_ACCURACY_TOLERANCE ?? "0.25");
 // Local runs may be offline; CI and upgrade baselines must never silently measure
 // nothing. `validate.yml` sets this, and so must any pre/post-upgrade baseline run.
@@ -62,6 +120,46 @@ const realFixtures = [
     package: "refractor",
     named: "refractor",
     label: "refractor (sideEffects glob anchored at the package root)",
+  },
+  // The ONLY real package in the set whose published ESM entry actually does `import "./index.css"`
+  // — react-toastify, react-datepicker, swiper and react-loading-skeleton all *ship* a stylesheet
+  // but none imports one from published JavaScript, so none would exercise this at all. It is what
+  // gates asset counting (B2) against the oracle: both sides must fold in the same stylesheet
+  // exactly once, so a double count or a dropped stylesheet shows up here as a delta rather than as
+  // a wrong number in the product. Its own stylesheets contain no `@import`, so that part of B2 is
+  // the unit tests' job, not this benchmark's.
+  {
+    package: "@uiw/react-md-editor",
+    named: "headingExecute",
+    label: "@uiw/react-md-editor (ESM entry imports CSS: asset counting vs the oracle)",
+    // Its own tolerances, because the global one cannot gate this benchmark honestly.
+    //
+    // The daemon compresses brotli at quality 4 (it runs per keystroke) while this oracle uses
+    // quality 11 (what a CDN actually serves), so EVERY benchmark reads high for a reason that has
+    // nothing to do with what was counted: 2.6-15% across the JS set. CSS compresses far better
+    // than JS, so that same asymmetry was amplified here to 24.8% at brotli quality 4 — nearly the
+    // entire 25% budget — which is why this fixture used to carry its own 35% brotli tolerance.
+    //
+    // Quality 9 (2026-07-18) halved that gap: this benchmark now reads 8.8% on brotli, comfortably
+    // inside the shared gate, so the override is gone. That is the point worth keeping: the 35% was
+    // never measuring the stylesheet, it was measuring OUR compressor being weaker than the oracle,
+    // and a tolerance that wide gated nothing. Measured 2026-07-17 by holding CSS at q4 and varying
+    // only the fold count: ZERO folds read 22.7%, ONCE 24.8%, TWICE 26.9% — all three under 35%, so
+    // the fixture would have stayed green with asset counting deleted outright.
+    //
+    // The MINIFIED pair is where the signal is, because neither side compresses it and the CSS is
+    // ~3% of that total rather than ~1.7%. Measured the same way: fold ZERO reads 3.80%, ONCE
+    // 0.81%, TWICE 2.19%.
+    //
+    // 1.5% sits between those, deliberately: it is nearly 2x the honest reading and a third below a
+    // double count, so both failure directions are caught with room, and it is what makes this
+    // fixture gate B2 at all. (2% would also catch a double count, but by under 10% — thin enough
+    // that a small real drift could hide one.) Our JS reads 0.8% LOW against esbuild minifier,
+    // which is why the band is not centred on zero. Both minifiers are exact-pinned and
+    // upgrade-gated, so this only moves on a deliberate re-baseline. If it goes red, a stylesheet
+    // fold count changed; do not raise the number.
+    minifiedTolerance: 0.015,
+    expectsStylesheet: true,
   },
 ];
 
@@ -97,6 +195,30 @@ const main = async () => {
         version: "1.0.0",
         named: "typed",
       },
+      {
+        label: "CSS local font emission",
+        activeDocumentPath: fixture.assetActiveDocumentPath,
+        package: assetPackageName,
+        version: "1.0.0",
+        named: "widget",
+        expectsStylesheet: true,
+        expectedAssets: [{ extension: ".woff2", kind: "font", bytes: emittedFontBytes }],
+        minifiedTolerance: 0.02,
+      },
+      {
+        label: "direct JS import of wasm and font",
+        activeDocumentPath: fixture.binaryActiveDocumentPath,
+        package: binaryPackageName,
+        version: "1.0.0",
+        named: "widget",
+        expectedAssets: [
+          { extension: ".wasm", kind: "wasm", bytes: directWasmBytes },
+          { extension: ".woff2", kind: "font", bytes: directFontBytes },
+        ],
+        // See the measurement note above `binaryModelTolerances`.
+        tolerance: binaryModelTolerances.brotli,
+        minifiedTolerance: binaryModelTolerances.minified,
+      },
       ...(realFixtureState.installed
         ? await writeRealFixtureEntries(workspace, realFixtureState.versions)
         : []),
@@ -106,24 +228,63 @@ const main = async () => {
 
     for (const [index, benchmark] of benchmarks.entries()) {
       const importLens = await importLensNamedSize(daemon, workspace, benchmark, index + 1);
-      const esbuildSize = await esbuildNamedSize(workspace, benchmark.activeDocumentPath);
+      const esbuildSize = await esbuildNamedSize(
+        workspace,
+        benchmark.activeDocumentPath,
+        benchmark.expectsStylesheet ?? false,
+        benchmark.expectedAssets,
+      );
       const delta = Math.abs(importLens.brotliBytes - esbuildSize.brotliBytes);
       const relativeDelta = delta / Math.max(esbuildSize.brotliBytes, 1);
+      const minifiedDelta = Math.abs(importLens.minifiedBytes - esbuildSize.minifiedBytes);
+      const relativeMinifiedDelta = minifiedDelta / Math.max(esbuildSize.minifiedBytes, 1);
 
       process.stdout.write(
         [
           `${benchmark.label}:`,
           `  Import Lens named import: ${importLens.brotliBytes} B br (${importLens.minifiedBytes} B minified)`,
           `  esbuild named import: ${esbuildSize.brotliBytes} B br (${esbuildSize.minifiedBytes} B minified)`,
-          `  relative delta: ${(relativeDelta * 100).toFixed(1)}%`,
+          `  relative delta: ${(relativeDelta * 100).toFixed(1)}% br, ${(relativeMinifiedDelta * 100).toFixed(2)}% minified (${minifiedDelta} B)`,
         ].join("\n"),
       );
       process.stdout.write("\n");
 
-      if (relativeDelta > tolerance) {
+      // A benchmark may carry its own tolerance where the global one cannot gate it honestly; see
+      // the CSS fixture. Everything else is held to the global number.
+      const benchmarkTolerance = benchmark.tolerance ?? tolerance;
+
+      if (relativeDelta > benchmarkTolerance) {
         throw new Error(
-          `${benchmark.label} accuracy delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(tolerance * 100).toFixed(1)}% tolerance`,
+          `${benchmark.label} accuracy delta ${(relativeDelta * 100).toFixed(1)}% exceeds ${(benchmarkTolerance * 100).toFixed(1)}% tolerance`,
         );
+      }
+
+      // The brotli delta above cannot gate WHAT WAS COUNTED on a benchmark whose assets are a small
+      // share of a compressed total, because both sides' compressors disagree by far more than the
+      // assets weigh (see the CSS fixture). Where a benchmark says so, hold the MINIFIED totals too:
+      // neither side compresses them, so the compressor gap is absent and the only thing left to
+      // explain a delta is a difference in what got folded in.
+      if (benchmark.minifiedTolerance !== undefined) {
+        if (relativeMinifiedDelta > benchmark.minifiedTolerance) {
+          throw new Error(
+            `${benchmark.label} minified delta ${(relativeMinifiedDelta * 100).toFixed(2)}% exceeds ${(benchmark.minifiedTolerance * 100).toFixed(2)}% tolerance. This is the axis that gates what was COUNTED: a stylesheet folded in twice, or not at all, moves it. Do not raise this number to make it green.`,
+          );
+        }
+      }
+
+      // Exactness, per expected artifact: EXACTLY ONE contribution of that kind, at exactly that
+      // byte count. `find` alone would have accepted a second, duplicate contribution of the same
+      // kind, so the count is asserted rather than the first match.
+      for (const expected of benchmark.expectedAssets ?? []) {
+        const contributions = importLens.assetBreakdown.filter(
+          (asset) => asset.kind === expected.kind,
+        );
+        if (contributions.length !== 1 || contributions[0].raw_bytes !== expected.bytes) {
+          throw new Error(
+            `${benchmark.label} expected exactly one ${expected.bytes}-byte ${expected.kind} ` +
+              `contribution, got ${JSON.stringify(contributions)}`,
+          );
+        }
       }
 
       if (
@@ -283,6 +444,32 @@ const assertRealFixturePreconditions = async (workspace) => {
     );
   }
 
+  // @uiw/react-md-editor is here for ONE property: its published ESM entry really does
+  // `import "./index.css"`. That is the whole reason it is the only real package in this suite that
+  // exercises asset counting (B2) against an independent bundler — react-toastify, react-datepicker,
+  // swiper and react-loading-skeleton all SHIP a stylesheet but none imports one from published
+  // JavaScript, so none would exercise it at all.
+  //
+  // If a future version drops that import, both sides fold in no CSS, every delta stays inside
+  // tolerance, and this benchmark silently degrades into a second pure-JS one while still claiming
+  // in its label to gate asset counting. That is the exact shape the refractor guard above exists to
+  // prevent, so it is guarded rather than assumed.
+  const editorPackage = "@uiw/react-md-editor";
+  const editorManifest = manifests[editorPackage];
+  const editorEntry =
+    editorManifest.exports?.["."]?.import ?? editorManifest.module ?? editorManifest.main;
+  const editorEntrySource = await readFile(
+    path.join(workspace, "node_modules", editorPackage, editorEntry),
+    "utf8",
+  );
+  if (!/import\s*["'][^"']+\.css["']/u.test(editorEntrySource)) {
+    throw new Error(
+      `${editorPackage} fixture's ESM entry (${editorEntry}) no longer imports a stylesheet; ` +
+        "no benchmark now compares asset counting against the oracle, and the CSS fixture has " +
+        "quietly become a duplicate JS one",
+    );
+  }
+
   return versions;
 };
 
@@ -291,7 +478,11 @@ const writeRealFixtureEntries = async (workspace, versions) => {
   const benchmarks = [];
 
   for (const fixture of realFixtures) {
-    const activeDocumentPath = path.join(sourceRoot, `real-${fixture.package}-entry.js`);
+    // A SCOPED package name carries a slash (`@uiw/react-md-editor`), which would turn this
+    // filename into a nested path whose directory does not exist. The entry file's name is
+    // arbitrary; only the specifier inside it matters.
+    const entryName = fixture.package.replaceAll(/[^a-z0-9.-]/giu, "-");
+    const activeDocumentPath = path.join(sourceRoot, `real-${entryName}-entry.js`);
     await writeFile(
       activeDocumentPath,
       `export { ${fixture.named} } from "${fixture.package}";\n`,
@@ -303,6 +494,9 @@ const writeRealFixtureEntries = async (workspace, versions) => {
       package: fixture.package,
       version: versions[fixture.package],
       named: fixture.named,
+      tolerance: fixture.tolerance,
+      minifiedTolerance: fixture.minifiedTolerance,
+      expectsStylesheet: fixture.expectsStylesheet,
     });
   }
 
@@ -379,7 +573,106 @@ const writeFixture = async (workspace) => {
   await writeFile(branchyActiveDocumentPath, `export { used } from "${packageName}";\n`, "utf8");
 
   const typedActiveDocumentPath = await writeTypedFixture(workspace, sourceRoot);
-  return { flatActiveDocumentPath, branchyActiveDocumentPath, typedActiveDocumentPath };
+  const assetActiveDocumentPath = await writeAssetFixture(workspace, sourceRoot);
+  const binaryActiveDocumentPath = await writeBinaryFixture(workspace, sourceRoot);
+  return {
+    flatActiveDocumentPath,
+    branchyActiveDocumentPath,
+    typedActiveDocumentPath,
+    assetActiveDocumentPath,
+    binaryActiveDocumentPath,
+  };
+};
+
+// The DIRECT-import binary fixture, and the only place the shipping model for a wasm/font imported
+// straight from JavaScript is compared against an oracle.
+//
+// `writeAssetFixture` reaches its font INDIRECTLY, through a surviving CSS `url()`. That never
+// exercises the other half of B2: the daemon intercepts a directly imported wasm/font at Rolldown's
+// `load` hook, stubs the module to `ModuleType::Empty`, and counts the file's raw bytes as a
+// separate artifact. Stubbing DELETES the reference code a real file-loader build emits, so the two
+// models are not obviously the same thing, and until this fixture existed nobody had measured
+// whether they agree. esbuild's `file` loader is the oracle: it emits the binary AND a JS module
+// exporting its URL, which is precisely the difference this benchmark quantifies.
+//
+// Both binaries must stay REFERENCED (`widget` reads both bindings) or tree shaking drops the
+// imports on both sides and the fixture measures nothing.
+const writeBinaryFixture = async (workspace, sourceRoot) => {
+  const packageRoot = path.join(workspace, "node_modules", binaryPackageName);
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify(
+      {
+        name: binaryPackageName,
+        version: "1.0.0",
+        type: "module",
+        module: "index.js",
+        sideEffects: false,
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "index.js"),
+    [
+      `import wasmUrl from "./probe.wasm";`,
+      `import fontUrl from "./probe.woff2";`,
+      `export const widget = () => wasmUrl + fontUrl;`,
+      ``,
+    ].join("\n"),
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "probe.wasm"),
+    incompressibleBytes(directWasmBytes, 0x12345678),
+  );
+  await writeFile(
+    path.join(packageRoot, "probe.woff2"),
+    incompressibleBytes(directFontBytes, 0x6d2b79f5),
+  );
+
+  const activeDocumentPath = path.join(sourceRoot, "binary-entry.js");
+  await writeFile(activeDocumentPath, `export { widget } from "${binaryPackageName}";\n`, "utf8");
+  return activeDocumentPath;
+};
+
+const writeAssetFixture = async (workspace, sourceRoot) => {
+  const packageRoot = path.join(workspace, "node_modules", assetPackageName);
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify(
+      {
+        name: assetPackageName,
+        version: "1.0.0",
+        type: "module",
+        module: "index.js",
+        sideEffects: ["*.css"],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "index.js"),
+    `import "./styles.css";\nexport const widget = "widget";\n`,
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "styles.css"),
+    `@font-face { font-family: Probe; src: url("./probe.woff2") format("woff2"); }\n` +
+      `.widget { font-family: Probe; }\n`,
+    "utf8",
+  );
+  await writeFile(path.join(packageRoot, "probe.woff2"), deterministicBytes(emittedFontBytes));
+
+  const activeDocumentPath = path.join(sourceRoot, "asset-entry.js");
+  await writeFile(activeDocumentPath, `export { widget } from "${assetPackageName}";\n`, "utf8");
+  return activeDocumentPath;
 };
 
 // The only TypeScript in the suite, and therefore the only thing that reaches the
@@ -481,30 +774,89 @@ const importLensNamedSize = async (daemon, workspace, benchmark, requestId) => {
     brotliBytes: result.brotli_bytes,
     minifiedBytes: result.minified_bytes,
     moduleBreakdown: result.module_breakdown ?? [],
+    assetBreakdown: result.asset_breakdown ?? [],
   };
 };
 
-const esbuildNamedSize = async (workspace, activeDocumentPath) => {
+const esbuildNamedSize = async (
+  workspace,
+  activeDocumentPath,
+  expectsStylesheet = false,
+  expectedAssets,
+) => {
   const result = await esbuild.build({
     absWorkingDir: workspace,
     entryPoints: [activeDocumentPath],
     bundle: true,
     minify: true,
     write: false,
+    // Required, not cosmetic: esbuild REFUSES to bundle a graph that imports CSS without an output
+    // path ("Cannot import ... into a JavaScript file without an output path configured"), and
+    // without one even a pure-JS build names its output `<stdout>` rather than `*.js`, so there is
+    // nothing to classify. With it, one entry yields `entry.js` plus a sibling `entry.css`. Nothing
+    // is written to disk (`write: false`); this only names the outputs, so no byte count moves.
+    outdir: path.join(workspace, "esbuild-out"),
     format: "esm",
     platform: "browser",
     treeShaking: true,
+    // `file` is the loader a real app configures for a binary it imports for its URL, and it is
+    // what makes the direct-import fixture measurable at all: esbuild has NO default loader for
+    // `.wasm`, so `import u from "./x.wasm"` is a hard build error without this line. Under `file`
+    // esbuild emits the binary as its own artifact and a JS module exporting the URL — the JS half
+    // is exactly what the daemon stubs away, which is the difference that benchmark quantifies.
+    loader: { ".woff2": "file", ".wasm": "file" },
     logLevel: "silent",
   });
-  const output = result.outputFiles[0]?.contents;
 
-  if (!output) {
-    throw new Error("esbuild did not produce an output file");
+  // When the bundled graph imports CSS, esbuild gathers it into that sibling `.css`, so
+  // `outputFiles` holds more than one entry and the JS is not guaranteed to be at index 0. The
+  // daemon counts those stylesheet bytes now (B2), so the oracle must too, or the two would be
+  // measuring different things and the comparison would be meaningless.
+  //
+  // Classify by extension and compress each artifact ON ITS OWN before summing — never concatenate
+  // first — because that is exactly what the daemon does (ADR-0005: they are separate files that
+  // ship separately). `reduce` over an empty CSS list is zero, so a pure-JS benchmark is unchanged.
+  const stylesheets = result.outputFiles.filter((file) => file.path.endsWith(".css"));
+  const javascript = result.outputFiles.filter((file) => file.path.endsWith(".js"));
+  const emittedAssets = result.outputFiles.filter(
+    (file) => !file.path.endsWith(".css") && !file.path.endsWith(".js"),
+  );
+
+  if (javascript.length === 0) {
+    throw new Error("esbuild did not produce a JavaScript output file");
   }
 
+  // The other half of the CSS fixture's precondition: the entry importing a stylesheet is what makes
+  // the ORACLE emit one. If it ever stops, both sides fold in no CSS, the deltas stay green, and the
+  // benchmark compares JS to JS while claiming to gate asset counting.
+  if (expectsStylesheet && stylesheets.length === 0) {
+    throw new Error(
+      "esbuild emitted no stylesheet for a benchmark whose entire purpose is comparing counted " +
+        "CSS against the oracle; the fixture is no longer exercising asset counting",
+    );
+  }
+
+  // One benchmark may expect SEVERAL emitted artifacts (the direct-import fixture imports both a
+  // wasm and a font), so this is a list. Each entry still demands exactly one match at exactly its
+  // byte count — a list did not loosen the check, it just repeated it per extension.
+  for (const expected of expectedAssets ?? []) {
+    const matching = emittedAssets.filter((file) => file.path.endsWith(expected.extension));
+    if (matching.length !== 1 || matching[0].contents.length !== expected.bytes) {
+      throw new Error(
+        `esbuild must emit one ${expected.bytes}-byte ${expected.extension} artifact; ` +
+          `got ${matching.map((file) => `${file.path}:${file.contents.length}`).join(", ") || "none"}`,
+      );
+    }
+  }
+
+  const bytesOf = (files) => files.reduce((bytes, file) => bytes + file.contents.length, 0);
+  const brotliBytesOf = (files) =>
+    files.reduce((bytes, file) => bytes + brotliSize(file.contents), 0);
+
   return {
-    brotliBytes: brotliSize(output),
-    minifiedBytes: output.length,
+    brotliBytes:
+      brotliBytesOf(javascript) + brotliBytesOf(stylesheets) + brotliBytesOf(emittedAssets),
+    minifiedBytes: bytesOf(javascript) + bytesOf(stylesheets) + bytesOf(emittedAssets),
   };
 };
 
@@ -697,6 +1049,45 @@ const deterministicPayload = (length) => {
   for (let index = 0; index < length; index += 1) {
     state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
     value += alphabet[state % alphabet.length];
+  }
+
+  return value;
+};
+
+// Deterministic bytes that behave like a REAL binary under a compressor, which `deterministicBytes`
+// does not: it takes `state & 0xff` from an LCG mod 2^32, and the low bits of such an LCG have
+// period 2^k — so its low byte repeats every 256 bytes. Measured 2026-07-18: 6144 B and 10240 B of
+// it both compress to 274 B (22:1 and 37:1). A wasm is entropy-dense and a woff2 is brotli-compressed
+// internally; neither shrinks. Using the LCG helper for the binary fixture would have left its
+// brotli axis measuring a compressible synthetic instead of a shipped binary.
+//
+// xorshift32's high byte is full-period: both sizes compress to length + 4 (ratio 1.000) at BOTH
+// quality 4 and 11. That is what makes this the one benchmark with NO compressor-gap noise.
+//
+// Callers pass distinct seeds so two artifacts in one fixture are not prefixes of one another.
+const incompressibleBytes = (length, seed) => {
+  const value = Buffer.allocUnsafe(length);
+  let state = seed;
+
+  for (let index = 0; index < length; index += 1) {
+    state ^= state << 13;
+    state >>>= 0;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    state >>>= 0;
+    value[index] = state >>> 24;
+  }
+
+  return value;
+};
+
+const deterministicBytes = (length) => {
+  const value = Buffer.allocUnsafe(length);
+  let state = 0x12345678;
+
+  for (let index = 0; index < length; index += 1) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    value[index] = state & 0xff;
   }
 
   return value;

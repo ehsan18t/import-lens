@@ -1,4 +1,5 @@
 import type { FileSizeDocumentResponse } from "../ipc/protocol.js";
+import { hasNonBudgetableDiagnostic } from "./budgetability.js";
 import { hasTransientStage } from "./transience.js";
 
 /**
@@ -18,12 +19,12 @@ import { hasTransientStage } from "./transience.js";
  *   number*: the combined build failed, so what is on offer is the SUM of the per-import costs, and
  *   a module two imports reach is counted twice. ADR-0004 calls that a Combined Import Cost, an
  *   upper bound, and says it must never be presented as a size.
- * - **`short`** — an import that belongs in the number contributed nothing to it (still building,
- *   unmeasurable, not installed, or a transient failure that reached the aggregate WITHOUT degrading
- *   it — the defensive path), so the number is missing bytes. A transient failure that *degrades* the
- *   aggregate is not short: it is the `combined-import-cost` quantity above, the combined build's own
- *   failure, and the `degraded` axis already reports it. Reading it as short too would claim a missing
- *   contributor that a timed-out combined build does not have.
+ * - **`short`** — bytes that belong in the number are missing (an import is still building,
+ *   unmeasurable, or not installed; or supported asset bytes were not counted, deterministically or
+ *   request-locally). A transient failure that *degrades* the aggregate is not short: it is the
+ *   `combined-import-cost` quantity above, the combined build's own failure, and the `degraded` axis
+ *   already reports it. Reading it as short too would claim a missing contributor that a timed-out
+ *   combined build does not have.
  *
  * Both at once is a real state and neither word alone describes it: a fallback sum that is *also*
  * short double-counts some imports and omits others, so it is a bound in neither direction.
@@ -33,8 +34,23 @@ export type FileCostQuantity = "file-cost" | "combined-import-cost";
 export interface FileCostQuality {
   /** The quantity the number IS — not what the surface wishes it were. */
   quantity: FileCostQuantity;
-  /** An import that belongs in the number contributed nothing to it. */
+  /** Some bytes that belong in the number contributed nothing to it. */
   short: boolean;
+  /**
+   * The number is a disclosed UPPER BOUND: every byte is present, but some are counted more than
+   * once. Today's only producer is the per-sheet CSS fallback (`imprecise_assets`) — the stylesheet
+   * set could not be bundled as one artifact, so each sheet was measured and compressed alone.
+   *
+   * A third axis rather than a flavour of `short`, because it points the OTHER way: `short` means
+   * bytes are missing and the number is a floor. Folding an over-count into a floor would tell the
+   * user the true cost is higher when it is lower.
+   *
+   * The extension had no axis for this at all. The daemon added a whole stage in order to SAY it,
+   * the CLI printed the sentence, and the editor rendered a bare "File Cost" while its budget
+   * silently returned `not-evaluated` — a number named as sound by one surface and refused by
+   * another, on the same run.
+   */
+  imprecise: boolean;
 }
 
 /** The three fields on the wire that decide what the number is. Nothing here asks about `error`: a
@@ -49,6 +65,7 @@ export const fileCostQuality = (response: FileCostFlags): FileCostQuality => ({
   short:
     response.incomplete === true ||
     (response.degraded !== true && hasTransientStage(response.diagnostics)),
+  imprecise: hasNonBudgetableDiagnostic(response.diagnostics),
 });
 
 /**
@@ -60,15 +77,20 @@ export const fileCostQuality = (response: FileCostFlags): FileCostQuality => ({
  * refuses to JUDGE is exactly the contradiction this model exists to end.
  */
 export const isFileCost = (quality: FileCostQuality): boolean =>
-  quality.quantity === "file-cost" && !quality.short;
+  quality.quantity === "file-cost" && !quality.short && !quality.imprecise;
 
-/** What to call the number. A floor is not a File Cost, and a per-import sum is not one either. */
+/** What to call the number. A floor is not a File Cost, a per-import sum is not one either, and
+ * neither is an over-count. */
 export const fileCostQuantityName = (quality: FileCostQuality): string => {
   if (quality.quantity === "combined-import-cost") {
     return "Combined Import Cost";
   }
 
-  return quality.short ? "File Cost floor" : "File Cost";
+  if (quality.short) {
+    return "File Cost floor";
+  }
+
+  return quality.imprecise ? "File Cost upper bound" : "File Cost";
 };
 
 /**
@@ -82,16 +104,23 @@ export const fileCostQuantityName = (quality: FileCostQuality): string => {
  * called it a File Cost "built as one bundle".
  */
 export const fileCostBecause = (quality: FileCostQuality): string => {
-  const missingImport =
-    "an import that belongs in this file's total was not measured, so the number is a floor and not the file's size";
+  const missingBytes =
+    "bytes that belong in this file's total were not measured, so the number is a floor and not the file's size";
   const combinedBuildFailed =
     "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size";
+  const assetUpperBound =
+    "asset processing produced a disclosed upper bound, so budgets were not evaluated";
+  const builtAsOneBundle = "this file's imports built as one bundle";
 
   if (quality.quantity === "combined-import-cost") {
     return quality.short
-      ? `${combinedBuildFailed}, and an import that belongs in it was not measured either`
+      ? `${combinedBuildFailed}, and bytes that belong in it were not measured either`
       : combinedBuildFailed;
   }
 
-  return quality.short ? missingImport : "this file's imports built as one bundle";
+  if (quality.short) {
+    return missingBytes;
+  }
+
+  return quality.imprecise ? assetUpperBound : builtAsOneBundle;
 };

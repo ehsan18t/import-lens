@@ -1,3 +1,4 @@
+use import_lens_daemon::engine::AssetKind;
 use import_lens_daemon::ipc::protocol::{
     ConfidenceLevel, ImportKind, ImportRequest, ImportRuntime, MeasuredSizes,
 };
@@ -2604,17 +2605,24 @@ fn a_workspace_linked_package_answers_with_what_rolldown_retained() {
 /// Nobody noticed, because the pipeline caught the failure and fabricated a size for it; delete the
 /// fabricator without `plugin.rs` linking the stylesheet as an empty module and they all go BLANK.
 ///
-/// The JS chunk is real and is measured exactly. The stylesheet's bytes are not in that number and
-/// do ship with the package, so they are disclosed — and they cost the result its High confidence,
-/// by design (see `engine::diagnostic_stage::UNCOUNTED_ASSETS`): a size that omits bytes the user's
-/// bundle will really carry is not a High-confidence measurement of that package's cost.
+/// The JS chunk is measured exactly, and the stylesheet's bytes are folded into the same number
+/// (B2): they really do ship, so a size that omitted them was an undercount of every CSS-shipping
+/// package. Proven against an identical package with no stylesheet, so the delta can only be the
+/// CSS. The disclosure this test used to assert is now only the FALLBACK, for a stylesheet that
+/// cannot be processed.
 #[test]
-fn analyze_a_css_shipping_package_measures_its_javascript_and_discloses_the_rest() {
+fn analyze_a_css_shipping_package_counts_its_stylesheet_in_the_import_cost() {
     let workspace = temp_workspace();
+    // `sideEffects: ["*.css"]` is what a real CSS-shipping package declares, and it is load-bearing
+    // here rather than decoration: it is the declaration that makes a bundler RETAIN the stylesheet,
+    // so counting those bytes is correct. A fixture declaring `sideEffects: false` would be the one
+    // shape where a bundler DROPS the CSS and this number would be wrong (see known-issues D7), so
+    // pinning B2 on that shape would pin the defect. The JS entry still matches no glob, so it stays
+    // non-effectful and the confidence assertion below means what it says.
     write_package(
         &workspace,
         "styled-lib",
-        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
         "import './styles.css';\nexport const widget = () => 'widget';\n",
     );
     write_package_file(
@@ -2639,25 +2647,649 @@ fn analyze_a_css_shipping_package_measures_its_javascript_and_discloses_the_rest
         ),
     );
 
+    // An identical package that ships NO stylesheet. Its JavaScript is byte-for-byte the same, so
+    // any difference between the two numbers is the stylesheet and nothing else.
+    write_package(
+        &workspace,
+        "plain-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "export const widget = () => 'widget';\n",
+    );
+    let plain = analyze_import(
+        &context,
+        &import_request(
+            "plain-lib",
+            "plain-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(
         result.error, None,
         "an emitted stylesheet is not an output-shape failure: {result:?}",
     );
     let sizes = common::measured_sizes(&result);
+    let plain_sizes = common::measured_sizes(&plain);
     assert!(sizes.brotli_bytes > 0, "{result:?}");
+
+    // THE POINT OF B2. Before it, both packages measured the same and the stylesheet's bytes were
+    // merely disclosed beside a number that excluded them — a systematic undercount of every
+    // CSS-shipping package. The stylesheet really ships, so it is in the number.
     assert!(
-        result
+        sizes.brotli_bytes > plain_sizes.brotli_bytes,
+        "a package that ships CSS must measure larger than the same package without it: styled \
+         {sizes:?} vs plain {plain_sizes:?}",
+    );
+    assert!(
+        sizes.raw_bytes > plain_sizes.raw_bytes
+            && sizes.minified_bytes > plain_sizes.minified_bytes,
+        "every quantity carries the stylesheet, not just the compressed one: styled {sizes:?} vs \
+         plain {plain_sizes:?}",
+    );
+
+    // The disclosure is the FALLBACK now, not the outcome: nothing here failed to process, so there
+    // are no uncounted bytes to name.
+    assert!(
+        !result
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == "uncounted_assets"
-                && diagnostic.message.contains("styles.css")),
-        "the bytes this size does NOT include must be named: {result:?}",
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "a counted stylesheet must not also be disclosed as uncounted: {result:?}",
+    );
+
+    // The number says how it is composed, so the stylesheet's share is legible rather than folded
+    // invisibly into one figure.
+    let css = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Css)
+        .expect("a CSS-shipping package must report what its stylesheet contributed");
+    assert!(css.brotli_bytes > 0 && css.minified_bytes > 0, "{css:?}");
+    assert_eq!(
+        sizes.brotli_bytes - plain_sizes.brotli_bytes,
+        css.brotli_bytes,
+        "the reported CSS contribution must be exactly the difference the stylesheet makes",
+    );
+
+    // With its bytes counted, nothing is uncounted, so the stylesheet no longer costs the package
+    // its confidence — the diagnostic that held it at Medium is only emitted on a failure now.
+    assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
+}
+
+#[test]
+fn analyze_local_assets_referenced_by_css_are_counted_in_the_import_cost() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "font-lib",
+        "styles.css",
+        "@font-face { font-family: Probe; src: url('./probe.woff2') format('woff2'); }\n\
+         .widget { font-family: Probe; background-image: url('./probe.wasm'); }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("font-lib")
+            .join("probe.woff2"),
+        vec![0x5a; 8 * 1024],
+    )
+    .expect("font fixture should be written");
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("font-lib")
+            .join("probe.wasm"),
+        vec![0x31; 4 * 1024],
+    )
+    .expect("wasm fixture should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "font-lib",
+            "font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    write_package(
+        &workspace,
+        "plain-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "export const widget = () => 'widget';\n",
+    );
+    let plain = analyze_import(
+        &context,
+        &import_request(
+            "plain-lib",
+            "plain-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "{result:?}");
+    let sizes = common::measured_sizes(&result);
+    let plain_sizes = common::measured_sizes(&plain);
+    let css = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Css)
+        .expect("the stylesheet must have a counted CSS contribution");
+    let font = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Font)
+        .expect("a local font referenced by counted CSS must have a Font contribution");
+    let wasm = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Wasm)
+        .expect("local wasm referenced by counted CSS must have a Wasm contribution");
+
+    assert_eq!(font.raw_bytes, 8 * 1024, "{font:?}");
+    assert!(font.brotli_bytes > 0, "{font:?}");
+    assert_eq!(wasm.raw_bytes, 4 * 1024, "{wasm:?}");
+    assert!(wasm.brotli_bytes > 0, "{wasm:?}");
+    assert_eq!(
+        sizes.raw_bytes,
+        plain_sizes.raw_bytes + css.raw_bytes + font.raw_bytes + wasm.raw_bytes,
+        "the headline must contain the JS, CSS, font, and wasm artifacts exactly once"
     );
     assert_eq!(
-        result.confidence,
-        ConfidenceLevel::Medium,
-        "an asset-emitting package is Medium by design; High would claim a completeness the number \
-         does not have: {result:?}",
+        sizes.brotli_bytes,
+        plain_sizes.brotli_bytes + css.brotli_bytes + font.brotli_bytes + wasm.brotli_bytes,
+        "each independently-compressed artifact must be folded into the headline"
     );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "a readable local font must not be disclosed as uncounted: {result:?}"
+    );
+    assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
+}
+
+/// **One icon used to cost the whole package its number.**
+///
+/// A directly imported `.png` is not UTF-8, so Rolldown's own loader failed on `InvalidData` and the
+/// entire build died — the user saw "unavailable" for a package whose JavaScript measures perfectly.
+/// An `.svg` is valid UTF-8, so it reached OXC instead and was parsed as JavaScript, which failed
+/// just as fatally by a different route. Both are now stubbed like any other asset: the JS graph
+/// measures, and the shipped bytes are disclosed rather than dropped.
+#[test]
+fn analyze_measures_a_package_that_directly_imports_an_image() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "icon-lib",
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+        "import logo from './logo.png';\nimport mark from './mark.svg';\nexport const brand = () => logo + mark;\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("icon-lib")
+            .join("logo.png"),
+        vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+            .into_iter()
+            .chain(std::iter::repeat_n(0x42, 16_376))
+            .collect::<Vec<u8>>(),
+    )
+    .expect("png fixture should be written");
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("icon-lib")
+            .join("mark.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"8\" height=\"8\"/></svg>",
+    )
+    .expect("svg fixture should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "icon-lib",
+            "icon-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["brand"],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(
+        result.error, None,
+        "one unmeasurable asset kind must not take the package's JavaScript with it: {result:?}"
+    );
+    assert!(
+        common::measured_sizes(&result).raw_bytes > 0,
+        "the JavaScript graph must still be measured: {result:?}"
+    );
+    let disclosure = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
+        .expect("shipped bytes the size omits must be disclosed");
+    assert!(
+        disclosure.message.contains("logo.png") && disclosure.message.contains("mark.svg"),
+        "both shipped files must be named: {disclosure:?}"
+    );
+    assert_ne!(
+        result.confidence,
+        ConfidenceLevel::High,
+        "a size that omits shipped bytes cannot claim High confidence: {result:?}"
+    );
+}
+
+/// The headline claims to be the import's full cost. An image is outside the counted taxonomy, and
+/// the closed `AssetKind` set used to drop it through a bare `None`: out of the number, out of every
+/// disclosure, still High confidence — a package advertising a total it was short by. Disclosing it
+/// is what restores `incomplete`, which is what re-closes the cache and budget paths behind it.
+#[test]
+fn analyze_discloses_an_image_referenced_by_counted_css_instead_of_dropping_it() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "image-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "image-lib",
+        "styles.css",
+        ".widget { background-image: url('./sprite.png'); }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("image-lib")
+            .join("sprite.png"),
+        vec![0x77; 64 * 1024],
+    )
+    .expect("image fixture should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "image-lib",
+            "image-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(result.error, None, "{result:?}");
+    assert!(
+        result
+            .asset_breakdown
+            .iter()
+            .all(|contribution| contribution.kind != AssetKind::Font
+                && contribution.kind != AssetKind::Wasm),
+        "an image is disclosed, not counted as some other kind: {result:?}"
+    );
+    let disclosure = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
+        .expect("a shipped image the size omits must be disclosed as uncounted");
+    assert!(
+        disclosure.message.contains("65536"),
+        "the disclosure must carry the image's real size: {disclosure:?}"
+    );
+    assert_ne!(
+        result.confidence,
+        ConfidenceLevel::High,
+        "a size that omits shipped bytes cannot claim High confidence: {result:?}"
+    );
+}
+
+#[test]
+fn analyze_a_font_reference_resolves_from_the_imported_stylesheet() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "nested-font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "nested-font-lib",
+        "styles.css",
+        "@import './nested/typography.css';\n.widget { font-family: Probe; }\n",
+    );
+    write_package_file(
+        &workspace,
+        "nested-font-lib",
+        "nested/typography.css",
+        "@font-face { font-family: Probe; src: url('./probe%20font.woff2?v=1#iefix'); }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("nested-font-lib")
+            .join("nested")
+            .join("probe font.woff2"),
+        vec![0x3c; 4 * 1024],
+    )
+    .expect("nested font fixture should be written");
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "nested-font-lib",
+            "nested-font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let font = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Font)
+        .expect("the imported stylesheet's font must be counted");
+    assert_eq!(font.raw_bytes, 4 * 1024, "{result:?}");
+    assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
+}
+
+#[test]
+fn analyze_two_stylesheets_count_their_shared_font_once() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "shared-font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './first.css';\nimport './second.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "shared-font-lib",
+        "first.css",
+        "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n.first { color: red; }\n",
+    );
+    write_package_file(
+        &workspace,
+        "shared-font-lib",
+        "second.css",
+        "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n.second { color: blue; }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("shared-font-lib")
+            .join("probe.woff2"),
+        vec![0x7f; 6 * 1024],
+    )
+    .expect("shared font fixture should be written");
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "shared-font-lib",
+            "shared-font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let font = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Font)
+        .expect("the shared font must be counted");
+    assert_eq!(
+        font.raw_bytes,
+        6 * 1024,
+        "two CSS references to one emitted font must not double-count it: {result:?}"
+    );
+}
+
+#[test]
+fn analyze_a_missing_css_font_is_disclosed_and_lowers_confidence() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "missing-font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "missing-font-lib",
+        "styles.css",
+        "@font-face { font-family: Missing; src: url('./missing.woff2'); }\n",
+    );
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "missing-font-lib",
+            "missing-font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "the JavaScript and CSS still measured");
+    assert!(
+        result
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == AssetKind::Css),
+        "the healthy CSS contribution must be retained: {result:?}"
+    );
+    assert!(
+        !result
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == AssetKind::Font),
+        "an unreadable font must not be fabricated into the breakdown: {result:?}"
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "uncounted_assets" && diagnostic.message.contains("missing.woff2")
+        }),
+        "the missing local font must be disclosed: {result:?}"
+    );
+    assert_eq!(result.confidence, ConfidenceLevel::Medium, "{result:?}");
+}
+
+#[test]
+fn analyze_external_css_fonts_are_disclosed_without_losing_the_budget_verdict() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "external-font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "external-font-lib",
+        "styles.css",
+        "@font-face { font-family: Remote; src: url('https://cdn.example/remote.woff2'); }\n\
+         @font-face { font-family: Public; src: url('/fonts/public.woff2'); }\n",
+    );
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "external-font-lib",
+            "external-font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "the local stylesheet still measured");
+    assert!(
+        !result
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == AssetKind::Font),
+        "external bytes must not be fabricated into a local artifact: {result:?}"
+    );
+    // Disclosed, but on `external` — the stage for weight the page pays that this package does not
+    // ship. The measured bytes are EXACT without it, so unlike a precision stage this one must not
+    // strip the result's budget verdict.
+    // This fixture holds one of EACH kind, and the whole point of the split is that they are not
+    // the same fact. The CDN font is fetched at runtime — not this package's bytes, so the size
+    // stays exact and budgetable. `/fonts/public.woff2` is a local file the package expects served
+    // from the site root: those bytes DO ship and are missing from the size, so it is an omission
+    // that makes the result a floor. One channel for both is what mislabelled one of them.
+    let external = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.stage == "external")
+        .expect("unmeasurable external font weight must be disclosed");
+    assert_eq!(external.details.len(), 1, "{external:?}");
+    assert!(
+        external.details[0].contains("cdn.example"),
+        "the runtime-fetched resource is the external one: {external:?}"
+    );
+
+    let omission = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
+        .expect("a public-root local font is a shipped byte this size omits");
+    assert!(
+        omission
+            .details
+            .iter()
+            .any(|detail| detail.contains("public.woff2")),
+        "the unlocatable local font is the omitted one: {omission:?}"
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "imprecise_assets"),
+        "neither reference is an over-count: {result:?}"
+    );
+    assert_eq!(result.confidence, ConfidenceLevel::Medium, "{result:?}");
+}
+
+#[test]
+fn analyze_an_ambiguous_css_url_keeps_the_css_and_discloses_the_omission() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "ambiguous-url-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "ambiguous-url-lib",
+        "styles.css",
+        ".widget { --probe-resource: url('./probe.woff2'); color: purple; }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("ambiguous-url-lib")
+            .join("probe.woff2"),
+        vec![0x2a; 2 * 1024],
+    )
+    .expect("ambiguous resource fixture should be written");
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "ambiguous-url-lib",
+            "ambiguous-url-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(
+        result.error, None,
+        "the valid stylesheet must remain measured"
+    );
+    assert!(
+        result
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == AssetKind::Css),
+        "dependency inspection must not discard the CSS contribution: {result:?}"
+    );
+    // `uncounted_assets`, not `imprecise_assets`. The sheet is counted but its whole `url()` graph
+    // went undiscovered, so bytes are MISSING and the number is a floor — the opposite direction
+    // from an over-count. Reporting it as imprecision is what stopped `incomplete` from firing and
+    // let a short total be cached and recorded as a file's permanent baseline.
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "uncounted_assets"
+                && diagnostic
+                    .message
+                    .contains("could not be located or inspected")
+        }),
+        "an ambiguous relative URL must not remain silently High confidence: {result:?}"
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "imprecise_assets"),
+        "an undiscovered url() graph omits bytes, it does not double-count them: {result:?}"
+    );
+    assert_eq!(result.confidence, ConfidenceLevel::Medium, "{result:?}");
 }

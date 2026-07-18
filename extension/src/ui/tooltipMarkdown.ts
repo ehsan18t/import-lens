@@ -1,9 +1,10 @@
 import type { ImportAnalysisInsight } from "../analysis/state.js";
 import type { ImportLensConfig } from "../config.js";
-import type { ImportResult, ImportRuntime } from "../ipc/protocol.js";
+import type { AssetKind, ImportResult, ImportRuntime } from "../ipc/protocol.js";
 import { confidenceVisualFor } from "./confidenceVisuals.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import {
+  assetKindLabel,
   bytesForCompression,
   type CompressionFormat,
   formatBytes,
@@ -74,7 +75,42 @@ export const importResultSizeMarkdown = (
     `- Gzip: ${formatBytes(sizes.gzip_bytes)}`,
     `- Brotli: ${formatBytes(sizes.brotli_bytes)}`,
     `- Zstd: ${formatBytes(sizes.zstd_bytes)}`,
+    ...assetBreakdownRows(result, compression, selected.label),
   ].join("\n");
+};
+
+/**
+ * How the size above is composed, when part of it is not JavaScript (B2).
+ *
+ * These bytes are already inside the number — a UI kit's cost is part JS and part stylesheet — so
+ * this names the parts rather than adding to the total. Nothing is rendered for the common case of
+ * an import that ships no assets.
+ *
+ * The heading names the compression these rows are in. Five differently-compressed figures are
+ * listed directly above them, so an unlabelled `- CSS: 12.3 kB` invites being read as the raw
+ * number when it is the selected one.
+ */
+const assetBreakdownRows = (
+  result: ImportResult,
+  compression: CompressionFormat,
+  compressionLabel: string,
+): string[] => {
+  const breakdown = result.asset_breakdown ?? [];
+
+  if (breakdown.length === 0) {
+    return [];
+  }
+
+  return [
+    "",
+    `**Included assets** (${compressionLabel})`,
+    ...breakdown.map(
+      (contribution) =>
+        `- ${assetKindLabel(contribution.kind)}: ${formatBytes(
+          bytesForCompression(contribution, compression),
+        )}`,
+    ),
+  ];
 };
 
 const yesNo = (value: boolean): "yes" | "no" => (value ? "yes" : "no");

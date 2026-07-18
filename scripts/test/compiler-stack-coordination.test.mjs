@@ -89,6 +89,24 @@ test("the glob matcher is exact-pinned at the version rolldown resolved", () => 
   );
 });
 
+test("the CSS processor is exact-pinned at its standalone configured version", () => {
+  // lightningcss bundles and minifies a package's stylesheets so their bytes can be folded
+  // into the Import Cost (B2). It processes the bytes that become the reported number, so a
+  // version bump can silently move CSS sizes -- the same hazard the rolldown/oxc pins guard,
+  // which is why it is asserted here. Unlike them it is pinned INDEPENDENTLY (not coordinated
+  // with rolldown's graph) and as an inline table (features), so match the `version = "=..."`
+  // inside it.
+  assert.match(
+    repoFile("daemon/Cargo.toml"),
+    new RegExp(
+      `^${compilerStackConfig.cssProcessorCrate} = \\{ version = "=${escapeVersion(
+        compilerStackConfig.currentCssProcessorVersion,
+      )}"`,
+      "mu",
+    ),
+  );
+});
+
 test("oxc_mangler stays out of the dependency graph", () => {
   // Guard: mangling would change emitted identifiers and break size accuracy.
   assert.doesNotMatch(repoFile("daemon/Cargo.toml"), /^oxc_mangler = /mu);

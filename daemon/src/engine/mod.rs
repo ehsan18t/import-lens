@@ -4,6 +4,8 @@
 //! the crate.
 
 mod adapter;
+mod asset_classifier;
+mod asset_input;
 pub mod boundary;
 pub(crate) mod dependency_paths;
 mod entry;
@@ -15,6 +17,11 @@ use std::path::PathBuf;
 
 pub use crate::ipc::protocol::ImportRuntime;
 pub use adapter::RolldownEngine;
+pub(crate) use asset_classifier::{AssetClass, classify_asset, classify_asset_class};
+pub use asset_input::CollectedAsset;
+// Test-only since the bounded pipeline took over every production read.
+#[cfg(test)]
+pub(crate) use asset_input::read_collected_asset;
 
 #[derive(Debug, Clone)]
 pub struct BundleRequest {
@@ -63,13 +70,70 @@ pub struct ModuleContribution {
 /// A non-JavaScript module the graph imported: real bytes that ship with the package and are NOT
 /// in the measured size, because the measured size is the JavaScript chunk.
 ///
-/// Almost always a stylesheet. Rolldown 1.1.5 cannot bundle CSS at all, so the plugin links it as
-/// an empty module and records it here; disclosing it is the honest alternative to counting bytes
-/// the bundler never rendered, or to failing the build and reporting nothing at all.
+/// This is now the FALLBACK shape only. A classified asset ([`CollectedAsset`]) is processed the
+/// way it ships and counted (B2); an asset reaches here only when it could not be processed — a
+/// Lightning CSS failure — or when Rolldown itself emitted one beside the chunk (nothing does
+/// today). Disclosing those bytes is the honest alternative to counting bytes nothing rendered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UncountedAsset {
     pub path: PathBuf,
     pub bytes: u64,
+}
+
+/// The one sentence every uncounted-asset disclosure uses, wherever the assets came from.
+///
+/// Two producers reach this shape — the engine adapter (an asset Rolldown emitted beside the chunk)
+/// and the asset pipeline (a processor fallback, or a shipped kind outside the counted taxonomy) —
+/// and they had grown separate copies of the same sentence. One definition means the user reads the
+/// same words for the same fact, and a change to how this is phrased cannot land in only one of them.
+///
+/// An asset whose bytes could not be stat'd contributes 0 to the sum, so the total is qualified
+/// rather than stated flatly: understating the shortfall is the failure mode this wording exists to
+/// avoid, and "totalling 0 bytes" reads as though the omission does not matter when the truth is
+/// that its size is unknown.
+pub fn uncounted_assets_message(assets: &[UncountedAsset]) -> String {
+    let disclosed_bytes: u64 = assets.iter().map(|asset| asset.bytes).sum();
+    let total = if assets.iter().all(|asset| asset.bytes > 0) {
+        format!("totalling {disclosed_bytes} bytes")
+    } else if disclosed_bytes > 0 {
+        format!("totalling at least {disclosed_bytes} bytes")
+    } else {
+        "of unknown size".to_owned()
+    };
+    let names = assets
+        .iter()
+        .map(|asset| {
+            asset
+                .path
+                .file_name()
+                .unwrap_or(asset.path.as_os_str())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "package ships {} non-JavaScript asset(s) {total} that this size does NOT include: {names}",
+        assets.len()
+    )
+}
+
+/// What a non-JavaScript module ships as, which decides how it is processed (B2).
+///
+/// CSS needs a processor (Lightning CSS resolves its `@import` tree and minifies it). A wasm or
+/// font has none: its shipped size is its raw bytes, and compressing them is the whole answer.
+///
+/// This crosses the wire inside [`crate::ipc::protocol::AssetContribution`], so the snake_case
+/// spellings here are the contract the extension matches on.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetKind {
+    Css,
+    Wasm,
+    Font,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +146,9 @@ pub struct ImportDiagnostic {
 pub struct BundleArtifact {
     /// Unminified source of the single output chunk.
     pub code: String,
+    /// Source bytes admitted under this build's aggregate graph ceiling. Direct assets contribute
+    /// their exact raw length even though Rolldown sees them as empty modules.
+    pub graph_source_bytes: usize,
     pub loaded_paths: Vec<PathBuf>,
     /// Fingerprints captured when each module's bytes were read during this build,
     /// so freshness describes the bytes the size was actually measured from (§8.3).
@@ -98,9 +165,14 @@ pub struct BundleArtifact {
     pub exported_names: Vec<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
     pub matched_side_effect_paths: Vec<PathBuf>,
-    /// Bytes this size does NOT include (see [`UncountedAsset`]). Already summarized into a
-    /// `uncounted_assets` diagnostic; kept structured so a future surface can show them.
-    pub uncounted_assets: Vec<UncountedAsset>,
+    /// The classified non-JavaScript modules the graph imported, intercepted at the load boundary
+    /// (see [`CollectedAsset`]). The pipeline processes these and folds their shipped bytes into
+    /// the size (B2); they are NOT in `code`, which is the JavaScript chunk alone.
+    pub assets: Vec<CollectedAsset>,
+    /// Bytes this build knows about but cannot process: assets Rolldown itself emitted beside the
+    /// chunk. Nothing does today, so this is normally empty; it is disclosed rather than counted
+    /// because there is no file behind it to process.
+    pub emitted_assets: Vec<UncountedAsset>,
 }
 
 /// The result of export enumeration (§8.4).
@@ -156,13 +228,12 @@ pub mod stage {
     // DECLARATION ORDER IS RANK ORDER. Adding a stage means deciding where the build reaches it,
     // and nothing else; see `rank`.
     stages! {
-        // ---- The build did not happen. --------------------------------------------------------
+        // ---- The build produced no reusable answer. ------------------------------------------
         //
-        // These three are not stages the build reached — they are the build being LOST, and they
-        // preempt everything below because nothing below ever ran. Ranking them first is what makes
-        // it impossible for a deterministic failure to outrank a transient one and so present a
-        // scheduling accident as a fact about the package's bytes — the one that must be cacheable
-        // and the other that must never be (ADR-0006, invariant 3).
+        // The first three are not stages the build reached — they are the build being LOST. The
+        // fourth means a supported asset's exact bytes could not be observed. All four preempt a
+        // deterministic module diagnostic because presenting a request-local failure as a fact
+        // about the package's bytes would make it durable (ADR-0006, invariant 3).
         //
         // Today they cannot even compete: each is constructed in `boundary.rs` at a point where the
         // build's diagnostics do not exist (a panic unwinds straight past `classify_failure`; a
@@ -177,6 +248,10 @@ pub mod stage {
         TIMEOUT => "timeout",
         /// The engine runtime dropped the build without replying.
         ENGINE_GONE => "engine_gone",
+        /// A supported asset input could not be observed as exact readable bytes. A concurrent
+        /// install, file lock, permission blip, or missing file can all recover without any input
+        /// the failed build fingerprinted changing.
+        ASSET_IO => "asset_io",
 
         // ---- The build was abandoned. ----------------------------------------------------------
         //
@@ -239,13 +314,13 @@ pub mod stage {
     /// is ranked by where the build reaches it. We do not claim to know which failure a user would
     /// rather hear about.
     ///
-    /// **Four stages are not ranked by where the build reaches them, because the build never reached
-    /// them.** The three transients are the build being LOST and `module_graph_limit` is the build
-    /// being ABANDONED; none is a thing that happened *to a module*, and each is the reason there is
-    /// no answer at all. They lead the order for that reason, not because they occur early — the
-    /// breach is in fact *detected* in the `load` hook, after resolve. Ranking a module's diagnostic
-    /// ahead of one of them would report the shrapnel of a build that was never going to finish, and
-    /// hide the cause. Every other stage is a position in a build that was genuinely running.
+    /// **Five outcomes are ranked by whole-build meaning rather than module-phase order.** `panic`,
+    /// `timeout`, and `engine_gone` mean the build was LOST; `asset_io` means its exact asset inputs
+    /// were not observable; and `module_graph_limit` means it was ABANDONED. Each is the reason no
+    /// reusable answer exists. They lead the order for that reason, not because they occur early —
+    /// the asset read and graph breach are both detected in `load`, after resolve. Ranking a module
+    /// diagnostic ahead of one would report its shrapnel and hide the request-local/whole-build
+    /// cause. Every other stage is a position in a build that was genuinely running.
     ///
     /// A stage outside the vocabulary sorts last. `adapter::stage_for` can only return a declared
     /// one, so that arm is unreachable from the ranking's only caller; it is here so the order is
@@ -261,10 +336,9 @@ pub mod stage {
     ///
     /// A `parse`/`link`/`resolve`/`output_shape`/`module_graph_limit` failure is a property of
     /// the code being measured: it will fail the same way next time, so the degraded result it
-    /// produces is worth caching. These three are not. A build that was cancelled at the
-    /// deadline, unwound, or lost its runtime tells us nothing about the package, so storing what
-    /// it produced makes a scheduling accident durable — and durable is forever, next to a build
-    /// that would have succeeded on the retry nobody will now run.
+    /// produces is worth caching. These four are not. A build that was cancelled at the deadline,
+    /// unwound, lost its runtime, or could not observe an asset input tells us nothing reusable
+    /// about the package, so storing what it produced makes a machine/filesystem accident durable.
     ///
     /// This is the ENGINE's list, and it is not by itself the cache gate: a stage can be transient
     /// in fact without being an engine stage at all (`pipeline::stage::ENTRY_METADATA` is
@@ -277,7 +351,7 @@ pub mod stage {
     /// The list is mirrored in the extension and the CLI, which cannot import it, under a drift
     /// check (`scripts/test/engine-stage-coordination.test.mjs`).
     pub fn is_transient(stage: &str) -> bool {
-        matches!(stage, TIMEOUT | PANIC | ENGINE_GONE)
+        matches!(stage, TIMEOUT | PANIC | ENGINE_GONE | ASSET_IO)
     }
 }
 
@@ -321,6 +395,21 @@ pub mod diagnostic_stage {
     /// carries no `~` prefix in the UI (that is reserved for Low), so a correctly-measured CSS
     /// package reads as a plain number with a stated caveat, which is exactly what it is.
     pub const UNCOUNTED_ASSETS: &str = "uncounted_assets";
+    /// Assets that ARE in the number, but whose bytes may be counted more than once.
+    ///
+    /// The stylesheet set bundles into ONE artifact because that is how it ships, and that union is
+    /// what dedupes an `@import` two sheets share. The union is all-or-nothing, so when it fails the
+    /// set is retried one sheet at a time: every sheet is still counted (nothing is
+    /// [`UNCOUNTED_ASSETS`]), but bytes two sheets share are now inlined into both and counted
+    /// twice, so the size reads **high**.
+    ///
+    /// This exists because that degradation had no way to be said. `uncounted_assets` is the only
+    /// consumer of the per-asset failure list, and it returns `None` the moment nothing is
+    /// uncounted — so a set that degraded and then measured every sheet successfully produced an
+    /// over-count with NO diagnostic, which `engine_confidence` reads as **High** and `is_durable`
+    /// then writes to disk. An over-count that says so is a disclosed limit; a silent one is the
+    /// overclaim this model exists to stop.
+    pub const IMPRECISE_ASSETS: &str = "imprecise_assets";
 }
 
 /// `stage` is one of [`stage::ALL`].

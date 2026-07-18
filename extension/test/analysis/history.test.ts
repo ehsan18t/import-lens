@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   type BundleImpactHistoryItem,
   bundleImpactHistoryDeltaLabel,
+  bundleImpactHistoryKey,
   bundleImpactHistoryLabel,
   type ImportCostHistoryItem,
   type ImportCostHistorySource,
@@ -62,10 +63,32 @@ test("recordBundleImpactHistory keeps newest entries first under the limit", asy
   await recordBundleImpactHistory(store, sizedDocument(900), "/workspace/src/c.ts", 1_800_000, 2);
 
   assert.deepEqual(
-    store
-      .get<BundleImpactHistoryItem[]>("importLens.bundleImpactHistory", [])
-      .map((entry) => entry.fileName),
+    store.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []).map((entry) => entry.fileName),
     ["/workspace/src/c.ts", "/workspace/src/b.ts"],
+  );
+});
+
+test("bundle-impact history leaves pre-D12 asset floors behind", async () => {
+  const store = new MemoryStore();
+  const legacyKey = "importLens.bundleImpactHistory.v2";
+  store.values.set(legacyKey, [item("/workspace/src/legacy-floor.ts", 100)]);
+
+  await recordBundleImpactHistory(
+    store,
+    sizedDocument(1500),
+    "/workspace/src/complete.ts",
+    1_800_001,
+  );
+
+  assert.equal(bundleImpactHistoryKey, "importLens.bundleImpactHistory.v3");
+  assert.deepEqual(
+    store.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []).map((entry) => entry.fileName),
+    ["/workspace/src/complete.ts"],
+  );
+  assert.deepEqual(
+    store.get<BundleImpactHistoryItem[]>(legacyKey, []).map((entry) => entry.fileName),
+    ["/workspace/src/legacy-floor.ts"],
+    "old rows have no quality metadata, so they are ignored rather than migrated as real baselines",
   );
 });
 

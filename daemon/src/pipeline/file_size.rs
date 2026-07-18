@@ -1,10 +1,16 @@
 use crate::{
+    cache::key::{
+        FileFingerprint, fingerprints_are_reusable, sort_and_dedup_fingerprints,
+        unverifiable_file_fingerprint,
+    },
     engine::{BundleEntry, BundlePurpose, BundleRequest, boundary},
     ipc::protocol::{
-        ImportDiagnostic, ImportRequest, ImportResult, ImportRuntime, ModuleContribution,
+        AssetContribution, ImportDiagnostic, ImportRequest, ImportResult, ImportRuntime,
+        ModuleContribution,
     },
     pipeline::{
         analyze::{AnalysisContext, engine_selection},
+        assets::{asset_diagnostics, process_assets_bounded},
         compress::{CompressionSizes, compress_all},
         minify::minify_source,
         resolver::resolve_package_entry,
@@ -108,12 +114,20 @@ pub struct FileSizeComputation {
     pub gzip_bytes: u64,
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
-    /// At least one import that belongs in these totals contributed **no bytes**, because it was
-    /// not Measured. The totals are then a LOWER BOUND on the file, not the file — safe to show
-    /// beside the diagnostics that say so (FR-024a: a floor beats a zero), and never safe to cache,
-    /// persist, or compare against a baseline (ADR-0006, invariant 4).
+    /// What the totals above are made of, per non-JavaScript kind — already INSIDE the five sizes.
     ///
-    /// **Any** non-Measured contributor sets it. All three kinds:
+    /// The file headline began including stylesheet, wasm and font bytes without any surface able to
+    /// say so, which is how a status-bar number silently changed meaning. One row per kind, summed
+    /// across every runtime group, because a runtime is an artifact boundary and each group's assets
+    /// were compressed on their own (ADR-0005).
+    pub asset_breakdown: Vec<AssetContribution>,
+    /// Bytes that belong in these totals are absent: an import contributed no measurement, or a
+    /// successful build disclosed supported `uncounted_assets`. The totals are then a LOWER BOUND
+    /// on the file, not the file — safe to show beside the diagnostics that say so (FR-024a: a
+    /// floor beats a zero), and never safe to cache, persist, or compare against a baseline
+    /// (ADR-0006, invariant 4).
+    ///
+    /// **Any** missing-byte shape sets it:
     ///
     /// * **Loading** — its own build had not landed when the sum was taken (`result: None`).
     /// * **Unmeasured, transient** — timeout / panic / engine_gone. Says nothing about the package.
@@ -127,10 +141,13 @@ pub struct FileSizeComputation {
     ///   `importlens check` with exit 0. "Deterministically unknown" is still unknown.
     /// * and an import that could not be RESOLVED, which is not even an entry of the combined build,
     ///   so its bytes are absent from these totals however well that build went.
+    /// * **Measured but partial** — its JavaScript/healthy assets have real sizes, while
+    ///   `uncounted_assets` identifies supported shipped bytes absent from them.
     ///
     /// It exists because neither of the other two signals can see this. `error` is `None` — the sum
     /// succeeded, it just summed less than the file. And the stage scan in [`Self::is_cacheable`]
-    /// sees only transient stages, while a still-building import has failed at no stage at all.
+    /// sees only request-local stages: a still-building import has no stage, while deterministic
+    /// `uncounted_assets` is deliberately reusable at the import level.
     pub incomplete: bool,
     /// The file's **own combined build** failed, so these totals fell back to a sum of per-import
     /// costs — with no shared-module deduplication. That is a **different quantity** from a File
@@ -152,6 +169,9 @@ pub struct FileSizeComputation {
     pub degraded: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
+    /// Exact inputs of the combined build, retained only for the process-local File Cost cache.
+    /// This is not part of the wire or disk schema.
+    pub(crate) dependency_fingerprints: Vec<FileFingerprint>,
 }
 
 impl FileSizeComputation {
@@ -177,10 +197,11 @@ impl FileSizeComputation {
         self.error.is_none()
             && !self.incomplete
             && !self.degraded
+            && fingerprints_are_reusable(&self.dependency_fingerprints)
             && !self
                 .diagnostics
                 .iter()
-                .any(|item| crate::engine::stage::is_transient(&item.stage))
+                .any(|item| crate::pipeline::stage::is_transient(&item.stage))
     }
 
     /// Fold one runtime group's conservative per-import sum into the file's totals, and report
@@ -203,7 +224,32 @@ impl FileSizeComputation {
         self.gzip_bytes += fallback.gzip_bytes;
         self.brotli_bytes += fallback.brotli_bytes;
         self.zstd_bytes += fallback.zstd_bytes;
+        self.absorb_asset_breakdown(&fallback.asset_breakdown);
         true
+    }
+
+    /// Merge one source of per-kind asset weight into the file's composition, summing by kind.
+    ///
+    /// Both routes feed this: a runtime group's own combined build, and the per-import fallback a
+    /// degraded group falls back to. A degraded file still has real asset bytes in its total, so
+    /// losing the breakdown exactly when the number is hardest to read would be the wrong trade.
+    fn absorb_asset_breakdown(&mut self, contributions: &[AssetContribution]) {
+        for contribution in contributions {
+            match self
+                .asset_breakdown
+                .iter_mut()
+                .find(|existing| existing.kind == contribution.kind)
+            {
+                Some(existing) => {
+                    existing.raw_bytes += contribution.raw_bytes;
+                    existing.minified_bytes += contribution.minified_bytes;
+                    existing.gzip_bytes += contribution.gzip_bytes;
+                    existing.brotli_bytes += contribution.brotli_bytes;
+                    existing.zstd_bytes += contribution.zstd_bytes;
+                }
+                None => self.asset_breakdown.push(*contribution),
+            }
+        }
     }
 }
 
@@ -543,15 +589,87 @@ fn compute_file_size_with(
             }
         };
 
+        // This group's non-JavaScript assets, processed the way they ship (B2). The combined build
+        // saw every import in this runtime, so its stylesheets bundle into ONE artifact for the
+        // whole group — which is how they ship, and it dedupes what two imports both `@import`
+        // rather than counting it twice. Each artifact is compressed on its own and summed
+        // (ADR-0005); an asset that cannot be processed falls back to disclosure and is reported.
+        let assets = match process_assets_bounded(
+            artifact.assets.clone(),
+            artifact.graph_source_bytes,
+            artifact.loaded_paths.clone(),
+        ) {
+            Ok(assets) => assets,
+            Err(failure) => {
+                // The JS chunk completed, but the runtime group's asset tail did not produce one
+                // coherent measurement. Degrade this group exactly like a combined-build failure:
+                // keep the already-known per-import floor and never cache or judge it as File Cost.
+                totals.degraded = true;
+                totals
+                    .dependency_fingerprints
+                    .extend(artifact.read_time_fingerprints.iter().cloned());
+                totals
+                    .dependency_fingerprints
+                    .extend(failure.read_time_fingerprints);
+                totals.dependency_fingerprints.extend(
+                    artifact
+                        .unhashed_paths
+                        .iter()
+                        .map(unverifiable_file_fingerprint),
+                );
+                diagnostics.push(diagnostic(
+                    failure.stage,
+                    failure.message,
+                    vec![
+                        "asset processing failed for this runtime; its totals are conservative \
+                         per-import sums without shared-module or shared-asset deduplication"
+                            .to_owned(),
+                    ],
+                ));
+                let fallback = per_import_totals(&group.sized, &mut diagnostics);
+                any_sized |= totals.absorb_fallback(fallback);
+                continue;
+            }
+        };
+        let asset_sizes = assets.total();
+        totals.absorb_asset_breakdown(&assets.contributions);
+        totals
+            .dependency_fingerprints
+            .extend(artifact.read_time_fingerprints.iter().cloned());
+        totals
+            .dependency_fingerprints
+            .extend(assets.freshness_fingerprints());
+        totals.dependency_fingerprints.extend(
+            artifact
+                .unhashed_paths
+                .iter()
+                .map(unverifiable_file_fingerprint),
+        );
+        for disclosure in asset_diagnostics(&assets) {
+            diagnostics.push(diagnostic(
+                &disclosure.stage,
+                disclosure.message,
+                disclosure.details,
+            ));
+        }
+
+        // The JavaScript chunk and every healthy asset are still useful as a lower bound, but an
+        // `uncounted_assets` disclosure means bytes that ship are absent from all five totals.
+        // Today those are processor fallbacks; retain the engine's emitted-asset channel too so a
+        // future Rolldown output cannot silently reopen the same hole. Deterministic asset
+        // fallbacks may remain reusable per import; they may not be cached, persisted, or judged
+        // as this file's complete cost.
+        totals.incomplete |= !artifact.emitted_assets.is_empty() || assets.has_uncounted_assets();
+
         any_sized = true;
-        totals.raw_bytes += artifact.code.len() as u64;
+        totals.raw_bytes += artifact.code.len() as u64 + asset_sizes.raw_bytes;
         // `minified_bytes` is measured on the same string this group's compressors saw, so the two
         // numbers describe the same bytes. The old join added one separator per extra group, so the
         // minified total described a string that ships nowhere.
-        totals.minified_bytes += minified.len() as u64;
-        totals.gzip_bytes += compressed.gzip_bytes;
-        totals.brotli_bytes += compressed.brotli_bytes;
-        totals.zstd_bytes += compressed.zstd_bytes;
+        totals.minified_bytes += minified.len() as u64 + asset_sizes.minified_bytes;
+        totals.gzip_bytes += compressed.gzip_bytes + asset_sizes.gzip_bytes;
+        totals.brotli_bytes += compressed.brotli_bytes + asset_sizes.brotli_bytes;
+        totals.zstd_bytes += compressed.zstd_bytes + asset_sizes.zstd_bytes;
     }
 
     if !any_sized {
@@ -562,6 +680,8 @@ fn compute_file_size_with(
             diagnostics,
         );
     }
+
+    sort_and_dedup_fingerprints(&mut totals.dependency_fingerprints);
 
     FileSizeComputation {
         diagnostics,
@@ -584,15 +704,18 @@ struct RuntimeGroup {
 #[derive(Default)]
 struct PerImportTotals {
     sized_any: bool,
-    /// An import that belongs in this sum contributed no bytes, because it was not Measured — it is
-    /// still being built (`result: None`), or its build failed, transiently or otherwise. This sum
-    /// is then under the file's true size by an amount the sum itself cannot know.
+    /// Bytes that belong in this sum are absent: an import was not Measured, or it was Measured with
+    /// an `uncounted_assets` disclosure. This sum is then under the file's true size by an amount
+    /// the sum itself cannot know.
     missing_inputs: bool,
     raw_bytes: u64,
     minified_bytes: u64,
     gzip_bytes: u64,
     brotli_bytes: u64,
     zstd_bytes: u64,
+    /// The per-kind composition of the imports in this sum, so a degraded runtime group still tells
+    /// the user what its number is made of.
+    asset_breakdown: Vec<AssetContribution>,
 }
 
 /// A file-level request must degrade to conservative non-deduped per-import totals
@@ -656,7 +779,7 @@ fn per_import_totals(
                 .unmeasured_stage()
                 .unwrap_or(crate::pipeline::stage::FILE_SIZE_FALLBACK);
             let mut details = vec![specifier];
-            details.push(if crate::engine::stage::is_transient(stage) {
+            details.push(if crate::pipeline::stage::is_transient(stage) {
                 "this import's own build failed transiently, so its bytes are unknown for this run \
                  and the file's total is a floor"
                     .to_owned()
@@ -676,12 +799,48 @@ fn per_import_totals(
             continue;
         };
 
+        if result.has_uncounted_assets() {
+            totals.missing_inputs = true;
+            for disclosure in result.diagnostics.iter().filter(|diagnostic| {
+                diagnostic.stage == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS
+            }) {
+                let mut details = vec![specifier.clone()];
+                details.extend(disclosure.details.iter().cloned());
+                diagnostics.push(diagnostic(
+                    &disclosure.stage,
+                    disclosure.message.clone(),
+                    details,
+                ));
+            }
+        }
+
         totals.sized_any = true;
         totals.raw_bytes += sizes.raw_bytes;
         totals.minified_bytes += sizes.minified_bytes;
         totals.gzip_bytes += sizes.gzip_bytes;
         totals.brotli_bytes += sizes.brotli_bytes;
         totals.zstd_bytes += sizes.zstd_bytes;
+        // These asset bytes are already inside `sizes`, so carrying the rows adds nothing to the
+        // total — it only makes the total say what it is made of. This sum does not deduplicate a
+        // stylesheet two imports share (that is precisely what the combined build it fell back FROM
+        // would have done), so the rows read high in the same way and by the same amount as the
+        // number they describe.
+        for contribution in &result.asset_breakdown {
+            match totals
+                .asset_breakdown
+                .iter_mut()
+                .find(|existing| existing.kind == contribution.kind)
+            {
+                Some(existing) => {
+                    existing.raw_bytes += contribution.raw_bytes;
+                    existing.minified_bytes += contribution.minified_bytes;
+                    existing.gzip_bytes += contribution.gzip_bytes;
+                    existing.brotli_bytes += contribution.brotli_bytes;
+                    existing.zstd_bytes += contribution.zstd_bytes;
+                }
+                None => totals.asset_breakdown.push(*contribution),
+            }
+        }
     }
 
     totals
@@ -740,6 +899,64 @@ mod tests {
     use crate::engine::stage;
     use crate::ipc::protocol::{ImportKind, MeasuredSizes};
     use std::path::PathBuf;
+
+    /// Two imports of the same UI kit pull ONE stylesheet, and the combined File Cost bundles it
+    /// once — so Combined Import Cost exceeds File Cost by that sheet. `shared_bytes` is the only
+    /// mechanism that explains such a gap, and it was blind to assets: a stylesheet links as an
+    /// EMPTY module, so the JS contribution walk dropped it and sharing never saw the bytes causing
+    /// the difference the user was looking at.
+    #[test]
+    fn a_stylesheet_two_imports_share_is_counted_as_shared_weight() {
+        let sheet = "/pkg/ui-kit/styles.css".to_owned();
+        let mut first = ImportResult::measured("ui-kit", MeasuredSizes::ZERO);
+        let mut second = ImportResult::measured("ui-kit", MeasuredSizes::ZERO);
+        for result in [&mut first, &mut second] {
+            result.internal_contributions = vec![ModuleContribution {
+                path: sheet.clone(),
+                bytes: 36_000,
+            }];
+        }
+
+        annotate_shared_bytes([
+            (ImportRuntime::Client, &mut first),
+            (ImportRuntime::Client, &mut second),
+        ]);
+
+        assert_eq!(
+            first.shared_bytes,
+            Some(36_000),
+            "a stylesheet both imports pull is shared weight, not weight each carries alone"
+        );
+        assert_eq!(second.shared_bytes, Some(36_000));
+    }
+
+    /// The counterpart: a runtime is an artifact boundary (ADR-0005), so a Server import and a
+    /// Client import each ship their own copy and share nothing. Without this the test above would
+    /// pass just as well on an implementation that ignored the runtime entirely.
+    #[test]
+    fn a_stylesheet_pulled_from_two_runtimes_is_not_shared() {
+        let sheet = "/pkg/ui-kit/styles.css".to_owned();
+        let mut client = ImportResult::measured("ui-kit", MeasuredSizes::ZERO);
+        let mut server = ImportResult::measured("ui-kit", MeasuredSizes::ZERO);
+        for result in [&mut client, &mut server] {
+            result.internal_contributions = vec![ModuleContribution {
+                path: sheet.clone(),
+                bytes: 36_000,
+            }];
+        }
+
+        annotate_shared_bytes([
+            (ImportRuntime::Client, &mut client),
+            (ImportRuntime::Server, &mut server),
+        ]);
+
+        assert_eq!(
+            client.shared_bytes,
+            Some(0),
+            "runtimes ship separate copies"
+        );
+        assert_eq!(server.shared_bytes, Some(0));
+    }
 
     fn request(specifier: &str) -> ImportRequest {
         ImportRequest {
@@ -810,6 +1027,29 @@ mod tests {
         assert!(
             totals.is_cacheable(),
             "every import was really measured, so the sum IS this file's size"
+        );
+    }
+
+    #[test]
+    fn conflicting_dependency_snapshots_are_not_cacheable() {
+        let mut totals = FileSizeComputation::default();
+        let first = FileFingerprint {
+            path: "/pkg/font.woff2".to_owned(),
+            len: 4,
+            modified_millis: 10,
+            content_hash: Some(crate::cache::key::content_hash(b"aaaa")),
+        };
+        totals.dependency_fingerprints = vec![
+            first.clone(),
+            FileFingerprint {
+                content_hash: Some(crate::cache::key::content_hash(b"bbbb")),
+                ..first
+            },
+        ];
+
+        assert!(
+            !totals.is_cacheable(),
+            "no on-disk file can validate two different known snapshots of one path"
         );
     }
 
@@ -912,6 +1152,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_measured_import_with_uncounted_assets_makes_the_fallback_a_floor() {
+        let mut partial = result("asset-lib", 100);
+        partial.diagnostics.push(ImportDiagnostic {
+            stage: crate::engine::diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
+            message: "a stylesheet could not be processed and is absent from this size".to_owned(),
+            details: vec!["broken.scss".to_owned()],
+        });
+
+        let totals = absorb(&[SizedImport::installed(request("asset-lib"), Some(partial))]);
+
+        assert_eq!(
+            totals.raw_bytes, 100,
+            "the measured portion remains useful as a lower bound"
+        );
+        assert!(
+            totals.incomplete,
+            "a successful JavaScript build does not make omitted asset bytes part of the sum"
+        );
+        assert!(
+            !totals.is_cacheable(),
+            "a deterministic floor may be cached per import, but not as this file's complete cost"
+        );
+        assert!(
+            totals.diagnostics.iter().any(|diagnostic| {
+                diagnostic.stage == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS
+                    && diagnostic
+                        .details
+                        .iter()
+                        .any(|detail| detail == "specifier: asset-lib")
+            }),
+            "the aggregate must retain which import left asset bytes out: {:?}",
+            totals.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_measured_import_with_imprecise_assets_is_not_a_floor() {
+        let mut high = result("asset-lib", 100);
+        high.diagnostics.push(ImportDiagnostic {
+            stage: crate::engine::diagnostic_stage::IMPRECISE_ASSETS.to_owned(),
+            message: "stylesheets were measured separately, so this size may read high".to_owned(),
+            details: Vec::new(),
+        });
+
+        let totals = absorb(&[SizedImport::installed(request("asset-lib"), Some(high))]);
+
+        assert!(
+            !totals.incomplete,
+            "an over-count is imprecise, but it is not missing asset bytes"
+        );
+    }
+
     /// The floor rule is about MEASUREMENT, not about failure: a file whose every import really was
     /// measured is complete, and must stay cacheable. Without this the fix above could be "made to
     /// pass" by flagging everything.
@@ -966,6 +1259,23 @@ mod tests {
             )
             .expect("manifest");
             std::fs::write(package_root.join("index.js"), source).expect("entry");
+            self
+        }
+
+        fn package_file(
+            &self,
+            package: &str,
+            relative_path: &str,
+            contents: impl AsRef<[u8]>,
+        ) -> &Self {
+            let path = self
+                .root
+                .join("node_modules")
+                .join(package)
+                .join(relative_path);
+            std::fs::create_dir_all(path.parent().expect("package file parent"))
+                .expect("package file directory");
+            std::fs::write(path, contents).expect("package file");
             self
         }
 
@@ -1200,6 +1510,114 @@ mod tests {
             "and a cold document's total must be CACHED, or the combined build re-runs on every \
              keystroke and `importlens check` can never judge a file it measured first: {:?}",
             totals.diagnostics
+        );
+    }
+
+    #[test]
+    fn file_cost_counts_a_font_shared_by_two_stylesheets_once() {
+        const FONT_BYTES: usize = 6 * 1024;
+
+        let fixture = Fixture::new("shared-css-font");
+        fixture
+            .package(
+                "font-lib",
+                "import './first.css';\nimport './second.css';\nexport const value = 42;\n",
+            )
+            .package_file(
+                "font-lib",
+                "package.json",
+                r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+            )
+            .package_file(
+                "font-lib",
+                "first.css",
+                "@font-face { font-family: First; src: url('./shared.woff2'); }\n",
+            )
+            .package_file(
+                "font-lib",
+                "second.css",
+                "@font-face { font-family: Second; src: url('./shared.woff2'); }\n",
+            )
+            .package_file("font-lib", "shared.woff2", []);
+
+        let imports = [SizedImport::installed(request("font-lib"), None)];
+        let empty_font = compute_file_size(&fixture.context(), &imports);
+        fixture.package_file("font-lib", "shared.woff2", vec![0x6d; FONT_BYTES]);
+        let populated_font = compute_file_size(&fixture.context(), &imports);
+
+        for totals in [&empty_font, &populated_font] {
+            assert!(totals.error.is_none(), "{totals:?}");
+            assert!(
+                !totals.degraded,
+                "the combined build must succeed: {totals:?}"
+            );
+            assert!(
+                !totals.incomplete,
+                "every emitted file is readable: {totals:?}"
+            );
+        }
+        assert_eq!(
+            populated_font.raw_bytes.checked_sub(empty_font.raw_bytes),
+            Some(FONT_BYTES as u64),
+            "zero means the CSS font was omitted; twice the font length means its two references \
+             were counted twice"
+        );
+        assert_eq!(
+            populated_font
+                .minified_bytes
+                .checked_sub(empty_font.minified_bytes),
+            Some(FONT_BYTES as u64),
+            "a binary artifact has no separate minification step"
+        );
+    }
+
+    #[test]
+    fn a_combined_build_that_omits_an_unparseable_stylesheet_is_a_floor() {
+        let fixture = Fixture::new("uncounted-css-floor");
+        fixture
+            .package(
+                "broken-css-lib",
+                "import './broken.scss';\nexport const value = 42;\n",
+            )
+            .package_file(
+                "broken-css-lib",
+                "package.json",
+                r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.scss"]}"#,
+            )
+            .package_file(
+                "broken-css-lib",
+                "broken.scss",
+                "$brand: red;\n@mixin thing { color: $brand }\n.bad { @include thing }\n",
+            );
+
+        let totals = compute_file_size(
+            &fixture.context(),
+            &[SizedImport::installed(request("broken-css-lib"), None)],
+        );
+
+        assert!(
+            totals.error.is_none(),
+            "the JavaScript still built: {totals:?}"
+        );
+        assert!(
+            !totals.degraded,
+            "the combined build itself succeeded: {totals:?}"
+        );
+        assert!(
+            totals
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage
+                    == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS),
+            "the missing stylesheet bytes must be disclosed: {totals:?}"
+        );
+        assert!(
+            totals.incomplete,
+            "the JavaScript-only number is a floor when a shipped stylesheet is absent"
+        );
+        assert!(
+            !totals.is_cacheable(),
+            "the floor must not become File Cost history or a budget verdict"
         );
     }
 

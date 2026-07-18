@@ -12,13 +12,26 @@ Project instructions for agents working in this repository.
 
 ## Deciding What To Fix Now
 
-A finding being **real** is not the same as it being **blocking**.
+**This section governs findings YOU surface. It has no authority over work I asked for.**
 
-> **Fix it in the current piece of work only if it (a) shows the user a WRONG NUMBER, or (b) can WEDGE the system or lose data.**
+If I ask for something — once, or in passing, or as part of a list — it is not a candidate for
+triage. Do it. Writing it into `docs/known-issues.md` instead of doing it is not a decision, it is a
+deferral wearing a decision's clothes, and it does not count as completing the request. If it cannot
+be done, say so in the reply, with the reason, and say what you would need. Never park my request in
+a document and report the task finished.
 
-Everything else gets an entry in `docs/known-issues.md` — stating what actually happens and why it is not fixed — and goes back in the queue. Add the entry when you **decide** not to fix something, not when you find it.
+The bar below exists for one purpose: stopping YOU from expanding scope on your own initiative,
+because a review pass will always generate more findings than are worth chasing.
 
-If a fix chains into a third round on the same sub-item, stop and re-check it against the plan. Do not let the next review report decide your priorities for you.
+> **A finding you surfaced gets fixed in the current piece of work only if it (a) shows the user a
+> WRONG NUMBER, or (b) can WEDGE the system or lose data.**
+
+Everything else you find gets an entry in `docs/known-issues.md` — stating what actually happens and
+why it is not fixed — and goes back in the queue. Add the entry when you **decide** not to fix
+something, not when you find it.
+
+If a fix chains into a third round on the same sub-item, stop and re-check it against the plan. Do
+not let the next review report decide your priorities for you.
 
 ## File And Formatting Rules
 
@@ -29,9 +42,48 @@ If a fix chains into a third round on the same sub-item, stop and re-check it ag
 - In TypeScript, prefer arrow functions where practical.
 - Do not use double casting or unnecessary cast chains.
 
+## Keeping The Core Small
+
+The asset feature reached ~9,000 lines before anyone counted. No single change was unreasonable; the
+growth came from adding beside instead of replacing. These rules target that specific failure, and
+each one has a trigger you can check in review rather than an aspiration.
+
+- **One mechanism per concern. A second way to do something the codebase already does is a defect.**
+  Four provider constructors, two read ledgers, and an `Option<Context>` that made production safety
+  bypassable were all added this way — each one locally sensible, none of them replacing what it
+  duplicated. If a variant is needed, change the existing thing; if it genuinely cannot bend, say in
+  the commit why not.
+- **Adding without deleting is the thing to be suspicious of.** A change that is pure addition should
+  name what it replaced, or say why nothing could be. This is a prompt to look, not a prohibition.
+- **No speculative surface.** An item with no caller is deleted, not kept for later. `AssetKind::ALL`
+  and `as_str` sat unused through three reviews.
+- **Tests use production entry points.** A test-only code path doubles the code and measures a system
+  that does not ship. Supply test *data* and test *limits*, never a parallel path — the asset tests
+  bypassed the resource ledger for weeks and hid a real production limit while doing it.
+- **State that must be interpreted together belongs together.** Six correlated collections that three
+  functions each re-read is the shape that produces both bloat and disagreement between surfaces.
+- **Roughly 700 lines is where a source file needs a reason.** Not a hard limit and nothing enforces
+  it; it is the point at which "should this be two things?" is worth asking out loud rather than
+  drifting past. The daemon has several files well over it that grew there unnoticed.
+
+**Performance: measure it, do not assert it.** "Optimized" is not a property you can review. Brotli
+quality was assumed too slow to raise for a year; measuring took ten minutes and showed quality 11
+costs 35x (disqualifying) while quality 9 halves the error for +33 ms — a real option nobody had
+costed. Claims about speed or size in a commit message should carry the number that supports them.
+
+**Where this stops.** Correctness outranks size, always. This product's whole value is a number the
+user can trust, so never trade a disclosed-correct result, a freshness guarantee, or a gate for
+fewer lines. Shorter code that is harder to verify is not smaller — the review cost moved, it did not
+go away. When a reduction and a guarantee genuinely conflict, keep the guarantee and record the
+larger size honestly.
+
+## Orchestration Default
+
+- **lean-orchestration is the default execution mode — no `/lean` needed.** Start every non-trivial task (feature, bug hunt, review/audit, design critique, refactor, mixed prompt) by invoking the `lean-orchestration` skill and following its routing. Step 0 of the skill still governs small work: quick lookups, tight debug loops, and small single-file changes stay inline. Full multi-agent/Workflow fan-outs only when explicitly requested. The skill and role agents live under `.claude/`; see `docs/lean-orchestration-setup.md`.
+
 ## Implementation Workflow
 
-- **Default to the `hybrid-execution` skill for any multi-commit or multi-file piece of work.** Do not stop to offer "subagent-driven vs inline" as a choice; there is no better default. Implement inline — coding is interdependent, which is the case multi-agent handles worst. Spend subagent tokens on an independent review of the risky commits: anything touching the release path, a public API, a cache or data format, or a diff you cannot fully eyeball. Fan out only over genuinely independent strands. Treat a reviewer's findings as hypotheses — reproduce each against the code before fixing it, and decline the rest with a one-line reason. Deviate only with a stated reason.
+- Treat a reviewer's or subagent's findings as hypotheses — reproduce each against the code before fixing it.
 - Read the relevant existing code before editing.
 - Add or update tests for behavior changes and bug fixes.
 - For daemon changes, run Rust formatting and tests.
@@ -39,7 +91,6 @@ If a fix chains into a third round on the same sub-item, stop and re-check it ag
 - If behavior diverges from the SRS, update `docs/ImportLens-SRS.md` in the same task.
 - If daemon code changes, rebuild/package for Windows and refresh the daemon hash before handing off.
 - Don't put something I give you as future or milestone or deferred work. Because if I give some you to do, I am asking you to do it right now.
-- Don't update docs inside the superpower sub-directory unless it's something that has not been implemented yet.
 - Split work into tasks.
 
 ## Testing Policy
@@ -71,7 +122,7 @@ assert.match(dockerfile, /^FROM node:24-bookworm$/mu);
 
 **Prefer making drift impossible over testing for drift.** A Drift check is a consolation prize for two sources of truth you could not merge. Before writing one, try to delete the second source. Keep the check only where duplication is genuinely forced — `cli/importlens.mjs` and `extension/src/daemon/platform.ts` each redeclare `daemonRoot` because neither can import `scripts/targets.mjs` at runtime.
 
-**Never assert a dependency version in a test, except compiler-stack coordination.** The coordinated compiler stack (rolldown, the OXC monorepo crates, and oxc_resolver) is the only set of dependencies where a version bump can silently break the app. Do not assert versions of GitHub Actions, pnpm, Node, the Rust toolchain, `@types/vscode`, or any dev tooling. A break there is caught by CI before it ships.
+**Never assert a dependency version in a test, except the size-determining stack.** These are the only dependencies where a version bump can silently change measured output, so they are exact-pinned and version-tested: rolldown, the OXC monorepo crates, oxc_resolver, the `sideEffects` glob matcher (fast-glob), and the CSS processor (lightningcss). The first four are coordinated (their versions derive from rolldown's own graph, via `deps:update:compiler`); lightningcss is a STANDALONE exact-pin (its version is chosen independently and it is not reachable from rolldown/oxc, so it stays out of the fingerprint closure). Do not assert versions of GitHub Actions, pnpm, Node, the Rust toolchain, `@types/vscode`, or any dev tooling. A break there is caught by CI before it ships.
 
 Do not:
 
@@ -102,7 +153,7 @@ pnpm package:win32-x64
 
 - **One commit per logically-coherent change — NOT one commit per plan step.** A multi-step plan that delivers a single cohesive change lands as ONE commit, or a small handful when there are genuinely separable concerns (an unrelated bug found along the way, an isolated mass-reformat). Plan steps are an implementation order, not a commit boundary. Never split a cohesive change into micro-commits merely because the plan had that many tasks — and if a plan or skill template says to commit per task, this rule wins. When unsure how to split, ask, or default to fewer.
 - Never commit to `main`. Branch first — including for design and plan documents.
-- Follow Conventional Commits: `type(scope)!: subject` (<=72 chars, no trailing period). Types: `feat fix perf docs refactor style test chore ci build` (kept in sync with `cliff.toml`).
+- Follow Conventional Commits: `type(scope)!: subject` (<=72 chars, no trailing period). Types: `feat fix perf docs refactor style test chore ci build revert` (kept in sync with `cliff.toml`).
 - A commit body (description) is REQUIRED and must explain the user-visible change and important technical rationale — it feeds the AI changelog. The `commit-msg` hook enforces this locally; CI enforces it on pull requests.
 - **Do NOT hard-wrap commit message bodies.** Write each paragraph as one continuous line and separate paragraphs with a single blank line. Never insert line breaks inside a paragraph to fit an assumed column width; viewers and tooling soft-wrap. A body is a handful of single-line paragraphs, not a block of fixed-width lines. (Pass each paragraph as its own `-m` argument, which produces exactly this shape.)
 - **A history rewrite bypasses the `commit-msg` hook.** `git commit-tree`, `filter-branch`, and non-interactive replay scripts write commits without running the hook, so nothing checks the new messages until CI (which validates every commit on the PR). Before moving the branch, self-verify every rewritten message — run `scripts/check-commit-msg.mjs` over each one, or confirm each subject header is `<=72` chars with a body and no hard-wrapping. Do NOT loosen the `<=72` limit to make a red check pass; shorten the subject. (Five over-length squash subjects reached CI exactly this way.)

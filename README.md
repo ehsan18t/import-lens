@@ -45,7 +45,7 @@ Unlike existing import cost calculators that spin up heavy Node.js bundlers, Imp
    import moment from "moment";            //  72.1 kB br
    ```
 
-4. **Hover an import** for the full breakdown: minified/gzip/brotli/zstd sizes, confidence reasons, module contributions, shared-byte explanations, and copyable diagnostics.
+4. **Hover an import** for the full breakdown: minified/gzip/brotli/zstd sizes, confidence reasons, module contributions, shared-byte explanations, included-asset rows, and copyable diagnostics.
 5. **Open `package.json`** to see per-dependency install cost and registry hints on every dependency row.
 6. **Explore the command palette** by typing `Import Lens:` to find reports, comparisons, history, and cache tools ([full list below](#commands)).
 
@@ -64,6 +64,30 @@ Every label is designed to be understood at a glance:
 | `unavailable` | Size could not be determined. Hover and use **Copy diagnostics** to see why. |
 
 **Confidence colors** (default renderer): high confidence uses a muted success color, medium uses amber, low uses red. Prefer VS Code's screen-reader-accessible rendering? Set `importLens.inlineRenderer` to `native`.
+
+### The number is not only JavaScript
+
+A package ships more than its code, so the inline number includes it. If a package's entry imports a
+stylesheet, a wasm module, or a font, those bytes are measured the way they actually ship — the
+stylesheet's `@import` tree is resolved and minified into one CSS file, binaries are taken as-is —
+and **each file is compressed on its own** before the sizes are added together. That last part
+matters: separate files ship separately, so compressing them as one blob would report a number no
+browser ever downloads.
+
+Hover shows an **Included assets** section breaking the total down by kind, so you can see that a
+40 kB UI kit is 4 kB of JavaScript and 36 kB of CSS.
+
+Some shipped bytes are disclosed instead of counted, and the hover always says which:
+
+| You'll see | What it means |
+| --- | --- |
+| An **Included assets** row | Those bytes are already inside the number. |
+| *"…does NOT include them"* | Real shipped bytes the tool could not process or does not count — an image referenced from CSS, an unreadable file, a preprocessor source. The number is a **floor**: the true cost is higher. Confidence drops to medium. |
+| *"…this size reads HIGH"* | The stylesheets could not be combined, so each was measured alone and bytes they share were counted more than once. The number is an **upper bound**, and budgets are not evaluated against it. |
+| *"…fetched at runtime"* | The CSS pulls something from a CDN (a web font, a remote sheet). That is real weight for your page but not bytes this package ships, so the number stays exact — only confidence drops. |
+
+A package with nothing to disclose keeps high confidence. Medium confidence here is not a warning
+that something is broken; it is the tool declining to present a number as more complete than it is.
 
 **Display modes** (`importLens.display`):
 

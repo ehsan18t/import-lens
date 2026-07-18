@@ -196,6 +196,53 @@ naturally. Building each import separately and adding up the results would count
 dependency once per importer — which is the wrong number, and the reason the bundler is never
 asked to build the same document's imports as independent bundles.
 
+### Non-JavaScript files the package ships
+
+A package's cost is not only its JavaScript. UI kits ship CSS; some packages ship wasm or fonts.
+Those bytes are **in** the reported number, and the reason is simple: the headline claims to be what
+the import costs, so a stylesheet the entry pulls is part of that cost or the claim is false.
+
+This stays inside the "measure an import, not a bundle" rule. Counting a package's own CSS is still
+measuring *that import's* weight; it is not modelling how a project would chunk its output.
+
+**Classified at the load boundary.** When the bundler asks for a module's bytes, the file is
+classified before anything else looks at it:
+
+| Class | Files | What happens |
+| --- | --- | --- |
+| **Counted** | `.css` and preprocessor sources, `.wasm`, fonts | Stubbed to an empty module, processed afterwards, folded into the number |
+| **Unmeasured** | images, SVG, icons, media | Stubbed to an empty module, bytes **disclosed** rather than counted |
+| Anything else | `.js`, `.ts`, unknown extensions | Handed back to the bundler untouched |
+
+Stubbing is not an optimisation, it is what makes the JavaScript number exact — and for several of
+these it is the difference between a number and nothing at all. Rolldown 1.1.5 refuses to bundle CSS
+and fails the *entire* build at link, so every package whose entry does `import "./styles.css"` was
+once unmeasurable. A `.png` is not UTF-8 and dies in the loader; an `.svg` **is** valid UTF-8, so it
+reaches the JavaScript parser and dies there instead. One such import used to cost the whole package
+its number.
+
+The Unmeasured list is deliberately an allowlist. An unknown extension still falls through to the
+bundler, because stubbing something we cannot name might stub real JavaScript.
+
+**Processed the way each really ships.** After the build, every reachable stylesheet is bundled by
+Lightning CSS into **one** artifact — its `@import` tree resolved and inlined, then minified —
+because that is how CSS ships and it is what dedupes a sheet two imports share. Wasm and fonts have
+no processor: their shipped size is their bytes. Each artifact is then compressed **on its own** and
+the sizes are added (§10). Never concatenate the JavaScript chunk and a stylesheet before
+compressing; they are separate files that ship separately, and compressing them together reports a
+number no browser downloads.
+
+**A stylesheet's own references are followed.** Lightning CSS reports every `url()` against the file
+that declared it, and each one resolves to exactly one outcome — counted, disclosed at its real size,
+named as an omission, or external. Nothing is dropped silently, which is the failure this part was
+built to end: a shipped image once left through a single unhandled branch, taking its bytes out of a
+number that still claimed to be complete.
+
+**Failure falls back, never below.** Anything the pipeline cannot process reverts to raw-byte
+disclosure with a diagnostic. That is the pre-asset behaviour, so the result is a strict improvement
+or a tie — and a package that discloses anything is held at Medium confidence, because a number that
+omits bytes the user's bundle carries is not a High-confidence measurement of that package.
+
 ---
 
 ## 5. What actually happens during a build
@@ -459,7 +506,7 @@ It was never seven bugs. It was one missing model, replicated everywhere anyone 
 the question. The fix is not a seventh patch: it is to make the state **unrepresentable**. With
 no size to misuse, every one of those checks becomes correct by construction.
 
-### Deterministic and transient are not the same failure
+### Deterministic and request-local are not the same outcome
 
 This is the distinction the code never made, and it is the one everything else rests on.
 
@@ -469,18 +516,26 @@ cache is already keyed by those bytes' fingerprints, so it expires exactly when 
 change. Refusing to cache it would re-enter the bundler for a broken package on *every* analysis,
 permanently occupying one of only two build slots.
 
-A **transient** failure — a panic, a timeout, a lost engine — is a fact about **this moment's
-scheduling**. It says nothing whatsoever about the package. It may **never** be cached, never
-persisted, never compared against a baseline, and never turned into a pass/fail verdict. A
-transient failure that becomes durable is the single worst thing this system can do, because it
-converts a momentary accident into a permanently wrong answer that outlives the daemon.
+A **request-local** failure — a panic, timeout, lost engine, unreadable asset input, or failed
+compressor — is a fact about **this moment's scheduling, filesystem, or machine**. It says nothing
+reusable about the package. It may **never** be cached, persisted, compared against a baseline, or
+turned into a pass/fail verdict. Some request-local asset outcomes carry a disclosed partial size;
+the `asset_io`/`compression` diagnostic, not absence of a number, is what keeps that floor local.
+Making such an outcome durable converts a momentary accident into a wrong answer that outlives the
+daemon.
 
-### Aggregates inherit the weakest input
+### Aggregates expose missing bytes structurally
 
-A file's combined total is only as complete as the imports that fed it. If **any** contributor
-is Loading or Unmeasured, the total is a **floor** — a lower bound, not a size. It is flagged
-as such, and no verdict may be drawn from it: a budget judged against a floor is neither passed
-nor failed, it is *not evaluated*.
+A successful combined build measures its imports directly, so it stays complete while their
+separate per-import analyses are still Loading. Its asset tail can still disclose supported bytes
+that it could not process: `uncounted_assets` makes that otherwise-successful File Cost a structural
+`incomplete` floor. If the combined build fails and the daemon instead sums per-import costs, any
+Loading, Unmeasured, or measured-with-uncounted-assets contributor makes that fallback short too.
+The known bytes remain worth showing, but no verdict may be drawn from them: a budget judged against
+a floor is neither passed nor failed, it is *not evaluated*. `imprecise_assets` is intentionally
+different: separately processed stylesheets can read high while still counting every sheet. That
+deterministic upper bound remains cacheable, but it is not budgetable: its compression-boundary
+inflation can produce a false failure just as a floor can produce a false pass.
 
 And a gate that cannot measure **must never report success**. `importlens check` exits non-zero
 with a code distinct from a real budget failure, so a flaky CI machine is diagnosable and is
@@ -589,7 +644,8 @@ And the five that exist because ignoring them produced the same defect seven tim
 12. **An aggregate is only as complete as its inputs.** Any Loading or Unmeasured contributor
     makes the total a **floor**, and **no verdict may be drawn from a floor** — a budget judged
     against one is not failed, it is *not evaluated*. **A gate that cannot measure must never
-    report success.**
+    report success.** A deterministic `imprecise_assets` upper bound is cacheable but equally
+    non-budgetable, because a verdict from it can falsely fail.
 13. **A runtime is an artifact boundary.** Compressed bytes may be summed across one and never
     within one. Nothing is ever deduplicated across a runtime, because each runtime genuinely
     ships its own copy.

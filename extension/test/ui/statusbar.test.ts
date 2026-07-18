@@ -14,9 +14,14 @@ const sized = (bytes: number, quality: FileCostQuality): StatusBarState => ({
   quality,
 });
 
-const fileCost: FileCostQuality = { quantity: "file-cost", short: false };
-const floor: FileCostQuality = { quantity: "file-cost", short: true };
-const combined: FileCostQuality = { quantity: "combined-import-cost", short: false };
+const fileCost: FileCostQuality = { quantity: "file-cost", short: false, imprecise: false };
+const floor: FileCostQuality = { quantity: "file-cost", short: true, imprecise: false };
+const combined: FileCostQuality = {
+  quantity: "combined-import-cost",
+  short: false,
+  imprecise: false,
+};
+const upperBound: FileCostQuality = { quantity: "file-cost", short: false, imprecise: true };
 
 test("statusBarText prefixes with IL and shows the size for a sized state", () => {
   assert.equal(statusBarText(sized(12300, fileCost)), "IL: 12.3 kB br");
@@ -84,8 +89,8 @@ test("an incomplete total is a floor, and the status bar refuses to call it a Fi
   assert.equal(statusBarText(state), "IL: ~118.0 kB br");
   assert.equal(
     statusBarTooltip(state),
-    "Import Lens: File Cost floor (~118.0 kB br) — an import that belongs in this file's total was \
-not measured, so the number is a floor and not the file's size. Budget not evaluated.",
+    "Import Lens: File Cost floor (~118.0 kB br) — bytes that belong in this file's total were not \
+measured, so the number is a floor and not the file's size. Budget not evaluated.",
   );
 });
 
@@ -95,4 +100,27 @@ test("only a File Cost is shown without a mark, and only it can be judged", () =
   assert.doesNotMatch(statusBarTooltip(sized(118_000, fileCost)), /not evaluated/u);
   assert.match(statusBarTooltip(sized(118_000, floor)), /Budget not evaluated\./u);
   assert.match(statusBarTooltip(sized(183_200, combined)), /Budget not evaluated\./u);
+});
+
+/**
+ * The fourth thing this surface can be handed, and until now the one it could not say.
+ *
+ * The stylesheets could not be bundled as one artifact, so each was measured and compressed alone
+ * and the number reads HIGH. Every import is Measured, nothing is missing, and the combined build
+ * succeeded — so `short` and `degraded` are both false and the status bar called it a plain "File
+ * Cost", while the budget beside it silently declined to judge the same number.
+ */
+test("an imprecise total is named an upper bound, and no budget is judged from it", () => {
+  const state = sized(120_400, upperBound);
+
+  assert.equal(
+    statusBarTooltip(state),
+    "Import Lens: File Cost upper bound (~120.4 kB br) — asset processing produced a disclosed \
+upper bound, so budgets were not evaluated. Budget not evaluated.",
+  );
+  assert.doesNotMatch(
+    statusBarTooltip(state),
+    /built as one bundle/u,
+    "an over-count must not claim the clean-measurement explanation",
+  );
 });

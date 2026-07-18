@@ -5,6 +5,7 @@ use crate::{
         ModuleContribution,
     },
     pipeline::{
+        assets::{AssetProcessingFailure, asset_diagnostics, process_assets_bounded},
         compress::compress_all,
         fallback::source_excerpt_detail,
         full_package,
@@ -33,6 +34,16 @@ pub struct AnalysisContext {
 }
 
 // Internal structured error translated into the stable ImportResult surface.
+#[derive(Debug, Clone, Default)]
+struct FailureFreshness {
+    /// Fingerprints of every module the failing build read.
+    read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    /// Modules parsed before failure, used to find first-party manifests that shaped resolution.
+    loaded_paths: Vec<PathBuf>,
+    /// Successful graph inputs that had no same-read hash.
+    stat_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AnalysisError {
     stage: &'static str,
@@ -47,10 +58,7 @@ pub struct AnalysisError {
     /// parse would keep serving the cached failure after the user fixed it, because nothing the
     /// cache watches moved. So the failure is fingerprinted against the bytes it was derived from,
     /// exactly as a success is.
-    read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
-    /// The modules that parsed before the build gave up, used only to find the first-party
-    /// manifests that shaped the resolution.
-    loaded_paths: Vec<PathBuf>,
+    freshness: Box<FailureFreshness>,
 }
 
 pub fn analyze_import(context: &AnalysisContext, request: &ImportRequest) -> ImportResult {
@@ -210,18 +218,21 @@ fn engine_failure_fingerprints(
     request: &ImportRequest,
     error: &AnalysisError,
 ) -> Option<FingerprintSource> {
-    if error.read_time_fingerprints.is_empty() {
+    if error.freshness.read_time_fingerprints.is_empty() && error.freshness.stat_paths.is_empty() {
         return None;
     }
 
-    let mut stat_paths = Vec::new();
+    let mut stat_paths = error.freshness.stat_paths.clone();
     if let Ok(resolved) = resolve_package_entry(&context.active_document_path, request) {
         stat_paths.push(resolved.package_root.join("package.json"));
     }
-    stat_paths.extend(first_party_manifests(context, &error.loaded_paths));
+    stat_paths.extend(first_party_manifests(
+        context,
+        &error.freshness.loaded_paths,
+    ));
 
     Some(FingerprintSource::ReadTime {
-        fingerprints: error.read_time_fingerprints.clone(),
+        fingerprints: error.freshness.read_time_fingerprints.clone(),
         stat_paths,
     })
 }
@@ -398,6 +409,19 @@ pub(crate) fn analyze_with_rolldown_engine(
         )
     })?;
 
+    // The package's non-JavaScript assets, processed the way they really ship, so their bytes JOIN
+    // the Import Cost instead of being disclosed beside a number that excluded them (B2). Each
+    // artifact is compressed on its own and summed (ADR-0005). Ordinary parse/compression failures
+    // still disclose raw bytes, but a whole-build resource/deadline breach has no coherent partial
+    // measurement and therefore returns one typed Unmeasured result.
+    let assets = process_assets_bounded(
+        artifact.assets.clone(),
+        artifact.graph_source_bytes,
+        artifact.loaded_paths.clone(),
+    )
+    .map_err(|failure| asset_processing_error(context, request, &artifact, failure))?;
+    let asset_sizes = assets.total();
+
     // §7.4/FR-021: Side-Effectful is a property of THE IMPORT — is the entry being measured one
     // the package declares effectful? — so the glob form answers by MATCHING the entry, and
     // `has_side_effects` is the whole answer.
@@ -419,6 +443,9 @@ pub(crate) fn analyze_with_rolldown_engine(
             details: Vec::new(),
         })
         .collect();
+    // An asset that could not be processed keeps the old disclosure: its bytes are real, they ship,
+    // and they are NOT in the number — which is exactly what this stage has always meant.
+    diagnostics.extend(asset_diagnostics(&assets));
 
     // Full-package comparison (§8.4/§6.3): a second engine build measures the
     // complete surface; failure degrades to "not treeshakeable", never an
@@ -492,7 +519,7 @@ pub(crate) fn analyze_with_rolldown_engine(
     }
 
     let (confidence, confidence_reasons) = engine_confidence(side_effects, &diagnostics);
-    let contributions: Vec<ModuleContribution> = artifact
+    let mut contributions: Vec<ModuleContribution> = artifact
         .contributions
         .iter()
         .map(|contribution| ModuleContribution {
@@ -500,31 +527,47 @@ pub(crate) fn analyze_with_rolldown_engine(
             bytes: contribution.rendered_bytes as u64,
         })
         .collect();
+    // Assets are contributors too, and leaving them out of this list cost two things.
+    //
+    // The breakdown stopped reconciling with its own headline: a stylesheet is linked as an EMPTY
+    // module, so its rendered length is 0 and the JS walk drops it — which is why a CSS-dominant
+    // package could show "top modules" summing to a fraction of the number printed beside them.
+    //
+    // And sharing went blind. `annotate_shared_bytes` unions on (runtime, contribution path), so a
+    // stylesheet two imports both pull was invisible to it, even though the combined File Cost
+    // bundles that sheet ONCE. The user saw Combined Import Cost exceed File Cost with no
+    // explanation, because the one mechanism that explains the gap could not see the bytes causing
+    // it. These rows flow into `internal_contributions`, which the L2 envelope already carries for
+    // exactly this reason, so a cached result shares identically to a freshly measured one.
+    contributions.extend(artifact.assets.iter().map(|asset| ModuleContribution {
+        path: asset.path.to_string_lossy().to_string(),
+        bytes: asset.raw_bytes(),
+    }));
 
-    // §8.3: freshness comes from the fingerprints the plugin captured as it read each
-    // module, so they describe the exact bytes this size was measured from. Two kinds
-    // of input have no read-time capture and must still be hashed: the package
-    // manifest, which drives resolution and side-effect classification but is not a
-    // graph module, and any binary module the plugin handed back to Rolldown. Hashing
-    // those after the build does not reopen the staleness window the read-time capture
-    // closes — a manifest is an input to resolution, not a source of measured bytes.
-    let mut stat_paths = artifact.unhashed_paths;
-    stat_paths.push(package_root.join("package.json"));
+    // §8.3: freshness comes from fingerprints captured by the same reads that supplied every
+    // measured byte. The plugin owns JavaScript and directly imported asset snapshots; the asset
+    // processor owns CSS `@import` children and local resources discovered through `url()`.
+    let mut stat_paths = vec![package_root.join("package.json")];
     stat_paths.extend(first_party_manifests(context, &artifact.loaded_paths));
-    let freshness = FingerprintSource::ReadTime {
-        fingerprints: artifact.read_time_fingerprints,
+    let freshness = import_freshness(
+        artifact.read_time_fingerprints.clone(),
+        &artifact.unhashed_paths,
+        assets.freshness_fingerprints(),
         stat_paths,
-    };
-    let loaded_paths = artifact.loaded_paths;
+    );
+    let mut loaded_paths = artifact.loaded_paths;
+    loaded_paths.extend(assets.read_paths.iter().cloned());
+    loaded_paths.sort();
+    loaded_paths.dedup();
 
     let mut result = ImportResult::measured(
         request.specifier.clone(),
         MeasuredSizes {
-            raw_bytes: artifact.code.len() as u64,
-            minified_bytes: minified.len() as u64,
-            gzip_bytes: compressed.gzip_bytes,
-            brotli_bytes: compressed.brotli_bytes,
-            zstd_bytes: compressed.zstd_bytes,
+            raw_bytes: artifact.code.len() as u64 + asset_sizes.raw_bytes,
+            minified_bytes: minified.len() as u64 + asset_sizes.minified_bytes,
+            gzip_bytes: compressed.gzip_bytes + asset_sizes.gzip_bytes,
+            brotli_bytes: compressed.brotli_bytes + asset_sizes.brotli_bytes,
+            zstd_bytes: compressed.zstd_bytes + asset_sizes.zstd_bytes,
         },
     );
     result.side_effects = side_effects;
@@ -534,6 +577,10 @@ pub(crate) fn analyze_with_rolldown_engine(
     result.confidence_reasons = confidence_reasons;
     result.diagnostics = diagnostics;
     result.module_breakdown = Some(top_module_contributions(&contributions));
+    // How the number above is composed: these bytes are already IN the five sizes, and this says
+    // which of them are stylesheet, wasm, or font, so a UI kit's cost is legible rather than a
+    // single opaque figure (B2).
+    result.asset_breakdown = assets.contributions;
     result.internal_contributions = contributions;
 
     Ok((result, loaded_paths, freshness))
@@ -589,10 +636,68 @@ fn engine_error(
             .collect(),
     );
     // The bytes the build read before it gave up. A cached deterministic failure expires against
-    // exactly these (see `AnalysisError::read_time_fingerprints`).
-    error.read_time_fingerprints = failure.read_time_fingerprints;
-    error.loaded_paths = failure.loaded_paths;
+    // exactly these (see `FailureFreshness::read_time_fingerprints`).
+    error.freshness.read_time_fingerprints = failure.read_time_fingerprints;
+    error.freshness.loaded_paths = failure.loaded_paths;
     error
+}
+
+fn asset_processing_error(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    artifact: &crate::engine::BundleArtifact,
+    failure: AssetProcessingFailure,
+) -> AnalysisError {
+    let mut error =
+        error_with_context(failure.stage, failure.message, context, request, Vec::new());
+    error.freshness.read_time_fingerprints = artifact.read_time_fingerprints.clone();
+    error
+        .freshness
+        .read_time_fingerprints
+        .extend(failure.read_time_fingerprints);
+    crate::cache::key::sort_and_dedup_fingerprints(&mut error.freshness.read_time_fingerprints);
+    error.freshness.loaded_paths = artifact.loaded_paths.clone();
+    error.freshness.loaded_paths.extend(failure.read_paths);
+    error.freshness.loaded_paths.sort();
+    error.freshness.loaded_paths.dedup();
+    error.freshness.stat_paths = artifact.unhashed_paths.clone();
+    error
+}
+
+/// §8.3: freshness comes from fingerprints captured by the same reads that supplied every measured
+/// byte. The plugin owns JavaScript and directly imported asset snapshots; the asset processor owns
+/// CSS `@import` children and local resources discovered through `url()`.
+///
+/// `unhashed_paths` are modules whose BYTES ARE IN THE NUMBER but whose read the plugin could not
+/// fingerprint — a binary module Rolldown loaded through its own loader. They are recorded as
+/// **unverifiable**, never as `stat_paths`. `stat_paths` are hashed AFTER the analysis, so a module
+/// rewritten inside the analysis window would pair a size measured from the OLD bytes with a hash of
+/// the NEW ones; every later probe would then match and answer Fresh, serving the stale size until
+/// the file changed again. An unverifiable fingerprint can never be fresh, which is the honest
+/// record for bytes we measured but cannot prove the identity of — and is already what the File Cost
+/// path and the full-package memo do with this same set.
+///
+/// A manifest is a different case and belongs in `stat_paths`: it is a resolution input, not bytes
+/// inside the measured chunk, so a post-analysis hash of it cannot contradict the size.
+fn import_freshness(
+    read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    unhashed_paths: &[PathBuf],
+    asset_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    stat_paths: Vec<PathBuf>,
+) -> FingerprintSource {
+    let mut fingerprints = read_time_fingerprints;
+    fingerprints.extend(
+        unhashed_paths
+            .iter()
+            .cloned()
+            .map(crate::cache::key::unverifiable_file_fingerprint),
+    );
+    fingerprints.extend(asset_fingerprints);
+    crate::cache::key::sort_and_dedup_fingerprints(&mut fingerprints);
+    FingerprintSource::ReadTime {
+        fingerprints,
+        stat_paths,
+    }
 }
 
 fn top_module_contributions(contributions: &[ModuleContribution]) -> Vec<ModuleContribution> {
@@ -698,14 +803,58 @@ fn error_with_context(
         stage,
         message: message.into(),
         details: context_details,
-        read_time_fingerprints: Vec::new(),
-        loaded_paths: Vec::new(),
+        freshness: Box::default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module whose bytes were measured but whose read was never fingerprinted must be recorded
+    /// as unverifiable, NOT deferred to a post-analysis stat.
+    ///
+    /// The stat happens after the analysis window, so if the module is rewritten inside that window
+    /// the stored size describes v1 while the stored hash describes v2 — and because the pair is
+    /// self-consistent, every later probe answers Fresh and serves the stale size until the file
+    /// changes AGAIN. An unverifiable fingerprint can never be fresh, so the result is simply
+    /// recomputed, which is the honest outcome for bytes whose identity we cannot prove.
+    #[test]
+    fn a_measured_but_unfingerprinted_module_is_unverifiable_not_stat_deferred() {
+        let unhashed = PathBuf::from("/pkg/native.node");
+        let manifest = PathBuf::from("/pkg/package.json");
+
+        let freshness = import_freshness(
+            Vec::new(),
+            std::slice::from_ref(&unhashed),
+            Vec::new(),
+            vec![manifest.clone()],
+        );
+
+        let FingerprintSource::ReadTime {
+            fingerprints,
+            stat_paths,
+        } = freshness;
+
+        assert!(
+            !stat_paths.contains(&unhashed),
+            "a measured module must never be deferred to a post-analysis hash: {stat_paths:?}"
+        );
+        assert_eq!(
+            stat_paths,
+            vec![manifest],
+            "only resolution inputs belong in stat_paths"
+        );
+
+        let recorded = fingerprints
+            .iter()
+            .find(|fingerprint| fingerprint.path.contains("native.node"))
+            .expect("the measured module must still reach freshness at all");
+        assert!(
+            crate::cache::key::fingerprint_is_unverifiable(recorded),
+            "it must be unverifiable so the result can never be served as fresh: {recorded:?}"
+        );
+    }
 
     /// Editing a first-party workspace dependency's manifest changes what the bundler
     /// resolves and retains, while none of its source files move. Without the manifest

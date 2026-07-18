@@ -44,6 +44,20 @@ debug = false
 [profile.test.package."*"]
 debug = false
 
+# What the dependency trim above leaves behind is the daemon's OWN debuginfo, and across
+# ~36 statically-linked test binaries that is still what dominates peak memory when a
+# tool compiles many of them at once. Adding `lightningcss` (B2) pushed the pre-commit
+# clippy past the edge on a tight machine: `clippy-driver` did not report a lint, it
+# CRASHED (`STATUS_STACK_BUFFER_OVERRUN`), on a different test binary each run — the
+# signature of resource exhaustion rather than a real diagnostic.
+#
+# `line-tables-only` keeps exactly what a failing test needs — the file and line behind
+# every frame of a panic backtrace — and drops the type/variable detail that only a
+# step-through debugger uses, which is not how these tests are diagnosed. The daemon's
+# own `dev` builds keep full debuginfo, so debugging the binary is unaffected.
+[profile.test]
+debug = "line-tables-only"
+
 # The high-value groups (correctness/suspicious/style/complexity/perf, plus the
 # disallowed-macros ban in clippy.toml) are hard errors. The two threshold-based
 # lints below are pedantic/nursery: kept as non-blocking warnings so they flag

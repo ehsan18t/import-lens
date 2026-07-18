@@ -1,7 +1,10 @@
 use crate::{
     cache::{
         disk::DiskCache,
-        key::{FileFingerprint, cache_key_is_orphan, cache_key_matches_any_package},
+        key::{
+            FileFingerprint, cache_key_is_orphan, cache_key_matches_any_package,
+            fingerprints_are_reusable,
+        },
         recency::RecencyClock,
     },
     ipc::protocol::{ImportResult, ResultFreshness},
@@ -685,7 +688,7 @@ impl ImportCache {
         dependency_fingerprints: Vec<FileFingerprint>,
         verified_generation: u64,
     ) {
-        if !result.is_durable() {
+        if !result.is_durable() || !fingerprints_are_reusable(&dependency_fingerprints) {
             // Logged, never silent. A refused *failure* is routine (a timeout, a locked file), so
             // it is debug. A refused **measurement** is not: the sizes are real, and the only thing
             // keeping them out is a stage `pipeline::stage` has not classified — a misclassification
@@ -1127,6 +1130,20 @@ mod tests {
         );
         result.truly_treeshakeable = true;
         result
+    }
+
+    #[test]
+    fn the_import_cache_refuses_an_unreusable_dependency_observation() {
+        let cache = ImportCache::new(None, false);
+        let key = "v4:asset-read-failed".to_owned();
+        let fingerprint = crate::cache::key::unverifiable_file_fingerprint("/pkg/unreadable.woff2");
+
+        cache.insert_with_fingerprints(key.clone(), minimal_result("asset-lib"), vec![fingerprint]);
+
+        assert!(
+            cache.memory.pin().get(&key).is_none(),
+            "the store itself must reject a result whose inputs were never observed exactly"
+        );
     }
 
     fn last_seq_of(cache: &ImportCache, key: &str) -> u64 {

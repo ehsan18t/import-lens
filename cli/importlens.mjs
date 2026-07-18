@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import { decode, encode } from "@msgpack/msgpack";
 
 const execFile = promisify(execFileCallback);
-const protocolVersion = 6;
+const protocolVersion = 7;
 const supportedExtensions = new Set([
   ".js",
   ".jsx",
@@ -113,13 +113,12 @@ export const runImportLensCheck = async ({
   for (const filePath of files) {
     const result = await analyzeFile(path.resolve(resolveRoot, filePath));
     const relative = path.relative(cwd, result.filePath).split(path.sep).join("/");
-    // A floor cannot absolve a budget and must not be allowed to: `incomplete` says an import that
-    // belongs in this file's total contributed no bytes, so the real number is larger than the one
-    // in hand by an unknown amount, and "under budget" is not a fact this run established. It is set
-    // by ANY unmeasured contributor now, deterministic ones included — a package this build cannot
-    // measure leaves the file's size just as unknown as one that timed out, and CI is the one place
-    // where nobody is looking at the screen to notice. No verdict from a floor (ADR-0006,
-    // invariant 5).
+    // A floor cannot absolve a budget and must not be allowed to: `incomplete` says bytes that
+    // belong in this file's total are absent — an import contributed no measurement, or supported
+    // asset bytes were disclosed as uncounted. The real number is larger than the one in hand by an
+    // unknown amount, and "under budget" is not a fact this run established. The cause may be
+    // deterministic or request-local; CI is the one place where nobody is looking at the screen to
+    // notice. No verdict from a floor (ADR-0006, invariant 5).
     //
     // And a DEGRADED total cannot condemn one. `degraded` says the file's own combined build failed
     // and the number fell back to a sum of per-import costs — a Combined Import Cost, which ADR-0004
@@ -129,17 +128,19 @@ export const runImportLensCheck = async ({
     // the file never had is neither passed nor failed. The daemon refuses to cache this shape and
     // the extension refuses to persist it; this gate is the third consumer of the same rule, and it
     // is the one that was still issuing a verdict.
-    const transient = (result.unmeasured ?? []).filter((item) => item.transient);
+    const blockedImports = (result.unmeasured ?? []).filter(
+      (item) => item.transient || item.blocksBudget,
+    );
 
     // **The gate is HERE, in the thing that issues the verdict** — not in `analyzeFile`, which is
     // injected and could be replaced by a caller who forgot it. A pass/fail verdict is a durable
     // store (ADR-0006, invariant 3), and a store that trusts its caller to have asked is a store
     // that eventually will not be asked. The daemon and the extension both learned this the same
     // way, and moved their gates inside their stores.
-    if (!isUsableFileSize(result) || transient.length > 0) {
+    if (!isUsableFileSize(result) || blockedImports.length > 0) {
       unmeasurable.push({
         relative,
-        transient,
+        blockedImports,
         // The raw flags, carried through so the LINE derives its words from the same model the GUI
         // does. Collapsing them into a verdict here is how the two drifted apart in the first place.
         incomplete: result.incomplete === true,
@@ -187,7 +188,7 @@ export const runImportLensCheck = async ({
       writeLine(unmeasurableLine(item));
     }
     writeLine(
-      "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+      "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
     );
     return EXIT_COULD_NOT_MEASURE;
   }
@@ -202,9 +203,16 @@ export const runImportLensCheck = async ({
   return 0;
 };
 
-const unmeasurableLine = ({ relative, transient, incomplete, degraded, diagnostics, error }) => {
-  const stages = [...new Set(transient.map((item) => item.stage))].sort().join(", ");
-  const count = transient.length;
+const unmeasurableLine = ({
+  relative,
+  blockedImports,
+  incomplete,
+  degraded,
+  diagnostics,
+  error,
+}) => {
+  const stages = [...new Set(blockedImports.map((item) => item.stage))].sort().join(", ");
+  const count = blockedImports.length;
 
   // The aggregate failed OUTRIGHT: no bytes at all, for this one file. It used to throw out of
   // `analyzeFileWithDaemon` and abandon the whole run with exit 2 — one unmeasurable file taking
@@ -212,6 +220,13 @@ const unmeasurableLine = ({ relative, transient, incomplete, degraded, diagnosti
   // rather than the one FR-032a mandates for "could not measure". One bad file is one bad file.
   if (error) {
     return `${relative}: could not measure this file (${error}) - budget not evaluated`;
+  }
+
+  if (
+    diagnostics.some((diagnostic) => nonBudgetableResultStages.has(diagnostic.stage)) ||
+    blockedImports.some((item) => item.stage.split("/").includes("imprecise_assets"))
+  ) {
+    return `${relative}: asset processing produced a disclosed upper bound, so budgets were not evaluated`;
   }
 
   const quality = fileCostQuality({ incomplete, degraded, diagnostics });
@@ -340,6 +355,22 @@ export const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => 
       const stage = item.unmeasured_stage ?? "unknown";
       return { specifier: item.specifier, stage, transient: transientStages.has(stage) };
     });
+  const nonBudgetableMeasurements = measured.flatMap((item) => {
+    const stages = nonBudgetableImportStages(item);
+    if (stages.length === 0) {
+      return [];
+    }
+
+    const blocksBudget = stages.some((stage) => nonBudgetableResultStages.has(stage));
+    return [
+      {
+        specifier: item.specifier,
+        stage: stages.join("/"),
+        transient: stages.some((stage) => !durableResultStages.has(stage)),
+        ...(blocksBudget ? { blocksBudget: true } : {}),
+      },
+    ];
+  });
 
   return {
     filePath,
@@ -353,24 +384,22 @@ export const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => 
     // And for "the file's own combined build failed", which `incomplete` cannot see at all.
     degraded: response.degraded === true,
     diagnostics: response.diagnostics ?? [],
-    unmeasured,
-    imports: measured.map((item) => ({
-      specifier: item.specifier,
-      brotliBytes: item.brotli_bytes,
-    })),
+    unmeasured: [...unmeasured, ...nonBudgetableMeasurements],
+    imports: measured
+      .filter((item) => nonBudgetableImportStages(item).length === 0)
+      .map((item) => ({
+        specifier: item.specifier,
+        brotliBytes: item.brotli_bytes,
+      })),
   };
 };
 
 /**
  * Whether a file's totals are a measurement of THAT FILE, and so may be judged against a budget.
  *
- * ADR-0006 invariant 3 names "any pass/fail verdict" a durable store, so this is the same gate the
- * L1 aggregate cache applies (`FileSizeComputation::is_cacheable`, Rust) and the extension applies
- * before persisting a bundle-impact row (`isDurableFileSize`, TypeScript). It is stated a third time
- * here only because this CLI ships standalone and can import neither — the same forced duplication
- * as `transientStages` below, and held to the same standard: the three are kept in lockstep by a
- * drift check (`scripts/test/file-size-usability-coordination.test.mjs`), so a field added to one
- * and forgotten in the others fails the build rather than shipping a fourth instance of this defect.
+ * Budgetability is deliberately stricter than cacheability. A deterministic `imprecise_assets`
+ * upper bound is useful to cache and show, but it cannot prove a threshold pass or failure. The
+ * standalone CLI mirrors the extension and daemon report stage list under a drift check.
  *
  * `degraded` is the one that was missing, and it is the one a CI gate is most likely to meet: a
  * file's combined build is the biggest build in the system, so it is the likeliest to hit the
@@ -381,7 +410,9 @@ export const isUsableFileSize = (response) =>
   !response.error &&
   response.incomplete !== true &&
   response.degraded !== true &&
-  !(response.diagnostics ?? []).some((item) => transientStages.has(item.stage));
+  !(response.diagnostics ?? []).some(
+    (item) => transientStages.has(item.stage) || nonBudgetableResultStages.has(item.stage),
+  );
 
 /**
  * WHICH QUANTITY the daemon handed over, and how sound it is — the CLI's mirror of
@@ -399,9 +430,9 @@ export const fileCostQuality = (response) => ({
   quantity: response.degraded === true ? "combined-import-cost" : "file-cost",
   // A `degraded` aggregate is a Combined Import Cost, not also short: the transient stage the daemon
   // pushes on a combined-build TIMEOUT is that build's OWN failure, which `degraded` already reports,
-  // not a missing contributor. Reading it as short here made `importlens check` print "... and an
-  // import that belongs in it was not measured either" on a file where every import WAS measured. A
-  // transient stage WITHOUT a degrade (the defensive path) is still short. The extension's copy in
+  // not missing import or asset bytes. Reading it as short here made `importlens check` claim a
+  // missing contributor on a file where every import WAS measured. A transient stage WITHOUT a
+  // degrade (the defensive path) is still short. The extension's copy in
   // `extension/src/analysis/fileCostQuality.ts` carries the identical guard.
   short:
     response.incomplete === true ||
@@ -412,25 +443,72 @@ export const fileCostQuality = (response) => ({
 export const isFileCost = (quality) => quality.quantity === "file-cost" && !quality.short;
 
 export const fileCostBecause = (quality) => {
-  const missingImport =
-    "an import that belongs in this file's total was not measured, so the number is a floor and not the file's size";
+  const missingBytes =
+    "bytes that belong in this file's total were not measured, so the number is a floor and not the file's size";
   const combinedBuildFailed =
     "the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size";
 
   if (quality.quantity === "combined-import-cost") {
     return quality.short
-      ? `${combinedBuildFailed}, and an import that belongs in it was not measured either`
+      ? `${combinedBuildFailed}, and bytes that belong in it were not measured either`
       : combinedBuildFailed;
   }
 
-  return quality.short ? missingImport : "this file's imports built as one bundle";
+  return quality.short ? missingBytes : "this file's imports built as one bundle";
 };
 
-// Mirrors `stage::is_transient` in daemon/src/engine/mod.rs (and `transientEngineStages` in
-// extension/src/analysis/transience.ts). The three of them are kept in step by the drift check in
+// Mirrors `TRANSIENT_ANALYSIS_STAGES` in daemon/src/pipeline/stage.rs (and
+// `transientAnalysisStages` in extension/src/analysis/transience.ts). The three copies are kept in
+// step by the drift check in
 // scripts/test/engine-stage-coordination.test.mjs: a stage the daemon will not cache is a stage
 // this gate must not judge from.
-const transientStages = new Set(["timeout", "panic", "engine_gone"]);
+const transientStages = new Set([
+  "panic",
+  "timeout",
+  "engine_gone",
+  "entry_metadata",
+  "asset_io",
+  "compression",
+]);
+
+// Mirrors `DURABLE_RESULT_STAGES` in daemon/src/pipeline/stage.rs and
+// `durableResultStages` in extension/src/analysis/transience.ts. This is an allowlist so a newly
+// introduced diagnostic cannot be persisted or judged until every process classifies it.
+const durableResultStages = new Set([
+  "resolve",
+  "parse",
+  "link",
+  "generate",
+  "output_shape",
+  "module_graph_limit",
+  "missing_export",
+  "ambiguous_export",
+  "external",
+  "uncounted_assets",
+  "imprecise_assets",
+  "package_validation",
+  "package_resolution",
+  "package_manifest",
+  "entry_resolution",
+  "oversized_entry",
+  "minify",
+  "types_only",
+  "native_binary_only",
+  "native_binary",
+]);
+
+// Mirrors `NON_BUDGETABLE_RESULT_STAGES` in daemon/src/pipeline/stage.rs and
+// `nonBudgetableResultStages` in extension/src/analysis/budgetability.ts.
+const nonBudgetableResultStages = new Set(["imprecise_assets"]);
+
+const nonBudgetableImportStages = (result) =>
+  [
+    ...(typeof result.unmeasured_stage === "string" ? [result.unmeasured_stage] : []),
+    ...(result.diagnostics ?? []).map((diagnostic) => diagnostic.stage),
+  ]
+    .filter((stage) => !durableResultStages.has(stage) || nonBudgetableResultStages.has(stage))
+    .filter((stage, index, stages) => stages.indexOf(stage) === index)
+    .sort();
 
 const startDaemon = async (workspaceRoot) => {
   const target = platformTarget();

@@ -1,6 +1,9 @@
 use crate::{
     cache::{
-        key::{cache_key_for_resolved_import, path_is_definitely_gone},
+        key::{
+            Freshness, cache_key_for_resolved_import, check_fingerprints_strict,
+            path_is_definitely_gone,
+        },
         memory::cache_generation,
     },
     engine::dependency_paths::cached_loaded_paths,
@@ -66,6 +69,10 @@ impl FileSizeCache {
         let entry = pinned.get(path)?;
         let now = crate::time::unix_millis_now();
         if entry.signature != signature || !within_ttl(entry.computed_at_millis, now) {
+            return None;
+        }
+        if check_fingerprints_strict(&entry.computation.dependency_fingerprints) != Freshness::Fresh
+        {
             return None;
         }
         entry.last_used_millis.store(now, Ordering::Relaxed);
@@ -252,7 +259,13 @@ fn first_party_module_token(entry_path: &Path, runtime: ImportRuntime) -> String
     let mut tokens = module_paths
         .iter()
         .filter(|path| !path_has_node_modules_segment(path))
-        .map(|path| stat_token(path))
+        .map(|path| {
+            format!(
+                "{}={}",
+                path.to_string_lossy().replace('\\', "/"),
+                stat_token(path)
+            )
+        })
         .collect::<Vec<_>>();
     tokens.sort();
     tokens.join(",")
@@ -339,6 +352,46 @@ mod tests {
         let cache = FileSizeCache::new();
         cache.insert(PathBuf::from("/a/index.ts"), 42, computation(1234));
         assert!(cache.get(Path::new("/a/index.ts"), 99).is_none());
+    }
+
+    #[test]
+    fn get_revalidates_exact_first_party_dependency_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "il-fsc-exact-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let dependency = root.join("asset.woff2");
+        std::fs::write(&dependency, b"old-bytes").expect("old dependency bytes");
+        let modified = std::fs::metadata(&dependency)
+            .and_then(|metadata| metadata.modified())
+            .expect("dependency mtime");
+        let fingerprint = crate::cache::key::file_fingerprint_reading_hash(&dependency)
+            .expect("dependency fingerprint");
+
+        let mut value = computation(1234);
+        value.dependency_fingerprints.push(fingerprint);
+        let document = root.join("index.ts");
+        let cache = FileSizeCache::new();
+        cache.insert(document.clone(), 42, value);
+        assert!(cache.get(&document, 42).is_some(), "unchanged input hits");
+
+        // Same length and restored mtime defeat a stat-only token. A first-party combined-build
+        // fingerprint still hash-verifies and must reject the cached aggregate.
+        std::fs::write(&dependency, b"new-bytes").expect("new dependency bytes");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dependency)
+            .expect("dependency handle");
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore dependency mtime");
+
+        assert!(
+            cache.get(&document, 42).is_none(),
+            "equal-length, mtime-preserving asset edits must invalidate File Cost"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -189,6 +189,62 @@ test("the per-import budget is judged per import, File Cost or not", () => {
   );
 });
 
+test("a transient asset floor produces no per-import budget verdict", () => {
+  const state = ready("asset-lib", 2600, 2);
+  state.result?.diagnostics.push({
+    stage: "asset_io",
+    message: "a stylesheet dependency could not be read",
+    details: [],
+  });
+
+  assert.equal(
+    budgetInsightForState(state, { perImportBrotliBytes: 2000 }),
+    null,
+    "a missing asset can move the import to either side of the threshold on retry",
+  );
+  assert.deepEqual(
+    budgetViolationsForStates([state], { perImportBrotliBytes: 2000 }),
+    [],
+    "neither an inline badge nor a Problems-panel verdict may be drawn from the floor",
+  );
+});
+
+test("an imprecise asset upper bound produces no budget verdict", () => {
+  const state = ready("asset-lib", 2600, 2);
+  state.result?.diagnostics.push({
+    stage: "imprecise_assets",
+    message: "stylesheets were measured separately, so this size may read high",
+    details: [],
+  });
+  const upperBound = fileCost(3400, {
+    diagnostics: [
+      {
+        stage: "imprecise_assets",
+        message: "stylesheets were measured separately, so this size may read high",
+        details: [],
+      },
+    ],
+  });
+  const budgets = { perImportBrotliBytes: 2000, perFileBrotliBytes: 3000 };
+
+  assert.equal(
+    budgetInsightForState(state, budgets),
+    null,
+    "a disclosed upper bound can cross the threshold only because CSS artifacts were split",
+  );
+  assert.deepEqual(
+    budgetViolationsForStates([state], budgets, upperBound),
+    [],
+    "neither the import nor file upper bound may produce a false failure",
+  );
+  assert.equal(fileBudgetVerdict(budgets, upperBound), "not-evaluated");
+  assert.equal(
+    fileBudgetVerdict(budgets, fileCost(10, { diagnostics: upperBound.diagnostics })),
+    "not-evaluated",
+    "the same inexact number cannot establish a pass when it happens to be below the limit",
+  );
+});
+
 test("budgetInsightForState adds distinct inline and hover text for import budget violations", () => {
   assert.deepEqual(
     budgetInsightForState(ready("large-lib", 2600), { perImportBrotliBytes: 2000 }),

@@ -210,6 +210,24 @@ impl MeasuredSizes {
     };
 }
 
+/// What one kind of non-JavaScript asset contributes to an import's size (B2).
+///
+/// Every artifact of that kind, each compressed on its own and summed (ADR-0005). These bytes are
+/// **already inside** the result's five sizes — this is the composition of a number, not an
+/// addendum to it, which is exactly what the old `uncounted_assets` disclosure was not.
+///
+/// Flat rather than nesting a [`MeasuredSizes`], because the disk cache encoding is positional and
+/// a flat row of `u64`s is the shape both sides read most plainly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetContribution {
+    pub kind: crate::engine::AssetKind,
+    pub raw_bytes: u64,
+    pub minified_bytes: u64,
+    pub gzip_bytes: u64,
+    pub brotli_bytes: u64,
+    pub zstd_bytes: u64,
+}
+
 /// One import's analysis, in exactly one of the two states a *response* can carry (ADR-0006).
 /// The third — Loading — is not an `ImportResult` at all: it is
 /// [`ImportAnalysisItem`] with `status: Loading` and no result.
@@ -225,14 +243,12 @@ impl MeasuredSizes {
 /// compiler asks the only question a consumer is allowed to ask: **is there a size?** — never "is
 /// there an error?".
 ///
-/// What is **not** unrepresentable — and was claimed to be — is *a size together with a transient
-/// stage*. That shape is REAL: a measurement whose full-package comparison build timed out has
-/// genuine sizes and an untrustworthy `truly_treeshakeable` (`pipeline::analyze`). Deleting it to
-/// satisfy a slogan would delete the only evidence that the tree-shaking verdict is fabricated, and
-/// no type can stop it anyway — `diagnostics` is an open list of open structs whose `stage` is a
-/// `String`. So it is representable, it is named ([`Self::is_transient`]), and the invariant that
-/// keeps it out of every store is enforced **at the stores**, by [`Self::is_durable`], not by a
-/// convention at the call sites.
+/// What is **not** unrepresentable — and was claimed to be — is *a size together with a
+/// request-local stage*. That shape is REAL: a full-package comparison can time out beside genuine
+/// primary sizes, or asset I/O/compression can leave a disclosed partial asset size. Deleting it
+/// would delete the only evidence that the numeric result or its tree-shaking verdict must not
+/// become durable, and no type can stop it anyway — `diagnostics` is an open list whose `stage` is a
+/// `String`. The invariant is therefore enforced **at the stores**, by [`Self::is_durable`].
 ///
 /// Serde note: the sizes are plain `Option<u64>` with **no** `skip_serializing_if` — and neither
 /// have `module_breakdown` or `shared_bytes`, for the same reason. The dominant `Option` pattern in
@@ -276,6 +292,15 @@ pub struct ImportResult {
     /// See the struct's serde note.
     #[serde(default)]
     pub shared_bytes: Option<u64>,
+    /// What each kind of non-JavaScript asset contributed to the five sizes above (B2). Empty when
+    /// the import ships none, which is the common case.
+    ///
+    /// These bytes are already IN the sizes; this says how they are composed, so a reader can see
+    /// that a UI kit's number is part JavaScript and part stylesheet. Plain `Vec`, no
+    /// `skip_serializing_if`, for the positional-msgpack reason above; `#[serde(default)]` so the
+    /// field is simply empty for anything that predates it.
+    #[serde(default)]
+    pub asset_breakdown: Vec<AssetContribution>,
     /// Freshness of this served value. `#[serde(default)]` so old disk entries decode
     /// as `Fresh`; `skip_serializing_if = is_fresh` so the DISK (positional msgpack)
     /// never emits it (disk only stores `Fresh`), keeping the array aligned past the
@@ -308,6 +333,7 @@ impl ImportResult {
             diagnostics: Vec::new(),
             module_breakdown: None,
             shared_bytes: None,
+            asset_breakdown: Vec::new(),
             freshness: ResultFreshness::fresh(),
             internal_contributions: Vec::new(),
         }
@@ -316,7 +342,7 @@ impl ImportResult {
     /// **Unmeasured**: the build could not answer. No size, ever — not a zero, not an estimate of
     /// the directory on disk, not the entry file measured alone. The stage says whether that is a
     /// property of the package's bytes (deterministic: `parse`, `link`, `output_shape`, …) or of
-    /// this moment's scheduling (transient: `timeout`, `panic`, `engine_gone`).
+    /// this request's machine/filesystem state (`timeout`, `panic`, `engine_gone`, `asset_io`, …).
     pub fn unmeasured(
         specifier: impl Into<String>,
         stage: &str,
@@ -350,6 +376,7 @@ impl ImportResult {
             }],
             module_breakdown: None,
             shared_bytes: None,
+            asset_breakdown: Vec::new(),
             freshness: ResultFreshness::fresh(),
             internal_contributions: Vec::new(),
         }
@@ -392,20 +419,19 @@ impl ImportResult {
         self.unmeasured_stage.as_deref()
     }
 
-    /// This result describes **this run of the daemon** rather than the package: either the build
-    /// itself was cancelled/unwound/orphaned, or a secondary build (the full-package comparison)
-    /// was, which fabricates `truly_treeshakeable: false` on an otherwise sound measurement.
+    /// This result describes **this run of the daemon** rather than the package: a build was lost,
+    /// a secondary comparison failed, exact asset bytes were unavailable, or a compressor failed.
     ///
     /// Both are reasons no durable store may take it (ADR-0006, invariant 3) — but they are not the
     /// only ones, so this is not the gate. [`Self::is_durable`] is.
     pub fn is_transient(&self) -> bool {
         self.unmeasured_stage
             .as_deref()
-            .is_some_and(crate::engine::stage::is_transient)
+            .is_some_and(crate::pipeline::stage::is_transient)
             || self
                 .diagnostics
                 .iter()
-                .any(|diagnostic| crate::engine::stage::is_transient(&diagnostic.stage))
+                .any(|diagnostic| crate::pipeline::stage::is_transient(&diagnostic.stage))
     }
 
     /// **The gate every durable store applies** (ADR-0006, invariant 3). A store that outlives the
@@ -413,15 +439,15 @@ impl ImportResult {
     /// result only if this is true, and each of those stores asks *itself*, at the insert, rather
     /// than trusting its callers to have asked.
     ///
-    /// It is an ALLOWLIST over stages, not a denylist of the three transient ones
+    /// It is an ALLOWLIST over stages, not a denylist of the currently-known transient ones
     /// (`pipeline::stage::may_enter_a_durable_store` explains why: `entry_metadata` is a bare
     /// `fs::metadata` failure — transient in fact, and absent from every list of the engine's
     /// transient stages). Both places a stage can hide are checked:
     ///
     /// * the result's own `unmeasured_stage` — the build that could not answer;
-    /// * every diagnostic — which is how a **successful** measurement whose full-package comparison
-    ///   build merely parked is caught, since its `truly_treeshakeable: false` was fabricated by
-    ///   that park and would otherwise be cached as a fact about a healthy package.
+    /// * every diagnostic — which catches both a **successful** primary measurement whose
+    ///   full-package comparison merely parked and a partial asset measurement carrying
+    ///   `asset_io`/`compression`.
     ///
     /// A Measured result with no failure diagnostics is durable, which is the overwhelmingly common
     /// case and the one that must stay fast.
@@ -436,6 +462,27 @@ impl ImportResult {
                 .diagnostics
                 .iter()
                 .all(|diagnostic| stage_is_durable(&diagnostic.stage))
+    }
+
+    /// Whether this result is precise enough for a budget verdict.
+    ///
+    /// Budgetability is deliberately stricter than durability. A deterministic upper bound can be
+    /// cached and shown again, but comparing it with a threshold can produce a false failure.
+    pub fn is_budgetable(&self) -> bool {
+        self.sizes().is_some()
+            && self.is_durable()
+            && self.diagnostics.iter().all(|diagnostic| {
+                !crate::pipeline::stage::prevents_budget_verdict(&diagnostic.stage)
+            })
+    }
+
+    /// Whether a successful build disclosed supported asset bytes that are absent from its five
+    /// sizes. The result may still be reusable when the omission is deterministic, but the number
+    /// is a floor and cannot stand in for a complete File Cost.
+    pub fn has_uncounted_assets(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS)
     }
 
     /// A **declarations-only** package: a package that resolves to no runtime entry *because it
@@ -615,10 +662,21 @@ pub struct FileSizeDocumentResponse {
     pub zstd_bytes: u64,
     pub imports: Vec<ImportResult>,
     pub states: Vec<ImportAnalysisItem>,
-    /// These totals are a **floor**, not the file's size: an import that belongs in them was not
-    /// measured — its own build had not landed when the sum was taken (`status: "loading"`), or a
-    /// transient engine failure fabricated the number it carries
-    /// ([`crate::pipeline::file_size::FileSizeComputation::incomplete`]).
+    /// What the five totals above are made of, per non-JavaScript kind — bytes already INSIDE them.
+    ///
+    /// The per-import result has carried this since B2; the file total did not, so the status bar
+    /// and "Show Current File Size" began including stylesheet, wasm and font bytes with no surface
+    /// able to say so. A headline that changes meaning without a way to explain itself is the shape
+    /// this model exists to avoid, so the composition travels with the number.
+    ///
+    /// `#[serde(default)]` because the IPC wire is msgpack NAMED: the field is simply absent for a
+    /// daemon that predates it.
+    #[serde(default)]
+    pub asset_breakdown: Vec<AssetContribution>,
+    /// These totals are a **floor**, not the file's size: an import that belongs in a fallback sum
+    /// was not measured, or a successful import/combined build disclosed supported asset bytes
+    /// that are absent from its five sizes (`uncounted_assets`; see
+    /// [`crate::pipeline::file_size::FileSizeComputation::incomplete`]).
     ///
     /// It is on the wire because the client has durable stores of its own (the bundle-impact
     /// history), and neither of the other two fields can tell it this: `error` is `None` — the sum

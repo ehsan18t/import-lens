@@ -56,6 +56,22 @@ export interface ImportRequest {
  * `error: null` PLUS a fabricated size, so every `!result.error` check in this codebase waved it
  * through; there is no size to misuse now. Use `measuredSizes()` in `ui/format.ts` to ask.
  */
+/** What a non-JavaScript asset ships as. Mirrors the daemon's `engine::AssetKind` (snake_case). */
+export type AssetKind = "css" | "wasm" | "font";
+
+/**
+ * One asset kind's contribution to an import's size (B2): every artifact of that kind, each
+ * compressed on its own and summed. Mirrors the daemon's `AssetContribution`.
+ */
+export interface AssetContribution {
+  kind: AssetKind;
+  raw_bytes: number;
+  minified_bytes: number;
+  gzip_bytes: number;
+  brotli_bytes: number;
+  zstd_bytes: number;
+}
+
 export interface ImportResult {
   specifier: string;
   raw_bytes: number | null;
@@ -77,6 +93,10 @@ export interface ImportResult {
   diagnostics: ImportDiagnostic[];
   module_breakdown?: ModuleContribution[];
   shared_bytes?: number;
+  // What each kind of non-JavaScript asset contributed to the five sizes above (B2). Empty for an
+  // import that ships none, which is the common case. These bytes are already IN the sizes: this
+  // says how the number is composed, it does not add to it.
+  asset_breakdown?: AssetContribution[];
   // Data-layer freshness of this served value. Omitted by the daemon when Fresh
   // (skip_serializing_if), so an absent field means Fresh. No consumer reads it yet.
   freshness?: ResultFreshness;
@@ -174,11 +194,15 @@ export interface FileSizeDocumentResponse {
   zstd_bytes: number;
   imports: ImportResult[];
   states: ImportAnalysisItem[];
-  // The totals are a FLOOR, not the file's size: an import that belongs in them was never
-  // measured — its own build had not landed (`status: "loading"`), or a transient engine failure
-  // fabricated the size it carries. Safe to show with the diagnostics that say so (FR-024a),
-  // never safe to record as a historical data point (FR-026c). Absent from an older daemon, which
-  // is why it is optional; read it as `incomplete === true`.
+  // What the five totals are made of, per non-JavaScript kind — bytes already INSIDE them. The file
+  // headline began including stylesheet/wasm/font weight with no surface able to say so; this is
+  // what lets the file total explain itself the way an import already can. Optional for older
+  // daemons, which simply omit it.
+  asset_breakdown?: AssetContribution[];
+  // The totals are a FLOOR, not the file's size: an import that belongs in a fallback sum was never
+  // measured, or a successful build disclosed supported asset bytes absent from its five sizes
+  // (`uncounted_assets`). Safe to show, never safe to record as history (FR-026c). Optional for
+  // older daemons; read as `=== true`.
   incomplete?: boolean;
   // The file's OWN combined build failed, so these totals are an un-deduplicated sum of the
   // per-import costs — a *different quantity* from a File Cost (ADR-0004), and an OVER-count.

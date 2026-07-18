@@ -170,6 +170,7 @@ const SLOW_CACHE_LOOKUP_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 struct ComputedAnalysis {
     result: ImportResult,
     dependency_fingerprints: Vec<FileFingerprint>,
+    dependencies_are_reusable: bool,
 }
 
 /// F1 trailing-re-check decision for the background SWR revalidation. After a
@@ -1158,6 +1159,8 @@ impl ImportLensService {
             zstd_bytes: file_size.zstd_bytes,
             imports: results,
             states,
+            // What those five totals are made of. Already inside them; this only makes them legible.
+            asset_breakdown: file_size.asset_breakdown.clone(),
             // The one fact the bytes cannot carry: whether every import that belongs in them was
             // really measured. The extension needs it to keep a floor out of its persisted
             // bundle-impact history (FR-026c) — a store with no TTL, where one fabricated row
@@ -2729,14 +2732,20 @@ impl ImportLensService {
                 } else {
                     Vec::new()
                 };
+                let dependencies_are_reusable =
+                    crate::cache::key::fingerprints_are_reusable(&dependency_fingerprints);
 
                 ComputedAnalysis {
                     result,
                     dependency_fingerprints,
+                    dependencies_are_reusable,
                 }
             });
 
-        if should_cache_result(&computed.result) && should_store() {
+        if should_cache_result(&computed.result)
+            && computed.dependencies_are_reusable
+            && should_store()
+        {
             cache.insert_with_fingerprints_at_generation(
                 key,
                 computed.result.clone(),
@@ -2892,6 +2901,7 @@ fn file_size_document_prelude(
             zstd_bytes: 0,
             imports: Vec::new(),
             states: Vec::new(),
+            asset_breakdown: Vec::new(),
             // Nothing was summed at all; `error` is the answer, and every client already refuses
             // an errored response.
             incomplete: false,
@@ -3104,7 +3114,7 @@ fn dependency_fingerprints(
     resolved: &ResolvedPackage,
     source: Option<&crate::pipeline::analyze::FingerprintSource>,
 ) -> Vec<crate::cache::key::FileFingerprint> {
-    use crate::cache::key::file_fingerprint_reading_hash;
+    use crate::cache::key::{file_fingerprint_reading_hash, sort_and_dedup_fingerprints};
     use crate::pipeline::analyze::FingerprintSource;
 
     let mut fingerprints = match source {
@@ -3137,8 +3147,7 @@ fn dependency_fingerprints(
 
     // Two ids can canonicalize to the same real path (a symlinked workspace dep), so
     // dedup is load-bearing, not cosmetic.
-    fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
-    fingerprints.dedup_by(|left, right| left.path == right.path);
+    sort_and_dedup_fingerprints(&mut fingerprints);
     fingerprints
 }
 /// Lives here rather than in `ipc::server` because the streaming document handler builds one
@@ -3170,6 +3179,7 @@ pub fn protocol_error_file_size_document_response(
         zstd_bytes: 0,
         imports: Vec::new(),
         states: Vec::new(),
+        asset_breakdown: Vec::new(),
         incomplete: false,
         degraded: false,
         error: Some(message.clone()),
@@ -3492,6 +3502,7 @@ mod analyze_and_cache_single_flight_tests {
                     ComputedAnalysis {
                         result: cacheable_result("pkg-flight"),
                         dependency_fingerprints: Vec::new(),
+                        dependencies_are_reusable: true,
                     }
                 })
         });
@@ -3567,10 +3578,9 @@ mod every_durable_store_rejects_a_non_durable_outcome {
     use crate::pipeline::stage as pipeline_stage;
     use std::path::PathBuf;
 
-    /// Every stage a durable store must REFUSE: the three transient engine stages, plus the ones
-    /// that are transient in fact without being the engine's (`entry_metadata` — a bare
-    /// `fs::metadata` failure — and `compression`). DERIVED from the allowlist rather than restated
-    /// beside it, so a stage that changes classification changes this list with it.
+    /// Every stage a durable store must REFUSE: request-local engine outcomes plus machine-local
+    /// pipeline work (`entry_metadata` and `compression`). DERIVED from the allowlist rather than
+    /// restated beside it, so a stage that changes classification changes this list with it.
     fn non_durable_stages() -> Vec<&'static str> {
         stage::ALL
             .iter()

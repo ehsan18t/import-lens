@@ -179,12 +179,12 @@ mod tests {
             mpsc,
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use crate::ipc::protocol::{ConfidenceLevel, ImportResult, MeasuredSizes};
 
-    use super::AnalysisFlightRegistry;
+    use super::{AnalysisFlightRegistry, lock_unpoisoned};
 
     fn result_for(specifier: &str, bytes: u64) -> ImportResult {
         let mut result = ImportResult::measured(
@@ -246,7 +246,31 @@ mod tests {
             })
         });
 
-        thread::sleep(Duration::from_millis(50));
+        // Wait for the follower to actually JOIN the flight, rather than guessing that 50ms is
+        // enough for it to get there. Under load it sometimes was not: the leader was released
+        // first, published, and removed the flight, so the follower arrived to an empty registry,
+        // became a leader itself, and computed a second time — failing on `compute_count == 2`.
+        // The test was reporting scheduling latency, not coalescing.
+        //
+        // The refcount is the real signal: the map holds one reference and the leader holds one, so
+        // a third means the follower has claimed the same flight and is about to block on it.
+        let joined_by = Instant::now();
+        loop {
+            let references = {
+                let flights = lock_unpoisoned(&registry.flights);
+                flights
+                    .get(&("react".to_owned(), 7))
+                    .map_or(0, Arc::strong_count)
+            };
+            if references >= 3 {
+                break;
+            }
+            assert!(
+                joined_by.elapsed() < Duration::from_secs(10),
+                "the follower never joined the leader's flight"
+            );
+            thread::yield_now();
+        }
         release(&release_compute);
 
         let leader_result = leader.join().expect("leader thread");

@@ -14,7 +14,7 @@ import type { ImportAnalysisState } from "../../src/analysis/state.js";
 import {
   isDurableFileSize,
   isDurableImportResult,
-  transientEngineStages,
+  transientAnalysisStages,
 } from "../../src/analysis/transience.js";
 import type {
   FileSizeDocumentResponse,
@@ -115,7 +115,7 @@ class MemoryStore {
 
 /**
  * **Property** over EVERY transient stage the daemon declares × every durable store the extension
- * owns. A stage added to `transientEngineStages` that some store forgets to gate on fails here.
+ * owns. A stage added to `transientAnalysisStages` that some store forgets to gate on fails here.
  *
  * **It feeds the STORES, not the constructors.** It used to feed `importCostHistoryItem` and
  * `bundleImpactHistoryItemForResponse` — the row builders — and assert they returned `undefined`.
@@ -130,9 +130,9 @@ class MemoryStore {
  * that never happened.
  */
 test("no durable store takes a transient outcome, in any of its shapes", async () => {
-  assert.ok(transientEngineStages.length > 0, "there must be at least one transient stage");
+  assert.ok(transientAnalysisStages.length > 0, "there must be at least one transient stage");
 
-  for (const stage of transientEngineStages) {
+  for (const stage of transientAnalysisStages) {
     assert.equal(
       isDurableImportResult(unmeasured(stage)),
       false,
@@ -221,6 +221,34 @@ test("a measurement is durable and a deterministic failure has nothing to record
     "a parse failure is a fact about the code, and the daemon caches it — but it has no SIZE, and a history row is five sizes",
   );
   assert.equal(isDurableImportResult(undefined), false);
+});
+
+test("a measured asset I/O fallback is not durable", async () => {
+  const assetIoFallback = comparisonDegraded("asset_io");
+
+  assert.equal(
+    isDurableImportResult(assetIoFallback),
+    false,
+    "the sizes omit asset bytes because of this machine's filesystem state",
+  );
+  assert.equal(
+    isDurableFileSize(
+      fileSize({ diagnostics: [{ stage: "asset_io", message: "read failed", details: [] }] }),
+    ),
+    false,
+    "the same undercount cannot become a persisted File Cost baseline",
+  );
+
+  const store = new MemoryStore();
+  await recordImportCostHistory(
+    store,
+    [stateFor("asset-lib", assetIoFallback), stateFor("dayjs", measured)],
+    1_000,
+  );
+  assert.deepEqual(
+    store.get<ImportCostHistoryItem[]>(importCostHistoryKey, []).map((item) => item.specifier),
+    ["dayjs"],
+  );
 });
 
 test("the persisted import-cost history records only what was measured", () => {

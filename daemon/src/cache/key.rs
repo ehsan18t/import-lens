@@ -4,7 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -72,9 +72,66 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// with no importable JS entry is answered as a native-binary-only zero instead of a bare failure, and
 /// one whose JS entry is a thin shim keeps its measured size with a native-binary flag beside it — so
 /// entries cached as `entry_resolution` failures or as confident shim sizes must be recomputed (B3).
+///
+/// `rolldown-1.1.x+5` (2026-07-17): asset counting moves the number for a whole category of packages,
+/// so every entry computed under `rolldown-1.1.x+4` must be rejected on read. A package's shipped
+/// CSS, wasm, and font bytes are now folded INTO the Import Cost instead of being disclosed beside a
+/// number that excluded them: stylesheets are bundled and minified by Lightning CSS (one artifact per
+/// import, `@import`s inlined and deduped), wasm and fonts are counted raw, and each artifact is
+/// compressed on its own and summed (ADR-0005). Every CSS-shipping package therefore reports a LARGER
+/// and correct size where it previously undercounted, and one whose only uncounted bytes were assets
+/// can now reach High confidence, because the `uncounted_assets` diagnostic that held it at Medium is
+/// emitted only when an asset cannot be processed. The result also carries a per-kind
+/// `asset_breakdown`, which no `+4` entry has (B2).
+///
+/// `rolldown-1.1.x+6` (2026-07-18): asset measurements and freshness now use the exact same read.
+/// Direct assets, CSS entrypoints, imported stylesheets, and local CSS resources are retained as
+/// immutable snapshots with read-time content hashes; failed and missing CSS dependencies also
+/// participate in freshness instead of leaving a reusable fallback. Combined File Cost entries
+/// validate those exact fingerprints before reuse. Entries computed under `+5` can contain bytes
+/// from one read paired with a later fingerprint, or remain cached after a CSS dependency changes,
+/// and therefore must be rejected.
+///
+/// `rolldown-1.1.x+7` (2026-07-18): every asset-processing read now shares the graph's aggregate
+/// resource ceiling and a bounded execution deadline. Cached `+6` measurements may include CSS
+/// `@import` or `url()` resources that escaped the graph limit, so they must be recomputed under the
+/// unified admission rules.
+///
+/// `rolldown-1.1.x+8` (2026-07-18): asset I/O and asset-compressor failures are request-local, not
+/// package facts. Direct relative assets now resolve through the observing plugin, failed reads
+/// retain a never-reusable fingerprint and an `asset_io` stage, and CSS/binary compressor failures
+/// retain `compression`. Cached `+7` resolve failures and disclosed asset floors lack those causes
+/// and could otherwise outlive the filesystem/machine condition that produced them.
+/// `rolldown-1.1.x+9` (2026-07-18): a stylesheet's `url()` graph is now classified by what the
+/// reference IS rather than by whether its extension is countable. A shipped file outside the
+/// CSS/wasm/font taxonomy (an image, an SVG) is disclosed with its real bytes instead of leaving
+/// through a silent `None`; a local resource that could not be located or whose URLs could not be
+/// inspected is reported as an omission on `uncounted_assets` rather than as an over-count on
+/// `imprecise_assets`; and a runtime-fetched resource is disclosed on `external`, which keeps the
+/// exact size budgetable. Cached `+8` entries can therefore be short by an undisclosed image at
+/// High confidence, or carry an omission mislabelled as imprecision — both of which changed
+/// completeness, confidence, and budgetability — so they must be rejected on read.
+/// `rolldown-1.1.x+10` (2026-07-18): two stored values changed meaning. A module whose bytes were
+/// measured but whose read was never fingerprinted is now recorded as UNVERIFIABLE rather than
+/// deferred to a post-analysis stat, so a `+9` entry can pair a size measured from one revision of a
+/// binary module with a hash taken from a later one and answer Fresh forever. And every directly
+/// imported asset is now a module contribution, so `shared_bytes` — carried in the L2 envelope —
+/// accounts for a stylesheet several imports pull, which a `+9` entry computed without.
+/// `rolldown-1.1.x+11` (2026-07-18): a package that a directly imported image, icon or media file
+/// used to make entirely unmeasurable now measures, with those bytes disclosed. A `+10` entry for
+/// such a package is a cached DURABLE failure — `resolve` for a PNG that failed the UTF-8 loader,
+/// `parse` for an SVG that reached the JavaScript parser — and would keep being served as
+/// "unavailable" for a package that now has a number. A bare CSS `@import` also stops recording a
+/// failed read of a path that cannot exist, so results that were permanently non-durable become
+/// cacheable.
+/// `rolldown-1.1.x+12` (2026-07-18): brotli moved from quality 4 to quality 9, so EVERY brotli
+/// figure the product reports changes. A `+11` entry was compressed at the old quality and would be
+/// served beside newly measured ones, making two packages incomparable for the reason least visible
+/// to the user. Measured: q4 reads 16.0% high against a CDN at q11, q9 reads 7.5% high, and the cost
+/// is +33 ms per artifact against q11 own +928 ms.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+4"
+        "rolldown-1.1.x+12"
     };
 }
 
@@ -307,9 +364,58 @@ pub fn fingerprints_for_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<F
         .into_iter()
         .filter_map(file_fingerprint)
         .collect::<Vec<_>>();
-    fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
-    fingerprints.dedup_by(|left, right| left.path == right.path);
+    sort_and_dedup_fingerprints(&mut fingerprints);
     fingerprints
+}
+
+/// Put fingerprint sets in deterministic cache-key order while preserving conflicting snapshots.
+///
+/// Two identical observations of one path collapse. Two different hashes for one path must both
+/// remain: no current file can satisfy both, so their coexistence safely makes an analysis that saw
+/// a mid-flight edit non-reusable. Deduplicating only by path silently chose one snapshot and could
+/// bless a size derived from the other.
+pub fn sort_and_dedup_fingerprints(fingerprints: &mut Vec<FileFingerprint>) {
+    fingerprints.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.len.cmp(&right.len))
+            .then_with(|| left.modified_millis.cmp(&right.modified_millis))
+            .then_with(|| left.content_hash.cmp(&right.content_hash))
+    });
+    fingerprints.dedup();
+}
+
+/// Whether one analysis observed mutually incompatible snapshots for the same path.
+///
+/// A hashless observation is compatible with a hashed one when their metadata agrees; it simply
+/// knows less. Different metadata, or two different known hashes, means the file changed while the
+/// answer was being assembled. No single on-disk state can validate that answer, so it must not be
+/// admitted to a cache even on the node_modules metadata fast path.
+pub fn fingerprints_have_conflicting_snapshots(fingerprints: &[FileFingerprint]) -> bool {
+    let mut observed: HashMap<&str, (u64, u64, Option<u64>)> = HashMap::new();
+    for fingerprint in fingerprints {
+        match observed.entry(&fingerprint.path) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((
+                    fingerprint.len,
+                    fingerprint.modified_millis,
+                    fingerprint.content_hash,
+                ));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (len, modified_millis, known_hash) = entry.get_mut();
+                if *len != fingerprint.len || *modified_millis != fingerprint.modified_millis {
+                    return true;
+                }
+                match (*known_hash, fingerprint.content_hash) {
+                    (Some(left), Some(right)) if left != right => return true,
+                    (None, Some(hash)) => *known_hash = Some(hash),
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +451,21 @@ fn modified_millis(metadata: &std::fs::Metadata) -> u64 {
 
 /// Tri-state freshness of one stored fingerprint against the current file.
 pub fn check_fingerprint(stored: &FileFingerprint) -> Freshness {
+    // An ABSENT input is the one case where "the file is not there" is the expected answer rather
+    // than a reason to give up. A stylesheet that `@import`s a file which does not exist is a
+    // deterministic fact about the package, so the result is worth keeping — but only for exactly
+    // as long as the file stays missing. Creating it makes this Stale, which is what re-measures.
+    //
+    // Without this the same path had to be recorded as UNVERIFIABLE, which is never fresh, so such a
+    // package was rebuilt on every keystroke over a file nobody was going to create.
+    if fingerprint_is_absent(stored) {
+        return match fs::metadata(&stored.path) {
+            Ok(_) => Freshness::Stale,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Freshness::Fresh,
+            Err(error) => classify_stat_error(error.kind()),
+        };
+    }
+
     let metadata = match fs::metadata(&stored.path) {
         Ok(metadata) => metadata,
         Err(error) => return classify_stat_error(error.kind()),
@@ -468,6 +589,55 @@ pub fn file_fingerprint_reading_hash(path: impl AsRef<Path>) -> Option<FileFinge
         Ok(bytes) => file_fingerprint_with_hash(path, Some(content_hash(&bytes))),
         Err(_) => file_fingerprint_with_hash(path, None),
     }
+}
+
+/// Represent a path that analysis attempted but could not read.
+///
+/// There are no bytes whose hash could make this state `Fresh`. Maximal len/mtime values guarantee
+/// an accessible file misses the metadata pre-filter and, with no content hash, classifies Stale;
+/// a still-missing file classifies Gone. Either outcome refuses the cached fallback, which keeps a
+/// machine-dependent read failure out of durable use without changing the serialized fingerprint
+/// schema to add an absence variant.
+pub fn unverifiable_file_fingerprint(path: impl AsRef<Path>) -> FileFingerprint {
+    FileFingerprint {
+        path: normalize_identity_path(path),
+        len: u64::MAX,
+        modified_millis: u64::MAX,
+        content_hash: None,
+    }
+}
+
+/// An input that is expected NOT to exist, and whose continued absence is what keeps a result fresh.
+///
+/// Distinguished from [`unverifiable_file_fingerprint`] by the mtime: that one is all-ones in both
+/// fields and can never be fresh, this one pairs an all-ones length with a zero mtime, a combination
+/// no real file produces. Both are sentinels rather than measurements; only this one has a state a
+/// later check can confirm.
+pub fn absent_file_fingerprint(path: impl AsRef<Path>) -> FileFingerprint {
+    FileFingerprint {
+        path: normalize_identity_path(path),
+        len: u64::MAX,
+        modified_millis: 0,
+        content_hash: None,
+    }
+}
+
+pub fn fingerprint_is_absent(fingerprint: &FileFingerprint) -> bool {
+    fingerprint.len == u64::MAX
+        && fingerprint.modified_millis == 0
+        && fingerprint.content_hash.is_none()
+}
+
+pub fn fingerprint_is_unverifiable(fingerprint: &FileFingerprint) -> bool {
+    fingerprint.len == u64::MAX
+        && fingerprint.modified_millis == u64::MAX
+        && fingerprint.content_hash.is_none()
+}
+
+/// Whether a dependency set represents one complete, internally consistent observation.
+pub fn fingerprints_are_reusable(fingerprints: &[FileFingerprint]) -> bool {
+    !fingerprints.iter().any(fingerprint_is_unverifiable)
+        && !fingerprints_have_conflicting_snapshots(fingerprints)
 }
 
 /// Len + mtime captured at the moment a module's bytes are read during analysis,
@@ -627,6 +797,103 @@ mod tests {
         );
         // Same length, different content — the case mtime+len can miss.
         assert_ne!(content_hash(b"aaaa"), content_hash(b"bbbb"));
+    }
+
+    #[test]
+    fn fingerprint_normalization_keeps_conflicting_snapshots_of_one_path() {
+        let first = FileFingerprint {
+            path: "/pkg/styles.css".to_owned(),
+            len: 4,
+            modified_millis: 10,
+            content_hash: Some(content_hash(b"aaaa")),
+        };
+        let conflicting = FileFingerprint {
+            content_hash: Some(content_hash(b"bbbb")),
+            ..first.clone()
+        };
+        let mut fingerprints = vec![conflicting.clone(), first.clone(), first.clone()];
+
+        sort_and_dedup_fingerprints(&mut fingerprints);
+
+        assert_eq!(fingerprints.len(), 2, "exact duplicates should collapse");
+        assert!(fingerprints.contains(&first));
+        assert!(fingerprints.contains(&conflicting));
+        assert!(
+            fingerprints_have_conflicting_snapshots(&fingerprints),
+            "two known hashes for one metadata snapshot cannot both describe the answer"
+        );
+        assert!(!fingerprints_are_reusable(&fingerprints));
+
+        let mut compatible = first.clone();
+        compatible.content_hash = None;
+        assert!(
+            !fingerprints_have_conflicting_snapshots(&[first, compatible]),
+            "a stat-only observation may agree with a more precise hashed observation"
+        );
+    }
+
+    /// The absent sentinel is the ONE case where "the file is not there" is the expected answer
+    /// rather than a reason to give up, so all three arms of that branch are pinned here.
+    ///
+    /// This is the only fingerprint kind that can return `Fresh` from a failed stat. That makes its
+    /// third arm — a stat that fails for any reason OTHER than absence — the one worth stating
+    /// explicitly: a locked or permission-denied file is not evidence that the file is gone, and
+    /// answering `Fresh` there would serve a result whose input we cannot see.
+    #[test]
+    fn an_absent_fingerprint_is_fresh_only_while_the_file_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-absent-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let missing = dir.join("created-later.css");
+        let fingerprint = absent_file_fingerprint(&missing);
+
+        assert!(fingerprint_is_absent(&fingerprint));
+        assert!(
+            !fingerprint_is_unverifiable(&fingerprint),
+            "absent and unverifiable must stay distinct: one can be fresh, the other never can"
+        );
+        assert_eq!(
+            check_fingerprint(&fingerprint),
+            Freshness::Fresh,
+            "a file that is still missing is exactly what this fingerprint recorded"
+        );
+        assert!(
+            fingerprints_are_reusable(std::slice::from_ref(&fingerprint)),
+            "a deterministic absence must not refuse the result it belongs to"
+        );
+
+        std::fs::write(&missing, b".created { color: red }").expect("create the missing input");
+        assert_eq!(
+            check_fingerprint(&fingerprint),
+            Freshness::Stale,
+            "creating the file is what re-measures the package"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_unverifiable_fingerprint_can_never_be_fresh() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-unverifiable-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let missing = dir.join("created-later.css");
+        let fingerprint = unverifiable_file_fingerprint(&missing);
+
+        assert!(!fingerprints_are_reusable(std::slice::from_ref(
+            &fingerprint
+        )));
+        assert_eq!(check_fingerprint(&fingerprint), Freshness::Gone);
+        std::fs::write(&missing, b".created { color: red }").expect("create missing input");
+        assert_eq!(check_fingerprint(&fingerprint), Freshness::Stale);
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

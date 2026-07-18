@@ -19,6 +19,7 @@ use super::{
     BundleArtifact, BundleFailure, BundleRequest, ImportDiagnostic, ImportRuntime,
     ModuleContribution, UncountedAsset, diagnostic_stage, entry, stage,
 };
+use crate::cache::key::sort_and_dedup_fingerprints;
 use crate::pipeline::node_builtins::{NODE_BUILTIN_MODULES, NODE_PREFIX_ONLY_MODULES};
 use crate::pipeline::resolver::resolve_options as shared_resolve_options;
 
@@ -69,12 +70,14 @@ impl RolldownEngine {
         let state = plugin.state();
         let output = run_build(options, plugin, &state).await?;
         let chunk = single_chunk(&output, &state)?;
-        let (read_time_fingerprints, unhashed_paths) = state.read_time_fingerprints();
+        let (read_time_fingerprints, unhashed_paths) = build_observations(&state);
+        let mut diagnostics = contract_diagnostics(&output.warnings);
+        diagnostics.extend(asset_io_diagnostic(&state));
 
         Ok(ExportEnumeration {
             names: chunk.exports.iter().map(|name| name.to_string()).collect(),
             // A successful build's warnings used to be dropped on the floor.
-            diagnostics: contract_diagnostics(&output.warnings),
+            diagnostics,
             read_time_fingerprints,
             loaded_paths: state.sorted_loaded_paths(),
             unhashed_paths,
@@ -91,6 +94,34 @@ fn rolldown_entry_path(path: &Path) -> String {
         .strip_prefix("//?/")
         .unwrap_or(&normalized)
         .to_owned()
+}
+
+fn build_observations(
+    state: &BuildState,
+) -> (Vec<crate::cache::key::FileFingerprint>, Vec<PathBuf>) {
+    let (mut fingerprints, unhashed_paths) = state.read_time_fingerprints();
+    fingerprints.extend(state.unverifiable_asset_fingerprints());
+    sort_and_dedup_fingerprints(&mut fingerprints);
+    (fingerprints, unhashed_paths)
+}
+
+fn asset_io_diagnostic(state: &BuildState) -> Option<ImportDiagnostic> {
+    let paths = state.failed_asset_paths();
+    if paths.is_empty() {
+        return None;
+    }
+    let names = paths
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(ImportDiagnostic {
+        stage: stage::ASSET_IO.to_owned(),
+        message: format!(
+            "supported asset input(s) could not be read during this analysis; retry after the \
+             filesystem settles: {names}"
+        ),
+    })
 }
 
 /// Fixed build options (spec §7.1). Everything not set here intentionally
@@ -205,9 +236,15 @@ fn translate(
         });
     }
 
-    let uncounted = uncounted_assets(&output, state);
+    // Two sources, one meaning: bytes this build knows ship and cannot count. Rolldown emitting an
+    // asset beside the chunk (nothing does today), and a directly imported file outside the
+    // measured taxonomy. They share a disclosure because the user's question is the same for both.
+    let mut emitted = emitted_assets(&output);
+    emitted.extend(state.unmeasured_assets());
+    emitted.sort_by(|left, right| left.path.cmp(&right.path));
     let mut diagnostics = contract_diagnostics(&output.warnings);
-    diagnostics.extend(uncounted_assets_diagnostic(&uncounted));
+    diagnostics.extend(asset_io_diagnostic(state));
+    diagnostics.extend(uncounted_assets_diagnostic(&emitted));
     for import in &chunk.imports {
         diagnostics.push(ImportDiagnostic {
             stage: diagnostic_stage::EXTERNAL.to_owned(),
@@ -223,10 +260,11 @@ fn translate(
     // `reported_side_effects` nobody else read. Both are gone. Rolldown still owns retention
     // (FR-021); the daemon only reports what the package declared about the entry it measured.
 
-    let (read_time_fingerprints, unhashed_paths) = state.read_time_fingerprints();
+    let (read_time_fingerprints, unhashed_paths) = build_observations(state);
 
     Ok(BundleArtifact {
         code: chunk.code.clone(),
+        graph_source_bytes: state.graph_source_bytes(),
         loaded_paths: state.sorted_loaded_paths(),
         read_time_fingerprints,
         unhashed_paths,
@@ -234,7 +272,8 @@ fn translate(
         exported_names: chunk.exports.iter().map(|name| name.to_string()).collect(),
         diagnostics,
         matched_side_effect_paths: Vec::new(),
-        uncounted_assets: uncounted,
+        assets: state.sorted_assets(),
+        emitted_assets: emitted,
     })
 }
 
@@ -261,48 +300,56 @@ fn single_chunk(
         }
     }
     if chunks.len() != 1 {
-        return Err(BundleFailure {
-            stage: stage::OUTPUT_SHAPE.to_owned(),
-            message: format!(
+        let mut diagnostics = contract_diagnostics(&output.warnings);
+        let asset_io = asset_io_diagnostic(state);
+        diagnostics.extend(asset_io.clone());
+        let message = asset_io.map_or_else(
+            || {
+                format!(
                 "expected exactly one JavaScript chunk, got {}; a split graph cannot be measured \
                  from one chunk without under-reporting the rest",
                 chunks.len()
-            ),
-            diagnostics: contract_diagnostics(&output.warnings),
+                )
+            },
+            |diagnostic| diagnostic.message,
+        );
+        return Err(BundleFailure {
+            stage: if state.failed_asset_paths().is_empty() {
+                stage::OUTPUT_SHAPE.to_owned()
+            } else {
+                stage::ASSET_IO.to_owned()
+            },
+            message,
+            diagnostics,
             loaded_paths: state.sorted_loaded_paths(),
-            read_time_fingerprints: Vec::new(),
+            read_time_fingerprints: build_observations(state).0,
         });
     }
     Ok(chunks.remove(0))
 }
 
-/// Every byte this build knows about and did NOT count, named and totalled.
+/// Bytes this build knows about that it cannot process, named and totalled.
 ///
-/// Two sources, because there are two ways a non-JS byte can exist here. The stylesheets the graph
-/// imported, which the plugin linked as empty modules (Rolldown 1.1.5 cannot bundle CSS: left to
-/// it, the whole build fails at the LINK stage). And anything Rolldown itself emitted beside the
-/// chunk — **nothing does today**, CSS included, but the output-shape guard no longer treats one as
-/// fatal, so it must not be silent either.
+/// The stylesheets, wasm and fonts the graph imported are NOT here: the plugin classifies them and
+/// the pipeline processes them the way they ship and counts them (B2). What is left is anything
+/// **Rolldown itself emitted** beside the chunk — nothing does today, CSS included, but the
+/// output-shape guard no longer treats one as fatal, so it must not be silent either. There is no
+/// file on disk behind an emitted asset to run a processor over, so it is disclosed, not counted.
 ///
-/// These bytes ship with the package and are not in the reported size, so the user is owed the
-/// number. See [`diagnostic_stage::UNCOUNTED_ASSETS`] for why disclosing them costs the result its
-/// High confidence rather than being exempted.
-fn uncounted_assets(output: &rolldown::BundleOutput, state: &BuildState) -> Vec<UncountedAsset> {
-    let mut assets = state
-        .sorted_uncounted_assets()
-        .into_iter()
-        .map(|(path, bytes)| UncountedAsset { path, bytes })
-        .collect::<Vec<_>>();
-
-    assets.extend(output.assets.iter().filter_map(|item| match item {
-        Output::Asset(asset) => Some(UncountedAsset {
-            path: PathBuf::from(asset.filename.to_string()),
-            bytes: asset.source.as_bytes().len() as u64,
-        }),
-        Output::Chunk(_) => None,
-    }));
-
-    assets
+/// See [`diagnostic_stage::UNCOUNTED_ASSETS`] for why disclosing bytes costs the result its High
+/// confidence rather than being exempted.
+fn emitted_assets(output: &rolldown::BundleOutput) -> Vec<UncountedAsset> {
+    output
+        .assets
+        .iter()
+        .filter_map(|item| match item {
+            Output::Asset(asset) => Some(UncountedAsset {
+                path: PathBuf::from(asset.filename.to_string()),
+                bytes: asset.source.as_bytes().len() as u64,
+            }),
+            Output::Chunk(_) => None,
+        })
+        .collect()
 }
 
 fn uncounted_assets_diagnostic(assets: &[UncountedAsset]) -> Option<ImportDiagnostic> {
@@ -310,27 +357,9 @@ fn uncounted_assets_diagnostic(assets: &[UncountedAsset]) -> Option<ImportDiagno
         return None;
     }
 
-    let total_bytes: u64 = assets.iter().map(|asset| asset.bytes).sum();
-    let names = assets
-        .iter()
-        .map(|asset| {
-            asset
-                .path
-                .file_name()
-                .unwrap_or(asset.path.as_os_str())
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
     Some(ImportDiagnostic {
         stage: diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
-        message: format!(
-            "package ships {} non-JavaScript asset(s) totalling {total_bytes} bytes that this \
-             size does NOT include: {names}",
-            assets.len()
-        ),
+        message: super::uncounted_assets_message(assets),
     })
 }
 
@@ -340,7 +369,7 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
     // contain is the module that failed to parse — which is precisely the one a cached failure has
     // to expire against. The read-time map is populated in `load`, before Rolldown parses anything,
     // so it has every module whose bytes this build actually read.
-    let (read_time_fingerprints, _) = state.read_time_fingerprints();
+    let (read_time_fingerprints, _) = build_observations(state);
     // A breach preempts every diagnostic below, and the ranking agrees: `MODULE_GRAPH_LIMIT` is the
     // first deterministic stage in `engine::stage`, because a blown graph limit is a fact about the
     // WHOLE build — it was too big to complete — and not about any one module in it. The two used to
@@ -362,6 +391,24 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
         };
     }
 
+    // BELOW the breach, deliberately. An unreadable asset input is request-local and says "retry
+    // after the filesystem settles"; a blown graph limit is a permanent fact about the package. When
+    // both are true the breach is the answer, because reporting the transient one erases a DURABLE
+    // stage: `ASSET_IO` is absent from `DURABLE_RESULT_STAGES` while `MODULE_GRAPH_LIMIT` is in it,
+    // so the mislabel also refuses the failure from every cache and rebuilds the oversized graph on
+    // every keystroke. This arm used to sit above the breach and did exactly that.
+    if let Some(asset_io) = asset_io_diagnostic(state) {
+        let mut diagnostics = contract_diagnostics(&diagnostics);
+        diagnostics.push(asset_io.clone());
+        return BundleFailure {
+            stage: stage::ASSET_IO.to_owned(),
+            message: asset_io.message,
+            diagnostics,
+            loaded_paths,
+            read_time_fingerprints,
+        };
+    }
+
     // THE EARLIEST STAGE PRESENT, not the first diagnostic in the vector. Rolldown accumulates
     // these from module tasks it runs concurrently, so their order is a race — and this stage is
     // what the user sees (ADR-0006: a failed build has no size, so the stage is the whole answer)
@@ -372,6 +419,7 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
         .map(stage_for)
         .min_by_key(|candidate| stage::rank(candidate))
         .unwrap_or(stage::LINK);
+    let (read_time_fingerprints, _) = build_observations(state);
     // Rendered from the SAME ordering, for the same reason: the message and the diagnostic list are
     // durable values too, and a message whose lines are shuffled by task timing is a different
     // cached answer for unchanged bytes.
@@ -452,4 +500,58 @@ fn contract_diagnostics(diagnostics: &[BuildDiagnostic]) -> Vec<ImportDiagnostic
             .then_with(|| left.message.cmp(&right.message))
     });
     contract
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::plugin::BuildState;
+
+    /// A missing optional asset says "retry after the filesystem settles"; a blown graph limit is a
+    /// permanent fact about the package. When both are recorded, the breach has to win.
+    ///
+    /// Reporting the transient one instead does two things, and the second is the expensive one:
+    /// the user is told to retry a condition that will never change, and — because `asset_io` is
+    /// absent from `DURABLE_RESULT_STAGES` while `module_graph_limit` is in it — the failure is
+    /// refused by every durable store, so the oversized graph is rebuilt on every keystroke.
+    ///
+    /// This is a Guard: the asset arm was once inserted ABOVE the breach, contradicting the ordering
+    /// comment in this very file. Re-inserting it there turns this red.
+    #[test]
+    fn a_durable_breach_outranks_a_transient_asset_read_failure() {
+        let state = BuildState::default();
+        state.record_failed_asset_input(PathBuf::from("/pkg/optional.css"));
+        state.record_breach("module graph exceeds the 2000 internal module limit");
+
+        let failure = classify_failure(Vec::new(), &state);
+
+        assert_eq!(
+            failure.stage,
+            stage::MODULE_GRAPH_LIMIT,
+            "a permanent property of the package must not be reported as a transient read: {failure:?}"
+        );
+        assert!(
+            failure.message.contains("2000 internal module limit"),
+            "the breach's own message is the answer, not the asset retry text: {failure:?}"
+        );
+        assert!(
+            crate::pipeline::stage::may_enter_a_durable_store(&failure.stage),
+            "a deterministic breach must stay cacheable so the graph is not rebuilt every request"
+        );
+    }
+
+    /// The converse, so the guard above cannot be satisfied by simply never reporting `asset_io`.
+    #[test]
+    fn a_transient_asset_read_failure_still_wins_when_no_breach_was_recorded() {
+        let state = BuildState::default();
+        state.record_failed_asset_input(PathBuf::from("/pkg/optional.css"));
+
+        let failure = classify_failure(Vec::new(), &state);
+
+        assert_eq!(failure.stage, stage::ASSET_IO, "{failure:?}");
+        assert!(
+            !crate::pipeline::stage::may_enter_a_durable_store(&failure.stage),
+            "a filesystem moment must not be cached as a package fact"
+        );
+    }
 }

@@ -132,8 +132,8 @@ test("runImportLensCheck refuses a verdict when an import could not be measured"
   );
   assert.notEqual(EXIT_COULD_NOT_MEASURE, EXIT_BUDGET_EXCEEDED);
   assert.deepEqual(output, [
-    "src/app.ts: an import that belongs in this file's total was not measured, so the number is a floor and not the file's size (1 unmeasured import; stage: timeout) - budget not evaluated",
-    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+    "src/app.ts: bytes that belong in this file's total were not measured, so the number is a floor and not the file's size (1 unmeasured import; stage: timeout) - budget not evaluated",
+    "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
   ]);
 });
 
@@ -164,7 +164,7 @@ test("a transient import failure does not make a sound file total a floor", asyn
   assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
   assert.deepEqual(output, [
     "src/app.ts: could not measure 1 import (stage: timeout) - budgets not evaluated",
-    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+    "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
   ]);
 });
 
@@ -202,8 +202,8 @@ test("runImportLensCheck refuses a verdict for a deterministically unmeasurable 
   );
   assert.deepEqual(output, [
     "src/measured.ts: large-lib Brotli budget exceeded: 1.5 kB > 1.0 kB",
-    "src/app.ts: an import that belongs in this file's total was not measured, so the number is a floor and not the file's size - budget not evaluated",
-    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+    "src/app.ts: bytes that belong in this file's total were not measured, so the number is a floor and not the file's size - budget not evaluated",
+    "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
   ]);
 });
 
@@ -248,7 +248,7 @@ test("runImportLensCheck refuses a verdict when the file's own combined build fa
   );
   assert.deepEqual(output, [
     "src/app.ts: the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size - budget not evaluated",
-    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+    "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
   ]);
 });
 
@@ -256,8 +256,8 @@ test("runImportLensCheck refuses a verdict when the file's own combined build fa
 // OUT — the biggest build in the system hitting the daemon's deadline. The daemon then sets `degraded`
 // AND pushes the `timeout` stage into the aggregate's own diagnostics, while every import stays
 // Measured (`incomplete: false`). This is the shape the previous test skipped, with an empty
-// `diagnostics`. The transient stage on the aggregate must NOT add "and an import that belongs in it
-// was not measured either" to the line — that clause claims a missing contributor a timed-out combined
+// `diagnostics`. The transient stage on the aggregate must NOT add "and bytes that belong in it were
+// not measured either" to the line — that clause claims a missing contributor a timed-out combined
 // build does not have. The timeout is the combined build's OWN failure, which `degraded` already says.
 test("runImportLensCheck names a timed-out combined build a Combined Import Cost, without a false missing-import clause", async () => {
   const output = [];
@@ -284,8 +284,114 @@ test("runImportLensCheck names a timed-out combined build a Combined Import Cost
   assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
   assert.deepEqual(output, [
     "src/app.ts: the file's combined build failed, so the number is an un-deduplicated sum of its imports and not the file's size - budget not evaluated",
-    "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+    "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
   ]);
+});
+
+test("a measured request-local asset floor produces no CLI import-budget verdict", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "importlens-cli-asset-floor-"));
+  const filePath = path.join(workspace, "app.ts");
+  writeFileSync(filePath, "import 'asset-lib';\n");
+  const daemon = {
+    request: async () => ({
+      request_id: 1,
+      brotli_bytes: 900,
+      error: null,
+      incomplete: false,
+      degraded: false,
+      diagnostics: [],
+      imports: [
+        {
+          specifier: "asset-lib",
+          brotli_bytes: 1500,
+          diagnostics: [{ stage: "asset_io", message: "read failed", details: [] }],
+        },
+      ],
+    }),
+  };
+
+  try {
+    const analyzedFile = await analyzeFileWithDaemon(filePath, workspace, daemon);
+    assert.deepEqual(
+      analyzedFile.imports,
+      [],
+      "a measured floor must not reach the list that can produce an import verdict",
+    );
+    assert.deepEqual(analyzedFile.unmeasured, [
+      { specifier: "asset-lib", stage: "asset_io", transient: true },
+    ]);
+
+    const output = [];
+    const exitCode = await runImportLensCheck({
+      cwd: workspace,
+      budgets: { perImportBrotliBytes: 1000, perFileBrotliBytes: 2000 },
+      changedFiles: async () => ["app.ts"],
+      analyzeFile: async () => analyzedFile,
+      writeLine: (line) => output.push(line),
+    });
+
+    assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
+    assert.deepEqual(output, [
+      "app.ts: could not measure 1 import (stage: asset_io) - budgets not evaluated",
+      "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
+    ]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("an imprecise asset upper bound produces no CLI budget verdict", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "importlens-cli-imprecise-assets-"));
+  const filePath = path.join(workspace, "app.ts");
+  writeFileSync(filePath, "import 'asset-lib';\n");
+  const diagnostic = {
+    stage: "imprecise_assets",
+    message: "stylesheets were measured separately, so this size may read high",
+    details: [],
+  };
+  const daemon = {
+    request: async () => ({
+      request_id: 1,
+      brotli_bytes: 2500,
+      error: null,
+      incomplete: false,
+      degraded: false,
+      diagnostics: [diagnostic],
+      imports: [
+        {
+          specifier: "asset-lib",
+          brotli_bytes: 2500,
+          diagnostics: [diagnostic],
+        },
+      ],
+    }),
+  };
+
+  try {
+    const analyzedFile = await analyzeFileWithDaemon(filePath, workspace, daemon);
+    assert.deepEqual(
+      analyzedFile.imports,
+      [],
+      "the upper bound must not reach the list that can produce an import verdict",
+    );
+
+    const output = [];
+    const exitCode = await runImportLensCheck({
+      cwd: workspace,
+      budgets: { perImportBrotliBytes: 1000, perFileBrotliBytes: 1000 },
+      changedFiles: async () => ["app.ts"],
+      analyzeFile: async () => analyzedFile,
+      writeLine: (line) => output.push(line),
+    });
+
+    assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
+    assert.deepEqual(output, [
+      "app.ts: asset processing produced a disclosed upper bound, so budgets were not evaluated",
+      "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
+    ]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 // One file whose AGGREGATE failed outright (`error: Some` — no bytes at all) used to throw out of
@@ -352,7 +458,7 @@ test("analyzeFileWithDaemon reports a failed aggregate instead of aborting the r
     assert.deepEqual(output, [
       "measured.ts: large-lib Brotli budget exceeded: 1.5 kB > 1.0 kB",
       "broken.ts: could not measure this file (no import could be sized conservatively) - budget not evaluated",
-      "Import Lens could not measure every changed file; those files' budgets were NOT evaluated. This is not a regression. A transient stage (timeout/panic/engine_gone) may pass on a re-run; any other cause is a package this build cannot measure, and it will not.",
+      "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",
     ]);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
@@ -383,6 +489,28 @@ test("isUsableFileSize refuses every shape that is not this file's size", () => 
     isUsableFileSize(response({ diagnostics: [{ stage: "timeout", message: "x", details: [] }] })),
     false,
     "a transient stage on the aggregate's own diagnostics",
+  );
+  assert.equal(
+    isUsableFileSize(
+      response({ diagnostics: [{ stage: "asset_io", message: "read failed", details: [] }] }),
+    ),
+    false,
+    "an asset-read floor must not produce a CI verdict",
+  );
+  assert.equal(
+    isUsableFileSize(
+      response({
+        diagnostics: [
+          {
+            stage: "imprecise_assets",
+            message: "stylesheets were measured separately",
+            details: [],
+          },
+        ],
+      }),
+    ),
+    false,
+    "a disclosed asset upper bound must not produce a false CI failure",
   );
   // A DETERMINISTIC stage on the aggregate is not, by itself, a reason to refuse: a `types_only`
   // diagnostic rides on a perfectly complete total. `degraded` is what says the build failed.

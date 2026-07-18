@@ -165,7 +165,14 @@ const allowed = new Set([
   "extension/src/ui/cacheManagerItems.ts#cacheManagerActionItems.totalBytes",
   // The bytes of ONE build: the uncounted assets a single package ships, and the source bytes of a
   // single module graph measured against the graph-source limit (FR-018a).
+  //
+  // There are two `uncounted_assets_diagnostic`s because there are two ways an asset can go
+  // uncounted, and each names the bytes of ONE package: `adapter.rs` for an asset Rolldown itself
+  // emitted (no file behind it to process), and `assets.rs` for one the pipeline could not process
+  // and fell back to disclosing (B2). Neither sums across imports, which is the only thing ADR-0004
+  // forbids.
   "daemon/src/engine/adapter.rs#uncounted_assets_diagnostic.total_bytes",
+  "daemon/src/pipeline/assets.rs#uncounted_assets_diagnostic.total_bytes",
   "daemon/src/engine/plugin.rs#module_parsed.total_bytes",
 ]);
 

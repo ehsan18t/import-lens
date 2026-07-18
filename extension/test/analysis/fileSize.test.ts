@@ -97,7 +97,7 @@ test("a cold document reports the size the daemon measured, named as the floor i
   assert.deepEqual(report, {
     kind: "summary",
     message:
-      "File Cost floor: 1.5 kB br · 5.3 kB min · 2 imports · an import that belongs in this file's total was not measured, so the number is a floor and not the file's size",
+      "File Cost floor: 1.5 kB br · 5.3 kB min · 2 imports · bytes that belong in this file's total were not measured, so the number is a floor and not the file's size",
   });
 });
 
@@ -155,4 +155,70 @@ test("a measured total is compared against the file's previous measurement", () 
     kind: "summary",
     message: "File Cost: 1.5 kB br · 5.3 kB min · 2 imports · +300 B br vs previous",
   });
+});
+
+/**
+ * The file headline includes stylesheet, wasm and font bytes, and until this it had no way to say
+ * so — a status-bar number that changed meaning with no surface able to explain it.
+ *
+ * The rows are quoted in the SAME compression as the headline. A gzip row beside a brotli headline
+ * is a number the reader cannot reconcile with the one above it, which is worse than saying nothing.
+ */
+test("the file summary names what share of the number is not JavaScript", () => {
+  const withAssets = response({
+    asset_breakdown: [
+      {
+        kind: "css",
+        raw_bytes: 900,
+        minified_bytes: 700,
+        gzip_bytes: 400,
+        brotli_bytes: 300,
+        zstd_bytes: 350,
+      },
+      {
+        kind: "font",
+        raw_bytes: 8000,
+        minified_bytes: 8000,
+        gzip_bytes: 7900,
+        brotli_bytes: 7800,
+        zstd_bytes: 7850,
+      },
+    ],
+  });
+
+  assert.equal(
+    formatCurrentFileSizeSummary(withAssets, "brotli"),
+    "File Cost: 1.5 kB br · 5.3 kB min · 2 imports · CSS 300 B · Fonts 7.8 kB",
+  );
+  assert.equal(
+    formatCurrentFileSizeSummary(withAssets, "gzip"),
+    "File Cost: 1.8 kB gz · 5.3 kB min · 2 imports · CSS 400 B · Fonts 7.9 kB",
+  );
+});
+
+/** A daemon that predates the field, and a package with no assets, must both render nothing rather
+ * than a bare "0 B" that reads as a measurement of something. */
+test("a file with no asset weight says nothing about assets", () => {
+  assert.equal(
+    formatCurrentFileSizeSummary(response(), "brotli"),
+    "File Cost: 1.5 kB br · 5.3 kB min · 2 imports",
+  );
+  assert.equal(
+    formatCurrentFileSizeSummary(
+      response({
+        asset_breakdown: [
+          {
+            kind: "css",
+            raw_bytes: 0,
+            minified_bytes: 0,
+            gzip_bytes: 0,
+            brotli_bytes: 0,
+            zstd_bytes: 0,
+          },
+        ],
+      }),
+      "brotli",
+    ),
+    "File Cost: 1.5 kB br · 5.3 kB min · 2 imports",
+  );
 });

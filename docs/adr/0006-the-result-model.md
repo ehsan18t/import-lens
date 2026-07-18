@@ -9,12 +9,14 @@ result's *type*, not from a convention a reader has to know:
 | **Loading** | none *yet* | A build is in flight. The response did not wait for it. |
 | **Unmeasured** | none *ever* | The build could not answer. Carries a **stage**. |
 
-**Unmeasured splits by cause**, and this distinction is the whole point:
+**Durability splits by cause**, and this distinction is the whole point:
 
 - **Deterministic** — `parse`, `link`, `missing_export`, `ambiguous_export`, `output_shape`,
   `module_graph_limit`. A property of the package's **bytes**. Same input, same outcome.
-- **Transient** — `panic`, `timeout`, `engine_gone`. A property of **this moment's
-  scheduling**. It says nothing at all about the package.
+- **Request-local** — `panic`, `timeout`, `engine_gone`, `entry_metadata`, `asset_io`,
+  `compression`. A property of **this moment's scheduling, filesystem, or machine**. It says
+  nothing reusable about the package. `asset_io`/`compression` can ride a measured partial asset
+  size, so this classification is not limited to Unmeasured results.
 
 ## Why this ADR exists
 
@@ -45,12 +47,14 @@ fabricated size, silently passing, so the regression merges.
 2. **The question a consumer asks is "is there a size?"** — an `Option`, enforced by the
    compiler and by the type system on the wire. **Never "is there an error?"** Invariant 1 is
    what makes this safe: a degraded result has no size to misuse.
-3. **A transient outcome may never enter a durable store.** Durable means: the L1 and L2
+3. **A request-local outcome may never enter a durable store.** Durable means: the L1 and L2
    caches, every memo, the extension's `workspaceState` and `globalState` histories, and **any
    pass/fail verdict**. A deterministic outcome **may** be cached — it is a property of the
    bytes, and the cache is already keyed by those bytes' fingerprints, so it expires exactly
    when the answer would change. Not caching it would re-enter the engine for a broken package
-   on every analysis, forever, burning one of only two permits.
+   on every analysis, forever, burning one of only two permits. Cacheability is necessary but not
+   sufficient for a verdict: a deterministic `imprecise_assets` upper bound is reusable and worth
+   showing, but it is not precise enough to pass or fail a threshold.
 4. **An aggregate is only as sound as its own build, and — when it has no build — only as
    complete as its inputs.**
 
@@ -61,6 +65,10 @@ fabricated size, silently passing, so the regression merges.
      is still Loading. On a cold document that is the normal case, and it is not a floor.
      *(An earlier draft of this ADR said any Loading contributor made the total a floor. That was
      wrong: it would flag every cold document, and taking it literally caused a regression.)*
+     Success of the JavaScript build is not success of every asset, however: a combined result
+     carrying `uncounted_assets` is a measured lower bound whose supported missing bytes set
+     `incomplete`. A separately processed CSS set carrying only `imprecise_assets` is an over-count,
+     not this missing-byte shape.
    - **If the combined build FAILS**, what remains is a **sum of per-import costs** — which
      [ADR-0004](0004-import-lens-measures-imports-not-bundles.md) says is a **different quantity**
      (a Combined Import Cost), because it counts a shared module twice. It must never be presented
@@ -75,8 +83,12 @@ fabricated size, silently passing, so the regression merges.
    does, every contributor is still perfectly Measured, so a check that inspects only the
    contributors sees nothing wrong. And a **types-only** import resolves to "no entry" *by design*
    and is **Measured** (a genuine zero); it is not a gap, and must not flag anything.
-5. **No verdict from a floor.** A budget is never judged against an incomplete number — not
-   "pass", not "fail". *"Not evaluated."* And **a gate that cannot measure must never report
+5. **No verdict from a floor or an upper bound.** A budget is never judged against an incomplete number — whether
+   incompleteness is a wire flag (including deterministic `uncounted_assets`) or an
+   `asset_io`/`compression` disclosure — not
+   "pass", not "fail". A disclosed `imprecise_assets` result is the opposite error: separately
+   processed stylesheets can make it read high, so it can falsely fail a budget. It is also *not
+   evaluated* while remaining cacheable. And **a gate that cannot measure must never report
    success**: `importlens check` exits non-zero with a distinct code, so a flaky CI box is
    diagnosable and is never confused with a genuine regression. A silent pass is the worst
    outcome available, because it merges the regression.
@@ -96,14 +108,15 @@ fabricated size, silently passing, so the regression merges.
   - **an allowlist, not a denylist**: a stage that nobody has classified is *refused* entry to a
     durable store. Forgetting then costs a rebuild, not a permanently wrong answer.
 
-### A size and a transient stage together are NOT unrepresentable — and must not be
+### A size and a request-local stage together are NOT unrepresentable — and must not be
 
 An earlier draft of this ADR demanded that shape be made impossible in the type system. **That
-was wrong, and it is retracted.** The shape is real and load-bearing: a measurement can succeed
-while the *full-package comparison* build beside it fails transiently. The sizes are genuine;
-what is untrustworthy is `truly_treeshakeable`, and the transient diagnostic is **the only
-evidence of that**. Making the shape unrepresentable would delete the very signal that says the
-badge is fabricated — sacrificing a real state to satisfy a slogan.
+was wrong, and it is retracted.** The shape is real and load-bearing. A primary measurement can
+succeed while the *full-package comparison* fails, leaving an untrustworthy
+`truly_treeshakeable`; or asset processing can retain the measured portion while an input read or
+compressor fails, leaving a disclosed floor. In both cases the request-local diagnostic is the
+only evidence that the numeric result must not become durable. Making the shape unrepresentable
+would delete the signal the stores and budget gates need.
 
 Nor could a type enforce it: `diagnostics` is an open list whose `stage` is a string.
 
