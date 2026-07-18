@@ -24,6 +24,11 @@ export const COMMIT_TYPES = [
   "chore",
   "ci",
   "build",
+  // Undoing a change that shipped. It is its own type because it is its own EVENT: a reader
+  // scanning history wants to see that something was taken back, and labelling it `fix` hides
+  // that. The PASSTHROUGH below only covers git's own machine-generated `Revert "..."` subject,
+  // which carries no scope and no explanation of why the revert was right.
+  "revert",
 ];
 
 const HEADER_MAX = 72;

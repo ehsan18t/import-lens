@@ -30,6 +30,9 @@ commit_parsers = [
   { message = "^perf", group = "<!-- 2 -->Performance" },
   { message = "^docs", group = "<!-- 3 -->Documentation" },
   { message = "^refactor", group = "<!-- 4 -->Refactoring" },
+  # Reverts are user-visible: something that shipped no longer behaves that way, and a reader of the
+  # changelog needs to see it as plainly as the change that introduced it.
+  { message = "^revert", group = "<!-- 5 -->Reverts" },
   { message = "^style", skip = true },
   { message = "^test", skip = true },
   { message = "^chore", skip = true },
