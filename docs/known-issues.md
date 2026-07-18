@@ -11,6 +11,17 @@ fixed before release. A **Deferred** item is worth doing and should become a tas
 are content to leave. Every entry states what actually happens and why it is treated the way it is. An entry
 with no failure scenario is a rumour, and a rumour in a tracker is worse than nothing.
 
+**Delete an entry when it is fixed.** This file answers one question — what is wrong with the product right
+now, and what did we decide about it — and every resolved entry left in place makes that question harder to
+answer. Fixing something and writing a paragraph about the fix here grows the file forever and buries the
+things that are still true. When an issue is resolved, cut the entry and add one row to
+[Resolved](#resolved); the behaviour belongs in the SRS, the reasoning in the commit, and the guarantee in
+the test.
+
+A decision **not** to fix is not a resolution. An Accepted or Deferred entry stays, in full, because it is
+still true of the product — and so does a documented decline, which exists to stop the same dangerous change
+being attempted twice.
+
 ### The bar that decides a blocker
 
 > Fix it before release only if it (a) shows the user a WRONG NUMBER, or (b) can WEDGE the system or lose
@@ -28,7 +39,7 @@ while eleven plan tasks sat untouched. "Real" was never the right bar.
 | **Accepted** | We know, we are not fixing it, and we are content. Revisit only if the blast radius changes. |
 | **Watch** | Not a defect today. Becomes one if some condition changes. |
 | **Unverified** | Shipped without the review we normally require. Not known to be wrong. |
-| **Resolved** | Fixed. Kept for history. |
+| **Resolved** | Fixed. The entry is **deleted** and collapses to one row in [Resolved](#resolved). |
 
 ---
 
@@ -258,58 +269,6 @@ does not cover `@import` children, since they are never graph modules. No real p
 enough for that to matter, and a tree that breaches the budget is refused rather than mismeasured, so this is
 recorded as a property of the bound rather than treated as a hole in it.
 
-### D11: An asset the daemon could not read is disclosed, and that disclosure is cached
-**Status: Resolved 2026-07-18** · Request-local asset failures never enter durable stores · Found by the B2 branch review
-
-Wasm and font bytes are read from disk after the build. A read that fails for a reason that has nothing to do
-with the package, an antivirus scanner holding the file, or a concurrent `pnpm install` replacing it, puts that
-asset in the uncounted list: its bytes leave the number, a diagnostic says so, and confidence drops to Medium.
-That part is correct and is exactly the pre-B2 floor.
-
-The durable `uncounted_assets` disclosure remains correct for deterministic processor limits, such as a syntax
-the CSS pipeline cannot accept. The fix gives request-local causes a second, typed stage instead of trying to
-infer durability from the disclosure or from `io::ErrorKind`:
-
-- the engine plugin observes supported asset-looking resolution through Rolldown's self-skipping configured
-  resolver, so browser aliases remain intact and a target that vanishes cannot become a durable-looking
-  `resolve` failure;
-- every direct or CSS-dependency metadata/read failure retains an unverifiable fingerprint and emits
-  `asset_io`; the observation stays sticky even if a later CSS retry succeeds;
-- CSS, font, and wasm compressor failures emit `compression`, and a CSS compressor failure no longer triggers
-  the structurally unrelated per-sheet retry;
-- the daemon caches and build memos, extension histories and budgets, workspace report, and standalone CLI all
-  refuse those request-local stages. The persisted history keys moved to v2 because old rows carry no stage
-  metadata with which to distinguish a pre-fix floor;
-- analyzer revision `rolldown-1.1.x+8` makes pre-fix daemon cache entries unreachable.
-
-Focused regressions cover direct-asset recovery followed by a healthy cache hit, missing CSS-child recovery,
-injected CSS/binary compressor failures, every durable-store boundary, histories, editor/report budgets, and a
-CLI run whose File Cost is clean while its per-import asset result is request-local.
-
-### D12: A file total that omits an asset is not structurally flagged as a floor
-**Status: Resolved 2026-07-18** · Omitted supported assets now make File Cost a structural floor · Found by the B2 branch review
-
-`uncounted_assets` has one meaning: supported bytes that ship are absent from the five reported sizes. The
-aggregate now carries that fact structurally on both routes that can produce its number:
-
-- after a successful combined build, processor fallbacks and any future Rolldown-emitted assets set
-  `incomplete: true` before their measured JavaScript/healthy-asset floor is returned;
-- after a combined-build fallback, a measured per-import result carrying `uncounted_assets` still contributes
-  its known bytes but marks the fallback short and preserves the affected specifier in diagnostics;
-- `imprecise_assets` alone does not set `incomplete`: the accepted per-sheet CSS degradation reads high but
-  does not omit the stylesheets.
-
-The existing File Cost gates then refuse the floor from the L1 aggregate cache, persisted bundle-impact
-history, editor file budget, and CLI verdict. Deterministic per-import fallbacks remain reusable, so the import
-cache still avoids rebuilding a broken package forever; only the aggregate that is not the file's complete
-cost is refused. Bundle-impact history moved to v3 because v2 rows have no quality metadata and can contain
-pre-fix deterministic asset floors.
-
-Regressions cover a real invalid-SCSS combined build, the per-import fallback route, the imprecise-overcount
-control, wire propagation, cache refusal, and recovery after only the stylesheet is repaired. This deliberately
-broadens D4: until a fingerprinted aggregate-failure memo exists, a file with a deterministic uncounted asset
-recomputes its combined File Cost rather than caching a floor as a measurement.
-
 ### D13: An image referenced from counted CSS is disclosed, not counted
 **Status: Accepted scope** · Decided 2026-07-18 while fixing the silent-drop defect
 
@@ -397,19 +356,6 @@ It would also cost accuracy. A monorepo package legitimately referencing a share
 is a real shape, and a containment check would stop counting bytes that genuinely ship — turning a
 correct number into a floor to prevent something that is not a defect.
 
-### D20: Nested rayon inside the asset pool does not widen its admission
-**Status: Investigated and retired 2026-07-18** · Raised as a guess by the B2 branch review
-
-`compress.rs` calls `rayon::join`, and Lightning CSS uses rayon internally, both INSIDE the two-thread asset
-pool. The review flagged — explicitly as a guess, with no failing case — that a worker blocked in a join might
-steal a sibling job's task and let real concurrency exceed the permit count, spending one job's eight-second
-deadline on another's work.
-
-Answered by a property test rather than by argument: offer four times as many jobs as there are permits, have
-each one park inside a `rayon::join` while holding its slot, and record the peak number executing at once. The
-peak never exceeds the permit count. The existing concurrency test covers the same invariant for plain jobs;
-this one adds the nested-rayon dimension, which is the part that was in doubt.
-
 ### D19: The per-sheet retry is bounded, not free
 **Status: Accepted bound** · Measured 2026-07-18
 
@@ -421,79 +367,6 @@ Recorded rather than fixed because the bound already exists and adding a second 
 for zero-byte operations would be more machinery than the risk justifies. The per-attempt snapshot
 copy that made retries quadratic **was** fixed: the ledger is now consulted one path at a time
 instead of being cloned per attempt.
-
-### D15: `shared_bytes` explains JavaScript sharing only
-**Status: RESOLVED 2026-07-18** · Raised by the 2026-07-18 asset review (A8)
-
-File Cost deduplicates a stylesheet shared by several imports, but `shared_modules`/`duplicate_imports` are
-built from JS-graph module contributions and cannot see assets. So a UI kit imported from twenty files
-contributes its stylesheet twenty times to Combined Import Cost with nothing saying those twenty are one file,
-and a user can see a gap between Combined Import Cost and File Cost with no asset-sharing explanation.
-
-Fixed by emitting each directly imported asset as a `ModuleContribution` alongside the JavaScript modules. A
-stylesheet links as an EMPTY module, so its rendered length is zero and the JS contribution walk dropped it —
-which is the same root cause behind the top-module list summing to a fraction of its own headline. Both close
-together: `annotate_shared_bytes` unions on (runtime, contribution path) and now sees the sheet, so a stylesheet
-two imports pull is counted as shared weight, while a Server and a Client import still share nothing because a
-runtime is an artifact boundary (ADR-0005).
-
-No wire change was needed and none was made. The rows travel in `internal_contributions`, which is
-`#[serde(skip)]` on the wire and carried explicitly by the L2 envelope for exactly this reason, so a cached
-result shares identically to a freshly measured one.
-
-### D16: Asset composition reaches only the hover
-**Status: RESOLVED 2026-07-18** · Raised by the 2026-07-18 asset review (A6/A7)
-
-`asset_breakdown` has one consumer: the import hover. `FileSizeDocumentResponse` carries no breakdown at all,
-so the status bar and "Show Current File Size" headline include asset bytes without any surface saying so. The
-extension also has no rendering for "this number is a disclosed upper bound", a sentence the CLI has verbatim —
-so an `imprecise_assets` File Cost silently returns `not-evaluated` from its budget with nothing explaining
-why. Relatedly, `module_breakdown` derives from JS rendered bytes, so a CSS-dominant package's "top modules"
-list sums to a fraction of the headline beside it.
-
-Fixed in three parts, all of which were one missing idea: a number that changed meaning had no way to explain
-itself.
-
-`FileSizeDocumentResponse` now carries `asset_breakdown`, summed per kind across runtime groups, with a
-degraded group's per-import fallback contributing its rows too — so the file total says what it is made of
-exactly when it is hardest to read. The summary line renders those rows in the SAME compression as the headline
-it sits beside, since a gzip row under a brotli headline cannot be reconciled with the number above it.
-
-`fileCostQuality` gained a third axis, `imprecise`, so the extension can finally say "File Cost upper bound" and
-print the sentence the CLI already had. The property test behind it was re-pinned from durability to
-**budgetability**, which is what its own doc comment always described: the two predicates agree everywhere
-except `imprecise_assets`, and that one input is precisely where an upper bound was being named a plain File
-Cost while the budget declined to judge it.
-
-The top-module reconciliation is fixed by the same change as D15 — assets are module contributions now, so a
-CSS-dominant package's breakdown adds up to its own headline.
-
-### D17: A per-import floor can still be compared against a budget
-**Status: RESOLVED 2026-07-18 — the SPEC moved, the code was right** · Raised by the 2026-07-18 asset review (A9)
-
-`NON_BUDGETABLE_RESULT_STAGES` contains only `imprecise_assets`, so a per-import result carrying a
-deterministic `uncounted_assets` floor is compared against `perImportBrotliBytes` on its JS-only bytes.
-
-The asymmetry is what keeps this off the fix-now list: budgeting a floor produces **false passes only, never
-false failures**. A floor F is at most the true cost T, so a violation fires only when F exceeds the limit,
-which forces T to exceed it too — every reported failure is true, and the only error is silence when
-F ≤ limit < T. Note this is the opposite of the hazard the list was built for: `protocol.rs` justifies
-non-budgetability as "comparing it with a threshold can produce a false failure", which is the over-count
-shape and does not apply to a floor at all. The list was never asked the under-count question.
-
-The CI surfaces are independently closed: `incomplete` propagation makes `isUsableFileSize` reject the file, so
-`importlens check` returns `EXIT_COULD_NOT_MEASURE` rather than 0.
-
-**Resolved by moving the spec, because the "fix" would have made things worse.** Adding `uncounted_assets` to
-`NON_BUDGETABLE_RESULT_STAGES` would delete the "over budget" badge, the Problems-panel entry, and the report's
-violation row for a floor import — every one of which is reporting a TRUE violation, since F > limit forces
-T > limit. It would remove true positives and prevent no false ones. The only error a floor can cause is
-silence, and no change to the stage list can fix silence; you would need the number you do not have.
-
-So the code stays and FR-032a now states the asymmetry it was always relying on: a floor may be judged for
-violation but its silence is never a pass, while an upper bound may not be judged at all. The residual is
-recorded there too — the workspace report's `budgetViolationCount` holds no File Cost, so it counts only true
-violations, may under-count, and must never be read as proof a workspace is inside budget.
 
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
@@ -977,90 +850,24 @@ problem, the tuning simply did not pay off here.
 
 ---
 
-# Resolved and historical
+# Resolved
 
-Kept for the record.
+One line each, and deliberately no more. A fixed issue is not a known issue, and a tracker that keeps
+every fix forever stops being read. The detail lives where it belongs: the behaviour in the SRS, the
+reasoning in the commit that made the change, the guarantee in the test that holds it. What survives here is
+only the identifier, because code comments and older entries refer to these by name and a reference that
+resolves to nothing is worse than the bloat.
 
-### B2: The Import Cost ignored shipped non-JS asset bytes (CSS, wasm, fonts)
-**Status: Resolved (2026-07-17)** · Fixed by `fix(analysis): count a package's shipped CSS, wasm, and font bytes` · Design: [asset-counting-design.md](asset-counting-design.md) · Plan: [asset-counting-plan.md](asset-counting-plan.md)
-
-A package's real cost is not only its JavaScript. The engine measured the JS chunk and recorded a reachable
-stylesheet's raw bytes as an `uncounted_asset`, disclosed beside the result but never folded into the Import
-Cost and never processed as it would actually ship, so every CSS-shipping package undercounted.
-
-The load boundary now classifies each non-JavaScript module as a stylesheet, wasm, font, or passthrough and
-stubs the first three, so the JavaScript chunk still measures exactly. Every reachable stylesheet becomes one
-artifact via Lightning CSS, which resolves the `@import` tree and minifies it, mirroring how CSS ships and how
-the esbuild oracle emits a single sibling stylesheet; wasm and fonts are counted raw. Each artifact is
-compressed on its own and summed ([ADR-0005](adr/0005-a-runtime-is-an-artifact-boundary.md)), in both the
-single-import and the per-runtime File Cost paths. The result carries a per-kind `asset_breakdown` so the number
-is legible, and a stylesheet that processes cleanly no longer costs the package its confidence. Any processing
-failure falls back to the old raw-byte disclosure, so the result is a strict improvement or a tie, never a
-regression ([ADR-0006](adr/0006-the-result-model.md)). `ANALYZER_REVISION` moved to `rolldown-1.1.x+5`.
-
-Verified against the esbuild oracle on `@uiw/react-md-editor`, the only real package whose published ESM entry
-imports CSS: the minified totals agree within 1%, so both sides fold in the same stylesheet exactly once. The
-residual limits it left behind are D7, D8, and D9 below.
-
-### B1: An all-inline-`type` named import was measured as the whole package
-**Status: Resolved (2026-07-16)** · Fixed by `fix(daemon): stop sizing an all-inline-type import as the whole package`
-
-`import { type Config } from "tailwindcss";`, a braced import whose every specifier carried the inline `type`
-modifier, is erased by TypeScript to zero runtime cost, but was reported as an `import * as ...` namespace of
-the whole package and summed into the file's Combined Import Cost. oxc marks the specifier entry `is_type` while
-leaving the module request `is_type = false`, so the static-import loop dropped the entry and the
-`requested_modules` fallback resurrected the statement as a namespace. The loop now registers such a statement
-in `elided_statements` so the fallback cannot resurrect it; a regression test pins an all-inline-type import to
-zero detected runtime imports. `ANALYZER_REVISION` moved to `rolldown-1.1.x+4`.
-
-### B3: Native-binary-backed packages were mismeasured instead of labelled
-**Status: Resolved (2026-07-16)** · Fixed by `fix(analysis): label native-binary packages rather than mismeasure them`
-
-A package that ships a platform-specific native binary as `optionalDependencies` (Biome, the TypeScript 7
-native rewrite, esbuild) either showed a bare "unavailable" (no importable JS entry) or a confident,
-misleadingly tiny size for a JS shim (TypeScript 7's 113 byte version stub, measured at roughly 867 bytes). The
-daemon now detects the platform-suffixed `optionalDependencies` convention at the resolver boundary and labels
-rather than counts: a package with no importable JS entry is a measured zero with a "native binary only" badge;
-one whose entry resolves keeps its measured size with a "native binary" flag beside it. Requiring the manifest
-to declare no entry field keeps a broken install honestly "unavailable". `ANALYZER_REVISION` moved to
-`rolldown-1.1.x+4`.
-
-### K1: The `sideEffects` badge fix is invisible on a warm cache until `ANALYZER_REVISION` moves
-**Status: Resolved (2026-07-15)** · Task 14 bumped `ANALYZER_REVISION` to `rolldown-1.1.x+3`
-
-**What actually happened.** A user who analysed `react-loading-skeleton`, or any package declaring a
-`sideEffects` glob or `[]`, on a pre-fix daemon held a persisted entry that said `side_effects: true`,
-`truly_treeshakeable: false`, Medium. That is the exact wrong badge `8f607a0` and this commit exist to abolish,
-and they kept being served it.
-
-Nothing re-examines it. `ImportResult::is_durable()` is an insert-time gate: it decides what may enter a store,
-and a stored entry is never re-validated on read. The only thing that rejects an entry computed by older code
-is its `CacheIdentity.analyzer_version` (`ANALYZER_VERSION` = crate version plus `ANALYZER_REVISION`,
-`cache/key.rs`), which both stores check on read and which `purge_orphan_entries` sweeps on. The analyzer
-changed; the identity did not.
-
-**Why it was bumped once, not per fix.** `ANALYZER_REVISION` is bumped once for the whole bundler-redesign
-batch, by Task 14: bumping it per fix would throw every user's cache away several times over the branch, and
-the disk schema stays at 8 meanwhile.
-
-**Resolution.** Task 14 bumped `ANALYZER_REVISION` from `rolldown2` to `rolldown-1.1.x+3` (`cache/key.rs`),
-which lands with every measurement-affecting change on this branch. Every entry computed by the pre-fix daemon
-now fails the `analyzer_version` check on read and is re-measured, so the corrected badge reaches existing
-installs, not only brand-new caches. This was the hard dependency the whole batch of badge and size fixes rode
-on; it is discharged. (The B1 and B3 fixes bumped it again, to `rolldown-1.1.x+4`; B2 will bump it once more when it lands in its own pull request.)
-
-### U1: `a6cae06` did not get an adversarial review
-**Status: Resolved (2026-07-16)** · Covered by the module audit's D2 review
-
-The commit that hoists the alias resolver construction out of the per-specifier loop (a 7x interactive-path
-regression fix: 27.96 ms to 7.27 ms at 20 aliased imports) was dispatched without the independent verify pass
-every other commit on this branch received.
-
-It self-proved the property that matters (the sticky-floor test still goes red if the resolvers are
-re-memoised) and the full suite passes. It was recorded here because every other round on this branch had a
-Critical found by independent verification.
-
-**Resolution.** The 2026-07-16 whole-codebase module audit reviewed `resolver.rs` in full under the D2 module
-(finder plus a fresh adversarial verifier), which covers the a6cae06 change. No wrong-number or wedge defect
-was found in the resolver; the two D2 findings (R1, R2) are a badge-only issue and a non-reproducible ordering
-inconsistency, both recorded above.
+| ID | What it was | Fixed |
+| --- | --- | --- |
+| D11 | An asset the daemon could not read is disclosed, and that disclosure is cached | 2026-07-18 |
+| D12 | A file total that omits an asset is not structurally flagged as a floor | 2026-07-18 |
+| D20 | Nested rayon inside the asset pool does not widen its admission | 2026-07-18 |
+| D15 | `shared_bytes` explains JavaScript sharing only | 2026-07-18 |
+| D16 | Asset composition reaches only the hover | 2026-07-18 |
+| D17 | A per-import floor can still be compared against a budget | 2026-07-18 |
+| B2 | The Import Cost ignored shipped non-JS asset bytes (CSS, wasm, fonts) | 2026-07-17 |
+| B1 | An all-inline-`type` named import was measured as the whole package | 2026-07-16 |
+| B3 | Native-binary-backed packages were mismeasured instead of labelled | 2026-07-16 |
+| K1 | The `sideEffects` badge fix is invisible on a warm cache until `ANALYZER_REVISION` moves | 2026-07-15 |
+| U1 | `a6cae06` did not get an adversarial review | 2026-07-16 |
