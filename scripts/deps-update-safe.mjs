@@ -14,6 +14,18 @@ import {
 
 const execFilePromise = promisify(execFileCallback);
 
+const CARGO_LOCK_PATH = "Cargo.lock";
+
+// A pin cannot land while a caret-drifted DEPENDENT still requires the newer
+// version, so the restore needs more than one pass: `rolldown_sourcemap` drifting
+// to 1.2.0 requires `oxc ^0.140.0`, which makes `oxc` unpinnable until that
+// sibling is itself restored -- and the fingerprint's name order reaches `oxc`
+// long before any `rolldown_*`. Each sweep re-reads the lock, so restoring a
+// dependent (which makes cargo drop the copies it dragged in outright) is seen by
+// the next one. Depth of the drifted chain is 2 today; the bound is slack, and a
+// sweep that pins nothing exits early because the lock is then provably unchanged.
+const MAX_RESTORE_SWEEPS = 8;
+
 // The set of crates the restore must pin back, and the exact version each must
 // return to, read straight from the committed fingerprint -- the ONLY complete
 // record of the coordinated closure. The direct crates (rolldown, its support
@@ -30,6 +42,78 @@ export const deriveRestorePins = (fingerprintText) =>
   JSON.parse(fingerprintText)
     .packages.filter((pkg) => typeof pkg.source === "string" && pkg.source !== "path")
     .map((pkg) => [pkg.name, pkg.version]);
+
+// Locked versions per crate name, straight from Cargo.lock. A name maps to more
+// than one version exactly when a drifted dependent pulled a second copy in --
+// the state that makes a bare `-p <name>` spec ambiguous and abort the restore.
+export const lockedVersionsByName = (lockText) => {
+  const versions = new Map();
+  for (const block of lockText.split(/\r?\n\[\[package\]\]\r?\n/u).slice(1)) {
+    const name = /^name = "(?<name>[^"]+)"$/mu.exec(block)?.groups?.name;
+    const version = /^version = "(?<version>[^"]+)"$/mu.exec(block)?.groups?.version;
+    if (name !== undefined && version !== undefined) {
+      versions.set(name, [...(versions.get(name) ?? []), version]);
+    }
+  }
+  return versions;
+};
+
+// Every locked copy that is not already at its recorded version, as
+// [crate, lockedVersion, targetVersion]. A crate at the recorded version yields
+// nothing, so a converged lock produces an empty sweep and the restore stops.
+export const outstandingPins = (lockText, pins) => {
+  const locked = lockedVersionsByName(lockText);
+  return pins.flatMap(([crate, target]) =>
+    (locked.get(crate) ?? [])
+      .filter((version) => version !== target)
+      .map((version) => [crate, version, target]),
+  );
+};
+
+const describeExecError = (error) =>
+  String(error?.stderr ?? "").trim() || (error instanceof Error ? error.message : String(error));
+
+// Pins every drifted copy back to its recorded version, sweeping until the lock
+// converges. Individual failures are collected rather than thrown: mid-sweep a
+// crate can legitimately refuse to move (a dependent still requires the drifted
+// version) or its spec can go stale (an earlier pin already made cargo drop that
+// copy), and both resolve on a later sweep. Only the caller's fingerprint
+// comparison decides success -- these strings exist to explain a failure, not to
+// cause one.
+const restoreCoordinatedStack = async ({ execFile, readFile, rootDir, pins }) => {
+  const lockPath = path.join(rootDir, CARGO_LOCK_PATH);
+  let refusals = [];
+
+  for (let sweep = 0; sweep < MAX_RESTORE_SWEEPS; sweep += 1) {
+    const outstanding = outstandingPins(await readFile(lockPath, "utf8"), pins);
+    if (outstanding.length === 0) {
+      return [];
+    }
+
+    refusals = [];
+    let pinned = 0;
+    for (const [crate, locked, target] of outstanding) {
+      try {
+        // `<name>@<version>`, never a bare name: once a drifted dependent has
+        // pulled a second copy in, cargo rejects the bare spec as ambiguous.
+        await execFile("cargo", ["update", "-p", `${crate}@${locked}`, "--precise", target], {
+          cwd: rootDir,
+        });
+        pinned += 1;
+      } catch (error) {
+        refusals.push(`${crate} ${locked} -> ${target}: ${describeExecError(error)}`);
+      }
+    }
+
+    // Nothing moved, so the lock is byte-identical and the next sweep would
+    // compute the same set and fail the same way. Stop and let the caller report.
+    if (pinned === 0) {
+      break;
+    }
+  }
+
+  return refusals;
+};
 
 // Range-respecting refresh of everything OUTSIDE the compiler stack. `pnpm
 // update` stays within package.json ranges and `cargo update` within
@@ -57,9 +141,12 @@ export const runSafeUpdate = async ({
   // One read of the committed fingerprint serves both roles: it names every
   // crate to pin back (below) and is the target the recompute must match (end).
   const committed = await readFile(path.join(rootDir, FINGERPRINT_PATH), "utf8");
-  for (const [crate, version] of deriveRestorePins(committed)) {
-    await execFile("cargo", ["update", "-p", crate, "--precise", version], { cwd: rootDir });
-  }
+  const refusals = await restoreCoordinatedStack({
+    execFile,
+    readFile,
+    rootDir,
+    pins: deriveRestorePins(committed),
+  });
 
   const recomputed = formatFingerprint(
     await computeCompilerStackFingerprint({ execFile, rootDir }),
@@ -68,7 +155,10 @@ export const runSafeUpdate = async ({
     throw new Error(
       "deps:update:safe could not restore the recorded compiler stack; the resolved " +
         "Rolldown/OXC graph no longer matches scripts/compiler-stack.fingerprint.json. " +
-        "Run pnpm deps:update:compiler to move the stack deliberately.",
+        "Run pnpm deps:update:compiler to move the stack deliberately." +
+        // Without these the failure names only the symptom; the refusal cargo
+        // gave for each crate is what says WHICH pin could not land and why.
+        (refusals.length > 0 ? `\nUnrestored pins:\n  ${refusals.join("\n  ")}` : ""),
     );
   }
 
