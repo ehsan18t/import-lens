@@ -220,9 +220,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetDeadline, AssetExecutor};
+    use super::{ASSET_PROCESSING_PERMITS, AssetDeadline, AssetExecutor};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration;
 
     const TEST_LIMIT: Duration = Duration::from_secs(2);
@@ -403,5 +403,65 @@ mod tests {
         assert!(message.contains("synthetic asset panic"), "{message}");
 
         assert_eq!(execute(&executor, TEST_LIMIT, |_| "healthy"), Ok("healthy"));
+    }
+    /// PROPERTY: however many jobs are offered, no more than `ASSET_PROCESSING_PERMITS` of them are
+    /// ever executing at once.
+    ///
+    /// This is the invariant the whole boundary exists for, and it was asserted only indirectly. It
+    /// also settles a standing question about nested rayon: `compress.rs` calls `rayon::join` and
+    /// Lightning CSS uses rayon internally, both INSIDE this pool, which raised the worry that a
+    /// worker blocked in a join could steal a sibling job's task and let real concurrency exceed the
+    /// permit count — spending one job's deadline on another's work.
+    ///
+    /// The observation is what matters, not the mechanism: if stealing could widen execution beyond
+    /// the permits, this goes red. Each job parks while holding its slot, so any extra admission
+    /// shows up immediately in the peak.
+    #[test]
+    fn no_more_jobs_execute_at_once_than_there_are_permits() {
+        let executor = Arc::new(AssetExecutor::new().expect("test asset executor should build"));
+        let inside = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let offered = ASSET_PROCESSING_PERMITS * 4;
+        let done = Arc::new(Barrier::new(offered + 1));
+
+        let handles: Vec<_> = (0..offered)
+            .map(|_| {
+                let executor = Arc::clone(&executor);
+                let inside = Arc::clone(&inside);
+                let peak = Arc::clone(&peak);
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    let _ =
+                        executor.submit(AssetDeadline::new(Duration::from_secs(10)), move |_| {
+                            let current = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(current, Ordering::SeqCst);
+                            // Hold the slot long enough that any over-admission overlaps observably,
+                            // and do it with nested rayon work so the stealing path is exercised.
+                            rayon::join(
+                                || std::thread::sleep(Duration::from_millis(40)),
+                                || std::thread::sleep(Duration::from_millis(40)),
+                            );
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    done.wait();
+                })
+            })
+            .collect();
+
+        done.wait();
+        for handle in handles {
+            handle.join().expect("probe thread should not panic");
+        }
+
+        assert!(
+            peak.load(Ordering::SeqCst) <= ASSET_PROCESSING_PERMITS,
+            "asset execution widened past its admission bound: peak {} > {ASSET_PROCESSING_PERMITS}",
+            peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            inside.load(Ordering::SeqCst),
+            0,
+            "every admitted job must have left the pool"
+        );
     }
 }

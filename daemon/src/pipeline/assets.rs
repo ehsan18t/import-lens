@@ -488,6 +488,36 @@ impl SourceProvider for TrackingProvider {
             }
         };
 
+        // A specifier that named a PACKAGE rather than a path, and only once the relative join has
+        // been shown not to exist.
+        //
+        // The order is the whole point. In CSS, `@import "theme.css"` is relative to the importing
+        // sheet — CSS has no bare-specifier concept, so a plain string is a relative URL, and
+        // `sub/dir.css` is an ordinary subdirectory. Deciding by SPELLING would reject the most
+        // common `@import` shape there is.
+        //
+        // What must not happen is the reverse: `FileProvider::resolve` is infallible — a naive
+        // `with_file_name` join — so `@import "pkg/base.css"` silently became
+        // `<dir-of-sheet>/pkg/base.css` and came back as a valid-looking File. The failure was then
+        // deferred to the read, which recorded a FAILED READ of a path that will never exist. That
+        // stamped the request-local `asset_io` stage on the whole asset result and wrote a
+        // never-fresh sentinel for the phantom path, so a package shipping one bare `@import` could
+        // never be cached and was re-measured on every keystroke.
+        //
+        // A MISSING RELATIVE import keeps the old behaviour deliberately: `./missing.css` may be
+        // created later, and the never-fresh sentinel on its real path is what makes creating it
+        // invalidate the result.
+        if !resolved.exists() && is_package_specifier(specifier) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "stylesheet {} imports `{specifier}`, which is not a file beside it and which \
+                     this measurement does not resolve as a package",
+                    originating_file.display()
+                ),
+            ));
+        }
+
         // CANONICALIZE, and not for tidiness: Lightning CSS cycle-detects on the very PathBuf
         // spelling this returns, and `FileProvider::resolve` is a naive `with_file_name` join that
         // never normalizes `..`. A cycle that crosses a `../` therefore hands back a LONGER, DISTINCT
@@ -500,6 +530,31 @@ impl SourceProvider for TrackingProvider {
             std::fs::canonicalize(&resolved).unwrap_or(resolved),
         ))
     }
+}
+
+/// Whether a specifier COULD name a package — asked only after the relative join was shown to miss.
+///
+/// This is not "is it bare" in the JavaScript sense, because CSS has no such concept: `theme.css`
+/// and `sub/dir.css` are ordinary relative URLs and resolve beside the sheet. It is the weaker
+/// question of whether, given that no such file exists, a package resolver is the only thing that
+/// could still answer — which is true for anything not explicitly anchored to the filesystem.
+///
+/// We decline to answer it. Resolving CSS with the JavaScript resolver would be worse than not
+/// resolving it: that profile has no `style` main field, no `style` condition, and no `.css`
+/// extension, so it would happily answer `pkg/base` with `pkg/base.js` and measure the wrong file.
+fn is_package_specifier(specifier: &str) -> bool {
+    let specifier = specifier.trim();
+    if specifier.is_empty() {
+        return false;
+    }
+    if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/') {
+        return false;
+    }
+    if specifier.starts_with('\\') || Path::new(specifier).is_absolute() {
+        return false;
+    }
+    // `.` and `..` alone are directory references, not package names.
+    !matches!(specifier, "." | "..")
 }
 
 /// An `@import` that names a network resource rather than a file on disk.
@@ -1723,6 +1778,92 @@ mod tests {
         );
         assert_eq!(bundle.referenced_assets, vec![expected_font]);
         assert!(bundle.dependency_omissions.is_empty());
+    }
+
+    /// A bare `@import` must fall back WITHOUT inventing a path that will never exist.
+    ///
+    /// `FileProvider::resolve` is infallible — a naive `with_file_name` join — so a bare specifier
+    /// used to become `<dir-of-sheet>/pkg/base.css` and come back as a valid-looking File. The
+    /// failure surfaced at the read instead, which recorded a FAILED READ of that phantom path: the
+    /// whole asset result took the request-local `asset_io` stage, and freshness got a never-fresh
+    /// sentinel for a file nobody will ever create. The package could then never be cached, and was
+    /// re-measured on every keystroke.
+    ///
+    /// The sheet is still disclosed at raw bytes (D8) — we genuinely cannot resolve it — but the
+    /// failure is now deterministic and the result stays reusable.
+    #[test]
+    fn a_bare_import_falls_back_without_poisoning_freshness() {
+        let dir = temp_dir("bare-import");
+        let entry = dir.join("index.css");
+        fs::write(&entry, "@import \"pkg/base.css\";\n.a { color: red }\n").expect("entry");
+
+        let asset = read_collected_asset(&entry, AssetKind::Css).expect("entry snapshot");
+        let result = bundle_collected_css(&asset);
+        fs::remove_dir_all(&dir).ok();
+
+        let error =
+            result.expect_err("a bare specifier cannot be resolved, so the sheet falls back");
+        assert!(
+            error.inputs.failed_paths.is_empty(),
+            "no phantom path may enter freshness: {:?}",
+            error.inputs.failed_paths
+        );
+        assert!(
+            !error
+                .non_durable_stages
+                .contains(crate::engine::stage::ASSET_IO),
+            "an unresolvable package specifier is a deterministic property of the sheet, not a \
+             filesystem moment: {:?}",
+            error.non_durable_stages
+        );
+    }
+
+    /// **The regression this nearly became.**
+    ///
+    /// `@import "theme.css"` — no `./` — is a RELATIVE url in CSS, and one of the most common
+    /// shapes real stylesheets ship. CSS has no bare-specifier concept, so deciding by spelling
+    /// alone would have dropped every such sheet to raw-byte disclosure. The existence of the file
+    /// beside the sheet is what decides; spelling only matters once nothing is there.
+    #[test]
+    fn an_unprefixed_import_is_relative_to_the_sheet_and_is_counted() {
+        let dir = temp_dir("unprefixed-import");
+        let entry = dir.join("index.css");
+        fs::write(dir.join("theme.css"), ".theme { color: blue }\n").expect("sibling sheet");
+        fs::create_dir_all(dir.join("sub")).expect("subdirectory");
+        fs::write(dir.join("sub").join("dir.css"), ".sub { color: green }\n")
+            .expect("nested sheet");
+        fs::write(
+            &entry,
+            "@import \"theme.css\";\n@import \"sub/dir.css\";\n.a { color: red }\n",
+        )
+        .expect("entry");
+
+        let result = bundle_css(&entry);
+        fs::remove_dir_all(&dir).ok();
+
+        let bundle = result.expect("an unprefixed relative @import must resolve beside the sheet");
+        let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
+        assert!(
+            css.contains(".theme") && css.contains(".sub") && css.contains(".a"),
+            "every relative sheet must be inlined and counted: {css}"
+        );
+    }
+
+    /// The spelling test, which only decides what happens once the file is known to be absent.
+    #[test]
+    fn only_unanchored_specifiers_could_name_a_package() {
+        for path in ["./a.css", "../a.css", "/a.css", ".", ".."] {
+            assert!(
+                !is_package_specifier(path),
+                "{path} is anchored to the filesystem"
+            );
+        }
+        for package in ["pkg/base.css", "@scope/pkg/base.css", "pkg"] {
+            assert!(
+                is_package_specifier(package),
+                "{package} could only be answered by a package resolver"
+            );
+        }
     }
 
     /// **The daemon-killer.** Lightning CSS cycle-detects on the very path spelling `resolve` hands
