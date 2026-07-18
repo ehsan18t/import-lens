@@ -25,9 +25,31 @@ use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
 use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
 use super::{AssetClass, CollectedAsset, UncountedAsset, classify_asset_class};
 use crate::cache::key::{
-    FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
-    sort_and_dedup_fingerprints, unverifiable_file_fingerprint,
+    FileFingerprint, absent_file_fingerprint, content_hash, file_fingerprint_from_read_time,
+    read_time_len_mtime_of, sort_and_dedup_fingerprints, unverifiable_file_fingerprint,
 };
+
+/// Why a classified asset input could not be observed.
+///
+/// The distinction is not cosmetic — it decides whether the whole result may be cached. A file that
+/// is NOT THERE is a deterministic fact about the package: its continued absence is exactly what a
+/// later freshness probe confirms, so it must not refuse the cache. A file that exists but could not
+/// be READ is a filesystem moment on this machine, and reusing a result built around it would cache
+/// a hiccup as a package fact.
+///
+/// Collapsing the two is what made an alternative-specifier probe expensive. napi-rs generates ~20
+/// platform-relative `require`s per package (`./crc32.win32-x64-msvc.node`, `./crc32.darwin-arm64.node`,
+/// …) and ships one; Rolldown asks the resolver about every one of them. Treating the 19 misses as
+/// unreadable made a perfectly good build emit "retry after the filesystem settles" and be refused by
+/// every cache forever — a full rebuild per request, for a package that measured correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AssetInputFailure {
+    /// Not on disk. Deterministic, and reusable: [`absent_file_fingerprint`] stays Fresh while it
+    /// stays missing, and stops being Fresh the moment somebody installs it.
+    Absent,
+    /// Present but unreadable. Request-local, and never reusable.
+    Unreadable,
+}
 
 /// Per-build state shared with the adapter, which reads it after the bundler
 /// finishes. Limit state is monotonic and thread-safe (spec §7.3).
@@ -47,10 +69,9 @@ pub(super) struct BuildState {
     /// Classified non-JavaScript modules the graph imported, keyed by canonical path. See
     /// [`ImportLensPlugin::load`]; the pipeline processes them and counts their shipped bytes (B2).
     assets: Mutex<HashMap<PathBuf, CollectedAsset>>,
-    /// Classified assets whose metadata or byte read failed in this plugin. Even if Rolldown later
-    /// succeeds through its own loader, that mixed observation describes this filesystem moment,
-    /// not a reusable fact about the package.
-    failed_asset_inputs: Mutex<HashSet<PathBuf>>,
+    /// Classified assets this plugin could not observe, and WHY — the two answers are cached in
+    /// opposite directions, so the reason has to travel with the path rather than be re-derived.
+    failed_asset_inputs: Mutex<HashMap<PathBuf, AssetInputFailure>>,
     /// Directly imported files that ship but are outside the measured taxonomy — an image, an icon.
     /// Stubbed so they cannot fail the build, and disclosed so their bytes are not silently absent.
     unmeasured_assets: Mutex<BTreeMap<PathBuf, UncountedAsset>>,
@@ -125,32 +146,50 @@ impl BuildState {
             .collect()
     }
 
-    pub(super) fn record_failed_asset_input(&self, path: PathBuf) {
-        self.failed_asset_inputs
+    /// `Unreadable` always wins a path already recorded as `Absent`: it is the stricter observation,
+    /// and letting a later "not there" downgrade an earlier read failure would admit a filesystem
+    /// moment into a durable store by ordering luck.
+    pub(super) fn record_failed_asset_input(&self, path: PathBuf, failure: AssetInputFailure) {
+        let mut inputs = self
+            .failed_asset_inputs
             .lock()
-            .expect("failed asset-input set should not be poisoned")
-            .insert(path);
+            .expect("failed asset-input map should not be poisoned");
+        let slot = inputs.entry(path).or_insert(failure);
+        if failure == AssetInputFailure::Unreadable {
+            *slot = AssetInputFailure::Unreadable;
+        }
     }
 
-    pub(super) fn failed_asset_paths(&self) -> Vec<PathBuf> {
+    /// Only the UNREADABLE ones. This drives the `asset_io` diagnostic and the `asset_io` failure
+    /// stage, and an absent input belongs in neither — nothing about it is transient, and nothing
+    /// about it needs the user to retry.
+    pub(super) fn unreadable_asset_paths(&self) -> Vec<PathBuf> {
         let mut paths = self
             .failed_asset_inputs
             .lock()
-            .expect("failed asset-input set should not be poisoned")
+            .expect("failed asset-input map should not be poisoned")
             .iter()
-            .cloned()
+            .filter(|(_, failure)| **failure == AssetInputFailure::Unreadable)
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         paths.sort();
         paths.dedup();
         paths
     }
 
-    /// Never-fresh observations that keep a machine-dependent asset failure out of every cache.
-    pub(super) fn unverifiable_asset_fingerprints(&self) -> Vec<FileFingerprint> {
+    /// One fingerprint per unobserved input, each carrying the freshness its reason earns: an absent
+    /// file stays Fresh while it stays missing (so the result caches and self-heals on install), an
+    /// unreadable one can never be Fresh (so the result never enters a durable store).
+    pub(super) fn asset_input_fingerprints(&self) -> Vec<FileFingerprint> {
         let mut fingerprints = self
-            .failed_asset_paths()
-            .into_iter()
-            .map(unverifiable_file_fingerprint)
+            .failed_asset_inputs
+            .lock()
+            .expect("failed asset-input map should not be poisoned")
+            .iter()
+            .map(|(path, failure)| match failure {
+                AssetInputFailure::Absent => absent_file_fingerprint(path),
+                AssetInputFailure::Unreadable => unverifiable_file_fingerprint(path),
+            })
             .collect::<Vec<_>>();
         sort_and_dedup_fingerprints(&mut fingerprints);
         fingerprints
@@ -299,6 +338,34 @@ fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Opt
     }
     let parent = importer.parent()?;
     Some(parent.join(specifier_path))
+}
+
+/// A read that failed because the file is not there is a fact about the package; anything else —
+/// a permission denial, a locked file, a device error — is a moment on this machine.
+fn failure_kind_of(error: &std::io::Error) -> AssetInputFailure {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        AssetInputFailure::Absent
+    } else {
+        AssetInputFailure::Unreadable
+    }
+}
+
+/// How to record a candidate the configured resolver could not answer for.
+///
+/// Only an ABSOLUTE path this hook can actually probe earns `Absent`. A bare, self-referential or
+/// aliased specifier has no honest filesystem location — `supported_asset_observation_candidate`
+/// hands back the spelling itself — so "it is not there" is not a claim this hook is entitled to
+/// make, and it stays `Unreadable`, which is the conservative answer that refuses the cache.
+async fn resolve_failure_kind(candidate: &Path) -> AssetInputFailure {
+    if !candidate.is_absolute() {
+        return AssetInputFailure::Unreadable;
+    }
+    match tokio::fs::metadata(candidate).await {
+        Err(error) => failure_kind_of(&error),
+        // It exists but the resolver still refused it — an `exports` denial, a bad symlink target.
+        // Not an absence, so do not claim one.
+        Ok(_) => AssetInputFailure::Unreadable,
+    }
 }
 
 /// Atomically reserve bytes without ever moving the counter past `limit` on rejection.
@@ -602,7 +669,12 @@ impl Plugin for ImportLensPlugin {
                     return Ok(Some(HookResolveIdOutput::from_resolved_id(resolved)));
                 }
                 Err(_) => {
-                    self.state.record_failed_asset_input(candidate);
+                    // An alternative-specifier probe is the ordinary case here, not the exception:
+                    // napi-rs writes one `require` per platform triple and ships one file, so most
+                    // of these misses are a package fact, not a filesystem hiccup. Recording WHICH
+                    // is what lets a correct build still be cached.
+                    let failure = resolve_failure_kind(&candidate).await;
+                    self.state.record_failed_asset_input(candidate, failure);
                     // Let the normal resolver run once more so Rolldown retains its native resolve
                     // diagnostic. `classify_failure` promotes our typed `asset_io` observation.
                     return Ok(None);
@@ -659,7 +731,8 @@ impl Plugin for ImportLensPlugin {
             Ok(metadata) => metadata,
             Err(error) => {
                 if asset_class.is_some() {
-                    self.state.record_failed_asset_input(canonical);
+                    let failure = failure_kind_of(&error);
+                    self.state.record_failed_asset_input(canonical, failure);
                     // Do not let the default loader reopen a recovering/growing asset outside this
                     // plugin's source-byte reservations. The adapter promotes the retained cause
                     // to `asset_io`, while this error keeps the build from consuming unobserved
@@ -709,7 +782,8 @@ impl Plugin for ImportLensPlugin {
                     self.release_source_bytes(reserved);
                 }
                 if asset_class.is_some() {
-                    self.state.record_failed_asset_input(canonical);
+                    let failure = failure_kind_of(&error);
+                    self.state.record_failed_asset_input(canonical, failure);
                     return Err(error.into());
                 }
                 return Ok(None);
@@ -939,9 +1013,9 @@ mod tests {
     fn failed_asset_observations_are_never_reusable() {
         let state = BuildState::default();
         let failed_read = PathBuf::from("/pkg/read-failed.woff2");
-        state.record_failed_asset_input(failed_read.clone());
+        state.record_failed_asset_input(failed_read.clone(), AssetInputFailure::Unreadable);
 
-        let observations = state.unverifiable_asset_fingerprints();
+        let observations = state.asset_input_fingerprints();
         assert_eq!(observations.len(), 1);
         assert_eq!(
             observations[0].path,
@@ -951,6 +1025,60 @@ mod tests {
             crate::cache::key::fingerprint_is_unverifiable(&observations[0]),
             "a read failure must prevent cache admission"
         );
+    }
+
+    /// The other half of the same rule, and the one that pays for the napi-rs family: a file that is
+    /// simply NOT THERE is a deterministic fact, so it must neither refuse the cache nor claim the
+    /// filesystem needs to settle.
+    #[test]
+    fn an_absent_asset_observation_is_reusable_and_is_not_an_io_failure() {
+        let state = BuildState::default();
+        let missing = PathBuf::from("/pkg/crc32.darwin-arm64.node");
+        state.record_failed_asset_input(missing.clone(), AssetInputFailure::Absent);
+
+        let observations = state.asset_input_fingerprints();
+        assert_eq!(observations.len(), 1);
+        assert!(
+            crate::cache::key::fingerprint_is_absent(&observations[0]),
+            "an absent input must record the absence it can later re-confirm"
+        );
+        assert!(
+            !crate::cache::key::fingerprint_is_unverifiable(&observations[0]),
+            "an absence is not a machine-dependent read failure"
+        );
+        assert!(
+            crate::cache::key::fingerprints_are_reusable(&observations),
+            "a deterministic absence must not refuse the result it belongs to"
+        );
+        assert!(
+            state.unreadable_asset_paths().is_empty(),
+            "an absent input must not raise the transient asset_io diagnostic"
+        );
+    }
+
+    /// Ordering must not decide durability. Two imports of the same path can reach these hooks
+    /// concurrently, and the stricter observation has to survive whichever lands second.
+    #[test]
+    fn an_unreadable_observation_outranks_an_absent_one_in_either_order() {
+        for absent_first in [true, false] {
+            let state = BuildState::default();
+            let path = PathBuf::from("/pkg/contested.node");
+            let order = if absent_first {
+                [AssetInputFailure::Absent, AssetInputFailure::Unreadable]
+            } else {
+                [AssetInputFailure::Unreadable, AssetInputFailure::Absent]
+            };
+            for failure in order {
+                state.record_failed_asset_input(path.clone(), failure);
+            }
+
+            let observations = state.asset_input_fingerprints();
+            assert_eq!(observations.len(), 1);
+            assert!(
+                crate::cache::key::fingerprint_is_unverifiable(&observations[0]),
+                "unreadable must win regardless of arrival order (absent_first={absent_first})"
+            );
+        }
     }
 
     #[test]

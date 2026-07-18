@@ -100,13 +100,16 @@ fn build_observations(
     state: &BuildState,
 ) -> (Vec<crate::cache::key::FileFingerprint>, Vec<PathBuf>) {
     let (mut fingerprints, unhashed_paths) = state.read_time_fingerprints();
-    fingerprints.extend(state.unverifiable_asset_fingerprints());
+    fingerprints.extend(state.asset_input_fingerprints());
     sort_and_dedup_fingerprints(&mut fingerprints);
     (fingerprints, unhashed_paths)
 }
 
 fn asset_io_diagnostic(state: &BuildState) -> Option<ImportDiagnostic> {
-    let paths = state.failed_asset_paths();
+    // Unreadable ONLY. An input that is simply absent is a deterministic fact about the package —
+    // saying "retry after the filesystem settles" about it is false, and routing it to the
+    // non-durable `asset_io` stage would refuse a correct measurement from every cache.
+    let paths = state.unreadable_asset_paths();
     if paths.is_empty() {
         return None;
     }
@@ -314,7 +317,7 @@ fn single_chunk(
             |diagnostic| diagnostic.message,
         );
         return Err(BundleFailure {
-            stage: if state.failed_asset_paths().is_empty() {
+            stage: if state.unreadable_asset_paths().is_empty() {
                 stage::OUTPUT_SHAPE.to_owned()
             } else {
                 stage::ASSET_IO.to_owned()
@@ -505,7 +508,7 @@ fn contract_diagnostics(diagnostics: &[BuildDiagnostic]) -> Vec<ImportDiagnostic
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::plugin::BuildState;
+    use crate::engine::plugin::{AssetInputFailure, BuildState};
 
     /// A missing optional asset says "retry after the filesystem settles"; a blown graph limit is a
     /// permanent fact about the package. When both are recorded, the breach has to win.
@@ -520,7 +523,10 @@ mod tests {
     #[test]
     fn a_durable_breach_outranks_a_transient_asset_read_failure() {
         let state = BuildState::default();
-        state.record_failed_asset_input(PathBuf::from("/pkg/optional.css"));
+        state.record_failed_asset_input(
+            PathBuf::from("/pkg/optional.css"),
+            AssetInputFailure::Unreadable,
+        );
         state.record_breach("module graph exceeds the 2000 internal module limit");
 
         let failure = classify_failure(Vec::new(), &state);
@@ -544,7 +550,10 @@ mod tests {
     #[test]
     fn a_transient_asset_read_failure_still_wins_when_no_breach_was_recorded() {
         let state = BuildState::default();
-        state.record_failed_asset_input(PathBuf::from("/pkg/optional.css"));
+        state.record_failed_asset_input(
+            PathBuf::from("/pkg/optional.css"),
+            AssetInputFailure::Unreadable,
+        );
 
         let failure = classify_failure(Vec::new(), &state);
 

@@ -120,6 +120,32 @@ Each fails because one transitive `require` targets a deep internal subpath of a
 resolver cannot resolve, which is the "one leaf poisons the whole build" case below, not a hidden measurement
 bug. `@biomejs/biome` is native-binary-backed and moves to the B3 blocker.
 
+**Sharpened 2026-07-19, and it changes what the class IS.** The failing specifiers are not missing files and
+not a broken install — they are **`exports`-blocked deep subpaths on code branches that never execute**.
+`jest-resolve@29.7.0` really does ship `build/defaultResolver.js`, but its `exports` map allows only `.` and
+`./package.json`, so the deep path is forbidden by encapsulation rather than absent; `jest-pnp-resolver` asks
+for it inside a `try`, then asks for the older `build/default_resolver` spelling in the `catch`, and only ever
+runs at all under Yarn PnP. `eslint-plugin-autofix` is the same shape without the `try`: it branches on
+`Number.parseInt(eslint version)` and, against the installed eslint 8.57.1, takes
+`require("eslint/use-at-your-own-risk")` — which resolves perfectly — while the `>= 6` and `else` arms asking
+for `eslint/lib/rules` and `eslint/lib/built-in-rules-index` are dead code that Rolldown still resolves
+statically and fails on. `eslint/lib/rules/index.js` exists on disk too; eslint 8 simply does not export it.
+
+So "unavailable" is *less* honest here than this entry has been claiming. These packages are not unmeasurable:
+their live path resolves, and the build dies on requires that cannot run. The `no wrong number` verdict stands
+(nothing is shown), but the justification "it is the anti-fabricator working" does not — nothing is being
+protected against.
+
+**This is the same shape as D22, not a separate problem.** An alternative-specifier probe — several
+specifiers written where only one is expected to resolve — is a normal, deliberate ecosystem idiom, and a
+bundler statically resolves every arm of it: ~20 platform `.node` requires from napi-rs (D22, fixed), two
+spellings in a `try`/`catch` (`jest`), three version branches (`eslint-plugin-autofix`). What is left here is
+the arm that fails with an `exports` DENIAL rather than a plain absence: rolldown already externalizes an
+unresolvable bare specifier when the resolver answers `NotFound`, which is why `tsdown` measures, but
+`jest-resolve/build/defaultResolver` answers `PackagePathNotExported` — the file is on disk, the package
+simply does not export it — and that variant hard-fails the build. The distinction is the ERROR VARIANT, not
+the specifier's shape, and closing it is what would let these two measure.
+
 **The universal defect: one leaf poisons the whole number.** A single unbundleable edge (a dynamic `require`,
 an unresolvable specifier) anywhere in the graph fails the ENTIRE package build, so a 2 MB
 JS graph with one such leaf reports nothing instead of "at least 2 MB, excluding it." Import Lens ALREADY does
@@ -146,38 +172,6 @@ native-binary packages that used to sit here (for example `@biomejs/biome`) are 
 project's whole dependency set and buckets each "unavailable" by its actual stage (native-leaf, no-entry,
 unresolved, dynamic-require, graph-limit, timeout, parse) sizes the fix and surfaces any genuine bug. Build
 that first.
-
-### D20: A `.node` specifier that does not resolve is recorded as an unreadable asset input, not an absent one
-**Status: Deferred — ENGINE scope. Found by the adversarial review of the `.node` fix (2026-07-19)** · Proven by executed repro against the pinned Rolldown 1.1.5 · No wrong number, no wedge
-
-`ImportLensPlugin::resolve_id` treats any asset-classified specifier whose `ctx.resolve` fails as a **failed
-asset input** (`record_failed_asset_input`, `plugin.rs`), which is the right call for a file that exists but
-could not be read and the wrong one for a file that was never there. The CSS path already draws that
-distinction — `asset_budget.rs`'s `record_failed_path(missing)` selects `absent_file_fingerprint` — and the
-plugin has no equivalent. Admitting `.node` to the classifier (2026-07-19) did not create this mechanism; it
-gave it a **high-frequency trigger**, which is why it is recorded now and was not before.
-
-**What actually happens, on two paths.** napi-rs generates roughly twenty platform-relative requires per
-package (`./crc32.win32-x64-msvc.node`, `./crc32.darwin-arm64.node`, …) inside `try`/`catch`, and ships at
-most one of them; Rolldown issues `resolveId` for every one regardless of the `createRequire` reassignment and
-the `catch`. So on the **success** path a perfectly good build (`@node-rs/crc32` measured, chunk intact) now
-carries ~20 recorded failures, which emits the `asset_io` diagnostic — "supported asset input(s) could not be
-read during this analysis; retry after the filesystem settles" — on a successful analysis where nothing needs
-retrying, and stamps `unverifiable_asset_fingerprints` (len/mtime `u64::MAX`) into the artifact, so
-`fingerprints_are_reusable` is false and every cache refuses the result **permanently**: a full rebuild per
-request for the whole napi-rs family. On the **failure** path, a statically imported `.node` that genuinely
-does not exist (un-run `node-gyp`, absent platform binary) used to fail `UNRESOLVED_IMPORT` → `resolve`, which
-is in `DURABLE_RESULT_STAGES` and cached once; it now short-circuits to `asset_io`, which is deliberately not
-durable, so a permanent failure is re-derived on every request under a message calling it transient.
-
-**Why it is not fixed here.** Neither path shows a wrong number — the five sizes stay correct on the success
-path and there is no number at all on the failure path — and neither can wedge or lose data. It is a false
-transient message plus lost cacheability, which is exactly the "everything else" the fix-now bar defers.
-
-**The fix, when it is taken.** Split absent from unreadable at the plugin's resolve boundary the way the CSS
-path already does, and reuse `absent_file_fingerprint` rather than inventing a second ledger — an absent
-optional platform binary is a deterministic, cacheable fact about the package, not a filesystem hiccup. Do it
-at the boundary so it covers every asset kind at once; do not special-case napi-rs or `.node`.
 
 ### D7: A stylesheet its own package declares droppable is counted anyway
 **Status: Accepted** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the B2 adversarial review
@@ -866,6 +860,7 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| D22 | An asset input that was never there was recorded as an unreadable one, costing a correct build its cache | 2026-07-19 |
 | D11 | An asset the daemon could not read is disclosed, and that disclosure is cached | 2026-07-18 |
 | D12 | A file total that omits an asset is not structurally flagged as a floor | 2026-07-18 |
 | D20 | Nested rayon inside the asset pool does not widen its admission | 2026-07-18 |

@@ -2986,6 +2986,67 @@ fn analyze_measures_a_package_whose_graph_reaches_a_native_addon() {
     );
 }
 
+/// **An alternative-specifier probe must not cost the package its cache.**
+///
+/// napi-rs writes one `require` per platform triple and ships exactly one of the files, inside
+/// `try`/`catch`. Rolldown asks the resolver about every one of them, so the misses are the NORMAL
+/// state, not an incident. Recording them as unreadable inputs made a perfectly good build emit
+/// `asset_io` — "retry after the filesystem settles", about a file that will never appear — and
+/// stamped never-fresh fingerprints that refused the correct result from every cache, forever.
+///
+/// An absence is a deterministic fact about the package: it is recorded as an absence, the build
+/// measures, no transient diagnostic is raised, and the result stays cacheable.
+#[test]
+fn analyze_does_not_report_io_trouble_for_platform_addons_a_package_never_shipped() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "napi-lib",
+        r#"{"version":"1.0.0","main":"index.js"}"#,
+        "let binding;\ntry { binding = require('./napi.win32-x64-msvc.node'); } catch (e) {\n  try { binding = require('./napi.darwin-arm64.node'); } catch (e2) {\n    binding = require('./napi.linux-x64-gnu.node');\n  }\n}\nmodule.exports.checksum = () => binding;\n",
+    );
+    // Exactly ONE of the three exists, which is every napi-rs install on every machine.
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("napi-lib")
+            .join("napi.win32-x64-msvc.node"),
+        vec![0x4d, 0x5a, 0x90, 0x00]
+            .into_iter()
+            .chain(std::iter::repeat_n(0xcc, 4_092))
+            .collect::<Vec<u8>>(),
+    )
+    .expect("the one shipped addon should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "napi-lib",
+            "napi-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["checksum"],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(
+        result.error, None,
+        "two absent platform addons must not fail a package that ships the third: {result:?}"
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "asset_io"),
+        "an addon this package never shipped is not a filesystem incident to retry: {result:?}"
+    );
+}
+
 /// The headline claims to be the import's full cost. An image is outside the counted taxonomy, and
 /// the closed `AssetKind` set used to drop it through a bare `None`: out of the number, out of every
 /// disclosure, still High confidence — a package advertising a total it was short by. Disclosing it
