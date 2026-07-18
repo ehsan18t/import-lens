@@ -149,7 +149,7 @@ struct TrackingProvider {
     synthetic: Option<(PathBuf, String)>,
     read_paths: Mutex<HashSet<PathBuf>>,
     read_time_fingerprints: Mutex<Vec<FileFingerprint>>,
-    failed_paths: Mutex<HashSet<PathBuf>>,
+    failed_paths: Mutex<Vec<FailedRead>>,
     budget: Mutex<ReadBudget>,
     /// One ledger for every union/per-sheet attempt in this build. Never optional: production
     /// safety that a caller can omit is safety the tests will omit.
@@ -183,7 +183,7 @@ impl TrackingProvider {
             synthetic,
             read_paths: Mutex::new(HashSet::new()),
             read_time_fingerprints: Mutex::new(Vec::new()),
-            failed_paths: Mutex::new(HashSet::new()),
+            failed_paths: Mutex::new(Vec::new()),
             budget: Mutex::new(ReadBudget::default()),
             context,
         }
@@ -254,7 +254,8 @@ impl TrackingProvider {
             .expect("CSS failed-path set should not be poisoned")
             .into_iter()
             .collect::<Vec<_>>();
-        failed_paths.sort();
+        failed_paths.sort_by(|left, right| left.path.cmp(&right.path));
+        failed_paths.dedup();
         CssReadInputs {
             paths,
             fingerprints,
@@ -275,12 +276,13 @@ impl TrackingProvider {
         }
     }
 
-    fn record_failed_read(&self, path: PathBuf) {
+    fn record_failed_read(&self, path: PathBuf, kind: std::io::ErrorKind) {
         self.failed_paths
             .lock()
             .expect("CSS failed-path set should not be poisoned")
-            .insert(path.clone());
-        self.context.record_failed_path(&path);
+            .push(FailedRead::new(path.clone(), kind));
+        self.context
+            .record_failed_path(&path, kind == std::io::ErrorKind::NotFound);
     }
 
     fn check_deadline(&self) -> Result<(), std::io::Error> {
@@ -347,7 +349,7 @@ impl SourceProvider for TrackingProvider {
                 let metadata = match std::fs::metadata(&key) {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        self.record_failed_read(key);
+                        self.record_failed_read(key, error.kind());
                         return Err(error);
                     }
                 };
@@ -362,7 +364,7 @@ impl SourceProvider for TrackingProvider {
                 let bytes = match std::fs::read(&key) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        self.record_failed_read(key);
+                        self.record_failed_read(key, error.kind());
                         return Err(error);
                     }
                 };
@@ -441,7 +443,7 @@ pub struct CssBundle {
     pub minified_bytes: Vec<u8>,
     pub read_paths: Vec<PathBuf>,
     pub read_time_fingerprints: Vec<FileFingerprint>,
-    failed_paths: Vec<PathBuf>,
+    failed_paths: Vec<FailedRead>,
     /// Supported local artifacts referenced by the CSS that survives minification. They are
     /// separate emitted files, so the caller processes and compresses them independently.
     pub referenced_assets: Vec<CollectedAsset>,
@@ -463,11 +465,38 @@ pub struct CssBundle {
     pub dependency_external: Vec<String>,
 }
 
+/// A read that failed, and WHY — because the two reasons must not be treated alike.
+///
+/// A file that simply is not there is a deterministic fact about the package: it will keep not being
+/// there until someone creates it, and creating it invalidates the result through the never-fresh
+/// sentinel below. A permission error, a lock, or a file deleted mid-build is a fact about this
+/// machine at this moment.
+///
+/// Both must stay never-fresh. Only the second may contribute the request-local `asset_io` stage —
+/// conflating them meant one missing `@import` target refused the WHOLE asset result from every
+/// durable store, so the package was re-measured on every keystroke over a file nobody was going to
+/// create. One collection rather than two parallel ones: two vectors that must agree is the shape
+/// that drifts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedRead {
+    path: PathBuf,
+    missing: bool,
+}
+
+impl FailedRead {
+    fn new(path: PathBuf, kind: std::io::ErrorKind) -> Self {
+        Self {
+            missing: kind == std::io::ErrorKind::NotFound,
+            path,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct CssReadInputs {
     paths: Vec<PathBuf>,
     fingerprints: Vec<FileFingerprint>,
-    failed_paths: Vec<PathBuf>,
+    failed_paths: Vec<FailedRead>,
 }
 
 impl CssReadInputs {
@@ -488,7 +517,7 @@ struct CssProcessingError {
 impl CssProcessingError {
     fn from_transform(message: String, inputs: CssReadInputs) -> Self {
         let mut non_durable_stages = BTreeSet::new();
-        if !inputs.failed_paths.is_empty() {
+        if inputs.failed_paths.iter().any(|failed| !failed.missing) {
             non_durable_stages.insert(crate::engine::stage::ASSET_IO);
         }
         Self {
@@ -810,7 +839,7 @@ pub struct ProcessedAssets {
     pub read_time_fingerprints: Vec<FileFingerprint>,
     /// Paths whose read failed during any attempt. A later success in the same union/retry flow
     /// does not erase the failure: that mixed observation cannot produce a reusable cache entry.
-    failed_paths: Vec<PathBuf>,
+    failed_paths: Vec<FailedRead>,
     /// Assets that could NOT be processed, disclosed with their raw bytes exactly as before.
     pub uncounted: Vec<UncountedAsset>,
     /// Why each of those fell back, for the diagnostic.
@@ -879,14 +908,40 @@ impl ProcessedAssets {
             .iter()
             .map(|fingerprint| fingerprint.path.clone())
             .collect::<HashSet<_>>();
-        let mut failed_paths = self.failed_paths.clone();
+        // A path that was MISSING gets the absent sentinel: fresh while it stays missing, stale
+        // the moment it appears. A path that failed for any other reason stays unverifiable, which
+        // is never fresh, because we cannot say what state it was in.
+        let mut absent_paths = self
+            .failed_paths
+            .iter()
+            .filter(|failed| failed.missing)
+            .map(|failed| failed.path.clone())
+            .collect::<Vec<_>>();
+        absent_paths.sort();
+        absent_paths.dedup();
+        let missing = absent_paths.iter().cloned().collect::<HashSet<_>>();
+        fingerprints.extend(
+            absent_paths
+                .into_iter()
+                .map(crate::cache::key::absent_file_fingerprint),
+        );
+        let mut failed_paths = self
+            .failed_paths
+            .iter()
+            .filter(|failed| !failed.missing)
+            .map(|failed| failed.path.clone())
+            .collect::<Vec<_>>();
         // Defensive inference for any future processor that records an attempted path but forgets
         // to classify the failed read explicitly. Explicit failures remain even if another attempt
         // later fingerprinted the same path.
+        // A path already recorded as absent is excluded: giving it the unverifiable sentinel too
+        // would put two different sentinels on one path, which reads as a conflicting observation
+        // and refuses the whole result — the exact reuse this fix exists to restore.
         failed_paths.extend(
             self.read_paths
                 .iter()
                 .filter(|path| !fingerprinted.contains(&path.to_string_lossy().replace('\\', "/")))
+                .filter(|path| !missing.contains(*path))
                 .cloned(),
         );
         failed_paths.sort();
@@ -990,10 +1045,15 @@ fn external_css_resources_diagnostic(processed: &ProcessedAssets) -> Option<Impo
 }
 
 fn asset_io_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
-    if processed.failed_paths.is_empty() {
+    let mut paths = processed
+        .failed_paths
+        .iter()
+        .filter(|failed| !failed.missing)
+        .map(|failed| failed.path.clone())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
         return None;
     }
-    let mut paths = processed.failed_paths.clone();
     paths.sort();
     paths.dedup();
     Some(ImportDiagnostic {
@@ -1332,8 +1392,10 @@ fn process_stylesheets(
                 zstd_bytes: 0,
             };
             for (bundle, compressed) in counted {
-                let had_asset_io =
-                    !bundle.failed_paths.is_empty() || !bundle.referenced_failures.is_empty();
+                // Only a TRANSIENT failure makes the result request-local. A missing file is a
+                // deterministic fact about the package and stays cacheable.
+                let had_asset_io = bundle.failed_paths.iter().any(|failed| !failed.missing)
+                    || !bundle.referenced_failures.is_empty();
                 css.raw_bytes += bundle.raw_bytes.len() as u64;
                 css.minified_bytes += bundle.minified_bytes.len() as u64;
                 css.gzip_bytes += compressed.gzip_bytes;
@@ -1352,7 +1414,10 @@ fn process_stylesheets(
                 referenced_assets.extend(bundle.referenced_assets);
                 for failure in bundle.referenced_failures {
                     processed.read_paths.push(failure.path.clone());
-                    processed.failed_paths.push(failure.path.clone());
+                    processed.failed_paths.push(FailedRead {
+                        path: failure.path.clone(),
+                        missing: false,
+                    });
                     processed.failures.push(failure.message);
                     processed.uncounted.push(UncountedAsset {
                         path: failure.path,
@@ -1443,7 +1508,10 @@ fn compress_bundle_with(
             }
             for failure in bundle.referenced_failures {
                 inputs.paths.push(failure.path.clone());
-                inputs.failed_paths.push(failure.path);
+                inputs.failed_paths.push(FailedRead {
+                    path: failure.path,
+                    missing: false,
+                });
             }
             Err(CssProcessingError::from_compression(
                 format!("failed to compress the bundled stylesheet: {error}"),
@@ -2152,10 +2220,11 @@ mod tests {
         };
         let freshness = processed.freshness_fingerprints();
 
+        // Asserts the INVARIANT rather than which sentinel carries it. This run saw one path in two
+        // states — absent, then present with bytes — and a run that disagrees with itself cannot be
+        // reused whichever marker records the first observation.
         assert!(
-            freshness
-                .iter()
-                .any(crate::cache::key::fingerprint_is_unverifiable),
+            !crate::cache::key::fingerprints_are_reusable(&freshness),
             "a later success must not make a mixed failure/success run cacheable: {freshness:?}"
         );
         assert!(

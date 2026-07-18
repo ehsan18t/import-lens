@@ -124,9 +124,14 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// "unavailable" for a package that now has a number. A bare CSS `@import` also stops recording a
 /// failed read of a path that cannot exist, so results that were permanently non-durable become
 /// cacheable.
+/// `rolldown-1.1.x+12` (2026-07-18): brotli moved from quality 4 to quality 9, so EVERY brotli
+/// figure the product reports changes. A `+11` entry was compressed at the old quality and would be
+/// served beside newly measured ones, making two packages incomparable for the reason least visible
+/// to the user. Measured: q4 reads 16.0% high against a CDN at q11, q9 reads 7.5% high, and the cost
+/// is +33 ms per artifact against q11 own +928 ms.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+11"
+        "rolldown-1.1.x+12"
     };
 }
 
@@ -446,6 +451,21 @@ fn modified_millis(metadata: &std::fs::Metadata) -> u64 {
 
 /// Tri-state freshness of one stored fingerprint against the current file.
 pub fn check_fingerprint(stored: &FileFingerprint) -> Freshness {
+    // An ABSENT input is the one case where "the file is not there" is the expected answer rather
+    // than a reason to give up. A stylesheet that `@import`s a file which does not exist is a
+    // deterministic fact about the package, so the result is worth keeping — but only for exactly
+    // as long as the file stays missing. Creating it makes this Stale, which is what re-measures.
+    //
+    // Without this the same path had to be recorded as UNVERIFIABLE, which is never fresh, so such a
+    // package was rebuilt on every keystroke over a file nobody was going to create.
+    if fingerprint_is_absent(stored) {
+        return match fs::metadata(&stored.path) {
+            Ok(_) => Freshness::Stale,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Freshness::Fresh,
+            Err(error) => classify_stat_error(error.kind()),
+        };
+    }
+
     let metadata = match fs::metadata(&stored.path) {
         Ok(metadata) => metadata,
         Err(error) => return classify_stat_error(error.kind()),
@@ -585,6 +605,27 @@ pub fn unverifiable_file_fingerprint(path: impl AsRef<Path>) -> FileFingerprint 
         modified_millis: u64::MAX,
         content_hash: None,
     }
+}
+
+/// An input that is expected NOT to exist, and whose continued absence is what keeps a result fresh.
+///
+/// Distinguished from [`unverifiable_file_fingerprint`] by the mtime: that one is all-ones in both
+/// fields and can never be fresh, this one pairs an all-ones length with a zero mtime, a combination
+/// no real file produces. Both are sentinels rather than measurements; only this one has a state a
+/// later check can confirm.
+pub fn absent_file_fingerprint(path: impl AsRef<Path>) -> FileFingerprint {
+    FileFingerprint {
+        path: normalize_identity_path(path),
+        len: u64::MAX,
+        modified_millis: 0,
+        content_hash: None,
+    }
+}
+
+pub fn fingerprint_is_absent(fingerprint: &FileFingerprint) -> bool {
+    fingerprint.len == u64::MAX
+        && fingerprint.modified_millis == 0
+        && fingerprint.content_hash.is_none()
 }
 
 pub fn fingerprint_is_unverifiable(fingerprint: &FileFingerprint) -> bool {
@@ -789,6 +830,49 @@ mod tests {
             !fingerprints_have_conflicting_snapshots(&[first, compatible]),
             "a stat-only observation may agree with a more precise hashed observation"
         );
+    }
+
+    /// The absent sentinel is the ONE case where "the file is not there" is the expected answer
+    /// rather than a reason to give up, so all three arms of that branch are pinned here.
+    ///
+    /// This is the only fingerprint kind that can return `Fresh` from a failed stat. That makes its
+    /// third arm — a stat that fails for any reason OTHER than absence — the one worth stating
+    /// explicitly: a locked or permission-denied file is not evidence that the file is gone, and
+    /// answering `Fresh` there would serve a result whose input we cannot see.
+    #[test]
+    fn an_absent_fingerprint_is_fresh_only_while_the_file_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-absent-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let missing = dir.join("created-later.css");
+        let fingerprint = absent_file_fingerprint(&missing);
+
+        assert!(fingerprint_is_absent(&fingerprint));
+        assert!(
+            !fingerprint_is_unverifiable(&fingerprint),
+            "absent and unverifiable must stay distinct: one can be fresh, the other never can"
+        );
+        assert_eq!(
+            check_fingerprint(&fingerprint),
+            Freshness::Fresh,
+            "a file that is still missing is exactly what this fingerprint recorded"
+        );
+        assert!(
+            fingerprints_are_reusable(std::slice::from_ref(&fingerprint)),
+            "a deterministic absence must not refuse the result it belongs to"
+        );
+
+        std::fs::write(&missing, b".created { color: red }").expect("create the missing input");
+        assert_eq!(
+            check_fingerprint(&fingerprint),
+            Freshness::Stale,
+            "creating the file is what re-measures the package"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

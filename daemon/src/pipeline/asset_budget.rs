@@ -1,7 +1,7 @@
 //! One resource ledger for every non-JavaScript input and every CSS retry in a build.
 
 use crate::cache::key::{
-    FileFingerprint, read_time_len_mtime_of, sort_and_dedup_fingerprints,
+    FileFingerprint, absent_file_fingerprint, read_time_len_mtime_of, sort_and_dedup_fingerprints,
     unverifiable_file_fingerprint,
 };
 use crate::engine::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
@@ -265,7 +265,7 @@ impl AssetProcessingContext {
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                self.record_failed_path(&path);
+                self.record_failed_path(&path, error.kind() == std::io::ErrorKind::NotFound);
                 return Err(error);
             }
         };
@@ -273,7 +273,7 @@ impl AssetProcessingContext {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.record_failed_path(&path);
+                self.record_failed_path(&path, error.kind() == std::io::ErrorKind::NotFound);
                 return Err(error);
             }
         };
@@ -310,11 +310,23 @@ impl AssetProcessingContext {
         normalized_observations(&self.lock_state().fingerprints)
     }
 
-    pub(crate) fn record_failed_path(&self, path: &Path) {
+    /// Record a read that failed, keeping WHY.
+    ///
+    /// A missing file gets the absent sentinel — fresh while it stays missing, stale the moment it
+    /// appears — so a package that imports something which is not there stays cacheable instead of
+    /// rebuilding on every keystroke. Anything else stays unverifiable, which is never fresh,
+    /// because we cannot say what state the file was in. The two must agree with the provider half
+    /// of this recording: one path carrying two different sentinels is a conflicting observation and
+    /// refuses the whole result.
+    pub(crate) fn record_failed_path(&self, path: &Path, missing: bool) {
         let path = canonical_path(path);
         let mut state = self.lock_state();
         state.read_paths.insert(path.clone());
-        state.fingerprints.push(unverifiable_file_fingerprint(path));
+        state.fingerprints.push(if missing {
+            absent_file_fingerprint(path)
+        } else {
+            unverifiable_file_fingerprint(path)
+        });
     }
 
     pub(crate) fn failure(&self) -> Option<AssetBudgetFailure> {

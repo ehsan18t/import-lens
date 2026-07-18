@@ -3614,13 +3614,28 @@ fn creating_a_missing_css_import_child_invalidates_the_cached_fallback() {
             .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
         "the missing child must produce the disclosed CSS fallback: {missing:?}"
     );
+    // NOT `asset_io`. A file that is not there is a deterministic fact about the package, and
+    // `asset_io` means "the filesystem was having a moment, retry later" — which refused the whole
+    // asset result from every durable store and re-measured this package on every keystroke over a
+    // file nobody was going to create. The disclosure above already tells the user what is missing.
+    //
+    // What must NOT change is the line below: deterministic does not mean pinned. The path still
+    // carries never-fresh evidence, so creating the file invalidates the result.
     assert!(
-        missing.imports[0]
+        !missing.imports[0]
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.stage == "asset_io"),
-        "the wire result must say that this fallback came from a non-durable filesystem failure: \
-         {missing:?}"
+        "a missing @import target is a package fact, not a filesystem moment: {missing:?}"
+    );
+
+    // The point of treating it as deterministic: measuring the same unchanged package again is a
+    // cache hit. Under `asset_io` this was refused by every durable store, so a package with one
+    // missing `@import` target rebuilt its whole graph on every keystroke, forever.
+    let repeated = service.handle_batch(package_batch(&workspace, 2, "missing-css-lib", "value"));
+    assert!(
+        repeated.imports[0].cache_hit,
+        "a deterministic missing child must not force a rebuild on every request: {repeated:?}"
     );
 
     fs::write(
@@ -3628,7 +3643,7 @@ fn creating_a_missing_css_import_child_invalidates_the_cached_fallback() {
         ".created { color: green; padding: 9876px; }\n",
     )
     .expect("missing child should be created");
-    let created = service.handle_batch(package_batch(&workspace, 2, "missing-css-lib", "value"));
+    let created = service.handle_batch(package_batch(&workspace, 3, "missing-css-lib", "value"));
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(

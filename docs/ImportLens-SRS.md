@@ -455,7 +455,7 @@ Every requested surface must carry a unique entry alias so strict entry signatur
 
 **FR-019** (Critical) - The daemon must use `oxc_minifier` to perform dead code elimination, constant folding, and supported identifier mangling on the tree-shaken output, then use `oxc_codegen` (with `minify: true`) to emit the minified JavaScript string. Codegen must use the scoping and private-member mappings returned by `oxc_minifier::Minifier::minify`; the daemon must not run a second independent mangling pass over already-minified AST state.
 
-**FR-020** (Critical) - After minification, the daemon must compute three compressed sizes in parallel: gzip using `flate2` at level 6, Brotli using the `brotli` crate at level 4, and zstd using the `zstd` crate at level 3.
+**FR-020** (Critical) - After minification, the daemon must compute three compressed sizes in parallel: gzip using `flate2` at level 6, Brotli using the `brotli` crate at level 9, and zstd using the `zstd` crate at level 3. Brotli quality is a measured trade rather than a default: quality 4 reports 16% more than a CDN at quality 11 actually delivers, quality 11 costs +928 ms per artifact on a compressor that runs per keystroke, and quality 9 halves the overstatement for +33 ms.
 
 **FR-021** (Critical) - Rolldown is the only semantic authority for `package.json#sideEffects`: it natively interprets boolean, string, and array forms plus nearest-transitive-package metadata, and the daemon must not override its retention decisions with a hook or an AST purity check. The daemon reads the root package's `sideEffects` field separately as **reporting metadata only** — it decides a badge, never a byte — and **`side_effects` is a property of THE IMPORT, not of the package**: the question it answers is whether *the entry being measured* is one the package declares effectful. It sets the response fields:
 - If the field is `true` or absent: the response sets `side_effects: true` and `truly_treeshakeable: false`.
@@ -1001,7 +1001,7 @@ OXC Rust crates use 0.x versions, but that does not mean they are alpha quality.
 | `bytes`           | 1.11.1                   | `^1`           | ✅ Stable        | Frame payload buffer type used by `tokio-util` codec sinks.                                                                                                                                |
 | `futures-util`    | 0.3.32                   | `^0.3`         | ✅ Stable        | `SinkExt`/`StreamExt` utilities for framed IPC read/write loops.                                                                                                                           |
 | `flate2`          | 1.1.9                    | `^1.1`         | ✅ Stable        | Gzip level 6.                                                                                                                                                                              |
-| `brotli`          | 8.0.3                    | `^8`           | ✅ Stable        | Brotli level 4.                                                                                                                                                                            |
+| `brotli`          | 8.0.3                    | `^8`           | ✅ Stable        | Brotli level 9.                                                                                                                                                                            |
 | `zstd`            | 0.13.3                   | `~0.13`        | ✅ Stable API    | Zstd level 3.                                                                                                                                                                              |
 | ~~`num_cpus`~~    | N/A                      | N/A            | Removed         | Replaced by `std::thread::available_parallelism()` (stable since Rust 1.59). The `num_cpus` crate is in maintenance mode and provides no value over the stdlib.                            |
 
@@ -1093,7 +1093,7 @@ interface ImportResult {
   raw_bytes: number;              // Unpacked size of the relevant module files
   minified_bytes: number;         // After OXC tree-shake and minification
   gzip_bytes: number;             // flate2 level 6
-  brotli_bytes: number;           // brotli level 4
+  brotli_bytes: number;           // brotli level 9
   zstd_bytes: number;             // zstd level 3
   cache_hit: boolean;
   side_effects: boolean;          // true if sideEffects is absent, true, or a glob the ENTRY matches
@@ -1586,7 +1586,7 @@ The virtual entry module format (the synthetic `import-lens:target/<index>` ids 
 
 ### 10.4 Compression Pipeline
 
-The compression pipeline (gzip level 6, brotli level 4, zstd level 3, run in parallel over the minified string and collected before the response is sent) is specified in [bundler-architecture.md](bundler-architecture.md) §13.2.
+The compression pipeline (gzip level 6, brotli level 9, zstd level 3, run in parallel over the minified string and collected before the response is sent) is specified in [bundler-architecture.md](bundler-architecture.md) §13.2.
 
 ### 10.5 Daemon Startup and Lifecycle
 

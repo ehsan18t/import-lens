@@ -137,16 +137,15 @@ const realFixtures = [
     // The daemon compresses brotli at quality 4 (it runs per keystroke) while this oracle uses
     // quality 11 (what a CDN actually serves), so EVERY benchmark reads high for a reason that has
     // nothing to do with what was counted: 2.6-15% across the JS set. CSS compresses far better
-    // than JS, so that same asymmetry is amplified here to 24.8% — nearly the entire 25% budget,
-    // leaving no headroom for ordinary compressor variance. Hence 35% on brotli.
+    // than JS, so that same asymmetry was amplified here to 24.8% at brotli quality 4 — nearly the
+    // entire 25% budget — which is why this fixture used to carry its own 35% brotli tolerance.
     //
-    // But that brotli number gates NOTHING about the stylesheet, and it is important not to pretend
-    // otherwise: this package's CSS is ~1.7% of the compressed total while the compressor gap is
-    // ~25%, a 14:1 noise-to-signal ratio. Measured 2026-07-17, holding our CSS at q4 and varying
-    // only the fold count: folding it ZERO times reads 22.7%, ONCE 24.8%, TWICE 26.9%. All three
-    // sit under 35% — this fixture would stay green if asset counting were deleted outright. (An
-    // earlier version of this comment claimed 35% was "far below what a double-counted stylesheet
-    // would produce". That was simply false, and it is why the check below now exists.)
+    // Quality 9 (2026-07-18) halved that gap: this benchmark now reads 8.8% on brotli, comfortably
+    // inside the shared gate, so the override is gone. That is the point worth keeping: the 35% was
+    // never measuring the stylesheet, it was measuring OUR compressor being weaker than the oracle,
+    // and a tolerance that wide gated nothing. Measured 2026-07-17 by holding CSS at q4 and varying
+    // only the fold count: ZERO folds read 22.7%, ONCE 24.8%, TWICE 26.9% — all three under 35%, so
+    // the fixture would have stayed green with asset counting deleted outright.
     //
     // The MINIFIED pair is where the signal is, because neither side compresses it and the CSS is
     // ~3% of that total rather than ~1.7%. Measured the same way: fold ZERO reads 3.80%, ONCE
@@ -155,11 +154,10 @@ const realFixtures = [
     // 1.5% sits between those, deliberately: it is nearly 2x the honest reading and a third below a
     // double count, so both failure directions are caught with room, and it is what makes this
     // fixture gate B2 at all. (2% would also catch a double count, but by under 10% — thin enough
-    // that a small real drift could hide one.) Our JS reads 0.8% LOW against esbuild's minifier,
+    // that a small real drift could hide one.) Our JS reads 0.8% LOW against esbuild minifier,
     // which is why the band is not centred on zero. Both minifiers are exact-pinned and
-    // upgrade-gated, so this only moves on a deliberate re-baseline. If it goes red, a stylesheet's
+    // upgrade-gated, so this only moves on a deliberate re-baseline. If it goes red, a stylesheet
     // fold count changed; do not raise the number.
-    tolerance: 0.35,
     minifiedTolerance: 0.015,
     expectsStylesheet: true,
   },
