@@ -505,11 +505,20 @@ pub struct CssBundle {
     pub referenced_assets: Vec<CollectedAsset>,
     /// Local supported resources that survived CSS minification but could not be read.
     pub(crate) referenced_failures: Vec<crate::pipeline::css_dependencies::CssDependencyFailure>,
-    /// Dependency analysis is metadata-only and must never discard an otherwise valid CSS size.
-    /// When it cannot inspect every URL (for example an ambiguous relative URL in a custom
-    /// property), the caller keeps the CSS contribution and discloses that referenced assets may
-    /// be missing.
-    pub dependency_failures: Vec<String>,
+    /// Local resources the stylesheet ships that are outside the counted taxonomy — images, SVG.
+    /// Disclosed at their real size, never counted, and never silently dropped.
+    pub referenced_uncounted: Vec<UncountedAsset>,
+    /// Local resources that ship but whose bytes could not even be sized, including the case where
+    /// dependency analysis could not inspect a sheet's URLs at all (an ambiguous relative URL in a
+    /// custom property fails the metadata-only print while both measuring prints succeed).
+    ///
+    /// Dependency analysis is metadata-only and must never discard an otherwise valid CSS size, so
+    /// the CSS contribution is kept and the omission is disclosed. It is an OMISSION, not an
+    /// over-count: these bytes are missing from the total, so they make the result a floor.
+    pub dependency_omissions: Vec<String>,
+    /// Runtime-fetched resources: real weight, but not bytes this package ships, so the measured
+    /// size is exact and stays budgetable.
+    pub dependency_external: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -743,7 +752,13 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
     // measured artifact. `to_css` borrows immutably; the ordinary print below still emits the real
     // minified stylesheet. Analyze after minification so a resource removed from shipped CSS is not
     // counted.
-    let (referenced_assets, referenced_failures, dependency_failures) = stylesheet
+    let (
+        referenced_assets,
+        referenced_failures,
+        referenced_uncounted,
+        dependency_omissions,
+        dependency_external,
+    ) = stylesheet
         .to_css(PrinterOptions {
             minify: true,
             targets: Targets::default(),
@@ -759,17 +774,25 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
             (
                 dependencies.assets,
                 dependencies.failures,
-                dependencies.unresolved,
+                dependencies.uncounted,
+                dependencies.omissions,
+                dependencies.external,
             )
         })
         .unwrap_or_else(|error| {
+            // This print is the ONLY one with dependency analysis enabled, and lightningcss has
+            // errors that fire only in that mode (an ambiguous relative `url()` in a custom
+            // property). So the sheet measures fine while its whole `url()` graph goes
+            // undiscovered — an omission of unknown size, disclosed as one.
             (
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 vec![format!(
                     "lightningcss could not inspect resource URLs in {}: {error:?}",
                     entry.display()
                 )],
+                Vec::new(),
             )
         });
     provider
@@ -802,7 +825,9 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
         failed_paths: Vec::new(),
         referenced_assets,
         referenced_failures,
-        dependency_failures,
+        referenced_uncounted,
+        dependency_omissions,
+        dependency_external,
     })
 }
 
@@ -832,9 +857,18 @@ pub struct ProcessedAssets {
     /// and was dropped on the floor, taking a silent, High-confidence, cacheable over-count with
     /// it. Every channel here now has one consumer and its own trigger.
     pub stylesheets_measured_separately: Option<String>,
-    /// Dependency-analysis failures keep the valid CSS contribution but make it impossible to
-    /// prove that every local font/wasm reference was discovered.
-    pub css_dependency_failures: Vec<String>,
+    /// Local resources a counted stylesheet references that are missing from the total and whose
+    /// size is not even known — an unlocatable path, an unreadable file, or a sheet whose URLs
+    /// could not be inspected at all.
+    ///
+    /// This is an OMISSION channel. It used to be disclosed as `imprecise_assets`, the stage that
+    /// means the number reads HIGH, which pointed the disclosure in the opposite direction from the
+    /// error: `incomplete` never fired, so a total missing real shipped bytes was cached and
+    /// recorded as a file's permanent baseline.
+    pub css_dependency_omissions: Vec<String>,
+    /// Runtime-fetched resources a counted stylesheet references. Disclosed, but the measured bytes
+    /// are exact without them, so this must not touch completeness or budgetability.
+    pub css_dependency_external: Vec<String>,
     /// Machine/request-local causes retained structurally so neither cache admission nor wire
     /// consumers have to infer durability from human-readable error text.
     non_durable_stages: BTreeSet<&'static str>,
@@ -863,7 +897,11 @@ impl ProcessedAssets {
     /// processor rejection is reusable at the import level, but any aggregate containing it is a
     /// lower bound rather than a complete File Cost.
     pub fn has_uncounted_assets(&self) -> bool {
-        !self.uncounted.is_empty()
+        // A CSS-referenced omission counts here even though it has no `UncountedAsset` row: the
+        // bytes are missing from the total just the same, and the fact that their size is unknown
+        // makes the result MORE of a floor, not less. Reading only `uncounted` is what let an
+        // omission through as a complete measurement.
+        !self.uncounted.is_empty() || !self.css_dependency_omissions.is_empty()
     }
 
     /// Exact asset fingerprints plus never-fresh sentinels for attempted paths that supplied no
@@ -961,17 +999,46 @@ pub fn imprecise_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
     })
 }
 
-fn unresolved_css_dependencies_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
-    if processed.css_dependency_failures.is_empty() {
+/// The disclosure for local resources a counted stylesheet references but the size does not include.
+///
+/// `UNCOUNTED_ASSETS`, not `IMPRECISE_ASSETS`. Those two stages point in opposite directions:
+/// imprecise means bytes are counted more than once and the number reads HIGH, uncounted means
+/// bytes are missing and the number is a floor. This channel is the second one, and reporting it as
+/// the first is what stopped `incomplete` from firing — so a File Cost short by real shipped bytes
+/// passed every durability gate and was written to the no-TTL history as that file's baseline.
+fn omitted_css_resources_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
+    if processed.css_dependency_omissions.is_empty() {
         return None;
     }
 
     Some(ImportDiagnostic {
-        stage: diagnostic_stage::IMPRECISE_ASSETS.to_owned(),
-        message: "the stylesheet was measured, but some CSS resource references could not be \
-                  inspected, so this size may omit referenced font or wasm artifacts"
+        stage: diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
+        message: "the stylesheet was measured, but local resources it references could not be \
+                  located or inspected, so this size does NOT include their shipped bytes"
             .to_owned(),
-        details: processed.css_dependency_failures.clone(),
+        details: processed.css_dependency_omissions.clone(),
+    })
+}
+
+/// The disclosure for resources a counted stylesheet fetches at runtime rather than ships.
+///
+/// `EXTERNAL`, which is durable AND budgetable, because the measured bytes are exact without them:
+/// a CDN font is weight the page pays but not weight this package carries, so refusing to judge the
+/// number would be wrong. Routing these through a precision stage is what silently disabled budget
+/// verdicts for every package that `@import`s a web font. The disclosure still costs High
+/// confidence, which is the honest reading — there is runtime weight this number does not model.
+fn external_css_resources_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
+    if processed.css_dependency_external.is_empty() {
+        return None;
+    }
+
+    Some(ImportDiagnostic {
+        stage: diagnostic_stage::EXTERNAL.to_owned(),
+        message:
+            "the stylesheet references resources fetched at runtime; they are real weight for \
+                  the page but are not bytes this package ships, so this size excludes them"
+                .to_owned(),
+        details: processed.css_dependency_external.clone(),
     })
 }
 
@@ -1014,7 +1081,8 @@ pub fn asset_diagnostics(processed: &ProcessedAssets) -> Vec<ImportDiagnostic> {
     [
         uncounted_assets_diagnostic(processed),
         imprecise_assets_diagnostic(processed),
-        unresolved_css_dependencies_diagnostic(processed),
+        omitted_css_resources_diagnostic(processed),
+        external_css_resources_diagnostic(processed),
         asset_io_diagnostic(processed),
         asset_compression_diagnostic(processed),
     ]
@@ -1354,9 +1422,22 @@ fn process_stylesheets(
                         bytes: failure.raw_bytes,
                     });
                 }
+                // Shipped bytes outside the counted taxonomy. Their size IS known, so they are
+                // disclosed as ordinary uncounted assets and named in the same summary.
+                for asset in bundle.referenced_uncounted {
+                    processed.failures.push(format!(
+                        "CSS resource {} is not a counted asset kind, so its bytes are disclosed \
+                         rather than included",
+                        asset.path.display()
+                    ));
+                    processed.uncounted.push(asset);
+                }
                 processed
-                    .css_dependency_failures
-                    .extend(bundle.dependency_failures);
+                    .css_dependency_omissions
+                    .extend(bundle.dependency_omissions);
+                processed
+                    .css_dependency_external
+                    .extend(bundle.dependency_external);
             }
             processed.contributions.push(css);
         }
@@ -1641,7 +1722,7 @@ mod tests {
             "dependency-analysis placeholders must never enter the measured artifact: {css}"
         );
         assert_eq!(bundle.referenced_assets, vec![expected_font]);
-        assert!(bundle.dependency_failures.is_empty());
+        assert!(bundle.dependency_omissions.is_empty());
     }
 
     /// **The daemon-killer.** Lightning CSS cycle-detects on the very path spelling `resolve` hands
@@ -1772,14 +1853,128 @@ mod tests {
             css.contains(".a"),
             "the local rules must still be counted: {css}"
         );
+        // A CDN stylesheet is fetched at runtime and is not a byte this package ships, so the
+        // measured size is EXACT and must keep its budget verdict. It is still disclosed — just on
+        // `external`, which is durable AND budgetable, rather than on a precision stage that
+        // refuses to judge the number. Routing it through the latter silently disabled budgeting
+        // for every package that `@import`s a web font.
         assert_eq!(
-            bundle.dependency_failures.len(),
+            bundle.dependency_external.len(),
             1,
-            "the unmeasured remote stylesheet must lower confidence: {bundle:?}"
+            "the external stylesheet must still be disclosed: {bundle:?}"
         );
         assert!(
-            bundle.dependency_failures[0].contains("fonts.googleapis.com"),
+            bundle.dependency_external[0].contains("fonts.googleapis.com"),
             "the disclosure should identify the external stylesheet: {bundle:?}"
+        );
+        assert!(
+            bundle.dependency_omissions.is_empty(),
+            "an external @import is out of scope, not a local omission: {bundle:?}"
+        );
+
+        let mut processed = ProcessedAssets::default();
+        processed
+            .css_dependency_external
+            .extend(bundle.dependency_external);
+        assert!(
+            !processed.has_uncounted_assets(),
+            "external weight must not make an exact measurement a floor"
+        );
+        let diagnostic = external_css_resources_diagnostic(&processed)
+            .expect("the external reference must be disclosed to the user");
+        assert_eq!(
+            diagnostic.stage,
+            diagnostic_stage::EXTERNAL,
+            "{diagnostic:?}"
+        );
+        assert!(
+            !crate::pipeline::stage::prevents_budget_verdict(&diagnostic.stage),
+            "an exact size must keep its budget verdict: {diagnostic:?}"
+        );
+    }
+
+    /// The headline claims to be the import's full cost, so a shipped file it does not include has
+    /// to say so. An image is outside the counted taxonomy, which used to mean it left through a
+    /// bare `None` — out of the number, out of every disclosure, still High confidence.
+    #[test]
+    fn an_image_referenced_by_css_is_disclosed_with_its_real_size() {
+        let dir = temp_dir("image-url");
+        let entry = dir.join("index.css");
+        fs::write(dir.join("bg.png"), vec![7u8; 4096]).expect("image");
+        fs::write(&entry, ".a { background-image: url('./bg.png') }\n").expect("entry");
+
+        let result = bundle_css(&entry);
+        fs::remove_dir_all(&dir).ok();
+
+        let bundle = result.expect("an image reference must not fail the stylesheet");
+        assert_eq!(
+            bundle.referenced_uncounted.len(),
+            1,
+            "the shipped image must be disclosed: {bundle:?}"
+        );
+        assert_eq!(
+            bundle.referenced_uncounted[0].bytes, 4096,
+            "the disclosure must carry the image's real size, not a zero: {bundle:?}"
+        );
+        assert!(
+            bundle.dependency_omissions.is_empty(),
+            "a resolvable image is a sized disclosure, not an unknown omission: {bundle:?}"
+        );
+    }
+
+    /// A `url()` in a custom property fails lightningcss's dependency print while both measuring
+    /// prints succeed, so the sheet is counted with its whole `url()` graph undiscovered. One such
+    /// declaration disables discovery for every sheet in the union, so the omission has to reach
+    /// `has_uncounted_assets` or the short total is cached as complete.
+    #[test]
+    fn an_uninspectable_url_graph_is_an_omission_not_an_over_count() {
+        let dir = temp_dir("ambiguous-url");
+        let entry = dir.join("index.css");
+        fs::write(dir.join("icons.woff2"), vec![3u8; 2048]).expect("font");
+        fs::write(
+            &entry,
+            ":root { --icon-font: url(./icons.woff2) }\n.a { color: red }\n",
+        )
+        .expect("entry");
+
+        let result = bundle_css(&entry);
+        fs::remove_dir_all(&dir).ok();
+
+        let bundle = result.expect("an ambiguous url() must not fail the stylesheet");
+        assert!(
+            !bundle.minified_bytes.is_empty(),
+            "the sheet itself must still be measured: {bundle:?}"
+        );
+        assert_eq!(
+            bundle.dependency_omissions.len(),
+            1,
+            "an uninspectable url() graph must be disclosed as an omission: {bundle:?}"
+        );
+        // Pin the mechanism, not just the symptom: this fires because the metadata-only print is
+        // the only one with dependency analysis on, so it is the only one that can fail here.
+        assert!(
+            bundle.dependency_omissions[0].contains("could not inspect resource URLs"),
+            "the omission must name the dependency print that failed: {bundle:?}"
+        );
+        assert!(
+            bundle.referenced_assets.is_empty(),
+            "the font behind the ambiguous url() is exactly what went undiscovered: {bundle:?}"
+        );
+
+        let mut processed = ProcessedAssets::default();
+        processed
+            .css_dependency_omissions
+            .extend(bundle.dependency_omissions);
+        assert!(
+            processed.has_uncounted_assets(),
+            "the omission must make the result a floor so it cannot be cached as complete"
+        );
+        let diagnostic = omitted_css_resources_diagnostic(&processed)
+            .expect("the omission must be disclosed to the user");
+        assert_eq!(
+            diagnostic.stage,
+            diagnostic_stage::UNCOUNTED_ASSETS,
+            "bytes MISSING are uncounted, not imprecise: {diagnostic:?}"
         );
     }
 
@@ -2031,7 +2226,9 @@ mod tests {
             failed_paths: Vec::new(),
             referenced_assets: Vec::new(),
             referenced_failures: Vec::new(),
-            dependency_failures: Vec::new(),
+            referenced_uncounted: Vec::new(),
+            dependency_omissions: Vec::new(),
+            dependency_external: Vec::new(),
         };
         let failure = compress_bundle_with(bundle, None, &|_| Err("injected failure".to_owned()))
             .expect_err("the injected compressor must fail");

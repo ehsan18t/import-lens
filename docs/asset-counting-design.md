@@ -1,8 +1,23 @@
 # Design: counting non-JS asset bytes (CSS, wasm, fonts)
 
-**Status: Design, not yet implemented. RELEASE BLOCKER.** This is the agreed shape for
-closing [known issue B2](known-issues.md). It will be refined during implementation and graduates to its own
-spec plus plan when built.
+**Status: IMPLEMENTED (2026-07-18). Superseded as a spec by
+[FR-018a/FR-018b](ImportLens-SRS.md) — this document is kept for its rationale, not as the
+contract.** B2 is closed. Where this design and the SRS disagree, the SRS wins.
+
+Two decisions below were refined during implementation and are recorded here so the drift is not
+mistaken for an oversight:
+
+- **`lightningcss` did NOT join the Rolldown dependency-graph fingerprint closure.** The
+  "Consequences" section calls for that, but the crate's version is chosen independently and is not
+  reachable from rolldown/oxc, so forcing it into that closure would couple two unrelated things. It
+  is a **standalone exact pin** with its own drift test instead.
+- **The "CSS combination / dedup model" open question below is settled, not open.** All reachable
+  CSS becomes one artifact, measured against the esbuild oracle on `@uiw/react-md-editor` and
+  agreeing within 1%. This is model-consistent because the tool builds with code splitting disabled
+  — more than one chunk is a typed `output_shape` failure — so one JS chunk implies one CSS sheet.
+- **The asset taxonomy needed a disclosure path for kinds it does not count.** The design named
+  CSS/wasm/font and left everything else implicit, which shipped as a silent drop. See FR-018b: an
+  unsupported-but-shipped resource is now disclosed at its real size rather than dropped.
 
 **Why it blocks the release.** Today the engine measures a package's JS chunk and only discloses its non-JS
 asset bytes (CSS, wasm, fonts) beside the result, never folding them into the Import Cost. So the headline

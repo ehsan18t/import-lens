@@ -2828,6 +2828,75 @@ fn analyze_local_assets_referenced_by_css_are_counted_in_the_import_cost() {
     assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
 }
 
+/// The headline claims to be the import's full cost. An image is outside the counted taxonomy, and
+/// the closed `AssetKind` set used to drop it through a bare `None`: out of the number, out of every
+/// disclosure, still High confidence — a package advertising a total it was short by. Disclosing it
+/// is what restores `incomplete`, which is what re-closes the cache and budget paths behind it.
+#[test]
+fn analyze_discloses_an_image_referenced_by_counted_css_instead_of_dropping_it() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "image-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "image-lib",
+        "styles.css",
+        ".widget { background-image: url('./sprite.png'); }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("image-lib")
+            .join("sprite.png"),
+        vec![0x77; 64 * 1024],
+    )
+    .expect("image fixture should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "image-lib",
+            "image-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(result.error, None, "{result:?}");
+    assert!(
+        result
+            .asset_breakdown
+            .iter()
+            .all(|contribution| contribution.kind != AssetKind::Font
+                && contribution.kind != AssetKind::Wasm),
+        "an image is disclosed, not counted as some other kind: {result:?}"
+    );
+    let disclosure = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
+        .expect("a shipped image the size omits must be disclosed as uncounted");
+    assert!(
+        disclosure.message.contains("65536"),
+        "the disclosure must carry the image's real size: {disclosure:?}"
+    );
+    assert_ne!(
+        result.confidence,
+        ConfidenceLevel::High,
+        "a size that omits shipped bytes cannot claim High confidence: {result:?}"
+    );
+}
+
 #[test]
 fn analyze_a_font_reference_resolves_from_the_imported_stylesheet() {
     let workspace = temp_workspace();
@@ -2996,7 +3065,7 @@ fn analyze_a_missing_css_font_is_disclosed_and_lowers_confidence() {
 }
 
 #[test]
-fn analyze_external_css_fonts_are_disclosed_as_imprecise() {
+fn analyze_external_css_fonts_are_disclosed_without_losing_the_budget_verdict() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -3035,20 +3104,49 @@ fn analyze_external_css_fonts_are_disclosed_as_imprecise() {
             .any(|contribution| contribution.kind == AssetKind::Font),
         "external bytes must not be fabricated into a local artifact: {result:?}"
     );
-    let disclosure = result
+    // Disclosed, but on `external` — the stage for weight the page pays that this package does not
+    // ship. The measured bytes are EXACT without it, so unlike a precision stage this one must not
+    // strip the result's budget verdict.
+    // This fixture holds one of EACH kind, and the whole point of the split is that they are not
+    // the same fact. The CDN font is fetched at runtime — not this package's bytes, so the size
+    // stays exact and budgetable. `/fonts/public.woff2` is a local file the package expects served
+    // from the site root: those bytes DO ship and are missing from the size, so it is an omission
+    // that makes the result a floor. One channel for both is what mislabelled one of them.
+    let external = result
         .diagnostics
         .iter()
-        .find(|diagnostic| {
-            diagnostic.stage == "imprecise_assets"
-                && diagnostic.message.contains("resource references")
-        })
+        .find(|diagnostic| diagnostic.stage == "external")
         .expect("unmeasurable external font weight must be disclosed");
-    assert_eq!(disclosure.details.len(), 2, "{disclosure:?}");
+    assert_eq!(external.details.len(), 1, "{external:?}");
+    assert!(
+        external.details[0].contains("cdn.example"),
+        "the runtime-fetched resource is the external one: {external:?}"
+    );
+
+    let omission = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
+        .expect("a public-root local font is a shipped byte this size omits");
+    assert!(
+        omission
+            .details
+            .iter()
+            .any(|detail| detail.contains("public.woff2")),
+        "the unlocatable local font is the omitted one: {omission:?}"
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "imprecise_assets"),
+        "neither reference is an over-count: {result:?}"
+    );
     assert_eq!(result.confidence, ConfidenceLevel::Medium, "{result:?}");
 }
 
 #[test]
-fn analyze_an_ambiguous_css_url_keeps_the_css_and_discloses_imprecision() {
+fn analyze_an_ambiguous_css_url_keeps_the_css_and_discloses_the_omission() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -3097,12 +3195,25 @@ fn analyze_an_ambiguous_css_url_keeps_the_css_and_discloses_imprecision() {
             .any(|contribution| contribution.kind == AssetKind::Css),
         "dependency inspection must not discard the CSS contribution: {result:?}"
     );
+    // `uncounted_assets`, not `imprecise_assets`. The sheet is counted but its whole `url()` graph
+    // went undiscovered, so bytes are MISSING and the number is a floor — the opposite direction
+    // from an over-count. Reporting it as imprecision is what stopped `incomplete` from firing and
+    // let a short total be cached and recorded as a file's permanent baseline.
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "imprecise_assets"
-                && diagnostic.message.contains("resource references")
+            diagnostic.stage == "uncounted_assets"
+                && diagnostic
+                    .message
+                    .contains("could not be located or inspected")
         }),
         "an ambiguous relative URL must not remain silently High confidence: {result:?}"
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "imprecise_assets"),
+        "an undiscovered url() graph omits bytes, it does not double-count them: {result:?}"
     );
     assert_eq!(result.confidence, ConfidenceLevel::Medium, "{result:?}");
 }

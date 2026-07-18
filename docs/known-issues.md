@@ -246,6 +246,82 @@ control, wire propagation, cache refusal, and recovery after only the stylesheet
 broadens D4: until a fingerprinted aggregate-failure memo exists, a file with a deterministic uncounted asset
 recomputes its combined File Cost rather than caching a floor as a measurement.
 
+### D13: An image referenced from counted CSS is disclosed, not counted
+**Status: Accepted scope** · Decided 2026-07-18 while fixing the silent-drop defect
+
+A stylesheet's `url()` graph can reference kinds outside the processed taxonomy — images, SVG. Those bytes
+ship, so they are disclosed at their real size under `uncounted_assets`, which makes the result a floor and
+holds it at Medium confidence (FR-018b).
+
+They are **not counted**, and the distinction is deliberate rather than technical. An image needs no processor
+— its shipped size is its raw bytes compressed, exactly like a font — so counting it would be easy. What stops
+it is that counting changes what the number *means* for a whole category of packages, and the esbuild oracle
+and every accuracy baseline would have to be re-measured to confirm the two sides still agree on what a build
+emits for an image reference. That is a measurement task, not a code change, and it is not this fix.
+
+The cost of the current choice is real and should not be hidden: a UI kit shipping sprites reads Medium with a
+floor rather than High with a total. That is the honest reading of what we know, and it is a strict improvement
+on the previous behaviour, where those bytes left the headline through a silent `None` while the result still
+claimed High confidence.
+
+### D14: Runtime-fetched CSS resources are disclosed but never counted
+**Status: Accepted scope** · Decided 2026-07-18
+
+A CDN `@import` or a remote `url()` is disclosed on the `external` stage and excluded from the number. This
+follows ADR-0004: the tool measures what an import *ships*, and a resource the browser fetches from another
+origin is not shipped by this package. The measured size is therefore exact and keeps its budget verdict; only
+confidence drops.
+
+We do not fetch the resource to size it. Doing so would make a measurement depend on the network, make it
+non-deterministic and non-cacheable, and let a package's reported cost change without any byte on disk
+changing — all of which ADR-0006 exists to prevent.
+
+### D15: `shared_bytes` explains JavaScript sharing only
+**Status: Deferred** · Raised by the 2026-07-18 asset review (A8)
+
+File Cost deduplicates a stylesheet shared by several imports, but `shared_modules`/`duplicate_imports` are
+built from JS-graph module contributions and cannot see assets. So a UI kit imported from twenty files
+contributes its stylesheet twenty times to Combined Import Cost with nothing saying those twenty are one file,
+and a user can see a gap between Combined Import Cost and File Cost with no asset-sharing explanation.
+
+Not fixed now because it shows no wrong number — both quantities are correct under their own definitions, and
+ADR-0004 already sanctions counting a shared dependency once per import. It is an explanation gap, and the fix
+(emitting asset paths as first-class `ModuleContribution`s so the existing sharing model covers them) is a
+feature with wire and UI surface, not a correction.
+
+### D16: Asset composition reaches only the hover
+**Status: Deferred** · Raised by the 2026-07-18 asset review (A6/A7)
+
+`asset_breakdown` has one consumer: the import hover. `FileSizeDocumentResponse` carries no breakdown at all,
+so the status bar and "Show Current File Size" headline include asset bytes without any surface saying so. The
+extension also has no rendering for "this number is a disclosed upper bound", a sentence the CLI has verbatim —
+so an `imprecise_assets` File Cost silently returns `not-evaluated` from its budget with nothing explaining
+why. Relatedly, `module_breakdown` derives from JS rendered bytes, so a CSS-dominant package's "top modules"
+list sums to a fraction of the headline beside it.
+
+Not fixed now because the numbers are right and disclosed on the import surface; this is missing explanation,
+not a wrong value. It is grouped as one item because the fix is one change — carry the breakdown and the
+quality sentence onto the file-level response and render both.
+
+### D17: A per-import floor can still be compared against a budget
+**Status: Deferred (spec defect, not a code defect)** · Raised by the 2026-07-18 asset review (A9)
+
+`NON_BUDGETABLE_RESULT_STAGES` contains only `imprecise_assets`, so a per-import result carrying a
+deterministic `uncounted_assets` floor is compared against `perImportBrotliBytes` on its JS-only bytes.
+
+The asymmetry is what keeps this off the fix-now list: budgeting a floor produces **false passes only, never
+false failures**. A floor F is at most the true cost T, so a violation fires only when F exceeds the limit,
+which forces T to exceed it too — every reported failure is true, and the only error is silence when
+F ≤ limit < T. Note this is the opposite of the hazard the list was built for: `protocol.rs` justifies
+non-budgetability as "comparing it with a threshold can produce a false failure", which is the over-count
+shape and does not apply to a floor at all. The list was never asked the under-count question.
+
+The CI surfaces are independently closed: `incomplete` propagation makes `isUsableFileSize` reject the file, so
+`importlens check` returns `EXIT_COULD_NOT_MEASURE` rather than 0. The residual is the workspace report's
+`budgetViolationCount`, which holds no File Cost and so under-counts violations. The code currently matches
+SRS FR-032a's per-import enumeration exactly; that enumeration contradicts its own headline and ADR-0006
+invariant 5, so the decision to make is which of the two moves.
+
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
 

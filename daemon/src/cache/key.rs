@@ -102,9 +102,18 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// retain a never-reusable fingerprint and an `asset_io` stage, and CSS/binary compressor failures
 /// retain `compression`. Cached `+7` resolve failures and disclosed asset floors lack those causes
 /// and could otherwise outlive the filesystem/machine condition that produced them.
+/// `rolldown-1.1.x+9` (2026-07-18): a stylesheet's `url()` graph is now classified by what the
+/// reference IS rather than by whether its extension is countable. A shipped file outside the
+/// CSS/wasm/font taxonomy (an image, an SVG) is disclosed with its real bytes instead of leaving
+/// through a silent `None`; a local resource that could not be located or whose URLs could not be
+/// inspected is reported as an omission on `uncounted_assets` rather than as an over-count on
+/// `imprecise_assets`; and a runtime-fetched resource is disclosed on `external`, which keeps the
+/// exact size budgetable. Cached `+8` entries can therefore be short by an undisclosed image at
+/// High confidence, or carry an omission mislabelled as imprecision — both of which changed
+/// completeness, confidence, and budgetability — so they must be rejected on read.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+8"
+        "rolldown-1.1.x+9"
     };
 }
 
