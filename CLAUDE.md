@@ -12,13 +12,26 @@ Project instructions for agents working in this repository.
 
 ## Deciding What To Fix Now
 
-A finding being **real** is not the same as it being **blocking**.
+**This section governs findings YOU surface. It has no authority over work I asked for.**
 
-> **Fix it in the current piece of work only if it (a) shows the user a WRONG NUMBER, or (b) can WEDGE the system or lose data.**
+If I ask for something — once, or in passing, or as part of a list — it is not a candidate for
+triage. Do it. Writing it into `docs/known-issues.md` instead of doing it is not a decision, it is a
+deferral wearing a decision's clothes, and it does not count as completing the request. If it cannot
+be done, say so in the reply, with the reason, and say what you would need. Never park my request in
+a document and report the task finished.
 
-Everything else gets an entry in `docs/known-issues.md` — stating what actually happens and why it is not fixed — and goes back in the queue. Add the entry when you **decide** not to fix something, not when you find it.
+The bar below exists for one purpose: stopping YOU from expanding scope on your own initiative,
+because a review pass will always generate more findings than are worth chasing.
 
-If a fix chains into a third round on the same sub-item, stop and re-check it against the plan. Do not let the next review report decide your priorities for you.
+> **A finding you surfaced gets fixed in the current piece of work only if it (a) shows the user a
+> WRONG NUMBER, or (b) can WEDGE the system or lose data.**
+
+Everything else you find gets an entry in `docs/known-issues.md` — stating what actually happens and
+why it is not fixed — and goes back in the queue. Add the entry when you **decide** not to fix
+something, not when you find it.
+
+If a fix chains into a third round on the same sub-item, stop and re-check it against the plan. Do
+not let the next review report decide your priorities for you.
 
 ## File And Formatting Rules
 

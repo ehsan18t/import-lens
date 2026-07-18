@@ -58,7 +58,7 @@ Real work, queued rather than abandoned. None of these is a wrong number or a we
 release, but each is worth turning into a task.
 
 ### D6: "Unavailable" is one label for several causes, and one unbundleable leaf discards the whole package
-**Status: Deferred — but the ASSET leaf is now fixed (2026-07-18)** · The most visible gap in real projects · Fix universally, never per-package
+**Status: Deferred — ENGINE scope. The asset half is closed (2026-07-18)** · The most visible gap in real projects · Fix universally, never per-package
 
 **The asset half is closed.** A directly imported image, icon or media file was one of these fatal leaves and
 is no longer: `import logo from './logo.png'` failed rolldown's loader with `InvalidData` because a PNG is not
@@ -71,8 +71,11 @@ counted — so the JavaScript measures exactly and the shipped bytes are not sil
 The allowlist is deliberately an allowlist. An unknown extension still falls through to Rolldown, because
 intercepting something we cannot name would stub a module that might have been real JavaScript.
 
-The native-addon and unresolvable-specifier leaves in the table below are unchanged and still fatal; those need
-the universal external-boundary fix this entry describes.
+The native-addon and unresolvable-specifier leaves in the table below are unchanged and still fatal. **They are
+not asset-counting work.** A `.node` addon and a deep-path `require` that cannot resolve are engine and
+resolver concerns that happen to share this entry because a shipped asset used to be a third trigger for the
+same symptom. Asset counting no longer contributes to D6 at all; what remains needs the universal
+external-boundary fix described below, at the engine seam.
 
 **What the user sees.** In a real `package.json`, a growing fraction of dependencies render **unavailable**,
 and not only native CLIs. The bigger the project, the more of them, which reads as "the build was too big." It
@@ -122,7 +125,7 @@ unresolved, dynamic-require, graph-limit, timeout, parse) sizes the fix and surf
 that first.
 
 ### D7: A stylesheet its own package declares droppable is counted anyway
-**Status: Deferred** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the B2 adversarial review
+**Status: Accepted** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the B2 adversarial review
 
 A bundler DROPS a bare `import "./styles.css"` from a package declaring `"sideEffects": false`, so that CSS
 never ships. Import Lens counts it anyway: the plugin banks an asset in the `load` hook, and rolldown only
@@ -139,42 +142,23 @@ rollup, and vite, which is exactly why maintainers do not ship it.
 **Do NOT fix it by filtering the collected assets against what the build retained.** That inverts into a far
 worse under-count: the `Empty` stub gives a stylesheet no statements, so rolldown treats it as side-effect-free
 and drops it even when the package declares nothing, which is the common and correct case. Filtering by
-retention would zero out the CSS for `@uiw/react-md-editor` and undo B2 entirely. The honest fix asks the
-DECLARATION rather than the build: `SideEffectsMode::False` already identifies the case at the single-import
-boundary, and `resolver` already owns rolldown's own glob matcher for per-asset matching. The File Cost path
-needs per-asset package attribution first, which is the real work.
+retention would zero out the CSS for `@uiw/react-md-editor` and undo B2 entirely. The honest fix asks the DECLARATION rather than the build — and that is exactly what this product forbids.
+FR-021 (Critical) and the engine boundary contract both state that the daemon's own reading of `sideEffects` is
+reporting metadata that "decides a badge, never a byte", and both name rolldown as the only authority on
+retention. Dropping an asset on our reading makes it decide bytes. Closing D7 therefore requires amending a
+Critical requirement, not writing code, and doing that quietly would be the narrow-the-spec-to-fit-the-code
+failure this repository has been bitten by before.
 
-### D21: A missing `@import` target makes the whole asset result permanently non-durable
-**Status: Deferred, with the root cause corrected** · Raised, mis-fixed, and reverted 2026-07-18
+Re-verified 2026-07-18, and the other two blockers are structural rather than incremental. Rolldown's
+`HookLoadArgs` carries `id`, `module_idx` and `asserted_module_type` and no importer at all; `resolve_id` has
+the importer and discards it on the success path, and the word appears in no daemon file outside `plugin.rs`,
+so no asset-to-package mapping exists anywhere to build on. And the `sideEffects` patterns are collapsed to a
+bool deliberately — `resolver.rs` says in prose that retaining them "invited a second reading of them", which
+is precisely the second reading D7 would need.
 
-A stylesheet whose `@import` target does not exist records a **failed read**, and that stamps the
-request-local `asset_io` stage on the entire asset result. `asset_io` means "the filesystem was
-having a moment, retry later", so the result is refused by every durable store. But a missing file
-named by a package's own stylesheet is a deterministic property of that package, not a filesystem
-moment — so such a package is never cached and is re-measured on every keystroke.
-
-**The fix attempted here was wrong and has been reverted.** The theory was that a specifier like
-`pkg/base.css` resolved to a "phantom" path that could never exist, so declining it before the read
-would avoid the failed read entirely. Two things were wrong with that:
-
-- **CSS has no bare specifiers.** `pkg/base.css` is an ordinary relative URL, so
-  `<dir-of-sheet>/pkg/base.css` is exactly where that file would live. It is not a phantom, and
-  recording it is correct: creating it later *should* invalidate the result.
-- Declining made the failure deterministic and therefore **cacheable**, which pinned the package's
-  CSS at zero counted bytes permanently. Adversarial verification reproduced it against the running
-  service: `@import 'created-later.css'` measured 0 bytes, was served from cache on repeat, and
-  **still** served 0 bytes after the file was created. The `./`-prefixed spelling recovered
-  correctly, so the invariant survived for one spelling and broke for the other.
-
-An earlier draft of the same fix was worse still, rejecting on spelling alone, which would have
-dropped every `@import "theme.css"` to raw disclosure.
-
-**The real fix is a classification split, not a resolve change.** A read that fails with
-`NotFound` is a deterministic fact about the package and should keep its never-fresh path evidence
-*without* the request-local `asset_io` stage; a read that fails for any other reason (permission,
-lock, transient IO) is genuinely request-local and must keep it. Today `failed_paths` drives both,
-so the two cannot be told apart. Splitting them keeps invalidation-on-create for every spelling and
-still lets a deterministically incomplete package be cached.
+Accepted rather than Deferred, because Deferred says "worth doing, not now" and this is not queued work: it is
+a measured non-shape in the ecosystem whose fix conflicts with a Critical requirement. Revisit only if the
+ecosystem survey changes.
 
 ### D8: One stylesheet Lightning CSS cannot parse falls back alone, but a cyclic one undercounts
 **Status: Accepted** · Never below the pre-B2 floor · Found by the B2 adversarial review
@@ -195,41 +179,6 @@ way.
 
 The `asset-counting-plan.md` claim that the provider falls back to `oxc_resolver` for a bare `@import` describes
 work that was not built; the plan is corrected rather than the gap papered over.
-
-### D10: Every reported brotli size is high, because the daemon compresses at quality 4
-**Status: Deferred** · A systematic over-report on every package · Surfaced by the B2 oracle re-baseline
-
-The daemon compresses brotli at **quality 4** (`pipeline::compress`), while the web serves **quality 11**. So
-every brotli figure Import Lens shows is larger than what a CDN actually delivers, by 2.6 to 15% across the
-accuracy benchmarks and around 25% on highly-compressible CSS. It is not an asset-counting artifact and it
-predates B2 by a long way: the accuracy oracle compresses at quality 11, which is why every benchmark has always
-read high, and it is the entire reason the CSS benchmark needed its own tolerance rather than the shared gate
-being loosened.
-
-Quality 4 is a deliberate speed choice (the compressor runs per keystroke and quality 11 can take seconds on a
-large chunk), so this is a real trade, not an oversight. But the number is presented as the brotli size, and it
-is not the brotli size anyone ships. The honest options are to compress at 11 off the interactive path (a
-background refinement of the number), to name the figure for what it is, or to accept it deliberately. It is
-recorded rather than fixed because it touches every number in the product and every baseline that gates them,
-which is its own piece of work.
-
-**Measured 2026-07-18**, on the real 139,262-byte minified extension bundle rather than a synthetic payload (a
-repeated literal compresses to almost nothing and makes every quality look identical):
-
-| quality | size | time |
-| --- | ---: | ---: |
-| 4 (current) | 39,671 B | 27 ms |
-| 9 | 36,775 B | 60 ms |
-| 11 (what the web serves) | 34,196 B | 955 ms |
-
-Two things follow. **Quality 11 is not available to us on the interactive path**: 35x the time and nearly a
-full second per artifact, for a compressor that runs per keystroke and often more than once. That closes the
-"just raise it" option, which had never been costed.
-
-**Quality 9 is a genuine middle nobody had considered.** It removes half the overstatement — q4 reads 16.0%
-high against q11, q9 reads 7.5% high — for +33 ms. That is the trade actually on the table, and it is a
-product decision about per-keystroke latency rather than a defect to fix. The re-baselining cost is unchanged
-whichever quality is chosen, so it is the same piece of work either way.
 
 ### D9: A stylesheet's own `@import` tree is bounded at 256 files
 **Status: Accepted** · A bound where there was none · Found by the B2 adversarial review
@@ -863,6 +812,8 @@ resolves to nothing is worse than the bloat.
 | D11 | An asset the daemon could not read is disclosed, and that disclosure is cached | 2026-07-18 |
 | D12 | A file total that omits an asset is not structurally flagged as a floor | 2026-07-18 |
 | D20 | Nested rayon inside the asset pool does not widen its admission | 2026-07-18 |
+| D21 | A missing @import target made the whole asset result permanently non-durable | 2026-07-18 |
+| D10 | Every reported brotli size was high, because the daemon compressed at quality 4 | 2026-07-18 |
 | D15 | `shared_bytes` explains JavaScript sharing only | 2026-07-18 |
 | D16 | Asset composition reaches only the hover | 2026-07-18 |
 | D17 | A per-import floor can still be compared against a budget | 2026-07-18 |
