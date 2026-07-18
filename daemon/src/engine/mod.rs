@@ -134,20 +134,6 @@ pub enum AssetKind {
     Font,
 }
 
-impl AssetKind {
-    /// Every kind, so a test can quantify over the whole vocabulary rather than the subset
-    /// someone remembered.
-    pub const ALL: &'static [Self] = &[Self::Css, Self::Wasm, Self::Font];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Css => "css",
-            Self::Wasm => "wasm",
-            Self::Font => "font",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ImportDiagnostic {
     pub stage: String,

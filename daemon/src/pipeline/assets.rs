@@ -1602,13 +1602,50 @@ mod tests {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("il-assets-{}-{tag}-{unique}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    /// A temp workspace that writes its files up front and deletes itself on drop, so an assertion
+    /// failing mid-test cannot leak the directory the way a trailing `remove_dir_all` did.
+    struct Fixture {
+        dir: PathBuf,
+    }
+
+    impl Fixture {
+        /// `Fixture::new("css", &[("index.css", "@import \"./child.css\";"), ("child.css", "…")])`.
+        /// A name may contain `/`; its parent directories are created for it.
+        fn new(tag: &str, files: &[(&str, &str)]) -> Self {
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("il-assets-{}-{tag}-{unique}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("temp dir");
+            let fixture = Self { dir };
+            for (name, contents) in files {
+                fixture.write(name, contents);
+            }
+            fixture
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            self.write_bytes(name, contents.as_bytes())
+        }
+
+        fn write_bytes(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.path(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("fixture parent");
+            }
+            fs::write(&path, bytes).expect("fixture file");
+            path
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 
     fn css_asset(path: &Path) -> CollectedAsset {
@@ -1617,18 +1654,19 @@ mod tests {
 
     #[test]
     fn bundle_css_inlines_the_import_tree_minifies_and_captures_every_read_path() {
-        let dir = temp_dir("css");
-        let entry = dir.join("index.css");
-        let child = dir.join("child.css");
-        fs::write(&child, "  .child   {   color :  red ;  }\n").expect("child");
-        fs::write(
-            &entry,
-            "@import \"./child.css\";\n.entry  {  color :  blue ;  }\n",
-        )
-        .expect("entry");
+        let fixture = Fixture::new(
+            "css",
+            &[
+                ("child.css", "  .child   {   color :  red ;  }\n"),
+                (
+                    "index.css",
+                    "@import \"./child.css\";\n.entry  {  color :  blue ;  }\n",
+                ),
+            ],
+        );
 
-        let bundle = bundle_css(&entry).expect("a valid stylesheet should bundle");
-        fs::remove_dir_all(&dir).ok();
+        let bundle =
+            bundle_css(&fixture.path("index.css")).expect("a valid stylesheet should bundle");
 
         let css = String::from_utf8(bundle.minified_bytes.clone()).expect("utf8");
         // The `@import` child is inlined, both rules survive, and the whitespace is minified away.
@@ -1663,18 +1701,18 @@ mod tests {
 
     #[test]
     fn invalid_utf8_is_a_deterministic_css_input_whether_top_level_or_imported() {
-        let dir = temp_dir("invalid-utf8-css");
-        let child = dir.join("child.css");
-        let importing = dir.join("importing.css");
-        let top_level = dir.join("top-level.css");
-        fs::write(&child, [0xff, 0xfe, 0xfd]).expect("invalid imported stylesheet");
-        fs::write(&importing, "@import './child.css';\n.root { color: red; }")
-            .expect("importing stylesheet");
-        fs::write(&top_level, [0xff, 0xfe, 0xfd]).expect("invalid top-level stylesheet");
+        let fixture = Fixture::new(
+            "invalid-utf8-css",
+            &[(
+                "importing.css",
+                "@import './child.css';\n.root { color: red; }",
+            )],
+        );
+        fixture.write_bytes("child.css", &[0xff, 0xfe, 0xfd]);
+        let top_level = fixture.write_bytes("top-level.css", &[0xff, 0xfe, 0xfd]);
 
-        let imported_failure = process_assets(&[css_asset(&importing)]);
+        let imported_failure = process_assets(&[css_asset(&fixture.path("importing.css"))]);
         let top_level_failure = process_assets(&[css_asset(&top_level)]);
-        fs::remove_dir_all(&dir).ok();
 
         for (label, processed) in [
             ("imported child", imported_failure),
@@ -1702,19 +1740,18 @@ mod tests {
 
     #[test]
     fn dependency_analysis_discovers_a_font_without_rewriting_measured_css() {
-        let dir = temp_dir("css-font-url");
-        let entry = dir.join("index.css");
-        let font = dir.join("probe.woff2");
-        fs::write(
-            &entry,
-            "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n",
-        )
-        .expect("entry");
-        fs::write(&font, [0x5a; 32]).expect("font");
+        let fixture = Fixture::new(
+            "css-font-url",
+            &[(
+                "index.css",
+                "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n",
+            )],
+        );
+        let font = fixture.write_bytes("probe.woff2", &[0x5a; 32]);
 
         let expected_font = read_collected_asset(&font, AssetKind::Font).expect("font snapshot");
-        let bundle = bundle_css(&entry).expect("a valid stylesheet should bundle");
-        fs::remove_dir_all(&dir).ok();
+        let bundle =
+            bundle_css(&fixture.path("index.css")).expect("a valid stylesheet should bundle");
 
         let css = std::str::from_utf8(&bundle.minified_bytes).expect("utf8");
         assert!(
@@ -1725,30 +1762,25 @@ mod tests {
         assert!(bundle.dependency_omissions.is_empty());
     }
 
-    /// **The regression this nearly became.**
-    ///
-    /// `@import "theme.css"` — no `./` — is a RELATIVE url in CSS, and one of the most common
-    /// shapes real stylesheets ship. CSS has no bare-specifier concept, so deciding by spelling
-    /// alone would have dropped every such sheet to raw-byte disclosure. The existence of the file
-    /// beside the sheet is what decides; spelling only matters once nothing is there.
+    /// `@import "theme.css"` — no `./` — is a RELATIVE url in CSS, and one of the most common shapes
+    /// real stylesheets ship. Deciding by spelling alone would have dropped every such sheet to
+    /// raw-byte disclosure; the file's existence beside the sheet is what decides.
     #[test]
     fn an_unprefixed_import_is_relative_to_the_sheet_and_is_counted() {
-        let dir = temp_dir("unprefixed-import");
-        let entry = dir.join("index.css");
-        fs::write(dir.join("theme.css"), ".theme { color: blue }\n").expect("sibling sheet");
-        fs::create_dir_all(dir.join("sub")).expect("subdirectory");
-        fs::write(dir.join("sub").join("dir.css"), ".sub { color: green }\n")
-            .expect("nested sheet");
-        fs::write(
-            &entry,
-            "@import \"theme.css\";\n@import \"sub/dir.css\";\n.a { color: red }\n",
-        )
-        .expect("entry");
+        let fixture = Fixture::new(
+            "unprefixed-import",
+            &[
+                ("theme.css", ".theme { color: blue }\n"),
+                ("sub/dir.css", ".sub { color: green }\n"),
+                (
+                    "index.css",
+                    "@import \"theme.css\";\n@import \"sub/dir.css\";\n.a { color: red }\n",
+                ),
+            ],
+        );
 
-        let result = bundle_css(&entry);
-        fs::remove_dir_all(&dir).ok();
-
-        let bundle = result.expect("an unprefixed relative @import must resolve beside the sheet");
+        let bundle = bundle_css(&fixture.path("index.css"))
+            .expect("an unprefixed relative @import must resolve beside the sheet");
         let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
         assert!(
             css.contains(".theme") && css.contains(".sub") && css.contains(".a"),
@@ -1756,90 +1788,76 @@ mod tests {
         );
     }
 
-    /// **The daemon-killer.** Lightning CSS cycle-detects on the very path spelling `resolve` hands
-    /// back, and the built-in resolver's naive `with_file_name` join never normalizes `..` — so a
-    /// cycle crossing a `../` used to yield a longer, distinct key for the same file on every hop,
-    /// the dedup never fired, and the recursion overflowed the stack. That is not catchable:
-    /// `catch_unwind` never runs, the process `__fastfail`s, and every in-flight request dies with
-    /// it. A package can ship such a cycle without knowing — browsers and real bundlers dedupe on a
-    /// resolved URL, so it is silent everywhere else.
+    /// **The daemon-killer.** Lightning CSS cycle-detects on the path spelling `resolve` hands back,
+    /// and the built-in resolver's naive `with_file_name` join never normalizes `..`, so a cycle
+    /// crossing a `../` yielded a distinct key for the same file on every hop, the dedup never
+    /// fired, and the recursion overflowed the stack — uncatchable, `__fastfail`, every in-flight
+    /// request dead with it.
     ///
     /// If this test ever hangs or aborts the runner rather than failing, THAT is the regression.
     #[test]
     fn a_dot_dot_crossing_import_cycle_terminates_instead_of_killing_the_process() {
-        let dir = temp_dir("cycle");
-        let components = dir.join("components");
-        let theme = dir.join("theme");
-        fs::create_dir_all(&components).expect("components");
-        fs::create_dir_all(&theme).expect("theme");
-        let button = components.join("button.css");
-        let tokens = theme.join("tokens.css");
         // A mutual cycle that crosses `../` in both directions.
-        fs::write(
-            &button,
-            "@import \"../theme/tokens.css\";\n.button { color: red }\n",
-        )
-        .expect("button");
-        fs::write(
-            &tokens,
-            "@import \"../components/button.css\";\n:root { --x: 1 }\n",
-        )
-        .expect("tokens");
-        let other = dir.join("other.css");
-        fs::write(&other, ".other { color: teal }\n").expect("other");
+        let fixture = Fixture::new(
+            "cycle",
+            &[
+                (
+                    "components/button.css",
+                    "@import \"../theme/tokens.css\";\n.button { color: red }\n",
+                ),
+                (
+                    "theme/tokens.css",
+                    "@import \"../components/button.css\";\n:root { --x: 1 }\n",
+                ),
+                ("other.css", ".other { color: teal }\n"),
+            ],
+        );
 
         // The multi-entry path is the exposed one: it is what the synthetic entry serves.
-        let canonical = |path: &Path| std::fs::canonicalize(path).expect("canonicalize");
-        let result = bundle_css_set(&[canonical(&button), canonical(&other)]);
-        fs::remove_dir_all(&dir).ok();
+        let canonical =
+            |name: &str| std::fs::canonicalize(fixture.path(name)).expect("canonicalize");
+        let result = bundle_css_set(&[canonical("components/button.css"), canonical("other.css")]);
 
         // Terminating at all is the whole assertion: reaching this line means the process survived.
         let bundle = result.expect("a cyclic @import must terminate, not overflow the stack");
         let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
-        // The sheets NOT caught in the cycle are still counted, so one package's broken CSS cannot
-        // sink the set. Lightning CSS drops the cyclic sheet's own rules, which undercounts that one
-        // stylesheet — pathological input, and still strictly better than before B2, when a
-        // CSS-shipping package contributed zero either way. Recorded in known-issues.
+        // Sheets outside the cycle are still counted, so one package's broken CSS cannot sink the
+        // set. Lightning CSS drops the cyclic sheet's own rules, undercounting that one stylesheet —
+        // recorded in known-issues.
         assert!(
             css.contains(".other"),
             "a stylesheet outside the cycle must still be counted: {css}"
         );
     }
 
-    /// The tree is bounded: assets are never graph modules, so none of the engine's limits ever
-    /// applied to them. The file count bounds BOTH breadth and depth, because it is the only bound
-    /// available: giving the walk its own big stack does NOT work, since Lightning CSS recurses on
-    /// rayon workers whose stacks it does not own. 256 is far below where a build's stack gives out
-    /// and far above any real stylesheet's `@import` tree.
+    /// The file count bounds BOTH breadth and depth because it is the only bound available: giving
+    /// the walk its own big stack does NOT work, since Lightning CSS recurses on rayon workers whose
+    /// stacks it does not own.
     #[test]
     fn a_stylesheet_tree_past_the_file_budget_is_refused_rather_than_read_forever() {
-        let dir = temp_dir("budget");
+        let fixture = Fixture::new("budget", &[]);
         let leaves = MAX_STYLESHEET_FILES + 8;
         let mut entry = String::new();
         for index in 0..leaves {
-            fs::write(
-                dir.join(format!("leaf{index}.css")),
-                format!(".rule{index} {{ color: red }}\n"),
-            )
-            .expect("leaf");
+            fixture.write(
+                &format!("leaf{index}.css"),
+                &format!(".rule{index} {{ color: red }}\n"),
+            );
             entry.push_str(&format!("@import \"./leaf{index}.css\";\n"));
         }
-        fs::write(dir.join("index.css"), entry).expect("entry");
+        fixture.write("index.css", &entry);
 
-        let result = bundle_css(&dir.join("index.css"));
-        fs::remove_dir_all(&dir).ok();
-
-        let error = result.expect_err("a tree past the file budget must be refused");
+        let error = bundle_css(&fixture.path("index.css"))
+            .expect_err("a tree past the file budget must be refused");
         assert!(error.contains("limit"), "{error}");
     }
 
-    /// An ordinary chain, well inside the budget, still bundles. This is the other half of the bound:
-    /// it must refuse the absurd without refusing the real. (It stays shallow deliberately — a test
-    /// that recursed near the budget would overflow a DEBUG build's stack, where frames run an order
-    /// of magnitude larger than the release build the budget is sized against.)
+    /// The other half of the bound: it must refuse the absurd without refusing the real. It stays
+    /// shallow deliberately — a test that recursed near the budget would overflow a DEBUG build's
+    /// stack, whose frames run an order of magnitude larger than the release build it is sized for.
     #[test]
     fn an_ordinary_import_chain_inside_the_budget_still_bundles() {
-        let dir = temp_dir("chain");
+        let fixture = Fixture::new("chain", &[]);
         let depth = 24;
         for index in 0..depth {
             let next = if index + 1 < depth {
@@ -1847,17 +1865,14 @@ mod tests {
             } else {
                 String::new()
             };
-            fs::write(
-                dir.join(format!("sheet{index}.css")),
-                format!("{next}.rule{index} {{ color: red }}\n"),
-            )
-            .expect("sheet");
+            fixture.write(
+                &format!("sheet{index}.css"),
+                &format!("{next}.rule{index} {{ color: red }}\n"),
+            );
         }
 
-        let result = bundle_css(&dir.join("sheet0.css"));
-        fs::remove_dir_all(&dir).ok();
-
-        let bundle = result.expect("an ordinary chain must bundle");
+        let bundle =
+            bundle_css(&fixture.path("sheet0.css")).expect("an ordinary chain must bundle");
         let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
         assert!(css.contains(".rule0") && css.contains(".rule23"), "{css}");
     }
@@ -1867,28 +1882,24 @@ mod tests {
     /// ordinary packages ship.
     #[test]
     fn a_remote_import_is_external_and_does_not_sink_the_stylesheet() {
-        let dir = temp_dir("remote");
-        let entry = dir.join("index.css");
-        fs::write(
-            &entry,
-            "@import url(\"https://fonts.googleapis.com/css2?family=Inter\");\n.a { color: red }\n",
-        )
-        .expect("entry");
+        let fixture = Fixture::new(
+            "remote",
+            &[(
+                "index.css",
+                "@import url(\"https://fonts.googleapis.com/css2?family=Inter\");\n.a { color: red }\n",
+            )],
+        );
 
-        let result = bundle_css(&entry);
-        fs::remove_dir_all(&dir).ok();
-
-        let bundle = result.expect("a remote @import must not fail the stylesheet");
+        let bundle = bundle_css(&fixture.path("index.css"))
+            .expect("a remote @import must not fail the stylesheet");
         let css = std::str::from_utf8(&bundle.minified_bytes).expect("utf8");
         assert!(
             css.contains(".a"),
             "the local rules must still be counted: {css}"
         );
         // A CDN stylesheet is fetched at runtime and is not a byte this package ships, so the
-        // measured size is EXACT and must keep its budget verdict. It is still disclosed — just on
-        // `external`, which is durable AND budgetable, rather than on a precision stage that
-        // refuses to judge the number. Routing it through the latter silently disabled budgeting
-        // for every package that `@import`s a web font.
+        // measured size is EXACT and must keep its budget verdict. Disclosing it on a precision
+        // stage instead silently disabled budgeting for every package that `@import`s a web font.
         assert_eq!(
             bundle.dependency_external.len(),
             1,
@@ -1929,15 +1940,14 @@ mod tests {
     /// bare `None` — out of the number, out of every disclosure, still High confidence.
     #[test]
     fn an_image_referenced_by_css_is_disclosed_with_its_real_size() {
-        let dir = temp_dir("image-url");
-        let entry = dir.join("index.css");
-        fs::write(dir.join("bg.png"), vec![7u8; 4096]).expect("image");
-        fs::write(&entry, ".a { background-image: url('./bg.png') }\n").expect("entry");
+        let fixture = Fixture::new(
+            "image-url",
+            &[("index.css", ".a { background-image: url('./bg.png') }\n")],
+        );
+        fixture.write_bytes("bg.png", &[7u8; 4096]);
 
-        let result = bundle_css(&entry);
-        fs::remove_dir_all(&dir).ok();
-
-        let bundle = result.expect("an image reference must not fail the stylesheet");
+        let bundle = bundle_css(&fixture.path("index.css"))
+            .expect("an image reference must not fail the stylesheet");
         assert_eq!(
             bundle.referenced_uncounted.len(),
             1,
@@ -1954,24 +1964,22 @@ mod tests {
     }
 
     /// A `url()` in a custom property fails lightningcss's dependency print while both measuring
-    /// prints succeed, so the sheet is counted with its whole `url()` graph undiscovered. One such
-    /// declaration disables discovery for every sheet in the union, so the omission has to reach
+    /// prints succeed, so the sheet is counted with its whole `url()` graph undiscovered — and one
+    /// such declaration disables discovery for every sheet in the union. The omission has to reach
     /// `has_uncounted_assets` or the short total is cached as complete.
     #[test]
     fn an_uninspectable_url_graph_is_an_omission_not_an_over_count() {
-        let dir = temp_dir("ambiguous-url");
-        let entry = dir.join("index.css");
-        fs::write(dir.join("icons.woff2"), vec![3u8; 2048]).expect("font");
-        fs::write(
-            &entry,
-            ":root { --icon-font: url(./icons.woff2) }\n.a { color: red }\n",
-        )
-        .expect("entry");
+        let fixture = Fixture::new(
+            "ambiguous-url",
+            &[(
+                "index.css",
+                ":root { --icon-font: url(./icons.woff2) }\n.a { color: red }\n",
+            )],
+        );
+        fixture.write_bytes("icons.woff2", &[3u8; 2048]);
 
-        let result = bundle_css(&entry);
-        fs::remove_dir_all(&dir).ok();
-
-        let bundle = result.expect("an ambiguous url() must not fail the stylesheet");
+        let bundle = bundle_css(&fixture.path("index.css"))
+            .expect("an ambiguous url() must not fail the stylesheet");
         assert!(
             !bundle.minified_bytes.is_empty(),
             "the sheet itself must still be measured: {bundle:?}"
@@ -2009,26 +2017,29 @@ mod tests {
         );
     }
 
-    /// One unprocessable sheet must not take the others down with it. In the File Cost's combined
-    /// build the set spans every import in the runtime group, so all-or-nothing meant one package's
-    /// `.scss` silently reverted CSS counting for all of them.
+    /// One unprocessable sheet must not take the others down with it. The set spans every import in
+    /// the runtime group, so all-or-nothing meant one package's `.scss` silently reverted CSS
+    /// counting for all of them.
     #[test]
     fn one_unparseable_stylesheet_does_not_sink_the_rest_of_the_set() {
-        let dir = temp_dir("isolation");
-        let good = dir.join("good.css");
-        let bad = dir.join("bad.scss");
-        fs::write(&good, ".good { color: red }\n").expect("good");
-        // Real preprocessor syntax: Lightning CSS parses plain CSS only.
-        fs::write(
-            &bad,
-            "$brand: red;\n@mixin thing { color: $brand }\n.bad { @include thing }\n",
-        )
-        .expect("bad");
-        let assets = vec![css_asset(&good), css_asset(&bad)];
+        let fixture = Fixture::new(
+            "isolation",
+            &[
+                ("good.css", ".good { color: red }\n"),
+                // Real preprocessor syntax: Lightning CSS parses plain CSS only.
+                (
+                    "bad.scss",
+                    "$brand: red;\n@mixin thing { color: $brand }\n.bad { @include thing }\n",
+                ),
+            ],
+        );
+        let assets = vec![
+            css_asset(&fixture.path("good.css")),
+            css_asset(&fixture.path("bad.scss")),
+        ];
         let expected_bad = assets[1].path.clone();
 
         let processed = process_assets(&assets);
-        fs::remove_dir_all(&dir).ok();
 
         let css = processed
             .contributions
@@ -2051,29 +2062,28 @@ mod tests {
         );
     }
 
-    /// When the union AND every per-sheet retry fail, the outcome must be exactly the pre-B2
-    /// fallback: each stylesheet disclosed ONCE. The retry used to report each failure as it went and
-    /// then hand back an error, so the outer arm disclosed them all a second time and the diagnostic
-    /// doubled its own count and byte total — a wrong number in the one place that exists to be
-    /// honest about what is missing.
+    /// When the union AND every per-sheet retry fail, each stylesheet must be disclosed ONCE. The
+    /// retry used to report each failure as it went and then hand back an error, so the outer arm
+    /// disclosed them all a second time and the diagnostic doubled its own count and byte total — a
+    /// wrong number in the one place that exists to be honest about what is missing.
     #[test]
     fn a_set_where_every_stylesheet_fails_discloses_each_of_them_exactly_once() {
-        let dir = temp_dir("allfail");
-        let first = dir.join("one.scss");
-        let second = dir.join("two.scss");
-        fs::write(
-            &first,
-            "$a: red;\n@mixin m { color: $a }\n.x { @include m }\n",
-        )
-        .expect("one");
-        fs::write(
-            &second,
-            "$b: blue;\n@mixin n { color: $b }\n.y { @include n }\n",
-        )
-        .expect("two");
-        let assets: Vec<CollectedAsset> = [&first, &second]
+        let fixture = Fixture::new(
+            "allfail",
+            &[
+                (
+                    "one.scss",
+                    "$a: red;\n@mixin m { color: $a }\n.x { @include m }\n",
+                ),
+                (
+                    "two.scss",
+                    "$b: blue;\n@mixin n { color: $b }\n.y { @include n }\n",
+                ),
+            ],
+        );
+        let assets: Vec<CollectedAsset> = ["one.scss", "two.scss"]
             .iter()
-            .map(|path| css_asset(path))
+            .map(|name| css_asset(&fixture.path(name)))
             .collect();
         let expected_paths = assets
             .iter()
@@ -2081,7 +2091,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         let processed = process_assets(&assets);
-        fs::remove_dir_all(&dir).ok();
 
         assert!(
             processed.contributions.is_empty(),
@@ -2105,19 +2114,16 @@ mod tests {
         );
     }
 
-    /// The union can fail for a reason NO individual sheet fails for — it is the only thing charged
-    /// for the whole set — and then every sheet counts and `uncounted` is empty. That combination
-    /// used to produce a size that was over-counted (a shared `@import` inlined into each sheet),
-    /// carried NO diagnostic, and therefore read as High confidence and was written to disk. The
-    /// over-count is the accepted cost of degrading; being silent about it was not.
+    /// The union can fail for a reason NO individual sheet fails for, and then every sheet counts and
+    /// `uncounted` is empty. That combination used to produce an over-counted size (a shared
+    /// `@import` inlined into each sheet) carrying NO diagnostic, so it read as High confidence and
+    /// was written to disk. The over-count is the accepted cost of degrading; the silence was not.
     #[test]
     fn a_set_that_degrades_to_per_sheet_still_discloses_that_it_may_read_high() {
-        let dir = temp_dir("degraded");
+        let fixture = Fixture::new("degraded", &[("shared.css", ".shared { color: red }\n")]);
         // Each sheet's own tree is well inside the budget; only the two together breach it, which
         // is what makes the union fail while each sheet on its own succeeds.
         let per_sheet_leaves = 140;
-        let shared = dir.join("shared.css");
-        fs::write(&shared, ".shared { color: red }\n").expect("shared");
 
         let entries: Vec<PathBuf> = ["a", "b"]
             .iter()
@@ -2125,16 +2131,10 @@ mod tests {
                 let mut source = String::from("@import \"./shared.css\";\n");
                 for index in 0..per_sheet_leaves {
                     let leaf = format!("{name}{index}.css");
-                    fs::write(
-                        dir.join(&leaf),
-                        format!(".r{name}{index} {{ color: red }}\n"),
-                    )
-                    .expect("leaf");
+                    fixture.write(&leaf, &format!(".r{name}{index} {{ color: red }}\n"));
                     source.push_str(&format!("@import \"./{leaf}\";\n"));
                 }
-                let entry = dir.join(format!("{name}.css"));
-                fs::write(&entry, source).expect("entry");
-                entry
+                fixture.write(&format!("{name}.css"), &source)
             })
             .collect();
 
@@ -2152,7 +2152,6 @@ mod tests {
         );
 
         let processed = process_assets(&assets);
-        fs::remove_dir_all(&dir).ok();
 
         assert!(
             processed
@@ -2193,34 +2192,13 @@ mod tests {
     }
 
     #[test]
-    fn bundle_css_is_an_err_on_a_broken_stylesheet_so_the_caller_can_fall_back() {
-        let dir = temp_dir("broken");
-        let entry = dir.join("index.css");
-        // A dangling @import cannot be resolved from disk: bundling must error, not panic, so the
-        // caller reverts to raw-byte disclosure.
-        fs::write(
-            &entry,
-            "@import \"./does-not-exist.css\";\n.a { color: red }\n",
-        )
-        .expect("entry");
-
-        let result = bundle_css(&entry);
-        fs::remove_dir_all(&dir).ok();
-
-        assert!(
-            result.is_err(),
-            "a dangling @import must be an Err: {result:?}"
-        );
-    }
-
-    #[test]
     fn a_failed_css_read_remains_unverifiable_after_a_later_success() {
-        let dir = temp_dir("failed-then-readable");
-        let child = dir.join("created.css");
+        let fixture = Fixture::new("failed-then-readable", &[]);
+        let child = fixture.path("created.css");
         let provider = TrackingProvider::new(&[]);
 
         assert!(provider.read(&child).is_err(), "the first read is missing");
-        fs::write(&child, ".created { color: red }").expect("create child");
+        fixture.write("created.css", ".created { color: red }");
         assert!(provider.read(&child).is_ok(), "the retry can read it");
 
         let inputs = provider.into_read_inputs();
@@ -2231,7 +2209,6 @@ mod tests {
             ..ProcessedAssets::default()
         };
         let freshness = processed.freshness_fingerprints();
-        fs::remove_dir_all(&dir).ok();
 
         assert!(
             freshness
@@ -2278,9 +2255,8 @@ mod tests {
 
     #[test]
     fn a_binary_compressor_failure_is_disclosed_and_non_durable() {
-        let dir = temp_dir("binary-compression-failure");
-        let path = dir.join("probe.woff2");
-        fs::write(&path, [0x51; 64]).expect("font");
+        let fixture = Fixture::new("binary-compression-failure", &[]);
+        let path = fixture.write_bytes("probe.woff2", &[0x51; 64]);
         let asset = read_collected_asset(&path, AssetKind::Font).expect("font snapshot");
         let mut processed = ProcessedAssets::default();
 
@@ -2288,7 +2264,6 @@ mod tests {
             Err("injected failure".to_owned())
         })
         .expect("a per-asset compressor failure falls back instead of aborting the stage");
-        fs::remove_dir_all(&dir).ok();
 
         assert_eq!(processed.uncounted.len(), 1);
         assert!(processed.contributions.is_empty());
@@ -2304,17 +2279,17 @@ mod tests {
     /// once — not summed twice, which is what bundling them separately would do.
     #[test]
     fn bundle_css_set_unions_several_stylesheets_and_dedupes_a_shared_import() {
-        let dir = temp_dir("set");
-        let shared = dir.join("shared.css");
-        let first = dir.join("a.css");
-        let second = dir.join("b.css");
-        fs::write(&shared, ".shared { color: red }\n").expect("shared");
-        fs::write(&first, "@import \"./shared.css\";\n.a { color: blue }\n").expect("a");
-        fs::write(&second, "@import \"./shared.css\";\n.b { color: green }\n").expect("b");
+        let fixture = Fixture::new(
+            "set",
+            &[
+                ("shared.css", ".shared { color: red }\n"),
+                ("a.css", "@import \"./shared.css\";\n.a { color: blue }\n"),
+                ("b.css", "@import \"./shared.css\";\n.b { color: green }\n"),
+            ],
+        );
 
-        let bundle = bundle_css_set(&[first.clone(), second.clone()])
+        let bundle = bundle_css_set(&[fixture.path("a.css"), fixture.path("b.css")])
             .expect("both stylesheets should bundle");
-        fs::remove_dir_all(&dir).ok();
 
         let css = String::from_utf8(bundle.minified_bytes.clone()).expect("utf8");
         assert!(css.contains(".a"), "the first sheet must be inlined: {css}");
@@ -2338,14 +2313,18 @@ mod tests {
 
     #[test]
     fn process_assets_counts_a_stylesheet_and_reports_its_import_child_for_freshness() {
-        let dir = temp_dir("process");
-        let entry = dir.join("index.css");
-        let child = dir.join("child.css");
-        fs::write(&child, ".child { color: red }\n").expect("child");
-        fs::write(&entry, "@import \"./child.css\";\n.entry { color: blue }\n").expect("entry");
+        let fixture = Fixture::new(
+            "process",
+            &[
+                ("child.css", ".child { color: red }\n"),
+                (
+                    "index.css",
+                    "@import \"./child.css\";\n.entry { color: blue }\n",
+                ),
+            ],
+        );
 
-        let processed = process_assets(&[css_asset(&entry)]);
-        fs::remove_dir_all(&dir).ok();
+        let processed = process_assets(&[css_asset(&fixture.path("index.css"))]);
 
         assert_eq!(processed.contributions.len(), 1, "{processed:?}");
         let contribution = &processed.contributions[0];
@@ -2366,18 +2345,23 @@ mod tests {
         assert_eq!(processed.total().brotli_bytes, contribution.brotli_bytes);
     }
 
-    /// The fallback that keeps B2 from ever being worse than what it replaced.
+    /// The fallback that keeps B2 from ever being worse than what it replaced. A dangling `@import`
+    /// cannot be resolved from disk, so bundling must error rather than panic and the caller reverts
+    /// to raw-byte disclosure.
     #[test]
     fn process_assets_falls_back_to_raw_disclosure_when_a_stylesheet_cannot_be_processed() {
-        let dir = temp_dir("fallback");
-        let entry = dir.join("index.css");
-        fs::write(&entry, "@import \"./missing.css\";\n.a { color: red }\n").expect("entry");
-        let asset = css_asset(&entry);
+        let fixture = Fixture::new(
+            "fallback",
+            &[(
+                "index.css",
+                "@import \"./missing.css\";\n.a { color: red }\n",
+            )],
+        );
+        let asset = css_asset(&fixture.path("index.css"));
 
         let processed = process_assets(std::slice::from_ref(&asset));
         let expected_path = asset.path.clone();
         let expected_bytes = asset.raw_bytes();
-        fs::remove_dir_all(&dir).ok();
 
         assert!(
             processed.contributions.is_empty(),
@@ -2396,19 +2380,16 @@ mod tests {
 
     #[test]
     fn process_assets_counts_binary_assets_raw_and_sums_each_kind() {
-        let dir = temp_dir("binary");
-        let wasm = dir.join("engine.wasm");
-        let font = dir.join("body.woff2");
+        let fixture = Fixture::new("binary", &[]);
         // Deliberately compressible so gzip/brotli/zstd all produce a real number.
-        fs::write(&wasm, vec![7_u8; 4096]).expect("wasm");
-        fs::write(&font, vec![9_u8; 2048]).expect("font");
+        let wasm = fixture.write_bytes("engine.wasm", &[7_u8; 4096]);
+        let font = fixture.write_bytes("body.woff2", &[9_u8; 2048]);
         let assets = vec![
             read_collected_asset(&wasm, AssetKind::Wasm).expect("wasm snapshot"),
             read_collected_asset(&font, AssetKind::Font).expect("font snapshot"),
         ];
 
         let processed = process_assets(&assets);
-        fs::remove_dir_all(&dir).ok();
 
         assert_eq!(processed.contributions.len(), 2, "{processed:?}");
         let wasm_contribution = processed
