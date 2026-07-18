@@ -2,9 +2,8 @@
 
 A step-by-step guide to configuring and running Import Lens releases. It assumes **no prior knowledge** of the publishing tokens or the workflows — if you can open the GitHub repo settings, you can follow this.
 
-This guide pairs with the design spec at
-[`docs/superpowers/specs/2026-07-03-release-workflow-revamp-design.md`](superpowers/specs/2026-07-03-release-workflow-revamp-design.md),
-which explains *why* things are shaped this way. This document explains *what to do*.
+This document explains *what to do*; the reasoning behind the shape lived in a design spec that has
+since been deleted, its decisions having shipped.
 
 ---
 
