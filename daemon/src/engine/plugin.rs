@@ -101,7 +101,7 @@ impl BuildState {
         sorted
     }
 
-    fn record_failed_asset_input(&self, path: PathBuf) {
+    pub(super) fn record_failed_asset_input(&self, path: PathBuf) {
         self.failed_asset_inputs
             .lock()
             .expect("failed asset-input set should not be poisoned")
@@ -179,7 +179,7 @@ impl BuildState {
     /// the user is shown its message. The stage was never in doubt here; the message was. Ordering
     /// by content rather than by arrival makes the whole answer a function of the bytes, which is
     /// the same rule `engine::stage::rank` applies to the diagnostics beside it.
-    fn record_breach(&self, message: &str) {
+    pub(super) fn record_breach(&self, message: &str) {
         let mut breach = self
             .limit_breach
             .lock()

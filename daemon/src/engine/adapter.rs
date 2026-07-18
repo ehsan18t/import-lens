@@ -383,17 +383,6 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
     // to expire against. The read-time map is populated in `load`, before Rolldown parses anything,
     // so it has every module whose bytes this build actually read.
     let (read_time_fingerprints, _) = build_observations(state);
-    if let Some(asset_io) = asset_io_diagnostic(state) {
-        let mut diagnostics = contract_diagnostics(&diagnostics);
-        diagnostics.push(asset_io.clone());
-        return BundleFailure {
-            stage: stage::ASSET_IO.to_owned(),
-            message: asset_io.message,
-            diagnostics,
-            loaded_paths,
-            read_time_fingerprints,
-        };
-    }
     // A breach preempts every diagnostic below, and the ranking agrees: `MODULE_GRAPH_LIMIT` is the
     // first deterministic stage in `engine::stage`, because a blown graph limit is a fact about the
     // WHOLE build — it was too big to complete — and not about any one module in it. The two used to
@@ -410,6 +399,24 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
             stage: stage::MODULE_GRAPH_LIMIT.to_owned(),
             message: breach,
             diagnostics: contract_diagnostics(&diagnostics),
+            loaded_paths,
+            read_time_fingerprints,
+        };
+    }
+
+    // BELOW the breach, deliberately. An unreadable asset input is request-local and says "retry
+    // after the filesystem settles"; a blown graph limit is a permanent fact about the package. When
+    // both are true the breach is the answer, because reporting the transient one erases a DURABLE
+    // stage: `ASSET_IO` is absent from `DURABLE_RESULT_STAGES` while `MODULE_GRAPH_LIMIT` is in it,
+    // so the mislabel also refuses the failure from every cache and rebuilds the oversized graph on
+    // every keystroke. This arm used to sit above the breach and did exactly that.
+    if let Some(asset_io) = asset_io_diagnostic(state) {
+        let mut diagnostics = contract_diagnostics(&diagnostics);
+        diagnostics.push(asset_io.clone());
+        return BundleFailure {
+            stage: stage::ASSET_IO.to_owned(),
+            message: asset_io.message,
+            diagnostics,
             loaded_paths,
             read_time_fingerprints,
         };
@@ -506,4 +513,58 @@ fn contract_diagnostics(diagnostics: &[BuildDiagnostic]) -> Vec<ImportDiagnostic
             .then_with(|| left.message.cmp(&right.message))
     });
     contract
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::plugin::BuildState;
+
+    /// A missing optional asset says "retry after the filesystem settles"; a blown graph limit is a
+    /// permanent fact about the package. When both are recorded, the breach has to win.
+    ///
+    /// Reporting the transient one instead does two things, and the second is the expensive one:
+    /// the user is told to retry a condition that will never change, and — because `asset_io` is
+    /// absent from `DURABLE_RESULT_STAGES` while `module_graph_limit` is in it — the failure is
+    /// refused by every durable store, so the oversized graph is rebuilt on every keystroke.
+    ///
+    /// This is a Guard: the asset arm was once inserted ABOVE the breach, contradicting the ordering
+    /// comment in this very file. Re-inserting it there turns this red.
+    #[test]
+    fn a_durable_breach_outranks_a_transient_asset_read_failure() {
+        let state = BuildState::default();
+        state.record_failed_asset_input(PathBuf::from("/pkg/optional.css"));
+        state.record_breach("module graph exceeds the 2000 internal module limit");
+
+        let failure = classify_failure(Vec::new(), &state);
+
+        assert_eq!(
+            failure.stage,
+            stage::MODULE_GRAPH_LIMIT,
+            "a permanent property of the package must not be reported as a transient read: {failure:?}"
+        );
+        assert!(
+            failure.message.contains("2000 internal module limit"),
+            "the breach's own message is the answer, not the asset retry text: {failure:?}"
+        );
+        assert!(
+            crate::pipeline::stage::may_enter_a_durable_store(&failure.stage),
+            "a deterministic breach must stay cacheable so the graph is not rebuilt every request"
+        );
+    }
+
+    /// The converse, so the guard above cannot be satisfied by simply never reporting `asset_io`.
+    #[test]
+    fn a_transient_asset_read_failure_still_wins_when_no_breach_was_recorded() {
+        let state = BuildState::default();
+        state.record_failed_asset_input(PathBuf::from("/pkg/optional.css"));
+
+        let failure = classify_failure(Vec::new(), &state);
+
+        assert_eq!(failure.stage, stage::ASSET_IO, "{failure:?}");
+        assert!(
+            !crate::pipeline::stage::may_enter_a_durable_store(&failure.stage),
+            "a filesystem moment must not be cached as a package fact"
+        );
+    }
 }
