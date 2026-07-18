@@ -298,11 +298,12 @@ impl DiskCache {
         // (X-7). Hash-verify them strictly on the cold disk-hydration path too, so the
         // blind spot isn't served even on the first hit before memory hydration.
         // node_modules files stay on the cheap pre-filter inside the strict variant.
-        let freshness = if cached.first_party {
-            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints)
-        } else {
-            crate::cache::key::check_fingerprints(&cached.dependency_fingerprints)
-        };
+        // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
+        // stylesheet's `url()` reached outside the package root (D18). Routing by entry meant that
+        // file's stored content hash was never consulted, and a rehydrate from disk re-armed the
+        // same blind spot, so a restart did not clear it either.
+        let freshness =
+            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
         match freshness {
             crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
                 self.remove(key);
@@ -502,11 +503,12 @@ impl DiskCache {
         // (X-7). Hash-verify them strictly on the cold disk-hydration path too, so the
         // blind spot isn't served even on the first hit before memory hydration.
         // node_modules files stay on the cheap pre-filter inside the strict variant.
-        let freshness = if cached.first_party {
-            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints)
-        } else {
-            crate::cache::key::check_fingerprints(&cached.dependency_fingerprints)
-        };
+        // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
+        // stylesheet's `url()` reached outside the package root (D18). Routing by entry meant that
+        // file's stored content hash was never consulted, and a rehydrate from disk re-armed the
+        // same blind spot, so a restart did not clear it either.
+        let freshness =
+            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
         match freshness {
             crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
                 self.remove(key);

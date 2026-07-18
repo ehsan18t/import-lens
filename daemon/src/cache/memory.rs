@@ -277,17 +277,23 @@ impl ImportCache {
                     .is_some_and(|at| at.elapsed() < REVERIFY_TTL);
 
             if !fresh_without_restat {
-                // D3/X-7: first-party deps are re-probed on every get, so the cheap
-                // mtime+len pre-filter's blind spot (an equal-length, mtime-preserving
-                // rewrite) is live on this path — hash-verify them strictly.
-                // node_modules deps keep the cheap check: they change only behind a
-                // NodeModulesChanged generation bump, so re-reading their bytes on
-                // every hit would be pure waste.
-                let freshness = if cached.first_party {
-                    crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints)
-                } else {
-                    crate::cache::key::check_fingerprints(&cached.dependency_fingerprints)
-                };
+                // D3/X-7: the cheap mtime+len pre-filter has a blind spot — an equal-length,
+                // mtime-preserving rewrite reads Fresh without the hash ever being consulted — so
+                // any file that can change without a NodeModulesChanged generation bump must be
+                // hash-verified. `check_fingerprints_strict` decides that PER FINGERPRINT, keeping
+                // the cheap check for node_modules paths, where re-reading bytes on every hit would
+                // be pure waste.
+                //
+                // Deciding it per ENTRY instead was a live staleness bug. A node_modules entry is
+                // not made of node_modules files only: a stylesheet's `url()` may resolve outside
+                // the package root (D18), so a WORKSPACE font can sit in a node_modules entry's
+                // fingerprint set. Its content hash was computed and stored, and then never
+                // consulted — the entry was "not first party", so every fingerprint took the cheap
+                // path. Worse than a window: after the TTL the cheap check returns Fresh and
+                // restamps, re-arming it forever, and neither a generation bump nor a daemon
+                // restart clears it.
+                let freshness =
+                    crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
                 match freshness {
                     crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
                         // Non-`Unknown` outcome → reset any graduation window for a key
@@ -442,17 +448,23 @@ impl ImportCache {
                     .is_some_and(|at| at.elapsed() < REVERIFY_TTL);
 
             if !fresh_without_restat {
-                // D3/X-7: first-party deps are re-probed on every get, so the cheap
-                // mtime+len pre-filter's blind spot (an equal-length, mtime-preserving
-                // rewrite) is live on this path — hash-verify them strictly.
-                // node_modules deps keep the cheap check: they change only behind a
-                // NodeModulesChanged generation bump, so re-reading their bytes on
-                // every hit would be pure waste.
-                let freshness = if cached.first_party {
-                    crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints)
-                } else {
-                    crate::cache::key::check_fingerprints(&cached.dependency_fingerprints)
-                };
+                // D3/X-7: the cheap mtime+len pre-filter has a blind spot — an equal-length,
+                // mtime-preserving rewrite reads Fresh without the hash ever being consulted — so
+                // any file that can change without a NodeModulesChanged generation bump must be
+                // hash-verified. `check_fingerprints_strict` decides that PER FINGERPRINT, keeping
+                // the cheap check for node_modules paths, where re-reading bytes on every hit would
+                // be pure waste.
+                //
+                // Deciding it per ENTRY instead was a live staleness bug. A node_modules entry is
+                // not made of node_modules files only: a stylesheet's `url()` may resolve outside
+                // the package root (D18), so a WORKSPACE font can sit in a node_modules entry's
+                // fingerprint set. Its content hash was computed and stored, and then never
+                // consulted — the entry was "not first party", so every fingerprint took the cheap
+                // path. Worse than a window: after the TTL the cheap check returns Fresh and
+                // restamps, re-arming it forever, and neither a generation bump nor a daemon
+                // restart clears it.
+                let freshness =
+                    crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
                 match freshness {
                     crate::cache::key::Freshness::Gone => {
                         // Non-`Unknown` outcome → reset the graduation window (§4.3.1).
@@ -645,11 +657,11 @@ impl ImportCache {
     pub fn probe_freshness(&self, key: &str) -> Option<crate::cache::key::Freshness> {
         let memory = self.memory.pin();
         let cached = memory.get(key)?;
-        let freshness = if cached.first_party {
-            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints)
-        } else {
-            crate::cache::key::check_fingerprints(&cached.dependency_fingerprints)
-        };
+        // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
+        // stylesheet's `url()` reached outside the package root (D18), and that file changes with
+        // no generation bump behind it.
+        let freshness =
+            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
         Some(freshness)
     }
 
@@ -1333,6 +1345,59 @@ mod tests {
         assert!(
             cache.get_if_fresh(&key).is_none(),
             "force-fresh must skip the TTL fast path, re-probe, and reject the stale entry (RB-4)"
+        );
+
+        drop(cache);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A node_modules entry is not made of node_modules files only. A stylesheet's `url()` may
+    /// resolve outside the package root (D18), so a WORKSPACE font can sit in a node_modules
+    /// entry's fingerprint set — and a workspace file changes with no generation bump behind it.
+    ///
+    /// Routing strict-vs-cheap per ENTRY meant that file's stored content hash was computed and
+    /// then never consulted: the entry was "not first party", so every one of its fingerprints took
+    /// the cheap mtime+len pre-filter. An equal-length, mtime-preserving rewrite (`cp -p`,
+    /// `rsync -a`, a CI cache restore) therefore read Fresh forever — and because the post-TTL
+    /// check restamps on success, neither waiting, nor a generation bump, nor a restart cleared it.
+    ///
+    /// The fingerprint below carries the real file's length and mtime with the hash of DIFFERENT
+    /// content of the SAME length, which is exactly what such a rewrite leaves behind.
+    #[test]
+    fn a_workspace_file_inside_a_node_modules_entry_is_still_hash_verified() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-a10-strict-routing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Deliberately NOT under node_modules: this is the shape a CSS `url()` escape produces.
+        let font = dir.join("Inter.woff2");
+        std::fs::write(&font, b"AAAA").unwrap();
+        assert!(
+            !font
+                .to_string_lossy()
+                .replace('\\', "/")
+                .contains("/node_modules/"),
+            "the fixture must sit outside node_modules or it proves nothing"
+        );
+
+        let fingerprint = crate::cache::key::file_fingerprint_with_hash(
+            &font,
+            Some(crate::cache::key::content_hash(b"BBBB")),
+        )
+        .expect("fingerprint the workspace font");
+
+        // An opaque node_modules key: `cache_key_is_first_party` reads only the entry path, so this
+        // entry is "not first party" however many workspace files its fingerprints name.
+        let key = "v4:ui-kit".to_owned();
+        let cache = ImportCache::new(None, false);
+        cache.insert_with_fingerprints(key.clone(), minimal_result("ui-kit"), vec![fingerprint]);
+
+        assert!(
+            cache.get_if_fresh(&key).is_none(),
+            "the workspace font's content hash must be consulted, not skipped because the ENTRY \
+             lives under node_modules"
         );
 
         drop(cache);
