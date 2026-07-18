@@ -47,7 +47,21 @@ Real work, queued rather than abandoned. None of these is a wrong number or a we
 release, but each is worth turning into a task.
 
 ### D6: "Unavailable" is one label for several causes, and one unbundleable leaf discards the whole package
-**Status: Deferred** · The most visible gap in real projects · Fix universally, never per-package
+**Status: Deferred — but the ASSET leaf is now fixed (2026-07-18)** · The most visible gap in real projects · Fix universally, never per-package
+
+**The asset half is closed.** A directly imported image, icon or media file was one of these fatal leaves and
+is no longer: `import logo from './logo.png'` failed rolldown's loader with `InvalidData` because a PNG is not
+UTF-8, and `import mark from './mark.svg'` was worse — an SVG **is** valid UTF-8, so it reached OXC and was
+parsed as JavaScript, dying with `PARSE_ERROR: Unexpected JSX expression`. Either one made the whole package
+unmeasurable. Both are now classified `AssetClass::Unmeasured`, stubbed to `ModuleType::Empty` like any other
+asset, charged against the graph's aggregate byte budget, and **disclosed** at their real size rather than
+counted — so the JavaScript measures exactly and the shipped bytes are not silently absent.
+
+The allowlist is deliberately an allowlist. An unknown extension still falls through to Rolldown, because
+intercepting something we cannot name would stub a module that might have been real JavaScript.
+
+The native-addon and unresolvable-specifier leaves in the table below are unchanged and still fatal; those need
+the universal external-boundary fix this entry describes.
 
 **What the user sees.** In a real `package.json`, a growing fraction of dependencies render **unavailable**,
 and not only native CLIs. The bigger the project, the more of them, which reads as "the build was too big." It
@@ -119,6 +133,31 @@ DECLARATION rather than the build: `SideEffectsMode::False` already identifies t
 boundary, and `resolver` already owns rolldown's own glob matcher for per-asset matching. The File Cost path
 needs per-asset package attribution first, which is the real work.
 
+### D21: A bare `@import` no longer poisons freshness with a path that cannot exist
+**Status: Resolved 2026-07-18** · Found while investigating D8
+
+`FileProvider::resolve` is infallible — a naive `with_file_name` join — so `@import "pkg/base.css"` silently
+became `<dir-of-sheet>/pkg/base.css` and came back as a valid-looking file. The failure surfaced at the READ
+instead, which recorded a failed read of a path that does not and will never exist. Two consequences reached
+well beyond the one sheet: the request-local `asset_io` stage was stamped on the whole asset result, and a
+never-fresh sentinel was written for the phantom path. A package shipping one bare `@import` could therefore
+**never be cached**, and was re-measured on every keystroke over a file nobody will ever create.
+
+The resolve now declines such a specifier explicitly, so the sheet lands on the deterministic per-sheet
+fallback (D8's accepted raw-byte disclosure) while the result stays reusable.
+
+**The order of the check is load-bearing, and the first attempt got it wrong.** Deciding by spelling alone
+rejects `@import "theme.css"` and `@import "sub/dir.css"` — both ordinary relative URLs, since CSS has no
+bare-specifier concept and a plain string is a relative URL. That would have dropped a very common shape to
+raw disclosure. The existence of the file beside the sheet decides; spelling only decides what happens once
+nothing is there. A missing RELATIVE import keeps its failed read deliberately, because the never-fresh
+sentinel on its real path is what makes creating the file invalidate the result.
+
+Resolving the package specifier properly is still not done, and is not merely plumbing: the JavaScript
+resolver profile has no `style` main field, no `style` condition and no `.css` extension, so pointing it at
+`pkg/base` would happily answer `pkg/base.js` and measure the wrong file. That needs a purpose-built CSS
+resolver profile.
+
 ### D8: One stylesheet Lightning CSS cannot parse falls back alone, but a cyclic one undercounts
 **Status: Accepted** · Never below the pre-B2 floor · Found by the B2 adversarial review
 
@@ -155,6 +194,24 @@ is not the brotli size anyone ships. The honest options are to compress at 11 of
 background refinement of the number), to name the figure for what it is, or to accept it deliberately. It is
 recorded rather than fixed because it touches every number in the product and every baseline that gates them,
 which is its own piece of work.
+
+**Measured 2026-07-18**, on the real 139,262-byte minified extension bundle rather than a synthetic payload (a
+repeated literal compresses to almost nothing and makes every quality look identical):
+
+| quality | size | time |
+| --- | ---: | ---: |
+| 4 (current) | 39,671 B | 27 ms |
+| 9 | 36,775 B | 60 ms |
+| 11 (what the web serves) | 34,196 B | 955 ms |
+
+Two things follow. **Quality 11 is not available to us on the interactive path**: 35x the time and nearly a
+full second per artifact, for a compressor that runs per keystroke and often more than once. That closes the
+"just raise it" option, which had never been costed.
+
+**Quality 9 is a genuine middle nobody had considered.** It removes half the overstatement — q4 reads 16.0%
+high against q11, q9 reads 7.5% high — for +33 ms. That is the trade actually on the table, and it is a
+product decision about per-keystroke latency rather than a defect to fix. The re-baselining cost is unchanged
+whichever quality is chosen, so it is the same piece of work either way.
 
 ### D9: A stylesheet's own `@import` tree is bounded at 256 files
 **Status: Accepted** · A bound where there was none · Found by the B2 adversarial review
@@ -276,6 +333,47 @@ We do not fetch the resource to size it. Doing so would make a measurement depen
 non-deterministic and non-cacheable, and let a package's reported cost change without any byte on disk
 changing — all of which ADR-0006 exists to prevent.
 
+### D9 follow-up: unioning the surviving stylesheets is NOT a safe improvement
+**Status: Investigated and declined 2026-07-18** · Evidence below, revisit only after the prerequisite
+
+The obvious improvement to the per-sheet fallback — re-union the sheets that parsed, so only the
+offender is measured alone — was investigated and rejected on evidence.
+
+`charge_css_work` is monotonic with no per-path dedupe, and union-plus-retry already spends roughly
+2x the set's reads against a build-wide 512-read / 16 MiB ledger. A third pass makes it ~3x, and
+breaching that ledger is **terminal**: `process_stylesheets` turns a live context failure into a hard
+`AssetBudgetFailure` for the whole asset stage rather than a graceful degradation.
+
+Worse, the common reason the union fails IS the set breaching a budget together — that is exactly the
+shape the regression test at `assets.rs` pins (two sheets, each inside the 256-file per-attempt bound,
+breaching it together). In that case the "survivors" are all the sheets, so re-unioning them simply
+breaches again, having spent a third of the ledger to learn nothing. And
+`may_retry_stylesheets_separately` is a single negative test on the COMPRESSION stage, so there is no
+signal distinguishing "one unparseable sheet" from "the set was too large".
+
+The trade would therefore be a **disclosed** over-count (already non-budgetable, already labelled as
+reading high) for a possible hard failure of the whole asset stage. The prerequisite is a typed
+distinction between a per-sheet parse failure and a set-level budget breach; until that exists, this
+is not worth attempting.
+
+### D7 follow-up: per-asset `sideEffects` attribution is further away than recorded
+**Status: Still deferred, with a corrected blocker** · Re-examined 2026-07-18
+
+D7's recorded blocker is "needs per-asset package attribution first". That was read as meaning the
+attribution was the only missing piece. Re-examination found three separate blockers:
+
+- Rolldown's `load` hook has **no importer parameter**. `args.id` is the asset's own id; the importer
+  exists only in `resolve_id`, which discards it. Nothing anywhere maps an asset path back to the
+  module that imported it.
+- `sideEffects` patterns are **collapsed to a bool at parse time** (`SideEffectsMode::Array { entry_matches }`).
+  The patterns are deliberately not retained, so the value cannot be re-asked about a different path.
+- The engine boundary contract states the daemon's own reading of `sideEffects` is "reporting
+  metadata — it decides a badge, never a byte". Dropping an asset on that reading makes it decide
+  bytes, which is the thing the contract exists to prevent.
+
+Adding asset paths to the contribution model (D15) did **not** unblock this, contrary to an earlier
+note in the 2026-07-18 review.
+
 ### D18: A CSS `url()` may resolve outside the package root
 **Status: Accepted** · Decided 2026-07-18
 
@@ -291,6 +389,19 @@ narrow place while every other read ignores it, which buys no safety property.
 It would also cost accuracy. A monorepo package legitimately referencing a shared font through `../`
 is a real shape, and a containment check would stop counting bytes that genuinely ship — turning a
 correct number into a floor to prevent something that is not a defect.
+
+### D20: Nested rayon inside the asset pool does not widen its admission
+**Status: Investigated and retired 2026-07-18** · Raised as a guess by the B2 branch review
+
+`compress.rs` calls `rayon::join`, and Lightning CSS uses rayon internally, both INSIDE the two-thread asset
+pool. The review flagged — explicitly as a guess, with no failing case — that a worker blocked in a join might
+steal a sibling job's task and let real concurrency exceed the permit count, spending one job's eight-second
+deadline on another's work.
+
+Answered by a property test rather than by argument: offer four times as many jobs as there are permits, have
+each one park inside a `rayon::join` while holding its slot, and record the peak number executing at once. The
+peak never exceeds the permit count. The existing concurrency test covers the same invariant for plain jobs;
+this one adds the nested-rayon dimension, which is the part that was in doubt.
 
 ### D19: The per-sheet retry is bounded, not free
 **Status: Accepted bound** · Measured 2026-07-18
