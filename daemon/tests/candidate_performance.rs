@@ -55,13 +55,15 @@
 //! does go red on CI, that is a fact about NFR-002 worth hearing, not a number to inflate.
 
 use import_lens_daemon::engine::{
-    BundleEntry, BundlePurpose, BundleRequest, ImportRuntime, RolldownEngine,
+    AssetKind, BundleEntry, BundlePurpose, BundleRequest, ImportRuntime, RolldownEngine,
 };
 use import_lens_daemon::ipc::codec::{FrameDecoder, decode_payload, encode_frame};
 use import_lens_daemon::ipc::protocol::{
-    BatchRequest, BatchResponse, HelloMessage, ImportKind, ImportRequest, PROTOCOL_VERSION,
+    BatchRequest, BatchResponse, HelloMessage, ImportKind, ImportRequest, ImportResult,
+    PROTOCOL_VERSION,
 };
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -71,6 +73,8 @@ mod common;
 /// §10.6: "five warm-up runs followed by at least 30 recorded runs".
 const WARMUP_RUNS: usize = 5;
 const RECORDED_RUNS: usize = 30;
+const ASSET_BINARY_BYTES: usize = 1024 * 1024;
+const ASSET_BATCH_PER_KIND: usize = 4;
 
 /// The one import every latency gate is measured on. `css-tree` is the deep-ESM-graph fixture of
 /// the §10.3 real-package set, and `parse` is one export of it — a typical named import, which is
@@ -383,6 +387,96 @@ fn latency_batch(workspace: &Path, request_id: u64) -> BatchRequest {
     )
 }
 
+fn asset_import(package: &str) -> ImportRequest {
+    ImportRequest {
+        specifier: package.to_owned(),
+        package_name: package.to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["value".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::default(),
+    }
+}
+
+fn write_css_heavy_package(workspace: &Path, package: &str) {
+    const CHILDREN: usize = 32;
+    const RULES_PER_CHILD: usize = 128;
+    let root = workspace.join("node_modules").join(package);
+    fs::create_dir_all(root.join("styles")).expect("CSS fixture directory should be created");
+    fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{"name":"{package}","version":"1.0.0","module":"index.js","sideEffects":true}}"#
+        ),
+    )
+    .expect("CSS fixture manifest should be written");
+    fs::write(
+        root.join("index.js"),
+        "import './styles.css';\nexport const value = 1;\n",
+    )
+    .expect("CSS fixture entry should be written");
+    let imports = (0..CHILDREN)
+        .map(|index| format!("@import './styles/child-{index}.css';"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(root.join("styles.css"), imports).expect("CSS fixture root should be written");
+    for child in 0..CHILDREN {
+        let rules = (0..RULES_PER_CHILD)
+            .map(|rule| {
+                format!(
+                    ".asset-{child}-{rule} {{ color: rgb({}, {}, {}); padding: {rule}px; }}",
+                    child % 255,
+                    rule % 255,
+                    (child + rule) % 255
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            root.join("styles").join(format!("child-{child}.css")),
+            rules,
+        )
+        .expect("CSS fixture child should be written");
+    }
+}
+
+fn write_binary_heavy_package(workspace: &Path, package: &str) {
+    let root = workspace.join("node_modules").join(package);
+    fs::create_dir_all(&root).expect("binary fixture directory should be created");
+    fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{"name":"{package}","version":"1.0.0","module":"index.js","sideEffects":true}}"#
+        ),
+    )
+    .expect("binary fixture manifest should be written");
+    fs::write(
+        root.join("index.js"),
+        "import './font.woff2';\nimport './payload.wasm';\nexport const value = 1;\n",
+    )
+    .expect("binary fixture entry should be written");
+    let pseudo_random_bytes = |mut state: u64| {
+        (0..ASSET_BINARY_BYTES)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 56) as u8
+            })
+            .collect::<Vec<_>>()
+    };
+    fs::write(
+        root.join("font.woff2"),
+        pseudo_random_bytes(0x4f2c_91ab_38d7_e605),
+    )
+    .expect("font fixture should be written");
+    fs::write(
+        root.join("payload.wasm"),
+        pseudo_random_bytes(0x9a71_5e24_c603_b8fd),
+    )
+    .expect("wasm fixture should be written");
+}
+
 /// A gate that timed a FAILED analysis would be timing the error path, and an Unmeasured result
 /// never enters the engine at all — it would make every gate here trivially green.
 fn assert_measured(response: &BatchResponse, expected: usize) {
@@ -400,6 +494,40 @@ fn assert_measured(response: &BatchResponse, expected: usize) {
             result.unmeasured_stage(),
             result.error,
         );
+    }
+}
+
+fn assert_asset_breakdown(result: &ImportResult, expected: &[(AssetKind, Option<u64>)]) {
+    assert_eq!(
+        result.asset_breakdown.len(),
+        expected.len(),
+        "`{}` must expose exactly the asset kinds its fixture ships: {:?}",
+        result.specifier,
+        result.asset_breakdown,
+    );
+    for (kind, expected_raw_bytes) in expected {
+        let contribution = result
+            .asset_breakdown
+            .iter()
+            .find(|contribution| contribution.kind == *kind)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{}` must report a {kind:?} contribution: {:?}",
+                    result.specifier, result.asset_breakdown,
+                )
+            });
+        assert!(
+            contribution.raw_bytes > 0,
+            "`{}` must perform real {kind:?} asset work: {contribution:?}",
+            result.specifier,
+        );
+        if let Some(expected_raw_bytes) = expected_raw_bytes {
+            assert_eq!(
+                contribution.raw_bytes, *expected_raw_bytes,
+                "`{}` must count the complete {kind:?} fixture",
+                result.specifier,
+            );
+        }
     }
 }
 
@@ -575,6 +703,145 @@ async fn shipped_daemon_twenty_import_batch_peak_rss_stays_under_release_thresho
         peak < 400 * 1024 * 1024,
         "20-import batch peak RSS exceeded the 400 MB gate (NFR-004): {peak} bytes"
     );
+}
+
+// AC-03: the post-build asset tail has its own two-wide admission and eight-second deadline. The
+// ordinary real-package fixture above is JS-heavy, so it cannot detect a regression that queues
+// unbounded Lightning CSS/compressor work or retains several large asset snapshots at once. These
+// synthetic packages keep every request a cache miss while exercising the two expensive shapes
+// independently: a broad @import tree and two emitted binary artifacts.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "release-only asset-processing p95/RSS measurement"]
+async fn shipped_daemon_asset_heavy_p95_and_peak_rss_stay_bounded() {
+    let workspace = common::temp_workspace("import-lens-asset-performance");
+    fs::create_dir_all(workspace.join("src")).expect("fixture source directory should be created");
+    let runs = WARMUP_RUNS + RECORDED_RUNS;
+    let css_packages = (0..runs)
+        .map(|run| format!("asset-css-{run}"))
+        .collect::<Vec<_>>();
+    let binary_packages = (0..runs)
+        .map(|run| format!("asset-binary-{run}"))
+        .collect::<Vec<_>>();
+    let batch_css_packages = (0..ASSET_BATCH_PER_KIND)
+        .map(|index| format!("asset-css-batch-{index}"))
+        .collect::<Vec<_>>();
+    let batch_binary_packages = (0..ASSET_BATCH_PER_KIND)
+        .map(|index| format!("asset-binary-batch-{index}"))
+        .collect::<Vec<_>>();
+    for package in &css_packages {
+        write_css_heavy_package(&workspace, package);
+    }
+    for package in &batch_css_packages {
+        write_css_heavy_package(&workspace, package);
+    }
+    for package in &binary_packages {
+        write_binary_heavy_package(&workspace, package);
+    }
+    for package in &batch_binary_packages {
+        write_binary_heavy_package(&workspace, package);
+    }
+
+    let mut session = start_daemon(&workspace).await;
+    let mut css_durations = Vec::with_capacity(RECORDED_RUNS);
+    for (run, package) in css_packages.iter().enumerate() {
+        let request = batch_of(&workspace, run as u64 + 1, vec![asset_import(package)]);
+        let (response, elapsed) = timed_batch(&mut session, &request).await;
+        assert_measured(&response, 1);
+        assert!(!response.imports[0].cache_hit, "{response:?}");
+        assert_asset_breakdown(&response.imports[0], &[(AssetKind::Css, None)]);
+        if run >= WARMUP_RUNS {
+            css_durations.push(elapsed);
+        }
+    }
+
+    let mut binary_durations = Vec::with_capacity(RECORDED_RUNS);
+    for (run, package) in binary_packages.iter().enumerate() {
+        let request = batch_of(
+            &workspace,
+            (runs + run) as u64 + 1,
+            vec![asset_import(package)],
+        );
+        let (response, elapsed) = timed_batch(&mut session, &request).await;
+        assert_measured(&response, 1);
+        assert!(!response.imports[0].cache_hit, "{response:?}");
+        assert_asset_breakdown(
+            &response.imports[0],
+            &[
+                (AssetKind::Font, Some(ASSET_BINARY_BYTES as u64)),
+                (AssetKind::Wasm, Some(ASSET_BINARY_BYTES as u64)),
+            ],
+        );
+        if run >= WARMUP_RUNS {
+            binary_durations.push(elapsed);
+        }
+    }
+
+    // A fresh multi-import request makes several post-build tails contend for the dedicated
+    // two-wide boundary. Sequential single-import samples above establish latency, but cannot
+    // expose widened admission or concurrent retention in the daemon's high-water RSS.
+    let batch_imports = batch_css_packages
+        .iter()
+        .chain(&batch_binary_packages)
+        .map(|package| asset_import(package))
+        .collect::<Vec<_>>();
+    let (batch_response, batch_elapsed) = timed_batch(
+        &mut session,
+        &batch_of(&workspace, (runs * 2) as u64 + 1, batch_imports),
+    )
+    .await;
+    assert_measured(&batch_response, ASSET_BATCH_PER_KIND * 2);
+    for result in &batch_response.imports {
+        assert!(!result.cache_hit, "{result:?}");
+        if result.specifier.starts_with("asset-css-batch-") {
+            assert_asset_breakdown(result, &[(AssetKind::Css, None)]);
+        } else if result.specifier.starts_with("asset-binary-batch-") {
+            assert_asset_breakdown(
+                result,
+                &[
+                    (AssetKind::Font, Some(ASSET_BINARY_BYTES as u64)),
+                    (AssetKind::Wasm, Some(ASSET_BINARY_BYTES as u64)),
+                ],
+            );
+        } else {
+            panic!("unexpected active-batch fixture: {}", result.specifier);
+        }
+    }
+
+    let css = percentiles_of(&mut css_durations);
+    let binary = percentiles_of(&mut binary_durations);
+    let peak = peak_working_set_bytes(session.process_id());
+    eprintln!(
+        "shipped daemon CSS-heavy cold asset tail ({RECORDED_RUNS} runs): p50 {:?}, p95 {:?}, \
+         max {:?}\nshipped daemon binary-heavy cold asset tail ({RECORDED_RUNS} runs): p50 {:?}, \
+         p95 {:?}, max {:?}\nasset-heavy {}-import contention batch: {batch_elapsed:?}\nasset-heavy \
+         peak RSS: {} MB",
+        css.p50,
+        css.p95,
+        css.max,
+        binary.p50,
+        binary.p95,
+        binary.max,
+        ASSET_BATCH_PER_KIND * 2,
+        peak / (1024 * 1024),
+    );
+
+    assert!(
+        css.p95.as_millis() <= threshold_ms(500),
+        "CSS-heavy asset p95 exceeded the 500 ms cold-import gate: {}ms",
+        css.p95.as_millis()
+    );
+    assert!(
+        binary.p95.as_millis() <= threshold_ms(500),
+        "binary-heavy asset p95 exceeded the 500 ms cold-import gate: {}ms",
+        binary.p95.as_millis()
+    );
+    assert!(
+        peak < 400 * 1024 * 1024,
+        "asset-heavy peak RSS exceeded the 400 MB active-computation gate: {peak} bytes"
+    );
+
+    drop(session);
+    fs::remove_dir_all(workspace).expect("asset performance workspace cleanup");
 }
 
 async fn bundle_once(entry: BundleEntry) -> usize {

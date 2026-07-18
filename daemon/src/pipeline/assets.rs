@@ -28,6 +28,8 @@ use crate::engine::{
     AssetKind, CollectedAsset, UncountedAsset, diagnostic_stage, read_collected_asset,
 };
 use crate::ipc::protocol::{AssetContribution, ImportDiagnostic, MeasuredSizes};
+use crate::pipeline::asset_boundary::{self, AssetBoundaryError, AssetDeadline};
+use crate::pipeline::asset_budget::{AssetBudgetFailure, AssetProcessingContext};
 use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
 use crate::pipeline::css_dependencies::collect_referenced_assets;
 use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider};
@@ -36,7 +38,8 @@ use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions};
 use lightningcss::targets::Targets;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// How many files one `@import` tree may pull in, and how many bytes of them.
 ///
@@ -69,6 +72,11 @@ struct ReadBudget {
     bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReadReservation {
+    bytes: usize,
+}
+
 /// A `SourceProvider` that reads from disk like the built-in `FileProvider` but records every path
 /// it opens, bounds what one `@import` tree may pull in, and can serve one synthetic in-memory
 /// entry. The bundler drives the `@import` graph with `rayon`, so the provider must be
@@ -85,6 +93,9 @@ struct TrackingProvider {
     read_time_fingerprints: Mutex<Vec<FileFingerprint>>,
     failed_paths: Mutex<HashSet<PathBuf>>,
     budget: Mutex<ReadBudget>,
+    /// One ledger for every union/per-sheet attempt in this build. `None` only for the small
+    /// standalone helpers used by processor tests; daemon production always supplies it.
+    context: Option<Arc<AssetProcessingContext>>,
 }
 
 impl TrackingProvider {
@@ -101,6 +112,31 @@ impl TrackingProvider {
             read_time_fingerprints: Mutex::new(Vec::new()),
             failed_paths: Mutex::new(HashSet::new()),
             budget: Mutex::new(ReadBudget::default()),
+            context: None,
+        }
+    }
+
+    fn new_bounded(entries: &[CollectedAsset], context: Arc<AssetProcessingContext>) -> Self {
+        let mut preloaded = context
+            .snapshots()
+            .into_iter()
+            .map(|asset| (asset.path.clone(), asset))
+            .collect::<BTreeMap<_, _>>();
+        preloaded.extend(
+            entries
+                .iter()
+                .cloned()
+                .map(|asset| (asset.path.clone(), asset)),
+        );
+        Self {
+            inner: FileProvider::new(),
+            preloaded,
+            synthetic: None,
+            read_paths: Mutex::new(HashSet::new()),
+            read_time_fingerprints: Mutex::new(Vec::new()),
+            failed_paths: Mutex::new(HashSet::new()),
+            budget: Mutex::new(ReadBudget::default()),
+            context: Some(context),
         }
     }
 
@@ -117,24 +153,80 @@ impl TrackingProvider {
             read_time_fingerprints: Mutex::new(Vec::new()),
             failed_paths: Mutex::new(HashSet::new()),
             budget: Mutex::new(ReadBudget::default()),
+            context: None,
         }
     }
 
-    /// Charge one file against the tree's budget, refusing once it is spent.
-    fn charge(&self, bytes: usize) -> Result<(), std::io::Error> {
+    fn with_synthetic_bounded(
+        entries: &[CollectedAsset],
+        path: PathBuf,
+        content: String,
+        context: Arc<AssetProcessingContext>,
+    ) -> Self {
+        let mut preloaded = context
+            .snapshots()
+            .into_iter()
+            .map(|asset| (asset.path.clone(), asset))
+            .collect::<BTreeMap<_, _>>();
+        preloaded.extend(
+            entries
+                .iter()
+                .cloned()
+                .map(|asset| (asset.path.clone(), asset)),
+        );
+        Self {
+            inner: FileProvider::new(),
+            preloaded,
+            synthetic: Some((path, content)),
+            read_paths: Mutex::new(HashSet::new()),
+            read_time_fingerprints: Mutex::new(Vec::new()),
+            failed_paths: Mutex::new(HashSet::new()),
+            budget: Mutex::new(ReadBudget::default()),
+            context: Some(context),
+        }
+    }
+
+    /// Reserve one file against the tree's budget before its bytes are read.
+    fn reserve(&self, bytes: usize) -> Result<ReadReservation, std::io::Error> {
         let mut budget = self
             .budget
             .lock()
             .expect("css read budget should not be poisoned");
-        budget.files += 1;
-        budget.bytes += bytes;
-
-        if budget.files > MAX_STYLESHEET_FILES || budget.bytes > MAX_STYLESHEET_BYTES {
+        let files = budget.files.saturating_add(1);
+        let total_bytes = budget.bytes.saturating_add(bytes);
+        if files > MAX_STYLESHEET_FILES || total_bytes > MAX_STYLESHEET_BYTES {
             return Err(std::io::Error::other(format!(
                 "stylesheet @import tree exceeds the {MAX_STYLESHEET_FILES} file / \
                  {MAX_STYLESHEET_BYTES} byte limit"
             )));
         }
+        budget.files = files;
+        budget.bytes = total_bytes;
+        Ok(ReadReservation { bytes })
+    }
+
+    /// Reconcile a metadata reservation with the exact bytes returned by the read.
+    fn reconcile(
+        &self,
+        reservation: ReadReservation,
+        actual_bytes: usize,
+    ) -> Result<(), std::io::Error> {
+        let mut budget = self
+            .budget
+            .lock()
+            .expect("css read budget should not be poisoned");
+        let without_reservation = budget
+            .bytes
+            .checked_sub(reservation.bytes)
+            .expect("CSS read bytes must have an existing reservation");
+        let total_bytes = without_reservation.saturating_add(actual_bytes);
+        if total_bytes > MAX_STYLESHEET_BYTES {
+            return Err(std::io::Error::other(format!(
+                "stylesheet @import tree exceeds the {MAX_STYLESHEET_FILES} file / \
+                 {MAX_STYLESHEET_BYTES} byte limit"
+            )));
+        }
+        budget.bytes = total_bytes;
         Ok(())
     }
 
@@ -184,7 +276,33 @@ impl TrackingProvider {
         self.failed_paths
             .lock()
             .expect("CSS failed-path set should not be poisoned")
-            .insert(path);
+            .insert(path.clone());
+        if let Some(context) = &self.context {
+            context.record_failed_path(&path);
+        }
+    }
+
+    fn check_deadline(&self) -> Result<(), std::io::Error> {
+        self.context
+            .as_ref()
+            .map_or(Ok(()), |context| context.check_deadline())
+    }
+
+    fn read_referenced_asset(
+        &self,
+        path: &Path,
+        kind: AssetKind,
+    ) -> std::io::Result<CollectedAsset> {
+        match &self.context {
+            Some(context) => context.snapshot(path, kind),
+            None => read_collected_asset(path, kind),
+        }
+    }
+
+    fn should_continue_dependency_reads(&self) -> bool {
+        self.context
+            .as_ref()
+            .is_none_or(|context| context.check_deadline().is_ok())
     }
 }
 
@@ -192,6 +310,7 @@ impl SourceProvider for TrackingProvider {
     type Error = std::io::Error;
 
     fn read<'a>(&'a self, file: &Path) -> Result<&'a str, Self::Error> {
+        self.check_deadline()?;
         // The synthetic entry has no file behind it, so it is served from memory and never recorded
         // as a freshness input — there is nothing on disk that could change.
         if let Some((path, content)) = &self.synthetic
@@ -208,6 +327,10 @@ impl SourceProvider for TrackingProvider {
         self.record_read(key.clone(), None);
         let source = match self.preloaded.get(&key) {
             Some(asset) => {
+                if let Some(context) = &self.context {
+                    context.charge_css_snapshot(asset)?;
+                }
+                self.reserve(asset.bytes().len())?;
                 self.record_read(key.clone(), Some(asset.fingerprint.clone()));
                 std::str::from_utf8(asset.bytes()).map_err(|error| {
                     std::io::Error::new(
@@ -227,6 +350,18 @@ impl SourceProvider for TrackingProvider {
                         return Err(error);
                     }
                 };
+                let shared_reservation = self
+                    .context
+                    .as_ref()
+                    .map(|context| context.begin_css_read(&key, &metadata))
+                    .transpose()?;
+                let metadata_bytes = usize::try_from(metadata.len()).map_err(|_| {
+                    std::io::Error::other(format!(
+                        "stylesheet {} is too large for this platform",
+                        key.display()
+                    ))
+                })?;
+                let reservation = self.reserve(metadata_bytes)?;
                 let source = match self.inner.read(&key) {
                     Ok(source) => source,
                     Err(error) => {
@@ -234,20 +369,26 @@ impl SourceProvider for TrackingProvider {
                         return Err(error);
                     }
                 };
+                self.reconcile(reservation, source.len())?;
                 let (len, modified_millis) = read_time_len_mtime_of(&metadata);
-                self.record_read(
-                    key.clone(),
-                    Some(file_fingerprint_from_read_time(
+                let fingerprint = match (&self.context, shared_reservation) {
+                    (Some(context), Some(reservation)) => {
+                        context
+                            .finish_css_read(reservation, source.as_bytes())?
+                            .fingerprint
+                    }
+                    _ => file_fingerprint_from_read_time(
                         &key,
                         len,
                         modified_millis,
                         content_hash(source.as_bytes()),
-                    )),
-                );
+                    ),
+                };
+                self.record_read(key.clone(), Some(fingerprint));
                 source
             }
         };
-        self.charge(source.len())?;
+        self.check_deadline()?;
         Ok(source)
     }
 
@@ -352,7 +493,17 @@ pub fn bundle_css(entry: &Path) -> Result<CssBundle, String> {
 }
 
 fn bundle_collected_css(entry: &CollectedAsset) -> Result<CssBundle, CssProcessingError> {
-    let provider = TrackingProvider::new(std::slice::from_ref(entry));
+    bundle_collected_css_with_context(entry, None)
+}
+
+fn bundle_collected_css_with_context(
+    entry: &CollectedAsset,
+    context: Option<Arc<AssetProcessingContext>>,
+) -> Result<CssBundle, CssProcessingError> {
+    let provider = match context {
+        Some(context) => TrackingProvider::new_bounded(std::slice::from_ref(entry), context),
+        None => TrackingProvider::new(std::slice::from_ref(entry)),
+    };
     let result = bundle_with(&provider, &entry.path);
     let inputs = provider.into_read_inputs();
     match result {
@@ -382,19 +533,31 @@ pub fn bundle_css_set(entries: &[PathBuf]) -> Result<CssBundle, String> {
 }
 
 fn bundle_collected_css_set(entries: &[CollectedAsset]) -> Result<CssBundle, CssProcessingError> {
+    bundle_collected_css_set_with_context(entries, None)
+}
+
+fn bundle_collected_css_set_with_context(
+    entries: &[CollectedAsset],
+    context: Option<Arc<AssetProcessingContext>>,
+) -> Result<CssBundle, CssProcessingError> {
     match entries {
         [] => Err(CssProcessingError {
             message: "no stylesheets to bundle".to_owned(),
             inputs: CssReadInputs::default(),
         }),
-        [single] => bundle_collected_css(single),
+        [single] => bundle_collected_css_with_context(single, context),
         many => {
             let paths = many
                 .iter()
                 .map(|asset| asset.path.clone())
                 .collect::<Vec<_>>();
             let (path, content) = synthetic_entry(&paths);
-            let provider = TrackingProvider::with_synthetic(many, path.clone(), content);
+            let provider = match context {
+                Some(context) => {
+                    TrackingProvider::with_synthetic_bounded(many, path.clone(), content, context)
+                }
+                None => TrackingProvider::with_synthetic(many, path.clone(), content),
+            };
             let result = bundle_with(&provider, &path);
             let inputs = provider.into_read_inputs();
             match result {
@@ -451,6 +614,9 @@ fn css_string_escape(value: &str) -> String {
 /// The provider must outlive the `StyleSheet` (it borrows source strings held inside it), so all
 /// consumption happens here and only owned bytes escape.
 fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, String> {
+    provider
+        .check_deadline()
+        .map_err(|error| error.to_string())?;
     let mut bundler = Bundler::new(provider, None, ParserOptions::default());
     let mut stylesheet = bundler.bundle(entry).map_err(|error| {
         format!(
@@ -458,6 +624,9 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
             entry.display()
         )
     })?;
+    provider
+        .check_deadline()
+        .map_err(|error| error.to_string())?;
 
     // Print before minifying: this is the bundled sheet as authored, the CSS counterpart of the JS
     // chunk's unminified `raw_bytes`.
@@ -475,6 +644,9 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
         })?
         .code
         .into_bytes();
+    provider
+        .check_deadline()
+        .map_err(|error| error.to_string())?;
 
     stylesheet
         .minify(MinifyOptions {
@@ -487,6 +659,9 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
                 entry.display()
             )
         })?;
+    provider
+        .check_deadline()
+        .map_err(|error| error.to_string())?;
 
     // This is a metadata-only print. Lightning CSS replaces every URL in its returned code with a
     // hashed placeholder when dependency analysis is enabled, so that code must never become the
@@ -501,7 +676,11 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
             ..Default::default()
         })
         .map(|result| {
-            let dependencies = collect_referenced_assets(result.dependencies.unwrap_or_default());
+            let dependencies = collect_referenced_assets(
+                result.dependencies.unwrap_or_default(),
+                &|path, kind| provider.read_referenced_asset(path, kind),
+                &|| provider.should_continue_dependency_reads(),
+            );
             (
                 dependencies.assets,
                 dependencies.failures,
@@ -518,6 +697,9 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
                 )],
             )
         });
+    provider
+        .check_deadline()
+        .map_err(|error| error.to_string())?;
 
     let minified_bytes = stylesheet
         .to_css(PrinterOptions {
@@ -533,6 +715,9 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
         })?
         .code
         .into_bytes();
+    provider
+        .check_deadline()
+        .map_err(|error| error.to_string())?;
 
     Ok(CssBundle {
         raw_bytes,
@@ -719,17 +904,86 @@ pub fn asset_diagnostics(processed: &ProcessedAssets) -> Vec<ImportDiagnostic> {
     .collect()
 }
 
+const ASSET_PROCESSING_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// A whole post-build asset stage failed before it could produce one coherent measurement.
+#[derive(Debug, Clone)]
+pub(crate) struct AssetProcessingFailure {
+    pub(crate) stage: &'static str,
+    pub(crate) message: String,
+    pub(crate) read_paths: Vec<PathBuf>,
+    pub(crate) read_time_fingerprints: Vec<FileFingerprint>,
+}
+
+impl From<AssetBudgetFailure> for AssetProcessingFailure {
+    fn from(failure: AssetBudgetFailure) -> Self {
+        Self {
+            stage: failure.stage.as_str(),
+            message: failure.message,
+            read_paths: failure.read_paths,
+            read_time_fingerprints: failure.read_time_fingerprints,
+        }
+    }
+}
+
+fn boundary_failure(error: AssetBoundaryError) -> AssetProcessingFailure {
+    let stage = match error {
+        AssetBoundaryError::AdmissionTimedOut { .. }
+        | AssetBoundaryError::ExecutionTimedOut { .. } => crate::engine::stage::TIMEOUT,
+        AssetBoundaryError::Panicked { .. } => crate::engine::stage::PANIC,
+        AssetBoundaryError::AdmissionFailed { .. } => crate::engine::stage::ENGINE_GONE,
+    };
+    AssetProcessingFailure {
+        stage,
+        message: error.to_string(),
+        read_paths: Vec::new(),
+        read_time_fingerprints: Vec::new(),
+    }
+}
+
+/// Production entry: asset work has its own two-wide admission gate and one absolute deadline.
+pub(crate) fn process_assets_bounded(
+    assets: Vec<CollectedAsset>,
+    graph_source_bytes: usize,
+    graph_loaded_paths: Vec<PathBuf>,
+) -> Result<ProcessedAssets, AssetProcessingFailure> {
+    if assets.is_empty() {
+        return Ok(ProcessedAssets::default());
+    }
+    asset_boundary::execute(ASSET_PROCESSING_TIMEOUT, move |deadline: AssetDeadline| {
+        let context = Arc::new(AssetProcessingContext::production(
+            graph_source_bytes,
+            &graph_loaded_paths,
+            &assets,
+            deadline,
+        ));
+        process_assets_with_context(&assets, Some(context)).map_err(AssetProcessingFailure::from)
+    })
+    .map_err(boundary_failure)?
+}
+
 /// Process every reachable asset the build collected, the way each really ships.
 ///
 /// Never fails: an asset it cannot process falls back to the raw-byte disclosure that was the whole
 /// behaviour before B2, so the result is a strict improvement or a tie, never a regression.
 pub fn process_assets(assets: &[CollectedAsset]) -> ProcessedAssets {
+    process_assets_with_context(assets, None)
+        .expect("unbounded standalone asset processing cannot hit a shared build limit")
+}
+
+fn process_assets_with_context(
+    assets: &[CollectedAsset],
+    context: Option<Arc<AssetProcessingContext>>,
+) -> Result<ProcessedAssets, AssetBudgetFailure> {
     let mut processed = ProcessedAssets::default();
+    if let Some(failure) = context.as_ref().and_then(|context| context.failure()) {
+        return Err(failure);
+    }
     if assets.is_empty() {
-        return processed;
+        return Ok(processed);
     }
 
-    let referenced_assets = process_stylesheets(assets, &mut processed);
+    let referenced_assets = process_stylesheets(assets, &mut processed, context.clone())?;
     let mut assets_by_path: BTreeMap<PathBuf, CollectedAsset> = assets
         .iter()
         .cloned()
@@ -756,7 +1010,18 @@ pub fn process_assets(assets: &[CollectedAsset]) -> ProcessedAssets {
         .extend(all_assets.iter().map(|asset| asset.fingerprint.clone()));
 
     for kind in [AssetKind::Wasm, AssetKind::Font] {
-        process_binary_kind(&all_assets, kind, &mut processed);
+        process_binary_kind(&all_assets, kind, &mut processed, context.as_deref())?;
+    }
+
+    // The shared ledger also observes metadata reservations that fail before a provider read and
+    // exact snapshots served across retry providers. Merge that whole history on success so a
+    // later successful retry cannot erase an earlier conflicting/failed observation from cache
+    // freshness merely because both used the same path.
+    if let Some(context) = &context {
+        processed.read_paths.extend(context.read_paths());
+        processed
+            .read_time_fingerprints
+            .extend(context.freshness_fingerprints());
     }
 
     processed
@@ -765,7 +1030,10 @@ pub fn process_assets(assets: &[CollectedAsset]) -> ProcessedAssets {
     processed.read_paths.sort();
     processed.read_paths.dedup();
     sort_and_dedup_fingerprints(&mut processed.read_time_fingerprints);
-    processed
+    if let Some(failure) = context.as_ref().and_then(|context| context.failure()) {
+        return Err(failure);
+    }
+    Ok(processed)
 }
 
 /// The settled result of bundling the stylesheet set, named rather than a bare tuple so that the
@@ -784,14 +1052,15 @@ struct StylesheetOutcome {
 fn process_stylesheets(
     assets: &[CollectedAsset],
     processed: &mut ProcessedAssets,
-) -> Vec<CollectedAsset> {
+    context: Option<Arc<AssetProcessingContext>>,
+) -> Result<Vec<CollectedAsset>, AssetBudgetFailure> {
     let entries: Vec<CollectedAsset> = assets
         .iter()
         .filter(|asset| asset.kind == AssetKind::Css)
         .cloned()
         .collect();
     if entries.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // One artifact for the whole set is the right answer (it is how CSS ships, and it dedupes what
@@ -812,8 +1081,8 @@ fn process_stylesheets(
     // the common outcome here, since the union's usual reason to fail is the whole set breaching a
     // budget that each sheet is well inside. That silence made this path report an over-count at
     // High confidence and cache it.
-    let bundled = bundle_collected_css_set(&entries)
-        .and_then(compress_bundle)
+    let bundled = bundle_collected_css_set_with_context(&entries, context.clone())
+        .and_then(|bundle| compress_bundle(bundle, context.as_deref()))
         .map(|counted| StylesheetOutcome {
             counted: vec![counted],
             failures: Vec::new(),
@@ -822,6 +1091,15 @@ fn process_stylesheets(
             degraded: None,
         })
         .or_else(|union_error| {
+            // An overall resource/deadline failure is final. Retrying each sheet would reset only
+            // the local tree counter and repeat work after the build-wide ledger was exhausted.
+            if context
+                .as_ref()
+                .and_then(|context| context.failure())
+                .is_some()
+            {
+                return Err(union_error);
+            }
             if entries.len() == 1 {
                 return Err(union_error);
             }
@@ -835,7 +1113,16 @@ fn process_stylesheets(
             let mut uncounted = Vec::new();
 
             for entry in &entries {
-                match bundle_collected_css(entry).and_then(compress_bundle) {
+                if context
+                    .as_ref()
+                    .and_then(|context| context.failure())
+                    .is_some()
+                {
+                    break;
+                }
+                match bundle_collected_css_with_context(entry, context.clone())
+                    .and_then(|bundle| compress_bundle(bundle, context.as_deref()))
+                {
                     Ok(bundled) => counted.push(bundled),
                     Err(error) => {
                         failures.push(error.message);
@@ -866,6 +1153,10 @@ fn process_stylesheets(
                 degraded: Some(union_message),
             })
         });
+
+    if let Some(failure) = context.as_ref().and_then(|context| context.failure()) {
+        return Err(failure);
+    }
 
     let mut referenced_assets = Vec::new();
     match bundled {
@@ -940,14 +1231,35 @@ fn process_stylesheets(
         }
     }
 
-    referenced_assets
+    Ok(referenced_assets)
 }
 
 /// Compress a bundled stylesheet as its own artifact — never concatenated with anything else first,
 /// because it ships as its own file (ADR-0005).
-fn compress_bundle(bundle: CssBundle) -> Result<(CssBundle, CompressionSizes), CssProcessingError> {
+fn compress_bundle(
+    bundle: CssBundle,
+    context: Option<&AssetProcessingContext>,
+) -> Result<(CssBundle, CompressionSizes), CssProcessingError> {
+    if let Some(context) = context {
+        context
+            .check_deadline()
+            .map_err(|error| CssProcessingError {
+                message: error.to_string(),
+                inputs: CssReadInputs::default(),
+            })?;
+    }
     match compress_all_bytes(&bundle.minified_bytes) {
-        Ok(compressed) => Ok((bundle, compressed)),
+        Ok(compressed) => {
+            if let Some(context) = context {
+                context
+                    .check_deadline()
+                    .map_err(|error| CssProcessingError {
+                        message: error.to_string(),
+                        inputs: CssReadInputs::default(),
+                    })?;
+            }
+            Ok((bundle, compressed))
+        }
         Err(error) => {
             let mut inputs = CssReadInputs {
                 paths: bundle.read_paths,
@@ -974,11 +1286,19 @@ fn process_binary_kind(
     assets: &[CollectedAsset],
     kind: AssetKind,
     processed: &mut ProcessedAssets,
-) {
+    context: Option<&AssetProcessingContext>,
+) -> Result<(), AssetBudgetFailure> {
     let mut sizes = MeasuredSizes::ZERO;
     let mut counted = false;
 
     for asset in assets.iter().filter(|asset| asset.kind == kind) {
+        if let Some(context) = context
+            && context.check_deadline().is_err()
+        {
+            return Err(context
+                .failure()
+                .expect("an expired asset deadline must retain a typed failure"));
+        }
         let measured = compress_all_bytes(asset.bytes())
             .map_err(|error| format!("failed to compress {}: {error}", asset.path.display()))
             .map(|compressed| (asset.raw_bytes(), compressed));
@@ -1001,6 +1321,13 @@ fn process_binary_kind(
                 });
             }
         }
+        if let Some(context) = context
+            && context.check_deadline().is_err()
+        {
+            return Err(context
+                .failure()
+                .expect("an expired asset deadline must retain a typed failure"));
+        }
     }
 
     if counted {
@@ -1013,6 +1340,7 @@ fn process_binary_kind(
             zstd_bytes: sizes.zstd_bytes,
         });
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,4 +1,6 @@
 pub mod analyze;
+mod asset_boundary;
+mod asset_budget;
 pub mod assets;
 mod build_memo;
 pub mod compress;

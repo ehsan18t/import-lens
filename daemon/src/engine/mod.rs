@@ -119,6 +119,9 @@ pub struct ImportDiagnostic {
 pub struct BundleArtifact {
     /// Unminified source of the single output chunk.
     pub code: String,
+    /// Source bytes admitted under this build's aggregate graph ceiling. Direct assets contribute
+    /// their exact raw length even though Rolldown sees them as empty modules.
+    pub graph_source_bytes: usize,
     pub loaded_paths: Vec<PathBuf>,
     /// Fingerprints captured when each module's bytes were read during this build,
     /// so freshness describes the bytes the size was actually measured from (§8.3).

@@ -9,7 +9,7 @@ use crate::{
     },
     pipeline::{
         analyze::{AnalysisContext, engine_selection},
-        assets::{asset_diagnostics, process_assets},
+        assets::{asset_diagnostics, process_assets_bounded},
         compress::{CompressionSizes, compress_all},
         minify::minify_source,
         resolver::resolve_package_entry,
@@ -557,7 +557,43 @@ fn compute_file_size_with(
         // whole group — which is how they ship, and it dedupes what two imports both `@import`
         // rather than counting it twice. Each artifact is compressed on its own and summed
         // (ADR-0005); an asset that cannot be processed falls back to disclosure and is reported.
-        let assets = process_assets(&artifact.assets);
+        let assets = match process_assets_bounded(
+            artifact.assets.clone(),
+            artifact.graph_source_bytes,
+            artifact.loaded_paths.clone(),
+        ) {
+            Ok(assets) => assets,
+            Err(failure) => {
+                // The JS chunk completed, but the runtime group's asset tail did not produce one
+                // coherent measurement. Degrade this group exactly like a combined-build failure:
+                // keep the already-known per-import floor and never cache or judge it as File Cost.
+                totals.degraded = true;
+                totals
+                    .dependency_fingerprints
+                    .extend(artifact.read_time_fingerprints.iter().cloned());
+                totals
+                    .dependency_fingerprints
+                    .extend(failure.read_time_fingerprints);
+                totals.dependency_fingerprints.extend(
+                    artifact
+                        .unhashed_paths
+                        .iter()
+                        .map(unverifiable_file_fingerprint),
+                );
+                diagnostics.push(diagnostic(
+                    failure.stage,
+                    failure.message,
+                    vec![
+                        "asset processing failed for this runtime; its totals are conservative \
+                         per-import sums without shared-module or shared-asset deduplication"
+                            .to_owned(),
+                    ],
+                ));
+                let fallback = per_import_totals(&group.sized, &mut diagnostics);
+                any_sized |= totals.absorb_fallback(fallback);
+                continue;
+            }
+        };
         let asset_sizes = assets.total();
         totals
             .dependency_fingerprints

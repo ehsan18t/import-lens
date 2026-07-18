@@ -22,7 +22,7 @@ pub struct CollectedAsset {
 }
 
 impl CollectedAsset {
-    pub(super) fn from_read(
+    pub(crate) fn from_read(
         canonical_path: PathBuf,
         kind: AssetKind,
         metadata: &std::fs::Metadata,

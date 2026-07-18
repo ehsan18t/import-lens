@@ -127,6 +127,12 @@ impl BuildState {
             .take()
     }
 
+    /// Source bytes admitted by this build after every direct-asset reservation has been
+    /// reconciled with the bytes actually read.
+    pub(super) fn graph_source_bytes(&self) -> usize {
+        self.total_source_bytes.load(Ordering::Relaxed)
+    }
+
     /// Keeps the SMALLEST breach message, not the first one to arrive.
     ///
     /// These hooks run on concurrently-spawned module tasks, so "first" means "whichever module the
@@ -148,24 +154,99 @@ impl BuildState {
         }
     }
 
-    fn record_asset(&self, asset: CollectedAsset) {
-        let path = asset.path.clone();
-        // Duplicate imports may reach this hook concurrently. Derive the fingerprint from the
-        // snapshot that actually won the asset-map entry so the two maps can never describe
-        // different reads of the same path.
-        let fingerprint = self
-            .assets
-            .lock()
-            .expect("asset map should not be poisoned")
-            .entry(path.clone())
-            .or_insert(asset)
-            .fingerprint
-            .clone();
+    fn record_fingerprint(&self, path: PathBuf, fingerprint: FileFingerprint) {
         self.read_time
             .lock()
             .expect("read-time fingerprint map should not be poisoned")
             .entry(path)
             .or_insert(fingerprint);
+    }
+
+    /// Record the exact stat snapshot that made a pre-read limit failure deterministic. A hash is
+    /// unnecessary here: an equal-length/equal-mtime rewrite cannot change whether the same byte
+    /// ceiling is breached, while any metadata change expires the cached failure.
+    fn record_stat_fingerprint(&self, canonical: &Path, metadata: &std::fs::Metadata) {
+        let (len, modified_millis) = read_time_len_mtime_of(metadata);
+        self.record_fingerprint(
+            canonical.to_path_buf(),
+            FileFingerprint {
+                path: canonical.to_string_lossy().replace('\\', "/"),
+                len,
+                modified_millis,
+                content_hash: None,
+            },
+        );
+    }
+
+    /// Returns whether this read won the canonical asset slot. Rolldown normally loads one module
+    /// identity once, but treating the map as the authority prevents a duplicate hook invocation
+    /// from leaving the aggregate source counter double-charged.
+    fn record_asset(&self, asset: CollectedAsset) -> bool {
+        let path = asset.path.clone();
+        // Duplicate imports may reach this hook concurrently. Derive the fingerprint from the
+        // snapshot that actually won the asset-map entry so the two maps can never describe
+        // different reads of the same path.
+        let (fingerprint, inserted) = {
+            let mut assets = self
+                .assets
+                .lock()
+                .expect("asset map should not be poisoned");
+            match assets.entry(path.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    (entry.get().fingerprint.clone(), false)
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let fingerprint = asset.fingerprint.clone();
+                    entry.insert(asset);
+                    (fingerprint, true)
+                }
+            }
+        };
+        self.record_fingerprint(path, fingerprint);
+        inserted
+    }
+}
+
+/// Atomically reserve bytes without ever moving the counter past `limit` on rejection.
+///
+/// `fetch_add` is not suitable for a hard resource ceiling: it mutates first, so every rejected
+/// module permanently inflates the total and can manufacture follow-on breaches. `fetch_update`
+/// makes the check and increment one compare/exchange operation and leaves the counter untouched
+/// when the reservation does not fit.
+fn try_reserve_source_bytes(total: &AtomicUsize, bytes: usize, limit: usize) -> Result<(), usize> {
+    total
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current
+                .checked_add(bytes)
+                .filter(|candidate| *candidate <= limit)
+        })
+        .map(|_| ())
+}
+
+fn release_source_bytes(total: &AtomicUsize, bytes: usize) {
+    total
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(bytes)
+        })
+        .expect("released source bytes must have an existing reservation");
+}
+
+/// Replace a metadata reservation with the exact length returned by the read. A shrinking file
+/// releases capacity; a growing file must atomically acquire the difference before its bytes can
+/// enter the artifact.
+fn reconcile_source_bytes(
+    total: &AtomicUsize,
+    reserved: usize,
+    actual: usize,
+    limit: usize,
+) -> Result<(), usize> {
+    match actual.cmp(&reserved) {
+        std::cmp::Ordering::Less => {
+            release_source_bytes(total, reserved - actual);
+            Ok(())
+        }
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => try_reserve_source_bytes(total, actual - reserved, limit),
     }
 }
 
@@ -318,17 +399,38 @@ impl ImportLensPlugin {
         std::io::Error::other(message)
     }
 
-    fn charge_source_bytes(&self, source_bytes: usize, path: &Path) -> Result<(), std::io::Error> {
-        let total_bytes = self
-            .state
-            .total_source_bytes
-            .fetch_add(source_bytes, Ordering::Relaxed)
-            + source_bytes;
+    fn reserve_source_bytes(&self, source_bytes: usize) -> Result<(), std::io::Error> {
         let max_graph_source_bytes = *MAX_GRAPH_SOURCE_BYTES;
-        if total_bytes > max_graph_source_bytes {
+        if try_reserve_source_bytes(
+            &self.state.total_source_bytes,
+            source_bytes,
+            max_graph_source_bytes,
+        )
+        .is_err()
+        {
             return Err(self.breach(format!(
-                "module graph exceeds the {max_graph_source_bytes} byte total source limit after reading {}",
-                path.display()
+                "module graph exceeds the {max_graph_source_bytes} byte total source limit"
+            )));
+        }
+        Ok(())
+    }
+
+    fn release_source_bytes(&self, source_bytes: usize) {
+        release_source_bytes(&self.state.total_source_bytes, source_bytes);
+    }
+
+    fn reconcile_source_bytes(&self, reserved: usize, actual: usize) -> Result<(), std::io::Error> {
+        if reconcile_source_bytes(
+            &self.state.total_source_bytes,
+            reserved,
+            actual,
+            *MAX_GRAPH_SOURCE_BYTES,
+        )
+        .is_err()
+        {
+            return Err(self.breach(format!(
+                "module graph exceeds the {} byte total source limit",
+                *MAX_GRAPH_SOURCE_BYTES
             )));
         }
         Ok(())
@@ -337,19 +439,10 @@ impl ImportLensPlugin {
     /// Capture len+mtime from the stat taken BEFORE the read, paired with a hash of the bytes we
     /// actually read, so freshness describes the bytes the size was measured from (§8.3).
     fn record_read_time(&self, canonical: &Path, len: u64, modified_millis: u64, bytes: &[u8]) {
-        self.state
-            .read_time
-            .lock()
-            .expect("read-time fingerprint map should not be poisoned")
-            .entry(canonical.to_path_buf())
-            .or_insert_with(|| {
-                file_fingerprint_from_read_time(
-                    canonical,
-                    len,
-                    modified_millis,
-                    content_hash(bytes),
-                )
-            });
+        self.state.record_fingerprint(
+            canonical.to_path_buf(),
+            file_fingerprint_from_read_time(canonical, len, modified_millis, content_hash(bytes)),
+        );
     }
 }
 
@@ -421,6 +514,7 @@ impl Plugin for ImportLensPlugin {
         if !path.is_absolute() {
             return Ok(None);
         }
+        let asset_kind = classify_asset(path);
 
         // §7.3: reject an oversized module BEFORE reading it. The limit exists to
         // bound memory, so reading first would blow the very bound being enforced.
@@ -434,7 +528,8 @@ impl Plugin for ImportLensPlugin {
             // Not a readable file (or vanished): let Rolldown produce its own error.
             Err(_) => return Ok(None),
         };
-        if metadata.len() as usize > MAX_MODULE_SOURCE_BYTES {
+        if metadata.len() > MAX_MODULE_SOURCE_BYTES as u64 {
+            self.state.record_stat_fingerprint(&canonical, &metadata);
             return Err(self
                 .breach(format!(
                     "module {} exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit",
@@ -450,8 +545,30 @@ impl Plugin for ImportLensPlugin {
         // which is the very failure this hook exists to prevent.
         let (len, modified_millis) = read_time_len_mtime_of(&metadata);
 
-        let Ok(bytes) = tokio::fs::read(&canonical).await else {
-            return Ok(None);
+        // Direct assets become empty Rolldown modules, so `module_parsed` sees zero bytes for them.
+        // Reserve the stat length here, BEFORE reading, both to make the aggregate cap cover them
+        // and to keep a static oversized asset from allocating past the bound it is about to fail.
+        // The per-file check above makes this conversion safe on every supported architecture.
+        let reserved_asset_bytes = if asset_kind.is_some() {
+            let metadata_bytes = usize::try_from(metadata.len())
+                .expect("a per-file-admitted asset length must fit usize");
+            if let Err(error) = self.reserve_source_bytes(metadata_bytes) {
+                self.state.record_stat_fingerprint(&canonical, &metadata);
+                return Err(error.into());
+            }
+            Some(metadata_bytes)
+        } else {
+            None
+        };
+
+        let bytes = match tokio::fs::read(&canonical).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                if let Some(reserved) = reserved_asset_bytes {
+                    self.release_source_bytes(reserved);
+                }
+                return Ok(None);
+            }
         };
 
         // A non-JavaScript ASSET the package's own entry imports, intercepted BEFORE the UTF-8
@@ -467,14 +584,38 @@ impl Plugin for ImportLensPlugin {
         // asset itself is recorded here with its kind, and the pipeline then processes it the way
         // it really ships and folds those bytes into the Import Cost (B2) — they are neither
         // fabricated into the JS number nor thrown away with it.
-        if let Some(kind) = classify_asset(path) {
-            // Asset bytes stay attached to this read-time fingerprint all the way through
-            // post-processing. Charge them before retaining the snapshot; otherwise moving bytes
-            // into the artifact would turn the existing aggregate-limit bypass into unbounded
-            // retained memory.
-            self.charge_source_bytes(bytes.len(), &canonical)?;
-            self.state
-                .record_asset(CollectedAsset::from_read(canonical, kind, &metadata, bytes));
+        if let Some(kind) = asset_kind {
+            let reserved = reserved_asset_bytes
+                .expect("a classified asset must reserve its metadata length before reading");
+            let asset = CollectedAsset::from_read(canonical, kind, &metadata, bytes);
+            let actual = asset.bytes().len();
+
+            // A file may grow between metadata and read. The pre-read check is still the memory
+            // guard for stable files; this exact post-read check closes the concurrent-growth gap
+            // and fingerprints the bytes that made the deterministic failure true.
+            if actual > MAX_MODULE_SOURCE_BYTES {
+                self.state
+                    .record_fingerprint(asset.path.clone(), asset.fingerprint.clone());
+                self.release_source_bytes(reserved);
+                return Err(self
+                    .breach(format!(
+                        "module {} exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit",
+                        asset.path.display()
+                    ))
+                    .into());
+            }
+
+            if let Err(error) = self.reconcile_source_bytes(reserved, actual) {
+                self.state
+                    .record_fingerprint(asset.path.clone(), asset.fingerprint.clone());
+                // A failed growth reservation leaves the original metadata reservation intact.
+                self.release_source_bytes(reserved);
+                return Err(error.into());
+            }
+
+            if !self.state.record_asset(asset) {
+                self.release_source_bytes(actual);
+            }
 
             return Ok(Some(HookLoadOutput {
                 code: String::new().into(),
@@ -524,7 +665,7 @@ impl Plugin for ImportLensPlugin {
                 .into());
         }
 
-        self.charge_source_bytes(source_bytes, path)?;
+        self.reserve_source_bytes(source_bytes)?;
 
         let canonical = self.state.canonical_path(path);
         let module_count = {
@@ -549,5 +690,56 @@ impl Plugin for ImportLensPlugin {
 
     fn register_hook_usage(&self) -> HookUsage {
         HookUsage::ResolveId | HookUsage::Load | HookUsage::ModuleParsed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_source_reservation_never_inflates_the_total() {
+        let total = AtomicUsize::new(8);
+
+        assert_eq!(try_reserve_source_bytes(&total, 3, 10), Err(8));
+        assert_eq!(total.load(Ordering::Relaxed), 8);
+
+        let near_overflow = AtomicUsize::new(usize::MAX - 1);
+        assert_eq!(
+            try_reserve_source_bytes(&near_overflow, 2, usize::MAX),
+            Err(usize::MAX - 1)
+        );
+        assert_eq!(near_overflow.load(Ordering::Relaxed), usize::MAX - 1);
+    }
+
+    #[test]
+    fn concurrent_source_reservations_never_cross_the_ceiling() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let accepted = (0..16)
+            .map(|_| {
+                let total = Arc::clone(&total);
+                std::thread::spawn(move || try_reserve_source_bytes(&total, 10, 50).is_ok())
+            })
+            .map(|worker| worker.join().expect("reservation worker should not panic"))
+            .filter(|was_accepted| *was_accepted)
+            .count();
+
+        assert_eq!(accepted, 5);
+        assert_eq!(total.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn metadata_reservation_reconciles_to_the_exact_read_length() {
+        let shrank = AtomicUsize::new(20);
+        assert_eq!(reconcile_source_bytes(&shrank, 8, 3, 25), Ok(()));
+        assert_eq!(shrank.load(Ordering::Relaxed), 15);
+
+        let grew = AtomicUsize::new(20);
+        assert_eq!(reconcile_source_bytes(&grew, 8, 10, 25), Ok(()));
+        assert_eq!(grew.load(Ordering::Relaxed), 22);
+
+        let rejected_growth = AtomicUsize::new(20);
+        assert_eq!(reconcile_source_bytes(&rejected_growth, 8, 14, 25), Err(20));
+        assert_eq!(rejected_growth.load(Ordering::Relaxed), 20);
     }
 }

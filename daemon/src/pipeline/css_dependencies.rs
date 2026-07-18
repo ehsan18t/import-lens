@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use lightningcss::dependencies::{Dependency, ImportDependency, UrlDependency};
 
-use crate::engine::{AssetKind, CollectedAsset, classify_asset, read_collected_asset};
+use crate::engine::{AssetKind, CollectedAsset, classify_asset};
 
 /// Resolve the supported local files referenced by `url()` in a bundled stylesheet.
 ///
@@ -32,14 +32,19 @@ enum SupportedAsset {
 
 pub(super) fn collect_referenced_assets(
     dependencies: impl IntoIterator<Item = Dependency>,
+    read_asset: &impl Fn(&Path, AssetKind) -> std::io::Result<CollectedAsset>,
+    should_continue: &impl Fn() -> bool,
 ) -> CssDependencyAssets {
     let mut assets = BTreeMap::new();
     let mut failures = BTreeMap::new();
     let mut unresolved = BTreeSet::new();
 
     for dependency in dependencies {
+        if !should_continue() {
+            break;
+        }
         match dependency {
-            Dependency::Url(dependency) => match collect_supported_asset(dependency) {
+            Dependency::Url(dependency) => match collect_supported_asset(dependency, read_asset) {
                 Some(SupportedAsset::Collected(asset)) => {
                     assets.entry(asset.path.clone()).or_insert(asset);
                 }
@@ -86,7 +91,10 @@ fn unresolved_import(dependency: ImportDependency) -> Option<String> {
     ))
 }
 
-fn collect_supported_asset(dependency: UrlDependency) -> Option<SupportedAsset> {
+fn collect_supported_asset(
+    dependency: UrlDependency,
+    read_asset: &impl Fn(&Path, AssetKind) -> std::io::Result<CollectedAsset>,
+) -> Option<SupportedAsset> {
     let resource_path = resource_path(&dependency.url)?;
     let kind = classify_asset(Path::new(&resource_path))?;
     if !matches!(kind, AssetKind::Wasm | AssetKind::Font) {
@@ -106,7 +114,7 @@ fn collect_supported_asset(dependency: UrlDependency) -> Option<SupportedAsset> 
     let path = source_file.parent()?.join(resource);
     let path = fs::canonicalize(&path).unwrap_or(path);
     let raw_bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    Some(match read_collected_asset(&path, kind) {
+    Some(match read_asset(&path, kind) {
         Ok(asset) => SupportedAsset::Collected(asset),
         Err(error) => SupportedAsset::Unreadable(CssDependencyFailure {
             message: format!("failed to read CSS resource {}: {error}", path.display()),

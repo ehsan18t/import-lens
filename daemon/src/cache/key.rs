@@ -91,9 +91,14 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// validate those exact fingerprints before reuse. Entries computed under `+5` can contain bytes
 /// from one read paired with a later fingerprint, or remain cached after a CSS dependency changes,
 /// and therefore must be rejected.
+///
+/// `rolldown-1.1.x+7` (2026-07-18): every asset-processing read now shares the graph's aggregate
+/// resource ceiling and a bounded execution deadline. Cached `+6` measurements may include CSS
+/// `@import` or `url()` resources that escaped the graph limit, so they must be recomputed under the
+/// unified admission rules.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+6"
+        "rolldown-1.1.x+7"
     };
 }
 

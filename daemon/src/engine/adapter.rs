@@ -227,6 +227,7 @@ fn translate(
 
     Ok(BundleArtifact {
         code: chunk.code.clone(),
+        graph_source_bytes: state.graph_source_bytes(),
         loaded_paths: state.sorted_loaded_paths(),
         read_time_fingerprints,
         unhashed_paths,

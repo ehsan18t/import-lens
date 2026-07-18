@@ -5,7 +5,7 @@ use crate::{
         ModuleContribution,
     },
     pipeline::{
-        assets::{asset_diagnostics, process_assets},
+        assets::{AssetProcessingFailure, asset_diagnostics, process_assets_bounded},
         compress::compress_all,
         fallback::source_excerpt_detail,
         full_package,
@@ -34,6 +34,16 @@ pub struct AnalysisContext {
 }
 
 // Internal structured error translated into the stable ImportResult surface.
+#[derive(Debug, Clone, Default)]
+struct FailureFreshness {
+    /// Fingerprints of every module the failing build read.
+    read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
+    /// Modules parsed before failure, used to find first-party manifests that shaped resolution.
+    loaded_paths: Vec<PathBuf>,
+    /// Successful graph inputs that had no same-read hash.
+    stat_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AnalysisError {
     stage: &'static str,
@@ -48,10 +58,7 @@ pub struct AnalysisError {
     /// parse would keep serving the cached failure after the user fixed it, because nothing the
     /// cache watches moved. So the failure is fingerprinted against the bytes it was derived from,
     /// exactly as a success is.
-    read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
-    /// The modules that parsed before the build gave up, used only to find the first-party
-    /// manifests that shaped the resolution.
-    loaded_paths: Vec<PathBuf>,
+    freshness: Box<FailureFreshness>,
 }
 
 pub fn analyze_import(context: &AnalysisContext, request: &ImportRequest) -> ImportResult {
@@ -211,18 +218,21 @@ fn engine_failure_fingerprints(
     request: &ImportRequest,
     error: &AnalysisError,
 ) -> Option<FingerprintSource> {
-    if error.read_time_fingerprints.is_empty() {
+    if error.freshness.read_time_fingerprints.is_empty() && error.freshness.stat_paths.is_empty() {
         return None;
     }
 
-    let mut stat_paths = Vec::new();
+    let mut stat_paths = error.freshness.stat_paths.clone();
     if let Ok(resolved) = resolve_package_entry(&context.active_document_path, request) {
         stat_paths.push(resolved.package_root.join("package.json"));
     }
-    stat_paths.extend(first_party_manifests(context, &error.loaded_paths));
+    stat_paths.extend(first_party_manifests(
+        context,
+        &error.freshness.loaded_paths,
+    ));
 
     Some(FingerprintSource::ReadTime {
-        fingerprints: error.read_time_fingerprints.clone(),
+        fingerprints: error.freshness.read_time_fingerprints.clone(),
         stat_paths,
     })
 }
@@ -401,9 +411,15 @@ pub(crate) fn analyze_with_rolldown_engine(
 
     // The package's non-JavaScript assets, processed the way they really ship, so their bytes JOIN
     // the Import Cost instead of being disclosed beside a number that excluded them (B2). Each
-    // artifact is compressed on its own and summed (ADR-0005). This never fails: an asset it cannot
-    // process falls back to the raw-byte disclosure that was the whole behaviour before B2.
-    let assets = process_assets(&artifact.assets);
+    // artifact is compressed on its own and summed (ADR-0005). Ordinary parse/compression failures
+    // still disclose raw bytes, but a whole-build resource/deadline breach has no coherent partial
+    // measurement and therefore returns one typed Unmeasured result.
+    let assets = process_assets_bounded(
+        artifact.assets.clone(),
+        artifact.graph_source_bytes,
+        artifact.loaded_paths.clone(),
+    )
+    .map_err(|failure| asset_processing_error(context, request, &artifact, failure))?;
     let asset_sizes = assets.total();
 
     // §7.4/FR-021: Side-Effectful is a property of THE IMPORT — is the entry being measured one
@@ -607,9 +623,31 @@ fn engine_error(
             .collect(),
     );
     // The bytes the build read before it gave up. A cached deterministic failure expires against
-    // exactly these (see `AnalysisError::read_time_fingerprints`).
-    error.read_time_fingerprints = failure.read_time_fingerprints;
-    error.loaded_paths = failure.loaded_paths;
+    // exactly these (see `FailureFreshness::read_time_fingerprints`).
+    error.freshness.read_time_fingerprints = failure.read_time_fingerprints;
+    error.freshness.loaded_paths = failure.loaded_paths;
+    error
+}
+
+fn asset_processing_error(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    artifact: &crate::engine::BundleArtifact,
+    failure: AssetProcessingFailure,
+) -> AnalysisError {
+    let mut error =
+        error_with_context(failure.stage, failure.message, context, request, Vec::new());
+    error.freshness.read_time_fingerprints = artifact.read_time_fingerprints.clone();
+    error
+        .freshness
+        .read_time_fingerprints
+        .extend(failure.read_time_fingerprints);
+    crate::cache::key::sort_and_dedup_fingerprints(&mut error.freshness.read_time_fingerprints);
+    error.freshness.loaded_paths = artifact.loaded_paths.clone();
+    error.freshness.loaded_paths.extend(failure.read_paths);
+    error.freshness.loaded_paths.sort();
+    error.freshness.loaded_paths.dedup();
+    error.freshness.stat_paths = artifact.unhashed_paths.clone();
     error
 }
 
@@ -716,8 +754,7 @@ fn error_with_context(
         stage,
         message: message.into(),
         details: context_details,
-        read_time_fingerprints: Vec::new(),
-        loaded_paths: Vec::new(),
+        freshness: Box::default(),
     }
 }
 
