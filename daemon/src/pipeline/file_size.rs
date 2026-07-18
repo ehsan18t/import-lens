@@ -985,6 +985,23 @@ mod tests {
             self
         }
 
+        fn package_file(
+            &self,
+            package: &str,
+            relative_path: &str,
+            contents: impl AsRef<[u8]>,
+        ) -> &Self {
+            let path = self
+                .root
+                .join("node_modules")
+                .join(package)
+                .join(relative_path);
+            std::fs::create_dir_all(path.parent().expect("package file parent"))
+                .expect("package file directory");
+            std::fs::write(path, contents).expect("package file");
+            self
+        }
+
         /// A declarations-only package: a manifest, a `.d.ts`, and NO runtime entry. It resolves to
         /// `Err` by design.
         fn types_only_package(&self, name: &str) -> &Self {
@@ -1216,6 +1233,64 @@ mod tests {
             "and a cold document's total must be CACHED, or the combined build re-runs on every \
              keystroke and `importlens check` can never judge a file it measured first: {:?}",
             totals.diagnostics
+        );
+    }
+
+    #[test]
+    fn file_cost_counts_a_font_shared_by_two_stylesheets_once() {
+        const FONT_BYTES: usize = 6 * 1024;
+
+        let fixture = Fixture::new("shared-css-font");
+        fixture
+            .package(
+                "font-lib",
+                "import './first.css';\nimport './second.css';\nexport const value = 42;\n",
+            )
+            .package_file(
+                "font-lib",
+                "package.json",
+                r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+            )
+            .package_file(
+                "font-lib",
+                "first.css",
+                "@font-face { font-family: First; src: url('./shared.woff2'); }\n",
+            )
+            .package_file(
+                "font-lib",
+                "second.css",
+                "@font-face { font-family: Second; src: url('./shared.woff2'); }\n",
+            )
+            .package_file("font-lib", "shared.woff2", []);
+
+        let imports = [SizedImport::installed(request("font-lib"), None)];
+        let empty_font = compute_file_size(&fixture.context(), &imports);
+        fixture.package_file("font-lib", "shared.woff2", vec![0x6d; FONT_BYTES]);
+        let populated_font = compute_file_size(&fixture.context(), &imports);
+
+        for totals in [&empty_font, &populated_font] {
+            assert!(totals.error.is_none(), "{totals:?}");
+            assert!(
+                !totals.degraded,
+                "the combined build must succeed: {totals:?}"
+            );
+            assert!(
+                !totals.incomplete,
+                "every emitted file is readable: {totals:?}"
+            );
+        }
+        assert_eq!(
+            populated_font.raw_bytes.checked_sub(empty_font.raw_bytes),
+            Some(FONT_BYTES as u64),
+            "zero means the CSS font was omitted; twice the font length means its two references \
+             were counted twice"
+        );
+        assert_eq!(
+            populated_font
+                .minified_bytes
+                .checked_sub(empty_font.minified_bytes),
+            Some(FONT_BYTES as u64),
+            "a binary artifact has no separate minification step"
         );
     }
 

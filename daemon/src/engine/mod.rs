@@ -4,6 +4,7 @@
 //! the crate.
 
 mod adapter;
+mod asset_classifier;
 pub mod boundary;
 pub(crate) mod dependency_paths;
 mod entry;
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 
 pub use crate::ipc::protocol::ImportRuntime;
 pub use adapter::RolldownEngine;
+pub(crate) use asset_classifier::classify_asset;
 
 #[derive(Debug, Clone)]
 pub struct BundleRequest {
@@ -104,9 +106,9 @@ impl AssetKind {
     }
 }
 
-/// A non-JavaScript module the graph imported, classified and intercepted at the load boundary so
-/// the JavaScript chunk still measures exactly. Its bytes really do ship, so the pipeline processes
-/// it the way it ships and folds the result into the Import Cost (B2).
+/// A reachable non-JavaScript artifact discovered either at the JavaScript load boundary or through
+/// a local CSS `url()`. Its bytes really do ship, so the pipeline processes it the way it ships and
+/// folds the result into the Import Cost (B2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectedAsset {
     pub path: PathBuf,

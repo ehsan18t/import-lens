@@ -2718,3 +2718,391 @@ fn analyze_a_css_shipping_package_counts_its_stylesheet_in_the_import_cost() {
     // its confidence — the diagnostic that held it at Medium is only emitted on a failure now.
     assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
 }
+
+#[test]
+fn analyze_local_assets_referenced_by_css_are_counted_in_the_import_cost() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "font-lib",
+        "styles.css",
+        "@font-face { font-family: Probe; src: url('./probe.woff2') format('woff2'); }\n\
+         .widget { font-family: Probe; background-image: url('./probe.wasm'); }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("font-lib")
+            .join("probe.woff2"),
+        vec![0x5a; 8 * 1024],
+    )
+    .expect("font fixture should be written");
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("font-lib")
+            .join("probe.wasm"),
+        vec![0x31; 4 * 1024],
+    )
+    .expect("wasm fixture should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "font-lib",
+            "font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    write_package(
+        &workspace,
+        "plain-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "export const widget = () => 'widget';\n",
+    );
+    let plain = analyze_import(
+        &context,
+        &import_request(
+            "plain-lib",
+            "plain-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "{result:?}");
+    let sizes = common::measured_sizes(&result);
+    let plain_sizes = common::measured_sizes(&plain);
+    let css = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Css)
+        .expect("the stylesheet must have a counted CSS contribution");
+    let font = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Font)
+        .expect("a local font referenced by counted CSS must have a Font contribution");
+    let wasm = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Wasm)
+        .expect("local wasm referenced by counted CSS must have a Wasm contribution");
+
+    assert_eq!(font.raw_bytes, 8 * 1024, "{font:?}");
+    assert!(font.brotli_bytes > 0, "{font:?}");
+    assert_eq!(wasm.raw_bytes, 4 * 1024, "{wasm:?}");
+    assert!(wasm.brotli_bytes > 0, "{wasm:?}");
+    assert_eq!(
+        sizes.raw_bytes,
+        plain_sizes.raw_bytes + css.raw_bytes + font.raw_bytes + wasm.raw_bytes,
+        "the headline must contain the JS, CSS, font, and wasm artifacts exactly once"
+    );
+    assert_eq!(
+        sizes.brotli_bytes,
+        plain_sizes.brotli_bytes + css.brotli_bytes + font.brotli_bytes + wasm.brotli_bytes,
+        "each independently-compressed artifact must be folded into the headline"
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "a readable local font must not be disclosed as uncounted: {result:?}"
+    );
+    assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
+}
+
+#[test]
+fn analyze_a_font_reference_resolves_from_the_imported_stylesheet() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "nested-font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "nested-font-lib",
+        "styles.css",
+        "@import './nested/typography.css';\n.widget { font-family: Probe; }\n",
+    );
+    write_package_file(
+        &workspace,
+        "nested-font-lib",
+        "nested/typography.css",
+        "@font-face { font-family: Probe; src: url('./probe%20font.woff2?v=1#iefix'); }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("nested-font-lib")
+            .join("nested")
+            .join("probe font.woff2"),
+        vec![0x3c; 4 * 1024],
+    )
+    .expect("nested font fixture should be written");
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "nested-font-lib",
+            "nested-font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let font = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Font)
+        .expect("the imported stylesheet's font must be counted");
+    assert_eq!(font.raw_bytes, 4 * 1024, "{result:?}");
+    assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
+}
+
+#[test]
+fn analyze_two_stylesheets_count_their_shared_font_once() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "shared-font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './first.css';\nimport './second.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "shared-font-lib",
+        "first.css",
+        "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n.first { color: red; }\n",
+    );
+    write_package_file(
+        &workspace,
+        "shared-font-lib",
+        "second.css",
+        "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n.second { color: blue; }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("shared-font-lib")
+            .join("probe.woff2"),
+        vec![0x7f; 6 * 1024],
+    )
+    .expect("shared font fixture should be written");
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "shared-font-lib",
+            "shared-font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let font = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Font)
+        .expect("the shared font must be counted");
+    assert_eq!(
+        font.raw_bytes,
+        6 * 1024,
+        "two CSS references to one emitted font must not double-count it: {result:?}"
+    );
+}
+
+#[test]
+fn analyze_a_missing_css_font_is_disclosed_and_lowers_confidence() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "missing-font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "missing-font-lib",
+        "styles.css",
+        "@font-face { font-family: Missing; src: url('./missing.woff2'); }\n",
+    );
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "missing-font-lib",
+            "missing-font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "the JavaScript and CSS still measured");
+    assert!(
+        result
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == AssetKind::Css),
+        "the healthy CSS contribution must be retained: {result:?}"
+    );
+    assert!(
+        !result
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == AssetKind::Font),
+        "an unreadable font must not be fabricated into the breakdown: {result:?}"
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "uncounted_assets" && diagnostic.message.contains("missing.woff2")
+        }),
+        "the missing local font must be disclosed: {result:?}"
+    );
+    assert_eq!(result.confidence, ConfidenceLevel::Medium, "{result:?}");
+}
+
+#[test]
+fn analyze_external_css_fonts_are_disclosed_as_imprecise() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "external-font-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "external-font-lib",
+        "styles.css",
+        "@font-face { font-family: Remote; src: url('https://cdn.example/remote.woff2'); }\n\
+         @font-face { font-family: Public; src: url('/fonts/public.woff2'); }\n",
+    );
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "external-font-lib",
+            "external-font-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(result.error, None, "the local stylesheet still measured");
+    assert!(
+        !result
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == AssetKind::Font),
+        "external bytes must not be fabricated into a local artifact: {result:?}"
+    );
+    let disclosure = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.stage == "imprecise_assets"
+                && diagnostic.message.contains("resource references")
+        })
+        .expect("unmeasurable external font weight must be disclosed");
+    assert_eq!(disclosure.details.len(), 2, "{disclosure:?}");
+    assert_eq!(result.confidence, ConfidenceLevel::Medium, "{result:?}");
+}
+
+#[test]
+fn analyze_an_ambiguous_css_url_keeps_the_css_and_discloses_imprecision() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "ambiguous-url-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.css"]}"#,
+        "import './styles.css';\nexport const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "ambiguous-url-lib",
+        "styles.css",
+        ".widget { --probe-resource: url('./probe.woff2'); color: purple; }\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("ambiguous-url-lib")
+            .join("probe.woff2"),
+        vec![0x2a; 2 * 1024],
+    )
+    .expect("ambiguous resource fixture should be written");
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "ambiguous-url-lib",
+            "ambiguous-url-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert_eq!(
+        result.error, None,
+        "the valid stylesheet must remain measured"
+    );
+    assert!(
+        result
+            .asset_breakdown
+            .iter()
+            .any(|contribution| contribution.kind == AssetKind::Css),
+        "dependency inspection must not discard the CSS contribution: {result:?}"
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "imprecise_assets"
+                && diagnostic.message.contains("resource references")
+        }),
+        "an ambiguous relative URL must not remain silently High confidence: {result:?}"
+    );
+    assert_eq!(result.confidence, ConfidenceLevel::Medium, "{result:?}");
+}

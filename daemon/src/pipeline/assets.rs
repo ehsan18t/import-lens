@@ -14,18 +14,21 @@
 //! ([ADR-0005](../../../docs/adr/0005-a-runtime-is-an-artifact-boundary.md)): they are separate
 //! files that ship separately, so concatenating them before compressing would invent a number.
 //!
-//! Every path Lightning CSS opens — the entry and each resolved `@import` child — is captured for
-//! cache freshness, so an edit to any of them invalidates the measured size. Any processing failure
-//! falls back to disclosing the raw bytes, which is exactly today's behaviour: never below it
+//! Every path Lightning CSS opens — the entry and each resolved `@import` child — plus supported
+//! local artifacts referenced by `url()` are captured for cache freshness, so an edit to any of
+//! them invalidates the measured size. Any processing failure falls back to disclosing the raw
+//! bytes, which is exactly today's behaviour: never below it
 //! ([ADR-0006](../../../docs/adr/0006-the-result-model.md)).
 
 use crate::engine::{AssetKind, CollectedAsset, UncountedAsset, diagnostic_stage};
 use crate::ipc::protocol::{AssetContribution, ImportDiagnostic, MeasuredSizes};
 use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
+use crate::pipeline::css_dependencies::collect_referenced_assets;
 use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider};
+use lightningcss::dependencies::DependencyOptions;
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions};
 use lightningcss::targets::Targets;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -202,6 +205,14 @@ pub struct CssBundle {
     /// The `@import`-inlined, minified stylesheet: what actually ships, and what gets compressed.
     pub minified_bytes: Vec<u8>,
     pub read_paths: Vec<PathBuf>,
+    /// Supported local artifacts referenced by the CSS that survives minification. They are
+    /// separate emitted files, so the caller processes and compresses them independently.
+    pub referenced_assets: Vec<CollectedAsset>,
+    /// Dependency analysis is metadata-only and must never discard an otherwise valid CSS size.
+    /// When it cannot inspect every URL (for example an ambiguous relative URL in a custom
+    /// property), the caller keeps the CSS contribution and discloses that referenced assets may
+    /// be missing.
+    pub dependency_failures: Vec<String>,
 }
 
 /// Bundle one stylesheet the way it ships: resolve its `@import` tree from disk into one
@@ -210,12 +221,9 @@ pub struct CssBundle {
 /// result never drops below today's behavior.
 pub fn bundle_css(entry: &Path) -> Result<CssBundle, String> {
     let provider = TrackingProvider::new();
-    let (raw_bytes, minified_bytes) = bundle_with(&provider, entry)?;
-    Ok(CssBundle {
-        raw_bytes,
-        minified_bytes,
-        read_paths: provider.into_read_paths(),
-    })
+    let mut bundle = bundle_with(&provider, entry)?;
+    bundle.read_paths = provider.into_read_paths();
+    Ok(bundle)
 }
 
 /// Bundle EVERY reachable stylesheet into one artifact, which is how CSS ships and how the esbuild
@@ -229,12 +237,9 @@ pub fn bundle_css_set(entries: &[PathBuf]) -> Result<CssBundle, String> {
         many => {
             let (path, content) = synthetic_entry(many);
             let provider = TrackingProvider::with_synthetic(path.clone(), content);
-            let (raw_bytes, minified_bytes) = bundle_with(&provider, &path)?;
-            Ok(CssBundle {
-                raw_bytes,
-                minified_bytes,
-                read_paths: provider.into_read_paths(),
-            })
+            let mut bundle = bundle_with(&provider, &path)?;
+            bundle.read_paths = provider.into_read_paths();
+            Ok(bundle)
         }
     }
 }
@@ -279,7 +284,7 @@ fn css_string_escape(value: &str) -> String {
 
 /// The provider must outlive the `StyleSheet` (it borrows source strings held inside it), so all
 /// consumption happens here and only owned bytes escape.
-fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, String> {
     let mut bundler = Bundler::new(provider, None, ParserOptions::default());
     let mut stylesheet = bundler.bundle(entry).map_err(|error| {
         format!(
@@ -317,6 +322,32 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<(Vec<u8>, Ve
             )
         })?;
 
+    // This is a metadata-only print. Lightning CSS replaces every URL in its returned code with a
+    // hashed placeholder when dependency analysis is enabled, so that code must never become the
+    // measured artifact. `to_css` borrows immutably; the ordinary print below still emits the real
+    // minified stylesheet. Analyze after minification so a resource removed from shipped CSS is not
+    // counted.
+    let (referenced_assets, dependency_failures) = stylesheet
+        .to_css(PrinterOptions {
+            minify: true,
+            targets: Targets::default(),
+            analyze_dependencies: Some(DependencyOptions::default()),
+            ..Default::default()
+        })
+        .map(|result| {
+            let dependencies = collect_referenced_assets(result.dependencies.unwrap_or_default());
+            (dependencies.assets, dependencies.unresolved)
+        })
+        .unwrap_or_else(|error| {
+            (
+                Vec::new(),
+                vec![format!(
+                    "lightningcss could not inspect resource URLs in {}: {error:?}",
+                    entry.display()
+                )],
+            )
+        });
+
     let minified_bytes = stylesheet
         .to_css(PrinterOptions {
             minify: true,
@@ -332,7 +363,13 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<(Vec<u8>, Ve
         .code
         .into_bytes();
 
-    Ok((raw_bytes, minified_bytes))
+    Ok(CssBundle {
+        raw_bytes,
+        minified_bytes,
+        read_paths: Vec::new(),
+        referenced_assets,
+        dependency_failures,
+    })
 }
 
 /// What the reachable assets really cost, ready to fold into the Import Cost.
@@ -340,9 +377,9 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<(Vec<u8>, Ve
 pub struct ProcessedAssets {
     /// One entry per asset kind actually present, already summed across that kind's artifacts.
     pub contributions: Vec<AssetContribution>,
-    /// Files the processing read that the build did not already know about — a stylesheet's
-    /// `@import` children. Without these in the freshness fingerprints, editing one would not
-    /// invalidate the size it fed.
+    /// Files the processing discovered outside the JavaScript graph — a stylesheet's `@import`
+    /// children and supported local `url()` artifacts. Without these in freshness, editing one
+    /// would not invalidate the size it fed.
     pub read_paths: Vec<PathBuf>,
     /// Assets that could NOT be processed, disclosed with their raw bytes exactly as before.
     pub uncounted: Vec<UncountedAsset>,
@@ -356,6 +393,9 @@ pub struct ProcessedAssets {
     /// and was dropped on the floor, taking a silent, High-confidence, cacheable over-count with
     /// it. Every channel here now has one consumer and its own trigger.
     pub stylesheets_measured_separately: Option<String>,
+    /// Dependency-analysis failures keep the valid CSS contribution but make it impossible to
+    /// prove that every local font/wasm reference was discovered.
+    pub css_dependency_failures: Vec<String>,
 }
 
 impl ProcessedAssets {
@@ -442,6 +482,20 @@ pub fn imprecise_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
     })
 }
 
+fn unresolved_css_dependencies_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
+    if processed.css_dependency_failures.is_empty() {
+        return None;
+    }
+
+    Some(ImportDiagnostic {
+        stage: diagnostic_stage::IMPRECISE_ASSETS.to_owned(),
+        message: "the stylesheet was measured, but some CSS resource references could not be \
+                  inspected, so this size may omit referenced font or wasm artifacts"
+            .to_owned(),
+        details: processed.css_dependency_failures.clone(),
+    })
+}
+
 /// Every disclosure the processed assets owe the user, so a caller cannot fold in the bytes and
 /// forget one. Both call sites take the whole list rather than naming the diagnostics one by one:
 /// a future asset caveat is then disclosed by construction instead of by memory.
@@ -449,6 +503,7 @@ pub fn asset_diagnostics(processed: &ProcessedAssets) -> Vec<ImportDiagnostic> {
     [
         uncounted_assets_diagnostic(processed),
         imprecise_assets_diagnostic(processed),
+        unresolved_css_dependencies_diagnostic(processed),
     ]
     .into_iter()
     .flatten()
@@ -465,14 +520,27 @@ pub fn process_assets(assets: &[CollectedAsset]) -> ProcessedAssets {
         return processed;
     }
 
-    process_stylesheets(assets, &mut processed);
+    let referenced_assets = process_stylesheets(assets, &mut processed);
+    let mut assets_by_path: BTreeMap<PathBuf, CollectedAsset> = assets
+        .iter()
+        .cloned()
+        .map(|asset| (asset.path.clone(), asset))
+        .collect();
+    for asset in referenced_assets {
+        processed.read_paths.push(asset.path.clone());
+        assets_by_path.entry(asset.path.clone()).or_insert(asset);
+    }
+    let all_assets: Vec<CollectedAsset> = assets_by_path.into_values().collect();
+
     for kind in [AssetKind::Wasm, AssetKind::Font] {
-        process_binary_kind(assets, kind, &mut processed);
+        process_binary_kind(&all_assets, kind, &mut processed);
     }
 
     processed
         .contributions
         .sort_by_key(|contribution| contribution.kind);
+    processed.read_paths.sort();
+    processed.read_paths.dedup();
     processed
 }
 
@@ -487,14 +555,17 @@ struct StylesheetOutcome {
     degraded: Option<String>,
 }
 
-fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAssets) {
+fn process_stylesheets(
+    assets: &[CollectedAsset],
+    processed: &mut ProcessedAssets,
+) -> Vec<CollectedAsset> {
     let entries: Vec<PathBuf> = assets
         .iter()
         .filter(|asset| asset.kind == AssetKind::Css)
         .map(|asset| asset.path.clone())
         .collect();
     if entries.is_empty() {
-        return;
+        return Vec::new();
     }
 
     // One artifact for the whole set is the right answer (it is how CSS ships, and it dedupes what
@@ -563,6 +634,7 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
             })
         });
 
+    let mut referenced_assets = Vec::new();
     match bundled {
         Ok(StylesheetOutcome {
             counted,
@@ -590,6 +662,10 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
                 css.brotli_bytes += compressed.brotli_bytes;
                 css.zstd_bytes += compressed.zstd_bytes;
                 processed.read_paths.extend(bundle.read_paths);
+                referenced_assets.extend(bundle.referenced_assets);
+                processed
+                    .css_dependency_failures
+                    .extend(bundle.dependency_failures);
             }
             processed.contributions.push(css);
         }
@@ -606,6 +682,8 @@ fn process_stylesheets(assets: &[CollectedAsset], processed: &mut ProcessedAsset
             );
         }
     }
+
+    referenced_assets
 }
 
 /// Compress a bundled stylesheet as its own artifact — never concatenated with anything else first,
@@ -738,6 +816,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dependency_analysis_discovers_a_font_without_rewriting_measured_css() {
+        let dir = temp_dir("css-font-url");
+        let entry = dir.join("index.css");
+        let font = dir.join("probe.woff2");
+        fs::write(
+            &entry,
+            "@font-face { font-family: Probe; src: url('./probe.woff2'); }\n",
+        )
+        .expect("entry");
+        fs::write(&font, [0x5a; 32]).expect("font");
+
+        let expected_font = fs::canonicalize(&font).unwrap_or_else(|_| font.clone());
+        let bundle = bundle_css(&entry).expect("a valid stylesheet should bundle");
+        fs::remove_dir_all(&dir).ok();
+
+        let css = std::str::from_utf8(&bundle.minified_bytes).expect("utf8");
+        assert!(
+            css.contains("probe.woff2"),
+            "dependency-analysis placeholders must never enter the measured artifact: {css}"
+        );
+        assert_eq!(
+            bundle.referenced_assets,
+            vec![CollectedAsset {
+                path: expected_font,
+                kind: AssetKind::Font,
+                raw_bytes: 32,
+            }]
+        );
+        assert!(bundle.dependency_failures.is_empty());
+    }
+
     /// **The daemon-killer.** Lightning CSS cycle-detects on the very path spelling `resolve` hands
     /// back, and the built-in resolver's naive `with_file_name` join never normalizes `..` — so a
     /// cycle crossing a `../` used to yield a longer, distinct key for the same file on every hop,
@@ -861,10 +971,19 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
 
         let bundle = result.expect("a remote @import must not fail the stylesheet");
-        let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
+        let css = std::str::from_utf8(&bundle.minified_bytes).expect("utf8");
         assert!(
             css.contains(".a"),
             "the local rules must still be counted: {css}"
+        );
+        assert_eq!(
+            bundle.dependency_failures.len(),
+            1,
+            "the unmeasured remote stylesheet must lower confidence: {bundle:?}"
+        );
+        assert!(
+            bundle.dependency_failures[0].contains("fonts.googleapis.com"),
+            "the disclosure should identify the external stylesheet: {bundle:?}"
         );
     }
 

@@ -23,7 +23,7 @@ use rolldown_common::{ModuleInfo, NormalModule};
 
 use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
 use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
-use super::{AssetKind, CollectedAsset};
+use super::{AssetKind, CollectedAsset, classify_asset};
 use crate::cache::key::{
     FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
 };
@@ -531,33 +531,5 @@ impl Plugin for ImportLensPlugin {
 
     fn register_hook_usage(&self) -> HookUsage {
         HookUsage::ResolveId | HookUsage::Load | HookUsage::ModuleParsed
-    }
-}
-
-/// What a non-JavaScript module the JavaScript graph imports ships as, or `None` for anything
-/// `load` should hand to Rolldown untouched.
-///
-/// Every kind here is intercepted and stubbed, for two different reasons. A **stylesheet** reaching
-/// Rolldown 1.1.5 as a graph module fails the ENTIRE build (`UNSUPPORTED_FEATURE`, at the link
-/// stage) rather than merely going uncounted. A **wasm or font** would not fail the build, but it is
-/// an artifact that ships on its own terms, and leaving it in the graph lets it perturb the JS chunk
-/// we need to measure exactly.
-///
-/// The lists are deliberately narrow: only what a published package's JS entry plausibly imports.
-/// Anything else (an image, a JSON blob, a `.node` addon) is not an asset we count, and falls
-/// through to Rolldown exactly as before.
-fn classify_asset(path: &Path) -> Option<AssetKind> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)?;
-
-    match extension.as_str() {
-        "css" | "scss" | "sass" | "less" | "styl" | "stylus" | "pcss" | "postcss" => {
-            Some(AssetKind::Css)
-        }
-        "wasm" => Some(AssetKind::Wasm),
-        "woff" | "woff2" | "ttf" | "otf" | "eot" => Some(AssetKind::Font),
-        _ => None,
     }
 }

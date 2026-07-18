@@ -8,6 +8,8 @@
 //     - typescript package: the `graph.rs` TypeScript transform path, the only place
 //       the daemon transforms real TS. A lowered `enum` and `namespace` both codegen
 //       as IIFEs, so this doubles as coverage of the minifier's unused-IIFE analysis.
+//     - emitted asset: JS imports CSS whose surviving `url()` references a local WOFF2;
+//       esbuild and Import Lens must both emit/count that font exactly once.
 //   real packages (downloaded on demand, lockfile-pinned)
 //     - css-tree: deep ESM graph with transitive dependencies.
 //     - date-fns: deep zero-dependency ESM graph.
@@ -42,6 +44,8 @@ import * as esbuild from "esbuild";
 const protocolVersion = 6;
 const packageName = "importlens-accuracy-fixture";
 const typedPackageName = "importlens-accuracy-ts-fixture";
+const assetPackageName = "importlens-accuracy-asset-fixture";
+const emittedFontBytes = 8 * 1024;
 // Maximum accepted brotli delta against the esbuild oracle, as a fraction.
 //
 // Derivation: the worst delta observed across the JavaScript benchmarks (2026-07-17
@@ -155,6 +159,16 @@ const main = async () => {
         version: "1.0.0",
         named: "typed",
       },
+      {
+        label: "CSS local font emission",
+        activeDocumentPath: fixture.assetActiveDocumentPath,
+        package: assetPackageName,
+        version: "1.0.0",
+        named: "widget",
+        expectsStylesheet: true,
+        expectedAsset: { extension: ".woff2", kind: "font", bytes: emittedFontBytes },
+        minifiedTolerance: 0.02,
+      },
       ...(realFixtureState.installed
         ? await writeRealFixtureEntries(workspace, realFixtureState.versions)
         : []),
@@ -168,6 +182,7 @@ const main = async () => {
         workspace,
         benchmark.activeDocumentPath,
         benchmark.expectsStylesheet ?? false,
+        benchmark.expectedAsset,
       );
       const delta = Math.abs(importLens.brotliBytes - esbuildSize.brotliBytes);
       const relativeDelta = delta / Math.max(esbuildSize.brotliBytes, 1);
@@ -204,6 +219,18 @@ const main = async () => {
         if (relativeMinifiedDelta > benchmark.minifiedTolerance) {
           throw new Error(
             `${benchmark.label} minified delta ${(relativeMinifiedDelta * 100).toFixed(2)}% exceeds ${(benchmark.minifiedTolerance * 100).toFixed(2)}% tolerance. This is the axis that gates what was COUNTED: a stylesheet folded in twice, or not at all, moves it. Do not raise this number to make it green.`,
+          );
+        }
+      }
+
+      if (benchmark.expectedAsset) {
+        const contribution = importLens.assetBreakdown.find(
+          (asset) => asset.kind === benchmark.expectedAsset.kind,
+        );
+        if (contribution?.raw_bytes !== benchmark.expectedAsset.bytes) {
+          throw new Error(
+            `${benchmark.label} expected one ${benchmark.expectedAsset.bytes}-byte ` +
+              `${benchmark.expectedAsset.kind} contribution, got ${JSON.stringify(contribution)}`,
           );
         }
       }
@@ -494,7 +521,49 @@ const writeFixture = async (workspace) => {
   await writeFile(branchyActiveDocumentPath, `export { used } from "${packageName}";\n`, "utf8");
 
   const typedActiveDocumentPath = await writeTypedFixture(workspace, sourceRoot);
-  return { flatActiveDocumentPath, branchyActiveDocumentPath, typedActiveDocumentPath };
+  const assetActiveDocumentPath = await writeAssetFixture(workspace, sourceRoot);
+  return {
+    flatActiveDocumentPath,
+    branchyActiveDocumentPath,
+    typedActiveDocumentPath,
+    assetActiveDocumentPath,
+  };
+};
+
+const writeAssetFixture = async (workspace, sourceRoot) => {
+  const packageRoot = path.join(workspace, "node_modules", assetPackageName);
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    path.join(packageRoot, "package.json"),
+    JSON.stringify(
+      {
+        name: assetPackageName,
+        version: "1.0.0",
+        type: "module",
+        module: "index.js",
+        sideEffects: ["*.css"],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "index.js"),
+    `import "./styles.css";\nexport const widget = "widget";\n`,
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "styles.css"),
+    `@font-face { font-family: Probe; src: url("./probe.woff2") format("woff2"); }\n` +
+      `.widget { font-family: Probe; }\n`,
+    "utf8",
+  );
+  await writeFile(path.join(packageRoot, "probe.woff2"), deterministicBytes(emittedFontBytes));
+
+  const activeDocumentPath = path.join(sourceRoot, "asset-entry.js");
+  await writeFile(activeDocumentPath, `export { widget } from "${assetPackageName}";\n`, "utf8");
+  return activeDocumentPath;
 };
 
 // The only TypeScript in the suite, and therefore the only thing that reaches the
@@ -596,10 +665,16 @@ const importLensNamedSize = async (daemon, workspace, benchmark, requestId) => {
     brotliBytes: result.brotli_bytes,
     minifiedBytes: result.minified_bytes,
     moduleBreakdown: result.module_breakdown ?? [],
+    assetBreakdown: result.asset_breakdown ?? [],
   };
 };
 
-const esbuildNamedSize = async (workspace, activeDocumentPath, expectsStylesheet = false) => {
+const esbuildNamedSize = async (
+  workspace,
+  activeDocumentPath,
+  expectsStylesheet = false,
+  expectedAsset,
+) => {
   const result = await esbuild.build({
     absWorkingDir: workspace,
     entryPoints: [activeDocumentPath],
@@ -615,6 +690,7 @@ const esbuildNamedSize = async (workspace, activeDocumentPath, expectsStylesheet
     format: "esm",
     platform: "browser",
     treeShaking: true,
+    loader: { ".woff2": "file" },
     logLevel: "silent",
   });
 
@@ -627,7 +703,10 @@ const esbuildNamedSize = async (workspace, activeDocumentPath, expectsStylesheet
   // first — because that is exactly what the daemon does (ADR-0005: they are separate files that
   // ship separately). `reduce` over an empty CSS list is zero, so a pure-JS benchmark is unchanged.
   const stylesheets = result.outputFiles.filter((file) => file.path.endsWith(".css"));
-  const javascript = result.outputFiles.filter((file) => !file.path.endsWith(".css"));
+  const javascript = result.outputFiles.filter((file) => file.path.endsWith(".js"));
+  const emittedAssets = result.outputFiles.filter(
+    (file) => !file.path.endsWith(".css") && !file.path.endsWith(".js"),
+  );
 
   if (javascript.length === 0) {
     throw new Error("esbuild did not produce a JavaScript output file");
@@ -643,13 +722,24 @@ const esbuildNamedSize = async (workspace, activeDocumentPath, expectsStylesheet
     );
   }
 
+  if (expectedAsset) {
+    const matching = emittedAssets.filter((file) => file.path.endsWith(expectedAsset.extension));
+    if (matching.length !== 1 || matching[0].contents.length !== expectedAsset.bytes) {
+      throw new Error(
+        `esbuild must emit one ${expectedAsset.bytes}-byte ${expectedAsset.extension} artifact; ` +
+          `got ${matching.map((file) => `${file.path}:${file.contents.length}`).join(", ") || "none"}`,
+      );
+    }
+  }
+
   const bytesOf = (files) => files.reduce((bytes, file) => bytes + file.contents.length, 0);
   const brotliBytesOf = (files) =>
     files.reduce((bytes, file) => bytes + brotliSize(file.contents), 0);
 
   return {
-    brotliBytes: brotliBytesOf(javascript) + brotliBytesOf(stylesheets),
-    minifiedBytes: bytesOf(javascript) + bytesOf(stylesheets),
+    brotliBytes:
+      brotliBytesOf(javascript) + brotliBytesOf(stylesheets) + brotliBytesOf(emittedAssets),
+    minifiedBytes: bytesOf(javascript) + bytesOf(stylesheets) + bytesOf(emittedAssets),
   };
 };
 
@@ -842,6 +932,18 @@ const deterministicPayload = (length) => {
   for (let index = 0; index < length; index += 1) {
     state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
     value += alphabet[state % alphabet.length];
+  }
+
+  return value;
+};
+
+const deterministicBytes = (length) => {
+  const value = Buffer.allocUnsafe(length);
+  let state = 0x12345678;
+
+  for (let index = 0; index < length; index += 1) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    value[index] = state & 0xff;
   }
 
   return value;
