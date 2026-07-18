@@ -266,7 +266,7 @@ The audit did not refile these as new defects:
 | D9: 256-file/8 MiB CSS tree and per-sheet overcount | Accepted bounded degradation |
 | D10: Brotli quality 4 reads high | Deferred product-wide compression trade-off |
 | D11: transient asset read failure can be cached | Fixed; typed `asset_io`/`compression` causes are never durable |
-| D12: File Cost omits an asset without structurally becoming a floor | Accepted; request-local cases fixed by D11 |
+| D12: File Cost omits an asset without structurally becoming a floor | Fixed; every `uncounted_assets` aggregate is `incomplete` |
 
 AC-01 through AC-03 are not restatements of those decisions: they are silent omission, freshness-identity, and
 resource-admission defects introduced or exposed by the new asset pipeline.

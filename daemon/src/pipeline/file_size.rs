@@ -113,12 +113,13 @@ pub struct FileSizeComputation {
     pub gzip_bytes: u64,
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
-    /// At least one import that belongs in these totals contributed **no bytes**, because it was
-    /// not Measured. The totals are then a LOWER BOUND on the file, not the file — safe to show
-    /// beside the diagnostics that say so (FR-024a: a floor beats a zero), and never safe to cache,
-    /// persist, or compare against a baseline (ADR-0006, invariant 4).
+    /// Bytes that belong in these totals are absent: an import contributed no measurement, or a
+    /// successful build disclosed supported `uncounted_assets`. The totals are then a LOWER BOUND
+    /// on the file, not the file — safe to show beside the diagnostics that say so (FR-024a: a
+    /// floor beats a zero), and never safe to cache, persist, or compare against a baseline
+    /// (ADR-0006, invariant 4).
     ///
-    /// **Any** non-Measured contributor sets it. All three kinds:
+    /// **Any** missing-byte shape sets it:
     ///
     /// * **Loading** — its own build had not landed when the sum was taken (`result: None`).
     /// * **Unmeasured, transient** — timeout / panic / engine_gone. Says nothing about the package.
@@ -132,10 +133,13 @@ pub struct FileSizeComputation {
     ///   `importlens check` with exit 0. "Deterministically unknown" is still unknown.
     /// * and an import that could not be RESOLVED, which is not even an entry of the combined build,
     ///   so its bytes are absent from these totals however well that build went.
+    /// * **Measured but partial** — its JavaScript/healthy assets have real sizes, while
+    ///   `uncounted_assets` identifies supported shipped bytes absent from them.
     ///
     /// It exists because neither of the other two signals can see this. `error` is `None` — the sum
     /// succeeded, it just summed less than the file. And the stage scan in [`Self::is_cacheable`]
-    /// sees only transient stages, while a still-building import has failed at no stage at all.
+    /// sees only request-local stages: a still-building import has no stage, while deterministic
+    /// `uncounted_assets` is deliberately reusable at the import level.
     pub incomplete: bool,
     /// The file's **own combined build** failed, so these totals fell back to a sum of per-import
     /// costs — with no shared-module deduplication. That is a **different quantity** from a File
@@ -615,6 +619,14 @@ fn compute_file_size_with(
             ));
         }
 
+        // The JavaScript chunk and every healthy asset are still useful as a lower bound, but an
+        // `uncounted_assets` disclosure means bytes that ship are absent from all five totals.
+        // Today those are processor fallbacks; retain the engine's emitted-asset channel too so a
+        // future Rolldown output cannot silently reopen the same hole. Deterministic asset
+        // fallbacks may remain reusable per import; they may not be cached, persisted, or judged
+        // as this file's complete cost.
+        totals.incomplete |= !artifact.emitted_assets.is_empty() || assets.has_uncounted_assets();
+
         any_sized = true;
         totals.raw_bytes += artifact.code.len() as u64 + asset_sizes.raw_bytes;
         // `minified_bytes` is measured on the same string this group's compressors saw, so the two
@@ -658,9 +670,9 @@ struct RuntimeGroup {
 #[derive(Default)]
 struct PerImportTotals {
     sized_any: bool,
-    /// An import that belongs in this sum contributed no bytes, because it was not Measured — it is
-    /// still being built (`result: None`), or its build failed, transiently or otherwise. This sum
-    /// is then under the file's true size by an amount the sum itself cannot know.
+    /// Bytes that belong in this sum are absent: an import was not Measured, or it was Measured with
+    /// an `uncounted_assets` disclosure. This sum is then under the file's true size by an amount
+    /// the sum itself cannot know.
     missing_inputs: bool,
     raw_bytes: u64,
     minified_bytes: u64,
@@ -749,6 +761,21 @@ fn per_import_totals(
             ));
             continue;
         };
+
+        if result.has_uncounted_assets() {
+            totals.missing_inputs = true;
+            for disclosure in result.diagnostics.iter().filter(|diagnostic| {
+                diagnostic.stage == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS
+            }) {
+                let mut details = vec![specifier.clone()];
+                details.extend(disclosure.details.iter().cloned());
+                diagnostics.push(diagnostic(
+                    &disclosure.stage,
+                    disclosure.message.clone(),
+                    details,
+                ));
+            }
+        }
 
         totals.sized_any = true;
         totals.raw_bytes += sizes.raw_bytes;
@@ -1007,6 +1034,59 @@ mod tests {
                 totals.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn a_measured_import_with_uncounted_assets_makes_the_fallback_a_floor() {
+        let mut partial = result("asset-lib", 100);
+        partial.diagnostics.push(ImportDiagnostic {
+            stage: crate::engine::diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
+            message: "a stylesheet could not be processed and is absent from this size".to_owned(),
+            details: vec!["broken.scss".to_owned()],
+        });
+
+        let totals = absorb(&[SizedImport::installed(request("asset-lib"), Some(partial))]);
+
+        assert_eq!(
+            totals.raw_bytes, 100,
+            "the measured portion remains useful as a lower bound"
+        );
+        assert!(
+            totals.incomplete,
+            "a successful JavaScript build does not make omitted asset bytes part of the sum"
+        );
+        assert!(
+            !totals.is_cacheable(),
+            "a deterministic floor may be cached per import, but not as this file's complete cost"
+        );
+        assert!(
+            totals.diagnostics.iter().any(|diagnostic| {
+                diagnostic.stage == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS
+                    && diagnostic
+                        .details
+                        .iter()
+                        .any(|detail| detail == "specifier: asset-lib")
+            }),
+            "the aggregate must retain which import left asset bytes out: {:?}",
+            totals.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_measured_import_with_imprecise_assets_is_not_a_floor() {
+        let mut high = result("asset-lib", 100);
+        high.diagnostics.push(ImportDiagnostic {
+            stage: crate::engine::diagnostic_stage::IMPRECISE_ASSETS.to_owned(),
+            message: "stylesheets were measured separately, so this size may read high".to_owned(),
+            details: Vec::new(),
+        });
+
+        let totals = absorb(&[SizedImport::installed(request("asset-lib"), Some(high))]);
+
+        assert!(
+            !totals.incomplete,
+            "an over-count is imprecise, but it is not missing asset bytes"
+        );
     }
 
     /// The floor rule is about MEASUREMENT, not about failure: a file whose every import really was
@@ -1372,6 +1452,56 @@ mod tests {
                 .checked_sub(empty_font.minified_bytes),
             Some(FONT_BYTES as u64),
             "a binary artifact has no separate minification step"
+        );
+    }
+
+    #[test]
+    fn a_combined_build_that_omits_an_unparseable_stylesheet_is_a_floor() {
+        let fixture = Fixture::new("uncounted-css-floor");
+        fixture
+            .package(
+                "broken-css-lib",
+                "import './broken.scss';\nexport const value = 42;\n",
+            )
+            .package_file(
+                "broken-css-lib",
+                "package.json",
+                r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.scss"]}"#,
+            )
+            .package_file(
+                "broken-css-lib",
+                "broken.scss",
+                "$brand: red;\n@mixin thing { color: $brand }\n.bad { @include thing }\n",
+            );
+
+        let totals = compute_file_size(
+            &fixture.context(),
+            &[SizedImport::installed(request("broken-css-lib"), None)],
+        );
+
+        assert!(
+            totals.error.is_none(),
+            "the JavaScript still built: {totals:?}"
+        );
+        assert!(
+            !totals.degraded,
+            "the combined build itself succeeded: {totals:?}"
+        );
+        assert!(
+            totals
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage
+                    == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS),
+            "the missing stylesheet bytes must be disclosed: {totals:?}"
+        );
+        assert!(
+            totals.incomplete,
+            "the JavaScript-only number is a floor when a shipped stylesheet is absent"
+        );
+        assert!(
+            !totals.is_cacheable(),
+            "the floor must not become File Cost history or a budget verdict"
         );
     }
 

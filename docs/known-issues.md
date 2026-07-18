@@ -216,21 +216,28 @@ injected CSS/binary compressor failures, every durable-store boundary, histories
 CLI run whose File Cost is clean while its per-import asset result is request-local.
 
 ### D12: A file total that omits an asset is not structurally flagged as a floor
-**Status: Accepted** · Request-local durability fixed by D11; deterministic omissions remain · Found by the B2 branch review
+**Status: Resolved 2026-07-18** · Omitted supported assets now make File Cost a structural floor · Found by the B2 branch review
 
-In the File Cost aggregate, an asset that cannot be processed contributes nothing and the group still reports
-`incomplete: false`. D11 now gives request-local read/compressor omissions an `asset_io`/`compression`
-diagnostic, so daemon caches, histories, and budget gates refuse those totals despite the missing wire flag.
-The structural gap remains for deterministic omissions such as unsupported or unparseable stylesheets: their
-durable `uncounted_assets` disclosure leaves the total cacheable and `importlens check` can evaluate a number
-that is missing real bytes, where `SizedPackage::NotInstalled` raises the floor flag for the same shape.
+`uncounted_assets` has one meaning: supported bytes that ship are absent from the five reported sizes. The
+aggregate now carries that fact structurally on both routes that can produce its number:
 
-The reason it is not fixed here is that it is a tie with the old behaviour, not a regression: before B2 the
-combined build stubbed every stylesheet and its bytes vanished from a total that was equally cacheable and
-equally unflagged. B2 made that number strictly better, and ADR-0006 asks for a floor beating a blank, not for
-every disclosure to also become a floor. Raising `incomplete` here would newly refuse to cache any file
-importing a package with one unparseable `.scss`, which is a real cost for a number that is already disclosed
-at the import level. Worth deciding deliberately, alongside D4, rather than as a side effect of B2.
+- after a successful combined build, processor fallbacks and any future Rolldown-emitted assets set
+  `incomplete: true` before their measured JavaScript/healthy-asset floor is returned;
+- after a combined-build fallback, a measured per-import result carrying `uncounted_assets` still contributes
+  its known bytes but marks the fallback short and preserves the affected specifier in diagnostics;
+- `imprecise_assets` alone does not set `incomplete`: the accepted per-sheet CSS degradation reads high but
+  does not omit the stylesheets.
+
+The existing File Cost gates then refuse the floor from the L1 aggregate cache, persisted bundle-impact
+history, editor file budget, and CLI verdict. Deterministic per-import fallbacks remain reusable, so the import
+cache still avoids rebuilding a broken package forever; only the aggregate that is not the file's complete
+cost is refused. Bundle-impact history moved to v3 because v2 rows have no quality metadata and can contain
+pre-fix deterministic asset floors.
+
+Regressions cover a real invalid-SCSS combined build, the per-import fallback route, the imprecise-overcount
+control, wire propagation, cache refusal, and recovery after only the stylesheet is repaired. This deliberately
+broadens D4: until a fingerprinted aggregate-failure memo exists, a file with a deterministic uncounted asset
+recomputes its combined File Cost rather than caching a floor as a measurement.
 
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
@@ -243,7 +250,9 @@ engine currently discards the partial graph on failure, so this needs plumbing t
 **Status: Deferred** · A performance cost of an invariant we want
 
 An aggregate missing a contributor's bytes is a **floor**, and a floor is never cached. So a file containing
-one permanently-broken import re-runs its (fast-failing) combined build on every size request.
+one permanently-broken import, or one deterministically unprocessable supported asset, re-runs its combined
+build and asset tail on every size request. The per-import deterministic outcome is still cached; the file
+aggregate cannot be, because it is not a complete File Cost.
 
 The honest fix is a build memo for the deterministic build failure: a failure caused by the package's bytes is
 a fact about those bytes, and the cache is already keyed by their fingerprints. Not caching the total is right;

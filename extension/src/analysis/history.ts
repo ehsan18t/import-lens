@@ -9,10 +9,12 @@ import { isDurableFileSize, isDurableImportResult } from "./transience.js";
 // computed against a number that never happened. So both stores below take the raw daemon output and
 // apply the gate themselves; neither will accept a row (ADR-0006, invariant 3; SRS FR-026c).
 
-// Version 2 deliberately leaves pre-asset-durability rows behind. Version 1 rows carry no stage
+// Version 2 deliberately left pre-asset-durability rows behind. Version 1 rows carry no stage
 // metadata, so a request-local asset floor recorded before D11 cannot be distinguished from a real
-// baseline and must not participate in future trends.
-export const bundleImpactHistoryKey = "importLens.bundleImpactHistory.v2";
+// baseline. Bundle-impact history advances once more: v2 can contain deterministic
+// `uncounted_assets` totals recorded before D12 made that missing weight structural, and its rows
+// likewise carry no quality metadata with which to reject only those floors.
+export const bundleImpactHistoryKey = "importLens.bundleImpactHistory.v3";
 export const importCostHistoryKey = "importLens.importCostHistory.v2";
 
 export interface BundleImpactHistoryItem {

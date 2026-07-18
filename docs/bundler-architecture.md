@@ -477,12 +477,16 @@ the `asset_io`/`compression` diagnostic, not absence of a number, is what keeps 
 Making such an outcome durable converts a momentary accident into a wrong answer that outlives the
 daemon.
 
-### Aggregates inherit the weakest input
+### Aggregates expose missing bytes structurally
 
-A file's combined total is only as complete as the imports that fed it. If **any** contributor
-is Loading or Unmeasured, the total is a **floor** — a lower bound, not a size. It is flagged
-as such, and no verdict may be drawn from it: a budget judged against a floor is neither passed
-nor failed, it is *not evaluated*.
+A successful combined build measures its imports directly, so it stays complete while their
+separate per-import analyses are still Loading. Its asset tail can still disclose supported bytes
+that it could not process: `uncounted_assets` makes that otherwise-successful File Cost a structural
+`incomplete` floor. If the combined build fails and the daemon instead sums per-import costs, any
+Loading, Unmeasured, or measured-with-uncounted-assets contributor makes that fallback short too.
+The known bytes remain worth showing, but no verdict may be drawn from them: a budget judged against
+a floor is neither passed nor failed, it is *not evaluated*. `imprecise_assets` is intentionally
+different: separately processed stylesheets can read high while still counting every sheet.
 
 And a gate that cannot measure **must never report success**. `importlens check` exits non-zero
 with a code distinct from a real budget failure, so a flaky CI machine is diagnosable and is

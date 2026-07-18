@@ -601,6 +601,108 @@ fn service_computes_file_size_from_document_source() {
     );
 }
 
+#[test]
+fn file_size_document_marks_uncounted_asset_bytes_as_a_floor_and_does_not_cache_it() {
+    let _shared_index_guard = SHARED_INDEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("broken-css-file-cost");
+    fs::create_dir_all(&package_root).expect("package root should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":["*.scss"]}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("index.js"),
+        "import './broken.scss';\nexport const value = 1;\n",
+    )
+    .expect("entry should be written");
+    fs::write(
+        package_root.join("broken.scss"),
+        "$brand: red;\n@mixin thing { color: $brand }\n.bad { @include thing }\n",
+    )
+    .expect("broken stylesheet should be written");
+
+    let service = ImportLensService::new(None, false);
+    let document_path = workspace.join("src").join("index.ts");
+    let mut first_request = file_size_document_request(
+        &workspace,
+        34,
+        "import { value } from 'broken-css-file-cost';\nconsole.log(value);\n",
+    );
+    first_request.force_fresh = false;
+    let response = service.handle_file_size_document(first_request);
+
+    assert!(
+        response.error.is_none(),
+        "the JavaScript still builds: {response:?}"
+    );
+    assert!(
+        !response.degraded,
+        "the combined build itself succeeds: {response:?}"
+    );
+    assert!(
+        response.raw_bytes > 0,
+        "the measured floor remains useful: {response:?}"
+    );
+    assert!(
+        response.incomplete,
+        "the response must structurally say that the stylesheet bytes are absent: {response:?}"
+    );
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"),
+        "the floor must retain its asset disclosure: {response:?}"
+    );
+    assert!(
+        !shared_file_size_cache().contains_path(&document_path),
+        "a deterministic import fallback may be reusable, but the partial File Cost may not"
+    );
+
+    fs::write(
+        package_root.join("broken.scss"),
+        ".fixed { color: rebeccapurple; padding: 12345px; }\n",
+    )
+    .expect("stylesheet should be repaired");
+    let mut repaired_request = file_size_document_request(
+        &workspace,
+        35,
+        "import { value } from 'broken-css-file-cost';\nconsole.log(value);\n",
+    );
+    repaired_request.force_fresh = false;
+    let repaired = service.handle_file_size_document(repaired_request);
+
+    assert!(
+        repaired.error.is_none(),
+        "the repaired file must measure: {repaired:?}"
+    );
+    assert!(
+        !repaired.incomplete,
+        "the repaired asset closes the floor: {repaired:?}"
+    );
+    assert!(
+        repaired
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.stage != "uncounted_assets"),
+        "the repaired response must lose the stale disclosure: {repaired:?}"
+    );
+    assert!(
+        repaired.raw_bytes > response.raw_bytes,
+        "the repaired stylesheet's bytes must enter the total: before={response:?}, after={repaired:?}"
+    );
+    assert!(
+        shared_file_size_cache().contains_path(&document_path),
+        "a complete repaired File Cost should enter the aggregate cache"
+    );
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+}
+
 /// A workspace manifest naming `tiny-lib`, plus whatever else the caller declares.
 fn write_workspace_manifest(workspace: &Path, extra_dependencies: &str) {
     fs::write(

@@ -195,9 +195,9 @@ export interface FileSizeDocumentResponse {
   imports: ImportResult[];
   states: ImportAnalysisItem[];
   // The totals are a FLOOR, not the file's size: an import that belongs in a fallback sum was never
-  // measured. Request-local asset omissions are additionally refused through their diagnostic
-  // (D11); D12 tracks making every asset omission set this structural flag too. Safe to show, never
-  // safe to record as history (FR-026c). Optional for older daemons; read as `=== true`.
+  // measured, or a successful build disclosed supported asset bytes absent from its five sizes
+  // (`uncounted_assets`). Safe to show, never safe to record as history (FR-026c). Optional for
+  // older daemons; read as `=== true`.
   incomplete?: boolean;
   // The file's OWN combined build failed, so these totals are an un-deduplicated sum of the
   // per-import costs — a *different quantity* from a File Cost (ADR-0004), and an OVER-count.

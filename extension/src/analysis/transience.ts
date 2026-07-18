@@ -91,9 +91,9 @@ export const isDurableImportResult = (result: ImportResult | undefined): result 
  * Four ways the totals are not the file's, and only one of them is an error.
  *
  * - `error` — nothing was summed at all.
- * - `incomplete` — an import that belongs in the totals contributed no bytes: its own build had not
- *   landed (`loading`), or it could not be measured, for ANY reason (transient, deterministic, an
- *   entry that would not resolve, a package that is not installed). An UNDER-count.
+ * - `incomplete` — bytes that belong in the totals are absent: an import's build had not landed or
+ *   could not be measured, or a successful build disclosed supported `uncounted_assets`. An
+ *   UNDER-count.
  * - `degraded` — the file's own combined build failed, so the totals fell back to a sum of
  *   per-import costs with no shared-module deduplication. An OVER-count, and the one that carries no
  *   other signal: every contributor can be Measured, leaving `incomplete: false` and `error: null`.

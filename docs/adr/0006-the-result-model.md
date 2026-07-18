@@ -63,6 +63,10 @@ fabricated size, silently passing, so the regression merges.
      is still Loading. On a cold document that is the normal case, and it is not a floor.
      *(An earlier draft of this ADR said any Loading contributor made the total a floor. That was
      wrong: it would flag every cold document, and taking it literally caused a regression.)*
+     Success of the JavaScript build is not success of every asset, however: a combined result
+     carrying `uncounted_assets` is a measured lower bound whose supported missing bytes set
+     `incomplete`. A separately processed CSS set carrying only `imprecise_assets` is an over-count,
+     not this missing-byte shape.
    - **If the combined build FAILS**, what remains is a **sum of per-import costs** — which
      [ADR-0004](0004-import-lens-measures-imports-not-bundles.md) says is a **different quantity**
      (a Combined Import Cost), because it counts a shared module twice. It must never be presented
@@ -78,7 +82,8 @@ fabricated size, silently passing, so the regression merges.
    contributors sees nothing wrong. And a **types-only** import resolves to "no entry" *by design*
    and is **Measured** (a genuine zero); it is not a gap, and must not flag anything.
 5. **No verdict from a floor.** A budget is never judged against an incomplete number — whether
-   incompleteness is a wire flag or an `asset_io`/`compression` disclosure — not
+   incompleteness is a wire flag (including deterministic `uncounted_assets`) or an
+   `asset_io`/`compression` disclosure — not
    "pass", not "fail". *"Not evaluated."* And **a gate that cannot measure must never report
    success**: `importlens check` exits non-zero with a distinct code, so a flaky CI box is
    diagnosable and is never confused with a genuine regression. A silent pass is the worst

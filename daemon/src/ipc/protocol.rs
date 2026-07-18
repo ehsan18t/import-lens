@@ -464,6 +464,15 @@ impl ImportResult {
                 .all(|diagnostic| stage_is_durable(&diagnostic.stage))
     }
 
+    /// Whether a successful build disclosed supported asset bytes that are absent from its five
+    /// sizes. The result may still be reusable when the omission is deterministic, but the number
+    /// is a floor and cannot stand in for a complete File Cost.
+    pub fn has_uncounted_assets(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS)
+    }
+
     /// A **declarations-only** package: a package that resolves to no runtime entry *because it
     /// ships no runtime code*, and is answered Measured — a genuine zero, at High confidence
     /// ([`crate::pipeline::types_only`]).
@@ -641,11 +650,10 @@ pub struct FileSizeDocumentResponse {
     pub zstd_bytes: u64,
     pub imports: Vec<ImportResult>,
     pub states: Vec<ImportAnalysisItem>,
-    /// These totals are a **floor**, not the file's size: an import that belongs in them was not
-    /// measured — its own build had not landed when the fallback sum was taken, or it was
-    /// Unmeasured ([`crate::pipeline::file_size::FileSizeComputation::incomplete`]). Request-local
-    /// asset omissions also make a displayed total a floor today, but are signalled by their
-    /// diagnostic; D12 tracks folding every asset omission into this structural flag.
+    /// These totals are a **floor**, not the file's size: an import that belongs in a fallback sum
+    /// was not measured, or a successful import/combined build disclosed supported asset bytes
+    /// that are absent from its five sizes (`uncounted_assets`; see
+    /// [`crate::pipeline::file_size::FileSizeComputation::incomplete`]).
     ///
     /// It is on the wire because the client has durable stores of its own (the bundle-impact
     /// history), and neither of the other two fields can tell it this: `error` is `None` — the sum

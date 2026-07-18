@@ -859,6 +859,13 @@ impl ProcessedAssets {
         self.contributions.is_empty()
     }
 
+    /// Whether supported asset bytes are disclosed but absent from [`Self::total`]. A deterministic
+    /// processor rejection is reusable at the import level, but any aggregate containing it is a
+    /// lower bound rather than a complete File Cost.
+    pub fn has_uncounted_assets(&self) -> bool {
+        !self.uncounted.is_empty()
+    }
+
     /// Exact asset fingerprints plus never-fresh sentinels for attempted paths that supplied no
     /// bytes. Both Import Cost and File Cost consume this one normalization so neither can silently
     /// drop an unreadable CSS child or resource from freshness.
@@ -1812,6 +1819,10 @@ mod tests {
             vec![&expected_bad],
             "only the offender falls back to disclosure: {processed:?}",
         );
+        assert!(
+            processed.has_uncounted_assets(),
+            "the aggregate must be able to distinguish this missing-byte result"
+        );
     }
 
     /// When the union AND every per-sheet retry fail, the outcome must be exactly the pre-B2
@@ -1929,6 +1940,10 @@ mod tests {
             processed.uncounted.is_empty(),
             "nothing failed, so nothing is uncounted - which is exactly why the uncounted \
              disclosure cannot be what reports this: {processed:?}",
+        );
+        assert!(
+            !processed.has_uncounted_assets(),
+            "the per-sheet result reads high but does not omit a stylesheet"
         );
         assert!(
             uncounted_assets_diagnostic(&processed).is_none(),

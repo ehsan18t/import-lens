@@ -113,13 +113,12 @@ export const runImportLensCheck = async ({
   for (const filePath of files) {
     const result = await analyzeFile(path.resolve(resolveRoot, filePath));
     const relative = path.relative(cwd, result.filePath).split(path.sep).join("/");
-    // A floor cannot absolve a budget and must not be allowed to: `incomplete` says an import that
-    // belongs in this file's total contributed no bytes, so the real number is larger than the one
-    // in hand by an unknown amount, and "under budget" is not a fact this run established. It is set
-    // by ANY unmeasured contributor now, deterministic ones included — a package this build cannot
-    // measure leaves the file's size just as unknown as one that timed out, and CI is the one place
-    // where nobody is looking at the screen to notice. No verdict from a floor (ADR-0006,
-    // invariant 5).
+    // A floor cannot absolve a budget and must not be allowed to: `incomplete` says bytes that
+    // belong in this file's total are absent — an import contributed no measurement, or supported
+    // asset bytes were disclosed as uncounted. The real number is larger than the one in hand by an
+    // unknown amount, and "under budget" is not a fact this run established. The cause may be
+    // deterministic or request-local; CI is the one place where nobody is looking at the screen to
+    // notice. No verdict from a floor (ADR-0006, invariant 5).
     //
     // And a DEGRADED total cannot condemn one. `degraded` says the file's own combined build failed
     // and the number fell back to a sum of per-import costs — a Combined Import Cost, which ADR-0004
@@ -407,9 +406,9 @@ export const fileCostQuality = (response) => ({
   quantity: response.degraded === true ? "combined-import-cost" : "file-cost",
   // A `degraded` aggregate is a Combined Import Cost, not also short: the transient stage the daemon
   // pushes on a combined-build TIMEOUT is that build's OWN failure, which `degraded` already reports,
-  // not a missing contributor. Reading it as short here made `importlens check` print "... and an
-  // import that belongs in it was not measured either" on a file where every import WAS measured. A
-  // transient stage WITHOUT a degrade (the defensive path) is still short. The extension's copy in
+  // not missing import or asset bytes. Reading it as short here made `importlens check` claim a
+  // missing contributor on a file where every import WAS measured. A transient stage WITHOUT a
+  // degrade (the defensive path) is still short. The extension's copy in
   // `extension/src/analysis/fileCostQuality.ts` carries the identical guard.
   short:
     response.incomplete === true ||

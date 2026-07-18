@@ -19,10 +19,11 @@ import { hasTransientStage } from "./transience.js";
  *   a module two imports reach is counted twice. ADR-0004 calls that a Combined Import Cost, an
  *   upper bound, and says it must never be presented as a size.
  * - **`short`** — bytes that belong in the number are missing (an import is still building,
- *   unmeasurable, or not installed; or an asset input was temporarily unreadable). A transient
- *   failure that *degrades* the aggregate is not short: it is the `combined-import-cost` quantity
- *   above, the combined build's own failure, and the `degraded` axis already reports it. Reading it
- *   as short too would claim a missing contributor that a timed-out combined build does not have.
+ *   unmeasurable, or not installed; or supported asset bytes were not counted, deterministically or
+ *   request-locally). A transient failure that *degrades* the aggregate is not short: it is the
+ *   `combined-import-cost` quantity above, the combined build's own failure, and the `degraded` axis
+ *   already reports it. Reading it as short too would claim a missing contributor that a timed-out
+ *   combined build does not have.
  *
  * Both at once is a real state and neither word alone describes it: a fallback sum that is *also*
  * short double-counts some imports and omits others, so it is a bound in neither direction.
