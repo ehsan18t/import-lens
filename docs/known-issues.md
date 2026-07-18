@@ -133,30 +133,37 @@ DECLARATION rather than the build: `SideEffectsMode::False` already identifies t
 boundary, and `resolver` already owns rolldown's own glob matcher for per-asset matching. The File Cost path
 needs per-asset package attribution first, which is the real work.
 
-### D21: A bare `@import` no longer poisons freshness with a path that cannot exist
-**Status: Resolved 2026-07-18** · Found while investigating D8
+### D21: A missing `@import` target makes the whole asset result permanently non-durable
+**Status: Deferred, with the root cause corrected** · Raised, mis-fixed, and reverted 2026-07-18
 
-`FileProvider::resolve` is infallible — a naive `with_file_name` join — so `@import "pkg/base.css"` silently
-became `<dir-of-sheet>/pkg/base.css` and came back as a valid-looking file. The failure surfaced at the READ
-instead, which recorded a failed read of a path that does not and will never exist. Two consequences reached
-well beyond the one sheet: the request-local `asset_io` stage was stamped on the whole asset result, and a
-never-fresh sentinel was written for the phantom path. A package shipping one bare `@import` could therefore
-**never be cached**, and was re-measured on every keystroke over a file nobody will ever create.
+A stylesheet whose `@import` target does not exist records a **failed read**, and that stamps the
+request-local `asset_io` stage on the entire asset result. `asset_io` means "the filesystem was
+having a moment, retry later", so the result is refused by every durable store. But a missing file
+named by a package's own stylesheet is a deterministic property of that package, not a filesystem
+moment — so such a package is never cached and is re-measured on every keystroke.
 
-The resolve now declines such a specifier explicitly, so the sheet lands on the deterministic per-sheet
-fallback (D8's accepted raw-byte disclosure) while the result stays reusable.
+**The fix attempted here was wrong and has been reverted.** The theory was that a specifier like
+`pkg/base.css` resolved to a "phantom" path that could never exist, so declining it before the read
+would avoid the failed read entirely. Two things were wrong with that:
 
-**The order of the check is load-bearing, and the first attempt got it wrong.** Deciding by spelling alone
-rejects `@import "theme.css"` and `@import "sub/dir.css"` — both ordinary relative URLs, since CSS has no
-bare-specifier concept and a plain string is a relative URL. That would have dropped a very common shape to
-raw disclosure. The existence of the file beside the sheet decides; spelling only decides what happens once
-nothing is there. A missing RELATIVE import keeps its failed read deliberately, because the never-fresh
-sentinel on its real path is what makes creating the file invalidate the result.
+- **CSS has no bare specifiers.** `pkg/base.css` is an ordinary relative URL, so
+  `<dir-of-sheet>/pkg/base.css` is exactly where that file would live. It is not a phantom, and
+  recording it is correct: creating it later *should* invalidate the result.
+- Declining made the failure deterministic and therefore **cacheable**, which pinned the package's
+  CSS at zero counted bytes permanently. Adversarial verification reproduced it against the running
+  service: `@import 'created-later.css'` measured 0 bytes, was served from cache on repeat, and
+  **still** served 0 bytes after the file was created. The `./`-prefixed spelling recovered
+  correctly, so the invariant survived for one spelling and broke for the other.
 
-Resolving the package specifier properly is still not done, and is not merely plumbing: the JavaScript
-resolver profile has no `style` main field, no `style` condition and no `.css` extension, so pointing it at
-`pkg/base` would happily answer `pkg/base.js` and measure the wrong file. That needs a purpose-built CSS
-resolver profile.
+An earlier draft of the same fix was worse still, rejecting on spelling alone, which would have
+dropped every `@import "theme.css"` to raw disclosure.
+
+**The real fix is a classification split, not a resolve change.** A read that fails with
+`NotFound` is a deterministic fact about the package and should keep its never-fresh path evidence
+*without* the request-local `asset_io` stage; a read that fails for any other reason (permission,
+lock, transient IO) is genuinely request-local and must keep it. Today `failed_paths` drives both,
+so the two cannot be told apart. Splitting them keeps invalidation-on-create for every spelling and
+still lets a deterministically incomplete package be cached.
 
 ### D8: One stylesheet Lightning CSS cannot parse falls back alone, but a cyclic one undercounts
 **Status: Accepted** · Never below the pre-B2 floor · Found by the B2 adversarial review
