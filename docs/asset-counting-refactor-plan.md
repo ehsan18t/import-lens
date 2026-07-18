@@ -16,35 +16,38 @@ decision unchanged.
 ## 1. Baseline and reduction target
 
 The relevant feature baseline is `b29c329`, immediately before the asset-counting branch. The frozen
-behavior point for this refactor is `8fe2342`.
+behavior point for this refactor is **`de2f550`**.
 
-| Range | Added | Deleted | Net |
-| --- | ---: | ---: | ---: |
-| Initial asset work through `7729faa` | 2,887 | 238 | +2,649 |
-| Audit and follow-up fixes through `8fe2342` | 6,902 | 625 | +6,277 |
-| Whole asset feature through `8fe2342` | 9,523 | 597 | +8,926 |
+**The freeze point moved, and this section was rewritten on 2026-07-18 to say so.** The plan
+originally froze at `8fe2342`, but nine commits landed after it and several changed behavior on
+purpose — a directly imported image is now intercepted and disclosed rather than failing the build,
+assets are module contributions, the file total carries an `asset_breakdown`, `fileCostQuality` has
+an `imprecise` axis, and a measured-but-unfingerprinted module is unverifiable. Refactoring against
+the old freeze would have "preserved" behavior the product no longer has.
 
-The two lean-orchestration commits after `8fe2342` are unrelated and are excluded from every target
-below.
+The six asset-specific modules contain **4,088 physical lines** (2,841 implementation, 1,247 test):
 
-The six asset-specific modules currently contain about 3,680 physical lines:
+| Module | Impl | Test | Main problem |
+| --- | ---: | ---: | --- |
+| `pipeline/assets.rs` | 1,596 | 830 | Orchestration, CSS provider, diagnostics, budgets, compression, and binary handling are mixed together. |
+| `pipeline/asset_budget.rs` | 612 | 170 | Repeats stat/read/reservation and observation concerns also present in `assets.rs`. |
+| `pipeline/asset_boundary.rs` | 220 | 247 | The tests are larger than the one two-permit blocking executor they cover. |
+| `pipeline/css_dependencies.rs` | 265 | 0 | Cohesive logic, but exposed beside rather than hidden inside the asset module. |
+| `engine/asset_input.rs` | 90 | 0 | Cohesive exact-byte snapshot type; keep it. |
+| `engine/asset_classifier.rs` | 58 | 0 | Cohesive classifier; keep it. |
 
-| Module | Current lines | Main problem |
-| --- | ---: | --- |
-| `pipeline/assets.rs` | 2,198 | Orchestration, CSS provider, diagnostics, budgets, compression, binary handling, and 683 test lines are mixed together. |
-| `pipeline/asset_budget.rs` | 776 | Repeats stat/read/reservation and observation concerns also present in `assets.rs`. |
-| `pipeline/asset_boundary.rs` | 407 | The interface and 187 test lines are large relative to one two-permit blocking executor. |
-| `pipeline/css_dependencies.rs` | 192 | Cohesive logic, but exposed beside rather than hidden inside the asset module. |
-| `engine/asset_input.rs` | 83 | Cohesive exact-byte snapshot type; keep it. |
-| `engine/asset_classifier.rs` | 24 | Cohesive classifier; keep it. |
+**The behavior baseline is the test inventory, not just a green suite.** This plan permits deleting
+tests, so "everything passes" cannot prove preservation — a deleted test passes too. The 646 Rust
+test names at the freeze point are captured, and every phase must account for each one that
+disappears by naming the row that replaces it.
 
 ### Required target
 
 - Delete at least **1,800 net lines** from the feature implementation and its tests.
 - Target **2,400 net deleted lines**; do not sacrifice a behavior or gate to reach it.
-- Reduce the six-module asset cluster from about 3,680 lines to **2,300 lines or fewer**, including
+- Reduce the six-module asset cluster from 4,088 lines to **2,300 lines or fewer**, including
   its tests.
-- Reduce runtime implementation inside that cluster from about 2,640 lines to **1,450 lines or
+- Reduce runtime implementation inside that cluster from 2,841 lines to **1,450 lines or
   fewer**.
 - Reduce asset interface/implementation tests to **650-750 lines**, plus only the independent
   end-to-end, cache, oracle, and performance gates that cross a real seam.
@@ -73,6 +76,31 @@ This refactor must preserve the following behavior exactly.
 6. Each font/wasm file is a separate artifact. JavaScript, CSS, fonts, and wasm are compressed per
    artifact and only the resulting sizes are summed.
 7. `asset_breakdown` contains at most one summed row for each current `AssetKind`.
+
+### Added to the freeze on 2026-07-18, after the fixes that followed the original plan
+
+These landed between the old freeze point and this one. They are behavior now, and the refactor must
+carry them:
+
+7a. A directly imported file outside the counted taxonomy — image, icon, media — is classified
+    `AssetClass::Unmeasured`, stubbed to `ModuleType::Empty`, charged against the graph's aggregate
+    byte budget, fingerprinted, and disclosed at its real size. It must not fail the build. The
+    interception list stays an allowlist; an unknown extension still falls through to Rolldown.
+7b. Both arms of that classification account for bytes identically: reserve from metadata before the
+    read, post-read growth check, reconcile after, fingerprint before any deterministic failure
+    returns, and release the reservation on a duplicate hook invocation.
+7c. Every directly imported asset is a `ModuleContribution`, so the top-module breakdown reconciles
+    with its own headline and `annotate_shared_bytes` sees a stylesheet several imports share. The
+    rows travel in `internal_contributions` only — never on the wire — and the L2 envelope carries
+    them.
+7d. `FileSizeDocumentResponse` carries `asset_breakdown`, summed per kind across runtime groups, with
+    a degraded group's per-import fallback contributing its rows.
+7e. A CSS `url()` reference resolves to exactly one of: counted, disclosed at real size, named as an
+    omission, or external. `@import "theme.css"` and `@import "sub/dir.css"` are RELATIVE and must
+    stay counted — CSS has no bare-specifier concept.
+7f. A module whose bytes were measured but whose read was never fingerprinted is recorded
+    unverifiable, never deferred to a post-analysis stat.
+7g. The asset pool's execution never widens past its admission bound, including under nested rayon.
 
 ### Freshness and resource safety
 
