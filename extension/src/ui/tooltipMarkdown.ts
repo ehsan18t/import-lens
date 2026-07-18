@@ -4,6 +4,7 @@ import type { AssetKind, ImportResult, ImportRuntime } from "../ipc/protocol.js"
 import { confidenceVisualFor } from "./confidenceVisuals.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import {
+  assetKindLabel,
   bytesForCompression,
   type CompressionFormat,
   formatBytes,
@@ -78,12 +79,6 @@ export const importResultSizeMarkdown = (
   ].join("\n");
 };
 
-const assetKindLabels: Readonly<Record<AssetKind, string>> = {
-  css: "CSS",
-  wasm: "wasm",
-  font: "Fonts",
-};
-
 /**
  * How the size above is composed, when part of it is not JavaScript (B2).
  *
@@ -111,7 +106,7 @@ const assetBreakdownRows = (
     `**Included assets** (${compressionLabel})`,
     ...breakdown.map(
       (contribution) =>
-        `- ${assetKindLabels[contribution.kind]}: ${formatBytes(
+        `- ${assetKindLabel(contribution.kind)}: ${formatBytes(
           bytesForCompression(contribution, compression),
         )}`,
     ),

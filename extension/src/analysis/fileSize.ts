@@ -1,5 +1,6 @@
 import type { FileSizeDocumentResponse, ImportAnalysisItem } from "../ipc/protocol.js";
 import {
+  assetKindLabel,
   bytesForCompression,
   type CompressionFormat,
   formatBytes,
@@ -55,8 +56,32 @@ export const formatCurrentFileSizeSummary = (
     `${fileCostQuantityName(fileCostQuality(response))}: ${formatBytes(bytesForCompression(response, compression))} ${labelForCompression(compression)}`,
     `${formatBytes(response.minified_bytes)} min`,
     `${importCount} ${importLabel}`,
+    ...assetCompositionParts(response, compression),
   ].join(" · ");
 };
+
+/**
+ * What share of the headline is NOT JavaScript, named per kind.
+ *
+ * The file total silently began including stylesheet, wasm and font bytes, and this line is what
+ * stops that from being invisible: a user comparing two UI kits can see that one file's 40 kB is
+ * mostly CSS. The bytes are already inside the number, so this adds nothing to it — it only says
+ * what it is made of, in the SAME compression the headline is quoting, because a gzip row beside a
+ * brotli headline is a number that cannot be reconciled with the one above it.
+ *
+ * Empty for a package with no assets, and empty for a daemon that predates the field, so neither
+ * renders a bare "0 B" that reads as a measurement.
+ */
+const assetCompositionParts = (
+  response: FileSizeDocumentResponse,
+  compression: CompressionFormat,
+): string[] =>
+  (response.asset_breakdown ?? [])
+    .filter((contribution) => bytesForCompression(contribution, compression) > 0)
+    .map(
+      (contribution) =>
+        `${assetKindLabel(contribution.kind)} ${formatBytes(bytesForCompression(contribution, compression))}`,
+    );
 
 /**
  * The **File Cost** of one document: ONE bundle over all its imports, so a module two of them reach

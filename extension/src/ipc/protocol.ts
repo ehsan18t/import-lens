@@ -194,6 +194,11 @@ export interface FileSizeDocumentResponse {
   zstd_bytes: number;
   imports: ImportResult[];
   states: ImportAnalysisItem[];
+  // What the five totals are made of, per non-JavaScript kind — bytes already INSIDE them. The file
+  // headline began including stylesheet/wasm/font weight with no surface able to say so; this is
+  // what lets the file total explain itself the way an import already can. Optional for older
+  // daemons, which simply omit it.
+  asset_breakdown?: AssetContribution[];
   // The totals are a FLOOR, not the file's size: an import that belongs in a fallback sum was never
   // measured, or a successful build disclosed supported asset bytes absent from its five sizes
   // (`uncounted_assets`). Safe to show, never safe to record as history (FR-026c). Optional for

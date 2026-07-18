@@ -1,4 +1,4 @@
-import type { ConfidenceLevel, ImportResult, ImportRuntime } from "../ipc/protocol.js";
+import type { AssetKind, ConfidenceLevel, ImportResult, ImportRuntime } from "../ipc/protocol.js";
 import type { InlineHintTone } from "./inlineHintVisuals.js";
 import {
   isNativeBinaryOnlyResult,
@@ -27,6 +27,22 @@ export interface CompressionByteSizes {
   gzip_bytes: number;
   zstd_bytes: number;
 }
+
+const assetKindLabels: Readonly<Record<AssetKind, string>> = {
+  css: "CSS",
+  wasm: "wasm",
+  font: "Fonts",
+};
+
+/**
+ * What to call one non-JavaScript kind, in the one place every surface reads it from.
+ *
+ * The fallback is not decoration. A newer daemon can name a kind this build has never heard of, and
+ * an unguarded lookup renders the literal string `undefined` beside a real byte count — a row that
+ * looks like a measurement of nothing. Showing the wire name instead degrades to something true:
+ * the user sees a kind they do not recognise, carrying bytes that really are in the number.
+ */
+export const assetKindLabel = (kind: AssetKind): string => assetKindLabels[kind] ?? kind;
 
 /**
  * The five sizes of a build that succeeded — the TypeScript half of ADR-0006's `MeasuredSizes`.

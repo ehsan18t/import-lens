@@ -167,3 +167,42 @@ test("budget verdicts reject the same deterministic upper-bound stages everywher
   assert.deepEqual(extensionNonBudgetableStages(), daemon);
   assert.deepEqual(cliNonBudgetableStages(), daemon);
 });
+
+// Drift check. The protocol version is declared THREE times — the daemon, the extension, and the
+// standalone CLI — because none of the three can import the others at runtime. The daemon accepts a
+// RANGE of versions for backward compatibility, so a stale copy in one client does not fail loudly:
+// it silently negotiates an older protocol and simply never receives whatever the newer version
+// added. The CLI sat a version behind exactly this way.
+//
+// This is the check that makes the third copy visible. It is a Drift test, not an Echo: the expected
+// value is derived from the daemon's own declaration, so bumping PROTOCOL_VERSION and forgetting a
+// client turns it red.
+const daemonProtocolVersion = () => {
+  const declaration = /pub const PROTOCOL_VERSION: u32 = (\d+)/u.exec(
+    repoFile("daemon/src/ipc/protocol.rs"),
+  );
+  assert.ok(declaration, "the daemon must still declare PROTOCOL_VERSION");
+  return Number(declaration[1]);
+};
+
+test("every client speaks the protocol version the daemon declares", () => {
+  const daemon = daemonProtocolVersion();
+
+  const extension = /export const protocolVersion = (\d+)/u.exec(
+    repoFile("extension/src/ipc/protocol.ts"),
+  );
+  assert.ok(extension, "the extension must still declare protocolVersion");
+  assert.equal(
+    Number(extension[1]),
+    daemon,
+    "the extension negotiates an older protocol and silently loses newer response fields",
+  );
+
+  const cliVersion = /^const protocolVersion = (\d+);$/mu.exec(cli);
+  assert.ok(cliVersion, "the CLI must still declare protocolVersion");
+  assert.equal(
+    Number(cliVersion[1]),
+    daemon,
+    "the CLI negotiates an older protocol and silently loses newer response fields",
+  );
+});

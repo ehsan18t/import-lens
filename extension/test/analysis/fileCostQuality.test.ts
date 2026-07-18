@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { isBudgetableFileSize } from "../../src/analysis/budgetability.js";
 import {
   fileCostBecause,
   fileCostQuantityName,
@@ -19,6 +20,7 @@ const flags = (overrides: Partial<Flags> = {}): Flags => ({
 });
 
 const timeout = [{ stage: "timeout", message: "build cancelled", details: [] }];
+const imprecise = [{ stage: "imprecise_assets", message: "measured sheet by sheet", details: [] }];
 
 /**
  * PROPERTY, over the whole flag space the daemon can send.
@@ -31,15 +33,15 @@ const timeout = [{ stage: "timeout", message: "build cancelled", details: [] }];
  * Quantified, not enumerated: add a fourth way a total can fail to be the file's, teach one of the
  * two about it and not the other, and this goes red.
  */
-test("a total is durable if and only if it is a File Cost", () => {
+test("a total is budgetable if and only if it is a File Cost", () => {
   for (const incomplete of [true, false]) {
     for (const degraded of [true, false]) {
-      for (const diagnostics of [[], timeout]) {
+      for (const diagnostics of [[], timeout, imprecise]) {
         const response = flags({ incomplete, degraded, diagnostics });
 
         assert.equal(
           isFileCost(quality(response)),
-          isDurableFileSize({ ...response, error: null }),
+          isBudgetableFileSize({ ...response, error: null }),
           `the two readings of ${JSON.stringify(response)} disagree: one of the surfaces will name \
 a number the other refuses to judge`,
         );
@@ -48,8 +50,26 @@ a number the other refuses to judge`,
   }
 });
 
+/**
+ * Durability is a DIFFERENT question from budgetability, and `imprecise_assets` is exactly where the
+ * two part company: a per-sheet CSS over-count is deterministic, so it is worth caching, but it is
+ * not precise enough to pass or fail a threshold (ADR-0006, invariants 3 and 5).
+ *
+ * Pinned so the property above cannot be "simplified" back onto durability. That is what it used to
+ * assert, and it is why an upper bound could be named a plain File Cost while the budget declined to
+ * judge it — the two predicates agreed on every input the test tried, and disagreed on the one it
+ * did not.
+ */
+test("a deterministic upper bound is durable but not budgetable", () => {
+  const response = { ...flags({ diagnostics: imprecise }), error: null };
+
+  assert.equal(isDurableFileSize(response), true, "a deterministic over-count is worth caching");
+  assert.equal(isBudgetableFileSize(response), false, "it cannot pass or fail a threshold");
+  assert.equal(isFileCost(quality(response)), false, "and it must not be named a plain File Cost");
+});
+
 test("a measured total is a File Cost, and says how it was built", () => {
-  assert.deepEqual(quality(flags()), { quantity: "file-cost", short: false });
+  assert.deepEqual(quality(flags()), { quantity: "file-cost", short: false, imprecise: false });
   assert.equal(fileCostQuantityName(quality(flags())), "File Cost");
   assert.equal(fileCostBecause(quality(flags())), "this file's imports built as one bundle");
 });
@@ -58,7 +78,7 @@ test("a measured total is a File Cost, and says how it was built", () => {
 test("an incomplete total is a floor and is never named a File Cost", () => {
   const floor = quality(flags({ incomplete: true }));
 
-  assert.deepEqual(floor, { quantity: "file-cost", short: true });
+  assert.deepEqual(floor, { quantity: "file-cost", short: true, imprecise: false });
   assert.equal(isFileCost(floor), false);
   assert.equal(fileCostQuantityName(floor), "File Cost floor");
   assert.equal(
@@ -75,7 +95,7 @@ test("an incomplete total is a floor and is never named a File Cost", () => {
 test("a degraded total is a Combined Import Cost, never a File Cost built as one bundle", () => {
   const degraded = quality(flags({ degraded: true }));
 
-  assert.deepEqual(degraded, { quantity: "combined-import-cost", short: false });
+  assert.deepEqual(degraded, { quantity: "combined-import-cost", short: false, imprecise: false });
   assert.equal(isFileCost(degraded), false);
   assert.equal(fileCostQuantityName(degraded), "Combined Import Cost");
   assert.equal(
@@ -92,7 +112,7 @@ test("a degraded total is a Combined Import Cost, never a File Cost built as one
 test("a degraded total that is also short says both things", () => {
   const both = quality(flags({ degraded: true, incomplete: true }));
 
-  assert.deepEqual(both, { quantity: "combined-import-cost", short: true });
+  assert.deepEqual(both, { quantity: "combined-import-cost", short: true, imprecise: false });
   assert.equal(fileCostQuantityName(both), "Combined Import Cost");
   assert.equal(
     fileCostBecause(both),
@@ -113,7 +133,7 @@ test("a degraded total that is also short says both things", () => {
 test("a degraded total whose combined build timed out is a Combined Import Cost, not also short", () => {
   const timedOut = quality(flags({ degraded: true, diagnostics: timeout }));
 
-  assert.deepEqual(timedOut, { quantity: "combined-import-cost", short: false });
+  assert.deepEqual(timedOut, { quantity: "combined-import-cost", short: false, imprecise: false });
   assert.equal(fileCostQuantityName(timedOut), "Combined Import Cost");
   assert.equal(
     fileCostBecause(timedOut),
@@ -126,5 +146,6 @@ test("a transient stage on the aggregate makes the total a floor", () => {
   assert.deepEqual(quality(flags({ diagnostics: timeout })), {
     quantity: "file-cost",
     short: true,
+    imprecise: false,
   });
 });

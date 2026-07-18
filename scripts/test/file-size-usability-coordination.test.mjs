@@ -168,10 +168,16 @@ either, and it must never report a pass",
 // above. Reword one and forget the other, and this is red.
 const qualityModel = read("extension/src/analysis/fileCostQuality.ts");
 
-/** Every sentence the extension explains a non-durable total with. Derived, never typed out here. */
+/** Every sentence the extension explains a non-durable total with. Derived, never typed out here.
+ *
+ * Matched as `const NAME = "..."` DECLARATIONS rather than as any long quoted run. A bare
+ * `/"([^"]{40,})"/` pairs quotes by position, so it happily pairs the closing quote of one short
+ * literal with the opening quote of the next and captures the code between them — which is what it
+ * did the moment a branch grew longer than forty characters. A check that can silently start reading
+ * source code instead of sentences is a check that agrees with anything. */
 const sharedSentences = [
   ...bodyBetween(qualityModel, "export const fileCostBecause = (", "\n};").matchAll(
-    /"([^"]{40,})"/gu,
+    /const \w+ =\s*"([^"]{40,})";/gu,
   ),
 ].map((match) => match[1]);
 

@@ -43,7 +43,7 @@ test("the extension's asset-kind union matches the daemon's enum", () => {
 });
 
 test("every asset kind the daemon can send has a label to render", () => {
-  const source = repoFile("extension/src/ui/tooltipMarkdown.ts");
+  const source = repoFile("extension/src/ui/format.ts");
   const body = source.match(/assetKindLabels[^{]*\{([^}]*)\}/u)?.[1];
   assert.ok(body, "`assetKindLabels` not found; this check is stale");
 

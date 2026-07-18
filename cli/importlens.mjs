@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 import { decode, encode } from "@msgpack/msgpack";
 
 const execFile = promisify(execFileCallback);
-const protocolVersion = 6;
+const protocolVersion = 7;
 const supportedExtensions = new Set([
   ".js",
   ".jsx",
