@@ -29,9 +29,13 @@ If a fix chains into a third round on the same sub-item, stop and re-check it ag
 - In TypeScript, prefer arrow functions where practical.
 - Do not use double casting or unnecessary cast chains.
 
+## Orchestration Default
+
+- **lean-orchestration is the default execution mode — no `/lean` needed.** Start every non-trivial task (feature, bug hunt, review/audit, design critique, refactor, mixed prompt) by invoking the `lean-orchestration` skill and following its routing. Step 0 of the skill still governs small work: quick lookups, tight debug loops, and small single-file changes stay inline. Full multi-agent/Workflow fan-outs only when explicitly requested. The skill and role agents live under `.claude/`; see `docs/lean-orchestration-setup.md`.
+
 ## Implementation Workflow
 
-- **Default to the `hybrid-execution` skill for any multi-commit or multi-file piece of work.** Do not stop to offer "subagent-driven vs inline" as a choice; there is no better default. Implement inline — coding is interdependent, which is the case multi-agent handles worst. Spend subagent tokens on an independent review of the risky commits: anything touching the release path, a public API, a cache or data format, or a diff you cannot fully eyeball. Fan out only over genuinely independent strands. Treat a reviewer's findings as hypotheses — reproduce each against the code before fixing it, and decline the rest with a one-line reason. Deviate only with a stated reason.
+- Treat a reviewer's or subagent's findings as hypotheses — reproduce each against the code before fixing it.
 - Read the relevant existing code before editing.
 - Add or update tests for behavior changes and bug fixes.
 - For daemon changes, run Rust formatting and tests.
