@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { DetectedImport, FileSizeDocumentResponse, ImportResult } from "../ipc/protocol.js";
 import { formatBytes, measuredSizes } from "../ui/format.js";
+import { hasNonBudgetableDiagnostic } from "./budgetability.js";
 import { isDurableFileSize, isDurableImportResult } from "./transience.js";
 
 // The two persisted histories live in `globalState`: no TTL, no cache generation, no Clear Caches
@@ -9,13 +10,18 @@ import { isDurableFileSize, isDurableImportResult } from "./transience.js";
 // computed against a number that never happened. So both stores below take the raw daemon output and
 // apply the gate themselves; neither will accept a row (ADR-0006, invariant 3; SRS FR-026c).
 
-// Version 2 deliberately left pre-asset-durability rows behind. Version 1 rows carry no stage
-// metadata, so a request-local asset floor recorded before D11 cannot be distinguished from a real
-// baseline. Bundle-impact history advances once more: v2 can contain deterministic
-// `uncounted_assets` totals recorded before D12 made that missing weight structural, and its rows
-// likewise carry no quality metadata with which to reject only those floors.
-export const bundleImpactHistoryKey = "importLens.bundleImpactHistory.v3";
-export const importCostHistoryKey = "importLens.importCostHistory.v2";
+// Each version left the previous rows behind for one recurring reason: they carry no metadata with
+// which to reject only the bad ones. v1 rows have no stage, so a request-local asset floor recorded
+// before D11 is indistinguishable from a real baseline; v2 rows can hold deterministic
+// `uncounted_assets` totals from before D12 made that missing weight structural.
+//
+// Both advance again now. An `imprecise_assets` total is a disclosed UPPER BOUND, which FR-032a says
+// MAY enter history — and must, since it is deterministic and reusable — but v3 rows record no sign
+// of having been one. Every later delta against such a row is measured partly against an over-count,
+// and rows are REPLACED rather than aged out, so nothing would ever clear them. Rows carry the flag
+// from v4/v3 onward, which is what makes the caveat below possible at all.
+export const bundleImpactHistoryKey = "importLens.bundleImpactHistory.v4";
+export const importCostHistoryKey = "importLens.importCostHistory.v3";
 
 export interface BundleImpactHistoryItem {
   timestamp: number;
@@ -26,6 +32,16 @@ export interface BundleImpactHistoryItem {
   brotliBytes: number;
   zstdBytes: number;
   importCount: number;
+  /**
+   * The stored number was a disclosed UPPER BOUND, not a size: the stylesheet set could not be
+   * bundled as one artifact, so shared bytes were counted more than once.
+   *
+   * Persisted because a delta is only a change if both sides are the same kind of number. Without
+   * it the row was indistinguishable from a real baseline once written, so re-validation was not
+   * merely missing but structurally impossible — the next sound run rendered a byte-exact saving
+   * that was partly the over-count evaporating.
+   */
+  imprecise: boolean;
 }
 
 export interface BundleImpactHistoryStore {
@@ -44,6 +60,9 @@ export interface ImportCostHistoryItem {
   gzipBytes: number;
   brotliBytes: number;
   zstdBytes: number;
+  /** As {@link BundleImpactHistoryItem.imprecise}. The import axis carried no caveat in EITHER
+   * direction, so it was the worse of the two. */
+  imprecise: boolean;
 }
 
 /**
@@ -82,6 +101,7 @@ export const bundleImpactHistoryItemForResponse = (
     // still-loading import is exactly one the count must include. `states` is the file's imports as
     // the FILE has them.
     importCount: response.states.length,
+    imprecise: hasNonBudgetableDiagnostic(response.diagnostics),
   };
 };
 
@@ -131,7 +151,12 @@ export const bundleImpactHistoryDeltaLabel = (
 ): string => {
   const delta = current.brotliBytes - previous.brotliBytes;
   const sign = delta >= 0 ? "+" : "-";
-  return `${sign}${formatBytes(Math.abs(delta))} br vs previous`;
+  const label = `${sign}${formatBytes(Math.abs(delta))} br vs previous`;
+  // As on the import axis: an upper bound on either side means part of the difference is the
+  // over-count appearing or evaporating. The caveat was previously reachable only when the
+  // imprecise result was the CURRENT one, because it came from reading the current response —
+  // the direction that mattered, an upper-bound BASELINE with a sound run against it, said nothing.
+  return current.imprecise || previous.imprecise ? `${label}, against an upper bound` : label;
 };
 
 export const previousBundleImpactForFile = (
@@ -185,6 +210,7 @@ export const importCostHistoryItem = (
     gzipBytes: sizes.gzip_bytes,
     brotliBytes: sizes.brotli_bytes,
     zstdBytes: sizes.zstd_bytes,
+    imprecise: hasNonBudgetableDiagnostic(result.diagnostics),
   };
 };
 
@@ -200,7 +226,12 @@ export const importCostHistoryDeltaLabel = (
 ): string => {
   const delta = current.brotliBytes - previous.brotliBytes;
   const sign = delta >= 0 ? "+" : "-";
-  return `${sign}${formatBytes(Math.abs(delta))}`;
+  const label = `${sign}${formatBytes(Math.abs(delta))}`;
+  // A delta is only a change if both sides are the same kind of number. An upper bound on either
+  // side means part of the difference is the over-count appearing or evaporating, not the package
+  // moving — so the figure is real but it is not a like-for-like comparison, and saying so is the
+  // whole point of having stored the flag.
+  return current.imprecise || previous.imprecise ? `${label}, against an upper bound` : label;
 };
 
 /**

@@ -14,6 +14,7 @@ const historyItem = (
   brotliBytes: 900,
   zstdBytes: 1000,
   importCount: 3,
+  imprecise: false,
   ...overrides,
 });
 

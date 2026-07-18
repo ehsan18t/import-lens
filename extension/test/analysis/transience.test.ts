@@ -287,6 +287,9 @@ test("the persisted bundle-impact history refuses a floor and takes a measuremen
       // HAD when it answered; on a streamed read the ones still building are absent, so this
       // recorded a file's two imports as zero. `incomplete` cannot catch it: it guards the bytes.
       importCount: 2,
+      // A sound measurement, so the number is a size rather than a disclosed upper bound. The flag
+      // is persisted because a delta is only a change if both sides are the same kind of number.
+      imprecise: false,
     },
   );
 });

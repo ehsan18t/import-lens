@@ -7,6 +7,7 @@ import {
   bundleImpactHistoryLabel,
   type ImportCostHistoryItem,
   type ImportCostHistorySource,
+  importCostHistoryDeltaLabel,
   importCostHistoryKey,
   recordBundleImpactHistory,
   recordImportCostHistory,
@@ -35,6 +36,7 @@ const item = (fileName: string, brotliBytes: number): BundleImpactHistoryItem =>
   brotliBytes,
   zstdBytes: 1_700,
   importCount: 2,
+  imprecise: false,
 });
 
 /** A measured document: the store takes the RESPONSE and builds the row itself. */
@@ -68,9 +70,11 @@ test("recordBundleImpactHistory keeps newest entries first under the limit", asy
   );
 });
 
-test("bundle-impact history leaves pre-D12 asset floors behind", async () => {
+test("bundle-impact history leaves rows without quality metadata behind", async () => {
   const store = new MemoryStore();
-  const legacyKey = "importLens.bundleImpactHistory.v2";
+  // v3 rows carry no `imprecise` flag, so a disclosed upper bound recorded under them cannot be
+  // told from a real baseline — the same reason v2 was left behind for pre-D12 asset floors.
+  const legacyKey = "importLens.bundleImpactHistory.v3";
   store.values.set(legacyKey, [item("/workspace/src/legacy-floor.ts", 100)]);
 
   await recordBundleImpactHistory(
@@ -80,7 +84,7 @@ test("bundle-impact history leaves pre-D12 asset floors behind", async () => {
     1_800_001,
   );
 
-  assert.equal(bundleImpactHistoryKey, "importLens.bundleImpactHistory.v3");
+  assert.equal(bundleImpactHistoryKey, "importLens.bundleImpactHistory.v4");
   assert.deepEqual(
     store.get<BundleImpactHistoryItem[]>(bundleImpactHistoryKey, []).map((entry) => entry.fileName),
     ["/workspace/src/complete.ts"],
@@ -178,4 +182,61 @@ test("recording a changed import cost keeps one row per identity", async () => {
     .filter((entry) => entry.specifier === "react");
   assert.equal(rows.length, 1);
   assert.equal(rows[0].brotliBytes, 150);
+});
+
+/**
+ * A delta is only a change if both sides are the same kind of number.
+ *
+ * An `imprecise_assets` total is a disclosed UPPER BOUND, and FR-032a says it may enter history —
+ * it is deterministic and reusable, so refusing the row would be the wrong fix. What was wrong is
+ * that the row kept no record of being one, which made re-validation not merely absent but
+ * structurally impossible. The direction that mattered was the silent one: an imprecise CURRENT
+ * result was captioned, while an imprecise BASELINE with a sound run against it rendered a clean
+ * byte-exact saving that was partly the over-count evaporating.
+ */
+test("a delta measured against an upper-bound baseline says so", () => {
+  const baseline: BundleImpactHistoryItem = {
+    ...item("/workspace/src/a.ts", 65_000),
+    imprecise: true,
+  };
+  const sound = item("/workspace/src/a.ts", 40_000);
+
+  assert.ok(
+    bundleImpactHistoryDeltaLabel(sound, baseline).endsWith(", against an upper bound"),
+    "a sound run measured against a stored upper bound is not a like-for-like comparison",
+  );
+  assert.ok(
+    !bundleImpactHistoryDeltaLabel(sound, item("/workspace/src/a.ts", 45_000)).includes(
+      "upper bound",
+    ),
+    "two sound rows compare cleanly and must not be caveated",
+  );
+});
+
+/** The import axis carried no caveat in EITHER direction, so it was the worse of the two. */
+test("an import delta measured against an upper-bound baseline says so", () => {
+  const importItem = (brotliBytes: number, imprecise = false): ImportCostHistoryItem => ({
+    identity: "react|named|",
+    timestamp: 1_800_000,
+    specifier: "react",
+    importKind: "named",
+    named: [],
+    rawBytes: brotliBytes * 4,
+    minifiedBytes: brotliBytes * 2,
+    gzipBytes: brotliBytes,
+    brotliBytes,
+    zstdBytes: brotliBytes,
+    imprecise,
+  });
+  const previous = importItem(9_000, true);
+  const current = importItem(4_000);
+
+  assert.ok(
+    importCostHistoryDeltaLabel(current, previous).endsWith(", against an upper bound"),
+    "the import axis must caveat an upper-bound baseline too",
+  );
+  assert.ok(
+    !importCostHistoryDeltaLabel(current, importItem(5_000)).includes("upper bound"),
+    "two sound rows compare cleanly",
+  );
 });
