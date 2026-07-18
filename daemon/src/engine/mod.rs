@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 pub use crate::ipc::protocol::ImportRuntime;
 pub use adapter::RolldownEngine;
-pub(crate) use asset_classifier::classify_asset;
+pub(crate) use asset_classifier::{AssetClass, classify_asset, classify_asset_class};
 pub use asset_input::CollectedAsset;
 pub(crate) use asset_input::read_collected_asset;
 

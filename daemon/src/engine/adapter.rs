@@ -236,7 +236,12 @@ fn translate(
         });
     }
 
-    let emitted = emitted_assets(&output);
+    // Two sources, one meaning: bytes this build knows ship and cannot count. Rolldown emitting an
+    // asset beside the chunk (nothing does today), and a directly imported file outside the
+    // measured taxonomy. They share a disclosure because the user's question is the same for both.
+    let mut emitted = emitted_assets(&output);
+    emitted.extend(state.unmeasured_assets());
+    emitted.sort_by(|left, right| left.path.cmp(&right.path));
     let mut diagnostics = contract_diagnostics(&output.warnings);
     diagnostics.extend(asset_io_diagnostic(state));
     diagnostics.extend(uncounted_assets_diagnostic(&emitted));

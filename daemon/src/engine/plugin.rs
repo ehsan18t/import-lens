@@ -5,7 +5,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -23,7 +23,7 @@ use rolldown_common::{ModuleInfo, NormalModule};
 
 use super::entry::{TARGET_PREFIX, VIRTUAL_ENTRY_ID};
 use super::limits::{MAX_GRAPH_MODULES, MAX_GRAPH_SOURCE_BYTES, MAX_MODULE_SOURCE_BYTES};
-use super::{CollectedAsset, classify_asset};
+use super::{AssetClass, CollectedAsset, UncountedAsset, classify_asset_class};
 use crate::cache::key::{
     FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
     sort_and_dedup_fingerprints, unverifiable_file_fingerprint,
@@ -51,6 +51,9 @@ pub(super) struct BuildState {
     /// succeeds through its own loader, that mixed observation describes this filesystem moment,
     /// not a reusable fact about the package.
     failed_asset_inputs: Mutex<HashSet<PathBuf>>,
+    /// Directly imported files that ship but are outside the measured taxonomy — an image, an icon.
+    /// Stubbed so they cannot fail the build, and disclosed so their bytes are not silently absent.
+    unmeasured_assets: Mutex<BTreeMap<PathBuf, UncountedAsset>>,
 }
 
 impl BuildState {
@@ -99,6 +102,27 @@ impl BuildState {
         let mut sorted: Vec<CollectedAsset> = assets.values().cloned().collect();
         sorted.sort_by(|left, right| left.path.cmp(&right.path));
         sorted
+    }
+
+    /// Returns whether this call is the one that claimed the path. `false` means a duplicate hook
+    /// invocation, whose byte reservation the caller must release — the counted asset map reports
+    /// the same thing for the same reason.
+    fn record_unmeasured_asset(&self, asset: UncountedAsset) -> bool {
+        self.unmeasured_assets
+            .lock()
+            .expect("unmeasured asset map should not be poisoned")
+            .insert(asset.path.clone(), asset)
+            .is_none()
+    }
+
+    /// Disclosed, deduplicated by path so two imports of the same icon are one disclosure.
+    pub(super) fn unmeasured_assets(&self) -> Vec<UncountedAsset> {
+        self.unmeasured_assets
+            .lock()
+            .expect("unmeasured asset map should not be poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub(super) fn record_failed_asset_input(&self, path: PathBuf) {
@@ -258,7 +282,7 @@ fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Opt
         .min()
         .unwrap_or(specifier.len());
     let specifier_path = Path::new(&specifier[..path_end]);
-    classify_asset(specifier_path)?;
+    classify_asset_class(specifier_path)?;
     if specifier_path.is_absolute() {
         return Some(specifier_path.to_path_buf());
     }
@@ -618,7 +642,11 @@ impl Plugin for ImportLensPlugin {
         if !path.is_absolute() {
             return Ok(None);
         }
-        let asset_kind = classify_asset(path);
+        let asset_class = classify_asset_class(path);
+        let asset_kind = match asset_class {
+            Some(AssetClass::Counted(kind)) => Some(kind),
+            _ => None,
+        };
 
         // §7.3: reject an oversized module BEFORE reading it. The limit exists to
         // bound memory, so reading first would blow the very bound being enforced.
@@ -630,7 +658,7 @@ impl Plugin for ImportLensPlugin {
         let metadata = match tokio::fs::metadata(&canonical).await {
             Ok(metadata) => metadata,
             Err(error) => {
-                if asset_kind.is_some() {
+                if asset_class.is_some() {
                     self.state.record_failed_asset_input(canonical);
                     // Do not let the default loader reopen a recovering/growing asset outside this
                     // plugin's source-byte reservations. The adapter promotes the retained cause
@@ -662,7 +690,7 @@ impl Plugin for ImportLensPlugin {
         // Reserve the stat length here, BEFORE reading, both to make the aggregate cap cover them
         // and to keep a static oversized asset from allocating past the bound it is about to fail.
         // The per-file check above makes this conversion safe on every supported architecture.
-        let reserved_asset_bytes = if asset_kind.is_some() {
+        let reserved_asset_bytes = if asset_class.is_some() {
             let metadata_bytes = usize::try_from(metadata.len())
                 .expect("a per-file-admitted asset length must fit usize");
             if let Err(error) = self.reserve_source_bytes(metadata_bytes) {
@@ -680,7 +708,7 @@ impl Plugin for ImportLensPlugin {
                 if let Some(reserved) = reserved_asset_bytes {
                     self.release_source_bytes(reserved);
                 }
-                if asset_kind.is_some() {
+                if asset_class.is_some() {
                     self.state.record_failed_asset_input(canonical);
                     return Err(error.into());
                 }
@@ -731,6 +759,65 @@ impl Plugin for ImportLensPlugin {
             }
 
             if !self.state.record_asset(asset) {
+                self.release_source_bytes(actual);
+            }
+
+            return Ok(Some(HookLoadOutput {
+                code: String::new().into(),
+                module_type: Some(ModuleType::Empty),
+                ..HookLoadOutput::default()
+            }));
+        }
+
+        // A file that ships but is outside the measured taxonomy — an image, an icon, a media file.
+        //
+        // It is intercepted for the same reason a font is: left to Rolldown, ONE of these makes the
+        // whole package unmeasurable. A `.png` is not UTF-8, so its loader fails on `InvalidData`;
+        // an `.svg` IS valid UTF-8, so it is handed to OXC and parsed as JavaScript, which fails
+        // differently and just as fatally. The user saw "unavailable" for a package whose
+        // JavaScript we could measure perfectly.
+        //
+        // Stubbing it to `Empty` lets the JS graph measure exactly, and the bytes are DISCLOSED
+        // rather than dropped: they ship, so a size that omits them is a floor and has to say so.
+        // Its length is charged against the graph's aggregate ceiling like any other asset, so
+        // stubbing cannot become a way to admit bytes no limit ever sees.
+        if asset_class == Some(AssetClass::Unmeasured) {
+            let reserved = reserved_asset_bytes
+                .expect("a classified asset must reserve its metadata length before reading");
+            let actual = bytes.len();
+
+            // Same post-read growth check the counted arm makes. The pre-read stat bounds a stable
+            // file; this closes the window where it grew between the stat and the read, and it
+            // fingerprints the bytes that made the deterministic failure true.
+            if actual > MAX_MODULE_SOURCE_BYTES {
+                self.record_read_time(&canonical, len, modified_millis, &bytes);
+                self.release_source_bytes(reserved);
+                return Err(self
+                    .breach(format!(
+                        "module {} exceeds the {MAX_MODULE_SOURCE_BYTES} byte module source limit",
+                        canonical.display()
+                    ))
+                    .into());
+            }
+
+            if let Err(error) = self.reconcile_source_bytes(reserved, actual) {
+                // Record the fingerprint BEFORE returning, as the counted arm does: this failure is
+                // deterministic and cacheable, and without the fingerprint it would not expire when
+                // the file that caused it changes.
+                self.record_read_time(&canonical, len, modified_millis, &bytes);
+                self.release_source_bytes(reserved);
+                return Err(error.into());
+            }
+            self.record_read_time(&canonical, len, modified_millis, &bytes);
+
+            // Release on a DUPLICATE, exactly as the counted arm does. Two module ids can
+            // canonicalize to one path (a pnpm symlink layout is the ordinary shape), and both
+            // charge their length against the aggregate ceiling. Only the first is ever accounted
+            // for, so without this the counter drifts up for the rest of the build.
+            if !self.state.record_unmeasured_asset(UncountedAsset {
+                path: canonical,
+                bytes: actual as u64,
+            }) {
                 self.release_source_bytes(actual);
             }
 

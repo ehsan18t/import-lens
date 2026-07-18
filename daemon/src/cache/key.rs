@@ -117,9 +117,16 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// binary module with a hash taken from a later one and answer Fresh forever. And every directly
 /// imported asset is now a module contribution, so `shared_bytes` — carried in the L2 envelope —
 /// accounts for a stylesheet several imports pull, which a `+9` entry computed without.
+/// `rolldown-1.1.x+11` (2026-07-18): a package that a directly imported image, icon or media file
+/// used to make entirely unmeasurable now measures, with those bytes disclosed. A `+10` entry for
+/// such a package is a cached DURABLE failure — `resolve` for a PNG that failed the UTF-8 loader,
+/// `parse` for an SVG that reached the JavaScript parser — and would keep being served as
+/// "unavailable" for a package that now has a number. A bare CSS `@import` also stops recording a
+/// failed read of a path that cannot exist, so results that were permanently non-durable become
+/// cacheable.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.1.x+10"
+        "rolldown-1.1.x+11"
     };
 }
 

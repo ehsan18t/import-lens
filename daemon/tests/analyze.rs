@@ -2828,6 +2828,82 @@ fn analyze_local_assets_referenced_by_css_are_counted_in_the_import_cost() {
     assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
 }
 
+/// **One icon used to cost the whole package its number.**
+///
+/// A directly imported `.png` is not UTF-8, so Rolldown's own loader failed on `InvalidData` and the
+/// entire build died — the user saw "unavailable" for a package whose JavaScript measures perfectly.
+/// An `.svg` is valid UTF-8, so it reached OXC instead and was parsed as JavaScript, which failed
+/// just as fatally by a different route. Both are now stubbed like any other asset: the JS graph
+/// measures, and the shipped bytes are disclosed rather than dropped.
+#[test]
+fn analyze_measures_a_package_that_directly_imports_an_image() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "icon-lib",
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+        "import logo from './logo.png';\nimport mark from './mark.svg';\nexport const brand = () => logo + mark;\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("icon-lib")
+            .join("logo.png"),
+        vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+            .into_iter()
+            .chain(std::iter::repeat_n(0x42, 16_376))
+            .collect::<Vec<u8>>(),
+    )
+    .expect("png fixture should be written");
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("icon-lib")
+            .join("mark.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"8\" height=\"8\"/></svg>",
+    )
+    .expect("svg fixture should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "icon-lib",
+            "icon-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["brand"],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(
+        result.error, None,
+        "one unmeasurable asset kind must not take the package's JavaScript with it: {result:?}"
+    );
+    assert!(
+        common::measured_sizes(&result).raw_bytes > 0,
+        "the JavaScript graph must still be measured: {result:?}"
+    );
+    let disclosure = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
+        .expect("shipped bytes the size omits must be disclosed");
+    assert!(
+        disclosure.message.contains("logo.png") && disclosure.message.contains("mark.svg"),
+        "both shipped files must be named: {disclosure:?}"
+    );
+    assert_ne!(
+        result.confidence,
+        ConfidenceLevel::High,
+        "a size that omits shipped bytes cannot claim High confidence: {result:?}"
+    );
+}
+
 /// The headline claims to be the import's full cost. An image is outside the counted taxonomy, and
 /// the closed `AssetKind` set used to drop it through a bare `None`: out of the number, out of every
 /// disclosure, still High confidence — a package advertising a total it was short by. Disclosing it
