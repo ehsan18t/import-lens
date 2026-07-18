@@ -51,8 +51,15 @@ const confidenceVisuals: Record<ConfidenceTone, ConfidenceVisual> = {
   },
 };
 
+/**
+ * The `unknown` visual is the fallback for a level this build has never heard of, not just a tone
+ * callers may pass deliberately. An older extension meets a newer daemon routinely, and an
+ * unguarded lookup returned `undefined` for a fourth `ConfidenceLevel` — the caller then read
+ * `.badge` off it and the whole hover rendered nothing rather than degrading. The asset-kind lookup
+ * beside this one already renders an unknown wire value under its own name.
+ */
 export const confidenceVisualFor = (confidence: ConfidenceTone): ConfidenceVisual =>
-  confidenceVisuals[confidence];
+  confidenceVisuals[confidence] ?? confidenceVisuals.unknown;
 
 export const confidenceCssColor = (confidence: ConfidenceTone): string => {
   const visual = confidenceVisualFor(confidence);
