@@ -444,7 +444,13 @@ Every requested surface must carry a unique entry alias so strict entry signatur
   * a **local resource that cannot be located or inspected** — a public-root `/fonts/x.woff2`, an unreadable file, or a sheet whose URLs Lightning CSS could not inspect at all — is disclosed under `uncounted_assets` as an omission of unknown size. It is **not** `imprecise_assets`: those two stages point in opposite directions, and reporting missing bytes as an over-count prevents `incomplete` from firing (FR-024a);
   * a **runtime-fetched resource** (a CDN `@import` or a remote `url()`) is disclosed under `external`. Those bytes are real weight for the page but are not shipped by this package, so the measured size is exact and **keeps its budget verdict**. Routing them through a precision stage silently disabled budgeting for every package that `@import`s a web font.
 
-  A resource that could not be located but *did* resolve to a path must retain that path in freshness (FR-025), so that supplying the missing file invalidates the result.
+  A resource that could not be located but *did* resolve to a path must retain that path in freshness (FR-025), so that supplying the missing file invalidates the result. A reference that never resolved to a path has nothing to fingerprint and is disclosed without one.
+
+**FR-018c** (High) - **Asset weight is visible wherever the number it is inside is.** A counted asset is part of the reported size, so every surface that shows the size must be able to say so:
+
+  * `ImportResult.asset_breakdown` and `FileSizeDocumentResponse.asset_breakdown` both carry one summed `AssetContribution` row per kind present. The file-level rows are summed across runtime groups, and a degraded group's per-import fallback contributes its rows too, so a degraded file still says what its number is made of;
+  * an asset is a **module contribution** as well. A stylesheet links as an empty module, so the JavaScript walk cannot see it — leaving it out made a CSS-dominant package's top-module list sum to a fraction of the headline printed beside it, and made a stylesheet two imports share invisible to `shared_bytes`, which is the one mechanism that explains a gap between Combined Import Cost and File Cost;
+  * an unknown asset kind from a newer daemon must render its wire name, never a placeholder that reads as a measurement of nothing.
 
 **FR-019** (Critical) - The daemon must use `oxc_minifier` to perform dead code elimination, constant folding, and supported identifier mangling on the tree-shaken output, then use `oxc_codegen` (with `minify: true`) to emit the minified JavaScript string. Codegen must use the scoping and private-member mappings returned by `oxc_minifier::Minifier::minify`; the daemon must not run a second independent mangling pass over already-minified AST state.
 
@@ -708,6 +714,10 @@ This is one trade, not two independent losses. The same synthetic namespace that
   Silence must therefore be read correctly on each of them. In the editor, an unmeasured or request-local partial import produces no budget warning and shows its unavailable/asset disclosure beside it. That is acceptable in an editor, where the user is looking at the file. It is **not** acceptable in CI, where nobody is: `importlens check` must exit **non-zero with a distinct code (3) and a distinct message** when it could not measure what it was asked to judge — because a file's total is a floor (`incomplete` or a request-local diagnostic), because the file's own combined build failed (`degraded`), or because a per-import result is request-local even while the combined File Cost is clean. A budget violation remains exit 1. Confusing the two in either direction is a failure of this requirement.
 
   **And no verdict from an over-count either.** A `degraded` total (FR-024a) is a sum of per-import costs, not a File Cost: it is *larger* than the file, so it cannot produce a false pass — but it can produce a false **FAIL**, and invariant 5 forbids both. `imprecise_assets` is another disclosed over-count: the result is deterministic and may enter caches/history, while budget gates must reject it through the coordinated non-budgetable-stage list. A budget judged against a number the file never had is neither passed nor failed.
+
+  **A floor and an upper bound are not symmetric, and the per-import enumeration above is deliberate.** A deterministic per-import `uncounted_assets` floor F satisfies F ≤ T, the true cost. A violation fires only when F > limit, which forces T > limit — so **every violation reported from a floor is true**, and the only possible error is silence when F ≤ limit < T. Refusing to judge a floor would therefore delete true violations and prevent none, which is why `NON_BUDGETABLE_RESULT_STAGES` holds only the over-count stage. An upper bound is the reverse: it can fire on a package that is really inside its budget, so it must never be judged.
+
+  What a floor may **not** do is have its silence read as success. In the editor that is acceptable — the user is looking at the file, and the asset disclosure sits beside the number. In CI it is not, and it is closed independently of the stage list: a per-import `uncounted_assets` omission makes its file's aggregate `incomplete` (FR-024a), `isUsableFileSize` rejects an incomplete total, and `importlens check` exits **3**, not 0. The one surface with no such compensating gate is the workspace report's `budgetViolationCount`, which holds no File Cost; it therefore counts only true violations and may under-count, and must never be read as proof that a workspace is inside budget.
 
   **The gate belongs to the verdict, not to its caller.** `runImportLensCheck` applies `isUsableFileSize` itself, to the raw response fields, rather than trusting the injected `analyzeFile` to have decided. A pass/fail verdict is a durable store, and a store that trusts its caller to have asked is a store that will eventually not be asked.
 
@@ -1320,6 +1330,9 @@ interface FileSizeResponse {
   brotli_bytes: number;
   zstd_bytes: number;
   imports: ImportResult[];
+  // Per-kind non-JS weight already INSIDE the five totals, summed across runtime groups (FR-018c).
+  // Absent from a daemon that predates the field; never a zero row for a kind with no weight.
+  asset_breakdown?: AssetContribution[];
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }

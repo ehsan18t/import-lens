@@ -276,21 +276,55 @@ We do not fetch the resource to size it. Doing so would make a measurement depen
 non-deterministic and non-cacheable, and let a package's reported cost change without any byte on disk
 changing — all of which ADR-0006 exists to prevent.
 
+### D18: A CSS `url()` may resolve outside the package root
+**Status: Accepted** · Decided 2026-07-18
+
+A relative `url("../../../fonts/x.woff2")` in a stylesheet is resolved and canonicalized with no check
+that the result stays inside the package that declared it, so a reference can escape into a sibling
+package or above `node_modules` entirely.
+
+Not fixed, and deliberately: containment is not an invariant this tool holds anywhere else. The graph
+already loads and measures whatever JavaScript an entry imports, from wherever it resolves, and
+`node_modules` is trusted build input by construction. Adding a boundary here would enforce it in one
+narrow place while every other read ignores it, which buys no safety property.
+
+It would also cost accuracy. A monorepo package legitimately referencing a shared font through `../`
+is a real shape, and a containment check would stop counting bytes that genuinely ship — turning a
+correct number into a floor to prevent something that is not a defect.
+
+### D19: The per-sheet retry is bounded, not free
+**Status: Accepted bound** · Measured 2026-07-18
+
+A stylesheet's `url()` dependencies are stat'd one at a time, and the loop checks the deadline before
+each one, so the work is bounded by the same eight-second budget as everything else in the stage. The
+stats are not charged to the byte ledger because a stat moves no bytes.
+
+Recorded rather than fixed because the bound already exists and adding a second accounting mechanism
+for zero-byte operations would be more machinery than the risk justifies. The per-attempt snapshot
+copy that made retries quadratic **was** fixed: the ledger is now consulted one path at a time
+instead of being cloned per attempt.
+
 ### D15: `shared_bytes` explains JavaScript sharing only
-**Status: Deferred** · Raised by the 2026-07-18 asset review (A8)
+**Status: RESOLVED 2026-07-18** · Raised by the 2026-07-18 asset review (A8)
 
 File Cost deduplicates a stylesheet shared by several imports, but `shared_modules`/`duplicate_imports` are
 built from JS-graph module contributions and cannot see assets. So a UI kit imported from twenty files
 contributes its stylesheet twenty times to Combined Import Cost with nothing saying those twenty are one file,
 and a user can see a gap between Combined Import Cost and File Cost with no asset-sharing explanation.
 
-Not fixed now because it shows no wrong number — both quantities are correct under their own definitions, and
-ADR-0004 already sanctions counting a shared dependency once per import. It is an explanation gap, and the fix
-(emitting asset paths as first-class `ModuleContribution`s so the existing sharing model covers them) is a
-feature with wire and UI surface, not a correction.
+Fixed by emitting each directly imported asset as a `ModuleContribution` alongside the JavaScript modules. A
+stylesheet links as an EMPTY module, so its rendered length is zero and the JS contribution walk dropped it —
+which is the same root cause behind the top-module list summing to a fraction of its own headline. Both close
+together: `annotate_shared_bytes` unions on (runtime, contribution path) and now sees the sheet, so a stylesheet
+two imports pull is counted as shared weight, while a Server and a Client import still share nothing because a
+runtime is an artifact boundary (ADR-0005).
+
+No wire change was needed and none was made. The rows travel in `internal_contributions`, which is
+`#[serde(skip)]` on the wire and carried explicitly by the L2 envelope for exactly this reason, so a cached
+result shares identically to a freshly measured one.
 
 ### D16: Asset composition reaches only the hover
-**Status: Deferred** · Raised by the 2026-07-18 asset review (A6/A7)
+**Status: RESOLVED 2026-07-18** · Raised by the 2026-07-18 asset review (A6/A7)
 
 `asset_breakdown` has one consumer: the import hover. `FileSizeDocumentResponse` carries no breakdown at all,
 so the status bar and "Show Current File Size" headline include asset bytes without any surface saying so. The
@@ -299,12 +333,25 @@ so an `imprecise_assets` File Cost silently returns `not-evaluated` from its bud
 why. Relatedly, `module_breakdown` derives from JS rendered bytes, so a CSS-dominant package's "top modules"
 list sums to a fraction of the headline beside it.
 
-Not fixed now because the numbers are right and disclosed on the import surface; this is missing explanation,
-not a wrong value. It is grouped as one item because the fix is one change — carry the breakdown and the
-quality sentence onto the file-level response and render both.
+Fixed in three parts, all of which were one missing idea: a number that changed meaning had no way to explain
+itself.
+
+`FileSizeDocumentResponse` now carries `asset_breakdown`, summed per kind across runtime groups, with a
+degraded group's per-import fallback contributing its rows too — so the file total says what it is made of
+exactly when it is hardest to read. The summary line renders those rows in the SAME compression as the headline
+it sits beside, since a gzip row under a brotli headline cannot be reconciled with the number above it.
+
+`fileCostQuality` gained a third axis, `imprecise`, so the extension can finally say "File Cost upper bound" and
+print the sentence the CLI already had. The property test behind it was re-pinned from durability to
+**budgetability**, which is what its own doc comment always described: the two predicates agree everywhere
+except `imprecise_assets`, and that one input is precisely where an upper bound was being named a plain File
+Cost while the budget declined to judge it.
+
+The top-module reconciliation is fixed by the same change as D15 — assets are module contributions now, so a
+CSS-dominant package's breakdown adds up to its own headline.
 
 ### D17: A per-import floor can still be compared against a budget
-**Status: Deferred (spec defect, not a code defect)** · Raised by the 2026-07-18 asset review (A9)
+**Status: RESOLVED 2026-07-18 — the SPEC moved, the code was right** · Raised by the 2026-07-18 asset review (A9)
 
 `NON_BUDGETABLE_RESULT_STAGES` contains only `imprecise_assets`, so a per-import result carrying a
 deterministic `uncounted_assets` floor is compared against `perImportBrotliBytes` on its JS-only bytes.
@@ -317,10 +364,18 @@ non-budgetability as "comparing it with a threshold can produce a false failure"
 shape and does not apply to a floor at all. The list was never asked the under-count question.
 
 The CI surfaces are independently closed: `incomplete` propagation makes `isUsableFileSize` reject the file, so
-`importlens check` returns `EXIT_COULD_NOT_MEASURE` rather than 0. The residual is the workspace report's
-`budgetViolationCount`, which holds no File Cost and so under-counts violations. The code currently matches
-SRS FR-032a's per-import enumeration exactly; that enumeration contradicts its own headline and ADR-0006
-invariant 5, so the decision to make is which of the two moves.
+`importlens check` returns `EXIT_COULD_NOT_MEASURE` rather than 0.
+
+**Resolved by moving the spec, because the "fix" would have made things worse.** Adding `uncounted_assets` to
+`NON_BUDGETABLE_RESULT_STAGES` would delete the "over budget" badge, the Problems-panel entry, and the report's
+violation row for a floor import — every one of which is reporting a TRUE violation, since F > limit forces
+T > limit. It would remove true positives and prevent no false ones. The only error a floor can cause is
+silence, and no change to the stage list can fix silence; you would need the number you do not have.
+
+So the code stays and FR-032a now states the asymmetry it was always relying on: a floor may be judged for
+violation but its silence is never a pass, while an upper bound may not be judged at all. The residual is
+recorded there too — the workspace report's `budgetViolationCount` holds no File Cost, so it counts only true
+violations, may under-count, and must never be read as proof a workspace is inside budget.
 
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
