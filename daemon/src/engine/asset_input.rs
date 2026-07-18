@@ -1,5 +1,7 @@
 use std::fmt;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cache::key::{
@@ -74,6 +76,7 @@ impl fmt::Debug for CollectedAsset {
 /// Read one processor-discovered asset once and bind its fingerprint to those exact bytes.
 /// Canonicalization happens before the stat/read pair so a symlink retarget cannot give the bytes
 /// of one target the identity of another.
+#[cfg(test)]
 pub(crate) fn read_collected_asset(
     path: &Path,
     kind: AssetKind,

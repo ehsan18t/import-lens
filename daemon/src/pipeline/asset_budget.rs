@@ -24,6 +24,23 @@ pub(crate) struct AssetBudgetLimits {
 }
 
 impl AssetBudgetLimits {
+    /// Production limits with the build-wide CSS work ledger lifted, for a test that exercises the
+    /// PER-ATTEMPT stylesheet-tree bound.
+    ///
+    /// The two cannot both be production in one test: a union that breaches the 256-file attempt
+    /// bound needs N > 256 reads, and its per-sheet retry reads all N again, so the pair costs 2N
+    /// against a build-wide ledger of 512. Any N that triggers the degradation also exhausts the
+    /// ledger. That is real production behaviour and is recorded in known-issues; a test that wants
+    /// to observe the degradation itself has to hold the other limit out of the way.
+    #[cfg(test)]
+    pub(crate) fn unbounded_css_work() -> Self {
+        Self {
+            max_css_work_reads: usize::MAX,
+            max_css_work_bytes: usize::MAX,
+            ..Self::production()
+        }
+    }
+
     pub(crate) fn production() -> Self {
         Self {
             max_unique_files: MAX_GRAPH_MODULES,

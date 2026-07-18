@@ -20,15 +20,14 @@
 //! bytes, which is exactly today's behaviour: never below it
 //! ([ADR-0006](../../../docs/adr/0006-the-result-model.md)).
 
-use crate::cache::key::{
-    FileFingerprint, content_hash, file_fingerprint_from_read_time, read_time_len_mtime_of,
-    sort_and_dedup_fingerprints,
-};
-use crate::engine::{
-    AssetKind, CollectedAsset, UncountedAsset, diagnostic_stage, read_collected_asset,
-};
+use crate::cache::key::{FileFingerprint, sort_and_dedup_fingerprints};
+#[cfg(test)]
+use crate::engine::read_collected_asset;
+use crate::engine::{AssetKind, CollectedAsset, UncountedAsset, diagnostic_stage};
 use crate::ipc::protocol::{AssetContribution, ImportDiagnostic, MeasuredSizes};
 use crate::pipeline::asset_boundary::{self, AssetBoundaryError, AssetDeadline};
+#[cfg(test)]
+use crate::pipeline::asset_budget::AssetBudgetLimits;
 use crate::pipeline::asset_budget::{AssetBudgetFailure, AssetProcessingContext};
 use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
 use crate::pipeline::css_dependencies::collect_referenced_assets;
@@ -152,94 +151,41 @@ struct TrackingProvider {
     read_time_fingerprints: Mutex<Vec<FileFingerprint>>,
     failed_paths: Mutex<HashSet<PathBuf>>,
     budget: Mutex<ReadBudget>,
-    /// One ledger for every union/per-sheet attempt in this build. `None` only for the small
-    /// standalone helpers used by processor tests; daemon production always supplies it.
-    context: Option<Arc<AssetProcessingContext>>,
+    /// One ledger for every union/per-sheet attempt in this build. Never optional: production
+    /// safety that a caller can omit is safety the tests will omit.
+    context: Arc<AssetProcessingContext>,
 }
 
 impl TrackingProvider {
-    fn new(entries: &[CollectedAsset]) -> Self {
-        Self {
-            inner: FileProvider::new(),
-            retained_sources: RetainedSources::default(),
-            preloaded: entries
-                .iter()
-                .cloned()
-                .map(|asset| (asset.path.clone(), asset))
-                .collect(),
-            synthetic: None,
-            read_paths: Mutex::new(HashSet::new()),
-            read_time_fingerprints: Mutex::new(Vec::new()),
-            failed_paths: Mutex::new(HashSet::new()),
-            budget: Mutex::new(ReadBudget::default()),
-            context: None,
-        }
-    }
-
-    fn new_bounded(entries: &[CollectedAsset], context: Arc<AssetProcessingContext>) -> Self {
-        // Only this attempt's entries. Everything the ledger has already read is looked up ON
-        // DEMAND through the context — copying the whole snapshot map in here made each per-sheet
-        // retry pay for every read before it, which is quadratic in a set that degrades.
-        let preloaded = entries
-            .iter()
-            .cloned()
-            .map(|asset| (asset.path.clone(), asset))
-            .collect::<BTreeMap<_, _>>();
-        Self {
-            inner: FileProvider::new(),
-            retained_sources: RetainedSources::default(),
-            preloaded,
-            synthetic: None,
-            read_paths: Mutex::new(HashSet::new()),
-            read_time_fingerprints: Mutex::new(Vec::new()),
-            failed_paths: Mutex::new(HashSet::new()),
-            budget: Mutex::new(ReadBudget::default()),
-            context: Some(context),
-        }
-    }
-
-    fn with_synthetic(entries: &[CollectedAsset], path: PathBuf, content: String) -> Self {
-        Self {
-            inner: FileProvider::new(),
-            retained_sources: RetainedSources::default(),
-            preloaded: entries
-                .iter()
-                .cloned()
-                .map(|asset| (asset.path.clone(), asset))
-                .collect(),
-            synthetic: Some((path, content)),
-            read_paths: Mutex::new(HashSet::new()),
-            read_time_fingerprints: Mutex::new(Vec::new()),
-            failed_paths: Mutex::new(HashSet::new()),
-            budget: Mutex::new(ReadBudget::default()),
-            context: None,
-        }
-    }
-
-    fn with_synthetic_bounded(
+    /// The ONE way to build a provider.
+    ///
+    /// There were four: bounded and unbounded, each with and without a synthetic entry. The
+    /// unbounded pair existed only so processor tests could skip the ledger — which meant the
+    /// tests exercised a different code path from production, and the safety context was optional
+    /// exactly where it was load-bearing. Tests now pass a context with test limits instead.
+    ///
+    /// `preloaded` holds only THIS attempt's entries. Everything an earlier attempt read is looked
+    /// up on demand through the context, because copying the whole snapshot map per attempt made
+    /// each per-sheet retry pay for every read before it.
+    fn new(
         entries: &[CollectedAsset],
-        path: PathBuf,
-        content: String,
+        synthetic: Option<(PathBuf, String)>,
         context: Arc<AssetProcessingContext>,
     ) -> Self {
-        // Only this attempt's entries. Everything the ledger has already read is looked up ON
-        // DEMAND through the context — copying the whole snapshot map in here made each per-sheet
-        // retry pay for every read before it, which is quadratic in a set that degrades.
-        let preloaded = entries
-            .iter()
-            .cloned()
-            .map(|asset| (asset.path.clone(), asset))
-            .collect::<BTreeMap<_, _>>();
         Self {
             inner: FileProvider::new(),
             retained_sources: RetainedSources::default(),
-            preloaded,
-            synthetic: Some((path, content)),
+            preloaded: entries
+                .iter()
+                .cloned()
+                .map(|asset| (asset.path.clone(), asset))
+                .collect(),
+            synthetic,
             read_paths: Mutex::new(HashSet::new()),
             read_time_fingerprints: Mutex::new(Vec::new()),
             failed_paths: Mutex::new(HashSet::new()),
             budget: Mutex::new(ReadBudget::default()),
-            context: Some(context),
+            context,
         }
     }
 
@@ -334,15 +280,11 @@ impl TrackingProvider {
             .lock()
             .expect("CSS failed-path set should not be poisoned")
             .insert(path.clone());
-        if let Some(context) = &self.context {
-            context.record_failed_path(&path);
-        }
+        self.context.record_failed_path(&path);
     }
 
     fn check_deadline(&self) -> Result<(), std::io::Error> {
-        self.context
-            .as_ref()
-            .map_or(Ok(()), |context| context.check_deadline())
+        self.context.check_deadline()
     }
 
     fn read_referenced_asset(
@@ -350,16 +292,11 @@ impl TrackingProvider {
         path: &Path,
         kind: AssetKind,
     ) -> std::io::Result<CollectedAsset> {
-        match &self.context {
-            Some(context) => context.snapshot(path, kind),
-            None => read_collected_asset(path, kind),
-        }
+        self.context.snapshot(path, kind)
     }
 
     fn should_continue_dependency_reads(&self) -> bool {
-        self.context
-            .as_ref()
-            .is_none_or(|context| context.check_deadline().is_ok())
+        self.context.check_deadline().is_ok()
     }
 }
 
@@ -385,16 +322,14 @@ impl SourceProvider for TrackingProvider {
         // This attempt's own entry first, then anything an earlier attempt already read. Reusing the
         // ledger's snapshot is what keeps a retry measuring the SAME bytes the union measured, and
         // what stops it from charging the same file twice.
-        let snapshot = self.preloaded.get(&key).cloned().or_else(|| {
-            self.context
-                .as_ref()
-                .and_then(|context| context.snapshot_for(&key))
-        });
+        let snapshot = self
+            .preloaded
+            .get(&key)
+            .cloned()
+            .or_else(|| self.context.snapshot_for(&key));
         let source = match snapshot {
             Some(asset) => {
-                if let Some(context) = &self.context {
-                    context.charge_css_snapshot(&asset)?;
-                }
+                self.context.charge_css_snapshot(&asset)?;
                 self.reserve(asset.bytes().len())?;
                 self.record_read(key.clone(), Some(asset.fingerprint.clone()));
                 let bytes = self.retained_sources.retain_snapshot(asset.bytes_arc());
@@ -416,11 +351,7 @@ impl SourceProvider for TrackingProvider {
                         return Err(error);
                     }
                 };
-                let shared_reservation = self
-                    .context
-                    .as_ref()
-                    .map(|context| context.begin_css_read(&key, &metadata))
-                    .transpose()?;
+                let shared_reservation = self.context.begin_css_read(&key, &metadata)?;
                 let metadata_bytes = usize::try_from(metadata.len()).map_err(|_| {
                     std::io::Error::other(format!(
                         "stylesheet {} is too large for this platform",
@@ -436,18 +367,10 @@ impl SourceProvider for TrackingProvider {
                     }
                 };
                 self.reconcile(reservation, bytes.len())?;
-                let (len, modified_millis) = read_time_len_mtime_of(&metadata);
-                let fingerprint = match (&self.context, shared_reservation) {
-                    (Some(context), Some(reservation)) => {
-                        context.finish_css_read(reservation, &bytes)?.fingerprint
-                    }
-                    _ => file_fingerprint_from_read_time(
-                        &key,
-                        len,
-                        modified_millis,
-                        content_hash(&bytes),
-                    ),
-                };
+                let fingerprint = self
+                    .context
+                    .finish_css_read(shared_reservation, &bytes)?
+                    .fingerprint;
                 self.record_read(key.clone(), Some(fingerprint));
                 let source = String::from_utf8(bytes).map_err(|error| {
                     std::io::Error::new(
@@ -588,24 +511,55 @@ impl CssProcessingError {
 /// stylesheet, minify with deterministic (target-free) output, and print. Returns the bytes and the
 /// set of files read. Any failure is an `Err`; the caller falls back to raw-byte disclosure so the
 /// result never drops below today's behavior.
+///
+/// Test-only, and it builds a REAL ledger rather than skipping one. There used to be an unbounded
+/// path here so processor tests could avoid constructing a context, which meant the tests measured
+/// through code production never runs — the one place where "it passed in tests" is worth least.
+#[cfg(test)]
 pub fn bundle_css(entry: &Path) -> Result<CssBundle, String> {
     let asset = read_collected_asset(entry, AssetKind::Css)
         .map_err(|error| format!("failed to read stylesheet {}: {error}", entry.display()))?;
-    bundle_collected_css(&asset).map_err(|error| error.message)
+    let context = test_context(std::slice::from_ref(&asset));
+    bundle_collected_css(&asset, context).map_err(|error| error.message)
 }
 
-fn bundle_collected_css(entry: &CollectedAsset) -> Result<CssBundle, CssProcessingError> {
-    bundle_collected_css_with_context(entry, None)
+/// A production-shaped ledger for a test that only wants to bundle something.
+///
+/// Production limits deliberately: a test that quietly ran under looser bounds than the daemon
+/// would be measuring a different system. The per-attempt stylesheet-tree bound lives on the
+/// provider and still applies, which is what the budget tests exercise.
+#[cfg(test)]
+fn process_assets_for_test(assets: &[CollectedAsset]) -> ProcessedAssets {
+    process_assets(assets, test_context(assets))
+        .expect("a generous test ledger cannot hit a shared build limit")
 }
 
-fn bundle_collected_css_with_context(
+#[cfg(test)]
+fn test_context(entries: &[CollectedAsset]) -> Arc<AssetProcessingContext> {
+    test_context_with(entries, AssetBudgetLimits::production())
+}
+
+#[cfg(test)]
+fn test_context_with(
+    entries: &[CollectedAsset],
+    limits: AssetBudgetLimits,
+) -> Arc<AssetProcessingContext> {
+    Arc::new(AssetProcessingContext::new(
+        0,
+        &[],
+        entries,
+        crate::pipeline::asset_boundary::AssetDeadline::for_test(std::time::Duration::from_secs(
+            30,
+        )),
+        limits,
+    ))
+}
+
+fn bundle_collected_css(
     entry: &CollectedAsset,
-    context: Option<Arc<AssetProcessingContext>>,
+    context: Arc<AssetProcessingContext>,
 ) -> Result<CssBundle, CssProcessingError> {
-    let provider = match context {
-        Some(context) => TrackingProvider::new_bounded(std::slice::from_ref(entry), context),
-        None => TrackingProvider::new(std::slice::from_ref(entry)),
-    };
+    let provider = TrackingProvider::new(std::slice::from_ref(entry), None, context);
     let result = bundle_with(&provider, &entry.path);
     let inputs = provider.into_read_inputs();
     match result {
@@ -623,6 +577,7 @@ fn bundle_collected_css_with_context(
 /// oracle emits it. A single entry bundles directly; several are combined behind a synthetic entry
 /// that `@import`s each, so Lightning CSS inlines and dedupes them into one sheet rather than us
 /// summing overlapping copies.
+#[cfg(test)]
 pub fn bundle_css_set(entries: &[PathBuf]) -> Result<CssBundle, String> {
     let entries = entries
         .iter()
@@ -631,16 +586,13 @@ pub fn bundle_css_set(entries: &[PathBuf]) -> Result<CssBundle, String> {
                 .map_err(|error| format!("failed to read stylesheet {}: {error}", entry.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    bundle_collected_css_set(&entries).map_err(|error| error.message)
+    let context = test_context(&entries);
+    bundle_collected_css_set(&entries, context).map_err(|error| error.message)
 }
 
-fn bundle_collected_css_set(entries: &[CollectedAsset]) -> Result<CssBundle, CssProcessingError> {
-    bundle_collected_css_set_with_context(entries, None)
-}
-
-fn bundle_collected_css_set_with_context(
+fn bundle_collected_css_set(
     entries: &[CollectedAsset],
-    context: Option<Arc<AssetProcessingContext>>,
+    context: Arc<AssetProcessingContext>,
 ) -> Result<CssBundle, CssProcessingError> {
     match entries {
         [] => Err(CssProcessingError {
@@ -648,19 +600,14 @@ fn bundle_collected_css_set_with_context(
             inputs: CssReadInputs::default(),
             non_durable_stages: BTreeSet::new(),
         }),
-        [single] => bundle_collected_css_with_context(single, context),
+        [single] => bundle_collected_css(single, context),
         many => {
             let paths = many
                 .iter()
                 .map(|asset| asset.path.clone())
                 .collect::<Vec<_>>();
             let (path, content) = synthetic_entry(&paths);
-            let provider = match context {
-                Some(context) => {
-                    TrackingProvider::with_synthetic_bounded(many, path.clone(), content, context)
-                }
-                None => TrackingProvider::with_synthetic(many, path.clone(), content),
-            };
+            let provider = TrackingProvider::new(many, Some((path.clone(), content)), context);
             let result = bundle_with(&provider, &path);
             let inputs = provider.into_read_inputs();
             match result {
@@ -1095,7 +1042,7 @@ const ASSET_PROCESSING_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A whole post-build asset stage failed before it could produce one coherent measurement.
 #[derive(Debug, Clone)]
-pub(crate) struct AssetProcessingFailure {
+pub struct AssetProcessingFailure {
     pub(crate) stage: &'static str,
     pub(crate) message: String,
     pub(crate) read_paths: Vec<PathBuf>,
@@ -1129,7 +1076,10 @@ fn boundary_failure(error: AssetBoundaryError) -> AssetProcessingFailure {
 }
 
 /// Production entry: asset work has its own two-wide admission gate and one absolute deadline.
-pub(crate) fn process_assets_bounded(
+///
+/// Public because the freshness integration test measures through it. There used to be an unbounded
+/// entry point for that, which meant the test measured code production never runs.
+pub fn process_assets_bounded(
     assets: Vec<CollectedAsset>,
     graph_source_bytes: usize,
     graph_loaded_paths: Vec<PathBuf>,
@@ -1144,26 +1094,23 @@ pub(crate) fn process_assets_bounded(
             &assets,
             deadline,
         ));
-        process_assets_with_context(&assets, Some(context)).map_err(AssetProcessingFailure::from)
+        process_assets(&assets, context).map_err(AssetProcessingFailure::from)
     })
     .map_err(boundary_failure)?
 }
 
 /// Process every reachable asset the build collected, the way each really ships.
 ///
-/// Never fails: an asset it cannot process falls back to the raw-byte disclosure that was the whole
-/// behaviour before B2, so the result is a strict improvement or a tie, never a regression.
-pub fn process_assets(assets: &[CollectedAsset]) -> ProcessedAssets {
-    process_assets_with_context(assets, None)
-        .expect("unbounded standalone asset processing cannot hit a shared build limit")
-}
-
-fn process_assets_with_context(
+/// Never fails on an asset it cannot process: that falls back to the raw-byte disclosure that was
+/// the whole behaviour before B2, so the result is a strict improvement or a tie. It DOES fail when
+/// the shared build ledger is exhausted, which is a fact about the build rather than about any one
+/// asset.
+fn process_assets(
     assets: &[CollectedAsset],
-    context: Option<Arc<AssetProcessingContext>>,
+    context: Arc<AssetProcessingContext>,
 ) -> Result<ProcessedAssets, AssetBudgetFailure> {
     let mut processed = ProcessedAssets::default();
-    if let Some(failure) = context.as_ref().and_then(|context| context.failure()) {
+    if let Some(failure) = context.failure() {
         return Err(failure);
     }
     if assets.is_empty() {
@@ -1197,19 +1144,17 @@ fn process_assets_with_context(
         .extend(all_assets.iter().map(|asset| asset.fingerprint.clone()));
 
     for kind in [AssetKind::Wasm, AssetKind::Font] {
-        process_binary_kind(&all_assets, kind, &mut processed, context.as_deref())?;
+        process_binary_kind(&all_assets, kind, &mut processed, &context)?;
     }
 
     // The shared ledger also observes metadata reservations that fail before a provider read and
     // exact snapshots served across retry providers. Merge that whole history on success so a
     // later successful retry cannot erase an earlier conflicting/failed observation from cache
     // freshness merely because both used the same path.
-    if let Some(context) = &context {
-        processed.read_paths.extend(context.read_paths());
-        processed
-            .read_time_fingerprints
-            .extend(context.freshness_fingerprints());
-    }
+    processed.read_paths.extend(context.read_paths());
+    processed
+        .read_time_fingerprints
+        .extend(context.freshness_fingerprints());
 
     processed
         .contributions
@@ -1217,7 +1162,7 @@ fn process_assets_with_context(
     processed.read_paths.sort();
     processed.read_paths.dedup();
     sort_and_dedup_fingerprints(&mut processed.read_time_fingerprints);
-    if let Some(failure) = context.as_ref().and_then(|context| context.failure()) {
+    if let Some(failure) = context.failure() {
         return Err(failure);
     }
     Ok(processed)
@@ -1248,7 +1193,7 @@ fn may_retry_stylesheets_separately(error: &CssProcessingError) -> bool {
 fn process_stylesheets(
     assets: &[CollectedAsset],
     processed: &mut ProcessedAssets,
-    context: Option<Arc<AssetProcessingContext>>,
+    context: Arc<AssetProcessingContext>,
 ) -> Result<Vec<CollectedAsset>, AssetBudgetFailure> {
     let entries: Vec<CollectedAsset> = assets
         .iter()
@@ -1277,8 +1222,8 @@ fn process_stylesheets(
     // the common outcome here, since the union's usual reason to fail is the whole set breaching a
     // budget that each sheet is well inside. That silence made this path report an over-count at
     // High confidence and cache it.
-    let bundled = bundle_collected_css_set_with_context(&entries, context.clone())
-        .and_then(|bundle| compress_bundle(bundle, context.as_deref()))
+    let bundled = bundle_collected_css_set(&entries, context.clone())
+        .and_then(|bundle| compress_bundle(bundle, &context))
         .map(|counted| StylesheetOutcome {
             counted: vec![counted],
             failures: Vec::new(),
@@ -1290,11 +1235,7 @@ fn process_stylesheets(
         .or_else(|union_error| {
             // An overall resource/deadline failure is final. Retrying each sheet would reset only
             // the local tree counter and repeat work after the build-wide ledger was exhausted.
-            if context
-                .as_ref()
-                .and_then(|context| context.failure())
-                .is_some()
-            {
+            if context.failure().is_some() {
                 return Err(union_error);
             }
             // Compression says nothing about whether the CSS union is structurally invalid.
@@ -1317,15 +1258,11 @@ fn process_stylesheets(
             let mut uncounted = Vec::new();
 
             for entry in &entries {
-                if context
-                    .as_ref()
-                    .and_then(|context| context.failure())
-                    .is_some()
-                {
+                if context.failure().is_some() {
                     break;
                 }
-                match bundle_collected_css_with_context(entry, context.clone())
-                    .and_then(|bundle| compress_bundle(bundle, context.as_deref()))
+                match bundle_collected_css(entry, context.clone())
+                    .and_then(|bundle| compress_bundle(bundle, &context))
                 {
                     Ok(bundled) => counted.push(bundled),
                     Err(error) => {
@@ -1361,7 +1298,7 @@ fn process_stylesheets(
             })
         });
 
-    if let Some(failure) = context.as_ref().and_then(|context| context.failure()) {
+    if let Some(failure) = context.failure() {
         return Err(failure);
     }
 
@@ -1470,7 +1407,7 @@ fn process_stylesheets(
 /// because it ships as its own file (ADR-0005).
 fn compress_bundle(
     bundle: CssBundle,
-    context: Option<&AssetProcessingContext>,
+    context: &AssetProcessingContext,
 ) -> Result<(CssBundle, CompressionSizes), CssProcessingError> {
     compress_bundle_with(bundle, context, &compress_asset_bytes)
 }
@@ -1481,21 +1418,17 @@ fn compress_asset_bytes(bytes: &[u8]) -> Result<CompressionSizes, String> {
 
 fn compress_bundle_with(
     bundle: CssBundle,
-    context: Option<&AssetProcessingContext>,
+    context: &AssetProcessingContext,
     compress: &dyn Fn(&[u8]) -> Result<CompressionSizes, String>,
 ) -> Result<(CssBundle, CompressionSizes), CssProcessingError> {
-    if let Some(context) = context {
-        context.check_deadline().map_err(|error| {
-            CssProcessingError::from_transform(error.to_string(), CssReadInputs::default())
-        })?;
-    }
+    context.check_deadline().map_err(|error| {
+        CssProcessingError::from_transform(error.to_string(), CssReadInputs::default())
+    })?;
     match compress(&bundle.minified_bytes) {
         Ok(compressed) => {
-            if let Some(context) = context {
-                context.check_deadline().map_err(|error| {
-                    CssProcessingError::from_transform(error.to_string(), CssReadInputs::default())
-                })?;
-            }
+            context.check_deadline().map_err(|error| {
+                CssProcessingError::from_transform(error.to_string(), CssReadInputs::default())
+            })?;
             Ok((bundle, compressed))
         }
         Err(error) => {
@@ -1524,7 +1457,7 @@ fn process_binary_kind(
     assets: &[CollectedAsset],
     kind: AssetKind,
     processed: &mut ProcessedAssets,
-    context: Option<&AssetProcessingContext>,
+    context: &AssetProcessingContext,
 ) -> Result<(), AssetBudgetFailure> {
     process_binary_kind_with(assets, kind, processed, context, &compress_asset_bytes)
 }
@@ -1533,16 +1466,14 @@ fn process_binary_kind_with(
     assets: &[CollectedAsset],
     kind: AssetKind,
     processed: &mut ProcessedAssets,
-    context: Option<&AssetProcessingContext>,
+    context: &AssetProcessingContext,
     compress: &dyn Fn(&[u8]) -> Result<CompressionSizes, String>,
 ) -> Result<(), AssetBudgetFailure> {
     let mut sizes = MeasuredSizes::ZERO;
     let mut counted = false;
 
     for asset in assets.iter().filter(|asset| asset.kind == kind) {
-        if let Some(context) = context
-            && context.check_deadline().is_err()
-        {
+        if context.check_deadline().is_err() {
             return Err(context
                 .failure()
                 .expect("an expired asset deadline must retain a typed failure"));
@@ -1572,9 +1503,7 @@ fn process_binary_kind_with(
                 });
             }
         }
-        if let Some(context) = context
-            && context.check_deadline().is_err()
-        {
+        if context.check_deadline().is_err() {
             return Err(context
                 .failure()
                 .expect("an expired asset deadline must retain a typed failure"));
@@ -1711,8 +1640,9 @@ mod tests {
         fixture.write_bytes("child.css", &[0xff, 0xfe, 0xfd]);
         let top_level = fixture.write_bytes("top-level.css", &[0xff, 0xfe, 0xfd]);
 
-        let imported_failure = process_assets(&[css_asset(&fixture.path("importing.css"))]);
-        let top_level_failure = process_assets(&[css_asset(&top_level)]);
+        let imported_failure =
+            process_assets_for_test(&[css_asset(&fixture.path("importing.css"))]);
+        let top_level_failure = process_assets_for_test(&[css_asset(&top_level)]);
 
         for (label, processed) in [
             ("imported child", imported_failure),
@@ -2039,7 +1969,11 @@ mod tests {
         ];
         let expected_bad = assets[1].path.clone();
 
-        let processed = process_assets(&assets);
+        let processed = process_assets(
+            &assets,
+            test_context_with(&assets, AssetBudgetLimits::unbounded_css_work()),
+        )
+        .expect("the per-attempt bound is what this test exercises");
 
         let css = processed
             .contributions
@@ -2090,7 +2024,7 @@ mod tests {
             .map(|asset| asset.path.clone())
             .collect::<Vec<_>>();
 
-        let processed = process_assets(&assets);
+        let processed = process_assets_for_test(&assets);
 
         assert!(
             processed.contributions.is_empty(),
@@ -2143,7 +2077,11 @@ mod tests {
         // Guard the premise: if this ever stops being the shape under test, the assertions below
         // would pass for the wrong reason.
         assert!(
-            bundle_css_set(&entries).is_err(),
+            bundle_collected_css_set(
+                &assets,
+                test_context_with(&assets, AssetBudgetLimits::unbounded_css_work())
+            )
+            .is_err(),
             "the premise is a set whose union breaches the budget",
         );
         assert!(
@@ -2151,7 +2089,11 @@ mod tests {
             "the premise is that each sheet on its own is well inside the budget",
         );
 
-        let processed = process_assets(&assets);
+        let processed = process_assets(
+            &assets,
+            test_context_with(&assets, AssetBudgetLimits::unbounded_css_work()),
+        )
+        .expect("the per-attempt bound is what this test exercises");
 
         assert!(
             processed
@@ -2195,7 +2137,7 @@ mod tests {
     fn a_failed_css_read_remains_unverifiable_after_a_later_success() {
         let fixture = Fixture::new("failed-then-readable", &[]);
         let child = fixture.path("created.css");
-        let provider = TrackingProvider::new(&[]);
+        let provider = TrackingProvider::new(&[], None, test_context(&[]));
 
         assert!(provider.read(&child).is_err(), "the first read is missing");
         fixture.write("created.css", ".created { color: red }");
@@ -2238,8 +2180,10 @@ mod tests {
             dependency_omissions: Vec::new(),
             dependency_external: Vec::new(),
         };
-        let failure = compress_bundle_with(bundle, None, &|_| Err("injected failure".to_owned()))
-            .expect_err("the injected compressor must fail");
+        let failure = compress_bundle_with(bundle, &test_context(&[]), &|_| {
+            Err("injected failure".to_owned())
+        })
+        .expect_err("the injected compressor must fail");
 
         assert!(
             failure
@@ -2260,9 +2204,13 @@ mod tests {
         let asset = read_collected_asset(&path, AssetKind::Font).expect("font snapshot");
         let mut processed = ProcessedAssets::default();
 
-        process_binary_kind_with(&[asset], AssetKind::Font, &mut processed, None, &|_| {
-            Err("injected failure".to_owned())
-        })
+        process_binary_kind_with(
+            &[asset],
+            AssetKind::Font,
+            &mut processed,
+            &test_context(&[]),
+            &|_| Err("injected failure".to_owned()),
+        )
         .expect("a per-asset compressor failure falls back instead of aborting the stage");
 
         assert_eq!(processed.uncounted.len(), 1);
@@ -2324,7 +2272,7 @@ mod tests {
             ],
         );
 
-        let processed = process_assets(&[css_asset(&fixture.path("index.css"))]);
+        let processed = process_assets_for_test(&[css_asset(&fixture.path("index.css"))]);
 
         assert_eq!(processed.contributions.len(), 1, "{processed:?}");
         let contribution = &processed.contributions[0];
@@ -2359,7 +2307,7 @@ mod tests {
         );
         let asset = css_asset(&fixture.path("index.css"));
 
-        let processed = process_assets(std::slice::from_ref(&asset));
+        let processed = process_assets_for_test(std::slice::from_ref(&asset));
         let expected_path = asset.path.clone();
         let expected_bytes = asset.raw_bytes();
 
@@ -2389,7 +2337,7 @@ mod tests {
             read_collected_asset(&font, AssetKind::Font).expect("font snapshot"),
         ];
 
-        let processed = process_assets(&assets);
+        let processed = process_assets_for_test(&assets);
 
         assert_eq!(processed.contributions.len(), 2, "{processed:?}");
         let wasm_contribution = processed

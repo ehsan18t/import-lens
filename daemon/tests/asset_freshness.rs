@@ -16,7 +16,7 @@ use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime
 use import_lens_daemon::pipeline::analyze::{
     AnalysisContext, FingerprintSource, analyze_resolved_import_with_dependencies,
 };
-use import_lens_daemon::pipeline::assets::process_assets;
+use import_lens_daemon::pipeline::assets::process_assets_bounded;
 use import_lens_daemon::pipeline::resolver::resolve_package_entry;
 
 mod common;
@@ -87,7 +87,12 @@ fn direct_binary_assets_use_the_snapshot_captured_by_the_engine() {
     // the snapshot that produced the artifact, not of when post-processing happens to run.
     write_file(&package_root, "probe.woff2", vec![0x53; FONT_A * 10]);
     write_file(&package_root, "probe.wasm", vec![0x64; WASM_A * 10]);
-    let processed = process_assets(&artifact.assets);
+    let processed = process_assets_bounded(
+        artifact.assets.clone(),
+        artifact.graph_source_bytes,
+        artifact.loaded_paths.clone(),
+    )
+    .expect("the production asset path must admit this fixture");
 
     let font = processed
         .contributions
@@ -128,14 +133,24 @@ fn a_top_level_stylesheet_uses_the_snapshot_captured_by_the_engine() {
     );
 
     let artifact = bundle(package_root.clone());
-    let before_edit = process_assets(&artifact.assets);
+    let before_edit = process_assets_bounded(
+        artifact.assets.clone(),
+        artifact.graph_source_bytes,
+        artifact.loaded_paths.clone(),
+    )
+    .expect("the production asset path must admit this fixture");
 
     write_file(
         &package_root,
         "styles.css",
         ".snapshot { color: rebeccapurple; padding: 123456px; margin: 654321px; }\n",
     );
-    let after_edit = process_assets(&artifact.assets);
+    let after_edit = process_assets_bounded(
+        artifact.assets.clone(),
+        artifact.graph_source_bytes,
+        artifact.loaded_paths.clone(),
+    )
+    .expect("the production asset path must admit this fixture");
 
     assert_eq!(
         before_edit.contributions, after_edit.contributions,

@@ -19,6 +19,8 @@ pub use crate::ipc::protocol::ImportRuntime;
 pub use adapter::RolldownEngine;
 pub(crate) use asset_classifier::{AssetClass, classify_asset, classify_asset_class};
 pub use asset_input::CollectedAsset;
+// Test-only since the bounded pipeline took over every production read.
+#[cfg(test)]
 pub(crate) use asset_input::read_collected_asset;
 
 #[derive(Debug, Clone)]
