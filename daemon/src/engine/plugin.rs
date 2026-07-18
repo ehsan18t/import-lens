@@ -326,7 +326,12 @@ impl BuildState {
     }
 }
 
-fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Option<PathBuf> {
+/// The filesystem-looking portion of a specifier or module id, with any loader suffix removed.
+///
+/// One mechanism for both plugin hooks. `resolve_id` used its own copy of this and `load` had none,
+/// so the two halves disagreed about what a module id names: `./font.woff2?url` was recognised on
+/// the way in and unclassifiable on the way out.
+fn path_portion(specifier: &str) -> &str {
     let query = specifier.find('?');
     // A leading `#` is a package-import specifier, not a URL fragment. A later `#` is still a
     // loader-style fragment and is removed before extension classification.
@@ -340,7 +345,11 @@ fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Opt
         .chain(fragment)
         .min()
         .unwrap_or(specifier.len());
-    let specifier_path = Path::new(&specifier[..path_end]);
+    &specifier[..path_end]
+}
+
+fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Option<PathBuf> {
+    let specifier_path = Path::new(path_portion(specifier));
     classify_asset_class(specifier_path)?;
     if specifier_path.is_absolute() {
         return Some(specifier_path.to_path_buf());
@@ -795,7 +804,26 @@ impl Plugin for ImportLensPlugin {
 
         // Rolldown runtime helpers and other synthetic ids are not files. Real module
         // ids are absolute paths; anything else is left to Rolldown.
-        let path = Path::new(args.id);
+        // A module id can carry a loader suffix that is not part of the file name —
+        // `./font.woff2?url`, `./styles.css?inline`, `./data.json?raw`. oxc_resolver re-appends the
+        // query it parsed and Rolldown builds the id from that, so the suffix arrives here.
+        // Classifying the raw id reads the extension as `woff2?url`, which matches nothing: the
+        // asset is never stubbed, Rolldown reads the id verbatim, and the whole build dies on a path
+        // the filesystem rejects — `?` is an illegal Windows filename character. That failure is
+        // durable, so the package stayed unmeasurable until its bytes changed.
+        // Strip the suffix ONLY when doing so reveals an asset. Rolldown gives its own modules
+        // suffixed ids too (proxy and helper modules), and a bare strip claims those: the file
+        // behind the stripped path exists, so this hook would load it and hand Rolldown source for a
+        // module it owns. Requiring the stripped path to classify keeps the rescue to the case that
+        // was broken, and matches what the resolve half already does with the same helper. A file
+        // whose real name contains `#` is unaffected, because the stripped form will not classify.
+        let literal = Path::new(args.id);
+        let stripped = Path::new(path_portion(args.id));
+        let path = if stripped != literal && classify_asset_class(stripped).is_some() {
+            stripped
+        } else {
+            literal
+        };
         if !path.is_absolute() {
             return Ok(None);
         }

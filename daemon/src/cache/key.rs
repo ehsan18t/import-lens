@@ -158,9 +158,16 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// stale the moment the file appears. References abandoned when the walk stops early are named
 /// rather than dropped. Numbers, floors and durability all move, so every `+15` entry must be
 /// rejected on read.
+/// `rolldown-1.2.x+17` (2026-07-19): a module id carrying a loader suffix — `./font.woff2?url`,
+/// `./styles.css?inline`, `./data.json?raw` — is stripped before classification, so the asset is
+/// stubbed instead of being handed to Rolldown as a literal path the filesystem rejects. The
+/// resolve hook already stripped the suffix; the load hook did not, so the two halves disagreed
+/// about what a module id names and the whole build died on a `?` (an illegal Windows filename
+/// character). That failure lands on a durable stage, so a `+16` entry for such a package is a
+/// cached "unavailable" for a package that now measures, and every one must be rejected on read.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.2.x+16"
+        "rolldown-1.2.x+17"
     };
 }
 

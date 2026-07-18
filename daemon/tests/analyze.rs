@@ -3295,6 +3295,51 @@ fn analyze_a_font_reference_resolves_from_the_imported_stylesheet() {
     assert_eq!(result.confidence, ConfidenceLevel::High, "{result:?}");
 }
 
+/// A loader suffix on an asset import is vocabulary oxc_resolver re-appends to the module id, so it
+/// arrives at the load hook. Classifying the raw id read the extension as `woff2?url`, which matches
+/// nothing: the asset was never stubbed, Rolldown read a path the filesystem rejects, and the whole
+/// package went unmeasurable — durably, so it stayed that way until its bytes changed.
+#[test]
+fn analyze_measures_an_asset_imported_with_a_loader_suffix() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "suffixed-asset-lib",
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+        "import fontUrl from './probe.woff2?url';\nexport const widget = () => fontUrl;\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("suffixed-asset-lib")
+            .join("probe.woff2"),
+        vec![0x3c; 4 * 1024],
+    )
+    .expect("font fixture should be written");
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "suffixed-asset-lib",
+            "suffixed-asset-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let font = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Font)
+        .expect("a suffixed asset import must still be classified and counted");
+    assert_eq!(font.raw_bytes, 4 * 1024, "{result:?}");
+}
+
 #[test]
 fn analyze_two_stylesheets_count_their_shared_font_once() {
     let workspace = temp_workspace();
