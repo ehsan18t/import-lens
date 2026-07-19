@@ -43,6 +43,12 @@ pub struct ProjectCacheRegistry {
     // Owns the global disk-byte budget and cross-shard LRU eviction. The budget
     // derives from `max_size_mb` in production (`new`) and is injected directly
     // by tests (`new_with_budget_bytes`); 0 disables it.
+    //
+    // "Global" is scoped to THIS registry's `base_path` — every shard below it,
+    // which for a multi-root window is several projects. It is NOT machine-wide:
+    // FR-026 puts one cache base per workspace, so a user with N windows open has
+    // N budgets of this size. Any surface that describes `cacheMaxSizeMB` has to
+    // say so; a single machine-wide total is not a promise this shape can keep.
     coordinator: BudgetCoordinator,
     // Last time the automatic orphan-shard sweep ran (RB-17). Throttles the sweep
     // to `ORPHAN_SWEEP_INTERVAL` so the rare-need scan doesn't stat every shard

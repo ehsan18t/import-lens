@@ -166,7 +166,7 @@
           "type": "number",
           "default": 512,
           "minimum": 64,
-          "description": "Global disk-byte budget in megabytes for Import Lens project caches. When the total across all projects exceeds this, the least-recently-used cache entries are evicted (entry-granular, across projects) down to ~90% of the budget."
+          "description": "Disk-byte budget in megabytes for one workspace's project caches. Import Lens keeps a separate cache base per workspace, so this budget covers every project shard within a single window — a multi-root window shares one budget — and every other window is budgeted separately. It is not a machine-wide total. When a base exceeds the budget, its least-recently-used cache entries are evicted (entry-granular, across that base's shards) down to ~90% of it."
         },
         "importLens.registryCacheMaxSizeMB": {
           "type": "number",
