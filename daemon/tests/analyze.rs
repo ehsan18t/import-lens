@@ -3340,6 +3340,59 @@ fn analyze_measures_an_asset_imported_with_a_loader_suffix() {
     assert_eq!(font.raw_bytes, 4 * 1024, "{result:?}");
 }
 
+/// The way most UI kits actually ship CSS: the package's JavaScript does not import its stylesheet
+/// at all, and the consumer is told to write `import "pkg/dist/styles.css"` themselves. That is a
+/// bare, side-effect-only import with no bindings, so it takes a different route through detection,
+/// selection and resolution than `import { Button } from "pkg"` — and nothing covered it.
+///
+/// It is the highest-traffic asset path in the product and it works by three independent things
+/// lining up: no extension filter rejects the specifier, a binding-less import becomes a namespace
+/// selection instead of short-circuiting to zero, and an explicit `.css` subpath resolves as a file.
+/// Any one of them could be changed innocently.
+#[test]
+fn analyze_counts_a_stylesheet_imported_bare_from_a_package() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "bare-css-lib",
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+        "export const widget = () => 'widget';\n",
+    );
+    write_package_file(
+        &workspace,
+        "bare-css-lib",
+        "dist/styles.css",
+        ".button { color: red; padding: 4px }\n.panel { display: grid }\n",
+    );
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "bare-css-lib/dist/styles.css",
+            "bare-css-lib",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let css = result
+        .asset_breakdown
+        .iter()
+        .find(|contribution| contribution.kind == AssetKind::Css)
+        .expect("a bare stylesheet import must be counted as CSS");
+    assert!(css.raw_bytes > 0 && css.minified_bytes > 0, "{result:?}");
+    // The whole number is the stylesheet: the package's JavaScript never enters this import.
+    assert!(
+        common::measured_sizes(&result).brotli_bytes > 0,
+        "{result:?}"
+    );
+}
+
 #[test]
 fn analyze_two_stylesheets_count_their_shared_font_once() {
     let workspace = temp_workspace();
