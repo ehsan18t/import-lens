@@ -539,10 +539,24 @@ pub(crate) fn analyze_with_rolldown_engine(
     // explanation, because the one mechanism that explains the gap could not see the bytes causing
     // it. These rows flow into `internal_contributions`, which the L2 envelope already carries for
     // exactly this reason, so a cached result shares identically to a freshly measured one.
-    contributions.extend(artifact.assets.iter().map(|asset| ModuleContribution {
-        path: asset.path.to_string_lossy().to_string(),
-        bytes: asset.raw_bytes(),
-    }));
+    // Merged by path, not appended. A stylesheet imported FROM JavaScript links as an empty module
+    // and the JS walk drops it, but one reached as the import's own ENTRY is different: the chunk
+    // attributes its wrapper bytes to that same path, so the path is already in the list. Appending
+    // beside it lists one file twice and makes the rows sum past what the file ships. The asset row
+    // wins because it is the shipped size; a wrapper's rendered length is not a fact about the file.
+    for asset in &artifact.assets {
+        let path = asset.path.to_string_lossy().to_string();
+        match contributions
+            .iter_mut()
+            .find(|contribution| contribution.path == path)
+        {
+            Some(existing) => existing.bytes = asset.raw_bytes(),
+            None => contributions.push(ModuleContribution {
+                path,
+                bytes: asset.raw_bytes(),
+            }),
+        }
+    }
 
     // §8.3: freshness comes from fingerprints captured by the same reads that supplied every
     // measured byte. The plugin owns JavaScript and directly imported asset snapshots; the asset

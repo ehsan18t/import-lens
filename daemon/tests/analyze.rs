@@ -3358,12 +3358,8 @@ fn analyze_counts_a_stylesheet_imported_bare_from_a_package() {
         r#"{"version":"1.0.0","module":"index.js"}"#,
         "export const widget = () => 'widget';\n",
     );
-    write_package_file(
-        &workspace,
-        "bare-css-lib",
-        "dist/styles.css",
-        ".button { color: red; padding: 4px }\n.panel { display: grid }\n",
-    );
+    const STYLESHEET: &str = ".button { color: red; padding: 4px }\n.panel { display: grid }\n";
+    write_package_file(&workspace, "bare-css-lib", "dist/styles.css", STYLESHEET);
 
     let result = analyze_import(
         &AnalysisContext {
@@ -3390,6 +3386,29 @@ fn analyze_counts_a_stylesheet_imported_bare_from_a_package() {
     assert!(
         common::measured_sizes(&result).brotli_bytes > 0,
         "{result:?}"
+    );
+
+    // One file, one row. A stylesheet reached as the import's own entry is attributed wrapper bytes
+    // by the JS walk AND carried as an asset, so appending the two listed it twice with different
+    // numbers — a breakdown summing past what the file ships, on the surface whose whole job is
+    // explaining the number beside it.
+    let breakdown = result
+        .module_breakdown
+        .as_ref()
+        .expect("a measured import carries a module breakdown");
+    let stylesheet_rows = breakdown
+        .iter()
+        .filter(|row| row.path.ends_with("styles.css"))
+        .collect::<Vec<_>>();
+    assert_eq!(stylesheet_rows.len(), 1, "{breakdown:?}");
+    // And the surviving row is the SHIPPED size, not the wrapper's rendered length: the stylesheet
+    // links as an empty module, so whatever the JS walk attributes to it is an artifact of the entry
+    // wrapper rather than a fact about the file.
+    assert_eq!(
+        stylesheet_rows[0].bytes,
+        STYLESHEET.len() as u64,
+        "the row must carry the stylesheet's own file bytes, not the wrapper's rendered length \
+         and not the bundled output: {breakdown:?}"
     );
 }
 
