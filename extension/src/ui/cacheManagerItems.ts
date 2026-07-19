@@ -145,10 +145,33 @@ export const cacheManagerActionItems = (
  * come from `CacheRemoveResponse`, the registry-only scope never claims shard
  * removals, and "everything" states everything it cleared — no overclaiming.
  */
+/**
+ * What an orphan purge did besides removing shards: entries scrubbed from caches that were kept,
+ * and stale registry metadata pruned. Rendered only when non-zero, so a run that genuinely did
+ * nothing still reads as nothing.
+ */
+const orphanScrubClause = (scrubbedEntries: number, registryEntriesRemoved: number): string => {
+  const parts: string[] = [];
+
+  if (scrubbedEntries > 0) {
+    parts.push(`${scrubbedEntries} stale entr${scrubbedEntries === 1 ? "y" : "ies"}`);
+  }
+
+  if (registryEntriesRemoved > 0) {
+    parts.push(
+      `${registryEntriesRemoved} registry entr${registryEntriesRemoved === 1 ? "y" : "ies"}`,
+    );
+  }
+
+  return parts.join(" and ");
+};
+
 export const cacheRemovalToast = (
   scope: CacheClearScope,
   removed: number,
   failed: number,
+  scrubbedEntries = 0,
+  registryEntriesRemoved = 0,
 ): string => {
   if (scope === "registry") {
     // Registry clear returns no shard-level results; report exactly what it did.
@@ -158,12 +181,23 @@ export const cacheRemovalToast = (
   const caches = (count: number): string => `${count} Import Lens cache${count === 1 ? "" : "s"}`;
 
   if (scope === "orphans") {
+    // The purge removes orphaned shards AND scrubs surviving ones. Reporting only the first half
+    // let a run that dropped hundreds of entries announce "nothing to reclaim".
+    const scrubbed = orphanScrubClause(scrubbedEntries, registryEntriesRemoved);
+
     if (failed > 0) {
       return `Reclaimed ${caches(removed)} for moved or deleted projects; ${failed} could not be removed.`;
     }
-    return removed > 0
-      ? `Reclaimed ${caches(removed)} for moved or deleted projects.`
-      : "No orphaned Import Lens caches to reclaim.";
+
+    if (removed > 0) {
+      return scrubbed
+        ? `Reclaimed ${caches(removed)} for moved or deleted projects, and scrubbed ${scrubbed} from the caches that remain.`
+        : `Reclaimed ${caches(removed)} for moved or deleted projects.`;
+    }
+
+    return scrubbed
+      ? `No orphaned Import Lens caches to reclaim; scrubbed ${scrubbed} from the caches that remain.`
+      : "No orphaned Import Lens caches to reclaim, and nothing stale to scrub.";
   }
 
   if (failed > 0) {

@@ -1639,6 +1639,8 @@ fn protocol_error_cache_remove_response(
         request_id: request.request_id,
         removed: Vec::new(),
         failed: Vec::new(),
+        scrubbed_entries: 0,
+        registry_entries_removed: 0,
         error: Some(message.clone()),
         diagnostics: protocol_diagnostics(message),
     }

@@ -543,6 +543,16 @@ export interface CacheRemoveResponse {
   request_id: number;
   removed: CacheOperationResult[];
   failed: CacheOperationResult[];
+  /**
+   * Stale entries scrubbed from caches that were KEPT, and stale registry metadata pruned.
+   *
+   * The orphan purge does three things and only ever reported one. A run that removed no shard
+   * reported "No orphaned Import Lens caches to reclaim" while having dropped entries from
+   * surviving shards — a zero shown for work that happened. Optional: an older daemon omits them,
+   * and `?? 0` is then the truth about what this build can know, not an invented count.
+   */
+  scrubbed_entries?: number;
+  registry_entries_removed?: number;
   error: string | null;
   diagnostics: ImportDiagnostic[];
 }

@@ -133,10 +133,36 @@ test("cacheRemovalToast reports accurate, non-overclaiming copy per scope (X-23/
     cacheRemovalToast("orphans", 2, 0),
     "Reclaimed 2 Import Lens caches for moved or deleted projects.",
   );
-  assert.equal(cacheRemovalToast("orphans", 0, 0), "No orphaned Import Lens caches to reclaim.");
+  assert.equal(
+    cacheRemovalToast("orphans", 0, 0),
+    "No orphaned Import Lens caches to reclaim, and nothing stale to scrub.",
+  );
   assert.equal(
     cacheRemovalToast("orphans", 1, 1),
     "Reclaimed 1 Import Lens cache for moved or deleted projects; 1 could not be removed.",
+  );
+});
+
+// The purge removes orphaned shards AND scrubs the shards it keeps AND prunes registry metadata.
+// Reporting only the first meant a run that dropped hundreds of entries announced "nothing to
+// reclaim" — a zero shown for work that happened, on the surface that asked for consent to do it.
+test("an orphan purge that removed no shard still reports what it scrubbed", () => {
+  assert.equal(
+    cacheRemovalToast("orphans", 0, 0, 142, 7),
+    "No orphaned Import Lens caches to reclaim; scrubbed 142 stale entries and 7 registry entries from the caches that remain.",
+  );
+  assert.equal(
+    cacheRemovalToast("orphans", 0, 0, 1, 0),
+    "No orphaned Import Lens caches to reclaim; scrubbed 1 stale entry from the caches that remain.",
+  );
+  assert.equal(
+    cacheRemovalToast("orphans", 2, 0, 30, 0),
+    "Reclaimed 2 Import Lens caches for moved or deleted projects, and scrubbed 30 stale entries from the caches that remain.",
+  );
+  // A genuinely empty run must still read as empty — the clause appears only when work happened.
+  assert.equal(
+    cacheRemovalToast("orphans", 0, 0, 0, 0),
+    "No orphaned Import Lens caches to reclaim, and nothing stale to scrub.",
   );
 });
 

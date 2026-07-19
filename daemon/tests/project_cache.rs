@@ -141,7 +141,7 @@ fn purge_orphans_removes_shards_for_deleted_project_roots() {
         .cache_for_root(&dead_root)
         .insert("vue@3.4.0::default".to_owned(), result("vue"));
 
-    let removed = registry.purge_orphans();
+    let (removed, _scrubbed) = registry.purge_orphans();
     let shards = registry.list_shards();
 
     fs::remove_dir_all(storage).expect("temp storage should be removed");
@@ -239,7 +239,7 @@ fn purge_orphans_does_not_remove_shard_whose_project_root_still_exists() {
         "fixture setup should have created the shard directory on disk"
     );
 
-    let removed = registry.purge_orphans();
+    let (removed, _scrubbed) = registry.purge_orphans();
 
     assert!(
         !removed

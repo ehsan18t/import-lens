@@ -2023,6 +2023,8 @@ impl ImportLensService {
                 request_id: request.request_id,
                 removed: Vec::new(),
                 failed: Vec::new(),
+                scrubbed_entries: 0,
+                registry_entries_removed: 0,
                 error: Some(format!("unsupported protocol version {}", request.version)),
                 diagnostics: vec![ImportDiagnostic::for_stage(
                     "protocol",
@@ -2030,6 +2032,11 @@ impl ImportLensService {
                 )],
             };
         }
+
+        // The orphan purge does three things; only the shard removals were ever reported. These
+        // carry the other two out so the UI can stop saying "nothing to reclaim" after work.
+        let mut scrubbed_entries = 0usize;
+        let mut registry_entries_removed = 0usize;
 
         let results = match request.scope {
             CacheRemoveScope::CurrentProject => match request.workspace_root.as_deref() {
@@ -2042,6 +2049,8 @@ impl ImportLensService {
                         request_id: request.request_id,
                         removed: Vec::new(),
                         failed: Vec::new(),
+                        scrubbed_entries: 0,
+                        registry_entries_removed: 0,
                         error: Some(
                             "workspace_root is required for current_project cache removal"
                                 .to_owned(),
@@ -2079,14 +2088,18 @@ impl ImportLensService {
                 // shards, plus a stale-registry-metadata prune. The maintenance tick
                 // runs the shard-only half of this automatically (throttled); this
                 // button is the on-demand, entry-inclusive pass.
-                let registry_removed = self.registry_hints.purge_expired_metadata();
-                if registry_removed > 0 {
+                registry_entries_removed = self.registry_hints.purge_expired_metadata();
+                if registry_entries_removed > 0 {
                     crate::logging::log_debug(
                         "registry",
-                        format!("orphan purge dropped {registry_removed} stale registry entries"),
+                        format!(
+                            "orphan purge dropped {registry_entries_removed} stale registry entries"
+                        ),
                     );
                 }
-                self.cache_registry.purge_orphans()
+                let (removed_shards, scrubbed) = self.cache_registry.purge_orphans();
+                scrubbed_entries = scrubbed;
+                removed_shards
             }
         };
         let (removed, failed): (Vec<_>, Vec<_>) =
@@ -2123,6 +2136,8 @@ impl ImportLensService {
             request_id: request.request_id,
             removed,
             failed,
+            scrubbed_entries,
+            registry_entries_removed,
             error: None,
             diagnostics: Vec::new(),
         }

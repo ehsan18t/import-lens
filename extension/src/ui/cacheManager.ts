@@ -195,9 +195,17 @@ const clearOrphanedCaches = async (
     return;
   }
 
+  // "Caches for projects that still exist are kept" was true of their SHARDS and false of their
+  // contents: the same pass scrubs stale entries out of those surviving caches and prunes expired
+  // registry metadata. A confirmation that names only the shard removal understates what the user
+  // is agreeing to.
   const confirmed = await vscode.window.showWarningMessage(
-    "Remove Import Lens caches for moved or deleted projects? Caches for projects that still exist are kept.",
-    { modal: true },
+    "Remove Import Lens caches for moved or deleted projects?",
+    {
+      modal: true,
+      detail:
+        "Caches for projects that still exist are kept, but stale entries inside them are scrubbed and expired npm registry metadata is pruned. Sizes are recomputed on demand, so nothing is lost permanently.",
+    },
     "Remove Orphaned",
   );
 
@@ -339,7 +347,13 @@ const reportRemoveResponse = async (
 
   const removed = response.removed.length;
   const failed = response.failed.length;
-  const message = cacheRemovalToast(scope, removed, failed);
+  const message = cacheRemovalToast(
+    scope,
+    removed,
+    failed,
+    response.scrubbed_entries ?? 0,
+    response.registry_entries_removed ?? 0,
+  );
 
   if (failed > 0) {
     logger.warn(message);

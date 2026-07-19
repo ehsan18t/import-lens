@@ -573,10 +573,12 @@ impl ProjectCacheRegistry {
     /// Removes shards whose project root is genuinely gone — drive-safe, so an
     /// unplugged/offline drive keeps its shard (X-3 / RB-7) — and drops
     /// stale/uninstalled entries from surviving shards. Stat-only (no project-tree
-    /// walk). Returns the removed-shard results (entry-level drops are not surfaced
-    /// per entry). The automatic maintenance-tick sweep is the shard-only
+    /// walk). Returns the removed-shard results plus a COUNT of the entries scrubbed from
+    /// surviving shards — not surfaced per entry, but no longer discarded: a purge that removes no
+    /// shard still does work, and reporting only the shard count let the UI say "nothing to
+    /// reclaim" after dropping entries. The automatic maintenance-tick sweep is the shard-only
     /// `sweep_orphaned_shards_if_due`; this manual pass additionally scrubs entries.
-    pub fn purge_orphans(&self) -> Vec<CacheOperationResult> {
+    pub fn purge_orphans(&self) -> (Vec<CacheOperationResult>, usize) {
         let analyzer_version = crate::cache::key::ANALYZER_VERSION;
         let loaded_ids = self
             .loaded
@@ -585,6 +587,7 @@ impl ProjectCacheRegistry {
             .unwrap_or_default();
 
         let mut removed = Vec::new();
+        let mut scrubbed = 0usize;
         for shard in self.list_shards() {
             if self.shard_root_is_orphaned(&shard) {
                 removed.push(self.remove_shard_by_id(&shard.shard_id));
@@ -600,7 +603,8 @@ impl ProjectCacheRegistry {
                         .map(|entry| Arc::clone(&entry.cache))
                 });
                 if let Some(cache) = cache {
-                    cache.purge_orphan_entries(analyzer_version);
+                    scrubbed =
+                        scrubbed.saturating_add(cache.purge_orphan_entries(analyzer_version));
                 }
             } else if !shard.cache_path.is_empty() {
                 let cache = ImportCache::new_with_recent_preload_limit(
@@ -608,11 +612,11 @@ impl ProjectCacheRegistry {
                     self.enable_disk_cache,
                     0,
                 );
-                cache.purge_orphan_entries(analyzer_version);
+                scrubbed = scrubbed.saturating_add(cache.purge_orphan_entries(analyzer_version));
             }
         }
 
-        removed
+        (removed, scrubbed)
     }
 
     /// Automatic orphan-shard reclaim for the maintenance tick (RB-17). Removes

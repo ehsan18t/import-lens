@@ -1308,6 +1308,17 @@ pub struct CacheRemoveResponse {
     pub request_id: u64,
     pub removed: Vec<CacheOperationResult>,
     pub failed: Vec<CacheOperationResult>,
+    /// Stale entries scrubbed from caches that were KEPT, and stale registry metadata pruned.
+    ///
+    /// The orphan purge does two things and only ever reported one of them. A run that removed no
+    /// shard reported "nothing to reclaim" while having dropped entries from surviving shards and
+    /// expired registry metadata — a zero shown for work that happened. Both counts were already
+    /// computed and thrown away (`purge_orphan_entries` returns a `usize`;
+    /// `purge_expired_metadata` went to a debug log), so this surfaces what the daemon already knew.
+    #[serde(default)]
+    pub scrubbed_entries: usize,
+    #[serde(default)]
+    pub registry_entries_removed: usize,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
 }
