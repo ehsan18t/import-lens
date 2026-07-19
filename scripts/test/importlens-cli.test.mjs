@@ -665,3 +665,48 @@ test("createDaemonClient rejects pending requests on malformed frames", async ()
 
   await assert.rejects(pending);
 });
+
+// A file whose analysis THROWS -- an IPC deadline on a cold cache is the live cause -- must not take
+// the rest of the run with it. The exception escaped the per-file loop, so every remaining file went
+// unevaluated, the violations already found were never printed, and `main` reported exit 2 ("the CLI
+// broke") rather than the "could not measure" code FR-032a mandates.
+test("a file that throws is one unmeasurable file, not an abandoned run", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "importlens-cli-throws-"));
+  writeFileSync(path.join(workspace, "a.ts"), "import 'lib';\n");
+  writeFileSync(path.join(workspace, "b.ts"), "import 'lib';\n");
+
+  const output = [];
+  const exitCode = await runImportLensCheck({
+    cwd: workspace,
+    budgets: { perFileBrotliBytes: 1000 },
+    changedFiles: async () => ["a.ts", "b.ts"],
+    analyzeFile: async (filePath) => {
+      if (filePath.endsWith("a.ts")) {
+        throw new Error("IPC request timed out after 10000ms");
+      }
+      return {
+        filePath,
+        brotliBytes: 5000,
+        imports: [],
+        unmeasured: [],
+        error: null,
+        incomplete: false,
+        degraded: false,
+        diagnostics: [],
+      };
+    },
+    writeLine: (line) => output.push(line),
+  });
+
+  assert.equal(exitCode, EXIT_COULD_NOT_MEASURE, output.join("\n"));
+  assert.ok(
+    output.some((line) => line.startsWith("a.ts: could not measure this file")),
+    `the thrown file is reported: ${output.join("\n")}`,
+  );
+  assert.ok(
+    output.some((line) => line.includes("b.ts") && line.includes("budget exceeded")),
+    `the file AFTER it is still judged: ${output.join("\n")}`,
+  );
+
+  rmSync(workspace, { recursive: true, force: true });
+});

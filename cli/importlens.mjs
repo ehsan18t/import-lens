@@ -91,6 +91,35 @@ export const EXIT_BUDGET_EXCEEDED = 1;
 // measure" is now an outcome of its own rather than an absence of violations.
 export const EXIT_COULD_NOT_MEASURE = 3;
 
+/**
+ * Analyze one file, turning a thrown failure into an unmeasurable RECORD rather than letting it
+ * escape the run.
+ *
+ * One file that could not be measured is one file. An exception escaping the per-file loop leaves
+ * every remaining file's budget unevaluated, never prints the violations already found — they are
+ * collected during the loop and written after it — and reaches `main`, which reports exit 2. That
+ * code means "the CLI broke", not the "could not measure" exit FR-032a mandates, so CI cannot tell
+ * the two apart. The per-file IPC deadline is a live cause: a cold cache under `force_fresh` waits
+ * on every per-import build plus the combined one, each bounded separately from the request itself.
+ */
+const analyzeOrRecordFailure = async (analyzeFile, cwd, resolveRoot, filePath) => {
+  const absolute = path.resolve(resolveRoot, filePath);
+  try {
+    return { result: await analyzeFile(absolute) };
+  } catch (error) {
+    return {
+      unmeasurable: {
+        relative: path.relative(cwd, absolute).split(path.sep).join("/"),
+        blockedImports: [],
+        incomplete: false,
+        degraded: false,
+        diagnostics: [],
+        error: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+};
+
 export const runImportLensCheck = async ({
   cwd = process.cwd(),
   resolveRoot = cwd,
@@ -111,7 +140,12 @@ export const runImportLensCheck = async ({
   const unmeasurable = [];
 
   for (const filePath of files) {
-    const result = await analyzeFile(path.resolve(resolveRoot, filePath));
+    const attempt = await analyzeOrRecordFailure(analyzeFile, cwd, resolveRoot, filePath);
+    if (attempt.unmeasurable) {
+      unmeasurable.push(attempt.unmeasurable);
+      continue;
+    }
+    const result = attempt.result;
     const relative = path.relative(cwd, result.filePath).split(path.sep).join("/");
     // A floor cannot absolve a budget and must not be allowed to: `incomplete` says bytes that
     // belong in this file's total are absent — an import contributed no measurement, or supported
