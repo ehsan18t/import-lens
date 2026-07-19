@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use lightningcss::dependencies::{Dependency, ImportDependency, UrlDependency};
 
-use crate::engine::{AssetKind, CollectedAsset, UncountedAsset, classify_asset};
+use crate::engine::{AssetClass, AssetKind, CollectedAsset, UncountedAsset, classify_asset_class};
 
 /// Resolve the local files referenced by `url()` in a bundled stylesheet.
 ///
@@ -227,8 +227,12 @@ fn collect_supported_asset(
     // bytes ship regardless, so they are disclosed at full size rather than dropped. This arm used
     // to be a bare `None`, which took them out of the headline in silence and left the result at
     // High confidence claiming to be the import's full cost.
-    let counted_kind =
-        classify_asset(&path).filter(|kind| matches!(kind, AssetKind::Wasm | AssetKind::Font));
+    // Only a binary is a separate artifact here. A `url()` naming a stylesheet is not: Lightning CSS
+    // inlines `@import` children into the one bundled sheet, so counting it again would double it.
+    let counted_kind = classify_asset_class(&path).and_then(|class| match class {
+        AssetClass::Counted(kind @ (AssetKind::Wasm | AssetKind::Font)) => Some(kind),
+        _ => None,
+    });
     let Some(kind) = counted_kind else {
         return Some(SupportedAsset::Uncounted(UncountedAsset {
             path,

@@ -884,10 +884,6 @@ impl ProcessedAssets {
         total
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.contributions.is_empty()
-    }
-
     /// Whether supported asset bytes are disclosed but absent from [`Self::total`]. A deterministic
     /// processor rejection is reusable at the import level, but any aggregate containing it is a
     /// lower bound rather than a complete File Cost.
@@ -1856,7 +1852,14 @@ mod tests {
 
         let error = bundle_css(&fixture.path("index.css"))
             .expect_err("a tree past the file budget must be refused");
-        assert!(error.contains("limit"), "{error}");
+        // Name the bound. This guard exists for an UNCATCHABLE stack overflow that takes the daemon
+        // down, and the build-wide CSS work ledger can refuse the same tree with a message that also
+        // contains "limit" — so asserting on that word alone cannot tell which mechanism actually
+        // stopped the walk, and the guard would read green while doing nothing.
+        assert!(
+            error.contains("stylesheet @import tree exceeds"),
+            "the per-attempt file bound must be what refused this tree: {error}"
+        );
     }
 
     /// The other half of the bound: it must refuse the absurd without refusing the real. It stays

@@ -280,7 +280,7 @@ impl AssetProcessingContext {
         self.finish_read(reservation, kind, &bytes)
     }
 
-    pub(crate) fn snapshot_if_present(&self, path: &Path) -> Option<CollectedAsset> {
+    fn snapshot_if_present(&self, path: &Path) -> Option<CollectedAsset> {
         {
             let state = self.lock_state();
             let identity = state.aliases.get(path).map_or(path, PathBuf::as_path);

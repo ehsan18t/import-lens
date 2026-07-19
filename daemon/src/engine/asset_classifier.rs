@@ -2,18 +2,6 @@ use std::path::Path;
 
 use super::AssetKind;
 
-/// What a non-JavaScript file ships as, or `None` when the engine should leave it to Rolldown.
-///
-/// The same classification is used at both discovery boundaries: JavaScript graph imports in the
-/// Rolldown plugin and local resources referenced by a bundled stylesheet. Keeping one vocabulary
-/// prevents a font from being intercepted in one path and silently ignored in the other.
-pub(crate) fn classify_asset(path: &Path) -> Option<AssetKind> {
-    match classify_asset_class(path)? {
-        AssetClass::Counted(kind) => Some(kind),
-        AssetClass::Unmeasured => None,
-    }
-}
-
 /// What the engine should do with a non-JavaScript file the graph imported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssetClass {

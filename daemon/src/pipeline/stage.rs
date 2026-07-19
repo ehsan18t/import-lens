@@ -185,7 +185,12 @@ mod tests {
     fn every_declared_stage_is_classified_and_no_transient_stage_is_durable() {
         let mut durable = Vec::new();
         let mut refused = Vec::new();
-        for stage in engine_stage::ALL.iter().chain(ALL.iter()).copied() {
+        for stage in engine_stage::ALL
+            .iter()
+            .chain(diagnostic_stage::ALL.iter())
+            .chain(ALL.iter())
+            .copied()
+        {
             if may_enter_a_durable_store(stage) {
                 durable.push(stage);
             } else {

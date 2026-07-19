@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 pub use crate::ipc::protocol::ImportRuntime;
 pub use adapter::RolldownEngine;
-pub(crate) use asset_classifier::{AssetClass, classify_asset, classify_asset_class};
+pub(crate) use asset_classifier::{AssetClass, classify_asset_class};
 pub use asset_input::CollectedAsset;
 // Test-only since the bounded pipeline took over every production read.
 #[cfg(test)]
@@ -410,6 +410,14 @@ pub mod diagnostic_stage {
     /// then writes to disk. An over-count that says so is a disclosed limit; a silent one is the
     /// overclaim this model exists to stop.
     pub const IMPRECISE_ASSETS: &str = "imprecise_assets";
+
+    /// Every diagnostic stage declared above.
+    ///
+    /// A stage absent from this list is classified by nothing: `pipeline::stage` decides durability
+    /// from an allowlist, so an unlisted stage is refused by every durable store and every package
+    /// carrying it becomes permanently uncacheable — with no test red, because the property test
+    /// over stage classification quantifies across this list. Add a constant, add it here.
+    pub const ALL: &[&str] = &[EXTERNAL, UNCOUNTED_ASSETS, IMPRECISE_ASSETS];
 }
 
 /// `stage` is one of [`stage::ALL`].

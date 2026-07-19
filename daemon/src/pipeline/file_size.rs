@@ -234,21 +234,33 @@ impl FileSizeComputation {
     /// degraded group falls back to. A degraded file still has real asset bytes in its total, so
     /// losing the breakdown exactly when the number is hardest to read would be the wrong trade.
     fn absorb_asset_breakdown(&mut self, contributions: &[AssetContribution]) {
-        for contribution in contributions {
-            match self
-                .asset_breakdown
-                .iter_mut()
-                .find(|existing| existing.kind == contribution.kind)
-            {
-                Some(existing) => {
-                    existing.raw_bytes += contribution.raw_bytes;
-                    existing.minified_bytes += contribution.minified_bytes;
-                    existing.gzip_bytes += contribution.gzip_bytes;
-                    existing.brotli_bytes += contribution.brotli_bytes;
-                    existing.zstd_bytes += contribution.zstd_bytes;
-                }
-                None => self.asset_breakdown.push(*contribution),
+        absorb_asset_breakdown_into(&mut self.asset_breakdown, contributions);
+    }
+}
+
+/// Sum per-kind asset weight into a breakdown, matching on kind.
+///
+/// One definition for the two accumulators that need it — the file's composition and the per-import
+/// fallback's. `AssetContribution` has five size fields and each was enumerated by hand in both
+/// places, so a sixth compression metric added to one would have silently dropped out of the other,
+/// leaving rows that no longer sum to the total shown beside them.
+fn absorb_asset_breakdown_into(
+    breakdown: &mut Vec<AssetContribution>,
+    contributions: &[AssetContribution],
+) {
+    for contribution in contributions {
+        match breakdown
+            .iter_mut()
+            .find(|existing| existing.kind == contribution.kind)
+        {
+            Some(existing) => {
+                existing.raw_bytes += contribution.raw_bytes;
+                existing.minified_bytes += contribution.minified_bytes;
+                existing.gzip_bytes += contribution.gzip_bytes;
+                existing.brotli_bytes += contribution.brotli_bytes;
+                existing.zstd_bytes += contribution.zstd_bytes;
             }
+            None => breakdown.push(*contribution),
         }
     }
 }
@@ -825,22 +837,7 @@ fn per_import_totals(
         // stylesheet two imports share (that is precisely what the combined build it fell back FROM
         // would have done), so the rows read high in the same way and by the same amount as the
         // number they describe.
-        for contribution in &result.asset_breakdown {
-            match totals
-                .asset_breakdown
-                .iter_mut()
-                .find(|existing| existing.kind == contribution.kind)
-            {
-                Some(existing) => {
-                    existing.raw_bytes += contribution.raw_bytes;
-                    existing.minified_bytes += contribution.minified_bytes;
-                    existing.gzip_bytes += contribution.gzip_bytes;
-                    existing.brotli_bytes += contribution.brotli_bytes;
-                    existing.zstd_bytes += contribution.zstd_bytes;
-                }
-                None => totals.asset_breakdown.push(*contribution),
-            }
-        }
+        absorb_asset_breakdown_into(&mut totals.asset_breakdown, &result.asset_breakdown);
     }
 
     totals
