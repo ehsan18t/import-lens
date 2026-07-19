@@ -40,15 +40,33 @@ impl RolldownEngine {
                 read_time_fingerprints: Vec::new(),
             });
         };
-        let input = InputItem {
-            name: None,
-            import: entry::VIRTUAL_ENTRY_ID.to_owned(),
+        let package_root = first_entry.package_root.clone();
+        let attempt = |shim_unbound_imports: bool| {
+            let input = InputItem {
+                name: None,
+                import: entry::VIRTUAL_ENTRY_ID.to_owned(),
+            };
+            let mut options = build_options(input, package_root.clone(), request.runtime);
+            options.shim_missing_exports = Some(shim_unbound_imports);
+            let plugin = ImportLensPlugin::for_request(&request);
+            let state = plugin.state();
+            (options, plugin, state)
         };
-        let options = build_options(input, first_entry.package_root.clone(), request.runtime);
-        let plugin = ImportLensPlugin::for_request(&request);
-        let state = plugin.state();
+
+        let (options, plugin, state) = attempt(false);
+        let failure = match run_build(options, plugin, &state).await {
+            Ok(output) => return translate(output, &state, Vec::new()),
+            Err(failure) => failure,
+        };
+        if !is_internal_unbound_import(&failure) {
+            return Err(failure);
+        }
+        // A fresh plugin and state, never the first attempt's: that one already recorded the paths
+        // and fingerprints of a graph that was thrown away, and freshness must describe the graph
+        // the returned size was actually taken from.
+        let (options, plugin, state) = attempt(true);
         let output = run_build(options, plugin, &state).await?;
-        translate(output, &state)
+        translate(output, &state, failure.diagnostics)
     }
 
     /// Export enumeration (§8.4): the resolved real entry becomes the strict
@@ -214,9 +232,32 @@ async fn run_build(
     result.map_err(|error| classify_failure(error.into_vec(), state))
 }
 
+/// Whether a failed build may be retried with the unmatched binding stubbed (`shim_missing_exports`).
+///
+/// Rolldown raises an unmatched import at `Severity::Error`, so one broken edge **anywhere** in a
+/// package's graph leaves the whole package unmeasured — a package four levels away can drop an
+/// export in a patch release and every dependent becomes unmeasurable.
+///
+/// Stubbing is sound for an edge BETWEEN dependencies: the user asked for the package, not for that
+/// binding, and every module still renders at its true bytes. It is refused for the export the user
+/// actually **requested**, which only the virtual entry imports — guessing that one is what the SRS
+/// forbids, and it would turn a typo into a confident size instead of a failure.
+///
+/// `ambiguous_export` is excluded on purpose: `shim_missing_exports` only rewrites a `NoMatch`
+/// binding, so a name lost to conflicting star providers fails the retry exactly as it failed the
+/// first attempt, and retrying it would only cost a second build.
+fn is_internal_unbound_import(failure: &BundleFailure) -> bool {
+    !failure.diagnostics.is_empty()
+        && failure.diagnostics.iter().all(|diagnostic| {
+            diagnostic.stage == stage::MISSING_EXPORT
+                && !diagnostic.message.contains(entry::VIRTUAL_ENTRY_ID)
+        })
+}
+
 fn translate(
     output: rolldown::BundleOutput,
     state: &BuildState,
+    unbound_imports: Vec<ImportDiagnostic>,
 ) -> Result<BundleArtifact, BundleFailure> {
     let chunk = single_chunk(&output, state)?;
 
@@ -246,6 +287,25 @@ fn translate(
     emitted.extend(state.unmeasured_assets());
     emitted.sort_by(|left, right| left.path.cmp(&right.path));
     let mut diagnostics = contract_diagnostics(&output.warnings);
+    // Carried from the attempt that FAILED, because a stubbed build reports nothing: Rolldown
+    // synthesizes the symbol and emits no diagnostic at all, so without these the broken edge comes
+    // back as a High-confidence size with the breakage invisible. They are the whole disclosure, and
+    // they are what holds the result at Medium.
+    if !unbound_imports.is_empty() {
+        diagnostics.extend(unbound_imports);
+        diagnostics.push(ImportDiagnostic {
+            stage: stage::MISSING_EXPORT.to_owned(),
+            // A FLOOR, and it must say so. Binding to an export that existed would retain whatever
+            // implements it — `walk` was a re-export from a separate `walk.js` one release earlier —
+            // so a stub measures the graph as installed and not the graph a working version would
+            // have. Claiming this is the package's real cost would be a wrong number.
+            message: "a dependency imports a binding its source module does not export; the graph \
+                      was measured with that binding stubbed, so whatever the real binding would \
+                      have retained is NOT in this size, and the import named above is `undefined` \
+                      wherever it is used"
+                .to_owned(),
+        });
+    }
     diagnostics.extend(asset_io_diagnostic(state));
     diagnostics.extend(uncounted_assets_diagnostic(&emitted));
     for import in &chunk.imports {
@@ -523,6 +583,64 @@ fn contract_diagnostics(diagnostics: &[BuildDiagnostic]) -> Vec<ImportDiagnostic
 mod tests {
     use super::*;
     use crate::engine::plugin::{AssetInputFailure, BuildState};
+
+    /// The gate deciding whether a failed build may be retried with the unmatched binding stubbed.
+    /// It is the whole of what separates "a dependency's broken edge is measured and disclosed" from
+    /// "a typo in the user's own import comes back as a confident size".
+    ///
+    /// A Guard as much as a Logic test: loosening any arm — dropping the virtual-entry check,
+    /// admitting `ambiguous_export`, accepting a mixed diagnostic list — turns it red.
+    #[test]
+    fn only_an_internal_missing_export_may_be_retried_with_a_stub() {
+        let failure = |diagnostics: Vec<ImportDiagnostic>| BundleFailure {
+            stage: stage::MISSING_EXPORT.to_owned(),
+            message: String::new(),
+            diagnostics,
+            loaded_paths: Vec::new(),
+            read_time_fingerprints: Vec::new(),
+        };
+        let diagnostic = |stage: &str, message: &str| ImportDiagnostic {
+            stage: stage.to_owned(),
+            message: message.to_owned(),
+        };
+
+        assert!(
+            is_internal_unbound_import(&failure(vec![diagnostic(
+                stage::MISSING_EXPORT,
+                r#""walk" is not exported by "yuku-parser/index.js", imported by "dts/index.mjs""#,
+            )])),
+            "an edge between two dependencies is the case this exists for"
+        );
+        assert!(
+            !is_internal_unbound_import(&failure(vec![diagnostic(
+                stage::MISSING_EXPORT,
+                &format!(
+                    r#""nope" is not exported by "lib/index.js", imported by "{}""#,
+                    entry::VIRTUAL_ENTRY_ID
+                ),
+            )])),
+            "the export the USER requested is the one the virtual entry imports, and guessing that \
+             binding is what the SRS forbids"
+        );
+        assert!(
+            !is_internal_unbound_import(&failure(vec![diagnostic(
+                stage::AMBIGUOUS_EXPORT,
+                "name is ambiguous",
+            )])),
+            "a stub only rewrites a NoMatch binding, so the retry would fail identically"
+        );
+        assert!(
+            !is_internal_unbound_import(&failure(vec![
+                diagnostic(stage::MISSING_EXPORT, "an internal edge"),
+                diagnostic(stage::PARSE, "a syntax error"),
+            ])),
+            "a graph that also fails to parse is not made measurable by stubbing a binding"
+        );
+        assert!(
+            !is_internal_unbound_import(&failure(Vec::new())),
+            "a failure with no diagnostics says nothing about what a retry would do"
+        );
+    }
 
     /// A missing optional asset says "retry after the filesystem settles"; a blown graph limit is a
     /// permanent fact about the package. When both are recorded, the breach has to win.

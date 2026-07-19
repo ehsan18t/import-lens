@@ -45,7 +45,7 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// caused it — attributed, dated, and unable to drift from the code the way a hand-kept list can.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.2.x+17"
+        "rolldown-1.2.x+18"
     };
 }
 

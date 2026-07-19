@@ -77,7 +77,12 @@ images and media) are closed — see [Resolved](#resolved):
 **The universal fix (never per-package).** At the engine/resolver boundary, treat every unbundleable leaf as an
 import boundary rather than a hard failure: measure the graph that did bundle as a **floor**, and disclose the
 uncounted leaf exactly as non-JS asset bytes are disclosed today. Same shape as D2 — a floor beats a blank —
-but triggered by a build error rather than a graph-limit breach. Pair it with a labelled reason in the UI
+but triggered by a build error rather than a graph-limit breach. **This shape now has a working instance to
+copy:** an unmatched import binding *between two dependencies* is stubbed, measured as a floor, and disclosed
+under `missing_export` (SRS failure-stage table), which is what makes a package like `tsdown` measurable at all.
+The remaining classes above want the same treatment, and the constraint that instance had to respect is the one
+they will meet too — the leniency must never extend to the thing the **user requested**, or a typo comes back
+as a confident number. Pair it with a labelled reason in the UI
 ("no importable entry", "unresolved: X") so the badge names the truth instead of a blanket "unavailable". Two
 probes already answer with a labelled Measured zero (`types_only`, `native_binary_only`); note
 `native_binary_only` ships with no SRS requirement behind it, so if a dedicated stage is added here, charter
@@ -331,6 +336,26 @@ project trees found no resolvable instance inside `node_modules`.
 Today an unbuildable import reports no size. A graph-limit breach means much of the graph was loaded before we
 stopped, so a real floor exists: "at least 4 MB; graph limit exceeded" is strictly better than a blank. The
 engine currently discards the partial graph on failure, so this needs plumbing through the engine boundary.
+
+### D29: A measured-but-floor import does not flag its file total incomplete
+**Status: Deferred** · Pre-existing, and now with one more way to reach it
+
+`FileSizeResult::incomplete` has exactly two triggers: an import that was **not measured**, or a disclosed
+`uncounted_assets` omission. An import that *was* measured but is knowingly a **floor** sets neither, so the
+file total is presented as complete while summing slightly less than the file.
+
+Two things produce such an import. An unresolvable bare specifier kept as an `external` boundary — "anything it
+would have pulled in is NOT in this size" — which has behaved this way since that disclosure existed. And, now,
+a stubbed unmatched binding under `missing_export`: binding to an export that really existed would retain
+whatever implements it, so the measured graph is the one *as installed*.
+
+**Why it is not fixed here.** No number is undisclosed — both carry a named diagnostic and cap the import at
+Medium confidence — and the gap is at the aggregate surface, which is a different fix from the one this change
+was making. It is the same family as D12 and D17 (both resolved), which made per-import and per-asset floors
+structural rather than prose; this is the third member, and it wants that same treatment: a floor that a
+consumer can see without reading diagnostic text. Doing it means deciding whether `incomplete` should key on
+"a contributor is a floor" rather than "a contributor is missing", which changes what every durable store and
+budget check does with an `external` boundary — far past the blast radius of the change that found it.
 
 ### D4: A file with one unmeasurable import can never cache its total
 **Status: Deferred** · A performance cost of an invariant we want

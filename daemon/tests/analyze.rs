@@ -587,6 +587,65 @@ fn analyze_import_reports_missing_esm_default_export_as_zero_size_error() {
     );
 }
 
+/// A broken edge BETWEEN dependencies is not a binding the user asked for, so it does not discard
+/// their measurement. Rolldown raises an unmatched import at error severity, so without this one
+/// edge four levels down takes the whole graph with it: `yuku-parser` dropped `walk` in a patch
+/// release while `rolldown-plugin-dts` still imported it, and every package above that pair —
+/// `tsdown` among them — reported no size at all.
+///
+/// The requested export is present and the internal one is not, which is the entire distinction.
+/// Every module still renders at its true bytes, so the size is real; the binding is stubbed, so the
+/// disclosure has to name it and the result cannot be High.
+#[test]
+fn an_unbound_import_between_dependencies_is_measured_and_disclosed() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "internal-unbound-lib",
+        r#"{"version":"1.0.0","module":"index.js","sideEffects":false}"#,
+        "import { walk } from './parser.js';\nexport const present = () => walk;\n",
+    );
+    write_package_file(
+        &workspace,
+        "internal-unbound-lib",
+        "parser.js",
+        "export const parse = 1;\n",
+    );
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "internal-unbound-lib",
+            "internal-unbound-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["present"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(
+        result.sizes().is_some(),
+        "an edge the user never asked for must not discard the measurement: {result:?}"
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "missing_export" && diagnostic.message.contains("walk")
+        }),
+        "a stubbed build emits nothing of its own, so the carried diagnostic naming the binding is \
+         the whole disclosure: {result:?}"
+    );
+    assert_eq!(
+        result.confidence,
+        ConfidenceLevel::Medium,
+        "a stubbed binding cannot be High: {result:?}"
+    );
+}
+
 /// The manifest fabricator, gone (ADR-0006 §1). An unreadable `package.json` used to be answered
 /// with the package directory's bytes ON DISK — and that one number was written to all five size
 /// fields, so this import's "brotli size" was an uncompressed directory that also counted its
