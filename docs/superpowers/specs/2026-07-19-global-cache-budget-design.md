@@ -74,7 +74,7 @@ waiting for the next reader.
 The commit on branch `fix/cache-budget-scope` corrects the description on all three surfaces
 (`package.json`, `README.md` — which ships inside the VSIX — and the SRS settings table), plus one
 comment at `project.rs:43` stating the constraint. **That commit is honest but unambitious: it makes
-the docs match a behaviour nobody wants.** This document proposes changing the behaviour instead, at
+the docs match a behavior nobody wants.** This document proposes changing the behavior instead, at
 which point those three descriptions change once more.
 
 ---
@@ -289,6 +289,12 @@ rather than a side effect.
 Every one is the lock-invisibility of §6.1 surfacing somewhere else. They are listed separately
 because each needs its own fix, and three of them are *user-visible* rather than internal.
 
+**Two of these already exist today** and are recorded as [D30 and D31](../../known-issues.md) — they
+are reachable now by opening one workspace in two windows, which is why they have never bitten. This
+proposal does not create them; it makes them routine. Sequencing their fixes with Phase 3 is a
+decision, not an oversight: fixing them first would mean building the recoverable-shard machinery
+before the thing that needs it.
+
 | Breakage | Anchor | Effect |
 |---|---|---|
 | **Manage Cache reports wrong numbers** | `project.rs:520-525`, `:484-488` | `status_for_root` folds the same rollup map, and `list_shards_with_rollups` stamps `entry_count` from it. With a second window open, the UI shows a wrong total and **0 entries** for any shard that window holds. |
@@ -434,11 +440,10 @@ Recorded so they are not lost; none is part of this feature.
 
 - **~20 MB stranded** under the previous publisher id across both editors, reclaimable by nothing.
   Deleting it is safe and needs no code. **[executed]**
-- **Multi-window cache degradation, today.** Two windows on the *same* workspace already share a base
-  and collide on shards: the second window's shard goes memory-only and does not heal while the first
-  holds it, with an un-rate-limited warning per request. Narrow, and by the repo's bar neither a wrong
-  number nor a wedge. **[verified]**
-- **`remove_shard` deletes unconditionally** ([`project.rs:812`](../../../daemon/src/cache/project.rs)),
-  with no cross-process check. On Windows an open handle should make this fail benignly; on unix it
-  would unlink a live sibling's inode. Windows-first product, so low priority — but it becomes
-  reachable far more often under a shared base. **[inferred]** for the platform behaviour.
+- **Multi-window cache degradation, today** — now recorded as **D30**. Two windows on the *same*
+  workspace already share a base and collide on shards: the second window's shard goes memory-only and
+  does not heal while the first holds it, with an un-rate-limited warning per request. **[verified]**
+- **`remove_shard` deletes unconditionally** — now recorded as **D31**
+  ([`project.rs:812`](../../../daemon/src/cache/project.rs)), with no cross-process check. On Windows an
+  open handle should make this fail benignly; on unix it would unlink a live sibling's inode.
+  **[inferred]** for the platform behavior.

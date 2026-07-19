@@ -357,6 +357,45 @@ consumer can see without reading diagnostic text. Doing it means deciding whethe
 "a contributor is a floor" rather than "a contributor is missing", which changes what every durable store and
 budget check does with an `external` boundary — far past the blast radius of the change that found it.
 
+### D30: A second window on the same workspace loses its disk cache for the whole session
+**Status: Deferred** · Reachable today only by opening one workspace twice · Becomes everyday if the cache base is centralised
+
+`redb` takes an **OS-level exclusive file lock** per database file
+(`redb-4.1.0/src/tree_store/page_store/file_backend/optimized.rs:29-39`, `file.try_lock()` →
+`WouldBlock` → `DatabaseAlreadyOpen`). Two windows on the same workspace resolve the same
+`storageUri`, so they share a cache base and collide on the same shard.
+
+`open_database` turns that into `None` (`disk.rs:1113-1127`), and `cache_for_root` then refuses to
+register the degraded shard so the next call can retry (`project.rs:390-392`). That retry is correct
+for the case it was written for — a transient in-process temp open during a maintenance pass — but the
+blocker here is **another process**, which holds the lock for as long as its window is open. So the
+second window never heals: every analysis request pays a failed open, emits one un-rate-limited
+warning, and serves memory-only.
+
+**Why it is not fixed:** no wrong number and nothing lost — a cache miss only costs a recompute. The
+log volume is the worst of it. The honest fix is to make the degraded state *recoverable* (an owned
+storage path plus a throttled `ensure_open`) rather than refused, which is the same fix the
+centralisation plan needs and is tracked there
+([global cache budget design](superpowers/specs/2026-07-19-global-cache-budget-design.md) §6.5).
+
+### D31: A shard directory is removed without checking whether another process holds it
+**Status: Deferred** · Data-loss class on unix; benign on Windows, which is the supported platform
+
+`remove_shard` calls `fs::remove_dir_all(&cache_path)` unconditionally (`project.rs:812`), reached from
+the Manage Cache commands and from the automatic orphan sweep (`service.rs:2220`). There is no check
+for another process holding the shard's `.redb`.
+
+On **Windows** `redb` opens through `std::fs::File`, which does not request `FILE_SHARE_DELETE`, so the
+delete fails with a sharing violation and is reported as `removed: false` — annoying, not destructive.
+On **unix** the unlink succeeds while the holder keeps writing to an unlinked inode, and that data
+vanishes on close. A related ordering hazard exists on both: `remove_dir_all` deletes in readdir order,
+so a failed `.redb` delete can still leave the JSON sidecar gone, producing a metadata-less shard
+directory that is invisible to every listing yet still counted by the maintenance gate.
+
+**Why it is not fixed:** unreachable in practice on the supported platform, and reaching it at all
+requires two windows on one workspace (see D30). Both the unix unlink and the sidecar ordering become
+routine under a shared cache base, so the fix is sequenced with that work rather than ahead of it.
+
 ### D4: A file with one unmeasurable import can never cache its total
 **Status: Deferred** · A performance cost of an invariant we want
 
