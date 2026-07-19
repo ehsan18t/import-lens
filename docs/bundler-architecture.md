@@ -764,7 +764,10 @@ where upstream vendors a component, we use *that* component).
 
 ### 13.5 The analyzer revision
 
-The authoritative value and its rationale live in `daemon/src/cache/key.rs` (`ANALYZER_REVISION`).
+The authoritative value and its format live in `daemon/src/cache/key.rs` (`ANALYZER_REVISION`). Past
+values are not kept there: each was set by the commit that moved the numbers, so
+`git log -S analyzer_revision -- daemon/src/cache/key.rs` gives every one alongside the change that
+caused it.
 History: `graph2` (old custom engine) → `rolldown1` (Phase 3 cutover) → `rolldown2` (2026-07-12,
 post-cutover correctness fixes) → `rolldown-1.1.x+3` (2026-07-15, the release-review fixes: the
 Windows verbatim-path `sideEffects` bug behind `refractor`'s 3.7x under-report, the deleted

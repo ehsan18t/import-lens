@@ -1415,11 +1415,11 @@ fn process_stylesheets(
                     processed.read_paths.push(failure.path.clone());
                     // Classify by the REAL reason. A `url()` target that is simply absent is a
                     // deterministic fact about the package: it takes the absent-state sentinel and
-                    // stays cacheable, so supplying the file is what invalidates the result. Forcing
-                    // every one of these to "not missing" made such a package permanently
-                    // unverifiable — rebuilt on every keystroke over a file nobody was going to
+                    // stays cacheable, so supplying the file is what invalidates the result.
+                    // Hardcoding "not missing" here would make such a package permanently
+                    // unverifiable — rebuilt on every keystroke over a file nobody is going to
                     // create — and put a second, conflicting sentinel on any path the snapshot half
-                    // had already recorded correctly.
+                    // records correctly.
                     processed
                         .failed_paths
                         .push(FailedRead::new(failure.path.clone(), failure.kind));

@@ -152,10 +152,10 @@ export const bundleImpactHistoryDeltaLabel = (
   const delta = current.brotliBytes - previous.brotliBytes;
   const sign = delta >= 0 ? "+" : "-";
   const label = `${sign}${formatBytes(Math.abs(delta))} br vs previous`;
-  // As on the import axis: an upper bound on either side means part of the difference is the
-  // over-count appearing or evaporating. The caveat was previously reachable only when the
-  // imprecise result was the CURRENT one, because it came from reading the current response —
-  // the direction that mattered, an upper-bound BASELINE with a sound run against it, said nothing.
+  // As on the import axis: an upper bound on EITHER side means part of the difference is the
+  // over-count appearing or evaporating. Reading quality off the current response alone is not
+  // enough — that catches an imprecise current result and misses an imprecise baseline, which is
+  // the direction that renders a clean saving nobody earned.
   return current.imprecise || previous.imprecise ? `${label}, against an upper bound` : label;
 };
 

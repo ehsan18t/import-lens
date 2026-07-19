@@ -33,6 +33,38 @@ something, not when you find it.
 If a fix chains into a third round on the same sub-item, stop and re-check it against the plan. Do
 not let the next review report decide your priorities for you.
 
+## Comments Are Not A Changelog
+
+**A code file records what the code IS, never what it USED to be. Do not put change history in a
+comment.** Git already stores that, in a form that is searchable, attributable, and does not cost a
+reader anything. A comment narrating a past state costs every future reader the time to work out that
+it describes something no longer present.
+
+Delete on sight, in your own new code as much as in old:
+
+- "this used to…", "before the fix…", "previously…", "the old behaviour was…"
+- "instance #5 of…", "found again in…", "the third occurrence of…"
+- what broke, which tests went red, how many rounds a review took, what a bug once cost
+- the reasoning that led you to the current shape, when the shape now speaks for itself
+
+Write instead:
+
+- **a decision and its constraint** — "compressed per artifact, never concatenated: separate files
+  ship separately" — because the next person will otherwise assume the cheaper thing is fine
+- **an explanation of something genuinely hard** — an unobvious invariant, a subtle ordering, an
+  `unsafe` justification, why a limit is the number it is
+- **a warning that stops a plausible wrong edit** — "stripping unconditionally claims ids the bundler
+  owns" states a live property, not a war story
+- **reference a reader needs at hand** — a format, a wire shape, a table of accepted values. This is
+  not history and nothing here argues against it: document the `<engine>-<minor>.x+<revision>` format
+  next to the constant, just not the fifteen values it held before today
+
+The discriminator: *would this sentence still be worth reading by someone who has never seen the old
+code?* If it only makes sense as a diff against the past, it belongs in the commit message, or — if it
+is a decision worth keeping — in `docs/`. `docs/known-issues.md` holds what is wrong and why it is
+unfixed; `docs/adr/` holds decisions with lasting force; the commit body holds why this change
+happened. None of that goes in a `//`.
+
 ## File And Formatting Rules
 
 - Keep files in LF line endings. Never save files as CRLF.

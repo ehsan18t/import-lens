@@ -204,12 +204,11 @@ impl AssetExecutor {
 
 /// The process-wide asset executor, built once and shared by every request.
 ///
-/// Only SUCCESS is cached, and the cell's type is what enforces it. Caching a
-/// `Result<AssetExecutor, _>` meant one failed `ThreadPoolBuilder::build` was kept for the daemon's
-/// whole lifetime: thread or handle exhaustion is a machine state that clears on its own, but every
-/// later request for any package carrying a `.css`, `.wasm` or font would report Unmeasured until a
-/// restart. A `OnceLock<AssetExecutor>` cannot hold a failure, so the retry is structural rather
-/// than something a future edit has to remember.
+/// Only SUCCESS is cached, and the cell's type is what enforces it. A failed
+/// `ThreadPoolBuilder::build` reflects thread or handle exhaustion — a machine state that clears on
+/// its own — so caching it would report Unmeasured for every asset-bearing package until a restart.
+/// A `OnceLock<AssetExecutor>` cannot hold a failure, which makes the retry structural rather than
+/// something a future edit has to remember.
 fn executor() -> Result<&'static AssetExecutor, AssetBoundaryError> {
     static EXECUTOR: OnceLock<AssetExecutor> = OnceLock::new();
     if let Some(executor) = EXECUTOR.get() {
@@ -286,11 +285,11 @@ mod tests {
     }
 
     /// The two-permit bound is only real if every request shares ONE executor, and no other test can
-    /// observe that: the concurrency test below builds its own so that a sibling test holding a
-    /// production permit cannot make it flake. That left de-globalizing `executor()` — a refactor
-    /// that reads as harmless cleanup — green while asset concurrency silently became unbounded,
-    /// because the engine releases its own permit before asset processing runs and this gate is the
-    /// only one left. Asserting the sharing directly is what makes that edit go red.
+    /// observe that: the concurrency test below builds its own, so that a sibling test holding a
+    /// production permit cannot make it flake. Without this, de-globalizing `executor()` — a
+    /// refactor that reads as harmless cleanup — stays green while asset concurrency becomes
+    /// unbounded, since the engine releases its own permit before asset processing runs and this
+    /// gate is the only one left.
     ///
     /// It also pins the other half: only a SUCCESS is cached, so a transient build failure is
     /// retried rather than kept for the daemon's lifetime.

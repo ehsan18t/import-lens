@@ -385,8 +385,8 @@ test("an imprecise asset upper bound produces no CLI budget verdict", async () =
     });
 
     assert.equal(exitCode, EXIT_COULD_NOT_MEASURE);
-    // The imprecise signal is an axis on the quality model now, not an early return, so this line
-    // also carries the unmeasured-import count and stage the early return used to drop.
+    // The imprecise signal is an axis on the quality model rather than an early return, so the line
+    // carries the unmeasured-import count and stage alongside the disclosure.
     assert.deepEqual(output, [
       "app.ts: asset processing produced a disclosed upper bound, so budgets were not evaluated (1 unmeasured import; stage: imprecise_assets) - budget not evaluated",
       "Import Lens could not evaluate every requested budget. A request-local failure may pass on a re-run; a deterministic package failure will not.",

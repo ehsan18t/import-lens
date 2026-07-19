@@ -21,9 +21,9 @@ test("confidenceVisualFor keeps unknown confidence visually neutral", () => {
 });
 
 test("confidenceVisualFor degrades a level from a newer daemon instead of throwing", () => {
-  // An older extension meets a newer daemon routinely. The lookup used to be unguarded, so a fourth
-  // ConfidenceLevel returned undefined and the caller's `.badge` read threw — taking the entire
-  // hover with it rather than losing one badge.
+  // An older extension meets a newer daemon routinely. An unguarded lookup returns undefined for a
+  // level this build has never heard of, and the caller reads `.badge` off it — losing the entire
+  // hover rather than one badge.
   const visual = confidenceVisualFor("very_low" as never);
   assert.equal(visual.badge, "Unknown");
   assert.equal(visual.themeColor, "descriptionForeground");

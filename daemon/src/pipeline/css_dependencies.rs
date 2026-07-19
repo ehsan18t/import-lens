@@ -39,9 +39,9 @@ pub(crate) struct CssDependencyFailure {
     /// WHY the read failed. A target that simply is not there is a deterministic fact about the
     /// package and must take the absent-state sentinel, so that supplying the file invalidates the
     /// result; a permission error or a lock is a fact about this machine right now and stays
-    /// request-local. Carrying the kind here is what lets the caller tell them apart — hardcoding
-    /// "not missing" made every stale `url()` target permanently non-durable and told the user the
-    /// result "reflects a changing or unavailable filesystem" about a stable package.
+    /// request-local. Carrying the kind here is what lets the caller tell them apart; hardcoding
+    /// "not missing" instead leaves every stale `url()` target permanently non-durable, and tells
+    /// the user the result "reflects a changing or unavailable filesystem" about a stable package.
     pub kind: std::io::ErrorKind,
 }
 
@@ -172,11 +172,11 @@ fn collect_supported_asset(
         )));
     }
 
-    // A reference we cannot turn into a path still names bytes that ship. Percent-escapes that do not
-    // decode to UTF-8 (a CP-1252 export naming `Ubuntu-R%E9gular.woff2`) used to leave through the
-    // same silent `None` as a `data:` payload, so a whole font face vanished from the total while the
-    // result stayed Measured at High confidence — cached, budgeted, and never invalidated by
-    // supplying the file. It is an omission: the bytes are missing and their size is unknown.
+    // A reference we cannot turn into a path still names bytes that ship, so it is an OMISSION and
+    // never a silent `None`. Percent-escapes that do not decode to UTF-8 reach here — a CP-1252
+    // export naming `Ubuntu-R%E9gular.woff2` — and dropping one costs a whole font face from the
+    // total while leaving the result Measured at High confidence: cached, budgeted, and not
+    // invalidated by supplying the file, because a dropped reference enters no freshness either.
     let Some(resource_path) = resource_path(specifier) else {
         return Some(SupportedAsset::Omitted(format!(
             "CSS resource `{}` in {} could not be interpreted as a file name, so its shipped bytes \
@@ -269,9 +269,9 @@ fn resource_path(specifier: &str) -> Option<PathBuf> {
 
 /// A reference the browser fetches from elsewhere rather than one this package ships.
 ///
-/// Protocol-relative (`//cdn/x.woff2`) counts, and leaving it out is what made a CDN font look like
-/// an unlocatable LOCAL file: the number stayed correct but was labelled a floor and lost its budget
-/// verdict. The `@import` half already knew about this form; the `url()` half did not.
+/// Protocol-relative (`//cdn/x.woff2`) counts. Omitting that form makes a CDN font read as an
+/// unlocatable LOCAL file, which keeps the number correct but labels it a floor and drops its budget
+/// verdict. Both discovery boundaries — `@import` and `url()` — must answer this the same way.
 fn is_remote_reference(value: &str) -> bool {
     value.starts_with("//") || has_url_scheme(value)
 }

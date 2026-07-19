@@ -284,14 +284,13 @@ impl ImportCache {
                 // the cheap check for node_modules paths, where re-reading bytes on every hit would
                 // be pure waste.
                 //
-                // Deciding it per ENTRY instead was a live staleness bug. A node_modules entry is
-                // not made of node_modules files only: a stylesheet's `url()` may resolve outside
-                // the package root (D18), so a WORKSPACE font can sit in a node_modules entry's
-                // fingerprint set. Its content hash was computed and stored, and then never
-                // consulted — the entry was "not first party", so every fingerprint took the cheap
-                // path. Worse than a window: after the TTL the cheap check returns Fresh and
-                // restamps, re-arming it forever, and neither a generation bump nor a daemon
-                // restart clears it.
+                // Per FINGERPRINT, never per entry. A node_modules entry is not made of
+                // node_modules files only: a stylesheet's `url()` may resolve outside the package
+                // root (D18), so a WORKSPACE font can sit in a node_modules entry's fingerprint
+                // set, and it changes with no generation bump behind it. Routing by entry leaves
+                // that file's stored content hash unconsulted, and the staleness does not expire —
+                // after the TTL the cheap check returns Fresh and restamps, so neither a generation
+                // bump nor a daemon restart clears it.
                 let freshness =
                     crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
                 match freshness {
@@ -455,14 +454,13 @@ impl ImportCache {
                 // the cheap check for node_modules paths, where re-reading bytes on every hit would
                 // be pure waste.
                 //
-                // Deciding it per ENTRY instead was a live staleness bug. A node_modules entry is
-                // not made of node_modules files only: a stylesheet's `url()` may resolve outside
-                // the package root (D18), so a WORKSPACE font can sit in a node_modules entry's
-                // fingerprint set. Its content hash was computed and stored, and then never
-                // consulted — the entry was "not first party", so every fingerprint took the cheap
-                // path. Worse than a window: after the TTL the cheap check returns Fresh and
-                // restamps, re-arming it forever, and neither a generation bump nor a daemon
-                // restart clears it.
+                // Per FINGERPRINT, never per entry. A node_modules entry is not made of
+                // node_modules files only: a stylesheet's `url()` may resolve outside the package
+                // root (D18), so a WORKSPACE font can sit in a node_modules entry's fingerprint
+                // set, and it changes with no generation bump behind it. Routing by entry leaves
+                // that file's stored content hash unconsulted, and the staleness does not expire —
+                // after the TTL the cheap check returns Fresh and restamps, so neither a generation
+                // bump nor a daemon restart clears it.
                 let freshness =
                     crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
                 match freshness {
