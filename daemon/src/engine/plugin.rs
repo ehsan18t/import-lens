@@ -1035,13 +1035,16 @@ impl Plugin for ImportLensPlugin {
             }));
         }
 
+        // Hash BEFORE the UTF-8 conversion, so the conversion can consume the buffer. Doing it the
+        // other way needs a full copy of every module's source purely to keep the bytes alive for
+        // hashing, which is a graph-sized memcpy on a path that runs per keystroke.
+        self.record_read_time(&canonical, len, modified_millis, &bytes);
+
         // A binary module that is NOT a classified asset. Rolldown handles those itself; the caller
         // back-fills their fingerprints from `read_time_fingerprints`.
-        let Ok(source) = String::from_utf8(bytes.clone()) else {
+        let Ok(source) = String::from_utf8(bytes) else {
             return Ok(None);
         };
-
-        self.record_read_time(&canonical, len, modified_millis, &bytes);
 
         Ok(Some(HookLoadOutput {
             code: source.into(),
