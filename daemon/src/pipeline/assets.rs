@@ -2245,6 +2245,7 @@ mod tests {
     /// whole import Unmeasured for a package whose code measured perfectly — and the verdict is
     /// durable, so it is cached rather than retried. Disclosing the bytes the breach could not reach
     /// IS the pre-B2 floor: the number stands and says what is missing from it.
+
     #[test]
     fn a_ledger_breach_discloses_the_stylesheet_rather_than_failing_the_import() {
         let fixture = Fixture::new("breach", &[("index.css", ".a { color: red }\n")]);

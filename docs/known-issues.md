@@ -45,10 +45,9 @@ while eleven plan tasks sat untouched. "Real" was never the right bar.
 
 # Priority 0: release blockers
 
-Nothing is open. B1 (the all-inline-`type` over-count), B3 (native-binary mislabeling), and B2 (non-JS asset
-counting) have all landed and moved to Resolved below. B1 and B3 shipped together under a single
-`ANALYZER_REVISION` bump to `rolldown-1.1.x+4`; B2 followed in its own pull request and moved it to
-`rolldown-1.1.x+5`.
+Nothing is open. B1 (the all-inline-`type` over-count), B3 (native-binary mislabeling) and B2 (non-JS asset
+counting) have all landed and moved to [Resolved](#resolved). The revision each shipped under is in git;
+`ANALYZER_REVISION` in `daemon/src/cache/key.rs` holds the current value.
 
 ---
 
@@ -58,125 +57,41 @@ Real work, queued rather than abandoned. None of these is a wrong number or a we
 release, but each is worth turning into a task.
 
 ### D6: "Unavailable" is one label for several causes, and one unbundleable leaf discards the whole package
-**Status: Deferred — RESOLVER scope. The asset half is closed (2026-07-18); the native-addon half is closed (2026-07-19)** · The most visible gap in real projects · Fix universally, never per-package
+**Status: Deferred — RESOLVER scope** · The most visible gap in real projects · Fix universally, never per-package
 
-**The asset half is closed.** A directly imported image, icon or media file was one of these fatal leaves and
-is no longer: `import logo from './logo.png'` failed rolldown's loader with `InvalidData` because a PNG is not
-UTF-8, and `import mark from './mark.svg'` was worse — an SVG **is** valid UTF-8, so it reached OXC and was
-parsed as JavaScript, dying with `PARSE_ERROR: Unexpected JSX expression`. Either one made the whole package
-unmeasurable. Both are now classified `AssetClass::Unmeasured`, stubbed to `ModuleType::Empty` like any other
-asset, charged against the graph's aggregate byte budget, and **disclosed** at their real size rather than
-counted — so the JavaScript measures exactly and the shipped bytes are not silently absent.
+**What the user sees.** In a real `package.json`, some dependencies render **unavailable**. The bigger the
+project, the more of them, which reads as "the build was too big." It is not a size problem.
 
-The allowlist is deliberately an allowlist. An unknown extension still falls through to Rolldown, because
-intercepting something we cannot name would stub a module that might have been real JavaScript.
+**What still lands here.** Two classes remain, and the fatal-leaf classes that used to dominate this entry
+(native `.node` addons, `exports`-blocked deep-path requires, unresolvable bare specifiers, directly imported
+images and media) are closed — see [Resolved](#resolved):
 
-**The native-addon half is closed too (2026-07-19).** A compiled `.node` addon is now classified
-`AssetClass::Unmeasured` alongside an image: stubbed to `ModuleType::Empty` so the JavaScript graph measures,
-its bytes charged against the graph budget, and **disclosed** rather than counted — the addon ships as its own
-file beside the chunk and is outside the processed taxonomy, so the size omits it and has to say so, exactly
-as it does for an image. It earns its place on the interception allowlist by the strongest form of the allowlist's own
-argument: Node resolves the extension through `process.dlopen`, so a `.node` file cannot be JavaScript by
-definition of its name. The rule is the extension, never the package — `keytar`, `@node-rs/crc32` and every
-addon nobody has hit yet are one line in `classify_asset_class`, not three exceptions. Measured after the fix:
-`@vscode/vsce` reports 4,636,409 B raw / 448,379 B brotli and `ovsx` 4,783,340 B / 466,764 B, each at Medium
-confidence disclosing `keytar.node` at 707,584 B, where both previously reported nothing at all.
+- **No importable entry.** A package declaring no `main`/`module`/`exports`/`browser` at all — confirmed on
+  `@next/font`, whose real code is subpath-only (`./google`, `./local`) — is **Unmeasured**, and correctly so:
+  importing that specifier does not cost nothing, it does not resolve at all, and a zero would be a fabricated
+  number. The message now names the reason and lists the importable subpaths. What is open is the **stage**: it
+  is still the generic `entry_resolution`, so the badge cannot distinguish this from a broken install.
+- **An unfollowable dynamic `require`.** A leaf a bundler cannot statically resolve still fails the whole
+  package build, so a 2 MB graph with one such edge reports nothing rather than "at least 2 MB, excluding it."
 
-**The unresolvable-specifier half is closed too (2026-07-19).** A bare specifier naming a subpath of ANOTHER
-package is now externalized when the resolver refuses it, so the graph that did bundle is measured and the
-edge is disclosed on `external` rather than discarding the package. Rolldown already reasoned this way for
-`NotFound` — that is why `tsdown` measured — but its leniency keys on the error VARIANT, and the interesting
-failures never reached it: a package that ships a file and declines to export it makes oxc_resolver answer
-`PackagePathNotExported`, which fell to the catch-all and killed the build. `jest` now reports 4,422,177 B and
-`eslint-plugin-autofix` 3,402,095 B, each disclosing the two specifiers it could not cross. Path-like
-specifiers are deliberately NOT covered: a package that cannot find its own relative file really is broken,
-and failing is the honest answer.
+**The universal fix (never per-package).** At the engine/resolver boundary, treat every unbundleable leaf as an
+import boundary rather than a hard failure: measure the graph that did bundle as a **floor**, and disclose the
+uncounted leaf exactly as non-JS asset bytes are disclosed today. Same shape as D2 — a floor beats a blank —
+but triggered by a build error rather than a graph-limit breach. Pair it with a labelled reason in the UI
+("no importable entry", "unresolved: X") so the badge names the truth instead of a blanket "unavailable". Two
+probes already answer with a labelled Measured zero (`types_only`, `native_binary_only`); note
+`native_binary_only` ships with no SRS requirement behind it, so if a dedicated stage is added here, charter
+both at the same time. Do this at the boundary so it covers every package by construction; do NOT special-case
+any named dependency.
 
-**What is left in D6 is the no-importable-entry class, and it is now honest rather than confusing.** A package
-declaring no `main`/`module`/`exports`/`browser` at all (confirmed on `@next/font`, 2026-07-19) is still
-**Unmeasured** — correctly, because importing such a specifier does not cost nothing, it does not resolve at
-all, so a zero would be a fabricated number. What changed is the message: the resolver used to report the
-literal `index.js` guess by listing every spelling it probed (`index.js.js`, `index.js.mjs`,
-`index.js/index.js`), which reads as a malfunction; it now says the package declares no importable entry and
-names the subpaths that ARE importable (`./google`, `./local`). What remains open is only the UI half of D6's
-"labelled reason": the stage is still the generic `entry_resolution`, so the badge cannot distinguish this
-from a broken install. Two probes on that same branch already answer with a labelled Measured zero
-(`types_only`, and `native_binary_only` for B3) — note `native_binary_only` ships with no SRS requirement
-behind it; if a dedicated stage is added here, charter both in the SRS at the same time.
-
-**What the user sees.** In a real `package.json`, a growing fraction of dependencies render **unavailable**,
-and not only native CLIs. The bigger the project, the more of them, which reads as "the build was too big." It
-is not a size problem.
-
-**"Unavailable" collapses distinct causes into one word.** Measured against esbuild (Import Lens's own
-accuracy oracle) on the installed packages, every failure is fast (4 to 300 ms, never a timeout):
-
-| Package | Real cause (confirmed 2026-07-16) | Class |
-| --- | --- | --- |
-| `@vscode/vsce` | imports `keytar.node` (a compiled native addon) | native leaf — **fixed 2026-07-19**, measures with the addon disclosed |
-| `ovsx` | `keytar.node` plus `@node-rs/crc32`'s `.node` | native leaf — **fixed 2026-07-19**, measures with the addon disclosed |
-| `@biomejs/biome` | no importable entry (`bin` only); real tool is a native binary. Now handled by **B3** | native binary (B3) |
-| `jest` | `jest-pnp-resolver` does `require('jest-resolve/build/defaultResolver')`, which `jest-resolve` ships but does not export | unresolvable leaf — **fixed 2026-07-19**, 4,422,177 B with the boundary disclosed |
-| `eslint-plugin-autofix` | does `require('eslint/lib/rules')` (eslint's non-exported internals) from a dead version branch | unresolvable leaf — **fixed 2026-07-19**, 3,402,095 B with the boundary disclosed |
-| `@next/font` | **confirmed 2026-07-19**: declares no `main`/`module`/`exports`/`browser` at all (only `types`); its real code is subpath-only (`google/`, `local/`), so the root has no importable entry | no importable entry — still Unmeasured, but the message now names the reason and the real subpaths |
-
-Confirmed 2026-07-16: `jest` and `eslint-plugin-autofix` are not "pure JS that should measure and does not."
-Each fails because one transitive `require` targets a deep internal subpath of another package that the
-resolver cannot resolve, which is the "one leaf poisons the whole build" case below, not a hidden measurement
-bug. `@biomejs/biome` is native-binary-backed and moves to the B3 blocker.
-
-**Sharpened 2026-07-19, and it changes what the class IS.** The failing specifiers are not missing files and
-not a broken install — they are **`exports`-blocked deep subpaths on code branches that never execute**.
-`jest-resolve@29.7.0` really does ship `build/defaultResolver.js`, but its `exports` map allows only `.` and
-`./package.json`, so the deep path is forbidden by encapsulation rather than absent; `jest-pnp-resolver` asks
-for it inside a `try`, then asks for the older `build/default_resolver` spelling in the `catch`, and only ever
-runs at all under Yarn PnP. `eslint-plugin-autofix` is the same shape without the `try`: it branches on
-`Number.parseInt(eslint version)` and, against the installed eslint 8.57.1, takes
-`require("eslint/use-at-your-own-risk")` — which resolves perfectly — while the `>= 6` and `else` arms asking
-for `eslint/lib/rules` and `eslint/lib/built-in-rules-index` are dead code that Rolldown still resolves
-statically and fails on. `eslint/lib/rules/index.js` exists on disk too; eslint 8 simply does not export it.
-
-So "unavailable" is *less* honest here than this entry has been claiming. These packages are not unmeasurable:
-their live path resolves, and the build dies on requires that cannot run. The `no wrong number` verdict stands
-(nothing is shown), but the justification "it is the anti-fabricator working" does not — nothing is being
-protected against.
-
-**This is the same shape as D22, not a separate problem.** An alternative-specifier probe — several
-specifiers written where only one is expected to resolve — is a normal, deliberate ecosystem idiom, and a
-bundler statically resolves every arm of it: ~20 platform `.node` requires from napi-rs (D22, fixed), two
-spellings in a `try`/`catch` (`jest`), three version branches (`eslint-plugin-autofix`). What is left here is
-the arm that fails with an `exports` DENIAL rather than a plain absence: rolldown already externalizes an
-unresolvable bare specifier when the resolver answers `NotFound`, which is why `tsdown` measures, but
-`jest-resolve/build/defaultResolver` answers `PackagePathNotExported` — the file is on disk, the package
-simply does not export it — and that variant hard-fails the build. The distinction is the ERROR VARIANT, not
-the specifier's shape, and closing it is what would let these two measure.
-
-**The universal defect: one leaf poisons the whole number.** A single unbundleable edge (a dynamic `require`,
-an unresolvable specifier) anywhere in the graph fails the ENTIRE package build, so a 2 MB
-JS graph with one such leaf reports nothing instead of "at least 2 MB, excluding it." Import Lens ALREADY does
-the right thing for two classes: it externalizes an unresolvable bare import (`tsdown` measured at 134.7 kB
-where esbuild refused on `@tsdown/css`), and since 2026-07-19 it stubs and discloses a `.node` addon. The
-remaining gap is that this leniency does not extend to an unresolvable **deep-path** `require` or an
-unfollowable dynamic one.
-
-**The universal fix (never per-package).** At the engine/resolver boundary, treat every unbundleable leaf as
-an external boundary rather than a hard failure: measure the JS graph that did bundle as a **floor**, and
-disclose the uncounted leaf exactly as non-JS asset bytes are disclosed today (B2). Same shape as D2 (a floor beats a blank),
-but triggered by a build error, not only a graph-limit breach. Pair it with a labeled reason in the UI
-("native addon (keytar)", "no importable entry", "unresolved: X") so the badge names the truth instead of a
-blanket "unavailable." Do this at the boundary, so it covers every package by construction; do NOT special-case
-`keytar`, `jest`, or any named dependency.
-
-**Why it is not a blocker.** For the unresolvable-leaf case, "unavailable" is honest today: no wrong number,
-cannot wedge (it is the anti-fabricator working). This is a coverage and UX upgrade, not a correctness fix. The
-"pure-JS package that should measure and does not" suspicion was flushed out on 2026-07-16: `jest` and
-`eslint-plugin-autofix` both fail on a genuine unresolvable deep-path `require`, not a measurement bug. The
-native-binary packages that used to sit here (for example `@biomejs/biome`) are the correctness blocker B3.
+**Why it is not a blocker.** "Unavailable" is honest: no wrong number is shown, and nothing can wedge. This is
+a coverage and UX upgrade, not a correctness fix. The suspicion that a pure-JS package "should measure and does
+not" was flushed out — every instance traced to a genuine unresolvable or unbundleable leaf, not a measurement
+bug.
 
 **Prerequisite: get the distribution before designing the fix.** A diagnostic that runs the daemon over a real
-project's whole dependency set and buckets each "unavailable" by its actual stage (native-leaf, no-entry,
-unresolved, dynamic-require, graph-limit, timeout, parse) sizes the fix and surfaces any genuine bug. Build
-that first.
+project's whole dependency set and buckets each "unavailable" by its actual stage (no-entry, dynamic-require,
+graph-limit, timeout, parse) sizes the fix and surfaces any genuine bug. Build that first.
 
 ### D7: A stylesheet its own package declares droppable is counted anyway
 **Status: Accepted** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the B2 adversarial review
@@ -369,9 +284,26 @@ each one, so the work is bounded by the same eight-second budget as everything e
 stats are not charged to the byte ledger because a stat moves no bytes.
 
 Recorded rather than fixed because the bound already exists and adding a second accounting mechanism
-for zero-byte operations would be more machinery than the risk justifies. The per-attempt snapshot
-copy that made retries quadratic **was** fixed: the ledger is now consulted one path at a time
-instead of being cloned per attempt.
+for zero-byte operations would be more machinery than the risk justifies.
+
+### D28: A CSS `url()` reference is canonicalized and stat'd before dedup
+**Status: Accepted** · Measured 2026-07-19
+
+`collect_supported_asset` canonicalizes and stats every `url()` reference before the collection that
+would deduplicate them, so an icon-font stylesheet naming three files across fifty rules pays fifty
+pairs rather than three. The ledger's snapshot then canonicalizes again for a first-time counted
+resource. `plugin.rs` memoizes `canonicalize` for exactly this reason — on Windows it is a
+file-handle open — and this path has no such memo.
+
+Measured, release build, 20 runs: 50 references across 3 files costs **8.20 ms** per asset stage
+against **2.40 ms** for 3 references across the same 3 files. About **0.12 ms per reference**, so the
+worst realistic shape spends roughly 6 ms more than it needs to, per keystroke.
+
+Accepted rather than fixed: that is a fifth of the +33 ms the product already accepted to halve
+brotli overstatement, it moves no number and can wedge nothing, and a memo on this path sits directly
+on the read that freshness is derived from -- a cache there is worth more care than 6 ms buys. Revisit
+if the asset stage ever shows up in a p95 regression; the fix is a per-build memo keyed on the
+requested path, mirroring the one the plugin already has.
 
 ### D24: A loader suffix on a non-JavaScript, non-asset module still fails the build
 **Status: Accepted** · Blocker identified 2026-07-19
@@ -392,11 +324,6 @@ only for asset specifiers and widening it changes resolution semantics for every
 Revisit if a real package ships this; `?raw` and `?url` are app-author vocabulary, and a sweep of two
 project trees found no resolvable instance inside `node_modules`.
 
-**Correction.** An earlier version of this entry claimed the strip had to be narrowed because Rolldown
-gives its own proxy and helper modules suffixed ids. That was inferred, never verified, and wrong. The
-six tests that broke did so because `path_portion` scanned from index 0 and ate the literal `?` in a
-Windows verbatim prefix (`\\?\C:\...`), truncating every module id to `\\`. That is fixed, with a unit
-test on the prefix, and the strip is general.
 
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
