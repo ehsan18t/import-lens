@@ -651,6 +651,17 @@ fn compute_file_size_with(
         totals
             .dependency_fingerprints
             .extend(assets.freshness_fingerprints());
+        // A first-party dependency's manifest is a freshness input here for the same reason it is
+        // one on the per-import path: `sideEffects` and `exports` decide which modules are retained
+        // and which file an entry resolves to, so editing one moves this number. No module byte
+        // changes when it does, a manifest is never a graph module, and the extension's watcher
+        // globs only `**/node_modules/*/package.json` — so without this, nothing observes the edit
+        // and the file total stays stale while the per-import numbers beside it update.
+        totals.dependency_fingerprints.extend(
+            crate::pipeline::analyze::first_party_manifests(context, &artifact.loaded_paths)
+                .into_iter()
+                .filter_map(crate::cache::key::file_fingerprint_reading_hash),
+        );
         totals.dependency_fingerprints.extend(
             artifact
                 .unhashed_paths
@@ -1964,5 +1975,79 @@ mod tests {
             totals.degraded,
             "the combined build failed too, and that flag must survive as well"
         );
+    }
+
+    /// A first-party dependency's manifest decides which of its modules survive (`sideEffects`) and
+    /// which file its entry resolves to (`exports`), so editing one moves this number — while no
+    /// module byte changes, a manifest is never a graph module, and the extension's watcher globs
+    /// only `**/node_modules/*/package.json`. Nothing else observes such an edit, so leaving the
+    /// manifest out of the File Cost's freshness set serves a stale total while the per-import
+    /// numbers beside it, which DO hash it, update.
+    #[test]
+    fn a_first_party_manifest_is_a_file_cost_freshness_input() {
+        let workspace = std::env::temp_dir().join(format!(
+            "il-file-cost-manifest-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        // A dependency whose entry escapes node_modules into workspace source: what a linked or
+        // workspace package looks like once its paths are canonicalized.
+        let linked = workspace.join("node_modules").join("linked");
+        std::fs::create_dir_all(&linked).expect("linked package dir");
+        std::fs::write(
+            linked.join("package.json"),
+            r#"{"name":"linked","version":"1.0.0","module":"index.js"}"#,
+        )
+        .expect("linked manifest");
+        std::fs::write(
+            linked.join("index.js"),
+            "export * from \"../../packages/ui/src/index.js\";\n",
+        )
+        .expect("linked entry");
+
+        let ui = workspace.join("packages").join("ui");
+        std::fs::create_dir_all(ui.join("src")).expect("ui dirs");
+        std::fs::write(
+            ui.join("package.json"),
+            r#"{"name":"ui","version":"1.0.0"}"#,
+        )
+        .expect("ui manifest");
+        std::fs::write(
+            ui.join("src").join("index.js"),
+            "export const widget = () => 'widget';\n",
+        )
+        .expect("ui source");
+
+        let computed = compute_file_size(
+            &AnalysisContext {
+                workspace_root: workspace.clone(),
+                active_document_path: workspace.join("src").join("app.ts"),
+            },
+            &[SizedImport::installed(
+                crate::ipc::protocol::ImportRequest {
+                    specifier: "linked".to_owned(),
+                    package_name: "linked".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    named: vec!["widget".to_owned()],
+                    import_kind: ImportKind::Named,
+                    runtime: crate::ipc::protocol::ImportRuntime::Component,
+                },
+                None,
+            )],
+        );
+
+        let has_manifest = computed.dependency_fingerprints.iter().any(|fingerprint| {
+            fingerprint
+                .path
+                .replace('\\', "/")
+                .ends_with("packages/ui/package.json")
+        });
+        assert!(
+            has_manifest,
+            "the first-party manifest must be a freshness input: {:?}",
+            computed.dependency_fingerprints
+        );
+
+        std::fs::remove_dir_all(&workspace).ok();
     }
 }

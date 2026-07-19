@@ -88,7 +88,10 @@ pub fn analyze_resolved_import(
 /// Installed packages are excluded: their manifests cannot change without an install,
 /// which bumps the cache generation, and including them would balloon the fingerprint
 /// set for every build.
-fn first_party_manifests(context: &AnalysisContext, loaded_paths: &[PathBuf]) -> Vec<PathBuf> {
+pub(super) fn first_party_manifests(
+    context: &AnalysisContext,
+    loaded_paths: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut manifests = Vec::new();
     let mut seen = std::collections::HashSet::new();
     // Loaded paths are canonicalized (verbatim `\\?\C:\...` on Windows) while the

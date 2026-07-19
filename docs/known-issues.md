@@ -398,21 +398,6 @@ six tests that broke did so because `path_portion` scanned from index 0 and ate 
 Windows verbatim prefix (`\\?\C:\...`), truncating every module id to `\\`. That is fixed, with a unit
 test on the prefix, and the strip is general.
 
-### D27: The File Cost cache omits package manifests
-**Status: Deferred** · Pre-dates the asset feature · Found 2026-07-19
-
-The L1 File Cost freshness set carries `read_time_fingerprints`, asset fingerprints and unhashed
-paths, but no package manifests, while the per-import path hashes them via `first_party_manifests`.
-Editing a transitive first-party dependency's `package.json` — flipping `sideEffects`, repointing
-`exports` — changes the measured bytes but leaves the File Cost signature unchanged, and the watcher
-globs only `**/node_modules/*/package.json`, so a real path under `packages/` fires nothing. The stale
-total is served as the headline while the per-import number beside it updates.
-
-Bounded and self-healing: `computed_at_millis` is stamped once at insert and a hit updates only
-`last_used_millis`, so the disagreement lasts at most the 30 s re-verify TTL and cannot be extended by
-polling. Recorded here rather than fixed with the asset work because it is not an asset defect — the
-asset feature added `freshness_fingerprints()` to both paths symmetrically; this asymmetry predates it.
-
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
 
@@ -906,6 +891,7 @@ resolves to nothing is worse than the bloat.
 | ID | What it was | Fixed |
 | --- | --- | --- |
 | D25 | The always-on-screen file total could not say what share of it was not JavaScript | 2026-07-19 |
+| D27 | A first-party dependency manifest edit left the File Cost stale while per-import numbers updated | 2026-07-19 |
 | D26 | A waiter that could not use an admission wake swallowed it, so a freed permit sat idle | 2026-07-19 |
 | D23 | A resource-ledger breach discarded an import's complete JavaScript measurement | 2026-07-19 |
 | D22 | An asset input that was never there was recorded as an unreadable one, costing a correct build its cache | 2026-07-19 |
