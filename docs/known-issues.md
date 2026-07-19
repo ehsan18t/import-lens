@@ -398,20 +398,6 @@ six tests that broke did so because `path_portion` scanned from index 0 and ate 
 Windows verbatim prefix (`\\?\C:\...`), truncating every module id to `\\`. That is fixed, with a unit
 test on the prefix, and the strip is general.
 
-### D25: The status bar cannot say what its number is made of
-**Status: Deferred** · FR-018c requirement 1 · Found 2026-07-19
-
-`listener.ts` builds the status-bar state from `fileCostQuality(response)` alone, and that type carries
-no asset field, so `asset_breakdown` is dropped at the boundary. The always-on-screen total renders as
-a bare figure whose tooltip never mentions that part of it is stylesheet, while the import hover and
-the package.json hover both disclose composition. Clicking the item routes to the log command, so
-there is no affordance either; only the on-demand "Show Current File Size" command shows the
-breakdown.
-
-Nothing false is displayed — this is an incomplete explanation of a correct number, not a wrong one —
-so it is queued rather than fixed. The fix is to widen the status-bar state to carry the composition,
-which is a surface change rather than a model change.
-
 ### D27: The File Cost cache omits package manifests
 **Status: Deferred** · Pre-dates the asset feature · Found 2026-07-19
 
@@ -919,6 +905,7 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| D25 | The always-on-screen file total could not say what share of it was not JavaScript | 2026-07-19 |
 | D26 | A waiter that could not use an admission wake swallowed it, so a freed permit sat idle | 2026-07-19 |
 | D23 | A resource-ledger breach discarded an import's complete JavaScript measurement | 2026-07-19 |
 | D22 | An asset input that was never there was recorded as an unreadable one, costing a correct build its cache | 2026-07-19 |

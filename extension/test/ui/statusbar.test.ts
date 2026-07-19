@@ -7,11 +7,16 @@ import {
   statusBarTooltip,
 } from "../../src/ui/statusbarText.js";
 
-const sized = (bytes: number, quality: FileCostQuality): StatusBarState => ({
+const sized = (
+  bytes: number,
+  quality: FileCostQuality,
+  composition: readonly string[] = [],
+): StatusBarState => ({
   kind: "size",
   bytes,
   compression: "brotli",
   quality,
+  composition,
 });
 
 const fileCost: FileCostQuality = { quantity: "file-cost", short: false, imprecise: false };
@@ -123,4 +128,19 @@ upper bound, so budgets were not evaluated. Budget not evaluated.",
     /built as one bundle/u,
     "an over-count must not claim the clean-measurement explanation",
   );
+});
+
+/**
+ * FR-018c requires every surface showing the size to be able to say what it is made of, and the
+ * status bar is the only one on screen at all times. Carrying the quality alone leaves it unable to
+ * mention that most of a total is stylesheet, while the import hover and the on-demand command both
+ * say so — the number is correct and its explanation is not available anywhere the user is looking.
+ */
+test("statusBarTooltip says what a fused number is made of", () => {
+  const tooltip = statusBarTooltip(sized(40000, fileCost, ["CSS 12.3 kB", "font 4.0 kB"]));
+  assert.ok(tooltip.includes("Includes CSS 12.3 kB · font 4.0 kB."), tooltip);
+});
+
+test("statusBarTooltip stays silent when nothing but JavaScript is in the number", () => {
+  assert.ok(!statusBarTooltip(sized(40000, fileCost)).includes("Includes"));
 });

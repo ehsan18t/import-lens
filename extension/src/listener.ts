@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { importAnalysisStateFromDaemon } from "./analysis/daemonState.js";
 import { DebouncedDocumentScheduler } from "./analysis/debouncedDocumentScheduler.js";
 import { fileCostQuality } from "./analysis/fileCostQuality.js";
-import { documentFileCost } from "./analysis/fileSize.js";
+import { assetCompositionParts, documentFileCost } from "./analysis/fileSize.js";
 import {
   documentSettled,
   type FileSizeReadState,
@@ -445,6 +445,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       bytes: bytesForCompression(response, config.compression),
       compression: config.compression,
       quality: fileCostQuality(response),
+      composition: assetCompositionParts(response, config.compression),
     });
   }
 

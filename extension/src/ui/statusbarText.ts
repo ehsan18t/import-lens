@@ -24,7 +24,21 @@ export type StatusBarState =
   | { kind: "ready" }
   | { kind: "computing" }
   | { kind: "unavailable" }
-  | { kind: "size"; bytes: number; compression: CompressionFormat; quality: FileCostQuality };
+  | {
+      kind: "size";
+      bytes: number;
+      compression: CompressionFormat;
+      quality: FileCostQuality;
+      /**
+       * What share of the number is not JavaScript, one entry per asset kind present.
+       *
+       * FR-018c requires every surface showing the size to be able to say what it is made of, and
+       * this is the only one on screen at all times. Carrying the quality alone leaves it unable to
+       * mention that a 40 kB total is mostly stylesheet, while the hover and the on-demand command
+       * both say so.
+       */
+      composition: readonly string[];
+    };
 
 /** `~` marks a figure that is not the file's size (FR-031's existing mark for an inexact number). */
 const sizeLabel = (state: { bytes: number; compression: CompressionFormat }, exact: boolean) =>
@@ -60,7 +74,12 @@ export const statusBarTooltip = (state: StatusBarState): string => {
     case "size": {
       const exact = isFileCost(state.quality);
       const verdict = exact ? "" : " Budget not evaluated.";
-      return `Import Lens: ${fileCostQuantityName(state.quality)} (${sizeLabel(state, exact)}) — ${fileCostBecause(state.quality)}.${verdict}`;
+      // Composition first, because it explains the number itself rather than qualifying it: a total
+      // that silently includes stylesheet, wasm or font bytes is one the user cannot reconcile with
+      // the package they think they imported.
+      const composition =
+        state.composition.length > 0 ? ` Includes ${state.composition.join(" · ")}.` : "";
+      return `Import Lens: ${fileCostQuantityName(state.quality)} (${sizeLabel(state, exact)}) — ${fileCostBecause(state.quality)}.${composition}${verdict}`;
     }
     case "computing":
       return "Import Lens: Computing current file size";

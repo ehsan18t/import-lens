@@ -72,7 +72,7 @@ export const formatCurrentFileSizeSummary = (
  * Empty for a package with no assets, and empty for a daemon that predates the field, so neither
  * renders a bare "0 B" that reads as a measurement.
  */
-const assetCompositionParts = (
+export const assetCompositionParts = (
   response: FileSizeDocumentResponse,
   compression: CompressionFormat,
 ): string[] =>
