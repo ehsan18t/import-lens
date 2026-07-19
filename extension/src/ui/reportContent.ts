@@ -100,7 +100,10 @@ body{font-family:var(--vscode-font-family);padding:16px;color:var(--vscode-foreg
 .metric strong{display:block;font-size:18px;margin-top:2px}
 .note{color:var(--vscode-descriptionForeground);margin:0 0 16px;max-width:80ch}
 .treemap{margin:0 0 16px;max-width:100%;height:auto;background:var(--vscode-editorWidget-background)}
-.treemap text{fill:var(--vscode-editor-foreground);font-size:12px}
+/* The label sits ON the confidence bar, whose fill is a saturated charts.* colour (FR-031f fixes
+   that fill, so the bar cannot change). A stroke painted behind the glyphs keeps the text legible
+   over both the bar and the panel background, in either theme, without touching the colour mapping. */
+.treemap text{fill:var(--vscode-editor-foreground);font-size:12px;paint-order:stroke;stroke:var(--vscode-editorWidget-background);stroke-width:3px;stroke-linejoin:round}
 .legend{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 12px}
 .legend-item{display:inline-flex;align-items:center;gap:6px;font-weight:600}
 .legend-swatch{width:10px;height:10px;background:currentColor;border-radius:2px}
@@ -113,9 +116,14 @@ body{font-family:var(--vscode-font-family);padding:16px;color:var(--vscode-foreg
 .confidence-fill-medium{fill:${confidenceCssColor("medium")}}
 .confidence-fill-low{fill:${confidenceCssColor("low")}}
 .confidence-fill-unknown{fill:${confidenceCssColor("unknown")}}
+/* The Imports table carries 14 columns. Measured in a Beside panel (client 769px) it lays out at
+   1572px, so Confidence, Confidence Reasons, Top Modules and Warning fall off the right edge with
+   no way to reach them — the page itself scrolls sideways instead. The table scrolls in its own
+   box, so the rest of the report stays put. */
+.table-scroll{overflow-x:auto;margin:0 0 16px}
 table{border-collapse:collapse;width:100%}
 td,th{border-bottom:1px solid var(--vscode-panel-border);padding:6px 8px;text-align:left;vertical-align:top}
-th{font-weight:600}
+th{font-weight:600;white-space:nowrap}
 .empty{color:var(--vscode-descriptionForeground)}
 </style>
 </head>
@@ -133,21 +141,27 @@ th{font-weight:600}
 <section class="legend">${confidenceLegend}</section>
 <section>${treemap || `<p class="empty">No measured imports to summarize.</p>`}</section>
 <h2>Duplicate Imports</h2>
+<div class="table-scroll">
 <table>
 <thead><tr><th>Import</th><th>Count</th><th>${combinedImportCostLabel}</th><th>Sources</th></tr></thead>
 <tbody>${duplicateImports || `<tr><td class="empty" colspan="4">No duplicate import specifiers found.</td></tr>`}</tbody>
 </table>
+</div>
 <h2>Shared Modules</h2>
 <p class="note">${escapeHtml(sharedModuleNote)}</p>
+<div class="table-scroll">
 <table>
 <thead><tr><th>Module</th><th>Imports</th><th>Module Bytes</th><th>${combinedImportCostLabel}</th><th>Specifiers</th><th>Vendored</th><th>Path</th></tr></thead>
 <tbody>${sharedModules || `<tr><td class="empty" colspan="7">No shared top modules found.</td></tr>`}</tbody>
 </table>
+</div>
 <h2>Imports</h2>
+<div class="table-scroll">
 <table>
 <thead><tr><th>Package</th><th>Import</th><th>Source</th><th>Line</th><th>Runtime</th><th>Minified</th><th>Gzip</th><th>Brotli</th><th>Zstd</th><th>Shared in File</th><th>Confidence</th><th>Confidence Reasons</th><th>Top Modules</th><th>Warning</th></tr></thead>
 <tbody>${importRows || `<tr><td class="empty" colspan="14">No package imports found.</td></tr>`}</tbody>
 </table>
+</div>
 </body>
 </html>`;
 };
