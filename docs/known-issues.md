@@ -373,27 +373,6 @@ for zero-byte operations would be more machinery than the risk justifies. The pe
 copy that made retries quadratic **was** fixed: the ledger is now consulted one path at a time
 instead of being cloned per attempt.
 
-### D23: A ledger breach discards an import's JavaScript measurement
-**Status: Deferred** · Mechanism proven, no demonstrated trigger · Found 2026-07-19
-
-The asset resource ledger seeds `unique_files` with the whole JS graph and then checks asset reads
-against the same 2,000-file constant the graph itself is capped by (`asset_budget.rs`,
-`engine/limits.rs`). A package whose graph legally loaded, say, 1,995 modules therefore has five files
-of headroom, and a sixth `@import` child trips the file-count arm. `record_limit` poisons the context,
-so the stylesheet bundle fails at its next checkpoint, and `assets.rs` turns the live failure into an
-`Err` that no caller on the import path degrades — the JavaScript measurement, computed *before* the
-asset stage, is discarded and the import reports Unmeasured. `MODULE_GRAPH_LIMIT` is durable, so the
-verdict is cached.
-
-Not fixed now: two independent verification passes agreed on every mechanical link and neither could
-construct a triggering package — it needs a graph landing in the narrow band `(2000-K, 2000]`, and
-above 2,000 the build already fails identically. The user sees "Size unavailable" instead of a JS
-number plus a disclosure, which is deterministic given the bytes, so caching it is self-consistent
-rather than the transient-cached-durably defect. That is neither a wrong number nor a wedge, so it
-does not meet the fix-now bar — but it **is** below the pre-B2 floor FR-018a promises, which is why it
-is Deferred rather than Accepted. The fix is to disclose on breach instead of discarding, in the same
-place `file_size.rs` already degrades the File Cost aggregate.
-
 ### D24: A loader suffix on a non-JavaScript, non-asset module still fails the build
 **Status: Accepted** · Blocker identified 2026-07-19
 
@@ -432,19 +411,6 @@ breakdown.
 Nothing false is displayed — this is an incomplete explanation of a correct number, not a wrong one —
 so it is queued rather than fixed. The fix is to widen the status-bar state to carry the composition,
 which is a surface change rather than a model change.
-
-### D26: A lost wakeup can produce a spurious admission timeout
-**Status: Accepted** · Measured 2026-07-19
-
-Asset admission deadlines are absolute from each caller's entry, so concurrent callers hold different
-ones. A waiter woken by `notify_one` that finds its own deadline expired returns `AdmissionTimedOut`
-without re-notifying, and `wait_timeout`'s result is discarded, so a notification-driven wake is
-indistinguishable from a timeout. A second waiter can then sleep to its own deadline with a permit
-sitting free, and its import reports Unmeasured despite available capacity.
-
-Accepted: no permit is leaked — the next caller takes it — and the user gets a disclosed fallback
-rather than a wrong number, so this costs one import one measurement in a narrow interleaving. A
-`notify_all` on the timeout path would close it, at the cost of a thundering herd on a two-permit gate.
 
 ### D27: The File Cost cache omits package manifests
 **Status: Deferred** · Pre-dates the asset feature · Found 2026-07-19
@@ -953,6 +919,8 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| D26 | A waiter that could not use an admission wake swallowed it, so a freed permit sat idle | 2026-07-19 |
+| D23 | A resource-ledger breach discarded an import's complete JavaScript measurement | 2026-07-19 |
 | D22 | An asset input that was never there was recorded as an unreadable one, costing a correct build its cache | 2026-07-19 |
 | D11 | An asset the daemon could not read is disclosed, and that disclosure is cached | 2026-07-18 |
 | D12 | A file total that omits an asset is not structurally flagged as a floor | 2026-07-18 |

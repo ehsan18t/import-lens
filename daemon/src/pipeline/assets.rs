@@ -1161,13 +1161,51 @@ pub fn process_assets_bounded(
 /// the whole behaviour before B2, so the result is a strict improvement or a tie. It DOES fail when
 /// the shared build ledger is exhausted, which is a fact about the build rather than about any one
 /// asset.
+/// Fold a resource-ledger breach into the result as a DISCLOSURE rather than an error.
+///
+/// The import's JavaScript is measured before this stage runs, so failing the stage throws away a
+/// complete measurement and reports the whole import Unmeasured — below the pre-B2 floor FR-018a
+/// promises never to go under. A breach is exactly what a disclosure is for: the number stands, and
+/// it says what it could not reach. Freshness travels with it, so the result still invalidates when
+/// the files it did observe change.
+fn disclose_budget_breach(
+    processed: &mut ProcessedAssets,
+    assets: &[CollectedAsset],
+    failure: AssetBudgetFailure,
+) {
+    processed.read_paths.extend(failure.read_paths);
+    processed
+        .read_time_fingerprints
+        .extend(failure.read_time_fingerprints);
+    processed.failures.push(failure.message);
+    processed.uncounted.extend(
+        assets
+            .iter()
+            .filter(|asset| asset.kind == AssetKind::Css)
+            .map(|asset| UncountedAsset {
+                path: asset.path.clone(),
+                bytes: asset.raw_bytes(),
+            }),
+    );
+    if processed.uncounted.is_empty() {
+        // Nothing sizeable to disclose, but bytes were still left unread. Without this the result
+        // would read complete, which is the one thing a breach must never let it do.
+        processed.css_dependency_omissions.push(
+            "asset processing stopped at its resource limit, so bytes it had not reached are not \
+             in this size"
+                .to_owned(),
+        );
+    }
+}
+
 fn process_assets(
     assets: &[CollectedAsset],
     context: Arc<AssetProcessingContext>,
 ) -> Result<ProcessedAssets, AssetBudgetFailure> {
     let mut processed = ProcessedAssets::default();
     if let Some(failure) = context.failure() {
-        return Err(failure);
+        disclose_budget_breach(&mut processed, assets, failure);
+        return Ok(processed);
     }
     if assets.is_empty() {
         return Ok(processed);
@@ -1355,7 +1393,8 @@ fn process_stylesheets(
         });
 
     if let Some(failure) = context.failure() {
-        return Err(failure);
+        disclose_budget_breach(processed, assets, failure);
+        return Ok(Vec::new());
     }
 
     let mut referenced_assets = Vec::new();
@@ -2200,6 +2239,40 @@ mod tests {
     /// retry used to report each failure as it went and then hand back an error, so the outer arm
     /// disclosed them all a second time and the diagnostic doubled its own count and byte total — a
     /// wrong number in the one place that exists to be honest about what is missing.
+    /// A resource-ledger breach must not cost the import its JavaScript.
+    ///
+    /// That measurement is already complete when this stage runs, so failing the stage reports the
+    /// whole import Unmeasured for a package whose code measured perfectly — and the verdict is
+    /// durable, so it is cached rather than retried. Disclosing the bytes the breach could not reach
+    /// IS the pre-B2 floor: the number stands and says what is missing from it.
+    #[test]
+    fn a_ledger_breach_discloses_the_stylesheet_rather_than_failing_the_import() {
+        let fixture = Fixture::new("breach", &[("index.css", ".a { color: red }\n")]);
+        let assets = vec![css_asset(&fixture.path("index.css"))];
+
+        let processed = process_assets(
+            &assets,
+            test_context_with(&assets, AssetBudgetLimits::exhausted()),
+        )
+        .expect("a ledger breach must not fail the asset stage");
+
+        assert!(
+            processed.contributions.is_empty(),
+            "nothing was processed, so nothing may be counted: {processed:?}"
+        );
+        assert!(
+            processed.has_uncounted_assets(),
+            "unreached bytes make the result a floor: {processed:?}"
+        );
+        assert!(
+            processed
+                .uncounted
+                .iter()
+                .any(|asset| asset.path == assets[0].path),
+            "the stylesheet is disclosed at its raw size: {processed:?}"
+        );
+    }
+
     #[test]
     fn a_set_where_every_stylesheet_fails_discloses_each_of_them_exactly_once() {
         let fixture = Fixture::new(

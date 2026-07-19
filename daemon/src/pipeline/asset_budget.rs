@@ -41,6 +41,17 @@ impl AssetBudgetLimits {
         }
     }
 
+    /// A ledger with no room at all, for a test that exercises what a BREACH does rather than what
+    /// triggers one. In production the same state needs a graph near the 2,000-file cap; the
+    /// behaviour under breach is identical and is what matters.
+    #[cfg(test)]
+    pub(crate) fn exhausted() -> Self {
+        Self {
+            max_unique_files: 0,
+            ..Self::production()
+        }
+    }
+
     pub(crate) fn production() -> Self {
         Self {
             max_unique_files: MAX_GRAPH_MODULES,
