@@ -94,6 +94,29 @@ th {
   font-weight: 600;
   text-transform: uppercase;
 }
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: -12px 0 20px;
+  padding: 0;
+  list-style: none;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+}
+.legend li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  word-break: break-all;
+}
+.swatch {
+  display: inline-block;
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
 .file {
   word-break: break-all;
 }
@@ -152,6 +175,46 @@ const historyRowHtml = (item: BundleImpactHistoryItem): string => `
 <td class="bytes">${formatBytes(item.minifiedBytes)}</td>
 </tr>`;
 
+/**
+ * One line per file, never one line across files.
+ *
+ * A polyline is a claim of continuity: joining `app.ts` to `util.ts` to `app.ts` drew a V-shaped
+ * crash-and-recovery that happened to no file, under a label calling it a trend. Each file gets its
+ * own series so no stroke ever spans two of them. The y-scale stays global — a shared scale is what
+ * makes two series comparable — and x is the measurement's own timestamp, not its index in the list.
+ */
+const chartSeriesColors = [
+  "var(--vscode-charts-blue)",
+  "var(--vscode-charts-green)",
+  "var(--vscode-charts-orange)",
+  "var(--vscode-charts-purple)",
+  "var(--vscode-charts-yellow)",
+  "var(--vscode-charts-red)",
+] as const;
+
+const seriesColorFor = (index: number): string =>
+  chartSeriesColors[index % chartSeriesColors.length] ?? chartSeriesColors[0];
+
+/** Distinct files in first-seen order, each keeping its own measurements in the order given. */
+const historySeries = (
+  history: readonly BundleImpactHistoryItem[],
+): { fileName: string; items: BundleImpactHistoryItem[] }[] => {
+  const byFile = new Map<string, BundleImpactHistoryItem[]>();
+
+  for (const item of history) {
+    const existing = byFile.get(item.fileName);
+
+    if (existing) {
+      existing.push(item);
+      continue;
+    }
+
+    byFile.set(item.fileName, [item]);
+  }
+
+  return [...byFile].map(([fileName, items]) => ({ fileName, items }));
+};
+
 const historyChartSvg = (
   history: readonly BundleImpactHistoryItem[],
   maxBrotli: number,
@@ -161,31 +224,80 @@ const historyChartSvg = (
   const padding = 28;
   const chartWidth = width - padding * 2;
   const chartHeight = height - padding * 2;
-  const points = history.map((item, index) => {
-    const x =
-      padding +
-      (history.length === 1 ? chartWidth / 2 : (index / (history.length - 1)) * chartWidth);
-    const y = padding + chartHeight - (item.brotliBytes / maxBrotli) * chartHeight;
-    return { item, x, y };
-  });
-  const polyline = points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
-  const circles = points
-    .map(
-      (point) => `
+
+  const timestamps = history.map((item) => item.timestamp);
+  const oldest = timestamps.length > 0 ? Math.min(...timestamps) : 0;
+  const newest = timestamps.length > 0 ? Math.max(...timestamps) : 0;
+  const span = newest - oldest;
+
+  // Guard on the SPAN, not on the count. Two measurements sharing a timestamp make `span` zero, and
+  // an unguarded (t - oldest) / span is NaN — which renders as an empty `points` attribute and a
+  // silently missing line rather than an error.
+  const xFor = (timestamp: number): number =>
+    padding + (span === 0 ? chartWidth / 2 : ((timestamp - oldest) / span) * chartWidth);
+  const yFor = (brotliBytes: number): number =>
+    padding + chartHeight - (brotliBytes / maxBrotli) * chartHeight;
+
+  const series = historySeries(history);
+  const paths = series
+    .map(({ fileName, items }, seriesIndex) => {
+      const color = seriesColorFor(seriesIndex);
+      const points = items.map((item) => ({
+        item,
+        x: xFor(item.timestamp),
+        y: yFor(item.brotliBytes),
+      }));
+      const polyline = points
+        .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
+        .join(" ");
+      const circles = points
+        .map(
+          (point) => `
 <circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="4">
 <title>${escapeHtml(`${formatBytes(point.item.brotliBytes)} br - ${point.item.fileName}`)}</title>
 </circle>`,
+        )
+        .join("");
+
+      return `<g class="series" data-file="${escapeHtml(fileName)}">
+<polyline points="${polyline}" fill="none" stroke="${color}" stroke-width="3" />
+<g fill="${color}">${circles}</g>
+</g>`;
+    })
+    .join("");
+
+  const legend = series
+    .map(
+      ({ fileName }, seriesIndex) =>
+        `<li><span class="swatch" style="background:${seriesColorFor(seriesIndex)}"></span>${escapeHtml(fileName)}</li>`,
     )
     .join("");
 
-  return `<svg role="img" aria-label="File Cost trend" viewBox="0 0 ${width} ${height}">
+  return `<svg role="img" aria-label="${escapeHtml(chartAriaLabel(series))}" viewBox="0 0 ${width} ${height}">
 <line x1="${padding}" y1="${height - padding}" x2="${width - padding}" y2="${height - padding}" stroke="var(--vscode-panel-border)" />
 <line x1="${padding}" y1="${padding}" x2="${padding}" y2="${height - padding}" stroke="var(--vscode-panel-border)" />
 <text x="${padding}" y="18" fill="var(--vscode-descriptionForeground)" font-size="12">${escapeHtml(formatBytes(maxBrotli))} br</text>
 <text x="${padding}" y="${height - 8}" fill="var(--vscode-descriptionForeground)" font-size="12">0 B</text>
-<polyline points="${polyline}" fill="none" stroke="var(--importlens-accent)" stroke-width="3" />
-<g fill="var(--importlens-accent)">${circles}</g>
-</svg>`;
+${paths}
+</svg>
+<ul class="legend">${legend}</ul>`;
+};
+
+/**
+ * `role="img"` collapses the SVG to one leaf in the accessibility tree, so the per-point `<title>`
+ * elements are unreachable to a screen reader. The label therefore has to carry the one thing the
+ * old "File Cost trend" hid: that these are separate files, and which.
+ */
+const chartAriaLabel = (series: readonly { fileName: string }[]): string => {
+  if (series.length === 0) {
+    return "File Cost trend: no measurements";
+  }
+
+  if (series.length === 1) {
+    return `File Cost trend for ${series[0]?.fileName ?? ""}`;
+  }
+
+  return `File Cost trend, one line per file, for ${series.length} files: ${series.map((entry) => entry.fileName).join(", ")}`;
 };
 
 const escapeHtml = (value: string): string =>
