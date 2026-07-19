@@ -29,14 +29,15 @@
 //                 same stylesheet exactly once, which `minifiedTolerance` is what checks.
 //
 // NOT covered: the `.js`-containing-JSX retry path (`graph.rs`), which is a
-// parse-failure fallback; the mangler's exported-destructuring handling, which
-// `pipeline/bundle.rs` puts out of reach by stripping `export ` before minification;
-// and -- despite what this file used to claim -- Lightning CSS's `@import` handling.
-// The CSS fixture's whole reachable stylesheet graph contains ZERO `@import`
-// statements (checked 2026-07-17): it aggregates CSS through JS `import "./x.css"`
-// instead. So the `@import` tree walk, the cycle canonicalization and the synthetic
-// entry -- the most intricate part of B2 -- are covered by the unit tests in
-// `daemon/src/pipeline/assets.rs`, and by nothing here.
+// parse-failure fallback; and the mangler's exported-destructuring handling, which
+// `pipeline/bundle.rs` puts out of reach by stripping `export ` before minification.
+//
+// The `@import` tree walk IS covered, by the asset fixture: its entry sheet pulls two
+// children and both pull the same third one, so resolution, dedup of a shared sheet,
+// and a `url()` discovered inside a child are all measured against esbuild resolving
+// the same tree independently. Cycle canonicalization and the 256-file bound remain
+// unit-tested only -- both are refusal paths with no oracle equivalent, since esbuild
+// has no such limit to agree or disagree with.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -662,12 +663,43 @@ const writeAssetFixture = async (workspace, sourceRoot) => {
     `import "./styles.css";\nexport const widget = "widget";\n`,
     "utf8",
   );
+  // An `@import` TREE, not a single sheet, and the shape is the point. The entry pulls two children
+  // and both pull the same third one, so a bundler that resolves the tree correctly emits `shared`
+  // ONCE. That is the one claim about CSS bundling nothing else here can check: Lightning CSS and
+  // esbuild resolve and dedupe independently, so a tree walk that visits a sheet twice, drops a
+  // child, or fails to canonicalize a repeat shows up as a byte difference against the oracle.
+  //
+  // The `url()` sits in a CHILD sheet, so the font assertion below also covers a resource
+  // discovered through an `@import` rather than from the entry.
   await writeFile(
     path.join(packageRoot, "styles.css"),
-    `@font-face { font-family: Probe; src: url("./probe.woff2") format("woff2"); }\n` +
-      `.widget { font-family: Probe; }\n`,
+    `@import "./typography.css";\n@import "./layout.css";\n.widget { font-family: Probe; }\n`,
     "utf8",
   );
+  await writeFile(
+    path.join(packageRoot, "typography.css"),
+    `@import "./shared.css";\n` +
+      `@font-face { font-family: Probe; src: url("./probe.woff2") format("woff2"); }\n`,
+    "utf8",
+  );
+  await writeFile(
+    path.join(packageRoot, "layout.css"),
+    `@import "./shared.css";\n.panel { display: grid; grid-template-columns: 1fr 1fr; }\n`,
+    "utf8",
+  );
+  // Deliberately BULKY, and that is a property of the gate rather than of the fixture. This
+  // benchmark's total is dominated by an 8 kB font, so a shared sheet of a few dozen bytes could be
+  // counted twice and still land far inside `minifiedTolerance` — coverage that cannot fail. At
+  // ~2 kB a double-count moves the minified total by roughly 20%, an order of magnitude past the 2%
+  // bound, so a tree walk that stops deduplicating shows up as a failure instead of a rounding
+  // difference. The rules are plain and unprefixed so both minifiers agree on them.
+  const sharedRules = Array.from(
+    { length: 48 },
+    (_, index) =>
+      `.shared-${index} { margin: ${index}px; padding: ${index}px; border-width: ${index}px; ` +
+      `line-height: 1.${index}; letter-spacing: 0.0${index}em; }`,
+  ).join("\n");
+  await writeFile(path.join(packageRoot, "shared.css"), `${sharedRules}\n`, "utf8");
   await writeFile(path.join(packageRoot, "probe.woff2"), deterministicBytes(emittedFontBytes));
 
   const activeDocumentPath = path.join(sourceRoot, "asset-entry.js");
