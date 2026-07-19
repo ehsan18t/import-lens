@@ -4,8 +4,10 @@ import {
   buildRequestBody,
   buildUserPrompt,
   COMMIT_GROUPS,
+  capBody,
   extractContent,
   generateWithAi,
+  isBreakingCommit,
   isUsableChangelog,
   linkifyRefs,
   parseRepoUrl,
@@ -15,6 +17,53 @@ import {
   resolveRange,
   SYSTEM_PROMPT,
 } from "../generate-changelog.mjs";
+
+// v0.2.0 shipped six breaking commits and the generated notes announced none of them, because the
+// only signal for four of them is the `!` in the subject and nothing looked for it.
+test("isBreakingCommit recognises both the subject marker and the body footer", () => {
+  assert.equal(
+    isBreakingCommit({ subject: "feat(daemon)!: make rolldown the only bundler" }),
+    true,
+  );
+  assert.equal(isBreakingCommit({ subject: "fix!: drop a flag" }), true);
+  assert.equal(
+    isBreakingCommit({ subject: "perf(daemon): cache enumeration", body: "BREAKING CHANGE: x" }),
+    true,
+  );
+  assert.equal(isBreakingCommit({ subject: "feat(daemon): add a flag", body: "nothing" }), false);
+  // A scope containing an exclamation mark must not be read as the breaking marker.
+  assert.equal(isBreakingCommit({ subject: "fix(a!b): not breaking", body: "" }), false);
+  assert.equal(isBreakingCommit(), false);
+});
+
+// The footer is conventionally last, which is exactly where head-truncation drops it: one real
+// commit's sat at byte 3142 of a 3352-byte body and never reached the model.
+test("capBody keeps a breaking footer that falls past the cap", () => {
+  const footer = "BREAKING CHANGE: the daemon protocol changed";
+  const long = `${"x".repeat(900)}\n\n${footer}`;
+  const capped = capBody(long, 200);
+
+  assert.ok(capped.length <= 200, `expected the budget to hold, got ${capped.length}`);
+  assert.match(capped, /BREAKING CHANGE: the daemon protocol changed$/u);
+  assert.equal(capBody("short body", 200), "short body");
+  assert.equal(capBody(undefined, 200), "");
+});
+
+test("buildUserPrompt tags breaking commits so the model cannot miss them", () => {
+  const prompt = buildUserPrompt("0.2.0", [
+    { short: "9a09570", subject: "feat(daemon)!: make rolldown the only bundler", body: "" },
+    { short: "abc1234", subject: "feat(ui): add a panel", body: "" },
+  ]);
+
+  assert.match(prompt, /^- \[9a09570\] \[BREAKING\] feat\(daemon\)!: /mu);
+  assert.match(prompt, /^- \[abc1234\] feat\(ui\): add a panel$/mu);
+});
+
+test("the system prompt demands a Breaking Changes section first", () => {
+  assert.match(SYSTEM_PROMPT, /Breaking Changes/u);
+  assert.match(SYSTEM_PROMPT, /\[BREAKING\]/u);
+  assert.match(SYSTEM_PROMPT, /FIRST, before all other sections/u);
+});
 
 test("resolveRange diffs from the previous tag, or full history when there is none", () => {
   assert.equal(resolveRange("v0.1.0"), "v0.1.0..HEAD");

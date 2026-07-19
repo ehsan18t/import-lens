@@ -5,11 +5,27 @@
 
 [changelog]
 header = ""
+# Breaking changes are rendered FIRST and separately, before the type groups. `protect_breaking_commits`
+# only keeps them from being filtered out — without this block they render inside Features or Bug Fixes
+# with the `!` invisible, which is how six breaking commits shipped as ordinary entries once.
 body = """
+{% set breaking = commits | filter(attribute="breaking", value=true) %}
+{% if breaking | length > 0 %}
+### Breaking Changes
+{% for commit in breaking %}
+- {{ commit.message | split(pat="\n") | first | upper_first }} ({{ commit.id | truncate(length=7, end="") }})
+{%- if commit.breaking_description and commit.breaking_description != commit.message %}
+  {{ commit.breaking_description | split(pat="
+
+") | first | replace(from="
+", to=" ") | trim | truncate(length=220) }}
+{%- endif %}
+{%- endfor %}
+{% endif %}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | split(pat="-->") | last | trim }}
 {% for commit in commits %}
-- {{ commit.message | split(pat="\n") | first | upper_first }} ({{ commit.id | truncate(length=7, end="") }})
+- {{ commit.message | split(pat="\n") | first | upper_first }}{% if commit.breaking %} **(breaking)**{% endif %} ({{ commit.id | truncate(length=7, end="") }})
 {%- endfor %}
 {% endfor %}"""
 trim = true

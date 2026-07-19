@@ -33,8 +33,15 @@ export const SYSTEM_PROMPT = [
   "Rules:",
   "- Never invent changes that are not present in the commits.",
   "- Use the body detail to write clearer, more user-facing bullets, but never introduce changes absent from the commits.",
-  "- Group entries under these sections when applicable: Features, Bug Fixes, Performance, Documentation, Other.",
+  "- Group entries under these sections when applicable: Breaking Changes, Features, Bug Fixes, Performance, Documentation, Other.",
   "- Omit any section that has no entries.",
+  // A release note that buries a breaking change has failed at the one job the reader
+  // cannot do for themselves. Both markers matter: several commits carry `!` with no
+  // footer, and a footer can appear anywhere in the body.
+  "- BREAKING CHANGES ARE THE MOST IMPORTANT PART. A commit is breaking when its entry is tagged '[BREAKING]' (the tag appears right after the short hash). Every tagged commit MUST get a bullet under a 'Breaking Changes' section placed FIRST, before all other sections, and must also appear in its normal section when it is also a feature or fix.",
+  "- A Breaking Changes bullet must say what actually changes for someone upgrading — what breaks, what moves, what they must do — not merely restate the subject line. If the body explains the consequence (numbers change, caches repopulate, a command is renamed), lead with that consequence.",
+  "- Prefer the reader's point of view over the implementation's. Bullets should describe what a user of the software observes, not how it was built. Merge several commits that together deliver one user-visible change into a single bullet rather than listing each step.",
+  "- Drop changes with no user-visible effect: test-only work, CI and build configuration, dependency bumps, internal refactors, and dev tooling. Keep an internal change ONLY when its effect is observable (for example a cache invalidation that forces recomputation, or a fix to a number the product displays).",
   "- One short, user-facing bullet per meaningful change; merge duplicates; drop pure noise (formatting, version bumps, merge commits).",
   "- Each commit below is prefixed with its short hash in square brackets, e.g. '[abc1234]'.",
   "- End every bullet with the short hash(es) of the commit(s) it summarizes in parentheses, e.g. '(abc1234)' or '(abc1234, def5678)' when a bullet merges several commits; use only the provided hashes and never invent one.",
@@ -44,6 +51,46 @@ export const SYSTEM_PROMPT = [
 
 // Cap each commit body so a few verbose commits cannot blow the prompt budget.
 const BODY_CAP = 600;
+
+/** Conventional-commit breaking marker in the subject: `type!:` or `type(scope)!:`. */
+const BREAKING_SUBJECT = /^[a-z]+(\([^)]*\))?!:/u;
+
+/** A `BREAKING CHANGE:` footer and its continuation lines, anywhere in the body. */
+const BREAKING_FOOTER = /^BREAKING[ -]CHANGE:[^\n]*(?:\n(?!\n)[^\n]*)*/mu;
+
+/**
+ * Both markers, because the repository uses both and neither implies the other.
+ *
+ * Four of the six breaking commits in the v0.1.0..v0.2.0 range carry only the `!` in the subject
+ * with no footer at all, so a footer-only check misses them; `9a09570` carries both. The generated
+ * notes for that release listed every one of them as an ordinary feature or fix.
+ */
+export const isBreakingCommit = ({ subject = "", body = "" } = {}) =>
+  BREAKING_SUBJECT.test(subject) || BREAKING_FOOTER.test(body);
+
+/**
+ * Truncate a body to the prompt budget WITHOUT discarding its breaking-change footer.
+ *
+ * A footer is conventionally last, which is exactly where a fixed head-truncation drops it:
+ * `200a8f5`'s sat at byte 3142 of a 3352-byte body and never reached the model. When the footer
+ * falls outside the cap it is appended in place of the equivalent tail, so the budget still holds.
+ */
+export const capBody = (body, cap = BODY_CAP) => {
+  const trimmed = (body ?? "").trim();
+
+  if (trimmed.length <= cap) {
+    return trimmed;
+  }
+
+  const footer = trimmed.match(BREAKING_FOOTER)?.[0]?.trim() ?? "";
+
+  if (!footer || trimmed.indexOf(footer) < cap) {
+    return trimmed.slice(0, cap).trim();
+  }
+
+  const room = Math.max(0, cap - footer.length - 1);
+  return `${trimmed.slice(0, room).trim()}\n${footer}`;
+};
 
 // Groq is both a named provider and the default for the back-compat custom slot.
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
@@ -110,10 +157,10 @@ export const buildUserPrompt = (version, commits) =>
   [
     `Release version: ${version}`,
     "",
-    "Commits (short hash, subject, then body detail):",
-    ...commits.map(({ short, subject, body }) => {
-      const head = `- [${short}] ${subject}`;
-      const trimmed = body ? body.slice(0, BODY_CAP).trim() : "";
+    "Commits (short hash, subject, then body detail). A '[BREAKING]' tag after the hash marks a breaking change:",
+    ...commits.map((commit) => {
+      const head = `- [${commit.short}]${isBreakingCommit(commit) ? " [BREAKING]" : ""} ${commit.subject}`;
+      const trimmed = capBody(commit.body);
       return trimmed ? `${head}\n  ${trimmed.replace(/\n/gu, "\n  ")}` : head;
     }),
   ].join("\n");
