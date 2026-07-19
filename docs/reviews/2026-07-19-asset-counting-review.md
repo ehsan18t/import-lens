@@ -44,9 +44,21 @@ The full reasoning for each deferral is in `known-issues.md`; the short version 
 demonstrated trigger and shows no wrong number, A12 is an incomplete explanation of a correct number,
 A14 costs one import one measurement in a narrow interleaving, and A9 pre-dates this feature.
 
-One regression was caught during the work and is worth recording: the first version of the A2 fix
-stripped loader suffixes unconditionally, which claimed Rolldown's own proxy and helper module ids and
-broke six file-size tests. The narrowing to asset-classifying paths is why D24 exists.
+One regression was introduced and fixed during the work, and the first diagnosis of it was wrong in a
+way worth recording. The initial A2 fix stripped loader suffixes unconditionally and broke six
+file-size tests. I attributed that to Rolldown's own proxy and helper module ids, narrowed the fix to
+asset-classifying paths, and wrote that explanation into a commit message, a code comment and a
+known-issues entry — **without ever verifying it**.
+
+Instrumenting the load hook showed the real cause: `path_portion` scanned from index 0 and ate the
+literal `?` inside a Windows verbatim prefix (`\\?\C:\...`), truncating every module id on Windows to
+`\\`. Rolldown's proxy modules had nothing to do with it. With that fixed the strip is general, so the
+narrowing was never needed, and `./util.js?v=1` now measures too. A unit test pins the prefix.
+
+The residual limit (`./payload.json?raw`) is real but has a different, verified cause — Rolldown
+infers module type from the id's extension — and is recorded as D24 with both candidate fixes and why
+neither is worth its cost today. The lesson generalises: a cause you inferred from a passing test is a
+hypothesis, and this repo's own rule is to reproduce it before acting on it.
 
 ## Verification levels
 

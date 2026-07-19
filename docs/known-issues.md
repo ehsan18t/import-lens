@@ -394,18 +394,30 @@ does not meet the fix-now bar — but it **is** below the pre-B2 floor FR-018a p
 is Deferred rather than Accepted. The fix is to disclose on breach instead of discarding, in the same
 place `file_size.rs` already degrades the File Cost aggregate.
 
-### D24: A non-asset loader suffix still fails the build
-**Status: Accepted** · Scope of the 2026-07-19 fix
+### D24: A loader suffix on a non-JavaScript, non-asset module still fails the build
+**Status: Accepted** · Blocker identified 2026-07-19
 
-A module id carrying a loader suffix is stripped before classification only when the stripped path
-classifies as an asset. `./data.json?raw` or `./Component.svelte?raw` therefore still reach Rolldown
-as a literal path the filesystem rejects, and the package goes unmeasurable.
+The load hook strips a loader suffix from any module id and falls back to the literal path when the
+stripped one is not on disk, so `./font.woff2?url` (asset, stubbed) and `./util.js?v=1` (JavaScript,
+parsed) both measure. `./payload.json?raw` does not: the file is found, but **Rolldown infers module
+type from the id's extension**, and `payload.json?raw` is not `.json`, so JSON text reaches the
+JavaScript parser and the build fails with `PARSE_ERROR` instead of the earlier filesystem error.
+Same outcome for the package, different stage.
 
-Deliberate. Stripping unconditionally claims ids that Rolldown owns: its proxy and helper modules
-carry suffixed ids too, the file behind the stripped path exists, and the load hook then hands
-Rolldown source for a module it did not ask us to load. That regressed six file-size tests when
-attempted, which is how the narrowing was chosen. Revisit only with a way to tell a loader suffix from
-a bundler-internal one — the extension allowlist is that discriminator today.
+Not fixed because both routes cost more than the shape is worth. Overriding the module type needs an
+extension-to-`ModuleType` table, which duplicates inference Rolldown already owns — the second
+mechanism this codebase's rules exist to prevent. Stripping the suffix in `resolve_id` instead would
+let Rolldown's own inference see a clean id, which is the right shape, but that arm currently fires
+only for asset specifiers and widening it changes resolution semantics for every module in the graph.
+
+Revisit if a real package ships this; `?raw` and `?url` are app-author vocabulary, and a sweep of two
+project trees found no resolvable instance inside `node_modules`.
+
+**Correction.** An earlier version of this entry claimed the strip had to be narrowed because Rolldown
+gives its own proxy and helper modules suffixed ids. That was inferred, never verified, and wrong. The
+six tests that broke did so because `path_portion` scanned from index 0 and ate the literal `?` in a
+Windows verbatim prefix (`\\?\C:\...`), truncating every module id to `\\`. That is fixed, with a unit
+test on the prefix, and the strip is general.
 
 ### D25: The status bar cannot say what its number is made of
 **Status: Deferred** · FR-018c requirement 1 · Found 2026-07-19

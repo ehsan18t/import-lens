@@ -332,20 +332,32 @@ impl BuildState {
 /// so the two halves disagreed about what a module id names: `./font.woff2?url` was recognised on
 /// the way in and unclassifiable on the way out.
 fn path_portion(specifier: &str) -> &str {
-    let query = specifier.find('?');
+    // A Windows verbatim (extended-length) path carries a literal `?` INSIDE its prefix —
+    // `\\?\C:\...` — and that `?` is part of the path, not a loader query. Scanning from index 0
+    // truncates every such module id to `\\`, which is what `fs::canonicalize` hands back on Windows
+    // for the whole graph. Skip the prefix, then look for a suffix in what follows.
+    const VERBATIM_PREFIX: &str = r"\\?\";
+    let offset = if specifier.starts_with(VERBATIM_PREFIX) {
+        VERBATIM_PREFIX.len()
+    } else {
+        0
+    };
+    let scanned = &specifier[offset..];
+
+    let query = scanned.find('?');
     // A leading `#` is a package-import specifier, not a URL fragment. A later `#` is still a
     // loader-style fragment and is removed before extension classification.
-    let fragment = if let Some(package_import) = specifier.strip_prefix('#') {
+    let fragment = if let Some(package_import) = scanned.strip_prefix('#') {
         package_import.find('#').map(|index| index + 1)
     } else {
-        specifier.find('#')
+        scanned.find('#')
     };
     let path_end = query
         .into_iter()
         .chain(fragment)
         .min()
-        .unwrap_or(specifier.len());
-    &specifier[..path_end]
+        .unwrap_or(scanned.len());
+    &specifier[..offset + path_end]
 }
 
 fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Option<PathBuf> {
@@ -811,27 +823,11 @@ impl Plugin for ImportLensPlugin {
         // asset is never stubbed, Rolldown reads the id verbatim, and the whole build dies on a path
         // the filesystem rejects — `?` is an illegal Windows filename character. That failure is
         // durable, so the package stayed unmeasurable until its bytes changed.
-        // Strip the suffix ONLY when doing so reveals an asset. Rolldown gives its own modules
-        // suffixed ids too (proxy and helper modules), and a bare strip claims those: the file
-        // behind the stripped path exists, so this hook would load it and hand Rolldown source for a
-        // module it owns. Requiring the stripped path to classify keeps the rescue to the case that
-        // was broken, and matches what the resolve half already does with the same helper. A file
-        // whose real name contains `#` is unaffected, because the stripped form will not classify.
         let literal = Path::new(args.id);
         let stripped = Path::new(path_portion(args.id));
-        let path = if stripped != literal && classify_asset_class(stripped).is_some() {
-            stripped
-        } else {
-            literal
-        };
-        if !path.is_absolute() {
+        if !stripped.is_absolute() {
             return Ok(None);
         }
-        let asset_class = classify_asset_class(path);
-        let asset_kind = match asset_class {
-            Some(AssetClass::Counted(kind)) => Some(kind),
-            _ => None,
-        };
 
         // §7.3: reject an oversized module BEFORE reading it. The limit exists to
         // bound memory, so reading first would blow the very bound being enforced.
@@ -839,8 +835,30 @@ impl Plugin for ImportLensPlugin {
         // covers modules this hook hands back to Rolldown below.
         // Resolve the identity BEFORE the stat/read pair. Canonicalizing after the read can pair
         // bytes from an old symlink target with the path of a newly-retargeted one.
-        let canonical = self.state.canonical_path(path);
-        let metadata = match tokio::fs::metadata(&canonical).await {
+        //
+        // Strip to rescue a loader suffix, never to lose a real file. `?` is illegal in a Windows
+        // filename but legal on Linux, and `#` is legal on both, so a stripped path that is not on
+        // disk means the suffix was part of the name — fall back to the literal id. The second stat
+        // runs only where the alternative was an outright build failure.
+        let mut path = stripped;
+        let mut canonical = self.state.canonical_path(stripped);
+        let mut stat = tokio::fs::metadata(&canonical).await;
+        if stat.is_err() && literal != stripped {
+            let literal_canonical = self.state.canonical_path(literal);
+            if let Ok(metadata) = tokio::fs::metadata(&literal_canonical).await {
+                path = literal;
+                canonical = literal_canonical;
+                stat = Ok(metadata);
+            }
+        }
+
+        let asset_class = classify_asset_class(path);
+        let asset_kind = match asset_class {
+            Some(AssetClass::Counted(kind)) => Some(kind),
+            _ => None,
+        };
+
+        let metadata = match stat {
             Ok(metadata) => metadata,
             Err(error) => {
                 if asset_class.is_some() {
@@ -1089,6 +1107,36 @@ impl Plugin for ImportLensPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Windows verbatim (extended-length) path carries a literal `?` inside its prefix, and
+    /// `fs::canonicalize` returns that form for the whole module graph on Windows. Treating it as a
+    /// loader query truncated every module id to `\\`, so the load hook stat'd a nonsense path,
+    /// handed every module back to Rolldown, and the file-size aggregate stopped being cacheable —
+    /// a whole-build failure from a one-character scan offset.
+    ///
+    /// The suffix cases below are what the helper is FOR; the verbatim case is what it must not eat.
+    #[test]
+    fn path_portion_strips_a_loader_suffix_without_eating_a_verbatim_prefix() {
+        assert_eq!(
+            path_portion(r"\\?\C:\pkg\node_modules\lib\index.js"),
+            r"\\?\C:\pkg\node_modules\lib\index.js",
+            "the `?` in a verbatim prefix is part of the path, not a query"
+        );
+        assert_eq!(
+            path_portion(r"\\?\C:\pkg\font.woff2?url"),
+            r"\\?\C:\pkg\font.woff2",
+            "a real suffix is still stripped from a verbatim path"
+        );
+        assert_eq!(path_portion("./font.woff2?url"), "./font.woff2");
+        assert_eq!(path_portion("./data.json?raw"), "./data.json");
+        assert_eq!(path_portion("./icon.svg#iefix"), "./icon.svg");
+        assert_eq!(path_portion("./plain.js"), "./plain.js");
+        assert_eq!(
+            path_portion("#font.woff2"),
+            "#font.woff2",
+            "a leading `#` is a package-import specifier, not a fragment"
+        );
+    }
 
     #[test]
     fn supported_asset_specifiers_become_observation_candidates_without_reinterpreting_dot_names() {
