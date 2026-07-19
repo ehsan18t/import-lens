@@ -2,7 +2,7 @@
   "name": "import-lens",
   "displayName": "Import Lens",
   "description": "VS Code import size analyzer backed by a native Rust daemon.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "ehsan18t",
   "license": "MIT",
   "repository": {
