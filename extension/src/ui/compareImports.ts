@@ -67,8 +67,12 @@ export const compareImports = async (
     return;
   }
 
-  const { items, warning } = compareImportItemsForResults(
-    response?.imports.flatMap((item) => (item.result ? [item.result] : [])) ?? null,
+  // The whole response, not just the results: an item with no result still names the specifier the
+  // user asked about and carries the daemon's reason for it, and dropping it here is what made a
+  // four-package comparison silently render two rows.
+  const { items, comparedCount, excludedCount, warning } = compareImportItemsForResults(
+    specifiers,
+    response?.imports ?? null,
   );
 
   if (warning) {
@@ -76,8 +80,18 @@ export const compareImports = async (
     return;
   }
 
-  await vscode.window.showQuickPick(items, {
-    title: "Import Lens Import Comparison",
+  const pickItems: vscode.QuickPickItem[] = items.map((item) =>
+    item.separator
+      ? { label: item.label, kind: vscode.QuickPickItemKind.Separator }
+      : { label: item.label, detail: item.detail },
+  );
+
+  await vscode.window.showQuickPick(pickItems, {
+    title:
+      excludedCount > 0
+        ? `Import Lens Import Comparison — ${comparedCount} of ${comparedCount + excludedCount} compared`
+        : "Import Lens Import Comparison",
     placeHolder: "Imports sorted by Brotli size",
+    matchOnDetail: true,
   });
 };
