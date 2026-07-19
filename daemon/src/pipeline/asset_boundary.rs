@@ -93,6 +93,14 @@ impl Admission {
         loop {
             let remaining = deadline.remaining();
             if remaining.is_zero() {
+                // Pass on a wake this waiter cannot use. `release` notifies ONE waiter, so if the
+                // one it picks has already expired and leaves silently, the freed permit sits idle
+                // while a waiter that could still use it sleeps to its own deadline and also fails.
+                // Deadlines are absolute per call, so waiters routinely expire in a different order
+                // than they arrived.
+                if *available > 0 {
+                    self.changed.notify_one();
+                }
                 return Err(AssetBoundaryError::AdmissionTimedOut {
                     limit: deadline.limit,
                 });
