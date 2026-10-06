@@ -21,13 +21,23 @@ const MISS_DRAIN_WORKERS: usize = ENGINE_PERMITS + 2;
 
 /// Run `run` over every item with a fixed number of scoped worker threads, returning
 /// `(index, result)` in completion order.
+///
+/// A lone item runs on the caller: the caller blocks on the result either way, and an OS
+/// thread spawn costs more than many a classified miss.
 fn drain_bounded<T, R, F>(items: &[T], workers: usize, run: F) -> Vec<(usize, R)>
 where
     T: Sync,
     R: Send,
     F: Fn(usize, &T) -> (usize, R) + Sync,
 {
-    let workers = workers.min(items.len()).max(1);
+    if items.len() <= 1 {
+        return items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| run(index, item))
+            .collect();
+    }
+    let workers = workers.min(items.len());
     let cursor = AtomicUsize::new(0);
     let completed = Mutex::new(Vec::with_capacity(items.len()));
 
@@ -290,6 +300,31 @@ mod tests {
 
         assert_eq!(output, vec![0, 1, 2, 3]);
         assert_eq!(peak.load(Ordering::Acquire), ENGINE_PERMITS);
+    }
+
+    /// A lone miss must not pay for a thread spawn: every drain blocks its caller anyway.
+    #[test]
+    fn a_lone_item_runs_on_the_calling_thread() {
+        let caller = thread::current().id();
+        let ran_on = Mutex::new(Vec::new());
+        let record = |_: usize| {
+            ran_on
+                .lock()
+                .expect("thread ids")
+                .push(thread::current().id())
+        };
+
+        drain_misses_owned(vec![0], record);
+        drain_ordered(&[0], |index, _: &i32| record(index));
+        drain_classified(
+            &[0],
+            |_, item: &i32| Err::<(), i32>(*item),
+            |index, _, _| {
+                record(index);
+            },
+        );
+
+        assert_eq!(*ran_on.lock().expect("thread ids"), vec![caller; 3]);
     }
 
     #[test]
