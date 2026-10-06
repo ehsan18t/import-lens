@@ -326,15 +326,6 @@ reusing the per-import module builds, which also makes ordering deterministic) r
 the "redesign at third recurrence" rule, that redesign is the first priority after release blockers and major
 fixes.
 
-### M1: With the cache populated, a heavy session holds about 70 to 100 MB more than its live data
-**Status: Deferred**
-
-Over a 60-file workspace importing 25 packages, the daemon idles at about 130 MB resident on Linux and 156 MB working set on Windows while its live heap is 15 to 45 MB; about 95 MB of the Linux figure is allocator arenas. After a full cache clear it drops to 80 MB (Linux) and 76 MB (Windows), and on the release-gate fixtures to 31 to 38 MB.
-
-Idle reclaim (ADR-0007) returns every page an idle thread no longer uses, but not a page that still holds one live block. Cache entries and resolver state are allocated by whichever handler or worker thread computed them, interleaved with the transient allocations of the build that produced them, so after the build is freed many pages stay resident for a few live blocks each. Collecting harder, collecting on thread exit, mimalloc's `page_reclaim_on_free` and `page_full_retain` options, and running the connection loop on a worker were each measured and moved nothing.
-
-Not fixed now because it is neither a wrong number nor a wedge, and the size does not grow over a session. The likely fix is to allocate long-lived results (cache entries, resolver caches) from a dedicated mimalloc heap so they share pages with each other instead of with build garbage.
-
 ---
 
 # Priority 2: accepted, minor or cosmetic

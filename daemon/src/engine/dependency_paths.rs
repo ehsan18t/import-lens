@@ -77,7 +77,16 @@ impl DependencyPathIndex {
         {
             sets.remove(&victim);
         }
-        sets.insert(key, PathSet { paths, last_used });
+        // Kept for the session, so copied into the long-lived heap (see `reclaim::long_lived`).
+        crate::reclaim::long_lived(|| {
+            sets.insert(
+                key.clone(),
+                PathSet {
+                    paths: paths.clone(),
+                    last_used,
+                },
+            )
+        });
     }
 
     fn get(&self, key: &DependencyKey) -> Option<Vec<PathBuf>> {

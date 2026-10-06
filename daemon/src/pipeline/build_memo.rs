@@ -177,7 +177,7 @@ impl<V: Clone> BuildMemo<V> {
         }
 
         let key = (entry_path.to_path_buf(), runtime);
-        let first_party = fingerprints
+        let first_party: Vec<FileFingerprint> = fingerprints
             .iter()
             .filter(|fingerprint| !fingerprint_is_installed(fingerprint))
             .cloned()
@@ -198,18 +198,21 @@ impl<V: Clone> BuildMemo<V> {
             }
         }
 
-        entries.insert(
-            key,
-            Entry {
-                value,
-                fingerprints,
-                first_party,
-                verified_at: None,
-                generation,
-                stamp,
-                used_at,
-            },
-        );
+        // Kept for the session, so copied into the long-lived heap (see `reclaim::long_lived`).
+        crate::reclaim::long_lived(|| {
+            entries.insert(
+                key.clone(),
+                Entry {
+                    value: value.clone(),
+                    fingerprints: fingerprints.clone(),
+                    first_party: first_party.clone(),
+                    verified_at: None,
+                    generation,
+                    stamp,
+                    used_at,
+                },
+            )
+        });
     }
 }
 

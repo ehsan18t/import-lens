@@ -94,15 +94,18 @@ impl FileSizeCache {
 
         let pinned = self.entries.pin();
         let now = crate::time::unix_millis_now();
-        pinned.insert(
-            path,
-            CachedFileSize {
-                signature,
-                computation,
-                computed_at_millis: now,
-                last_used_millis: AtomicU64::new(now),
-            },
-        );
+        // Kept for the session, so copied into the long-lived heap (see `reclaim::long_lived`).
+        crate::reclaim::long_lived(|| {
+            pinned.insert(
+                path.clone(),
+                CachedFileSize {
+                    signature,
+                    computation: computation.clone(),
+                    computed_at_millis: now,
+                    last_used_millis: AtomicU64::new(now),
+                },
+            )
+        });
 
         // Bound files-opened-then-closed by evicting the least-recently-used
         // entry. Editing the same file never triggers this because it
