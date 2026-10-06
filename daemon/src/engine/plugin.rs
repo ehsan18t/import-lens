@@ -949,9 +949,9 @@ impl Plugin for ImportLensPlugin {
         // conversion below — a wasm or font is not UTF-8, and handing one back to Rolldown lets it
         // perturb or fail the JS build, which is the number we need exact.
         //
-        // Stylesheets have their own reason: Rolldown 1.1.5 does not bundle CSS at all (it fails
-        // the whole build with `UNSUPPORTED_FEATURE` at the LINK stage), so every package whose ESM
-        // entry does `import './styles.css'` (most UI kits) could not be measured.
+        // Stylesheets have their own reason: Rolldown does not bundle CSS (loading one fails the
+        // whole build with `UNSUPPORTED_FEATURE`), so every package whose ESM entry does
+        // `import './styles.css'` (most UI kits) could not otherwise be measured.
         //
         // `ModuleType::Empty` makes the module link as nothing (and shims any binding imported from
         // it, so `import styles from './x.css'` works too), so the JS graph measures exactly. The

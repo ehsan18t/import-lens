@@ -379,13 +379,11 @@ fn translate(
 /// under-report the package by however much is in the others. That is a typed `output_shape`
 /// failure and stays one.
 ///
-/// An emitted **asset** is not an output shape failure. The guard used to demand "one chunk and no
-/// assets", which is a rule with no upside: an asset beside the chunk does not make the chunk wrong,
-/// it makes it incomplete, and [`uncounted_assets_diagnostic`] says so without destroying the
-/// measurement. Rolldown 1.1.5 in fact emits no asset for a stylesheet — it fails the build at the
-/// LINK stage, and `plugin.rs` is what handles that (FR-018a) — so today this arm counts only what a
-/// future Rolldown, or a plugin, might emit. It stays because "no assets" is not the invariant; "one
-/// chunk" is.
+/// An emitted **asset** is not an output shape failure: it does not make the chunk wrong, it makes
+/// it incomplete, and [`uncounted_assets_diagnostic`] says so without destroying the measurement.
+/// Rolldown emits no asset for a stylesheet (the plugin stubs CSS before Rolldown would reject it,
+/// FR-018a), so this arm only counts what a plugin or a future Rolldown might emit. "One chunk" is
+/// the invariant; "no assets" is not.
 fn single_chunk(
     output: &rolldown::BundleOutput,
     state: &BuildState,

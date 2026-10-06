@@ -781,9 +781,8 @@ where
                 // NOT streamed, deliberately (SRS FR-004b): both callers are one-shot commands
                 // with no per-import rows for a push to merge into, and a comparison assembled
                 // from half-measured imports is worse than "comparison failed". It therefore
-                // still waits for every engine miss it names — the one request in the daemon that
-                // does — and its total time is bounded only by `BUILD_TIMEOUT` per build. What it
-                // no longer does is hold the connection: it runs as a task like everything else.
+                // waits for every engine miss it names, bounded only by `BUILD_TIMEOUT` per build,
+                // but as a task, so the connection keeps serving meanwhile.
                 spawn_request(
                     &mut active_tasks,
                     &outbound_tx,

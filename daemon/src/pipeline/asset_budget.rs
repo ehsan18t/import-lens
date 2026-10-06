@@ -354,9 +354,8 @@ impl AssetProcessingContext {
     /// A missing file gets the absent sentinel — fresh while it stays missing, stale the moment it
     /// appears — so a package that imports something which is not there stays cacheable instead of
     /// rebuilding on every keystroke. Anything else stays unverifiable, which is never fresh,
-    /// because we cannot say what state the file was in. The two must agree with the provider half
-    /// of this recording: one path carrying two different sentinels is a conflicting observation and
-    /// refuses the whole result.
+    /// because we cannot say what state the file was in. One path carrying two different
+    /// observations is a conflict and refuses the whole result.
     pub(crate) fn record_failed_path(&self, path: &Path, missing: bool) {
         let path = canonical_path(path);
         let mut state = self.lock_state();

@@ -655,8 +655,8 @@ impl ImportLensService {
             // WorkspaceReport is a full-workspace scan: read cache non-promoting so it
             // can't flood the recency signal and evict the user's warm set (§5.1).
             //
-            // The report is the one caller that still WAITS for every build: its rows are a
-            // table, and a row that says "still measuring" is not a row. It therefore keeps the
+            // The report WAITS for every build: its rows are a table, and a row that says
+            // "still measuring" is not a row. It therefore keeps the
             // complete (blocking) analysis, and a workspace naming enough parked packages can
             // still outlive the client's 300s — stated as such in the SRS rather than papered
             // over with a fabricated size.

@@ -203,8 +203,8 @@ impl RegistryMetadataCache {
             self.unpersisted_writes.store(0, Ordering::Release);
             entries.clone()
         };
-        // union = false: the captured empty snapshot becomes the file verbatim, so the
-        // cleared entries are not merged back off disk on the next save (X-14).
+        // Written verbatim, never merged with the file, so the cleared entries do not come back
+        // off disk on the next save; `cleared_at` makes a sibling daemon drop its copies too.
         self.write_snapshot(&snapshot)
     }
 
