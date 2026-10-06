@@ -1091,7 +1091,8 @@ fn write_metadata(path: &Path, metadata: &ProjectCacheMetadata) -> Result<(), St
 
     let contents = serde_json::to_string(metadata)
         .map_err(|error| format!("failed to serialize cache metadata: {error}"))?;
-    fs::write(path, contents).map_err(|error| format!("failed to write cache metadata: {error}"))
+    crate::atomic_write::write_atomic(path, contents.as_bytes())
+        .map_err(|error| format!("failed to write cache metadata: {error}"))
 }
 
 fn directory_size(path: &Path) -> u64 {

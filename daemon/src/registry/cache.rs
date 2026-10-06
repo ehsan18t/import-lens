@@ -313,14 +313,9 @@ impl RegistryMetadataCache {
             cleared_at: self.cleared_at.load(Ordering::Acquire),
         })
         .map_err(|error| error.to_string())?;
-        // Temp file + rename, so a crash mid-write cannot truncate the live file. The temp name is
-        // per process: the file is shared global storage, and a fixed temp path would let two
-        // windows interleave writes and rename corrupt JSON into place.
-        let temp_path = self
-            .path
-            .with_extension(format!("json.{}.tmp", std::process::id()));
-        fs::write(&temp_path, bytes).map_err(|error| error.to_string())?;
-        fs::rename(&temp_path, &self.path).map_err(|error| error.to_string())
+        // Each process writes its own complete, merged file; the last rename wins with a
+        // superset snapshot, and a torn file would be silently reset to empty on load.
+        crate::atomic_write::write_atomic(&self.path, &bytes).map_err(|error| error.to_string())
     }
 }
 

@@ -364,6 +364,12 @@ fn verify_content_hash(path: &str, expected: u64) -> Freshness {
     }
 }
 
+/// An input under `node_modules`, which changes only through an install (a cache-generation bump)
+/// and so is trusted on len+mtime. Everything else is first-party and hash-verified.
+pub fn fingerprint_is_installed(fingerprint: &FileFingerprint) -> bool {
+    fingerprint.path.contains("/node_modules/")
+}
+
 /// Worst-case freshness across a set, hash-verifying first-party (non-node_modules)
 /// files strictly while keeping the cheap `check_fingerprint` pre-filter for
 /// node_modules files (which cannot silently change without a generation bump).
@@ -372,7 +378,7 @@ fn verify_content_hash(path: &str, expected: u64) -> Freshness {
 pub fn check_fingerprints_strict(fingerprints: &[FileFingerprint]) -> Freshness {
     let mut worst = Freshness::Fresh;
     for fingerprint in fingerprints {
-        let freshness = if fingerprint.path.contains("/node_modules/") {
+        let freshness = if fingerprint_is_installed(fingerprint) {
             check_fingerprint(fingerprint)
         } else {
             check_fingerprint_strict(fingerprint)

@@ -350,18 +350,6 @@ consumer can see without reading diagnostic text. Doing it means deciding whethe
 "a contributor is a floor" rather than "a contributor is missing", which changes what every durable store and
 budget check does with an `external` boundary — far past the blast radius of the change that found it.
 
-### D4: A file with one unmeasurable import can never cache its total
-**Status: Deferred** · A performance cost of an invariant we want
-
-An aggregate missing a contributor's bytes is a **floor**, and a floor is never cached. So a file containing
-one permanently-broken import, or one deterministically unprocessable supported asset, re-runs its combined
-build and asset tail on every size request. The per-import deterministic outcome is still cached; the file
-aggregate cannot be, because it is not a complete File Cost.
-
-The honest fix is a build memo for the deterministic build failure: a failure caused by the package's bytes is
-a fact about those bytes, and the cache is already keyed by their fingerprints. Not caching the total is right;
-re-doing the build is waste.
-
 ### D3: Marginal cost, a project-level bundle model
 **Status: Deferred** · A different product, decided on its own merits
 
@@ -369,69 +357,6 @@ re-doing the build is waste.
 ([ADR-0004](adr/0004-import-lens-measures-imports-not-bundles.md)) and has no model of what is already in the
 bundle. Answering this means building that union model. It is the highest-value idea absent from the design,
 and it must be a deliberate decision, not smuggled in as a bug fix.
-
-### G2: A failed (unmeasured) import is counted and badged as a "Conservative estimate"
-**Status: Deferred** · Wrong badge or count, never a wrong size · Found in the 2026-07-16 module audit (D9)
-
-`is_conservative_item` (`report/model.rs:92-96`) returns `is_cjs || side_effects || !truly_treeshakeable` and
-gates only on `result.is_some()`. `ImportResult::unmeasured` sets `side_effects: true`,
-`truly_treeshakeable: false` (`ipc/protocol.rs:352-353`), the honest conservative reading for a build that
-produced nothing, so every failed-build row also satisfies the predicate.
-
-**What actually happens.** A workspace report with 1 genuinely-conservative measured import and 2 failed
-imports reports `conservative_count = 3`, and each failed row carries a "Conservative estimate" warning stacked
-next to its failure message. No byte figure moves: `combined_import_cost_brotli_bytes` sums
-`filter_map(row.brotli_bytes)` (`model.rs:74-75`) and an unmeasured row's `brotli_bytes` is `None`
-(`model.rs:134`), so the headline, treemap, budget verdict, duplicate-import and shared-module figures all
-exclude it (pinned by `an_unmeasured_import_has_no_size_in_the_report_not_a_zero`, `model.rs:564`).
-
-**Why it is not blocking:** it inflates a badge or count on a row the user already sees failed; the S1/R1
-"wrong badge, never a wrong size" class, and it cannot wedge (a pure `filter().count()`).
-**What would fix it:** gate `is_conservative_item` on a measured size too. A failure is not an estimate but a
-different category, so a totally-unmeasured import should not be counted as conservative.
-
-### R2: The legacy entry-field fallback orders `module`, `browser`, `main`, against the resolver's own preference
-**Status: Deferred** · Not reproduced as a wrong number · Found in the 2026-07-16 module audit (D2)
-
-`resolve_legacy_fallback` searches the pre-resolved entry in the order `module`, `browser`, `main`
-(`resolver.rs:258-271`). For a Client or Component import the resolver itself prefers `browser`, `module`,
-`main` (`profile_entry_fields`, `resolver.rs:357`; `main_fields`, `resolver.rs:1128`), so the fallback
-contradicts that order.
-
-**What actually happens.** The fallback fires only when oxc's full resolution fails AND the package has no
-`exports` map AND no subpath. To pick a different entry than the resolver would, the package must also carry
-distinct top-level `browser` and `module` string fields, but when both point at real files, oxc (which also
-tries `browser` first) succeeds and the fallback never runs. No concrete package shape was found where oxc
-fails yet a usable distinct `browser` string remains, so no served wrong number is demonstrated; the worst
-theoretical case is a browser-versus-module entry delta on an exotic malformed package.
-
-**Why it is not fixed now:** not reproducible, so not a wrong number today.
-**What would fix it:** reorder the fallback to `browser`, `module`, `main` for parity with the resolver, a
-one-line change.
-
-### K2: The project-cache metadata file is written non-atomically
-**Status: Deferred** · Self-healing · Off the number-serving path · Found in the 2026-07-16 module audit (D5)
-
-`write_metadata` (`cache/project.rs:1084-1093`) is a plain `fs::write`: no temp-file plus rename, no fsync. A
-crash mid-write can leave a truncated or corrupt `metadata.json` for a shard.
-
-**What actually happens, nothing to a served number.** `read_metadata` returns `None` on a corrupt file
-(`serde_json::from_str(...).ok()?`), and every consumer drops the shard on `None`: budget eviction,
-`invalidate_packages`, orphan sweeps, cache-management listing, and the recency seed. Import numbers are served
-through `cache_for_root` then `ImportCache::get` then `DiskCache::get_entry`, which recomputes the shard id
-from the root and opens redb without reading metadata (`project.rs:350-419`), rewriting the metadata on that
-cold open once the disk opens, so a corrupt metadata file is invisible to the number-serving path and
-self-heals on next open. The one theoretical effect (a `NodeModulesChanged` invalidation skipped for the shard)
-is backstopped by `check_fingerprints` on the next `get`.
-
-**Why it is not fixed now:** it cannot serve a wrong number, wedge, or lose a durable measurement (the redb
-cache is the source of truth; metadata is observability plus invalidation bookkeeping).
-**What would fix it:** write to a temp file and `rename` (atomic replace).
-
-**Same pattern, second file (found in the D7b audit).** `record_recycle_timestamp` writes
-`importlens-recycles.json` with a plain `fs::write` (`lifecycle.rs:71-87`), read back with `unwrap_or_default()`
-on corruption. It gates only idle-recycle detection (after 4 h uptime plus 15 min idle), never a served number;
-worst case on a torn write is one extra, already-4h-gated recycle. Same class, same fix (temp plus rename).
 
 ### G0: The legacy `performance.rs` smoke suite still claims to gate the NFR numbers, at 8x loose
 **Status: Deferred** · Not an active hole, but a second suite that appears to gate what it does not
@@ -508,7 +433,8 @@ passes `false` as the resolver's verdict on the prefetch-refill path (`resolved_
 manifest fields, `exports` conditions and `type` first, so that `false` decides only an entry none of those
 classify, in practice an extensionless one. `CacheIdentity` carries no `is_cjs` (`cache/key.rs`), so the two
 paths share one cache key. The value flows only into `result.is_cjs`, whose single consumer is the
-"Conservative estimate" warning (`report/model.rs:95`: `is_cjs || side_effects || !truly_treeshakeable`).
+"Conservative estimate" warning (`is_conservative_item` in `report/model.rs`: a measured size with
+`is_cjs || side_effects || !truly_treeshakeable`).
 
 **What actually happens.** For an extensionless CommonJS entry, the same package can show the warning when
 first measured on the interactive path and hide it when the row was populated by prefetch (or the reverse). The
@@ -801,7 +727,7 @@ From the release review's improvement list. All real; none blocking. Each is a k
 | P6 | **`drain_ordered` uses 2 workers where `drain_classified` uses 4.** package.json analysis and both prefetch drains idle a permit with work queued. |
 | P7 | **Rebuild fixed option data once, not per build.** About 180 `String`s allocated per build; `LazyLock` candidates. |
 | P8 | **The miss drain spawns fresh OS threads per call.** A single cache miss spawns a thread to do work the caller could do inline; a 500-file report can perform hundreds of thread creations. |
-| P9 | **The completion path re-verifies a whole package graph on every popup.** Re-reads and re-hashes every non-`node_modules` file per keystroke inside an import's braces. |
+| P9 | **The completion path still hash-verifies every first-party file of the package graph on every popup.** Installed modules are re-checked once per `REVERIFY_TTL` (measured: 2,000 installed modules, about 41 ms per lookup down to about 3 µs, debug build, Windows), but a first-party package's own files are re-read and re-hashed per keystroke inside its import's braces. That part stays: nothing reports a first-party edit (D3 in `cache/memory.rs`), and an equal-length, mtime-preserving rewrite defeats a len+mtime check, so any window would serve a stale export list. |
 | P10 | **`ENGINE_PERMITS` is 2, tried at 4 (Task 13), measured, reverted.** Not deferred; see the outcome below. |
 
 **P10 outcome (Task 13, measured 2026-07-15, reverted).** Raising `engine_permits()` to
@@ -836,6 +762,10 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| D4 | A file with one deterministically unbuildable import re-ran its combined build on every size request | 2026-10-06 |
+| R2 | The legacy entry-field fallback searched `module`, `browser`, `main`, against the resolver's own per-runtime order | 2026-10-06 |
+| G2 | A failed (unmeasured) import was counted and badged as a "Conservative estimate" in the workspace report | 2026-10-06 |
+| K2 | The project-cache metadata and the recycle timestamp were written in place, so a crash mid-write could tear them | 2026-10-06 |
 | C5 | The process outlived its connection for as long as an uncancellable blocking drain ran, holding its cache shards open | 2026-10-06 |
 | P3 | The load hook copied every module's source per build purely to keep the bytes alive for hashing | 2026-07-19 |
 | D25 | The always-on-screen file total could not say what share of it was not JavaScript | 2026-07-19 |
