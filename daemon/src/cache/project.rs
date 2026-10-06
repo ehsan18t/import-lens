@@ -110,6 +110,39 @@ struct LoadedProjectCache {
     cache: Arc<ImportCache>,
     last_used_millis: u64,
     last_metadata_write_millis: u64,
+    /// Set while the shard's disk open has failed; the shard then serves from
+    /// memory and retries the open on this backoff.
+    disk_retry: Option<DiskRetry>,
+}
+
+/// Exponential backoff for retrying a shard's failed disk open, which also bounds
+/// the open-failure warnings a permanently unavailable shard logs.
+#[derive(Debug, Clone, Copy)]
+struct DiskRetry {
+    next_attempt_millis: u64,
+    interval_millis: u64,
+}
+
+impl DiskRetry {
+    const FIRST_INTERVAL_MILLIS: u64 = 5_000;
+    const MAX_INTERVAL_MILLIS: u64 = 300_000;
+
+    fn starting_at(now: u64) -> Self {
+        Self {
+            next_attempt_millis: now.saturating_add(Self::FIRST_INTERVAL_MILLIS),
+            interval_millis: Self::FIRST_INTERVAL_MILLIS,
+        }
+    }
+
+    /// Claims the retry when it is due, scheduling the next one twice as far out.
+    fn claim(&mut self, now: u64) -> bool {
+        if now < self.next_attempt_millis {
+            return false;
+        }
+        self.interval_millis = (self.interval_millis * 2).min(Self::MAX_INTERVAL_MILLIS);
+        self.next_attempt_millis = now.saturating_add(self.interval_millis);
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,8 +300,7 @@ impl ProjectCacheRegistry {
     /// pass. The loaded snapshot is taken under the lock and released before any
     /// disk I/O. A temp open racing a concurrent `cache_for_root` degrades
     /// harmlessly on either side: the temp cache scans/evicts nothing, and the
-    /// loading side serves one unregistered memory-only cache and heals on the
-    /// next call.
+    /// loading side registers a memory-only shard that retries its disk open.
     fn collect_shard_targets(&self) -> Vec<ShardTarget> {
         let (loaded_ids, mut targets) = match self.loaded.lock() {
             Ok(loaded) => {
@@ -322,7 +354,10 @@ impl ProjectCacheRegistry {
         // Fast warm path: hold `loaded` only for the map lookup + timestamp bump,
         // then release it before any metadata `fs::write` so a warm hit never
         // blocks peers on disk I/O.
-        if let Some(cache) = self.warm_shard_hit(&shard_id, now) {
+        if let Some((cache, retry_disk)) = self.warm_shard_hit(&shard_id, now, true) {
+            if retry_disk {
+                self.retry_disk_open(&shard_id, &cache);
+            }
             return cache;
         }
 
@@ -343,7 +378,7 @@ impl ProjectCacheRegistry {
 
         // Double-check: another thread may have finished loading this shard while
         // we waited on the per-shard load lock.
-        if let Some(cache) = self.warm_shard_hit(&shard_id, now) {
+        if let Some((cache, _)) = self.warm_shard_hit(&shard_id, now, false) {
             return cache;
         }
 
@@ -353,16 +388,12 @@ impl ProjectCacheRegistry {
         let cache_path = self.cache_path_for_shard(&shard_id);
         let disk_path = self.disk_cache_path(&cache_path);
         let cache = Arc::new(ImportCache::new(disk_path, self.enable_disk_cache));
-        // If persistence was requested but the open failed — most likely
-        // `DatabaseAlreadyOpen` because a maintenance pass (eviction, invalidation,
-        // orphan purge) temporarily holds this shard's file — do NOT register the
-        // degraded cache: a registered shard is permanent (only user-triggered
-        // removal evicts it from `loaded`), which would silently disable this
-        // project's persistence until recycle. Serve a memory-only cache for this
-        // call and let the next call retry the open.
-        if self.storage_enabled() && !cache.disk_available() {
-            return cache;
-        }
+        // A failed open (another daemon holding the file lock, a permission error,
+        // a maintenance pass briefly holding it) still registers the shard, so its
+        // memory layer survives between requests, and retries the disk on a
+        // backoff. No metadata is written until the disk opens.
+        let disk_retry = (self.storage_enabled() && !cache.disk_available())
+            .then(|| DiskRetry::starting_at(now));
         let shard = LoadedProjectCache {
             project_root: project_root.to_string_lossy().to_string(),
             normalized_root,
@@ -370,9 +401,12 @@ impl ProjectCacheRegistry {
             cache: Arc::clone(&cache),
             last_used_millis: now,
             last_metadata_write_millis: now,
+            disk_retry,
         };
         // Metadata write stays off the `loaded` lock (still under the load lock).
-        self.write_metadata_for_loaded(&shard_id, &shard);
+        if shard.disk_retry.is_none() {
+            self.write_metadata_for_loaded(&shard_id, &shard);
+        }
         // Briefly re-acquire `loaded` to register the freshly-opened shard. We hold
         // this shard's load lock, so no concurrent cold path could have inserted it
         // — a plain insert cannot clobber a different Arc. A poisoned lock leaves
@@ -389,17 +423,32 @@ impl ProjectCacheRegistry {
     /// perform any throttled metadata `fs::write` off-lock (so a warm hit never
     /// blocks peers on disk I/O). Returns `None` — with `loaded` released — when the
     /// shard is absent, so the caller can take the cold path without holding it.
-    fn warm_shard_hit(&self, shard_id: &str, now: u64) -> Option<Arc<ImportCache>> {
+    ///
+    /// With `claim_retry`, also reports whether this caller claimed a due disk-open
+    /// retry for a shard registered without its disk; the claim advances the
+    /// backoff, so only one caller per interval retries.
+    fn warm_shard_hit(
+        &self,
+        shard_id: &str,
+        now: u64,
+        claim_retry: bool,
+    ) -> Option<(Arc<ImportCache>, bool)> {
         let mut loaded = self.loaded.lock().ok()?;
         let shard = loaded.get_mut(shard_id)?;
         shard.last_used_millis = now;
-        let pending_metadata =
-            if should_write_project_metadata(shard.last_metadata_write_millis, now) {
-                shard.last_metadata_write_millis = now;
-                self.metadata_write_for_loaded(shard_id, shard)
-            } else {
-                None
-            };
+        let retry_disk = claim_retry
+            && shard
+                .disk_retry
+                .as_mut()
+                .is_some_and(|retry| retry.claim(now));
+        let pending_metadata = if shard.disk_retry.is_none()
+            && should_write_project_metadata(shard.last_metadata_write_millis, now)
+        {
+            shard.last_metadata_write_millis = now;
+            self.metadata_write_for_loaded(shard_id, shard)
+        } else {
+            None
+        };
         let cache = Arc::clone(&shard.cache);
         drop(loaded);
         // The timestamp is advanced under the lock above, so only one thread per
@@ -407,7 +456,34 @@ impl ProjectCacheRegistry {
         if let Some((path, metadata)) = pending_metadata {
             let _ = write_metadata(&path, &metadata);
         }
-        Some(cache)
+        Some((cache, retry_disk))
+    }
+
+    /// Retries the disk open of a shard registered without one. Under the per-shard
+    /// load lock, and only while `cache` is still the registered one, so a removal
+    /// that ran in between never sees its directory recreated.
+    fn retry_disk_open(&self, shard_id: &str, cache: &Arc<ImportCache>) {
+        let load_lock = self.load_lock_for(shard_id);
+        let _load_guard = load_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let still_registered = self.loaded.lock().is_ok_and(|loaded| {
+            loaded
+                .get(shard_id)
+                .is_some_and(|shard| Arc::ptr_eq(&shard.cache, cache))
+        });
+        if !still_registered || !cache.reopen_disk() {
+            return;
+        }
+        let pending_metadata = self.loaded.lock().ok().and_then(|mut loaded| {
+            let shard = loaded.get_mut(shard_id)?;
+            shard.disk_retry = None;
+            shard.last_metadata_write_millis = shard.last_used_millis;
+            self.metadata_write_for_loaded(shard_id, shard)
+        });
+        if let Some((path, metadata)) = pending_metadata {
+            let _ = write_metadata(&path, &metadata);
+        }
     }
 
     /// Returns this shard's per-shard load lock, creating it on first use. Holds the

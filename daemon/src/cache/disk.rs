@@ -159,6 +159,9 @@ pub struct DiskCache {
     // Unix millis before which an insert must not trigger a flush, set by a failed
     // flush (`FLUSH_RETRY_BACKOFF`); 0 when the last flush succeeded.
     flush_retry_after: AtomicU64,
+    // Where an enabled shard lives, kept so a failed open can be retried
+    // (`reopen_if_unavailable`). None when the disk cache is disabled.
+    storage_path: Option<PathBuf>,
 }
 
 impl DiskCache {
@@ -185,8 +188,10 @@ impl DiskCache {
             None => return Self::disabled(),
         };
 
+        let db = Self::open_database(&storage_path, create_missing);
         Self {
-            db: RwLock::new(Self::open_database(&storage_path, create_missing)),
+            db: RwLock::new(db),
+            storage_path: Some(storage_path),
             pending_inserts: Mutex::new(HashMap::new()),
             clear_generation: AtomicU64::new(0),
             clear_lock: Mutex::new(()),
@@ -1073,7 +1078,28 @@ impl DiskCache {
             // too) simply reads as idle.
             last_access: AtomicU64::new(0),
             flush_retry_after: AtomicU64::new(0),
+            storage_path: None,
         }
+    }
+
+    /// Retries the open of an enabled shard whose database is not open, creating it
+    /// if missing. Returns whether a database is open afterwards.
+    pub fn reopen_if_unavailable(&self) -> bool {
+        if self.is_available() {
+            return true;
+        }
+        let Some(storage_path) = self.storage_path.as_ref() else {
+            return false;
+        };
+        // Opened outside the lock so readers are not stalled on the open's I/O.
+        let Some(opened) = Self::open_database(storage_path, true) else {
+            return false;
+        };
+        let mut guard = self.db.write().unwrap_or_else(|poison| poison.into_inner());
+        if guard.is_none() {
+            *guard = Some(opened);
+        }
+        true
     }
 
     fn open_database(storage_path: &Path, create_missing: bool) -> Option<Database> {

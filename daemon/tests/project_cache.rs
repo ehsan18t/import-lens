@@ -801,44 +801,6 @@ fn maintenance_and_status_never_recreate_a_shard_database() {
 }
 
 #[test]
-fn a_racing_shard_open_degrades_one_call_and_heals_on_the_next() {
-    let storage = common::temp_workspace("import-lens-project-cache-open-race");
-    let root = storage.join("app");
-    fs::create_dir_all(&root).expect("project root");
-    let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512);
-
-    // Simulate a maintenance pass (eviction / invalidation / orphan purge)
-    // holding this shard's redb file when the project loads: redb allows one
-    // Database per file per process, so the load's open fails.
-    let shard_dir = storage.join(project_cache_shard_id(&root));
-    fs::create_dir_all(&shard_dir).expect("shard dir");
-    let held = Database::create(shard_dir.join(CACHE_DB_FILE_NAME)).expect("hold the db file");
-
-    // The racing call serves a memory-only cache and must NOT register it:
-    // registering would silently disable this project's persistence forever.
-    let degraded = registry.cache_for_root(&root);
-    assert!(
-        !degraded.disk_available(),
-        "the racing open must degrade to memory-only"
-    );
-
-    // Once the maintenance pass releases the file, the next call must retry the
-    // open and come back with real persistence.
-    drop(held);
-    let healed = registry.cache_for_root(&root);
-    assert!(
-        healed.disk_available(),
-        "the shard must heal on the next load instead of staying disabled"
-    );
-    healed.insert("react@18.3.1::default".to_owned(), result("react"));
-    healed.flush_to_disk().expect("flush should succeed");
-    assert!(healed.get("react@18.3.1::default").is_some());
-
-    drop((degraded, healed, registry));
-    fs::remove_dir_all(storage).expect("temp storage should be removed");
-}
-
-#[test]
 fn byte_budget_evicts_unloaded_shards_and_shrinks_their_files() {
     use import_lens_daemon::cache::budget::EVICTION_FLOOR;
 

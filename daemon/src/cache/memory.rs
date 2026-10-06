@@ -789,6 +789,13 @@ impl ImportCache {
         self.disk.is_available()
     }
 
+    /// Retries a failed disk open (see `DiskCache::reopen_if_unavailable`). The
+    /// memory layer is kept; entries measured while the disk was away stay
+    /// memory-only.
+    pub fn reopen_disk(&self) -> bool {
+        self.disk.reopen_if_unavailable()
+    }
+
     /// One-pass byte/recency summary of this cache's disk shard for the capacity
     /// coordinator. Empty when the disk cache is disabled.
     pub fn shard_rollup(&self) -> crate::cache::disk::ShardRollup {
