@@ -11,6 +11,7 @@ import {
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
+import { isShownDocument } from "../visibleDocuments.js";
 import { analysisRootForFile } from "../workspaceContext.js";
 import {
   markPackageJsonLoadingUnavailable,
@@ -35,9 +36,9 @@ type PackageJsonScheduleSource =
   | "active_editor"
   | "change"
   | "direct"
-  | "initial_text_document"
-  | "open"
-  | "refresh_visible";
+  | "initial_visible"
+  | "refresh_visible"
+  | "visible";
 
 export class PackageJsonAnalysisController implements vscode.Disposable {
   readonly #daemon: DaemonManager;
@@ -77,10 +78,16 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       `Package.json analysis controller initialized (text_documents=${vscode.workspace.textDocuments.length}, package_json_documents=${initialPackageJsonDocuments}, active_editor=${activeDocumentPath}).`,
     );
 
+    // Only shown documents are analyzed (see `isShownDocument`); the unchanged-content guard makes
+    // rescheduling an already-analyzed manifest on every visibility change free.
     context.subscriptions.push(
       vscode.workspace.onDidChangeTextDocument((event) => this.schedule(event.document, "change")),
-      vscode.workspace.onDidOpenTextDocument((document) => this.schedule(document, "open")),
       vscode.workspace.onDidCloseTextDocument((document) => this.disposeDocument(document)),
+      vscode.window.onDidChangeVisibleTextEditors((editors) => {
+        for (const editor of editors) {
+          this.schedule(editor.document, "visible");
+        }
+      }),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (editor) {
           this.schedule(editor.document, "active_editor");
@@ -88,8 +95,8 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       }),
     );
 
-    for (const document of vscode.workspace.textDocuments) {
-      this.schedule(document, "initial_text_document");
+    for (const editor of vscode.window.visibleTextEditors) {
+      this.schedule(editor.document, "initial_visible");
     }
   }
 
@@ -102,7 +109,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   }
 
   schedule(document: vscode.TextDocument, source: PackageJsonScheduleSource = "direct"): void {
-    if (!isPackageJsonDocument(document)) {
+    if (!isPackageJsonDocument(document) || !isShownDocument(document, vscode.window)) {
       return;
     }
 

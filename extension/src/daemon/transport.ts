@@ -61,6 +61,8 @@ export interface AnalysisTransport {
   invalidatePackage(packageName: string): void;
   invalidateAll(): void;
   nodeModulesChanged(packageJsonPaths: readonly string[], tsconfigPaths?: readonly string[]): void;
+  /** The documents shown right now. A transport keeps the latest set and replays it on (re)connect. */
+  visibleDocuments(documentPaths: readonly string[]): void;
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void;
   shutdown(): Promise<void>;
   dispose(): void | Promise<void>;
@@ -211,6 +213,14 @@ export class TransportCoordinator implements AnalysisTransport {
     tsconfigPaths: readonly string[] = [],
   ): void {
     this.#activeTransport?.nodeModulesChanged(packageJsonPaths, tsconfigPaths);
+  }
+
+  // Every transport, not only the active one: the set is state, not an event, and whichever
+  // transport becomes active next must already hold it.
+  visibleDocuments(documentPaths: readonly string[]): void {
+    for (const transport of this.#transports) {
+      transport.visibleDocuments(documentPaths);
+    }
   }
 
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {

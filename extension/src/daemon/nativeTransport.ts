@@ -80,6 +80,8 @@ export class NativeDaemonTransport implements AnalysisTransport {
   #stabilityTimer: NodeJS.Timeout | null = null;
   #cleanRecycleTimer: NodeJS.Timeout | null = null;
   #disconnectTimer: NodeJS.Timeout | null = null;
+  // The latest set the editor reported, replayed after every hello so a respawned daemon knows it.
+  #visibleDocuments: string[] | null = null;
   #lastAnalysisRoot: string | undefined;
   // Injected so this module depends on `vscode` for types only and can be
   // constructed under the extension-host-free test runner. In production the
@@ -253,6 +255,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     try {
       this.#client.send(this.#hello(workspaceRoot));
       this.#logger.info(`Sent daemon hello using protocol v${protocolVersion}.`);
+      this.#sendVisibleDocuments(this.#client);
     } catch (error) {
       this.#logger.warn(
         `Failed to send daemon hello: ${error instanceof Error ? error.message : String(error)}`,
@@ -601,6 +604,21 @@ export class NativeDaemonTransport implements AnalysisTransport {
       package_json_paths: [...packageJsonPaths],
       tsconfig_paths: [...tsconfigPaths],
     });
+  }
+
+  visibleDocuments(documentPaths: readonly string[]): void {
+    this.#visibleDocuments = [...documentPaths];
+    if (!this.#client || this.#state !== "ready") {
+      return;
+    }
+
+    this.#sendVisibleDocuments(this.#client);
+  }
+
+  #sendVisibleDocuments(client: IpcClient): void {
+    if (this.#visibleDocuments) {
+      client.send({ type: "visible_documents", document_paths: [...this.#visibleDocuments] });
+    }
   }
 
   prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {

@@ -34,7 +34,14 @@ import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import { bytesForCompression } from "./ui/format.js";
 import type { StatusBarController, StatusBarState } from "./ui/statusbar.js";
+import { isShownDocument, newlyVisibleDocuments } from "./visibleDocuments.js";
 import { analysisRootForFile } from "./workspaceContext.js";
+
+const isAnalyzableDocument = (document: vscode.TextDocument): boolean =>
+  supportedLanguageIds.has(document.languageId) && document.uri.scheme === "file";
+
+const isShown = (document: vscode.TextDocument): boolean =>
+  isShownDocument(document, vscode.window);
 
 /** The inputs a File Cost re-read needs, and the generation they belong to. @see DocumentAnalysisController.refetchFileSizeWhenSettled */
 interface FileSizeContext {
@@ -62,6 +69,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
   // both. A push carries only a URI (`daemon.onRefreshedResults`), and the File Cost is fetched per
   // document, per workspace root. Dropped when the document closes.
   readonly #analysisContexts = new Map<string, FileSizeContext>();
+  #visibleDocumentKeys: ReadonlySet<string> = new Set();
 
   constructor(
     context: vscode.ExtensionContext,
@@ -76,34 +84,48 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#logger = logger;
     this.#statusBar = statusBar;
 
+    // No `onDidOpenTextDocument`: VS Code opens documents it never shows, and a document that is
+    // shown arrives through the visible-editor or active-editor event anyway.
     context.subscriptions.push(
       vscode.workspace.onDidChangeTextDocument((event) => this.schedule(event.document)),
-      vscode.workspace.onDidOpenTextDocument((document) => this.schedule(document)),
       vscode.workspace.onDidCloseTextDocument((document) => this.disposeDocument(document)),
+      vscode.window.onDidChangeVisibleTextEditors((editors) => this.syncVisibleDocuments(editors)),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
-        if (
-          editor &&
-          supportedLanguageIds.has(editor.document.languageId) &&
-          editor.document.uri.scheme === "file"
-        ) {
+        if (editor && isAnalyzableDocument(editor.document)) {
           this.schedule(editor.document);
         } else {
           this.#statusBar.setState({ kind: "ready" });
         }
       }),
     );
+    this.syncVisibleDocuments(vscode.window.visibleTextEditors);
+  }
+
+  /**
+   * Analyze what just became visible, and tell the daemon the new set so it drops the queued
+   * builds of whatever stopped being visible.
+   */
+  syncVisibleDocuments(editors: readonly vscode.TextEditor[]): void {
+    const documents = editors.map((editor) => editor.document).filter(isAnalyzableDocument);
+    for (const document of newlyVisibleDocuments(documents, this.#visibleDocumentKeys)) {
+      this.schedule(document);
+    }
+    this.#visibleDocumentKeys = new Set(documents.map((document) => document.uri.toString()));
+    this.#daemon.visibleDocuments([...new Set(documents.map((document) => document.fileName))]);
   }
 
   schedule(document: vscode.TextDocument): void {
-    if (!supportedLanguageIds.has(document.languageId) || document.uri.scheme !== "file") {
+    if (!isAnalyzableDocument(document) || !isShown(document)) {
       return;
     }
 
-    this.#scheduler.schedule(
-      document.uri.toString(),
-      getImportLensConfig().debounceMs,
-      () => void this.analyze(document),
-    );
+    this.#scheduler.schedule(document.uri.toString(), getImportLensConfig().debounceMs, () => {
+      // Checked again when the debounce fires: a document hidden in the meantime would start
+      // builds the daemon was already told to drop.
+      if (isShown(document)) {
+        void this.analyze(document);
+      }
+    });
   }
 
   /**

@@ -248,6 +248,10 @@ class FakeTransport implements AnalysisTransport {
     this.calls.push(`nodeModules:${packageJsonPaths.length}`);
   }
 
+  visibleDocuments(documentPaths: readonly string[]): void {
+    this.calls.push(`visible:${documentPaths.join(",")}`);
+  }
+
   prewarmPackageJson(packageJsonPath: string): void {
     this.calls.push(`prewarm:${packageJsonPath}`);
   }
@@ -337,6 +341,8 @@ class SlowReadyTransport implements AnalysisTransport {
 
   nodeModulesChanged(): void {}
 
+  visibleDocuments(): void {}
+
   prewarmPackageJson(): void {}
 
   async shutdown(): Promise<void> {
@@ -369,6 +375,17 @@ test("TransportCoordinator selects the first ready transport and delegates reque
     "invalidate:react",
     "prewarm:/workspace/package.json",
   ]);
+});
+
+test("TransportCoordinator hands the visible set to every transport, ready or not", async () => {
+  const unavailable = new FakeTransport("unavailable");
+  const ready = new FakeTransport("ready");
+  const coordinator = new TransportCoordinator([unavailable, ready]);
+
+  coordinator.visibleDocuments(["/workspace/a.ts", "/workspace/b.ts"]);
+
+  assert.deepEqual(unavailable.calls, ["visible:/workspace/a.ts,/workspace/b.ts"]);
+  assert.deepEqual(ready.calls, ["visible:/workspace/a.ts,/workspace/b.ts"]);
 });
 
 test("TransportCoordinator returns null when no transport is ready", async () => {

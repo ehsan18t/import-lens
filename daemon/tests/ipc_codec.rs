@@ -147,8 +147,7 @@ fn import_request_defaults_missing_runtime_to_component() {
 }
 
 #[test]
-fn client_message_decodes_daemon_first_v7_requests() {
-    assert_eq!(PROTOCOL_VERSION, 7);
+fn client_message_decodes_every_daemon_first_request() {
     assert!(matches!(
         decode_client_message(serde_json::json!({
             "type": "analyze_document",
@@ -213,6 +212,14 @@ fn client_message_decodes_daemon_first_v7_requests() {
             "package_json_paths": ["C:/workspace/node_modules/tiny-lib/package.json"]
         })),
         ClientMessage::NodeModulesChanged(_),
+    ));
+    assert!(matches!(
+        decode_client_message(serde_json::json!({
+            "type": "visible_documents",
+            "document_paths": ["C:/workspace/src/index.ts"]
+        })),
+        ClientMessage::VisibleDocuments(message)
+            if message.document_paths == ["C:/workspace/src/index.ts"],
     ));
     assert!(matches!(
         decode_client_message(serde_json::json!({

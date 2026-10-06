@@ -1,4 +1,4 @@
-export const protocolVersion = 7;
+export const protocolVersion = 8;
 
 export type ImportKind = "named" | "default" | "namespace" | "dynamic";
 
@@ -390,6 +390,16 @@ export interface NodeModulesChangedMessage {
   tsconfig_paths: string[];
 }
 
+/**
+ * The documents an editor pane shows right now, sent whenever that set changes. The daemon drops
+ * the queued builds of every other document; a build already running finishes and is cached.
+ * Paths are spelled exactly as `active_document_path` is.
+ */
+export interface VisibleDocumentsMessage {
+  type: "visible_documents";
+  document_paths: string[];
+}
+
 export interface EnumerateExportsRequest {
   type: "enumerate_exports";
   version: number;
@@ -686,6 +696,7 @@ export type ClientMessage =
   | CacheInvalidateAllMessage
   | PrewarmPackageJsonMessage
   | NodeModulesChangedMessage
+  | VisibleDocumentsMessage
   | EnumerateExportsRequest
   | FileSizeRequest
   | FileSizeDocumentRequest

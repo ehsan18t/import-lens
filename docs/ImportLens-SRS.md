@@ -623,7 +623,7 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
   **What the message still buys, stated exactly.** The alias resolvers now memoize no filesystem fact — they are rebuilt per query, which is what stops a floor being sticky (FR-024a) — so a `paths` **edit** is picked up on the next request with no message at all. What survives a query is the **reachable-config walk**: which projects the workspace's `references` graph reaches. A config that starts *referencing* the project that owns the `paths` therefore stays invisible until this message drops that memo, and the L1 aggregate cache still holds totals computed under the old table. Both are dropped here.
 
-**FR-028** (Medium) - When a user opens or saves a `package.json` file in the workspace, the daemon must pre-calculate and cache the size of the namespace export (`*`) and, when the entry exposes one, the default export for each installed dependency listed in that file's `dependencies`, `devDependencies`, `peerDependencies` and `optionalDependencies` objects. These two export variants are the most common and cover the majority of real-world import patterns. Pre-warm tasks must run on a dedicated secondary Rayon thread pool sized to half the available parallelism (minimum 1), smaller than the primary pool's `available_parallelism - 2` on any machine with more than four threads, so that the primary pool remains fully available for real user requests. Because Rayon does not expose OS-level thread priority, reduced pool size is the correct mechanism for deprioritisation. At the engine boundary, pre-warm builds (package.json and recent-cache) may hold at most one fewer than the engine permits at once, so a permit is always held by or free for an interactive build and a user's import never queues behind pre-warm builds occupying every permit; a queued pre-warm build is admitted in FIFO order, never dropped. Pre-warm work must stop immediately when foreground analysis or cache-mutating work arrives, including document, package.json, raw-specifier, export-enumeration, file-size, completion, invalidation, cleanup, removal, shutdown, and recycle paths. Prewarm must reuse already-resolved package entries rather than resolving the same package twice. Prewarmed entries must land in the project shard interactive analysis reads: the connection's workspace root (from `hello`) when the manifest lies inside it, which covers a nested monorepo package and a manifest under `node_modules`, and the manifest's own directory otherwise.
+**FR-028** (Medium) - When a `package.json` file in the workspace becomes visible in an editor pane or is saved, the daemon must pre-calculate and cache the size of the namespace export (`*`) and, when the entry exposes one, the default export for each installed dependency listed in that file's `dependencies`, `devDependencies`, `peerDependencies` and `optionalDependencies` objects. These two export variants are the most common and cover the majority of real-world import patterns. Pre-warm tasks must run on a dedicated secondary Rayon thread pool sized to half the available parallelism (minimum 1), smaller than the primary pool's `available_parallelism - 2` on any machine with more than four threads, so that the primary pool remains fully available for real user requests. Because Rayon does not expose OS-level thread priority, reduced pool size is the correct mechanism for deprioritisation. At the engine boundary, pre-warm builds (package.json and recent-cache) may hold at most one fewer than the engine permits at once, so a permit is always held by or free for an interactive build and a user's import never queues behind pre-warm builds occupying every permit; a queued pre-warm build is admitted in FIFO order, never dropped. Pre-warm work must stop immediately when foreground analysis or cache-mutating work arrives, including document, package.json, raw-specifier, export-enumeration, file-size, completion, invalidation, cleanup, removal, shutdown, and recycle paths. Prewarm must reuse already-resolved package entries rather than resolving the same package twice. Prewarmed entries must land in the project shard interactive analysis reads: the connection's workspace root (from `hello`) when the manifest lies inside it, which covers a nested monorepo package and a manifest under `node_modules`, and the manifest's own directory otherwise.
 
 ### 5.6 User Interface
 
@@ -899,7 +899,7 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 ### 7.6 Extensibility
 
-**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v7 is the current native protocol and adds daemon-owned registry refresh and workspace report endpoints on top of v6 cache policy fields, cache status/list/remove endpoints, v5 daemon-first document/package.json/package.json streaming partials/raw specifier/current-file size/named-export completion/node_modules change endpoints, v4 confidence metadata, v3 runtime-aware imports, and v2 export enumeration/file-level shared sizing/module breakdowns/per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Every frame carries a `type` tag naming one `ClientMessage` variant; an untagged or unknown frame is not part of the protocol. v2 through v6 request compatibility must be preserved where the missing fields have safe defaults.
+**NFR-018** (Medium) - Versioned MessagePack request/response schemas must include a `version` field (integer). Protocol v8 is the current native protocol and adds the `visible_documents` message (only shown documents keep their queued builds) on top of v7 daemon-owned registry refresh and workspace report endpoints on top of v6 cache policy fields, cache status/list/remove endpoints, v5 daemon-first document/package.json/package.json streaming partials/raw specifier/current-file size/named-export completion/node_modules change endpoints, v4 confidence metadata, v3 runtime-aware imports, and v2 export enumeration/file-level shared sizing/module breakdowns/per-frame index metadata. The daemon must reject requests with an unrecognised version number and respond with a protocol error response when the request shape allows it. Every frame carries a `type` tag naming one `ClientMessage` variant; an untagged or unknown frame is not part of the protocol. v2 through v6 request compatibility must be preserved where the missing fields have safe defaults.
 
 ---
 
@@ -1252,9 +1252,24 @@ interface NodeModulesChangedMessage {
 }
 ```
 
+#### VisibleDocumentsMessage
+
+Protocol v8+. Sent by the extension host whenever the set of documents shown in editor panes changes (a tab switch, a split, a close), and replayed after every hello so a respawned daemon knows it. `document_paths` holds every shown analyzable document, spelled exactly as that document's `active_document_path`.
+
+The daemon must cancel the queued, not-yet-started work of every document outside the set: the streamed import builds an `AnalyzeDocument` handed off, the background revalidation a stale size read armed, and the combined file-size build. A build already inside Rolldown finishes and is cached, because its result is reused when the document is shown again or another file imports the package. A client that never sends this message (the CLI, an older extension) keeps every build, exactly as before v8.
+
+The extension host analyzes only shown documents: VS Code opens documents it never shows (peek and go-to-definition previews, diff views, files other extensions read), so `onDidOpenTextDocument` schedules nothing, and a debounced analysis whose document stopped being shown is not sent. The same rule holds for `package.json` guidance.
+
+```typescript
+interface VisibleDocumentsMessage {
+  type: "visible_documents";
+  document_paths: string[];
+}
+```
+
 #### PrewarmPackageJsonMessage
 
-Sent by the extension host when a workspace `package.json` is opened or saved.
+Sent by the extension host when a workspace `package.json` becomes visible in an editor pane or is saved, and replayed for the visible manifests when the daemon becomes ready. A manifest that is only opened (VS Code and other extensions open manifests nobody looks at) is not prewarmed.
 
 ```typescript
 interface PrewarmPackageJsonMessage {
@@ -1802,7 +1817,7 @@ import-lens/
 │   │   │   └── substitutions.ts       # curated import substitution suggestion mapping (FR-036k)
 │   │   ├── ipc/
 │   │   │   ├── client.ts              # Socket/pipe connection management
-│   │   │   ├── protocol.ts            # Protocol v7 IPC types
+│   │   │   ├── protocol.ts            # Protocol v8 IPC types
 │   │   │   ├── requestIds.ts          # shared monotonic IPC request ID generator
 │   │   │   └── codec.ts               # MessagePack encode/decode
 │   │   ├── daemon/
@@ -1863,7 +1878,7 @@ import-lens/
 │       │   ├── mod.rs
 │       │   ├── codec.rs               # MessagePack length-prefix codec
 │       │   ├── server.rs              # Unix socket / named pipe listener
-│       │   └── protocol.rs            # Protocol v7 serde types
+│       │   └── protocol.rs            # Protocol v8 serde types
 │       ├── engine/
 │       │   ├── mod.rs                 # Import Lens-owned request/artifact/failure types
 │       │   ├── adapter.rs             # Rolldown build orchestration and output translation

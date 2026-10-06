@@ -1,7 +1,7 @@
 use crate::document::{PackageJsonDependencyEntry, PackageJsonDependencySection};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 pub fn is_supported_protocol_version(version: u32) -> bool {
     (1..=PROTOCOL_VERSION).contains(&version)
@@ -974,6 +974,20 @@ pub struct PrewarmPackageJsonMessage {
     pub workspace_root: Option<String>,
 }
 
+/// The documents the client shows right now, sent whenever that set changes (protocol 8).
+///
+/// Every queued build of a document outside the set is cancelled before it starts; a build
+/// already inside Rolldown finishes and is cached, since returning to the document or another
+/// file importing the package reuses it. A client that never sends this keeps every build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisibleDocumentsMessage {
+    #[serde(rename = "type")]
+    #[serde(default = "visible_documents_message_type")]
+    pub message_type: String,
+    /// Spelled exactly as the client sends `active_document_path`.
+    pub document_paths: Vec<String>,
+}
+
 /// The watcher's "something the daemon memoized is no longer true" message.
 ///
 /// Carries both kinds of file that feed the resolvers: a `node_modules/<pkg>/package.json` (an
@@ -1160,6 +1174,7 @@ pub enum ClientMessage {
     CacheInvalidateAll(CacheInvalidateAllMessage),
     PrewarmPackageJson(PrewarmPackageJsonMessage),
     NodeModulesChanged(NodeModulesChangedMessage),
+    VisibleDocuments(VisibleDocumentsMessage),
     EnumerateExports(EnumerateExportsRequest),
     FileSizeDocument(FileSizeDocumentRequest),
     CompleteImportMembers(CompleteImportMembersRequest),
@@ -1206,6 +1221,10 @@ fn cache_invalidate_all_message_type() -> String {
 
 fn prewarm_package_json_message_type() -> String {
     "prewarm_package_json".to_owned()
+}
+
+fn visible_documents_message_type() -> String {
+    "visible_documents".to_owned()
 }
 
 fn node_modules_changed_message_type() -> String {

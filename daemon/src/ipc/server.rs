@@ -26,7 +26,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     path::{Path, PathBuf},
     sync::{
@@ -140,6 +140,17 @@ impl DocumentTaskLifecycle {
         flag
     }
 
+    /// Cancel and forget the work of every document not in `visible`, which holds document paths.
+    fn retain_visible(&mut self, visible: &HashSet<&str>) {
+        self.active_by_document.retain(|key, active| {
+            let keep = visible.contains(document_path_of(key));
+            if !keep {
+                active.store(true, Ordering::Release);
+            }
+            keep
+        });
+    }
+
     /// Cancel every document's work. `Drop` does this too, but only when the connection function
     /// returns, which is after the shutdown join this must shorten.
     fn cancel_all(&self) {
@@ -206,6 +217,10 @@ fn document_key(workspace_root: &str, document_path: &str) -> String {
     format!("{workspace_root}\0{document_path}")
 }
 
+fn document_path_of(key: &str) -> &str {
+    key.split_once('\0').map_or(key, |(_, path)| path)
+}
+
 /// Every piece of background work one connection owns that can be asked to stop, grouped behind a
 /// single `cancel_all` so teardown cannot miss one. A build already inside Rolldown cannot be
 /// reached; [`TASK_JOIN_TIMEOUT`] bounds the wait for it.
@@ -243,6 +258,18 @@ impl ConnectionLifecycles {
         self.document_stream.cancel_all();
         self.swr_refresh.cancel_all();
         self.size_builds.cancel_all();
+    }
+
+    /// Drop the queued work of every document the client no longer shows. The registry refresh
+    /// belongs to a manifest, not a document, and the prefetcher already yields to analysis.
+    fn retain_visible(&mut self, document_paths: &[String]) {
+        let visible = document_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        self.document_stream.retain_visible(&visible);
+        self.swr_refresh.retain_visible(&visible);
+        self.size_builds.retain_visible(&visible);
     }
 }
 
@@ -979,6 +1006,9 @@ where
                     },
                 ));
             }
+            ClientMessage::VisibleDocuments(message) if hello_received => {
+                lifecycles.retain_visible(&message.document_paths);
+            }
             ClientMessage::EnumerateExports(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
@@ -1072,6 +1102,7 @@ where
             }
             ClientMessage::PrewarmPackageJson(_)
             | ClientMessage::NodeModulesChanged(_)
+            | ClientMessage::VisibleDocuments(_)
             | ClientMessage::CacheInvalidate(_)
             | ClientMessage::CacheInvalidateAll(_) => {}
         }
@@ -1686,6 +1717,22 @@ mod tests {
 
         assert!(first.load(Ordering::Acquire));
         assert!(second.load(Ordering::Acquire));
+    }
+
+    /// A document the client stopped showing loses its queued builds; a shown one keeps them, and
+    /// showing the hidden one again starts it afresh instead of inheriting the cancellation.
+    #[test]
+    fn retaining_visible_documents_cancels_only_the_hidden_ones() {
+        let mut lifecycle = DocumentTaskLifecycle::new();
+        let shown = lifecycle.start_document("C:/ws", "C:/ws/a.ts");
+        let hidden = lifecycle.start_document("C:/ws", "C:/ws/b.ts");
+
+        lifecycle.retain_visible(&["C:/ws/a.ts"].into_iter().collect());
+
+        assert!(!shown.load(Ordering::Acquire));
+        assert!(hidden.load(Ordering::Acquire));
+        let reopened = lifecycle.start_document("C:/ws", "C:/ws/b.ts");
+        assert!(!reopened.load(Ordering::Acquire));
     }
 
     #[test]

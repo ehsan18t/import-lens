@@ -364,11 +364,11 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
           statusBar.setState({ kind: state === "ready" ? "ready" : "unavailable" }),
         prewarmPackageJson: () => {
           const prewarmCount = prewarmPackageJsonDocuments(
-            vscode.workspace.textDocuments,
+            vscode.window.visibleTextEditors.map((editor) => editor.document),
             activeDaemon,
           );
           if (prewarmCount > 0) {
-            logger.debug(`Replayed package.json prewarm for ${prewarmCount} open document(s).`);
+            logger.debug(`Replayed package.json prewarm for ${prewarmCount} visible document(s).`);
           }
         },
         refreshPackageJsonHints: () => packageJsonAnalysis.refreshVisibleDocuments(),

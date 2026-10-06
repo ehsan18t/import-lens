@@ -49,7 +49,7 @@ import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 import { decode, encode } from "@msgpack/msgpack";
 import * as esbuild from "esbuild";
 
-const protocolVersion = 7;
+const protocolVersion = 8;
 const packageName = "importlens-accuracy-fixture";
 const typedPackageName = "importlens-accuracy-ts-fixture";
 const assetPackageName = "importlens-accuracy-asset-fixture";
