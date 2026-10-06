@@ -12,11 +12,10 @@ use std::sync::{
 
 use super::boundary::{ENGINE_PERMITS, is_background, run_as_background};
 
-/// Two permits, but a worker keeps running after it releases one: minify, compress,
-/// fingerprint, insert. At exactly `ENGINE_PERMITS` workers that post-build tail
-/// leaves both permits idle with misses still queued behind it. The extra workers
-/// exist to refill the permits, not to widen them — concurrency at the engine is
-/// still bounded by the semaphore, so peak memory is unchanged.
+/// A worker keeps running after it releases its permit (minify, compress, fingerprint,
+/// insert), so at exactly `ENGINE_PERMITS` workers that tail idles the permits with misses
+/// still queued. The extra workers refill the permits, not widen them: the semaphore still
+/// bounds engine concurrency and peak memory.
 const MISS_DRAIN_WORKERS: usize = ENGINE_PERMITS + 2;
 
 /// Run `run` over every item with a fixed number of scoped worker threads, returning
@@ -86,15 +85,9 @@ where
 
 /// Classify every item at pool width, then drain only the ones that need the engine.
 ///
-/// The engine permits (§9) bound *builds* to two. They say nothing about cache hits or
-/// imports that never resolve, and running those inside the bounded drain would serve
-/// them at drain width. `classify` runs on the Rayon pool (`Ok` = answered, `Err` =
-/// pending work); only the `Err`s reach the bounded drain.
-///
-/// The miss drain runs slightly wider than the permit count on purpose: a worker
-/// that finished its build still has to minify, compress, fingerprint and insert,
-/// and it does all of that *after* releasing its permit. At exactly two workers that
-/// post-build tail leaves both permits idle with work queued behind it.
+/// The engine permits (§9) bound *builds*; cache hits and imports that never resolve would
+/// be needlessly throttled to drain width. `classify` runs on the Rayon pool (`Ok` =
+/// answered, `Err` = pending work); only the `Err`s reach the bounded drain.
 pub(crate) fn drain_classified<T, P, R, C, F>(items: &[T], classify: C, run: F) -> Vec<R>
 where
     T: Sync,
@@ -266,7 +259,7 @@ mod tests {
         assert_eq!(results, expected);
     }
 
-    /// Every item must be settled exactly once — a classified item must not also be
+    /// Every item must be settled exactly once: a classified item must not also be
     /// drained, and a deferred one must not be dropped.
     #[test]
     fn drain_classified_runs_each_item_once() {
@@ -358,11 +351,9 @@ mod tests {
 
     /// One import that parks the bundler must not hold back the imports beside it.
     ///
-    /// This is the drain half of the streaming guarantee: the response already went out
-    /// (`service::handle_analyze_document_streaming` runs no builds), and each import that lands
-    /// is pushed to the client from here. If the drain emitted in input order — or waited for the
-    /// whole set before emitting — a single parked build would still take the document's other
-    /// imports down with it, which is the entire defect.
+    /// The drain half of the streaming guarantee: each import that lands is pushed to the
+    /// client from here, so emitting in input order (or after the whole set) would let one
+    /// parked build delay the document's other imports.
     ///
     /// The slow item is deliberately FIRST: an implementation that collected results and returned
     /// them in order would pass a test where the slow one is last.

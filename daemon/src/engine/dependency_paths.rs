@@ -1,8 +1,5 @@
-//! Bounded index of real paths loaded by successful engine builds.
-//!
-//! This preserves the first-party file-size freshness signal previously
-//! supplied incidentally by the custom module-graph cache without retaining
-//! any linker or AST state.
+//! Bounded index of real paths loaded by successful engine builds. It feeds the first-party
+//! file-size freshness signal without retaining any linker or AST state.
 
 use std::{
     collections::HashMap,
@@ -49,15 +46,10 @@ impl DependencyPathIndex {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Poison-tolerant, like every other shared map in the daemon (`analysis_flight`, the
-    /// caches, `build_memo`).
-    ///
-    /// The release build unwinds, precisely so a panicking file can be isolated and
-    /// skipped. That means a panic *can* poison this lock — and an `.expect()` here would
-    /// then turn one contained panic into a daemon that panics on every subsequent
-    /// analysis, which is the exact failure the isolation exists to prevent. A poisoned
-    /// index is not dangerous: the worst case is a stale or partial path set, which costs
-    /// one re-record on the next build.
+    /// Poison-tolerant, like every other shared map in the daemon. The release build unwinds
+    /// so a panicking file can be isolated; an `.expect()` here would turn one contained
+    /// panic into a daemon that panics on every later analysis. A poisoned index costs at
+    /// worst a stale path set, re-recorded on the next build.
     fn read(&self) -> RwLockReadGuard<'_, HashMap<DependencyKey, PathSet>> {
         self.sets
             .read()

@@ -120,12 +120,10 @@ impl Prefetcher {
     }
 }
 
-/// Dispatch the outer prewarm coordination (dependency enumeration + fan-out)
-/// onto the bounded `PREWARM_POOL` instead of an unbounded per-call OS thread,
-/// logging a pool-build failure at debug. Every engine build the job starts is
-/// background work, so prewarm never holds the permit interactive builds rely on.
-/// Cancellation is still checked inside the job, so a superseded dispatch bails
-/// via the generation guard.
+/// Runs the prewarm coordination (dependency enumeration and fan-out) on the
+/// bounded `PREWARM_POOL`. Every engine build the job starts is background work,
+/// so prewarm never holds the permit interactive builds rely on. The job checks
+/// its generation, so a superseded dispatch bails.
 fn dispatch_prewarm(job: impl FnOnce() + Send + 'static) {
     match prewarm_pool() {
         Ok(pool) => pool.spawn(|| run_as_background(job)),
@@ -212,13 +210,9 @@ fn package_json_prewarm_jobs(
     Ok(requests)
 }
 
-// Avoid a guaranteed missing-export build: a package with no default export must not
-// get a Default prewarm job. The question is only ever about the entry file's own
-// export statements, so it is answered by parsing that one file — it used to be
-// answered with a full `enumerate_exports_sync` engine build of the entire package
-// graph, once per dependency, serially, before any real prewarm work could start.
-//
-// Still memoized per entry stat token: prewarm reruns on every package.json event.
+// A package with no default export must not get a Default prewarm job, which would
+// be a guaranteed missing-export build. Answered by parsing the entry file alone,
+// never by an engine build, and memoized per entry stat token.
 fn exposes_default_export(resolved: &ResolvedPackage) -> bool {
     let token = entry_stat_token(&resolved.entry_path);
     let memo = DEFAULT_EXPORT_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
@@ -279,7 +273,7 @@ fn source_exposes_default(source: &str, source_type: SourceType) -> bool {
     // `export default …` and `export { x as default }` land in local entries;
     // `export { default } from './x'` in indirect ones. A bare `export * from` does
     // NOT re-export the default (the spec excludes it), but `export * as default
-    // from` does — and that is a star entry carrying the name.
+    // from` does, as a star entry carrying the name.
     record.local_export_entries.iter().any(exports_default)
         || record.indirect_export_entries.iter().any(exports_default)
         || record.star_export_entries.iter().any(exports_default)
@@ -449,10 +443,6 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    // F3-A: the outer prewarm dispatch runs the coordination job on the bounded
-    // `PREWARM_POOL` instead of an unbounded per-call OS thread. Proven by observing
-    // the job actually execute on the pool — the raw `thread::Builder…spawn` with a
-    // swallowed spawn error is gone.
     #[test]
     fn dispatch_prewarm_runs_job_on_bounded_pool() {
         let (tx, rx) = mpsc::channel();
@@ -475,10 +465,8 @@ mod default_export_tests {
         source_exposes_default(source, SourceType::mjs())
     }
 
-    /// Answering this with a parse of the entry file replaced a full engine build of
-    /// the whole package graph, once per dependency. The predicate decides whether a
-    /// Default prewarm job exists at all, so every arm is pinned: a false negative
-    /// silently costs the user a cache miss on the import they are about to type.
+    /// The predicate decides whether a Default prewarm job exists at all, so every
+    /// arm is pinned: a false negative costs a cache miss on the import being typed.
     #[test]
     fn detects_every_shape_of_default_export() {
         assert!(exposes("export default function go() {}\n"));
@@ -497,7 +485,7 @@ mod default_export_tests {
         assert!(!exposes("export { alpha, beta } from './inner.js';\n"));
     }
 
-    /// A bare star re-export does NOT forward the default — the spec excludes it — so
+    /// A bare star re-export does NOT forward the default (the spec excludes it), so
     /// claiming otherwise would queue a build guaranteed to fail on a missing export.
     #[test]
     fn a_bare_star_reexport_does_not_forward_the_default() {

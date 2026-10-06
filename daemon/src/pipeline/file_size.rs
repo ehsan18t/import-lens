@@ -21,57 +21,45 @@ use std::collections::{BTreeMap, HashMap};
 
 /// What the daemon knows about the package behind an import, before any build runs.
 ///
-/// The two non-`Installed` kinds are both "there is no `node_modules/<name>/package.json`", and they
-/// are **not the same fact**. Collapsing them into one is a regression this enum exists to make
-/// unrepresentable: see [`crate::pipeline::resolver::FirstPartySourceProbe`], which is what
-/// decides between them — and decides it on positive evidence that the specifier IS first-party,
-/// never on the absence of a `package.json` declaration.
+/// The two non-`Installed` kinds both mean "no `node_modules/<name>/package.json`" but are
+/// different facts and must stay distinct. [`crate::pipeline::resolver::FirstPartySourceProbe`]
+/// decides between them on positive evidence that the specifier is first-party, never on the
+/// absence of a `package.json` declaration.
 #[derive(Debug, Clone)]
 pub enum SizedPackage {
     /// Installed: the daemon resolved its manifest and built a request (a request carries the
     /// installed version), so this import is an **entry** of the file's combined build.
     Installed(ImportRequest),
-    /// **Not installed** — and not first-party either: the specifier resolves to nothing at all. An
-    /// uninstalled dependency, a typo, a stale import. Its bytes belong in this file's total and are
-    /// missing from it, however cleanly every build goes, so the total is a floor (SRS FR-024a,
-    /// bullet 4). Whether `package.json` happens to declare it changes none of that.
+    /// **Not installed** and not first-party: the specifier resolves to nothing (an uninstalled
+    /// dependency, a typo, a stale import). Its bytes belong in the total and are missing, so the
+    /// total is a floor (SRS FR-024a, bullet 4), whether or not `package.json` declares it.
     NotInstalled,
-    /// **Not a package at all** — a tsconfig path alias (`@app/components`, `~lib/foo`, or a bare
+    /// **Not a package**: a tsconfig path alias (`@app/components`, `~lib/foo`, or a bare
     /// `components/Button` under a `baseUrl`) resolving to first-party source. Import Lens measures
-    /// third-party imports (ADR-0004), so first-party code contributes nothing to any total it
-    /// reports, exactly like a relative import. It is **not a gap** and flags nothing: reading it as
-    /// a missing dependency made every file that uses path aliases a permanent floor — never cached,
-    /// never persisted, and refused a verdict by `importlens check`.
+    /// third-party imports (ADR-0004), so it contributes nothing, like a relative import. It is
+    /// not a gap and flags nothing; flagging it would make every aliased file a permanent floor.
     ///
-    /// (The `@/…`, `~/…`, `#…` and `$…` spellings never get this far: `document::specifier` drops
-    /// them before detection. It is the alias forms that look like package names that reach here.)
+    /// (`@/…`, `~/…`, `#…` and `$…` never get this far: `document::specifier` drops them before
+    /// detection. Only alias forms that look like package names reach here.)
     PathAlias,
 }
 
 /// One import a file-size computation must account for, together with whatever the caller has
 /// already measured for it.
 ///
-/// `result` is `None` while that import's own build is still in flight — the streaming document
-/// handlers answer from cache and let the misses land later (`ipc::server`). Such an import is
-/// still an *entry* of the combined build (its bytes belong in the file's total), but it can
-/// contribute nothing to the conservative per-import fallback below, which is the honest thing:
-/// the fallback sums measurements, and there is not one yet. A fallback that had to skip it is
-/// marked [`FileSizeComputation::incomplete`] and is never cached.
+/// `result` is `None` while that import's own build is in flight (the streaming handlers answer
+/// from cache and let misses land later, `ipc::server`). Such an import is still an entry of the
+/// combined build, but contributes nothing to the per-import fallback, which then is
+/// [`FileSizeComputation::incomplete`] and never cached.
 ///
-/// A [`SizedPackage::NotInstalled`] import is not an entry of any build and has no measurement to
-/// contribute, and it used to be dropped from the aggregate's input entirely (`service.rs` filtered
-/// it out), so the file's total silently omitted it, was cached, was persisted as the file's
-/// baseline, and passed `importlens check` with exit 0. It is a floor now, exactly like every other
-/// unmeasured contributor (SRS FR-024a, bullet 4).
+/// A [`SizedPackage::NotInstalled`] import is not an entry of any build and makes the total a
+/// floor, like every other unmeasured contributor (SRS FR-024a, bullet 4).
 ///
-/// Carrying the measurement in rather than re-deriving it is also what keeps the fallback out of
-/// the engine. It used to re-analyze every import of the failing runtime group from scratch, so
-/// one combined build that parked cost a build timeout and then N more — duplicating, on a second
-/// set of permits, the very builds the caller had already run or was already running.
+/// The measurement is carried in, never re-derived, so the fallback never enters the engine.
 #[derive(Debug, Clone)]
 pub struct SizedImport {
     pub package: SizedPackage,
-    /// The specifier as written in the source — the one thing every import has, installed or not.
+    /// The specifier as written in the source; every import has one, installed or not.
     pub specifier: String,
     pub result: Option<ImportResult>,
 }
@@ -114,58 +102,42 @@ pub struct FileSizeComputation {
     pub gzip_bytes: u64,
     pub brotli_bytes: u64,
     pub zstd_bytes: u64,
-    /// What the totals above are made of, per non-JavaScript kind — already INSIDE the five sizes.
+    /// What the totals above are made of, per non-JavaScript kind; already inside the five sizes.
     ///
-    /// The file headline began including stylesheet, wasm and font bytes without any surface able to
-    /// say so, which is how a status-bar number silently changed meaning. One row per kind, summed
-    /// across every runtime group, because a runtime is an artifact boundary and each group's assets
-    /// were compressed on their own (ADR-0005).
+    /// One row per kind, summed across runtime groups: each group's assets are compressed on their
+    /// own (ADR-0005).
     pub asset_breakdown: Vec<AssetContribution>,
     /// Bytes that belong in these totals are absent: an import contributed no measurement, or a
-    /// successful build disclosed supported `uncounted_assets`. The totals are then a LOWER BOUND
-    /// on the file, not the file — safe to show beside the diagnostics that say so (FR-024a: a
-    /// floor beats a zero), and never safe to cache, persist, or compare against a baseline
-    /// (ADR-0006, invariant 4).
+    /// successful build disclosed supported `uncounted_assets`. The totals are then a lower bound:
+    /// safe to show beside the diagnostics that say so (FR-024a: a floor beats a zero), never safe
+    /// to cache, persist, or compare against a baseline (ADR-0006, invariant 4).
     ///
     /// **Any** missing-byte shape sets it:
     ///
-    /// * **Loading** — its own build had not landed when the sum was taken (`result: None`).
-    /// * **Unmeasured, transient** — timeout / panic / engine_gone. Says nothing about the package.
-    /// * **Unmeasured, deterministic** — parse / link / missing_export / … Says a great deal about
-    ///   the package, and *nothing at all about how many bytes it contributes*, which is the only
-    ///   question a total asks. This one was exempted, and the exemption is the seventh instance of
-    ///   the defect this model exists to end: a deterministic failure also KILLS the file's combined
-    ///   build, so the total collapses into an un-deduplicated per-import sum — a different number
-    ///   for every import that *was* measured — and with `incomplete: false` that number was cached,
-    ///   persisted as the file's permanent baseline, shown without an estimate label, and passed by
-    ///   `importlens check` with exit 0. "Deterministically unknown" is still unknown.
-    /// * and an import that could not be RESOLVED, which is not even an entry of the combined build,
-    ///   so its bytes are absent from these totals however well that build went.
-    /// * **Measured but partial** — its JavaScript/healthy assets have real sizes, while
-    ///   `uncounted_assets` identifies supported shipped bytes absent from them.
+    /// * **Loading**: its own build had not landed when the sum was taken (`result: None`).
+    /// * **Unmeasured, transient**: timeout / panic / engine_gone.
+    /// * **Unmeasured, deterministic**: parse / link / missing_export / …. This says nothing about
+    ///   how many bytes the import contributes, which is the only question a total asks.
+    /// * **Unresolved**: not an entry of the combined build, so its bytes are absent however well
+    ///   that build went.
+    /// * **Measured but partial**: `uncounted_assets` identifies supported shipped bytes absent
+    ///   from real JavaScript/asset sizes.
     ///
-    /// It exists because neither of the other two signals can see this. `error` is `None` — the sum
-    /// succeeded, it just summed less than the file. And the stage scan in [`Self::is_cacheable`]
-    /// sees only request-local stages: a still-building import has no stage, while deterministic
-    /// `uncounted_assets` is deliberately reusable at the import level.
+    /// No other signal sees this: `error` is `None` (the sum succeeded), and the stage scan in
+    /// [`Self::is_cacheable`] sees only request-local stages (a still-building import has no stage,
+    /// and `uncounted_assets` is deliberately reusable at the import level).
     pub incomplete: bool,
-    /// The file's **own combined build** failed, so these totals fell back to a sum of per-import
-    /// costs — with no shared-module deduplication. That is a **different quantity** from a File
-    /// Cost ([ADR-0004]): a module two imports both pull in is counted TWICE. It is an *over*-count,
-    /// not a floor, and it is just as unusable: never cached, never persisted, never judged
-    /// (ADR-0006, invariant 4, second half).
+    /// The file's own combined build failed, so these totals fell back to a sum of per-import costs
+    /// with no shared-module deduplication. That is a different quantity from a File Cost
+    /// ([ADR-0004]): a shared module is counted twice. An over-count, not a floor, and just as
+    /// unusable: never cached, persisted, or judged (ADR-0006, invariant 4, second half).
     ///
-    /// **`incomplete` structurally cannot see this**, and that is the whole reason the flag exists.
-    /// A combined build is strictly larger than any single import's build, which makes it the
-    /// likeliest thing in the daemon to hit `BUILD_TIMEOUT` — and when it does, every one of the
-    /// file's imports may still be perfectly Measured and cached. `missing_inputs` is then correctly
-    /// `false`, `error` is `None`, every import on the wire carries a size, and the only trace of
-    /// the failure is a `timeout` diagnostic that three of the four consumers never looked at.
+    /// `incomplete` cannot see this. The combined build is the likeliest build to hit
+    /// `BUILD_TIMEOUT`, and when it does every import may still be Measured and cached, so
+    /// `missing_inputs` is `false` and `error` is `None`.
     ///
-    /// Set for a **deterministic** combined-build failure too. The previous fix reasoned that an
-    /// over-count can never produce a false *pass*, so a budget verdict from it was safe. But a
-    /// false FAIL is also a verdict, and invariant 5 forbids both: a budget judged against a number
-    /// the file never had is neither passed nor failed.
+    /// Set for a deterministic combined-build failure too: a false fail is also a verdict, and
+    /// invariant 5 forbids judging a budget against a number the file never had.
     pub degraded: bool,
     pub error: Option<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
@@ -179,20 +151,13 @@ impl FileSizeComputation {
     /// file-size cache (SRS FR-026c). [`crate::pipeline::file_size_cache::FileSizeCache::insert`]
     /// asks this itself; a caller cannot forget it.
     ///
-    /// Four ways it is not. It failed outright (`error`). It is [`Self::incomplete`] — a sum
-    /// missing an input, which is a real number but not this file's. It is [`Self::degraded`] — the
-    /// file's own combined build failed, so what is on offer is an un-deduplicated per-import sum,
-    /// which is a real number and *also* not this file's. Or a **transient** stage rode in on a
-    /// diagnostic some other way.
+    /// It is not when it failed (`error`), is [`Self::incomplete`] (an under-count), is
+    /// [`Self::degraded`] (an un-deduplicated over-count), carries unverifiable fingerprints, or
+    /// carries a transient stage on a diagnostic.
     ///
-    /// `degraded` is not redundant with `incomplete`, and the two are not even the same *direction*
-    /// of error: a floor is an under-count, a degraded total is an over-count. A combined build can
-    /// park while every one of the file's imports is measured and cached, which leaves `incomplete`
-    /// correctly `false` — and the totals still are not the file's.
-    ///
-    /// Nor is `degraded` redundant with the transient scan: it also catches the DETERMINISTIC
-    /// combined-build failure, which carries a perfectly durable stage (`link`, `parse`) and would
-    /// otherwise be cached for the whole 30s TTL and judged by CI.
+    /// `degraded` is redundant with neither `incomplete` (a combined build can park while every
+    /// import is measured) nor the transient scan (a deterministic combined-build failure carries
+    /// a durable stage such as `link` or `parse`).
     pub fn is_cacheable(&self) -> bool {
         self.error.is_none()
             && !self.incomplete
@@ -207,12 +172,8 @@ impl FileSizeComputation {
     /// Fold one runtime group's conservative per-import sum into the file's totals, and report
     /// whether it contributed anything.
     ///
-    /// The ONLY way a fallback sum reaches the totals, which is the point: the "an input was not
-    /// really measured" flag travels WITH the bytes and is applied here, so a caller cannot add the
-    /// bytes and forget the flag. It has been forgotten three times in this design — a circuit
-    /// breaker that condemned a healthy package, a degraded import result cached over a healthy
-    /// one, and this file total — always because a fabricated number and a measured one are the
-    /// same `u64`.
+    /// The only way a fallback sum reaches the totals: the missing-input flag travels with the
+    /// bytes and is applied here, so a caller cannot add the bytes and forget the flag.
     fn absorb_fallback(&mut self, fallback: PerImportTotals) -> bool {
         self.incomplete |= fallback.missing_inputs;
         if !fallback.sized_any {
@@ -230,9 +191,8 @@ impl FileSizeComputation {
 
     /// Merge one source of per-kind asset weight into the file's composition, summing by kind.
     ///
-    /// Both routes feed this: a runtime group's own combined build, and the per-import fallback a
-    /// degraded group falls back to. A degraded file still has real asset bytes in its total, so
-    /// losing the breakdown exactly when the number is hardest to read would be the wrong trade.
+    /// Fed by both a runtime group's combined build and a degraded group's per-import fallback,
+    /// which still has real asset bytes in its total.
     fn absorb_asset_breakdown(&mut self, contributions: &[AssetContribution]) {
         absorb_asset_breakdown_into(&mut self.asset_breakdown, contributions);
     }
@@ -240,10 +200,8 @@ impl FileSizeComputation {
 
 /// Sum per-kind asset weight into a breakdown, matching on kind.
 ///
-/// One definition for the two accumulators that need it — the file's composition and the per-import
-/// fallback's. `AssetContribution` has five size fields and each was enumerated by hand in both
-/// places, so a sixth compression metric added to one would have silently dropped out of the other,
-/// leaving rows that no longer sum to the total shown beside them.
+/// One definition for both accumulators (the file's composition and the per-import fallback's), so
+/// a new size field cannot be added to one and silently dropped from the other.
 fn absorb_asset_breakdown_into(
     breakdown: &mut Vec<AssetContribution>,
     contributions: &[AssetContribution],
@@ -265,18 +223,13 @@ fn absorb_asset_breakdown_into(
     }
 }
 
-/// How much of each import's weight another import of the SAME document also pulls in — counted
-/// **within a runtime**, because that is the only place a shared module is shared.
+/// How much of each import's weight another import of the same document also pulls in, counted
+/// **within a runtime** only.
 ///
-/// Each import arrives paired with the runtime it resolves under, and the count is partitioned by
-/// it. A module reached from Astro frontmatter (Server) and from a client `<script>` (Client) is
-/// **not** shared: the two runtimes are two artifacts that ship separately, each carrying its own
-/// copy ([ADR-0005]). Counting it across the boundary claimed a deduplication the build model
-/// explicitly does not perform, and `insights.ts` rendered that claim to the user as a
-/// shared-dependency saving — on exactly the file shape the runtime split exists to handle.
-///
-/// The runtime comes in with the result rather than being re-derived here, so there is exactly one
-/// source of the partition.
+/// A module reached from Astro frontmatter (Server) and from a client `<script>` (Client) is not
+/// shared: the two runtimes ship as separate artifacts, each with its own copy ([ADR-0005]), and
+/// `insights.ts` would render a cross-runtime count as a saving the build never makes. The runtime
+/// arrives with each result, never re-derived, so the partition has one source.
 pub fn annotate_shared_bytes<'a>(
     imports: impl IntoIterator<Item = (ImportRuntime, &'a mut ImportResult)>,
 ) {
@@ -319,25 +272,18 @@ fn result_contributions(result: &ImportResult) -> &[ModuleContribution] {
 /// Combined file sizing builds one multi-entry Rolldown bundle **per runtime** so
 /// shared transitive modules are linked and counted once within a runtime.
 ///
-/// A `BundleRequest` carries a single runtime, and Rolldown resolves the whole
-/// transitive graph under it. Root entries are pre-resolved per request, so their
-/// own paths are always right — but Server and Client resolve dependencies under
-/// materially different conditions (`browser` alias fields, `browser` vs `node`
-/// export conditions). Sizing every entry under one import's runtime therefore
-/// resolves the *other* runtime's packages against the wrong conditions, and the
-/// mis-conditioned build still succeeds, so nothing warns. A single Astro file
-/// reaches this: frontmatter imports are Server, processed `<script>` imports are
-/// Client (design doc §6.3, I15).
+/// A `BundleRequest` carries a single runtime, and Rolldown resolves the whole transitive graph
+/// under it. Server and Client resolve dependencies under different conditions (`browser` alias
+/// fields, `browser` vs `node` export conditions), and a mis-conditioned build still succeeds
+/// silently, so every entry must be built under its own runtime. A single Astro file mixes them:
+/// frontmatter imports are Server, processed `<script>` imports are Client.
 ///
-/// Grouping is per runtime rather than per entry on purpose: shared-module
-/// deduplication is only ever real *within* a runtime, since Server and Client code
-/// never share a chunk in the shipped product.
+/// Grouping is per runtime, not per entry: shared-module deduplication is real only within a
+/// runtime.
 ///
-/// Each group is minified and **compressed on its own, and the results are added** — a runtime is
-/// an artifact boundary, and compressed bytes may be summed across such a boundary and never within
-/// one ([ADR-0005], [ADR-0004]; design doc §6.3, I20/I15). Only a document that mixes runtimes has
-/// more than one group, and only an Astro document mixes them: every other document's imports are
-/// `Component`, so the sum has exactly one term and cannot over-report.
+/// Each group is minified and **compressed on its own, and the results are added**: compressed
+/// bytes may be summed across an artifact boundary, never within one ([ADR-0005], [ADR-0004]).
+/// Only Astro documents mix runtimes; every other document has one `Component` group.
 pub fn compute_file_size(
     context: &AnalysisContext,
     imports: &[SizedImport],
@@ -349,18 +295,11 @@ pub fn compute_file_size(
 
 /// [`compute_file_size`] with the minifier injected, which no production caller does.
 ///
-/// The minify-failure arm below degrades the file's totals exactly as a build failure does, and
-/// **no fixture can reach it**: Rolldown parses every module with the same OXC parser that
-/// [`minify_source`] re-parses the linked chunk with, in strict module mode, so any source that
-/// would fail the chunk's re-parse fails the *build* first. (Measured, not assumed: `'0'`-prefixed
-/// octal literals, `with`, duplicate parameters, `delete` of a local, a hashbang — every one of them
-/// comes back a `parse` failure of the combined build, never a `minify` failure of its chunk.)
-///
-/// The arm is real all the same — a codegen/minifier defect, or a construct OXC can print and not
-/// re-parse — and being unreachable from a fixture is precisely why it went untested: `degraded` was
-/// deleted from it and the entire daemon suite stayed green, which is Critical 1's exact shape (the
-/// file's own build fails while every contributor is Measured). So the seam is here, used by one
-/// test, and by nothing else.
+/// The minify-failure arm below degrades the totals exactly as a build failure does, and no fixture
+/// can reach it: Rolldown parses every module with the same OXC parser [`minify_source`] uses, in
+/// strict module mode, so a source that would fail the re-parse fails the build first (legacy
+/// octal, `with`, duplicate parameters, `delete` of a local, and a hashbang all fail as `parse`).
+/// The arm still guards a codegen/minifier defect, so this seam exists for its one test.
 fn compute_file_size_with(
     context: &AnalysisContext,
     imports: &[SizedImport],
@@ -369,9 +308,7 @@ fn compute_file_size_with(
 ) -> FileSizeComputation {
     let mut diagnostics = Vec::new();
     let mut totals = FileSizeComputation::default();
-    // Entries and their originating imports, grouped by the runtime they must be
-    // built under. `BTreeMap` keeps the group order stable so identical input
-    // produces identical output.
+    // Entries and their imports, grouped by runtime. `BTreeMap` keeps the output deterministic.
     let mut groups: BTreeMap<ImportRuntime, RuntimeGroup> = BTreeMap::new();
 
     for import in imports {
@@ -379,10 +316,8 @@ fn compute_file_size_with(
         let request = match &import.package {
             SizedPackage::Installed(request) => request,
             SizedPackage::NotInstalled => {
-                // The package is NOT INSTALLED and the specifier is not first-party source: no
-                // request, no entry, no measurement. Its bytes are missing from the totals however
-                // cleanly every build goes, and it used to be filtered out of the aggregate's input
-                // before it could say so (SRS FR-024a, bullet 4). Floor.
+                // Not installed and not first-party: its bytes are missing however cleanly every
+                // build goes. Floor (SRS FR-024a, bullet 4).
                 totals.incomplete = true;
                 diagnostics.push(diagnostic(
                     crate::pipeline::stage::PACKAGE_RESOLUTION,
@@ -394,11 +329,8 @@ fn compute_file_size_with(
                 continue;
             }
             SizedPackage::PathAlias => {
-                // NOT a missing dependency: a tsconfig path alias, which RESOLVES to first-party
-                // source. Import Lens measures third-party imports (ADR-0004), so this contributes
-                // nothing to a total it reports — exactly like a relative import, which is never even
-                // detected. It is a fact, not a gap: NO flag, and the total stays complete. Flagging
-                // it made every aliased file a permanent floor.
+                // A path alias to first-party source contributes nothing (ADR-0004), like a
+                // relative import. A fact, not a gap: no flag, and the total stays complete.
                 diagnostics.push(diagnostic(
                     crate::pipeline::stage::PATH_ALIAS,
                     "specifier is a path alias resolving to first-party source, not an installed \
@@ -421,15 +353,10 @@ fn compute_file_size_with(
                 });
                 group.sized.push(import.clone());
             }
-            // A **declarations-only** package resolves to `Err` BY DESIGN — it ships no runtime
-            // entry because it ships no runtime code — and `pipeline::types_only` answers it
-            // MEASURED: a genuine zero, at High confidence. It is not an entry of any build and it
-            // contributes no bytes, and *both of those are facts*, so the total stays complete.
-            //
-            // Treating it as a gap (which the resolution check briefly did) made every file that
-            // imports an `@types/…` or any declarations-only package a permanent floor: the combined
-            // build re-ran on every size request, nothing was ever cached or persisted, and
-            // `importlens check` exited 3 — for a large fraction of real TypeScript files.
+            // A declarations-only package resolves to `Err` by design (it ships no runtime code),
+            // and `pipeline::types_only` answers it Measured at zero. Contributing no bytes is a
+            // fact, so the total stays complete; treating it as a gap would make every file that
+            // imports `@types/…` a permanent floor.
             Err(_)
                 if import
                     .result
@@ -444,10 +371,8 @@ fn compute_file_size_with(
                     vec![specifier],
                 ));
             }
-            // A **native-binary-only** package resolves to `Err` for the same reason — it ships no
-            // importable JS entry — and `pipeline::native_binary` answers it MEASURED at zero. It is
-            // not an entry of any build and contributes no bytes, both facts, so the total stays
-            // complete rather than becoming a floor.
+            // A native-binary-only package likewise ships no importable JS entry, and
+            // `pipeline::native_binary` answers it Measured at zero. The total stays complete.
             Err(_)
                 if import
                     .result
@@ -463,9 +388,8 @@ fn compute_file_size_with(
                 ));
             }
             Err(error) => {
-                // This import is not an ENTRY of any group, so its bytes are missing from the
-                // totals however cleanly the combined builds go — the one non-Measured contributor
-                // a successful build cannot absorb. Floor (ADR-0006, invariant 4).
+                // Not an entry of any group, so its bytes are missing however cleanly the
+                // combined builds go. Floor (ADR-0006, invariant 4).
                 totals.incomplete = true;
                 diagnostics.push(diagnostic(
                     crate::pipeline::stage::ENTRY_RESOLUTION,
@@ -477,29 +401,18 @@ fn compute_file_size_with(
     }
 
     if groups.is_empty() {
-        // No combined build to run. Either the file has no imports at all, or every one of them is
-        // declarations-only or a path alias (all three a complete, honest zero), or not one could be
-        // resolved (`incomplete`, and never cached as this file's size).
+        // No combined build to run: no imports, or only declarations-only/native-binary-only/path
+        // alias imports (a complete zero), or none resolved (`incomplete`, never cached).
         return FileSizeComputation {
             diagnostics,
             ..totals
         };
     }
 
-    // Each runtime group is minified AND COMPRESSED on its own, and the results are added.
-    //
-    // A runtime is an artifact boundary (ADR-0005): the Server bundle and the Client bundle are two
-    // things that ship, each carrying its own copy of anything both need, and each genuinely
-    // compressed alone. Summing their separately-compressed sizes therefore models reality exactly.
-    //
-    // This used to join the groups' minified outputs and compress the CONCATENATION once, on the
-    // reasoning that summing separately-compressed parts is unsound because compression is not
-    // additive. Non-additivity is real, but it applies to parts that would in reality be compressed
-    // TOGETHER — and two runtime groups never are. The join compressed away every byte of
-    // redundancy between two payloads that never meet, so the figure it produced was a strict lower
-    // bound on what ships (measured at ~49% under-report on a shared-heavy two-runtime Astro file),
-    // presented as a size, and about to gate the per-file budget. See the design doc §6.3 (I20,
-    // superseding I15's first accepted consequence).
+    // Each runtime group is minified and compressed on its own, and the results are added. A
+    // runtime is an artifact boundary (ADR-0005): Server and Client bundles ship and compress
+    // separately. Never concatenate groups before compressing: that compresses away redundancy
+    // between payloads that never meet, under-reporting what ships.
     let mut any_sized = false;
 
     for (runtime, group) in groups {
@@ -510,12 +423,9 @@ fn compute_file_size_with(
         }) {
             Ok(artifact) => artifact,
             Err(failure) => {
-                // Only this runtime's entries degrade. The other groups keep their real,
-                // shared-module-deduplicated numbers rather than being discarded with them — but
-                // the FILE's totals are now part deduplicated bundle, part per-import sum, so they
-                // are not the file's either way. `degraded` says so, for ANY failure stage: a
-                // timeout is the likeliest cause (this is the biggest build in the system) and a
-                // deterministic link failure is the one that reads as durable and gets cached.
+                // Only this runtime degrades; other groups keep their deduplicated numbers. The
+                // file's totals are then part bundle, part per-import sum, so `degraded` is set
+                // for any failure stage, deterministic ones included.
                 totals.degraded = true;
                 diagnostics.extend(failure.diagnostics.iter().map(|item| ImportDiagnostic {
                     stage: item.stage.clone(),
@@ -538,12 +448,9 @@ fn compute_file_size_with(
             }
         };
 
-        // `record_loaded_paths` is deliberately NOT called here. This build's
-        // `loaded_paths` is the union over every entry in the group, and writing that
-        // union under each entry's key would clobber the accurate per-entry sets the
-        // per-import analyses already recorded (`analyze.rs`), making an edit to one
-        // package invalidate another document's cached size for an unrelated one
-        // (design doc §6.3, I14).
+        // Never call `record_loaded_paths` here: this build's `loaded_paths` is the union over the
+        // group, and writing it under each entry's key would clobber the per-entry sets
+        // `analyze.rs` records, so an edit to one package would invalidate unrelated sizes.
         diagnostics.extend(artifact.diagnostics.iter().map(|item| ImportDiagnostic {
             stage: item.stage.clone(),
             message: item.message.clone(),
@@ -553,10 +460,8 @@ fn compute_file_size_with(
         let minified = match minify(&artifact.code) {
             Ok(minified) => minified,
             Err(error) => {
-                // Degrade only this runtime, exactly as a build failure does. Returning
-                // here would discard every other group's real totals and report zero
-                // for the whole file. The chunk linked but could not be minified, so this
-                // group's contribution falls back to the same un-deduplicated per-import sum.
+                // Degrade only this runtime, as a build failure does; returning would discard
+                // every other group's real totals.
                 totals.degraded = true;
                 diagnostics.push(diagnostic(
                     crate::pipeline::stage::MINIFY,
@@ -576,11 +481,7 @@ fn compute_file_size_with(
         let compressed = match compress(&minified) {
             Ok(compressed) => compressed,
             Err(error) => {
-                // Degrade only this runtime, exactly as the build and minify arms above do. This
-                // arm used to sit AFTER the loop, where `return error_computation(..)` was right:
-                // there was one compression pass over every group's output, so its failure really
-                // was the file's. Inside the loop that same `return` discards every OTHER group's
-                // real, already-measured bytes and reports ZERO for the whole file — one group's
+                // Degrade only this runtime, as the build and minify arms do: one group's
                 // compressor failing says nothing about another group's bytes.
                 totals.degraded = true;
                 diagnostics.push(diagnostic(
@@ -599,10 +500,9 @@ fn compute_file_size_with(
         };
 
         // This group's non-JavaScript assets, processed the way they ship (B2). The combined build
-        // saw every import in this runtime, so its stylesheets bundle into ONE artifact for the
-        // whole group — which is how they ship, and it dedupes what two imports both `@import`
-        // rather than counting it twice. Each artifact is compressed on its own and summed
-        // (ADR-0005); an asset that cannot be processed falls back to disclosure and is reported.
+        // saw every import in this runtime, so its stylesheets bundle into one artifact, deduping
+        // what two imports both `@import`. Each artifact is compressed on its own and summed
+        // (ADR-0005); an asset that cannot be processed is disclosed.
         let assets = match process_assets_bounded(
             artifact.assets.clone(),
             artifact.graph_source_bytes,
@@ -610,9 +510,8 @@ fn compute_file_size_with(
         ) {
             Ok(assets) => assets,
             Err(failure) => {
-                // The JS chunk completed, but the runtime group's asset tail did not produce one
-                // coherent measurement. Degrade this group exactly like a combined-build failure:
-                // keep the already-known per-import floor and never cache or judge it as File Cost.
+                // The asset tail produced no coherent measurement: degrade this group like a
+                // combined-build failure.
                 totals.degraded = true;
                 diagnostics.push(diagnostic(
                     failure.stage,
@@ -636,12 +535,9 @@ fn compute_file_size_with(
         totals
             .dependency_fingerprints
             .extend(assets.freshness_fingerprints());
-        // A first-party dependency's manifest is a freshness input here for the same reason it is
-        // one on the per-import path: `sideEffects` and `exports` decide which modules are retained
-        // and which file an entry resolves to, so editing one moves this number. No module byte
-        // changes when it does, a manifest is never a graph module, and the extension's watcher
-        // globs only `**/node_modules/*/package.json` — so without this, nothing observes the edit
-        // and the file total stays stale while the per-import numbers beside it update.
+        // First-party manifests are freshness inputs, as on the per-import path: `sideEffects` and
+        // `exports` change this number without moving a module byte, and the extension's watcher
+        // globs only `**/node_modules/*/package.json`.
         totals.dependency_fingerprints.extend(
             crate::pipeline::analyze::first_party_manifests(context, &artifact.loaded_paths)
                 .into_iter()
@@ -661,19 +557,14 @@ fn compute_file_size_with(
             ));
         }
 
-        // The JavaScript chunk and every healthy asset are still useful as a lower bound, but an
-        // `uncounted_assets` disclosure means bytes that ship are absent from all five totals.
-        // Today those are processor fallbacks; retain the engine's emitted-asset channel too so a
-        // future Rolldown output cannot silently reopen the same hole. Deterministic asset
-        // fallbacks may remain reusable per import; they may not be cached, persisted, or judged
-        // as this file's complete cost.
+        // An `uncounted_assets` disclosure, or any engine-emitted asset, means shipped bytes are
+        // absent from all five totals: a floor, never cached, persisted, or judged as File Cost
+        // (though deterministic asset fallbacks stay reusable per import).
         totals.incomplete |= !artifact.emitted_assets.is_empty() || assets.has_uncounted_assets();
 
         any_sized = true;
         totals.raw_bytes += artifact.code.len() as u64 + asset_sizes.raw_bytes;
-        // `minified_bytes` is measured on the same string this group's compressors saw, so the two
-        // numbers describe the same bytes. The old join added one separator per extra group, so the
-        // minified total described a string that ships nowhere.
+        // `minified_bytes` is measured on the same string this group's compressors saw.
         totals.minified_bytes += minified.len() as u64 + asset_sizes.minified_bytes;
         totals.gzip_bytes += compressed.gzip_bytes + asset_sizes.gzip_bytes;
         totals.brotli_bytes += compressed.brotli_bytes + asset_sizes.brotli_bytes;
@@ -712,9 +603,8 @@ struct RuntimeGroup {
 #[derive(Default)]
 struct PerImportTotals {
     sized_any: bool,
-    /// Bytes that belong in this sum are absent: an import was not Measured, or it was Measured with
-    /// an `uncounted_assets` disclosure. This sum is then under the file's true size by an amount
-    /// the sum itself cannot know.
+    /// Bytes that belong in this sum are absent: an import was not Measured, or was Measured with
+    /// an `uncounted_assets` disclosure. The sum then falls short of the file by an unknown amount.
     missing_inputs: bool,
     raw_bytes: u64,
     minified_bytes: u64,
@@ -726,39 +616,23 @@ struct PerImportTotals {
     asset_breakdown: Vec<AssetContribution>,
 }
 
-/// A file-level request must degrade to conservative non-deduped per-import totals
-/// instead of zeroing the aggregate when a package breaks the combined build (SRS
-/// FR-024a). Applied per runtime group, so a failure under one runtime never discards
-/// the other's real, deduplicated numbers.
+/// When a package breaks the combined build, a runtime group degrades to conservative
+/// non-deduplicated per-import totals instead of zeroing the aggregate (SRS FR-024a).
 ///
-/// It sums the measurements the caller already has, and **never enters the engine**. It used to
-/// re-analyze each import from scratch here, which is how one combined build that parked turned
-/// into a build timeout plus one more per import — the tail that the request budget existed to
-/// cut off, at the cost of fabricating the numbers it cut. Nothing here can park, so nothing
-/// needs cutting off.
+/// It sums the measurements the caller already has and **never enters the engine**, so nothing
+/// here can park.
 ///
-/// Only a **measured** import contributes bytes (ADR-0006: a size exists if and only if a build
-/// succeeded). Every other kind contributes exactly zero, and **every one of them therefore makes
-/// the sum a floor** — `missing_inputs`. That is invariant 4, stated without an exception, because
-/// the exception is where the seventh instance of this defect lived:
+/// Only a Measured import contributes bytes (ADR-0006: a size exists if and only if a build
+/// succeeded). Every other kind makes the sum a floor (`missing_inputs`, invariant 4, with no
+/// exception):
 ///
-/// * **Loading** (`result: None` — the streaming handlers answer from cache and let the misses
-///   arrive later). The sum is short by exactly that import's weight.
-/// * **Unmeasured, transient** (`timeout` / `panic` / `engine_gone`). Its bytes are unknown *for
-///   this run only*; the very next attempt may measure it.
-/// * **Unmeasured, deterministic** (`parse`, `link`, `missing_export`, `oversized_entry`, …). Its
-///   bytes are unknown **forever** — which is not the same as *zero*, and a total is a question
-///   about bytes. This kind used to be exempted, on the reasoning that "the total is as complete as
-///   this file can ever be, so cache it". Two things are wrong with that. The number is not the
-///   file's: the same deterministic failure also kills the file's COMBINED build, so what gets
-///   cached is a per-import sum with no shared-module deduplication — every measured import's
-///   contribution changes. And the exemption then let that number through *every* downstream gate
-///   at once, since all of them read one flag: it was cached (L1), persisted to the no-TTL
-///   bundle-impact history as the file's baseline, shown without the estimate label, and passed by
-///   `importlens check` with **exit 0**. A floor is a floor whatever made it one.
+/// * **Loading** (`result: None`): short by that import's weight.
+/// * **Unmeasured, transient** (`timeout` / `panic` / `engine_gone`): unknown for this run only.
+/// * **Unmeasured, deterministic** (`parse`, `link`, `missing_export`, `oversized_entry`, …):
+///   unknown forever, which is not zero. The same failure also kills the combined build, so the
+///   sum is not the file's number either.
 ///
-/// Every one of them is named in the diagnostics either way: the user is owed the fact, and the
-/// transient ones are owed the extra sentence that says a retry may fix them.
+/// Each is named in the diagnostics; transient ones also say a retry may fix them.
 fn per_import_totals(
     sized: &[SizedImport],
     diagnostics: &mut Vec<ImportDiagnostic>,
@@ -780,8 +654,8 @@ fn per_import_totals(
         };
 
         let Some(sizes) = result.sizes() else {
-            // No size, so no bytes, so the sum is short — whatever the stage. The stage decides
-            // only what the user is told, never whether the total is a floor.
+            // No size means the sum is short, whatever the stage. The stage decides only what
+            // the user is told.
             totals.missing_inputs = true;
             let stage = result
                 .unmeasured_stage()
@@ -828,30 +702,20 @@ fn per_import_totals(
         totals.gzip_bytes += sizes.gzip_bytes;
         totals.brotli_bytes += sizes.brotli_bytes;
         totals.zstd_bytes += sizes.zstd_bytes;
-        // These asset bytes are already inside `sizes`, so carrying the rows adds nothing to the
-        // total — it only makes the total say what it is made of. This sum does not deduplicate a
-        // stylesheet two imports share (that is precisely what the combined build it fell back FROM
-        // would have done), so the rows read high in the same way and by the same amount as the
-        // number they describe.
+        // These asset bytes are already inside `sizes`; the rows only describe composition. Like
+        // the sum, they do not deduplicate a stylesheet two imports share.
         absorb_asset_breakdown_into(&mut totals.asset_breakdown, &result.asset_breakdown);
     }
 
     totals
 }
 
-/// The real conservative-fallback path — `per_import_totals` folded through `absorb_fallback` —
-/// as one call, for the crate's tests.
+/// The real conservative-fallback path (`per_import_totals` folded through `absorb_fallback`) as
+/// one call, for the crate's tests, so the caching gate is tested against the total the code
+/// builds.
 ///
-/// The caching gate has to be tested against the total the code actually BUILDS. A hand-assembled
-/// `FileSizeComputation` cannot fail when the fold is wrong, and the fold is where the *first* half
-/// of ADR-0006 §4 lives: it is what decides whether an import that was never measured leaves a mark
-/// on the total.
-///
-/// **It is structurally blind to the second half, and that is how the second half survived.** This
-/// helper starts from a `FileSizeComputation::default()` and never runs a combined build, so
-/// `degraded` is always `false` here — the one shape where every contributor is Measured and the
-/// aggregate is still not the file's size cannot be expressed through it at all. Only
-/// [`compute_file_size`] can see that, so the tests for it go through `compute_file_size`.
+/// It never runs a combined build, so `degraded` is always `false` here: tests of the degraded
+/// shape must go through [`compute_file_size`].
 #[cfg(test)]
 pub(crate) fn per_import_totals_for_test(sized: &[SizedImport]) -> FileSizeComputation {
     let mut diagnostics = Vec::new();
@@ -864,11 +728,8 @@ pub(crate) fn per_import_totals_for_test(sized: &[SizedImport]) -> FileSizeCompu
 
 /// The aggregate failed outright: no bytes at all.
 ///
-/// It carries the flags forward rather than starting from `default()`, which silently reset
-/// `incomplete` to `false` — so the wire could say `incomplete: false` about a total that was
-/// already known to be missing an import before the failure that zeroed it. Every gate refuses this
-/// shape on `error` alone, so nothing was mis-stored, but the client was told something untrue and
-/// the next person to read `incomplete` in isolation would have believed it.
+/// It carries `incomplete` and `degraded` forward rather than resetting them, so the wire never
+/// claims `incomplete: false` about a total already known to be missing an import.
 fn error_computation(
     totals: &FileSizeComputation,
     stage: &str,
@@ -894,10 +755,8 @@ mod tests {
     use std::path::PathBuf;
 
     /// Two imports of the same UI kit pull ONE stylesheet, and the combined File Cost bundles it
-    /// once — so Combined Import Cost exceeds File Cost by that sheet. `shared_bytes` is the only
-    /// mechanism that explains such a gap, and it was blind to assets: a stylesheet links as an
-    /// EMPTY module, so the JS contribution walk dropped it and sharing never saw the bytes causing
-    /// the difference the user was looking at.
+    /// once, so Combined Import Cost exceeds File Cost by that sheet. `shared_bytes` must see it
+    /// even though a stylesheet links as an empty module.
     #[test]
     fn a_stylesheet_two_imports_share_is_counted_as_shared_weight() {
         let sheet = "/pkg/ui-kit/styles.css".to_owned();
@@ -981,8 +840,7 @@ mod tests {
         SizedImport::installed(request(specifier), Some(result(specifier, bytes)))
     }
 
-    /// The shape a TIMEOUT/PANIC leaves behind now: Unmeasured. No size at all — not the entry
-    /// file measured alone, not a zero.
+    /// The shape a timeout or panic leaves behind: Unmeasured, with no size at all.
     fn unmeasured(specifier: &str, stage: &str) -> SizedImport {
         SizedImport::installed(
             request(specifier),
@@ -1046,10 +904,8 @@ mod tests {
         );
     }
 
-    /// The streaming handlers answer a cold import `loading`, so its `result` is `None` when the
-    /// combined build fails and the conservative sum is taken. It contributes exactly zero, and a
-    /// total that is short by one whole import must never be served as the file's size for the L1
-    /// TTL.
+    /// A cold import's `result` is `None` when the combined build fails and the fallback sum is
+    /// taken; a total short by one whole import must never be cached as the file's size.
     #[test]
     fn a_sum_missing_a_still_building_import_is_not_the_file_and_is_never_cached() {
         let totals = absorb(&[
@@ -1073,12 +929,8 @@ mod tests {
         );
     }
 
-    /// The defect ADR-0006 §4 names, and the one the hand-built `FileSizeComputation` in
-    /// `service.rs` cannot see: with the static fallback deleted, a timed-out import arrives here
-    /// as an ordinary Unmeasured result — `error: Some`, no size — and the old code's `error`
-    /// branch `continue`d **past** the transient scan on the assumption that an error is always
-    /// deterministic. The file's total would then silently drop that import's bytes and be cached
-    /// as the file's size for the whole L1 TTL.
+    /// ADR-0006 §4: a timed-out import arrives as an ordinary Unmeasured result (`error: Some`, no
+    /// size); the total must not silently drop its bytes and be cached for the L1 TTL.
     #[test]
     fn a_transiently_unmeasured_import_makes_the_total_a_floor_and_is_never_cached() {
         for transient in [stage::TIMEOUT, stage::PANIC, stage::ENGINE_GONE] {
@@ -1107,16 +959,9 @@ mod tests {
         }
     }
 
-    /// **The seventh instance.** An import that failed DETERMINISTICALLY was exempted here: it
-    /// contributes zero, and the total was left `incomplete: false` on the reasoning that the
-    /// number is "as complete as this file can ever be".
-    ///
-    /// It is not. Deterministically-unknown bytes are still unknown, and the SAME failure also
-    /// killed the file's combined build — so the total on offer is an un-deduplicated per-import
-    /// sum, a number the file never had. With the flag clear it was cached (L1), persisted to the
-    /// no-TTL bundle-impact history as this file's baseline, shown with no estimate label, and
-    /// passed by `importlens check` with exit 0. ADR-0006 invariant 4 admits no exception, and now
-    /// neither does this.
+    /// A deterministically failed import's bytes are still unknown, and the same failure kills the
+    /// combined build, so the sum is a number the file never had. ADR-0006 invariant 4 admits no
+    /// exception.
     #[test]
     fn a_deterministically_unmeasured_import_makes_the_total_a_floor_and_is_never_cached() {
         for deterministic in [stage::PARSE, stage::LINK, stage::MISSING_EXPORT] {
@@ -1198,9 +1043,8 @@ mod tests {
         );
     }
 
-    /// The floor rule is about MEASUREMENT, not about failure: a file whose every import really was
-    /// measured is complete, and must stay cacheable. Without this the fix above could be "made to
-    /// pass" by flagging everything.
+    /// The floor rule is about measurement, not failure: a file whose every import was measured is
+    /// complete and cacheable, so flagging everything cannot satisfy the tests above.
     #[test]
     fn a_file_whose_every_import_was_measured_is_not_a_floor() {
         let totals = absorb(&[
@@ -1217,10 +1061,8 @@ mod tests {
     // ---------------------------------------------------------------------------------------
     // Through `compute_file_size` itself.
     //
-    // Everything above routes through `per_import_totals_for_test`, which never runs a combined
-    // build — so `degraded` is always false there and the shape ADR-0006 §4's second half names is
-    // literally not expressible. That is exactly how it survived seven rounds of review. These go
-    // through the real entry point, on a real fixture, with a real Rolldown build.
+    // `per_import_totals_for_test` never runs a combined build, so `degraded` cannot be expressed
+    // through it. These use the real entry point, a real fixture, and a real Rolldown build.
     // ---------------------------------------------------------------------------------------
 
     struct Fixture {
@@ -1241,8 +1083,7 @@ mod tests {
         }
 
         /// An installed package whose entry is `source`. Invalid JavaScript here fails the combined
-        /// Rolldown build at `parse` — deterministically, which is the half of invariant 4 the
-        /// previous fix declined to act on.
+        /// Rolldown build deterministically at `parse`.
         fn package(&self, name: &str, source: &str) -> &Self {
             let package_root = self.root.join("node_modules").join(name);
             std::fs::create_dir_all(&package_root).expect("package dir");
@@ -1340,11 +1181,8 @@ mod tests {
         result
     }
 
-    /// **CRITICAL 2 — the regression.** Re-resolving every import inside `compute_file_size` and
-    /// flagging `incomplete` on any `Err` treats a declarations-only package as an unmeasured gap.
-    /// It is not: it resolves to nothing BECAUSE it ships nothing, and it is answered Measured. A
-    /// file importing `@types/…` would otherwise carry an `incomplete` total forever — never cached,
-    /// never persisted, exit 3 from `importlens check`.
+    /// A declarations-only package resolves to nothing because it ships nothing, and is answered
+    /// Measured. Flagging its `Err` as a gap would make every `@types/…` importer a floor.
     #[test]
     fn a_types_only_import_is_a_measurement_and_leaves_its_file_complete() {
         let fixture = Fixture::new("types-only");
@@ -1390,9 +1228,8 @@ mod tests {
         );
     }
 
-    /// The native-binary-only twin of the check above. A `bin`-only package (Biome) resolves to
-    /// `Err` because it ships no importable JS entry, but it is answered Measured at zero, so it
-    /// contributes a genuine ZERO and must leave the file complete — not a permanent floor.
+    /// The native-binary-only twin of the check above: a `bin`-only package (Biome) is answered
+    /// Measured at zero and must leave the file complete.
     #[test]
     fn a_native_binary_only_import_is_a_measurement_and_leaves_its_file_complete() {
         let fixture = Fixture::new("native-binary-only");
@@ -1438,28 +1275,15 @@ mod tests {
         );
     }
 
-    /// **ADR-0006, invariant 4, first bullet — and it had NO test at all.**
+    /// ADR-0006, invariant 4, first bullet: if the combined build succeeds, the total is real even
+    /// while every per-import result is still Loading.
     ///
-    /// *"If the combined build SUCCEEDS, the total is real — even while every per-import result is
-    /// still Loading. On a cold document that is the normal case, and it is not a floor."*
-    ///
-    /// A File Cost has its **own build**: one bundle over all the file's imports, which does not
-    /// depend on the per-import builds at all. So a document nobody has measured yet — every
-    /// `result` still `None`, because the streaming handlers answer from cache and let the misses
-    /// land later — has a total that is a genuine measurement of the file, and it must be cached. On
-    /// a cold document that is the NORMAL case.
-    ///
-    /// The ADR records that reading it the other way already caused a regression once: flagging any
-    /// Loading contributor made **every cold document** a floor, so nothing was ever cached and the
-    /// combined build re-ran on every keystroke. Yet the mutation that reintroduces it —
-    /// `if import.result.is_none() { totals.incomplete = true; }` at the top of the loop in
-    /// `compute_file_size_with` — left the entire daemon suite green (162 lib, 49 service, 500
-    /// total, 0 failed). Every existing test either measures its imports or fails the build. An
-    /// invariant nothing can detect is not an invariant.
-    ///
-    /// The distinction this pins down is exactly the one `per_import_totals` gets right for the
-    /// FALLBACK sum, where a `None` result really is a missing input: there, no build is left to
-    /// count the bytes. Here the build counted them.
+    /// A File Cost has its own build over all the file's imports, independent of the per-import
+    /// builds, so a cold document (every `result` still `None`) has a genuine total that must be
+    /// cached. Flagging a Loading contributor (`if import.result.is_none() { totals.incomplete =
+    /// true; }` in `compute_file_size_with`) would make every cold document a floor. Only the
+    /// fallback sum in `per_import_totals` treats `None` as a missing input, because no build is
+    /// left there to count the bytes.
     #[test]
     fn a_cold_document_whose_combined_build_succeeds_is_not_a_floor() {
         let fixture = Fixture::new("cold");
@@ -1470,8 +1294,7 @@ mod tests {
         let totals = compute_file_size(
             &fixture.context(),
             &[
-                // NOTHING is measured: this is a cold document, and the per-import builds have not
-                // landed. The combined build still runs, and still answers.
+                // Nothing is measured yet; the combined build still runs and answers.
                 SizedImport::installed(request("alpha-lib"), None),
                 SizedImport::installed(request("beta-lib"), None),
             ],
@@ -1614,15 +1437,12 @@ mod tests {
         );
     }
 
-    /// **CRITICAL 1.** Every contributor Measured, and the file's OWN combined build fails. The
-    /// contributors are all fine, so `incomplete` is correctly `false`; `error` is `None`, because
-    /// the fallback summed successfully. What is on the wire is an un-deduplicated per-import sum —
-    /// a Combined Import Cost (ADR-0004), an OVER-count, a number the file never had — and the only
-    /// thing that says so is `degraded`.
+    /// Every contributor Measured while the file's own combined build fails: `incomplete` is
+    /// `false` and `error` is `None`, and only `degraded` says the total is an un-deduplicated
+    /// over-count (ADR-0004).
     ///
-    /// Deterministic (`parse`) on purpose: the timeout case was already refused by the transient
-    /// scan, and this one was not. It carries a durable stage, so it was cached for the L1 TTL,
-    /// persisted as the file's baseline, and judged by `importlens check`.
+    /// Deterministic (`parse`) on purpose: a timeout is also refused by the transient scan, but a
+    /// durable stage is caught only by `degraded`.
     #[test]
     fn a_failed_combined_build_degrades_the_total_even_with_every_import_measured() {
         let fixture = Fixture::new("degraded");
@@ -1665,21 +1485,12 @@ mod tests {
         );
     }
 
-    /// **The minify-failure arm.** The chunk LINKED — the combined build succeeded — and the
-    /// minifier could not process it, so this runtime group falls back to the same un-deduplicated
-    /// per-import sum a build failure falls back to, and the file's totals are just as much not the
-    /// file's. Every contributor here is Measured and `error` is `None`, which is Critical 1's exact
-    /// shape: nothing but `degraded` says the number is wrong.
+    /// The minify-failure arm: the chunk linked but could not be minified, so the group falls back
+    /// to the per-import sum. Every contributor is Measured and `error` is `None`, so only
+    /// `degraded` says the number is wrong.
     ///
-    /// `degraded` was deleted from this arm and the entire daemon suite stayed green.
-    ///
-    /// The minifier is injected because **no fixture can reach this arm** — Rolldown parses each
-    /// module with the same OXC parser that re-parses the linked chunk, so anything that would fail
-    /// the chunk's re-parse fails the *build* first (measured: octal literals, `with`, duplicate
-    /// parameters, `delete` of a local, a hashbang — every one comes back a `parse` failure of the
-    /// build). Being unreachable from a fixture is exactly why the arm went untested; it is not a
-    /// reason to leave it that way. Everything else in this test is the real thing: a real package,
-    /// a real Rolldown build, the real fallback.
+    /// The minifier is injected because no fixture can reach this arm (see
+    /// `compute_file_size_with`); everything else is real.
     #[test]
     fn a_minify_failure_degrades_the_total_even_with_every_import_measured() {
         let fixture = Fixture::new("minify-degraded");
@@ -1732,8 +1543,8 @@ mod tests {
         );
     }
 
-    /// Control for the injected minifier: with the REAL one, the same input is a clean, cacheable
-    /// measurement. Without this, the test above could be "made to pass" by degrading everything.
+    /// Control for the injected minifier: with the real one, the same input is a clean, cacheable
+    /// measurement, so degrading everything cannot satisfy the test above.
     #[test]
     fn the_same_file_with_a_working_minifier_is_a_clean_measurement() {
         let fixture = Fixture::new("minify-ok");
@@ -1755,20 +1566,12 @@ mod tests {
         assert!(totals.minified_bytes > 0);
     }
 
-    /// **The trap in moving compression inside the per-runtime loop.** Compression is now per
-    /// runtime, because two runtimes are two artifacts that ship separately and each pays for its
-    /// own redundancy (ADR-0005). The naive move takes the old post-loop `Err` arm with it — a
-    /// `return error_computation(..)` — and that arm now fires **inside** the loop, discarding every
-    /// OTHER runtime group's real, already-measured bytes and reporting **zero** for the whole file.
+    /// Compression runs per runtime (ADR-0005), so a compressor failure must degrade only its own
+    /// group, like the build and minify arms: an early `return error_computation(..)` inside the
+    /// loop would discard every other group's real bytes and report zero for the file.
     ///
-    /// One group's compressor failing says nothing about the other group's bytes. So it degrades
-    /// exactly like the build and minify arms beside it: that group alone falls back to its
-    /// un-deduplicated per-import sum, the file is flagged `degraded` and refused every store, and
-    /// the other groups keep their real numbers.
-    ///
-    /// The compressor is injected because nothing in a fixture can make `compress_all` fail — the
-    /// same reason the minify arm is injected. It selects the Server group by a marker string the
-    /// minifier preserves, so exactly one of the two groups fails.
+    /// The compressor is injected (no fixture can make `compress_all` fail) and fails only the
+    /// Server group, selected by a marker string the minifier preserves.
     #[test]
     fn a_compression_failure_in_one_runtime_does_not_zero_the_file() {
         let fixture = Fixture::new("compress-degraded");
@@ -1846,12 +1649,8 @@ mod tests {
         );
     }
 
-    /// **IMPORTANT 1 — a path alias is not a missing package.** `@app/components` has no installed
-    /// package and no request, exactly like an uninstalled dependency, and it is a completely
-    /// different fact: it resolves to first-party source, which Import Lens does not measure
-    /// (ADR-0004). It contributes no bytes because there are none to contribute — a fact, not a gap
-    /// — so the total stays complete and cacheable. Flagging it made every file that uses path
-    /// aliases a permanent floor.
+    /// A path alias is not a missing package: `@app/components` resolves to first-party source,
+    /// which Import Lens does not measure (ADR-0004), so the total stays complete and cacheable.
     #[test]
     fn a_path_alias_import_leaves_its_file_complete_and_cacheable() {
         let fixture = Fixture::new("path-alias");
@@ -1892,8 +1691,7 @@ mod tests {
     }
 
     /// FR-024a, bullet 4: an import of a package that is **not installed** contributes no bytes and
-    /// cannot even become an entry of the combined build. It used to be filtered out of the
-    /// aggregate's input before it could say so, and the file's total silently omitted it.
+    /// cannot become an entry of the combined build, so the total is a floor.
     #[test]
     fn a_not_installed_import_makes_the_total_a_floor() {
         let fixture = Fixture::new("not-installed");
@@ -1927,10 +1725,8 @@ mod tests {
         );
     }
 
-    /// The MINOR: `error_computation` rebuilt the result from `FileSizeComputation::default()`,
-    /// which reset `incomplete` to `false` — so the wire carried `incomplete: false` on a total
-    /// already known to be missing an import. Nothing mis-stored it (every gate refuses on `error`),
-    /// but the client was told something untrue.
+    /// An outright failure keeps the `incomplete` and `degraded` flags already raised, so the wire
+    /// never says `incomplete: false` about a total known to be missing an import.
     #[test]
     fn an_outright_failure_keeps_the_floor_flag_it_had_already_raised() {
         let fixture = Fixture::new("error-flags");
@@ -1962,12 +1758,9 @@ mod tests {
         );
     }
 
-    /// A first-party dependency's manifest decides which of its modules survive (`sideEffects`) and
-    /// which file its entry resolves to (`exports`), so editing one moves this number — while no
-    /// module byte changes, a manifest is never a graph module, and the extension's watcher globs
-    /// only `**/node_modules/*/package.json`. Nothing else observes such an edit, so leaving the
-    /// manifest out of the File Cost's freshness set serves a stale total while the per-import
-    /// numbers beside it, which DO hash it, update.
+    /// A first-party dependency's manifest (`sideEffects`, `exports`) moves this number without
+    /// moving a module byte, and the extension's watcher globs only
+    /// `**/node_modules/*/package.json`, so the manifest must be in the File Cost's freshness set.
     #[test]
     fn a_first_party_manifest_is_a_file_cost_freshness_input() {
         let workspace = std::env::temp_dir().join(format!(

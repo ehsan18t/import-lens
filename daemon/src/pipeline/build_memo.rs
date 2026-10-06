@@ -1,36 +1,25 @@
 //! A memo for anything derived from an engine build, keyed by `(entry, runtime)`.
 //!
-//! An engine build is the most expensive thing the daemon does, and two callers ask
-//! it questions whose answers do not depend on the request that triggered them:
+//! Two callers ask engine builds questions whose answers do not depend on the triggering request:
 //!
-//! - the full-package comparison behind `truly_treeshakeable` (§8.4/§6.3), whose
-//!   answer is the same for every named import of a package, while the import cache
-//!   key is not — so N named variants of one entry paid for N of these builds;
-//! - export enumeration for completion (§8.4), which was an uncached full build of
-//!   the whole package graph on every popup.
+//! - the full-package comparison behind `truly_treeshakeable` (§8.4/§6.3), whose answer is the
+//!   same for every named import of a package while the import cache key is not;
+//! - export enumeration for completion (§8.4), a full package-graph build per popup.
 //!
-//! Both are memoized here. Correctness rests on the memo expiring exactly when the
-//! value it holds would have gone wrong, which takes **two** independent guards:
+//! The memo must expire exactly when its value would go wrong, which takes two guards:
 //!
-//! 1. **Read-time fingerprints.** The build's own fingerprints (the bytes it was
-//!    actually measured from) are checked with `check_fingerprints_strict`, the same
-//!    validator the import cache uses. First-party inputs are hash-verified on every
-//!    lookup, so even an edit that preserves mtime and length is caught. Installed
-//!    (`node_modules`) inputs are verified on every lookup too, except in a memo built
-//!    with `trusting_installed_window` (the export list, which feeds no durable store):
-//!    that one re-checks them once per `REVERIFY_TTL` at a given generation, as the
-//!    import cache's fast path does. A build whose graph held a module the plugin could
-//!    not fingerprint as it read it is not memoized at all.
+//! 1. **Read-time fingerprints**, checked with `check_fingerprints_strict` (the import cache's
+//!    validator). First-party inputs are hash-verified on every lookup, catching edits that
+//!    preserve mtime and length. Installed inputs are verified on every lookup too, except in a
+//!    `trusting_installed_window` memo (the export list, which feeds no durable store), which
+//!    re-checks them once per `REVERIFY_TTL` per generation. A build with a module the plugin
+//!    could not fingerprint as it read it is not memoized.
 //!
-//! 2. **The cache generation.** Fingerprints alone are not enough. `node_modules`
-//!    manifests are deliberately not fingerprinted — an installed manifest cannot
-//!    change without an install, and an install bumps the generation, which is the
-//!    backstop the import cache leans on. Without the generation, `pnpm install`
-//!    could repoint a dependency's `exports` at a different file while leaving its
-//!    sources byte-identical, and every fingerprint would still hash clean over a
-//!    value measured against the *old* resolution. It is also what makes these memos
-//!    obey `invalidate_package` / `invalidate_all` — the user's "clear the cache"
-//!    escape hatch — without either having to know they exist.
+//! 2. **The cache generation.** `node_modules` manifests are not fingerprinted: they change only
+//!    with an install, and an install bumps the generation. Without this guard, `pnpm install`
+//!    could repoint a dependency's `exports` while leaving its sources byte-identical, and every
+//!    fingerprint would still pass. It also makes these memos obey `invalidate_package` /
+//!    `invalidate_all` without either knowing they exist.
 
 use std::{
     collections::HashMap,
@@ -120,10 +109,9 @@ impl<V: Clone> BuildMemo<V> {
                 entries.remove(&key);
                 return None;
             }
-            // Within the window, at the generation it was measured under, an installed input
-            // can only have changed with no invalidation event, which the window itself bounds
-            // (the import cache's fast path). First-party inputs change with no event at all,
-            // so they are re-verified on every lookup regardless (D3).
+            // Within the window, at the measured generation, an installed input can only have
+            // changed with no invalidation event, which the window bounds. First-party inputs
+            // change with no event at all, so they are re-verified on every lookup.
             let verified_recently = self.trusts_installed_window
                 && entry
                     .verified_at
@@ -147,17 +135,14 @@ impl<V: Clone> BuildMemo<V> {
         // hash, every module in the package graph.
         match check_fingerprints_strict(&fingerprints) {
             Freshness::Fresh => {}
-            // `Unknown` is a transient stat/read failure — a file locked by an antivirus
-            // scan, an offline mapped drive. The cache contract (see `cache::key`) is to
-            // KEEP such an entry rather than evict it; we simply decline to serve it and
-            // recompute. Evicting would throw away a still-good value and force a full
-            // build for as long as the condition lasted.
+            // `Unknown` is a transient stat/read failure (antivirus lock, offline mapped drive).
+            // The cache contract (`cache::key`) keeps such an entry: decline to serve it, but
+            // do not evict a still-good value.
             Freshness::Unknown => return None,
             Freshness::Stale | Freshness::Gone => {
                 let mut entries = self.lock();
-                // Drop the value we actually found stale, not whatever is there now: a
-                // concurrent caller may already have rebuilt and stored one measured from
-                // the current bytes, and removing that would just buy another full build.
+                // Drop the value found stale, not whatever is there now: a concurrent caller
+                // may already have stored one measured from the current bytes.
                 if entries.get(&key).is_some_and(|entry| entry.stamp == stamp) {
                     entries.remove(&key);
                 }
@@ -175,12 +160,10 @@ impl<V: Clone> BuildMemo<V> {
     }
 
     /// Store a value against the fingerprints of the exact bytes it was measured from.
-    /// Storing nothing is always safe — the caller just rebuilds.
+    /// Storing nothing is always safe: the caller just rebuilds.
     ///
-    /// `generation` must be the cache generation observed *before* the build ran, not
-    /// after — the same discipline `analyze_and_cache` uses. An invalidation that lands
-    /// while the build is in flight must not be stamped onto a value measured from the
-    /// bytes it invalidated.
+    /// `generation` must be observed *before* the build ran, so an invalidation landing
+    /// mid-build is not stamped onto a value measured from the bytes it invalidated.
     pub(crate) fn insert(
         &self,
         entry_path: &Path,
@@ -203,9 +186,8 @@ impl<V: Clone> BuildMemo<V> {
         let used_at = self.tick();
         let mut entries = self.lock();
 
-        // Only shed a victim when this insert actually grows the map. Re-storing a key
-        // that is already present would otherwise evict a live entry for nothing, and at
-        // a steady MAX_ENTRIES every refresh would ratchet the map down by one.
+        // Evict only when this insert grows the map; otherwise re-storing a present key at
+        // MAX_ENTRIES would shrink the map by one per refresh.
         if !entries.contains_key(&key) && entries.len() >= MAX_ENTRIES {
             let coldest = entries
                 .iter()

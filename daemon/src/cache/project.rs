@@ -20,9 +20,8 @@ const LEGACY_CENTRAL_CACHE_DB_FILE_NAME: &str = "importlens.redb";
 const LEGACY_CENTRAL_CACHE_SHARD_ID: &str = "legacy-central";
 const PROJECT_METADATA_WRITE_INTERVAL_MILLIS: u64 = 60_000;
 const AGGREGATE_OVER_BUDGET_COMPACT_THRESHOLD: f64 = 0.0;
-/// Minimum wall-clock gap between automatic orphan-shard sweeps on the
-/// maintenance tick (RB-17). Abandoned-project detection is rare and the sweep
-/// stats every shard root, so it runs far less often than the 60 s tick.
+/// Minimum wall-clock gap between automatic orphan-shard sweeps. The sweep stats every shard
+/// root and abandoned projects are rare, so it runs at most hourly however often projects open.
 const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug)]
@@ -31,22 +30,14 @@ pub struct ProjectCacheRegistry {
     enable_disk_cache: bool,
     max_size_mb: u64,
     loaded: Mutex<HashMap<String, LoadedProjectCache>>,
-    // Per-shard "load lock" (Finding 11): serializes concurrent COLD opens of the
-    // SAME shard so its database is opened exactly once, WITHOUT holding `loaded`
-    // across the `Database::create` + `load_recent` + metadata `fs::write`. A
-    // shard's `Arc<Mutex<()>>` is only ever locked while `loaded` is NOT held;
-    // `loaded` is then re-acquired briefly (double-check + register). Lock order is
-    // always load-lock -> loaded (held briefly, released), never the reverse — no
-    // cycle. This map's own mutex is a leaf, held only for the get-or-insert of a
-    // shard's lock Arc.
+    // Per-shard load lock: serializes cold opens of the SAME shard so its database
+    // opens exactly once, without holding `loaded` across the open and metadata
+    // write. Lock order is always load-lock, then `loaded` (briefly), never the
+    // reverse. This map's own mutex is a leaf, held only for the get-or-insert.
     load_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    // Owns the global disk-byte budget and cross-shard LRU eviction. The budget
-    // derives from `max_size_mb` in production (`new`) and is injected directly
-    // by tests (`new_with_budget_bytes`); 0 disables it.
+    // Global disk-byte budget and cross-shard LRU eviction; a 0 budget disables it.
     coordinator: BudgetCoordinator,
-    // Last time the automatic orphan-shard sweep ran (RB-17). Throttles the sweep
-    // to `ORPHAN_SWEEP_INTERVAL` so the rare-need scan doesn't stat every shard
-    // root on every 60 s maintenance tick.
+    // Throttles the automatic orphan sweep to `ORPHAN_SWEEP_INTERVAL`.
     last_orphan_sweep: Mutex<Option<Instant>>,
 }
 
@@ -161,9 +152,8 @@ impl ProjectCacheRegistry {
         Self::new_with_budget_bytes(base_path, enable_disk_cache, max_size_mb, budget_bytes)
     }
 
-    /// Like `new`, but with an explicit byte budget instead of deriving it from
-    /// `max_size_mb`. Lets tests exercise the evictor with a small budget without
-    /// inserting megabytes of entries.
+    /// Like `new`, but with an explicit byte budget instead of one derived from
+    /// `max_size_mb`.
     pub fn new_with_budget_bytes(
         base_path: Option<PathBuf>,
         enable_disk_cache: bool,
@@ -181,25 +171,15 @@ impl ProjectCacheRegistry {
         }
     }
 
-    /// Startup recency seed (C5 / Finding 10d, §3.3): before the server accepts any
-    /// request, lift the process-global recency clock above the GLOBAL maximum
-    /// persisted seq across every on-disk shard. The clock resets to 1 each process
-    /// start, so without this a fresh post-restart access (small seq) could sort as
-    /// *older* than an untouched prior-session shard's durable entries — inverting
-    /// the evictor's smallest-`oldest_seq` victim selection and letting the active
-    /// project be evicted before that stale shard. C1's per-shard `max_seq`
-    /// high-water is already observed on rollup/hydration, but only for shards
-    /// touched THIS session; this pass observes every shard's `max_seq` exactly once
-    /// so no shard — and no entry created before the first maintenance rollup — is
-    /// left unprotected.
+    /// Lifts the process-global recency clock above the maximum persisted seq across
+    /// every on-disk shard; must run before the server accepts a request. The clock
+    /// restarts at 1 each process, so without this a post-restart access could sort
+    /// as older than a prior session's entries and the evictor would pick the active
+    /// project over a stale shard.
     ///
-    /// A no-op when the disk cache is disabled (no shards, nothing persisted). Reuses
-    /// the maintenance shard enumeration: each unloaded shard is temp-opened with a
-    /// zero recent-preload (no hydration scan) and its `max_seq` read via a single
-    /// SUMMARY key — NOT a full CACHE_TABLE scan. One small read per project shard,
-    /// the design's §3.3 "rebuild rollups from stored summary" pass, an acceptable
-    /// one-time startup cost. Loaded shards (empty at true startup, but handled for
-    /// robustness if ever called later) are observed from their live handles.
+    /// No-op when the disk cache is disabled. Each unloaded shard is temp-opened and
+    /// its `max_seq` read from a single SUMMARY key, never a CACHE_TABLE scan; loaded
+    /// shards are read from their live handles.
     pub fn seed_recency_clock_from_disk(&self) {
         if !self.storage_enabled() {
             crate::logging::log_debug("cache", "skipped recency seed; disk cache is disabled");
@@ -239,20 +219,14 @@ impl ProjectCacheRegistry {
         );
     }
 
-    /// One full maintenance pass: byte-budget eviction, then normal per-shard
-    /// fragmentation compaction. If aggregate physical bytes still exceed the
-    /// budget afterward, an aggressive idle compaction pass runs with a zero
-    /// threshold so thinly-spread free pages can be reclaimed too. Both operate on
-    /// the same target set — loaded shards plus temp-opened unloaded ones — so a
-    /// drained unloaded shard's file shrinks too, keeping the PHYSICAL footprint
-    /// tracking the budget, not just the logical one.
+    /// One maintenance pass: byte-budget eviction, then per-shard fragmentation
+    /// compaction, then a zero-threshold compaction if physical bytes still exceed
+    /// the budget. Both run over loaded shards plus temp-opened unloaded ones, so
+    /// the PHYSICAL footprint tracks the budget, not just the logical total.
     ///
-    /// Unless `force` is set (manual "clean up now"), a cheap physical-size gate
-    /// runs first: every stored value lives inside its shard's `.redb` file, so
-    /// the summed file sizes bound the logical total from above — at/below budget
-    /// the full pass (which opens every unloaded shard and reads every seq
-    /// prefix) is provably unnecessary and skipped. Queued inserts not yet
-    /// flushed are invisible to the gate; the tick after their flush sees them.
+    /// Unless `force` is set, the pass is skipped when the summed `.redb` file
+    /// sizes (an upper bound on the logical total) are within budget. Queued
+    /// inserts not yet flushed are invisible to that gate until a later pass.
     pub fn run_maintenance(&self, force: bool) -> MaintenanceOutcome {
         if !self.enable_disk_cache || self.coordinator.budget_bytes() == 0 {
             return MaintenanceOutcome::default();
@@ -297,12 +271,10 @@ impl ProjectCacheRegistry {
         }
     }
 
-    /// Assembles the eviction/compaction target set: loaded shards (shared Arcs)
-    /// plus every on-disk shard not currently loaded, each temp-opened for the
-    /// pass. The loaded snapshot is taken under the lock and released before any
-    /// disk I/O. A temp open racing a concurrent `cache_for_root` degrades
-    /// harmlessly on either side: the temp cache scans/evicts nothing, and the
-    /// loading side registers a memory-only shard that retries its disk open.
+    /// Loaded shards plus every unloaded on-disk shard, temp-opened. The loaded
+    /// snapshot is released before any disk I/O. A temp open racing `cache_for_root`
+    /// degrades harmlessly: the temp cache evicts nothing, and the loading side
+    /// registers a memory-only shard that retries its disk open.
     fn collect_shard_targets(&self) -> Vec<ShardTarget> {
         let (loaded_ids, mut targets) = match self.loaded.lock() {
             Ok(loaded) => {
@@ -332,9 +304,8 @@ impl ProjectCacheRegistry {
         targets
     }
 
-    /// Sum of every shard's `.redb` file size — a cheap upper bound on the
-    /// logical cache total (values live inside the files), used to gate the full
-    /// maintenance pass.
+    /// Sum of every shard's `.redb` file size: a cheap upper bound on the logical
+    /// cache total, since values live inside the files.
     fn total_shard_file_bytes(&self) -> u64 {
         let Some(base_path) = self.base_path.as_ref() else {
             return 0;
@@ -353,9 +324,6 @@ impl ProjectCacheRegistry {
         let shard_id = project_cache_shard_id(project_root);
         let now = unix_millis_now();
 
-        // Fast warm path: hold `loaded` only for the map lookup + timestamp bump,
-        // then release it before any metadata `fs::write` so a warm hit never
-        // blocks peers on disk I/O.
         if let Some((cache, retry_disk)) = self.warm_shard_hit(&shard_id, now, true) {
             if retry_disk {
                 self.retry_disk_open(&shard_id, &cache);
@@ -363,29 +331,19 @@ impl ProjectCacheRegistry {
             return cache;
         }
 
-        // Cold path (Finding 11): open + register the shard WITHOUT holding
-        // `loaded` across the `Database::create` + `load_recent` + metadata write.
-        // A per-shard load lock serializes concurrent opens of THIS shard (so redb
-        // sees a single open — no `DatabaseAlreadyOpen` self-race) while unrelated
-        // shards load in parallel and `loaded` is held only for brief map ops.
-        //
-        // Lock order (no cycle): the per-shard load lock is acquired ONLY here,
-        // after the warm path released `loaded`; `loaded` is then re-acquired
-        // briefly inside it (the double-check and the register). `loaded` is never
-        // held while taking the load lock.
+        // Cold path. The per-shard load lock gives redb a single open of this shard
+        // (no `DatabaseAlreadyOpen` self-race) while other shards load in parallel.
+        // `loaded` is never held while taking the load lock.
         let load_lock = self.load_lock_for(&shard_id);
         let _load_guard = load_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Double-check: another thread may have finished loading this shard while
-        // we waited on the per-shard load lock.
+        // Another thread may have loaded the shard while we waited.
         if let Some((cache, _)) = self.warm_shard_hit(&shard_id, now, false) {
             return cache;
         }
 
-        // Sole opener for this shard now (we hold its load lock): perform the
-        // expensive I/O with no global lock held.
         let normalized_root = normalize_project_root(project_root);
         let cache_path = self.cache_path_for_shard(&shard_id);
         let disk_path = self.disk_cache_path(&cache_path);
@@ -405,30 +363,25 @@ impl ProjectCacheRegistry {
             last_metadata_write_millis: now,
             disk_retry,
         };
-        // Metadata write stays off the `loaded` lock (still under the load lock).
         if shard.disk_retry.is_none() {
             self.write_metadata_for_loaded(&shard_id, &shard);
         }
-        // Briefly re-acquire `loaded` to register the freshly-opened shard. We hold
-        // this shard's load lock, so no concurrent cold path could have inserted it
-        // — a plain insert cannot clobber a different Arc. A poisoned lock leaves
-        // the shard unregistered; the returned (disk-backed) cache still serves
-        // this call and the next call heals.
+        // The held load lock means no other cold path inserted this shard, so a plain
+        // insert cannot clobber a different Arc. A poisoned lock leaves the shard
+        // unregistered; this call is still served and the next one heals.
         if let Ok(mut loaded) = self.loaded.lock() {
             loaded.insert(shard_id, shard);
         }
         cache
     }
 
-    /// The warm path of `cache_for_root`: if the shard is already loaded, bump its
-    /// last-used timestamp under `loaded`, clone its `Arc`, RELEASE `loaded`, then
-    /// perform any throttled metadata `fs::write` off-lock (so a warm hit never
-    /// blocks peers on disk I/O). Returns `None` — with `loaded` released — when the
-    /// shard is absent, so the caller can take the cold path without holding it.
+    /// The warm path of `cache_for_root`: bumps a loaded shard's last-used time
+    /// under `loaded`, then releases it before any throttled metadata write, so a
+    /// warm hit never blocks peers on disk I/O. Returns `None` (with `loaded`
+    /// released) when the shard is absent.
     ///
     /// With `claim_retry`, also reports whether this caller claimed a due disk-open
-    /// retry for a shard registered without its disk; the claim advances the
-    /// backoff, so only one caller per interval retries.
+    /// retry; the claim advances the backoff, so one caller per interval retries.
     fn warm_shard_hit(
         &self,
         shard_id: &str,
@@ -488,10 +441,9 @@ impl ProjectCacheRegistry {
         }
     }
 
-    /// Returns this shard's per-shard load lock, creating it on first use. Holds the
-    /// `load_locks` map mutex only for the get-or-insert — a leaf lock, never held
-    /// across I/O, across `loaded`, or across the returned lock. Recovers a poisoned
-    /// map so a prior panic can't wedge all future loads.
+    /// Returns the shard's load lock, creating it on first use. The map mutex is a
+    /// leaf held only for the get-or-insert; a poisoned map is recovered so a prior
+    /// panic cannot wedge all future loads.
     fn load_lock_for(&self, shard_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self
             .load_locks
@@ -508,10 +460,8 @@ impl ProjectCacheRegistry {
         self.list_shards_with_rollups(&self.shard_rollups_by_id())
     }
 
-    /// Builds the shard list and stamps each shard's `entry_count` from the
-    /// supplied C1 rollups (O(1) per shard, keyed by shard id). Split out so a
-    /// status request can reuse the SAME rollup map for the top-level
-    /// `total_bytes`, opening each unloaded shard's summary at most once.
+    /// Builds the shard list, stamping each `entry_count` from `rollups`, so a
+    /// status request can reuse one rollup map for its `total_bytes` too.
     fn list_shards_with_rollups(
         &self,
         rollups: &HashMap<String, ShardRollup>,
@@ -547,13 +497,9 @@ impl ProjectCacheRegistry {
         shards
     }
 
-    /// The C1 per-shard rollups keyed by shard id: loaded shards read from their
-    /// live handles, unloaded shards temp-opened exactly as the maintenance pass
-    /// does ([`Self::collect_shard_targets`]). Each rollup is a few SUMMARY
-    /// scalars — O(1) per shard, never a CACHE_TABLE scan — so status/list
-    /// observability (§8/X-24) stays cheap. A temp open racing a concurrent load
-    /// degrades harmlessly (one side reads an empty rollup / serves memory-only
-    /// for a single call and self-heals).
+    /// Per-shard rollups keyed by shard id, over the same targets as
+    /// [`Self::collect_shard_targets`]. Each rollup is a few SUMMARY scalars, never
+    /// a CACHE_TABLE scan, so status and list stay cheap.
     fn shard_rollups_by_id(&self) -> HashMap<String, ShardRollup> {
         self.collect_shard_targets()
             .into_iter()
@@ -565,9 +511,7 @@ impl ProjectCacheRegistry {
     }
 
     pub fn status_for_root(&self, project_root: Option<&Path>) -> ProjectCacheStatus {
-        // One rollup pass feeds BOTH each shard's `entry_count` and the top-level
-        // `total_bytes`, so a status request opens each unloaded shard's O(1)
-        // summary at most once.
+        // One rollup pass feeds both `entry_count` and `total_bytes`.
         let rollups = self.shard_rollups_by_id();
         let shards = self.list_shards_with_rollups(&rollups);
         let total_size_bytes = shards.iter().map(|shard| shard.size_bytes).sum();
@@ -617,24 +561,19 @@ impl ProjectCacheRegistry {
     }
 
     /// Whether a shard's project root is a genuine orphan (its volume is live but
-    /// the folder is gone), safe to destroy. Drive-safe via `classify_project_root`
-    /// (X-3 / RB-7): an unplugged/offline drive, or a shard with no recorded root,
-    /// is never treated as orphaned.
+    /// the folder is gone). An offline drive, or a shard with no recorded root, is
+    /// never orphaned.
     fn shard_root_is_orphaned(&self, shard: &CacheShardInfo) -> bool {
         !shard.project_root.is_empty()
             && crate::cache::key::classify_project_root(Path::new(&shard.project_root))
                 == crate::cache::key::ProjectRootState::Orphaned
     }
 
-    /// Manual orphan reclaim (Manage-Cache "Remove Orphaned Caches", RB-17).
-    /// Removes shards whose project root is genuinely gone — drive-safe, so an
-    /// unplugged/offline drive keeps its shard (X-3 / RB-7) — and drops
-    /// stale/uninstalled entries from surviving shards. Stat-only (no project-tree
-    /// walk). Returns the removed-shard results plus a COUNT of the entries scrubbed from
-    /// surviving shards — not surfaced per entry, but no longer discarded: a purge that removes no
-    /// shard still does work, and reporting only the shard count let the UI say "nothing to
-    /// reclaim" after dropping entries. The automatic maintenance-tick sweep is the shard-only
-    /// `sweep_orphaned_shards_if_due`; this manual pass additionally scrubs entries.
+    /// Manual orphan reclaim ("Remove Orphaned Caches"): removes orphaned shards
+    /// (drive-safe) and drops stale or uninstalled entries from surviving shards,
+    /// stat-only with no project-tree walk. Returns the removed-shard results and
+    /// the count of scrubbed entries; a purge that removes no shard can still have
+    /// scrubbed entries, and the UI must not call that "nothing to reclaim".
     pub fn purge_orphans(&self) -> (Vec<CacheOperationResult>, usize) {
         let analyzer_version = crate::cache::key::ANALYZER_VERSION;
         let loaded_ids = self
@@ -652,8 +591,7 @@ impl ProjectCacheRegistry {
             }
 
             if loaded_ids.contains(&shard.shard_id) {
-                // Clone the Arc out and release the lock before the scan+write, so
-                // the purge doesn't block peers needing the loaded map.
+                // Release `loaded` before the scan and write.
                 let cache = self.loaded.lock().ok().and_then(|loaded| {
                     loaded
                         .get(&shard.shard_id)
@@ -675,13 +613,10 @@ impl ProjectCacheRegistry {
         (removed, scrubbed)
     }
 
-    /// Automatic orphan-shard reclaim for the maintenance tick (RB-17). Removes
-    /// ONLY shards whose project root is genuinely gone (drive-safe); entry-level
-    /// staleness is already reclaimed automatically (name invalidation + the
-    /// freshness `Gone` eviction), so this leaves surviving shards untouched.
-    /// Throttled to `ORPHAN_SWEEP_INTERVAL` — a no-op (returns empty) until due —
-    /// because an abandoned-project scan is rare and stats every shard root.
-    /// Returns the removed-shard results.
+    /// Automatic orphan reclaim for the maintenance pass: removes only orphaned
+    /// shards (drive-safe) and leaves surviving shards untouched, since stale
+    /// entries are reclaimed on access. Returns empty until `ORPHAN_SWEEP_INTERVAL`
+    /// has passed since the last sweep.
     pub fn sweep_orphaned_shards_if_due(&self) -> Vec<CacheOperationResult> {
         {
             let mut last = self
@@ -707,10 +642,8 @@ impl ProjectCacheRegistry {
         self.invalidate_packages(&[package_name.to_owned()]);
     }
 
-    /// Invalidates every named package across all loaded and on-disk shards in a
-    /// single pass: each on-disk shard's database is opened once (not once per
-    /// package), and the recursive per-shard size walk is skipped since only ids
-    /// and paths are needed for invalidation.
+    /// Invalidates every named package across all loaded and on-disk shards, opening
+    /// each on-disk shard once.
     pub fn invalidate_packages(&self, package_names: &[String]) {
         if package_names.is_empty() {
             return;
@@ -718,13 +651,9 @@ impl ProjectCacheRegistry {
 
         let package_set: HashSet<String> = package_names.iter().cloned().collect();
 
-        // Snapshot the loaded shards' ids + cache Arcs under the lock, then RELEASE
-        // it before the per-shard redb write scans (Finding 11): a single
-        // `NodeModulesChanged` invalidation must not stall in-flight parallel
-        // analysis for EVERY other project for the length of an N-shard rewrite.
-        // redb serializes each shard's own writer, so the cloned-Arc writes need no
-        // global lock. The id set fixes exactly which shards the disk loop below
-        // must skip (unchanged from holding the lock across the writes).
+        // Snapshot under `loaded`, then release it before the writes: an invalidation
+        // must not stall every other project's analysis for an N-shard rewrite. redb
+        // serializes each shard's writer, so the writes need no global lock.
         let (loaded_ids, loaded_caches) = self
             .loaded
             .lock()
@@ -760,9 +689,8 @@ impl ProjectCacheRegistry {
     }
 
     pub fn flush_to_disk(&self) -> Result<(), String> {
-        // Recover a poisoned lock (matching this file's convention, e.g. `cache_for_root`)
-        // rather than propagating: RB-10's whole point is to flush every shard we can, so
-        // a poisoned `loaded` (a panic under a brief map op) must not skip ALL flushes.
+        // Recover a poisoned lock: every shard that can flush must, so a panic under
+        // a brief map op must not skip all flushes.
         let caches = {
             let loaded = self
                 .loaded
@@ -789,10 +717,9 @@ impl ProjectCacheRegistry {
     }
 
     fn remove_shard_by_id(&self, shard_id: &str) -> CacheOperationResult {
-        // Removal is the destructive sibling of the cold-open path: take the same
-        // per-shard load lock so a cold opener cannot register a shard while its
-        // directory is being deleted. Preserve the global ordering used by
-        // `cache_for_root`: load-lock first, then `loaded` only for a brief map op.
+        // The load lock stops a cold opener registering the shard while its
+        // directory is deleted. Same order as `cache_for_root`: load lock, then
+        // `loaded` briefly.
         let load_lock = self.load_lock_for(shard_id);
         let _load_guard = load_lock
             .lock()
@@ -881,7 +808,7 @@ impl ProjectCacheRegistry {
             size_bytes: directory_size(&shard.cache_path),
             last_used_millis: Some(shard.last_used_millis),
             loaded: true,
-            // Populated from the C1 rollup by `list_shards_with_rollups`.
+            // Populated from the rollup by `list_shards_with_rollups`.
             entry_count: 0,
         }
     }
@@ -914,7 +841,7 @@ impl ProjectCacheRegistry {
                     size_bytes: directory_size(&cache_path),
                     last_used_millis: Some(metadata.last_used_millis),
                     loaded: false,
-                    // Populated from the C1 rollup by `list_shards_with_rollups`.
+                    // Populated from the rollup by `list_shards_with_rollups`.
                     entry_count: 0,
                 })
             })
@@ -952,9 +879,8 @@ impl ProjectCacheRegistry {
         }
     }
 
-    // Builds the metadata write target (path + payload) without performing the
-    // I/O, so callers on the hot path can capture it under the shards lock and
-    // then release the lock before the `fs::write`.
+    // Builds the metadata write without performing it, so a caller can capture it
+    // under `loaded` and write after releasing the lock.
     fn metadata_write_for_loaded(
         &self,
         shard_id: &str,
@@ -1006,8 +932,8 @@ mod project_cache_maintenance_tests;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCacheStatus {
     pub total_size_bytes: u64,
-    /// Σ of every shard's logical (envelope) bytes from the C1 rollups — the
-    /// budget-tracked total, distinct from `total_size_bytes` (physical footprint).
+    /// Sum of every shard's logical (envelope) bytes: the budget-tracked total, as
+    /// opposed to the physical footprint in `total_size_bytes`.
     pub total_bytes: u64,
     /// The global disk-byte budget the coordinator enforces (0 disables it).
     pub budget_bytes: u64,

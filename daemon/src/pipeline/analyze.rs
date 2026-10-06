@@ -22,11 +22,8 @@ use std::{
 
 /// Where an analysis runs, and nothing else.
 ///
-/// It used to carry an engine deadline too, because the response an import rode in was atomic:
-/// one build that parked pushed a whole document's results past the client's patience, so the
-/// request had to be able to abandon builds. It no longer is — a request answers from cache and
-/// each build is pushed to the client as it lands (`ipc::server`) — so no build has a deadline
-/// to be measured against, and none is passed one.
+/// It carries no deadline: a request answers from cache and each build is pushed to the client as
+/// it lands (`ipc::server`), so no request needs to abandon a build.
 #[derive(Debug, Clone)]
 pub struct AnalysisContext {
     pub workspace_root: PathBuf,
@@ -47,15 +44,13 @@ pub struct AnalysisError {
     stage: &'static str,
     message: String,
     details: Vec<String>,
-    /// Fingerprints of every module the failing build READ — empty for a failure that never
+    /// Fingerprints of every module the failing build read; empty for a failure that never
     /// entered the engine.
     ///
-    /// A DETERMINISTIC failure is cached (ADR-0006, invariant 3), and a cached fact must expire
-    /// exactly when the fact would change. Fingerprinting only the entry and the manifest does not
-    /// promise that: a workspace package whose entry merely re-exports the module that fails to
-    /// parse would keep serving the cached failure after the user fixed it, because nothing the
-    /// cache watches moved. So the failure is fingerprinted against the bytes it was derived from,
-    /// exactly as a success is.
+    /// A deterministic failure is cached (ADR-0006, invariant 3), so it is fingerprinted against
+    /// the bytes it was derived from, exactly as a success is. The entry and manifest alone are
+    /// not enough: an entry that re-exports the module that fails to parse would keep serving the
+    /// failure after the user fixed that module.
     freshness: Box<FailureFreshness>,
 }
 
@@ -68,26 +63,21 @@ pub fn analyze_import(context: &AnalysisContext, request: &ImportRequest) -> Imp
 
 /// Manifests of the first-party packages whose sources this build loaded (§8.3).
 ///
-/// The plugin records graph *modules*, and a `package.json` is never one — but it
-/// drives resolution and side-effect classification, so editing a workspace
-/// dependency's `exports`, `type` or `sideEffects` changes what the bundler pulls in
-/// while no fingerprinted path moves, and a stale size is served as fresh. The dep's
-/// *source* files are fingerprinted, so editing its code is already caught; what is
-/// missed is editing its manifest.
+/// The plugin records graph modules, and a `package.json` is never one, yet it drives resolution
+/// and side-effect classification: editing a workspace dependency's `exports`, `type` or
+/// `sideEffects` changes what the bundler pulls in while no fingerprinted source moves.
 ///
-/// Installed packages are excluded: their manifests cannot change without an install,
-/// which bumps the cache generation, and including them would balloon the fingerprint
-/// set for every build.
+/// Installed packages are excluded: their manifests change only with an install, which bumps the
+/// cache generation.
 pub(super) fn first_party_manifests(
     context: &AnalysisContext,
     loaded_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut manifests = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    // Loaded paths are canonicalized (verbatim `\\?\C:\...` on Windows) while the
-    // workspace root arrives off the wire as the editor spelled it, so the two never
-    // compare equal unless the root is canonicalized too — and the walk below would
-    // not actually stop where this says it does.
+    // Loaded paths are canonicalized (verbatim `\\?\C:\...` on Windows) while the workspace
+    // root arrives as the editor spelled it; without canonicalizing the root, the walk below
+    // would never stop at it.
     let workspace_root = fs::canonicalize(&context.workspace_root)
         .unwrap_or_else(|_| context.workspace_root.clone());
 
@@ -136,10 +126,9 @@ fn manifest_stat_paths(
     paths
 }
 
-/// Everything the full-package memo must expire against: the read-time fingerprints
-/// of every module the comparison build measured, plus the manifests that decide what
-/// it resolved. Mirrors the freshness set the import cache stores for the entry build
-/// itself — if the two ever diverge, the memo would outlive the size it describes.
+/// Everything the full-package memo must expire against: the comparison build's read-time
+/// fingerprints plus the manifests that decided what it resolved. Must match the import cache's
+/// freshness set, or the memo outlives the size it describes.
 fn full_package_fingerprints(
     context: &AnalysisContext,
     package_root: &Path,
@@ -153,13 +142,11 @@ fn full_package_fingerprints(
     )
 }
 
-/// A build's read-time fingerprints, augmented with the package's own manifest and the
-/// first-party manifests its sources loaded (§8.3) — the freshness set every build-derived
-/// memo needs so a manifest edit that no source file reflects still expires it.
+/// A build's read-time fingerprints plus the package's own manifest and the first-party
+/// manifests its sources loaded (§8.3), so a manifest edit no source file reflects still expires
+/// a build-derived memo.
 ///
-/// Shared by the full-package comparison memo and the export-list memo so the two cannot
-/// drift in what they call "still fresh" — and so there is exactly one manifest walker
-/// (`first_party_manifests`), per ADR-0002.
+/// Shared by the full-package and export-list memos so they agree on "still fresh".
 pub(crate) fn manifest_augmented_fingerprints(
     context: &AnalysisContext,
     package_root: &Path,
@@ -179,11 +166,9 @@ pub(crate) fn manifest_augmented_fingerprints(
 
 /// Freshness inputs for a successful engine build (§8.3).
 ///
-/// `fingerprints` were captured as each module's bytes were read *during* the
-/// build, so they describe exactly the bytes the size was measured from. Anything
-/// that is not a graph module — the package manifest, and binary modules the plugin
-/// handed back to Rolldown — has no read-time capture and is listed in `stat_paths`
-/// for the caller to hash.
+/// `fingerprints` were captured as each module's bytes were read during the build, so they
+/// describe exactly the measured bytes. `stat_paths` holds resolution inputs (manifests) with no
+/// read-time capture, for the caller to hash.
 pub enum FingerprintSource {
     ReadTime {
         fingerprints: Vec<crate::cache::key::FileFingerprint>,
@@ -201,25 +186,20 @@ pub fn analyze_resolved_import_with_dependencies(
     match analyze_import_inner_resolved(context, request, resolved) {
         Ok((result, source)) => (result, source),
         Err(error) => {
-            // A deterministic failure is CACHED (ADR-0006), so it must expire when the answer would
-            // change — which means fingerprinting the bytes the failure was derived from, not just
-            // the entry the caller happened to name. The engine reports what it had loaded when it
-            // gave up; those are those bytes.
+            // A deterministic failure is cached (ADR-0006), so it is fingerprinted against what
+            // the engine had loaded when it gave up, not just the entry.
             let source = engine_failure_fingerprints(context, &package_root, &error);
             (error_result(request, error), source)
         }
     }
 }
 
-/// Freshness inputs for a FAILED engine build: the bytes it read, plus the manifests that decided
-/// what it resolved. Mirrors the success path's set (`analyze_with_rolldown_engine`) exactly,
-/// because the requirement is exactly the same — the cached answer must expire when the bytes it
-/// was derived from change.
+/// Freshness inputs for a failed engine build: the bytes it read plus the manifests that decided
+/// what it resolved, the same set the success path (`analyze_with_rolldown_engine`) uses.
 ///
-/// `None` for a failure that never reached the engine — an unreadable manifest, an unresolvable
-/// entry, an oversized entry. Those have no graph, and `service::dependency_fingerprints` falls
-/// back to the entry and the manifest, which for those three IS the set that would have to change
-/// for the answer to change.
+/// `None` for a failure that never reached the engine (unreadable manifest, unresolvable or
+/// oversized entry). `service::dependency_fingerprints` then falls back to the entry and the
+/// manifest, which is exactly what would have to change for those answers to change.
 fn engine_failure_fingerprints(
     context: &AnalysisContext,
     package_root: &Path,
@@ -241,16 +221,11 @@ fn analyze_import_inner(
     context: &AnalysisContext,
     request: &ImportRequest,
 ) -> Result<ImportResult, AnalysisError> {
-    // No arm here invents a size. A manifest that cannot be read used to be answered with the
-    // package directory's bytes ON DISK — unminified, uncompressed, tests, source maps and all —
-    // and that one number was assigned to all five size fields, so the "brotli" size of such an
-    // import was an uncompressed directory. It is Unmeasured now (ADR-0006).
+    // No arm here invents a size: an unreadable manifest is Unmeasured (ADR-0006).
     let resolved = match resolve_package_entry(&context.active_document_path, request) {
         Ok(resolved) => resolved,
         Err(message) => return unresolved_import_result(context, request, message),
     };
-    // The non-resolved path has no caller that needs the analyzed graph, so it
-    // discards it and keeps returning a bare `ImportResult`.
     let (result, _graph) = analyze_import_inner_resolved(context, request, resolved)?;
     Ok(result)
 }
@@ -283,8 +258,8 @@ fn unresolved_import_result(
     };
 
     if stage == crate::pipeline::stage::ENTRY_RESOLUTION {
-        // A declarations-only package is MEASURED, not Unmeasured: it really does ship zero
-        // runtime bytes. Its diagnostic stage is what keeps `Some(0)` unambiguous.
+        // A declarations-only package is Measured: it ships zero runtime bytes. Its diagnostic
+        // stage keeps `Some(0)` unambiguous.
         if let Some(result) =
             declaration_only_package_result(&context.active_document_path, request)
         {
@@ -292,8 +267,8 @@ fn unresolved_import_result(
         }
 
         // A native-binary-only package (a `bin` plus a platform-specific native binary as
-        // `optionalDependencies`, no importable JS entry) is likewise MEASURED at zero and
-        // labelled, rather than shown as a bare "unavailable" (B3).
+        // `optionalDependencies`, no importable JS entry) is likewise Measured at zero and
+        // labelled (B3).
         if let Some(result) =
             native_binary_only_package_result(&context.active_document_path, request)
         {
@@ -324,9 +299,8 @@ fn analyze_import_inner_resolved(
     let is_cjs = resolved.is_cjs;
     let package_json = resolved.package_json;
 
-    // A stat failure is an IO condition, not a fact about the package (a lock, a permission blip, a
-    // drive that blinked), so `entry_metadata` is NOT durable — see `pipeline::stage`. It used to be
-    // cached, and expired only when the package's manifest changed.
+    // A stat failure is an IO condition, not a fact about the package, so `entry_metadata` is
+    // not durable (see `pipeline::stage`).
     let metadata = fs::metadata(&entry_path).map_err(|error| {
         error_with_context(
             crate::pipeline::stage::ENTRY_METADATA,
@@ -340,11 +314,9 @@ fn analyze_import_inner_resolved(
         )
     })?;
 
-    // An entry over the module source limit used to be sized from the entry file ALONE — the
-    // whole graph behind it uncounted — and that number was served as the import's size. It is a
-    // deterministic property of the package's bytes that the engine cannot answer, so it is
-    // Unmeasured: `oversized_entry` is not in `stage::ALL`, hence not transient, hence cached
-    // like any other fact about the code.
+    // An entry over the module source limit is a deterministic property of the package the engine
+    // cannot answer, so it is Unmeasured: `oversized_entry` is not in `stage::ALL`, hence not
+    // transient, hence cached like any other fact about the code.
     if metadata.len() as usize > MAX_MODULE_SOURCE_BYTES {
         return Err(error_with_context(
             crate::pipeline::stage::OVERSIZED_ENTRY,
@@ -357,9 +329,7 @@ fn analyze_import_inner_resolved(
         ));
     }
 
-    // A failed engine build is Unmeasured. It used to degrade to that same entry-file-alone
-    // sizing, which carried `error: None` plus a plausible byte count — the fabricated state
-    // every `!result.error` check in the system waves through.
+    // A failed engine build is Unmeasured, never sized from the entry file alone.
     let (mut result, loaded_paths, freshness) = analyze_with_rolldown_engine(
         context,
         request,
@@ -376,11 +346,9 @@ fn analyze_import_inner_resolved(
     Ok((result, Some(freshness)))
 }
 
-/// Rolldown-backed analysis (spec §8): one engine build produces the raw
-/// chunk, OXC minifies it, and the existing compression pipeline runs over
-/// the minified string. Returns the loaded real paths (plus the package
-/// manifest) for §8.3 freshness fingerprints alongside the result.
-///
+/// Rolldown-backed analysis (§8): one engine build produces the raw chunk, OXC minifies it, and
+/// the compression pipeline runs over the minified string. Returns the loaded real paths and the
+/// §8.3 freshness inputs alongside the result.
 pub(crate) fn analyze_with_rolldown_engine(
     context: &AnalysisContext,
     request: &ImportRequest,
@@ -422,11 +390,10 @@ pub(crate) fn analyze_with_rolldown_engine(
         )
     })?;
 
-    // The package's non-JavaScript assets, processed the way they really ship, so their bytes JOIN
-    // the Import Cost instead of being disclosed beside a number that excluded them (B2). Each
-    // artifact is compressed on its own and summed (ADR-0005). Parse/compression failures and a
-    // resource-ledger breach disclose raw bytes beside the measured JavaScript; only a request-local
-    // stage failure (deadline, panic, lost runtime) leaves the import Unmeasured.
+    // The package's non-JavaScript assets, processed the way they ship, join the Import Cost (B2).
+    // Each artifact is compressed on its own and summed (ADR-0005). Parse/compression failures and
+    // a resource-ledger breach disclose raw bytes beside the measured JavaScript; only a
+    // request-local stage failure (deadline, panic, lost runtime) leaves the import Unmeasured.
     let assets = process_assets_bounded(
         artifact.assets.clone(),
         artifact.graph_source_bytes,
@@ -435,17 +402,10 @@ pub(crate) fn analyze_with_rolldown_engine(
     .map_err(|failure| asset_processing_error(context, request, &artifact, failure))?;
     let asset_sizes = assets.total();
 
-    // §7.4/FR-021: Side-Effectful is a property of THE IMPORT — is the entry being measured one
-    // the package declares effectful? — so the glob form answers by MATCHING the entry, and
-    // `has_side_effects` is the whole answer.
-    //
-    // It used to be ORed with `is_array()`, which overrode that correct answer with an
-    // unconditional `true` for every array declaration. `"sideEffects": ["**/*.css"]` says nothing
-    // about a JavaScript entry, and it is an everyday declaration — so an everyday package was
-    // reported side-effectful, forced `truly_treeshakeable: false` BY CONSTRUCTION (the comparison
-    // below is gated on `!side_effects` and never ran), and could never reach High confidence. The
-    // premise that bought that conservatism — "glob matching unavailable from public bundler
-    // metadata" — was retracted by the §10.7 amendment, and the matcher is now Rolldown's own.
+    // §7.4/FR-021: Side-Effectful is a property of the import (does the package declare the
+    // measured entry effectful?), so the glob form answers by matching the entry and
+    // `has_side_effects` is the whole answer. Do not OR in `is_array()`: `["**/*.css"]` says
+    // nothing about a JavaScript entry, and it would gate off the comparison below.
     let side_effects = side_effects_mode.has_side_effects();
     let mut diagnostics: Vec<ImportDiagnostic> = artifact
         .diagnostics
@@ -456,28 +416,20 @@ pub(crate) fn analyze_with_rolldown_engine(
             details: Vec::new(),
         })
         .collect();
-    // An asset that could not be processed keeps the old disclosure: its bytes are real, they ship,
-    // and they are NOT in the number — which is exactly what this stage has always meant.
+    // An asset that could not be processed is disclosed: its bytes ship but are not in the number.
     diagnostics.extend(asset_diagnostics(&assets));
 
-    // Full-package comparison (§8.4/§6.3): a second engine build measures the
-    // complete surface; failure degrades to "not treeshakeable", never an
-    // analysis error.
-    //
-    // The answer does not depend on *which* names were imported, but the import
-    // cache key does — so without the memo, N named variants of one entry cost N
-    // of these builds on top of their own. `full_package::lookup` re-checks the
-    // fingerprints of the exact bytes the stored length was measured from, so it
-    // expires precisely when the length it holds would have gone wrong.
+    // Full-package comparison (§8.4/§6.3): a second engine build measures the complete surface;
+    // failure degrades to "not treeshakeable", never an analysis error. Memoized per entry
+    // because the answer does not depend on which names were imported.
     let mut truly_treeshakeable = false;
     if !side_effects
         && matches!(request.import_kind, ImportKind::Named)
         && !request.named.is_empty()
     {
         let full_len = full_package::lookup(entry_path, request.runtime).or_else(|| {
-            // Read before the build, not after: an invalidation landing while this build
-            // is in flight must not be stamped onto a length measured from the bytes it
-            // invalidated.
+            // Read before the build: an invalidation landing mid-build must not be stamped onto
+            // a length measured from the bytes it invalidated.
             let generation = crate::cache::memory::cache_generation();
             let full = match boundary::bundle_sync(BundleRequest {
                 entries: vec![bundle_entry(BundleSelection::Full)],
@@ -486,13 +438,10 @@ pub(crate) fn analyze_with_rolldown_engine(
             }) {
                 Ok(full) => full,
                 Err(failure) => {
-                    // Reported under the stage the comparison build actually failed at, not
-                    // under a label invented here (§12, same rule as `engine_fallback_diagnostic`
-                    // — the fallback is expressed by the message, not by erasing where it broke).
-                    // That is also what lets `should_cache_result` see a TRANSIENT failure here:
-                    // `truly_treeshakeable: false` is a fabricated fact when the build that would
-                    // have disproved it merely timed out, and caching it would mark a healthy
-                    // package "not tree-shakeable" for a whole cache generation.
+                    // Reported under the stage the build failed at, not an invented label (§12).
+                    // That lets `should_cache_result` see a transient failure: caching
+                    // `truly_treeshakeable: false` after a timeout would mark a healthy package
+                    // "not tree-shakeable" for a whole cache generation.
                     diagnostics.push(ImportDiagnostic {
                         stage: contract_stage(&failure.stage).to_owned(),
                         message: format!(
@@ -506,9 +455,8 @@ pub(crate) fn analyze_with_rolldown_engine(
             };
 
             let full_len = minify_source(&full.code).ok()?.len() as u64;
-            // A graph carrying a module the plugin could not fingerprint as it read it
-            // (a binary module) has no complete read-time record, so there is nothing to
-            // expire a memo against: measure it, use it, and store nothing.
+            // A graph with a module the plugin could not fingerprint (a binary module) has no
+            // complete read-time record to expire a memo against: use it, store nothing.
             if full.unhashed_paths.is_empty() {
                 full_package::store(
                     entry_path,
@@ -524,8 +472,7 @@ pub(crate) fn analyze_with_rolldown_engine(
         if let Some(full_len) = full_len
             && full_len > 0
         {
-            // Mirror the legacy predicate: within 5% of the full size is not
-            // truly tree-shakeable.
+            // Within 5% of the full size is not truly tree-shakeable.
             let ratio = (minified.len() as f64) / (full_len as f64);
             truly_treeshakeable = ratio <= 0.95;
         }
@@ -540,23 +487,14 @@ pub(crate) fn analyze_with_rolldown_engine(
             bytes: contribution.rendered_bytes as u64,
         })
         .collect();
-    // Assets are contributors too, and leaving them out of this list cost two things.
+    // Assets are contributors too. A stylesheet links as an empty module (rendered length 0), so
+    // without these rows the breakdown would not reconcile with the headline, and
+    // `annotate_shared_bytes` (which unions on runtime and contribution path) could not see a
+    // sheet two imports share. The rows reach `internal_contributions`, which the L2 envelope
+    // carries, so a cached result shares identically to a fresh one.
     //
-    // The breakdown stopped reconciling with its own headline: a stylesheet is linked as an EMPTY
-    // module, so its rendered length is 0 and the JS walk drops it — which is why a CSS-dominant
-    // package could show "top modules" summing to a fraction of the number printed beside them.
-    //
-    // And sharing went blind. `annotate_shared_bytes` unions on (runtime, contribution path), so a
-    // stylesheet two imports both pull was invisible to it, even though the combined File Cost
-    // bundles that sheet ONCE. The user saw Combined Import Cost exceed File Cost with no
-    // explanation, because the one mechanism that explains the gap could not see the bytes causing
-    // it. These rows flow into `internal_contributions`, which the L2 envelope already carries for
-    // exactly this reason, so a cached result shares identically to a freshly measured one.
-    // Merged by path, not appended. A stylesheet imported FROM JavaScript links as an empty module
-    // and the JS walk drops it, but one reached as the import's own ENTRY is different: the chunk
-    // attributes its wrapper bytes to that same path, so the path is already in the list. Appending
-    // beside it lists one file twice and makes the rows sum past what the file ships. The asset row
-    // wins because it is the shipped size; a wrapper's rendered length is not a fact about the file.
+    // Merged by path, not appended: a stylesheet that is the import's own entry already has a row
+    // carrying its wrapper bytes. The asset row wins because it is the shipped size.
     for asset in &artifact.assets {
         let path = asset.path.to_string_lossy().to_string();
         match contributions
@@ -602,9 +540,8 @@ pub(crate) fn analyze_with_rolldown_engine(
     result.confidence_reasons = confidence_reasons;
     result.diagnostics = diagnostics;
     result.module_breakdown = Some(top_module_contributions(&contributions));
-    // How the number above is composed: these bytes are already IN the five sizes, and this says
-    // which of them are stylesheet, wasm, or font, so a UI kit's cost is legible rather than a
-    // single opaque figure (B2).
+    // Composition only: these bytes are already in the five sizes; this says which are
+    // stylesheet, wasm, or font (B2).
     result.asset_breakdown = assets.contributions;
     result.internal_contributions = contributions;
 
@@ -617,8 +554,7 @@ pub(crate) fn engine_selection(request: &ImportRequest) -> crate::engine::Bundle
         ImportKind::Named if !request.named.is_empty() => {
             BundleSelection::Named(request.named.clone())
         }
-        // No requested names known: measure the full surface conservatively,
-        // matching the legacy empty-bundle fallback.
+        // No requested names known: measure the full surface conservatively.
         ImportKind::Named => BundleSelection::Full,
         ImportKind::Default => BundleSelection::Default,
         ImportKind::Namespace => BundleSelection::Namespace,
@@ -630,12 +566,9 @@ pub(crate) fn engine_selection(request: &ImportRequest) -> crate::engine::Bundle
 /// cache and diagnostic consumers see stable stage names, and collapse anything unknown to
 /// `generate` rather than inventing a label.
 ///
-/// The vocabulary is *derived* from `engine::stage::ALL` rather than restated here. It used
-/// to be restated, and the restatement drifted: the boundary's `panic`, `timeout` and
-/// `engine_gone` were missing, so a daemon-side panic reached the user relabelled as an
-/// ordinary codegen failure — indistinguishable from one — while `file_size.rs` passed the
-/// same stage through untouched, giving one failure two names in two different responses.
-/// Deriving the list makes that class of drift impossible instead of merely testable.
+/// The vocabulary is derived from `engine::stage::ALL`, never restated here: a restated list
+/// drifts, and a missing stage (`panic`, `timeout`, `engine_gone`) would be relabelled as a
+/// codegen failure while `file_size.rs` passes it through, giving one failure two names.
 fn contract_stage(stage: &str) -> &'static str {
     crate::engine::stage::ALL
         .iter()
@@ -706,17 +639,14 @@ fn unhashed_fingerprints(
 /// byte. The plugin owns JavaScript and directly imported asset snapshots; the asset processor owns
 /// CSS `@import` children and local resources discovered through `url()`.
 ///
-/// `unhashed_paths` are modules whose BYTES ARE IN THE NUMBER but whose read the plugin could not
-/// fingerprint — a binary module Rolldown loaded through its own loader. They are recorded as
-/// **unverifiable**, never as `stat_paths`. `stat_paths` are hashed AFTER the analysis, so a module
-/// rewritten inside the analysis window would pair a size measured from the OLD bytes with a hash of
-/// the NEW ones; every later probe would then match and answer Fresh, serving the stale size until
-/// the file changed again. An unverifiable fingerprint can never be fresh, which is the honest
-/// record for bytes we measured but cannot prove the identity of — and is already what the File Cost
-/// path and the full-package memo do with this same set.
+/// `unhashed_paths` are modules whose bytes are in the number but whose read the plugin could not
+/// fingerprint (a binary module Rolldown loaded itself). They are recorded as **unverifiable**,
+/// never as `stat_paths`: `stat_paths` are hashed after the analysis, so a module rewritten inside
+/// the analysis window would pair a size from the old bytes with a hash of the new ones and be
+/// served as Fresh until the file changed again. An unverifiable fingerprint is never fresh.
 ///
-/// A manifest is a different case and belongs in `stat_paths`: it is a resolution input, not bytes
-/// inside the measured chunk, so a post-analysis hash of it cannot contradict the size.
+/// A manifest belongs in `stat_paths`: it is a resolution input, not bytes inside the measured
+/// chunk, so a post-analysis hash of it cannot contradict the size.
 fn import_freshness(
     read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
     unhashed_paths: &[PathBuf],
@@ -761,10 +691,8 @@ fn engine_confidence(
 
     let mut reasons = Vec::new();
     if side_effects {
-        // The engine builds the same named-selection entry whether or not the package
-        // declares side effects; what changes is that an effectful package cannot be
-        // certified as fully tree-shakeable. The old text described the deleted
-        // engine, which really did switch to full-graph sizing here.
+        // The engine builds the same named-selection entry either way; an effectful package
+        // just cannot be certified as fully tree-shakeable.
         reasons.push(
             "Package declares side effects, so modules it retains cannot be certified as \
              tree-shaken away."
@@ -794,9 +722,7 @@ fn engine_confidence(
 
 /// The Unmeasured result an analysis failure becomes.
 ///
-/// It used to carry five **zero** sizes. That is the same lie as a fabricated one, told with a
-/// smaller number: `0 B` reads as "this import is free", and every consumer that summed or
-/// compared it did so. There is no size now, and the stage says why there is not.
+/// It carries no size, never zeros (`0 B` reads as "this import is free"); the stage says why.
 fn error_result(request: &ImportRequest, error: AnalysisError) -> ImportResult {
     ImportResult::unmeasured(
         request.specifier.clone(),
@@ -847,11 +773,8 @@ mod tests {
     /// A module whose bytes were measured but whose read was never fingerprinted must be recorded
     /// as unverifiable, NOT deferred to a post-analysis stat.
     ///
-    /// The stat happens after the analysis window, so if the module is rewritten inside that window
-    /// the stored size describes v1 while the stored hash describes v2 — and because the pair is
-    /// self-consistent, every later probe answers Fresh and serves the stale size until the file
-    /// changes AGAIN. An unverifiable fingerprint can never be fresh, so the result is simply
-    /// recomputed, which is the honest outcome for bytes whose identity we cannot prove.
+    /// A post-analysis stat of a module rewritten inside the window pairs a v1 size with a v2
+    /// hash, which every later probe answers Fresh.
     #[test]
     fn a_measured_but_unfingerprinted_module_is_unverifiable_not_stat_deferred() {
         let unhashed = PathBuf::from("/pkg/native.node");
@@ -949,7 +872,7 @@ mod tests {
 
     /// Editing a first-party workspace dependency's manifest changes what the bundler
     /// resolves and retains, while none of its source files move. Without the manifest
-    /// in the fingerprint set the cached size is served as fresh (spec R5).
+    /// in the fingerprint set the cached size is served as fresh (§8.3).
     ///
     /// Loaded paths are canonicalized, so a workspace package linked into
     /// `node_modules` (as pnpm does) resolves to its real path and is correctly seen
@@ -1002,12 +925,9 @@ mod tests {
     /// The other half of `contract_stage`: a stage the vocabulary does not know collapses to
     /// `generate` rather than reaching the client under an invented label.
     ///
-    /// There is deliberately no companion test asserting that every stage in `stage::ALL`
-    /// survives the edge. `contract_stage` *searches* `ALL`, so such a test is identity over
-    /// `ALL` by construction and can never go red — it would only look like coverage. The
-    /// property it pretended to protect (a declared stage is in `ALL`) is now structural:
-    /// `engine::stage` emits the constants and `ALL` from one macro invocation, so a stage
-    /// that is missing from `ALL` cannot be written.
+    /// No companion test asserts that every stage in `ALL` survives: `contract_stage` searches
+    /// `ALL`, so it would be identity by construction. `engine::stage` emits the constants and
+    /// `ALL` from one macro invocation, so a stage missing from `ALL` cannot be written.
     #[test]
     fn an_unknown_stage_collapses_to_generate() {
         assert_eq!(

@@ -30,16 +30,11 @@ use std::{
 // Distinct files are bounded by LRU eviction.
 const MAX_CACHED_FILE_SIZES: usize = 64;
 
-// Bound how long an aggregate is served without any freshness signal. Per import
-// the signature folds the package's manifest plus a content token: for node_modules
-// imports just the entry stat, for first-party imports a stat per cached loaded
-// path (see `resolved_import_token`). It never re-reads the transitive bundle. A
-// node_modules content change with no watcher event (e.g. a watcher-excluded
-// folder), or a first-party deep edit while that package's loaded paths are not
-// cached (the fallback stats only the entry), is reflected in the L2 per-import
-// cache after its own re-verify window but would otherwise never reach L1. This
-// TTL gives L1 the same backstop as `memory::REVERIFY_TTL`, capping staleness to
-// one window.
+// Bounds how long an aggregate is served without a freshness signal. The signature stats only
+// the manifest and entry (node_modules) or the cached loaded paths (first-party), never the
+// transitive bundle, so a node_modules change with no watcher event, or a first-party deep edit
+// while its loaded paths are not cached, would otherwise never reach L1. Matches
+// `memory::REVERIFY_TTL`.
 const REVERIFY_TTL_MS: u64 = 30_000;
 
 #[derive(Debug)]
@@ -79,13 +74,11 @@ impl FileSizeCache {
         Some(entry.computation.clone())
     }
 
-    /// Store a file's totals — **if they are the file's totals**.
+    /// Store a file's totals, but only if they are the file's totals.
     ///
-    /// The gate is here, in the store (ADR-0006, invariants 3 and 4). A floor — a total missing an
-    /// import that was Loading or Unmeasured — is a real number and not this file's, and a 30-second
-    /// TTL is long enough for it to become the file's reported size, its persisted baseline, and its
-    /// CI verdict. Refusing at the insert means a future caller cannot reintroduce that by
-    /// forgetting a predicate.
+    /// The gate lives in the store (ADR-0006, invariants 3 and 4) so no caller can bypass it. A
+    /// floor (a total missing a Loading or Unmeasured import) is not this file's number, and 30
+    /// seconds is long enough for it to become the reported size, the baseline, and the CI verdict.
     pub fn insert(&self, path: PathBuf, signature: u64, computation: FileSizeComputation) {
         if !computation.is_cacheable() {
             crate::logging::log_debug(
@@ -177,12 +170,10 @@ pub fn file_size_signature(context: &AnalysisContext, imports: &[SizedImport]) -
     let mut tokens = imports
         .iter()
         .map(|import| {
-            // An import with no request has no resolved entry to fingerprint, and it still belongs
-            // in the signature. The two kinds get DIFFERENT tokens, because they mean opposite
-            // things to the total and the user can move an import between them: a package that is
-            // not installed makes the total a floor (FR-024a) — installing it, or adding the
-            // tsconfig `paths` entry that makes the daemon see a specifier as first-party, must move
-            // the signature so the total is recomputed rather than served from L1.
+            // An import with no request still belongs in the signature, and the two kinds get
+            // different tokens: a not-installed package makes the total a floor (FR-024a), so
+            // installing it, or adding the tsconfig `paths` entry that makes it first-party, must
+            // move the signature.
             let request = match &import.package {
                 SizedPackage::Installed(request) => request,
                 SizedPackage::NotInstalled => {
@@ -219,18 +210,14 @@ pub fn file_size_signature(context: &AnalysisContext, imports: &[SizedImport]) -
 
 /// Per-import freshness token folded into the L1 signature.
 ///
-/// The cache key is fingerprint-free (identity is pure), so an independent stat
-/// token carries the edit signal without depending on the key. A raw len+mtime stat
-/// holds all the freshness signal a full `FileFingerprint` would here, without its
-/// `fs::canonicalize` (which opens the file on Windows) — this runs per import per
-/// poll BEFORE the L1 hit check, so it must stay stat-only: never read contents,
+/// The cache key is fingerprint-free, so a stat token carries the edit signal. A raw len+mtime
+/// stat avoids `FileFingerprint`'s `fs::canonicalize` (which opens the file on Windows). This runs
+/// per import per poll before the L1 hit check, so it must stay stat-only: never read contents,
 /// never trigger a graph build.
 ///
-/// A first-party package (workspace / `file:` / npm-link — a resolved entry with no
-/// `node_modules` segment) is fully editable, so a deep, transitively-imported module
-/// edit must move the signature. A node_modules package changes only via install,
-/// which bumps `cache_generation` (folded once by the caller), so it keeps the cheap
-/// entry+manifest stat and never pays to enumerate its internal modules.
+/// A first-party package (workspace, `file:`, npm-link: no `node_modules` segment) is editable, so
+/// a deep module edit must move the signature. A node_modules package changes only via install,
+/// which bumps `cache_generation`, so it keeps the cheap entry+manifest stat.
 fn resolved_import_token(request: &ImportRequest, resolved: &ResolvedPackage) -> String {
     let key = cache_key_for_resolved_import(request, resolved);
     let manifest_token = stat_token(&resolved.package_root.join("package.json"));
@@ -242,15 +229,10 @@ fn resolved_import_token(request: &ImportRequest, resolved: &ResolvedPackage) ->
     format!("{key}|{content_token}|{manifest_token}")
 }
 
-/// Stat token covering every first-party path loaded by the latest engine build.
-/// A deep-module edit — which changes neither the cache key nor the entry stat — moves
-/// the L1 signature. This index lookup never builds. Any
-/// `node_modules` modules a first-party package pulls in are skipped: they invalidate
-/// via `cache_generation`, not mtime, and re-stat'ing them every poll is the cost the
-/// node_modules branch deliberately avoids. With nothing cached yet, falls back to the
-/// entry stat alone; a later poll, once L2 has populated the dependency-path index,
-/// upgrades to full coverage. The tokens are sorted so the result is stable regardless
-/// of module order.
+/// Stat token covering every first-party path loaded by the latest engine build, so a deep-module
+/// edit moves the L1 signature. The index lookup never builds. `node_modules` modules are skipped:
+/// they invalidate via `cache_generation`. With nothing cached yet, falls back to the entry stat;
+/// a later poll upgrades to full coverage once L2 populates the index. Tokens are sorted.
 fn first_party_module_token(entry_path: &Path, runtime: ImportRuntime) -> String {
     let module_paths = cached_loaded_paths(entry_path, runtime);
     let Some(module_paths) = module_paths else {
@@ -306,8 +288,7 @@ mod tests {
     use crate::ipc::protocol::{ImportKind, ImportRuntime};
 
     /// `file_size_signature` folds the process-global cache generation, so every test here that
-    /// compares two signatures — and the one that deliberately bumps it — must serialize against
-    /// the rest of the binary. See `cache::memory::hold_cache_generation_steady`.
+    /// compares or bumps signatures must serialize against the rest of the binary.
     use crate::cache::memory::hold_cache_generation_steady as hold_generation_steady;
 
     fn computation(minified: u64) -> FileSizeComputation {
@@ -499,8 +480,7 @@ mod tests {
         })];
 
         let sig1 = file_size_signature(&context, &imports);
-        // Change the entry's content+length; the signature must change even though
-        // the cache key no longer carries entry fingerprints.
+        // The cache key carries no entry fingerprint, so the stat token must catch this.
         std::fs::write(pkg.join("index.js"), "export const a = 222222;").expect("entry v2");
         let sig2 = file_size_signature(&context, &imports);
 
@@ -563,8 +543,7 @@ mod tests {
         use crate::engine::dependency_paths::{clear, record_loaded_paths};
         use crate::pipeline::resolver::SideEffectsMode;
 
-        // A first-party fixture lives OUTSIDE node_modules: entry imports a deep
-        // module, both editable. Finding 8: editing the deep module must move L1.
+        // A first-party fixture outside node_modules: editing the deep module must move L1.
         let root = std::env::temp_dir().join(format!("il-l1-fp-{}", std::process::id()));
         let pkg = root.join("pkg");
         std::fs::create_dir_all(&pkg).expect("pkg dir");

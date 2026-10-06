@@ -42,30 +42,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Whether a cached-analyze read promotes the entry's LRU recency (FR-026b, scan
-/// resistance §5.1). An interactive read whose result the user is looking at now
-/// promotes; the workspace report does not, so a full-workspace pass can't flood
-/// the recency signal and evict the user's warm working set. When a caller's
-/// intent is ambiguous, prefer `Interactive`: over-promoting is safe.
+/// Whether a cached-analyze read promotes the entry's LRU recency (FR-026b, §5.1).
+/// The workspace report reads `Bulk` so a full-workspace pass cannot evict the
+/// user's warm working set. When intent is ambiguous, prefer `Interactive`:
+/// over-promoting is safe.
 #[derive(Clone, Copy)]
 enum ReadIntent {
     Interactive,
     Bulk,
 }
 
-/// The outcome of a cache lookup, before any engine build has been attempted.
+/// The outcome of a cache lookup, before any engine build.
 ///
-/// Separating "did the cache answer this?" from "build it" is what lets a batch
-/// classify every import at pool width and hand only the misses to the two-permit
-/// engine drain. `Miss` carries the resolved package and cache key forward so the
-/// build half does not re-read the manifest.
+/// A batch classifies every import at pool width and hands only the misses to the
+/// engine drain. `Miss` carries the resolved package and key so the build half does
+/// not re-read the manifest.
 enum CacheProbe {
     Hit(Box<ImportResult>),
     /// Boxed: this rides in the `Err` arm of the classify closure for every import in
     /// a batch, and `ResolvedPackage` dwarfs the discriminant.
     Miss(Box<PendingBuild>),
-    /// The package entry did not resolve. Carries the resolver's message, so the answer is
-    /// built from this resolution and never from a second one that could start a build.
+    /// The package entry did not resolve. The answer is built from this message, never from a
+    /// second resolution that could start a build.
     Unresolved(String),
 }
 
@@ -75,9 +73,8 @@ struct PendingBuild {
 }
 
 /// One import a streamed response answered `Loading`: everything needed to build it after the
-/// response has already gone out, and to address the result back to the right import on the
-/// client (the identity — specifier alone is not unique, since two imports of one package differ
-/// by kind and named exports).
+/// response has gone out and to address the result back to the right import (specifier alone is
+/// not unique: two imports of one package differ by kind and named exports).
 pub struct PendingImport {
     detected: DetectedImport,
     request: ImportRequest,
@@ -87,36 +84,22 @@ pub struct PendingImport {
 /// One import a response already carried a real measurement for, addressed by the same identity a
 /// push uses.
 ///
-/// The streamed builds need these: shared-module bytes are a property of the WHOLE document (which
-/// modules two imports both pull in), so the final annotation pass cannot see only the imports that
-/// arrived late.
+/// The streamed builds need these: shared-module bytes are a property of the WHOLE document, so
+/// the closing annotation pass cannot see only the imports that arrived late.
 ///
-/// The import's runtime rides in on `identity`, which needs it anyway (two runtime variants of one
-/// Astro import statement are two rows, and a specifier+kind+named key collides them into one), so
-/// it is not repeated as a second field here. Both construction sites used to drop the runtime on
-/// the floor, which is why the closing shared-bytes pass could not see the boundary at all.
-///
-/// **There IS a copy, and an earlier version of this comment denied it.** `ImportRuntime` lives on
-/// two structs, and the two partitions read different ones: SHARING partitions on
-/// `DetectedImport.runtime` (via this identity), while the BUILD partitions on
-/// `ImportRequest.runtime` (`pipeline::file_size` does `groups.entry(request.runtime)`). What keeps
-/// them from disagreeing is not the absence of a second field — it is that there is exactly one
-/// SOURCE (`DetectedImport.runtime`, decided in `document::script_regions`) and exactly one
-/// DERIVATION that copies it forward ([`import_request_for_detected`]). That is a fine design. It
-/// is not the same claim, and the difference is not academic: the derivation was the unpinned link,
-/// and rewriting that one line to a constant left the whole daemon suite green while a
-/// mixed-runtime file silently under-reported by ~49%. What makes the copy safe is the test that
-/// now pins it (`tests/file_size_runtime.rs::a_mixed_runtime_astro_document_is_built_as_two_artifacts`),
-/// not an assertion that the copy does not exist.
+/// The runtime rides on `identity` (two runtime variants of one Astro import are two rows).
+/// `ImportRuntime` also lives on `ImportRequest`: sharing partitions on `DetectedImport.runtime`,
+/// the build on `ImportRequest.runtime`. They agree only because [`import_request_for_detected`]
+/// is the single derivation copying one into the other; a mixed-runtime file under-reports if it
+/// diverges (pinned by `tests/file_size_runtime.rs`).
 #[derive(Clone)]
 pub struct MeasuredImport {
     pub result: ImportResult,
     pub identity: RefreshedImportIdentity,
 }
 
-/// A document analysis that did not wait for the engine: what the cache could answer now, what is
-/// still to be built, and — for the shared-bytes pass that closes the document — the measurements
-/// the response already carried.
+/// A document analysis that did not wait for the engine: what the cache answered now, what is
+/// still to be built, and the measurements already sent (for the closing shared-bytes pass).
 pub struct StreamedDocumentAnalysis {
     pub response: AnalyzeDocumentResponse,
     pub measured: Vec<MeasuredImport>,
@@ -171,31 +154,24 @@ struct ComputedAnalysis {
     dependencies_are_reusable: bool,
 }
 
-/// F1 trailing-re-check decision for the background SWR revalidation. After a
-/// revalidation recomputes and re-inserts a key, its freshness is re-probed: a
-/// `Stale` result means a dependency changed AGAIN while the recompute ran (and a
-/// concurrent stale serve was coalesced away by the in-flight guard), so exactly
-/// ONE more revalidation is re-armed and the served value catches up to the newer
-/// state without waiting for the next interactive read. A graduated transient
-/// `Unknown` is NEVER re-armed — re-analyzing would re-hit the same stat/read
-/// error and could overwrite the good cached value; `Fresh`/`Gone`/absent need no
-/// re-run either.
+/// Trailing re-check after a background SWR revalidation re-inserts a key. `Stale`
+/// means a dependency changed again during the recompute (and a concurrent stale
+/// serve was coalesced away), so exactly one more revalidation runs. A graduated
+/// transient `Unknown` is never re-armed: it would re-hit the same stat/read error
+/// and could overwrite the good cached value.
 fn should_rearm_revalidation(freshness: Option<crate::cache::key::Freshness>) -> bool {
     matches!(freshness, Some(crate::cache::key::Freshness::Stale))
 }
 
-/// Process-global "a cache-maintenance pass is running" flag (F4-B). Cache
-/// maintenance operates on the process-global on-disk cache — a single storage
-/// path shared by every service instance — so passes must serialize even across
-/// instances: a re-Hello builds a fresh service and spawns a new maintenance task
-/// whose immediate first tick would otherwise run concurrently with the previous
-/// connection's still-detached `spawn_blocking` pass. The passes already serialize
-/// on redb's single writer; this simply skips the redundant duplicate scan.
+/// Process-global "a cache-maintenance pass is running" flag. The on-disk cache is
+/// shared by every service instance, and a re-Hello schedules a fresh pass that
+/// can overlap the previous connection's detached `spawn_blocking` pass. redb's
+/// single writer already serializes them; this skips the duplicate scan.
 static CACHE_MAINTENANCE_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// RAII claim on [`CACHE_MAINTENANCE_IN_PROGRESS`]. Clears the flag on drop —
-/// including on panic/unwind — so a panicking pass cannot wedge maintenance off.
+/// RAII claim on [`CACHE_MAINTENANCE_IN_PROGRESS`]. Clears the flag on drop,
+/// including on unwind, so a panicking pass cannot wedge maintenance off.
 struct MaintenanceGuard;
 
 impl Drop for MaintenanceGuard {
@@ -204,10 +180,8 @@ impl Drop for MaintenanceGuard {
     }
 }
 
-/// Claims the maintenance-in-progress flag. Returns `Some(guard)` for the caller
-/// that wins the claim (which should run the pass) and `None` while a pass is
-/// already in flight, so a redundant concurrent pass is skipped. The guard
-/// releases the claim on drop.
+/// Claims the maintenance flag: `Some(guard)` for the winner, which runs the pass;
+/// `None` while a pass is already in flight.
 fn try_begin_cache_maintenance() -> Option<MaintenanceGuard> {
     CACHE_MAINTENANCE_IN_PROGRESS
         .compare_exchange(
@@ -252,25 +226,19 @@ fn registry_hint_result_from_lookup(
     }
 }
 
-// `RegistryHintService` and `RegistryRefreshExecutor` hold trait objects and a
-// thread pool respectively, so `ImportLensService` no longer derives `Debug`.
+// Not `Debug`: `RegistryHintService` holds trait objects and `RegistryRefreshExecutor` a pool.
 pub struct ImportLensService {
     cache_registry: ProjectCacheRegistry,
     analysis_flights: AnalysisFlightRegistry<ComputedAnalysis>,
     registry_hints: crate::registry::service::RegistryHintService,
     registry_executor: crate::registry::executor::RegistryRefreshExecutor,
     report_executor: crate::report::executor::WorkspaceReportExecutor,
-    // Registry-metadata store byte budget (`importLens.registryCacheMaxSizeMB`,
-    // wired through Hello — RB-16). The maintenance pass caps the registry store at
-    // this instead of the hardcoded default constant.
+    // Registry-metadata store byte budget (`importLens.registryCacheMaxSizeMB`, from Hello);
+    // the maintenance pass caps the registry store at this.
     registry_cache_max_size_bytes: u64,
-    // Set only by `new_with_registry_hints_for_tests`. When true, the IPC
-    // server's Hello handler preserves `registry_hints`/`registry_executor`
-    // across the Hello-driven service rebuild instead of reconstructing them
-    // from `hello.storage_path` with the real `UreqRegistryHttpClient`. This
-    // lets integration tests inject a fake `RegistryHttpClient` (e.g. to
-    // control fetch timing/failure deterministically) that survives the
-    // handshake. See `daemon/src/ipc/server.rs`'s `Hello` handling.
+    // Set only by `new_with_registry_hints_for_tests`: the IPC server's Hello handler then keeps
+    // `registry_hints`/`registry_executor` across the rebuild, so an injected fake
+    // `RegistryHttpClient` survives the handshake. See `ipc/server.rs`'s `Hello` handling.
     preserve_registry_across_hello: bool,
 }
 
@@ -316,11 +284,8 @@ impl ImportLensService {
         }
     }
 
-    /// Test-only: exists so integration tests (`daemon/tests/*.rs`, which
-    /// compile the daemon lib as an external crate and therefore cannot see
-    /// `#[cfg(test)]` items) can inject a fake `RegistryHintService`. See the
-    /// `preserve_registry_across_hello` field doc comment for why the IPC
-    /// server must special-case services constructed this way.
+    /// Test-only: lets integration tests (an external crate, so `#[cfg(test)]` is invisible to
+    /// them) inject a fake `RegistryHintService`. See `preserve_registry_across_hello`.
     pub fn new_with_registry_hints_for_tests(
         registry_hints: crate::registry::service::RegistryHintService,
     ) -> Self {
@@ -338,22 +303,16 @@ impl ImportLensService {
         }
     }
 
-    /// Test-only: exists so integration tests can seed cached registry
-    /// metadata without a real network fetch. See
-    /// `new_with_registry_hints_for_tests` for why this cannot be
-    /// `#[cfg(test)]`-gated.
+    /// Test-only: seeds cached registry metadata without a network fetch. Not
+    /// `#[cfg(test)]`-gated, for the reason on `new_with_registry_hints_for_tests`.
     pub fn registry_hints_for_tests(&self) -> RegistryHintTestHandle<'_> {
         RegistryHintTestHandle { service: self }
     }
 
-    /// Rebuilds only the cache-registry portion of the service for a freshly
-    /// negotiated Hello handshake while preserving the existing
-    /// `registry_hints`/`registry_executor`. Only called by the IPC server
-    /// when `preserve_registry_across_hello()` is true (i.e. the service was
-    /// constructed via `new_with_registry_hints_for_tests`); production
-    /// connections always rebuild via `new_with_cache_policy` so that
-    /// `hello.storage_path` remains the source of truth for registry
-    /// configuration.
+    /// Rebuilds only the cache registry for a new Hello, keeping `registry_hints` and
+    /// `registry_executor`. Called only when `preserve_registry_across_hello()` is true;
+    /// production rebuilds via `new_with_cache_policy` so `hello.storage_path` stays the
+    /// source of truth for registry configuration.
     pub fn rebuild_cache_registry_for_hello(
         self,
         storage_path: Option<PathBuf>,
@@ -380,11 +339,10 @@ impl ImportLensService {
         self.preserve_registry_across_hello
     }
 
-    /// Startup recency seed (C5 / Finding 10d, §3.3). Delegated to the cache
-    /// registry; the IPC server calls this synchronously in its Hello handler —
-    /// AFTER the registry is (re)built with the negotiated disk config and BEFORE
-    /// any analyze/cache request is served — so no new entry is created with a
-    /// pre-seed low seq. See `ProjectCacheRegistry::seed_recency_clock_from_disk`.
+    /// Startup recency seed. The Hello handler calls this synchronously, after the registry is
+    /// rebuilt with the negotiated disk config and before any analyze/cache request is served,
+    /// so no new entry gets a pre-seed low seq. See
+    /// `ProjectCacheRegistry::seed_recency_clock_from_disk`.
     pub fn seed_recency_clock_from_disk(&self) {
         self.cache_registry.seed_recency_clock_from_disk();
     }
@@ -409,29 +367,19 @@ impl ImportLensService {
         self.registry_executor.spawn(job);
     }
 
-    /// Fans a bulk "refresh dependency block" onto the isolated registry pool
-    /// (D7 / §6.1). Three properties this drain guarantees:
+    /// Fans a bulk "refresh dependency block" onto the isolated registry pool.
     ///
-    /// * **Cache first.** Non-cancelled targets are classified through one
-    ///   cache-only pre-pass. Cache-eligible results stream immediately, and
-    ///   only unresolved targets are enqueued for network refresh.
-    ///
+    /// * **Cache first.** One cache-only pre-pass streams cache-eligible results
+    ///   immediately; only the rest are enqueued for network refresh.
     /// * **Bounded in flight.** Each target is a `spawn` onto the
-    ///   `REGISTRY_REFRESH_CONCURRENCY`-thread pool, never a per-target thread,
-    ///   so at most the pool size is ever fetching at once — the pool IS the
-    ///   in-flight cap; no extra semaphore is layered on.
-    /// * **Cancellable.** Every job re-reads the shared `cancelled` flag BEFORE
-    ///   its network fetch. Once a newer block supersedes this one (or the
-    ///   connection ends) the flag flips and each still-queued job skips its
-    ///   fetch and reports `None` — no error is surfaced for the skipped work,
-    ///   and the jobs already in flight are left to finish. The registry is
-    ///   blocking std on rayon, so a plain `Arc<AtomicBool>` checked per job is
-    ///   the fit, not a tokio token.
+    ///   `REGISTRY_REFRESH_CONCURRENCY`-thread pool; the pool is the in-flight cap.
+    /// * **Cancellable.** Each job re-reads `cancelled` before its fetch. Once a
+    ///   newer block supersedes this one (or the connection ends), queued jobs
+    ///   report `None` without an error; jobs in flight finish.
     ///
-    /// `on_result` is invoked exactly once per target with the job's index and
-    /// either the fetched `RegistryHintResult` or `None` when the job was
-    /// skipped by cancellation. Every unresolved target that runs as a worker
-    /// still honors single-flight, the D-c cooldown, and the shared rate limiter.
+    /// `on_result` runs exactly once per target with its index and the result, or
+    /// `None` when skipped by cancellation. Workers still honor single-flight, the
+    /// registry cooldowns, and the shared rate limiter.
     pub fn spawn_registry_refresh_block<F>(
         self: &std::sync::Arc<Self>,
         targets: Vec<RegistryHintTarget>,
@@ -481,11 +429,7 @@ impl ImportLensService {
             let svc = std::sync::Arc::clone(self);
             let cancelled = std::sync::Arc::clone(&cancelled);
             self.spawn_registry_refresh(move || {
-                // Per-job pre-fetch cancellation check: a superseded/abandoned
-                // block skips its remaining network fetches. Acquire pairs with
-                // the Release store on the supersede/disconnect side so a worker
-                // that observes the flag also sees everything sequenced before
-                // it.
+                // Acquire pairs with the Release store on the supersede/disconnect side.
                 let outcome = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                     None
                 } else {
@@ -534,14 +478,10 @@ impl ImportLensService {
             };
         }
 
-        // F4-A: the report aggregation (workspace scan + build_report_rows +
-        // summary) runs on a fire-and-forget rayon worker via `spawn_workspace_report`;
-        // an uncaught panic here would unwind the pool job and drop the `oneshot`
-        // sender, surfacing only a generic transport error. Catch it and return an
-        // explicit error response — matching the registry worker (ipc/server) and the
-        // per-file report hardening (`analyze_report_source`). `AssertUnwindSafe` is
-        // sound: a panic that poisons a cache mutex is handled by the cache's
-        // poisoned-lock fallback, and no `&mut` state straddles the boundary.
+        // The aggregation runs on a fire-and-forget worker: an uncaught panic would drop the
+        // `oneshot` sender and surface only a generic transport error, so it becomes an explicit
+        // error response. `AssertUnwindSafe` is sound: a poisoned cache mutex is handled by the
+        // cache's poisoned-lock fallback, and no `&mut` state straddles the boundary.
         let version = request.version;
         let request_id = request.request_id;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -570,10 +510,8 @@ impl ImportLensService {
         &self,
         request: WorkspaceReportRequest,
     ) -> WorkspaceReportResponse {
-        // Forces an AGGREGATION panic (outside per-file analysis, which is caught
-        // separately in `analyze_report_source`) so the `catch_unwind` in
-        // `build_workspace_report_on_worker` is exercised. Compiled only under
-        // cfg(test); a no-op in release builds.
+        // Forces an aggregation panic (outside per-file analysis) to exercise the `catch_unwind`
+        // in `build_workspace_report_on_worker`.
         #[cfg(test)]
         {
             if request
@@ -586,15 +524,11 @@ impl ImportLensService {
 
         let workspace_root = PathBuf::from(&request.workspace_root);
         let files = crate::report::scanner::scan_workspace_sources(&workspace_root);
-        // One resolver per report run: files sharing a directory share a single
-        // .importlensignore ancestor walk, while edits between reports are
-        // re-read because each report constructs a fresh resolver.
+        // One resolver per report run: files in one directory share a .importlensignore walk, and
+        // edits between reports are re-read.
         let ignore_resolver = IgnoreRuleResolver::default();
-        // Reading, parsing and import-detecting a file needs no engine permit, so this
-        // runs at the width of the report's own pool rather than the engine's build
-        // width — the engine drain lives one level down, around the misses only. The
-        // pool is dedicated to reports (`report_executor`), so widening here cannot
-        // starve interactive requests on the global pool.
+        // Reading and import detection need no engine permit, so this runs at the width of the
+        // report's dedicated pool; only the misses go through the engine drain.
         let items = files
             .par_iter()
             .flat_map_iter(|source_path| {
@@ -635,12 +569,8 @@ impl ImportLensService {
             source,
         };
 
-        // Isolate per-file analysis: a panic while analyzing one workspace file
-        // must degrade to a skipped file, not fail the entire report. The report
-        // runs on a fire-and-forget worker, so an uncaught panic here would tear
-        // down the whole scan (mirrors the registry worker's catch_unwind).
-        // AssertUnwindSafe is sound because a panic that poisons a cache mutex is
-        // already handled by the cache's poisoned-lock fallback.
+        // A panic in one file degrades to a skipped file, not a failed report. AssertUnwindSafe
+        // is sound: a poisoned cache mutex is handled by the cache's poisoned-lock fallback.
         let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
             {
@@ -652,14 +582,11 @@ impl ImportLensService {
                 }
             }
 
-            // WorkspaceReport is a full-workspace scan: read cache non-promoting so it
-            // can't flood the recency signal and evict the user's warm set (§5.1).
+            // `Bulk`: a full-workspace scan must not evict the user's warm set (§5.1).
             //
-            // The report WAITS for every build: its rows are a table, and a row that says
-            // "still measuring" is not a row. It therefore keeps the
-            // complete (blocking) analysis, and a workspace naming enough parked packages can
-            // still outlive the client's 300s — stated as such in the SRS rather than papered
-            // over with a fabricated size.
+            // The report waits for every build (a "still measuring" row is not a row), so a
+            // workspace with enough parked packages can outlive the client's 300s, as the SRS
+            // states.
             self.handle_analyze_document_with_intent(
                 document_request,
                 ignore_resolver,
@@ -714,25 +641,16 @@ impl ImportLensService {
         });
     }
 
-    /// Analyze a document WITHOUT waiting for any engine build.
+    /// Analyze a document without waiting for any engine build (the editor's path).
     ///
-    /// This is the editor's path, and the whole point of the redesign. The response carries
-    /// every import the cache could answer, plus a `Loading` placeholder for each one whose
-    /// build has yet to run — and it is returned at once, because the response no longer waits
-    /// for the engine at all. The pending builds come back in
-    /// [`StreamedDocumentAnalysis::pending`]; the IPC server runs them and pushes each result to
-    /// the client as it lands (`RefreshedResults`).
+    /// The response carries every import the cache answered plus a `Loading` placeholder for
+    /// each one still to build, and returns at once. The pending builds come back in
+    /// [`StreamedDocumentAnalysis::pending`]; the IPC server runs them and pushes each result
+    /// (`RefreshedResults`), so a package that parks the bundler delays only its own number.
     ///
-    /// What that buys: one package that parks the bundler delays exactly one import's number.
-    /// It used to delay the whole `AnalyzeDocumentResponse` past the client's 10s deadline, and
-    /// the client threw the entire document away — every import in it already answered from
-    /// cache included.
-    ///
-    /// The placeholder is load-bearing, not cosmetic. An import ABSENT from the response is
-    /// dropped by the extension (`listener.ts` rebuilds the document's state array from
-    /// `response.imports`), and a later push can only UPDATE a state, never create one
-    /// (`refreshMerge.ts` maps over the states that exist). Omitting a still-building import
-    /// would therefore lose it permanently.
+    /// The placeholder is load-bearing: the extension rebuilds its state array from
+    /// `response.imports` (`listener.ts`) and a push can only update an existing state
+    /// (`refreshMerge.ts`), so an omitted import would be lost permanently.
     pub fn handle_analyze_document_streaming(
         &self,
         request: AnalyzeDocumentRequest,
@@ -889,9 +807,8 @@ impl ImportLensService {
             Ok(prelude) => prelude,
             Err(response) => return *response,
         };
-        // Interactive size read → serve stale (SWR) unless the client forces fresh
-        // (CI / CLI budget checks). A stale serve here triggers the background
-        // revalidation + RefreshedResults push in the FileSizeDocument handler.
+        // Serves stale (SWR) unless forced fresh; a stale serve triggers the background
+        // revalidation and `RefreshedResults` push in the FileSizeDocument handler.
         let states = self.analysis_items_for_detected(
             &context,
             detected,
@@ -904,16 +821,13 @@ impl ImportLensService {
 
     /// Size a document without waiting for any per-import build.
     ///
-    /// The file's own totals still come from a real build — ONE combined build per runtime,
-    /// bounded by `BUILD_TIMEOUT`, whose entries include the imports that are still being
-    /// measured individually (their bytes belong in the file's total whether or not their own
-    /// number has landed). What this no longer does is wait for those individual builds: their
-    /// states come back `Loading`, and `AnalyzeDocument`'s streaming pass — which the extension
-    /// always sends first, for the same document and the same generation — is what builds them
-    /// and pushes each one to the client.
+    /// The file's totals still come from one combined build per runtime, bounded by
+    /// `BUILD_TIMEOUT`, whose entries include imports still being measured individually. Those
+    /// individual states come back `Loading`; `AnalyzeDocument`'s streaming pass (which the
+    /// extension always sends first, for the same document and generation) builds and pushes
+    /// them.
     ///
-    /// A force-fresh request (CI) is served by the blocking path instead: completeness is the
-    /// entire point of that flag.
+    /// A force-fresh request (CI) takes the blocking path: completeness is that flag's point.
     pub fn handle_file_size_document_streaming(
         &self,
         request: FileSizeDocumentRequest,
@@ -942,43 +856,23 @@ impl ImportLensService {
         context: &AnalysisContext,
         states: Vec<ImportAnalysisItem>,
     ) -> FileSizeDocumentResponse {
-        // EVERY detected import reaches the aggregate — including one with no `request`, because a
-        // request carries the installed version and there is none.
+        // Every detected import reaches the aggregate, including one with no `request` (no
+        // installed version): it is a floor, like every unmeasured contributor (FR-024a).
         //
-        // Such an import used to be `filter_map`ped away right here, so it never reached the floor
-        // check: the file's total silently omitted it, was cached, was persisted as the file's
-        // baseline, and `importlens check` exited 0 on a number that was missing a whole dependency.
-        // It is a floor now, like every other unmeasured contributor (SRS FR-024a, bullet 4).
+        // Except a path alias (`@app/components`, a bare specifier under `baseUrl`): it points at
+        // first-party source, which is not measured (ADR-0004), so its zero is a fact, not a gap.
+        // The discriminator is positive evidence (it resolves through tsconfig `paths` to
+        // first-party source). A specifier that resolves to nothing is a floor, declared or not:
+        // a typo and an uninstalled dependency omit the same bytes (ADR-0006).
         //
-        // But "no request" is TWO facts, and flagging both cost a regression of its own. A **path
-        // alias** (`@app/components`, a bare `components/Button` under a `baseUrl`) is not a package
-        // at all — it points at first-party source, which Import Lens does not measure (ADR-0004),
-        // so its zero is a fact and not a gap. Treating an alias as a missing dependency made every
-        // file that uses path aliases a permanent floor: never cached, never persisted, never judged.
+        // One probe for the whole loop: it holds one alias resolver per reachable tsconfig, and
+        // building them per specifier cost ~20 ms of the 50 ms NFR-002 warm budget on a 20-alias
+        // component. It builds lazily, on the first import with no request.
         //
-        // The discriminator is POSITIVE evidence — the specifier resolves, through tsconfig `paths`,
-        // to first-party source — and never the absence of it. A specifier that resolves to nothing
-        // is a floor, whether the project declared it or not: a typo and an uninstalled dependency
-        // omit the same bytes from this total, and refusing a verdict is the direction ADR-0006
-        // demands to fail in.
-        //
-        // ONE probe for the whole loop. It holds the workspace's alias resolvers — one per reachable
-        // tsconfig, each a `Resolver::new` and a cold JSONC parse — and asking for them per specifier
-        // made this `O(aliased imports × reachable configs)`: on the create-vue shape a 20-alias page
-        // component burned ~20 ms of the 50 ms NFR-002 warm budget here, on every debounced
-        // keystroke. Built once, reused across the loop, it is `O(reachable configs)`.
-        //
-        // It must not outlive this response, and it does not: a `Resolver` that survives the request
-        // memoizes the filesystem, and the miss it memoizes is the one answer that must never be
-        // cached — an import written before the file it points at would stay a floor for the daemon's
-        // life, even after the developer created the file (`ResolverSet::alias_config_graphs`). The
-        // probe also builds nothing until the first import that HAS no request, so a document whose
-        // every import is installed still pays nothing.
-        //
-        // It is keyed on the WORKSPACE, not on the document: "does this specifier map to first-party
-        // source?" is a question about the project's alias table, and the answer must not change
-        // because the import happens to sit in a `.vue` file rather than a `.ts` one. It did — see
-        // `FirstPartySourceProbe`.
+        // It must not outlive this response: a surviving `Resolver` memoizes the filesystem, and
+        // a memoized miss would keep an import written before its target file a floor for the
+        // daemon's life (`ResolverSet::alias_config_graphs`). It is keyed on the workspace, not
+        // the document, so the answer does not depend on the importing file's extension.
         let first_party =
             FirstPartySourceProbe::new(&context.workspace_root, &context.active_document_path);
         let sized = states
@@ -1007,46 +901,31 @@ impl ImportLensService {
             zstd_bytes: file_size.zstd_bytes,
             imports: results,
             states,
-            // What those five totals are made of. Already inside them; this only makes them legible.
+            // What the five totals are made of; already inside them.
             asset_breakdown: file_size.asset_breakdown.clone(),
-            // The one fact the bytes cannot carry: whether every import that belongs in them was
-            // really measured. The extension needs it to keep a floor out of its persisted
-            // bundle-impact history (FR-026c) — a store with no TTL, where one fabricated row
-            // becomes the file's permanent baseline.
+            // Whether every import was really measured. The extension keeps a floor out of its
+            // persisted bundle-impact history (FR-026c), a store with no TTL.
             incomplete: file_size.incomplete,
-            // And the fact `incomplete` cannot carry: whether the file's OWN combined build
-            // succeeded. It can fail with every contributor Measured, and then these totals are an
-            // un-deduplicated per-import sum — a different quantity, and an over-count.
+            // Whether the file's own combined build failed. It can fail with every contributor
+            // measured; the totals are then an un-deduplicated per-import sum (an over-count).
             degraded: file_size.degraded,
             error: file_size.error,
             diagnostics: file_size.diagnostics,
         }
     }
 
-    /// Background SWR revalidation for a document's sizes: recompute the imports that
-    /// were served stale FRESH (bypassing serve-stale), deduped per cache key via a
-    /// `RevalidationGuard` so concurrent stale serves coalesce to one recompute and a
-    /// panicking recompute cannot leak the in-flight claim. `should_continue` is a
-    /// pre-recompute cancellation check (F3-B): a document superseded before/while the
-    /// revalidation runs bails before the expensive recompute. After a recompute the
-    /// entry's freshness is re-probed and, if it is STILL `Stale` (a dep changed again
-    /// mid-recompute), EXACTLY ONE more revalidation is re-armed (F1 — never a loop).
-    /// Only the specifiers in `stale_specifiers` are recomputed — a fresh sibling import
-    /// in the same document must NOT be re-analyzed, or one changed dep would trigger a
-    /// full re-analysis of every import in the file. Returns
-    /// `(workspace_root, document_path, fresh_results)` for the client push, or `None`
-    /// when nothing was recomputed (parse failure, no stale specifiers, or every stale
-    /// key already owned by an in-flight revalidation).
+    /// Background SWR revalidation: recomputes fresh only the imports in `stale_specifiers`
+    /// (a fresh sibling is never re-analyzed), deduped per key by a `RevalidationGuard` so
+    /// concurrent stale serves coalesce and a panic cannot leak the claim. `should_continue`
+    /// bails a superseded document before each recompute. A key still `Stale` after its
+    /// recompute gets exactly one more (never a loop).
     ///
-    /// F2 — no daemon-side debounce. §4.5 asks for background revalidation to be
-    /// debounced by `importLens.debounceMs`; that debounce already lives in the CLIENT.
-    /// The extension routes every `FileSizeDocument` request through
-    /// `DebouncedDocumentScheduler` (see `extension/src/listener.ts`), keyed per document
-    /// URI with `config.debounceMs` (default 300ms) and cancel-and-replace semantics, so
-    /// the settled requests that reach this per-request revalidation are already
-    /// ≥`debounceMs` apart per document. A second per-key debounce here would be
-    /// redundant; the in-flight `RevalidationGuard` dedupe below already coalesces the
-    /// only remaining concurrency (overlapping requests for the same key).
+    /// Returns `(workspace_root, document_path, results, identities)` for the push, or `None`
+    /// when nothing was recomputed.
+    ///
+    /// No daemon-side debounce: the §4.5 debounce lives in the client's
+    /// `DebouncedDocumentScheduler` (`extension/src/listener.ts`, per document, cancel and
+    /// replace), and the guard coalesces overlapping requests for one key.
     pub fn revalidate_document_sizes(
         &self,
         request: &FileSizeDocumentRequest,
@@ -1061,10 +940,6 @@ impl ImportLensService {
         if stale_specifiers.is_empty() {
             return None;
         }
-        // F3-B pre-recompute cancellation: a document superseded before this
-        // background revalidation starts (a newer FileSizeDocument or prewarm bumped
-        // the prefetcher's cancellation generation) bails before any expensive
-        // recompute, reusing the prefetch cancellation-generation bailout pattern.
         if !should_continue() {
             return None;
         }
@@ -1083,25 +958,18 @@ impl ImportLensService {
 
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
         let mut fresh = Vec::new();
-        // Index-aligned with `fresh`: each recomputed result is paired with the
-        // identity of the import it belongs to, so the client can assign it to the
-        // right same-specifier variant instead of collapsing them by specifier.
+        // Index-aligned with `fresh`, so the client assigns each result to the right
+        // same-specifier variant.
         let mut identities = Vec::new();
         for detected_import in &detected {
-            // Only recompute the imports that were served stale; a fresh sibling has a
-            // valid cache entry and re-analyzing it would waste a full bundle+compress.
             if !stale_specifiers.contains(&detected_import.specifier) {
                 continue;
             }
-            // F3-B: a document superseded mid-iteration bails before the remaining
-            // (expensive) recomputes rather than finishing work no client will use.
             if !should_continue() {
                 break;
             }
-            // Build the request straight from the detected import — do NOT route through
-            // analysis_items_for_detected, which would run a full recompute per import
-            // just to harvest the request list (doubling work and letting the dedupe
-            // gate below fire only after the expensive recompute).
+            // Not via `analysis_items_for_detected`: that would recompute every import before
+            // the dedupe gate below could fire.
             let Ok(import_request) =
                 import_request_for_detected(&context.active_document_path, detected_import)
             else {
@@ -1113,20 +981,16 @@ impl ImportLensService {
                 continue;
             };
             let key = cache_key_for_resolved_import(&import_request, &resolved);
-            // A served-`Stale` specifier is either a genuine content change (recompute
-            // it) or a transient `Unknown` graduated to a quiet `Stale{revalidating}`
-            // (§4.3.1). Re-PROBE the raw freshness and NEVER route a graduated `Unknown`
-            // into recompute: `analyze_and_cache` would re-read the same locked file, hit
-            // the same transient error, and could overwrite the good cached value with an
-            // error result. The re-probe itself re-stats the dependency, so for a
-            // graduated key it doubles as the active re-check that heals it on a later get.
+            // A served-`Stale` specifier is a real change or a transient `Unknown` graduated to
+            // `Stale{revalidating}` (§4.3.1). Never recompute an `Unknown`: it would hit the same
+            // transient error and could overwrite the good cached value. The re-probe re-stats
+            // the dependency, which heals a graduated key on a later get.
             let freshness = cache.probe_freshness(&key);
             if matches!(freshness, Some(crate::cache::key::Freshness::Unknown)) {
                 continue;
             }
-            // Dedupe only within one document generation. The real cache key remains
-            // global, but the in-flight claim is delivery-scoped so another document
-            // importing the same package is not starved of its own refresh push.
+            // The claim is scoped to one document generation, so another document importing the
+            // same package still gets its own refresh push.
             let claim_key = revalidation_claim_key(
                 &key,
                 &request.workspace_root,
@@ -1152,13 +1016,8 @@ impl ImportLensService {
                     || true,
                 ),
             };
-            // F1 trailing re-check: if a dependency changed AGAIN while this recompute
-            // ran, the value just inserted already reflects the older state and
-            // `probe_freshness` re-stats it to `Stale`. A concurrent stale serve during
-            // the recompute was coalesced away by the in-flight guard, so nothing else
-            // heals it until the next interactive read. Re-arm EXACTLY ONE more
-            // revalidation (never a loop — a still-`Stale` second result is left for the
-            // next interactive read) so the served value catches up to the newer state.
+            // Trailing re-check (see `should_rearm_revalidation`): one more recompute at most; a
+            // still-`Stale` second result is left for the next interactive read.
             if should_rearm_revalidation(cache.probe_freshness(&key)) {
                 result = self.analyze_and_cache(
                     cache.as_ref(),
@@ -1295,10 +1154,8 @@ impl ImportLensService {
             );
         }
 
-        // Resolve each dependency's installed version (an ancestor walk plus a
-        // package.json read) in parallel; into_par_iter preserves order, so the
-        // resulting states and import_requests still line up with streaming
-        // indexes exactly as the sequential loop did.
+        // Resolves each dependency in parallel; `into_par_iter` preserves order, so states and
+        // import_requests line up with the streaming indexes.
         type PreparedDependency = (ImportRequest, Result<ResolvedPackage, String>);
         let resolution_started_at = Instant::now();
         let resolved: Vec<(
@@ -1307,13 +1164,10 @@ impl ImportLensService {
         )> = entries
             .into_par_iter()
             .map(|entry| {
-                // Resolve the package once here and carry the ResolvedPackage
-                // to the analysis pass below, so the manifest is read once
-                // instead of resolve_installed_package_version + a second
-                // resolve_package_entry per dependency. Entry resolution can
-                // fail for an installed-but-unresolvable package (e.g. types
-                // -only); fall back to the lightweight version read and carry
-                // the resolver's message, which settles it without a build.
+                // Resolved once and carried to the analysis pass, so the manifest is read once.
+                // An installed-but-unresolvable package (e.g. types-only) falls back to the
+                // lightweight version read and carries the resolver's message, which settles
+                // it without a build.
                 let probe = ImportRequest {
                     specifier: entry.name.clone(),
                     package_name: entry.name.clone(),
@@ -1583,9 +1437,8 @@ impl ImportLensService {
             ),
         );
         let (indexes, mut results): (Vec<_>, Vec<_>) = indexed_results.into_iter().unzip();
-        // A dependency of a `package.json` has no document position and so no runtime split; its
-        // request carries the runtime all the same, and taking it from there keeps ONE source of
-        // the partition rather than assuming a default here.
+        // A `package.json` dependency has no runtime split, but the runtime still comes from its
+        // request so the partition has one source.
         let runtimes = indexes
             .iter()
             .map(|index| {
@@ -1676,10 +1529,9 @@ impl ImportLensService {
             }
         };
 
-        // The runtime is already classified from the LIVE editor buffer (`request.source`)
-        // by `named_import_completion_context` — the one document classifier — so hand it
-        // to the enumeration directly rather than re-deriving it from disk. `cursor_offset`
-        // is therefore `None`: the runtime is not re-classified for this path.
+        // The runtime is already classified from the live buffer by
+        // `named_import_completion_context`, so it is passed through, not re-derived from disk
+        // (hence `cursor_offset: None`).
         let response = self.enumerate_exports_with_runtime(
             EnumerateExportsRequest {
                 message_type: "enumerate_exports".to_owned(),
@@ -1722,11 +1574,9 @@ impl ImportLensService {
         self.enumerate_exports_with_runtime(request, runtime)
     }
 
-    /// The enumeration itself, once the runtime has been decided. Both callers reach it
-    /// with a runtime derived from the ONE document classifier — the completion popup from
-    /// the live buffer, the direct request from the cursor offset — so a hardcoded
-    /// `Component` (the old bug) cannot creep back in. The runtime drives BOTH resolution
-    /// (`browser` vs `node` conditions pick a different entry file) and the memo key.
+    /// The enumeration, once the runtime is decided by the document classifier (from the live
+    /// buffer for completion, from the cursor offset for a direct request). Never hardcode it:
+    /// the runtime drives both resolution (`browser` vs `node` conditions) and the memo key.
     fn enumerate_exports_with_runtime(
         &self,
         request: EnumerateExportsRequest,
@@ -1775,7 +1625,6 @@ impl ImportLensService {
                 specifier: request.specifier,
                 exports: enumeration.names,
                 error: None,
-                // A successful enumeration's warnings used to be dropped here.
                 diagnostics: enumeration
                     .diagnostics
                     .into_iter()
@@ -1833,8 +1682,7 @@ impl ImportLensService {
             current_project: status.current_project,
             total_bytes: status.total_bytes,
             budget_bytes: status.budget_bytes,
-            // A single serialized-length measurement of the shared registry
-            // snapshot (D-b's envelope size), not a scan.
+            // One serialized-length measurement of the shared registry snapshot, not a scan.
             registry_size_bytes: self.registry_hints.registry_size_bytes(),
             error: None,
             diagnostics: Vec::new(),
@@ -1881,8 +1729,8 @@ impl ImportLensService {
             };
         }
 
-        // The orphan purge does three things; only the shard removals were ever reported. These
-        // carry the other two out so the UI can stop saying "nothing to reclaim" after work.
+        // The orphan purge's non-shard work, reported so the UI does not say "nothing to
+        // reclaim" after reclaiming entries.
         let mut scrubbed_entries = 0usize;
         let mut registry_entries_removed = 0usize;
 
@@ -1915,27 +1763,21 @@ impl ImportLensService {
                 .remove_selected(request.shard_ids.as_deref().unwrap_or(&[])),
             CacheRemoveScope::All => {
                 let removed = self.cache_registry.remove_all();
-                // "Clear everything" drops the shared npm-hint store and the
-                // shared resolver caches in addition to the bundle shards, so no
-                // derived state survives the clear (X-14/X-16). The L1/graph
-                // caches are cleared unconditionally below (X-21).
+                // "Clear everything" also drops the npm-hint store and the shared resolver
+                // caches; the L1/graph caches are cleared unconditionally below.
                 self.registry_hints.clear();
                 crate::pipeline::resolver::invalidate_shared_resolvers();
                 removed
             }
             CacheRemoveScope::Registry => {
-                // Registry-only: drop the npm-hint store and nothing else. Bundle
-                // shards and their derived L1/graph caches stay put, so this
-                // returns no shard-removal results.
+                // Registry-only: bundle shards and their L1/graph caches stay put.
                 self.registry_hints.clear();
                 Vec::new()
             }
             CacheRemoveScope::Orphans => {
-                // Manual "Remove Orphaned Caches" (RB-17): drive-safe shard reclaim
-                // for moved/deleted projects + a stale-entry scrub of surviving
-                // shards, plus a stale-registry-metadata prune. The maintenance tick
-                // runs the shard-only half of this automatically (throttled); this
-                // button is the on-demand, entry-inclusive pass.
+                // Manual "Remove Orphaned Caches": drive-safe shard reclaim for moved/deleted
+                // projects, a stale-entry scrub of surviving shards, and a stale registry
+                // prune. The maintenance pass runs the shard reclaim automatically (throttled).
                 registry_entries_removed = self.registry_hints.purge_expired_metadata();
                 if registry_entries_removed > 0 {
                     crate::logging::log_debug(
@@ -1954,29 +1796,22 @@ impl ImportLensService {
             results.into_iter().partition(|result| result.removed);
 
         if matches!(request.scope, CacheRemoveScope::Orphans) {
-            // An entry-only orphan purge (uninstalled package, project still
-            // present) removes no shards, so the blanket clear below doesn't fire.
-            // Drop the L1/graph entries whose paths are specifically gone.
+            // An entry-only purge removes no shard, so the blanket clear below does not fire;
+            // drop the L1/graph entries whose paths are gone.
             crate::pipeline::file_size_cache::shared_file_size_cache().purge_missing_paths();
             crate::engine::dependency_paths::purge_missing();
         }
 
-        // Drop the derived L1/graph caches when a store-clearing scope ran. `All`
-        // clears them UNCONDITIONALLY (X-21): a "Clear everything" that removed no
-        // shard (nothing was cached yet, or only the registry was populated) must
-        // still drop the derived caches so no stale derived state survives. Scoped
-        // shard removals still only pay this when they actually removed a shard;
-        // the registry-only scope leaves these caches untouched.
+        // `All` drops the derived caches even when it removed no shard; other scopes only when
+        // a shard was removed.
         if matches!(request.scope, CacheRemoveScope::All) || !removed.is_empty() {
             crate::engine::dependency_paths::clear();
-            // Drop L1 aggregate sizes too so the status-bar size recomputes fresh
-            // after a cache clear (the memory-only L1 is not generation-bumped here).
+            // The L1 aggregates too, so the status-bar size recomputes after a clear.
             crate::pipeline::file_size_cache::shared_file_size_cache().clear();
         }
 
-        // A just-cleared store must not be silently repopulated as "fresh" by an
-        // analysis that captured the pre-clear generation. Bump so any in-flight
-        // insert lands `verified_generation < current` and re-validates (X-17).
+        // An in-flight analysis that captured the pre-clear generation must not repopulate the
+        // store as fresh: its insert lands `verified_generation < current` and re-validates.
         crate::cache::memory::bump_cache_generation();
 
         CacheRemoveResponse {
@@ -2005,23 +1840,12 @@ impl ImportLensService {
         crate::cache::memory::bump_cache_generation();
     }
 
-    /// Periodic cache maintenance: enforce the global disk-byte budget by
-    /// evicting the least-recently-used entries across shards, then reclaim
-    /// fragmented shard files. Runs on the maintenance interval task via
-    /// `spawn_blocking` — never on the connection's async loop.
-    ///
-    /// The maintenance task's first tick fires immediately after Hello, so this
-    /// also serves as the daemon's STARTUP maintenance pass; subsequent ticks are
-    /// the periodic pass. The registry-store retention + size cap ride the same
-    /// seam (A5/X-15, D3+D4 / §6.1): they must not run on the write hot path, so
-    /// they run here rather than on every registry write.
+    /// One cache-maintenance pass: evict least-recently-used entries across shards to the global
+    /// disk-byte budget, compact fragmented shard files, apply registry retention and size cap,
+    /// and sweep orphaned shards. Scheduled once per Hello, after a delay, on `spawn_blocking`
+    /// (decision-log D3). Registry retention runs here so it stays off the write hot path.
     pub fn run_cache_maintenance(&self) {
-        // F4-B skip-if-running: a redundant concurrent pass (e.g. a re-Hello's new
-        // maintenance task first tick overlapping the previous connection's still-
-        // running detached pass) is a no-op. Passes already serialize on redb's
-        // single writer; this avoids the wasted duplicate scan/compaction. The guard
-        // clears the flag on drop (including on panic), so a failed pass never wedges
-        // maintenance off permanently.
+        // A concurrent pass (e.g. from a previous connection) makes this one a no-op.
         let Some(_maintenance_guard) = try_begin_cache_maintenance() else {
             return;
         };
@@ -2042,11 +1866,9 @@ impl ImportLensService {
             );
         }
 
-        // Registry metadata store: automatic 30-day retention + byte-budget size
-        // cap, both written authoritatively so the deletions stick. The byte budget
-        // is the user's `importLens.registryCacheMaxSizeMB`, negotiated at Hello and
-        // stored here (RB-16); it falls back to the daemon default for an older
-        // client that omits the field (serde-defaulted in `HelloMessage`).
+        // Registry store retention and byte-budget cap, written authoritatively so deletions
+        // stick. The budget is `importLens.registryCacheMaxSizeMB` from Hello; a client that
+        // omits it gets the daemon default (serde-defaulted in `HelloMessage`).
         let registry_removed = self.registry_hints.run_maintenance(
             crate::time::unix_millis_now(),
             self.registry_cache_max_size_bytes,
@@ -2058,13 +1880,10 @@ impl ImportLensService {
             );
         }
 
-        // Orphaned-shard reclaim (RB-17): a project that was moved/deleted is never
-        // reopened, so the on-access reclaim (name invalidation + `Gone` eviction)
-        // never reaches it and its whole shard lingers — reclaimed here instead.
-        // Drive-safe (an offline/unplugged drive keeps its shard, X-3) and throttled
-        // (`ORPHAN_SWEEP_INTERVAL`), so most ticks are a cheap no-op. Removing a shard
-        // strands its derived L1/graph entries, so clear those + bump the generation,
-        // exactly as the manual cache-remove path does.
+        // Orphaned shards: a moved/deleted project is never reopened, so on-access reclaim never
+        // reaches its shard. Drive-safe (an unplugged drive keeps its shard) and throttled by
+        // `ORPHAN_SWEEP_INTERVAL`. Removing a shard strands its L1/graph entries, so clear them
+        // and bump the generation, as `remove_cache` does.
         let orphans_removed = self
             .cache_registry
             .sweep_orphaned_shards_if_due()
@@ -2102,9 +1921,7 @@ impl ImportLensService {
         let key = cache_key_for_resolved_import(request, &resolved);
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
 
-        // Prewarm dedup check: a bulk/background read must not promote recency
-        // (scan resistance, design §5.1) — prewarming the whole document should not
-        // evict the user's warm working set.
+        // A prewarm read must not promote recency (§5.1).
         if cache.get_for_prewarm(&key).is_some() || !should_continue() {
             return;
         }
@@ -2124,11 +1941,8 @@ impl ImportLensService {
         for package_json_path in package_json_paths {
             match package_name_from_package_json_path(package_json_path) {
                 Some(package_name) => package_names.push(package_name),
-                // A path we can't map to a package name is opaque, but the
-                // presence of one odd path (pnpm's `.pnpm/…` store, a symlinked
-                // package, or any layout the mapper doesn't recognize) is not a
-                // reason to nuke every OTHER project's cache -- skip it and keep
-                // targeting whatever did map.
+                // One unmappable path (pnpm's `.pnpm/…` store, a symlinked package) is no
+                // reason to clear every other project's cache: skip it.
                 None => crate::logging::log_debug(
                     "cache",
                     format!(
@@ -2139,9 +1953,8 @@ impl ImportLensService {
         }
 
         if package_names.is_empty() {
-            // Nothing mapped. An empty batch is a no-op (unchanged); a
-            // non-empty batch where every path was opaque has no safe
-            // targeted fallback, so a full clear is the only safe option.
+            // An empty batch is a no-op; a batch of only unmappable paths has no safe targeted
+            // fallback, so it clears everything.
             if package_json_paths.is_empty() {
                 return false;
             }
@@ -2149,11 +1962,8 @@ impl ImportLensService {
             return true;
         }
 
-        // Even for a large burst, invalidate only the affected packages (a single
-        // decode pass via `invalidate_packages`) rather than nuking every project
-        // shard under this workspace's cache base -- a full clear would evict
-        // unrelated sibling projects in a multi-root / monorepo window. The
-        // graph/resolver/generation invalidations run once for the whole burst.
+        // Targeted even for a large burst: a full clear would evict unrelated sibling projects
+        // in a multi-root window. The resolver and generation invalidations run once per burst.
         self.cache_registry.invalidate_packages(&package_names);
         for package_name in &package_names {
             crate::engine::dependency_paths::invalidate_package(package_name);
@@ -2163,32 +1973,17 @@ impl ImportLensService {
         true
     }
 
-    /// A `tsconfig.json` / `jsconfig.json` changed on disk, so the workspace's **alias table** did.
+    /// A `tsconfig.json` / `jsconfig.json` changed on disk, so the workspace's alias table did.
     ///
-    /// That table is the sole discriminator between a path alias and a package that is not
-    /// installed (`pipeline::resolver::FirstPartySourceProbe`), and the daemon read it
-    /// exactly once: `oxc_resolver` memoizes the parsed config in the shared resolver's FS cache,
-    /// and nothing ever dropped it. So a developer hitting the floor the SRS tells them to repair —
-    /// "mirror the alias into tsconfig `paths`" — applied the repair, saved the file, and the
-    /// daemon went on returning `incomplete: true` for the rest of its life. The remedy the spec
-    /// prescribes did nothing.
+    /// The alias resolvers are rebuilt per query, so a `paths` edit needs no message. What this
+    /// drops is the memoized reachable-config walk (which projects the `references` graph
+    /// reaches): a config that starts referencing the project owning the `paths` is invisible
+    /// until it is dropped. It rides the `node_modules_changed` path to
+    /// `invalidate_shared_resolvers`.
     ///
-    /// **What this still buys, now that the alias resolvers memoize no filesystem fact.** A `paths`
-    /// edit no longer needs a message at all: the resolvers are rebuilt per query (which is what
-    /// stops a floor being sticky), so the config is re-read on the next request. What survives the
-    /// query is the **reachable-config walk** — which projects the workspace's `references` graph
-    /// reaches — and a config that starts *referencing* the project that owns the `paths` is
-    /// invisible until that memo is dropped. This is what drops it.
-    ///
-    /// It rides the SAME path a `node_modules` change already rides (the extension's watcher →
-    /// `node_modules_changed` → here → `invalidate_shared_resolvers`), because it is the same fact:
-    /// something the resolvers memoized is no longer true.
-    ///
-    /// What it does NOT do is bump the cache generation or touch a shard. A tsconfig has no bearing
-    /// on what a package *weighs* — package entries are resolved by the runtime resolvers, which
-    /// never read it — so re-verifying every cached import against disk would buy nothing. What it
-    /// does invalidate is the L1 **aggregate**: a file whose alias classification flips changes
-    /// which of its imports contribute bytes, and whether its total is a floor at all.
+    /// No generation bump and no shard touched: a tsconfig never affects what a package weighs.
+    /// The L1 aggregates are cleared, since a flipped alias classification changes which imports
+    /// contribute bytes and whether the total is a floor.
     ///
     /// Returns whether anything was invalidated, so an empty batch stays a no-op.
     pub fn invalidate_workspace_config_paths(&self, config_paths: &[String]) -> bool {
@@ -2208,21 +2003,15 @@ impl ImportLensService {
         true
     }
 
-    /// Settle every import the daemon can answer **without an engine build**, and mark the rest
-    /// `Loading`.
+    /// Settle every import answerable without an engine build, and mark the rest `Loading`.
     ///
-    /// Three outcomes, none of which can park:
+    /// - a cache hit: `Ready`;
+    /// - an import that does not resolve: settled by `analyze_unresolved_import`, which is
+    ///   filesystem work only;
+    /// - a real miss: `Loading`, carried out in [`StreamedDocumentAnalysis::pending`].
     ///
-    /// - a cache hit → `Ready` with its result;
-    /// - an import that does not resolve to a package at all → settled here, because that path
-    ///   never reaches the engine: `analyze_unresolved_import` answers with the declaration-only
-    ///   result, the native-binary result, or a typed error, all of which are filesystem work;
-    /// - a real miss → `Loading`, with the resolved package and cache key carried out in
-    ///   [`StreamedDocumentAnalysis::pending`] so the caller can build it off the response path.
-    ///
-    /// The `Loading` item keeps its `request`, so a caller that only needs the resolved package
-    /// identity (the extension's named-export candidates command) is unaffected by the fact that
-    /// its size has not landed.
+    /// The `Loading` item keeps its `request`, so a caller needing only the resolved package
+    /// identity (the named-export candidates command) is unaffected.
     fn cached_analysis_items_for_detected(
         &self,
         context: &AnalysisContext,
@@ -2306,23 +2095,16 @@ impl ImportLensService {
     }
 
     /// Build the imports a streamed response answered `Loading`, handing each result to `emit`
-    /// the moment it lands. Runs off the response path (the IPC server spawns it), so a build
-    /// that parks for the full `BUILD_TIMEOUT` delays nothing but its own import.
+    /// as it lands. Runs off the response path, so a build that parks for the full
+    /// `BUILD_TIMEOUT` delays only its own import.
     ///
-    /// `should_continue` is checked before each build: a newer analysis of the same document
-    /// supersedes this one, and finishing builds for a document state the user has already
-    /// edited past buys nobody anything. Results still go through `analyze_and_cache`, so the
-    /// single-flight registry collapses a build another request is already running for the same
-    /// key rather than starting a second one.
+    /// `should_continue` is checked around each build so a superseded document stops early.
+    /// Builds go through `analyze_and_cache`, so single-flight joins a build already running
+    /// for the same key.
     ///
-    /// **Shared bytes close the document, not each import.** `shared_bytes` says how much of an
-    /// import's weight another import in the SAME file also pulls in, so it is not knowable until
-    /// every import of the file has been measured — and on a cold document that is only true once
-    /// the last push has landed. Each import is therefore delivered the moment it is measured (its
-    /// own number is what the user is waiting for), and one final push carries the imports whose
-    /// shared-byte figure the client does not yet have right. Without it, the shared-dependency
-    /// insight would silently never appear on a first analysis, because `annotate_ready_items` can
-    /// only annotate imports that already have a result and a cold document has none.
+    /// `shared_bytes` is a relation between imports of the same file, knowable only once every
+    /// import is measured. Each import is pushed as soon as it is measured, then one closing push
+    /// carries the shared-byte corrections; without it a cold document would never show them.
     pub fn complete_pending_imports(
         &self,
         context: &AnalysisContext,
@@ -2364,8 +2146,7 @@ impl ImportLensService {
                 .push(MeasuredImport { result, identity });
         });
 
-        // A superseded document is not worth a closing pass: the client has already dropped
-        // everything this stream pushed it.
+        // A superseded document gets no closing pass: the client already dropped its pushes.
         if !should_continue() {
             return;
         }
@@ -2386,9 +2167,8 @@ impl ImportLensService {
         serve_stale: bool,
         intent: ReadIntent,
     ) -> Vec<ImportAnalysisItem> {
-        // An import the cache can answer, or one that does not resolve at all, is settled
-        // at pool width; only a real miss queues for an engine permit. This path serves both
-        // interactive document analysis and every file of a workspace report.
+        // Cache hits and unresolvable imports settle at pool width; only a real miss queues for
+        // an engine permit.
         let ready = |detected: &DetectedImport, request: ImportRequest, result: ImportResult| {
             ImportAnalysisItem {
                 result: Some(result),
@@ -2454,22 +2234,17 @@ impl ImportLensService {
 
         crate::logging::log_debug("file_size_cache", format!("miss: {}", path.display()));
         let computed = compute_file_size(context, imports);
-        // Offered unconditionally: `FileSizeCache::insert` refuses a total that is not a
-        // measurement of the file (a floor, or one a parked combined build degraded). The gate is
-        // the store's, so it cannot be forgotten here or at the next call site added.
+        // Offered unconditionally: `FileSizeCache::insert` itself refuses a floor or a degraded
+        // total, so the gate cannot be forgotten at a call site.
         cache.insert(path, signature, computed.clone());
         computed
     }
 
     /// The lookup half of an analysis; `build_miss` is the build half.
     ///
-    /// Splitting the two is what lets a batch classify every import pool-wide and
-    /// then feed only the misses to the two-permit engine drain. §9 bounds *builds*
-    /// at two; it says nothing about cache hits, and serving those two-at-a-time
-    /// throttled the overwhelmingly common case to the width of the rarest one.
-    ///
-    /// A miss carries its resolved package and cache key forward so `build_miss`
-    /// does not resolve the manifest a second time.
+    /// The engine permits bound builds, not cache hits, so hits are served at pool width and
+    /// only misses enter the engine drain. A miss carries its resolved package and key so
+    /// `build_miss` does not resolve the manifest again.
     fn probe_cache(
         &self,
         context: &AnalysisContext,
@@ -2486,10 +2261,8 @@ impl ImportLensService {
 
         if serve_stale {
             let lookup_started_at = Instant::now();
-            // SWR: serve the last-known value (flagged Stale/Unverified) instead of
-            // evicting-and-recomputing. The FileSizeDocument handler spawns a background
-            // recompute + push when a served result is Stale. Only that interactive size
-            // read serves stale, and the read promotes recency.
+            // SWR: serve the last-known value (flagged Stale/Unverified); the FileSizeDocument
+            // handler revalidates a served Stale result in the background. The read promotes.
             if let Some((result, _freshness)) = cache.get_with_result_freshness(&key) {
                 log_cache_lookup_timing(
                     request,
@@ -2508,14 +2281,9 @@ impl ImportLensService {
                 lookup_started_at.elapsed(),
             );
         } else {
-            // Force-fresh (CI / `importlens check`, §4.5): serve ONLY a value verified
-            // `Fresh` against disk, across BOTH the memory working set and the disk
-            // cache. `get_if_fresh` returns `None` on Unknown/Stale/Gone/miss, so a
-            // transient `Unknown` — which the evicting `get` would launder into a
-            // `cache_hit`, whether memory-resident OR cold-daemon disk-hydrated — never
-            // reaches CI; we recompute synchronously below instead. This single gate
-            // also removes the double dependency re-verification of the prior
-            // memory-only `probe_freshness` + `get`.
+            // Force-fresh (CI, §4.5): serve only a value verified `Fresh` against disk, from
+            // memory or disk. `get_if_fresh` returns `None` on Unknown/Stale/Gone/miss, so a
+            // transient `Unknown` never reaches CI as a `cache_hit`.
             if let Some(result) = fresh_cached_result_for_key(cache.as_ref(), request, &key, intent)
             {
                 return CacheProbe::Hit(Box::new(result));
@@ -2589,9 +2357,8 @@ impl ImportLensService {
     }
 }
 
-/// Test-only handle: exists so integration tests can seed cached registry
-/// metadata via `ImportLensService::registry_hints_for_tests`. See that
-/// method's doc comment for why this cannot be `#[cfg(test)]`-gated.
+/// Test-only handle for seeding registry metadata; see
+/// `ImportLensService::registry_hints_for_tests`.
 pub struct RegistryHintTestHandle<'a> {
     service: &'a ImportLensService,
 }
@@ -2635,18 +2402,12 @@ fn effective_registry_hint_mode(
     }
 }
 
-/// Re-derive `shared_bytes` across a document's COMPLETE set of measurements and return only the
-/// imports whose figure the client does not already hold correctly.
+/// Re-derive `shared_bytes` across a document's complete set of measurements and return only the
+/// imports whose figure changed.
 ///
-/// Everything the client has was annotated against a PARTIAL set: an import answered from cache was
-/// annotated against the response's cache hits alone (`annotate_ready_items`), and an import that
-/// streamed in carried whatever its own build produced, which is no annotation at all. Neither can
-/// be right until the last import of the file has been measured — sharing is a relation between two
-/// imports of the same document.
-///
-/// A document with nothing shared produces nothing: an import whose shared bytes are zero reads the
-/// same to the client whether the field is `Some(0)` or absent (`insights.ts` and the tooltip both
-/// gate on `> 0`), so re-sending it would be a frame that changes nothing on screen.
+/// The client's figures were annotated against a partial set (cache hits only, or none for a
+/// streamed import). `Some(0)` and `None` compare equal: the client gates on `> 0` in both
+/// `insights.ts` and the tooltip, so re-sending would change nothing on screen.
 fn shared_bytes_corrections(
     document: Vec<MeasuredImport>,
 ) -> (Vec<ImportResult>, Vec<RefreshedImportIdentity>) {
@@ -2677,14 +2438,11 @@ fn shared_bytes_corrections(
 
 /// Shared-byte annotation across a document's *measured* imports.
 ///
-/// Imports still being measured contribute nothing: shared bytes are computed from module
-/// contributions, and an import with no result has none. `complete_pending_imports` re-derives the
-/// figure over the whole document once the last streamed import has landed, and pushes the
-/// corrections (`shared_bytes_corrections`).
+/// Imports still being measured contribute nothing; `complete_pending_imports` re-derives the
+/// figure once the last streamed import lands (`shared_bytes_corrections`).
 fn annotate_ready_items(items: &mut [ImportAnalysisItem]) {
     annotate_shared_bytes(items.iter_mut().filter_map(|item| {
-        // Read the runtime off the item BEFORE the result is borrowed mutably; it is the same
-        // `DetectedImport` runtime that decides which combined build the import is sized in.
+        // Read before the result is borrowed mutably.
         let runtime = item.detected.runtime;
         item.result.as_mut().map(|result| (runtime, result))
     }));
@@ -2725,8 +2483,7 @@ fn file_size_document_prelude(
             imports: Vec::new(),
             states: Vec::new(),
             asset_breakdown: Vec::new(),
-            // Nothing was summed at all; `error` is the answer, and every client already refuses
-            // an errored response.
+            // Nothing was summed; clients refuse an errored response.
             incomplete: false,
             degraded: false,
             error: Some(error.clone()),
@@ -2739,20 +2496,17 @@ fn file_size_document_prelude(
 
 /// Whether a result may be written to the import cache (ADR-0006, invariant 3).
 ///
-/// A **pre-check**, not the gate. The gate is `ImportResult::is_durable`, and it lives inside the
-/// stores themselves (`ImportCache::insert*`, `DiskCache::insert*`) — because a predicate a caller
-/// must remember to call is exactly the shape of every defect this model exists to end. This
-/// function is here to spare the work a refused insert would waste (the dependency fingerprints),
-/// and it asks the store's own question so the two can never disagree.
+/// A pre-check, not the gate: the gate is `ImportResult::is_durable` inside the stores
+/// (`ImportCache::insert*`, `DiskCache::insert*`). This asks the same question only to skip
+/// computing fingerprints for an insert that would be refused.
 ///
-/// What is cached: a Measured result, and an Unmeasured one whose stage is a property of the
-/// package's **bytes** (`parse`, `link`, `oversized_entry`, an unreadable manifest, an unresolvable
-/// entry). The cache is keyed by those bytes' fingerprints, so such a fact expires exactly when it
-/// would change — and refusing it would re-enter the engine for a broken package on *every*
-/// analysis, forever, on one of only two permits.
+/// Cached: a Measured result, and an Unmeasured one whose stage is a property of the package's
+/// bytes (`parse`, `link`, `oversized_entry`, an unreadable manifest, an unresolvable entry). The
+/// key's fingerprints expire such a fact exactly when it would change; refusing it would rebuild
+/// a broken package on every analysis.
 ///
-/// What is not: a transient outcome, an IO condition (`entry_metadata`), and any stage nobody has
-/// classified. See `pipeline::stage::may_enter_a_durable_store`.
+/// Not cached: a transient outcome, an IO condition (`entry_metadata`), and any unclassified
+/// stage. See `pipeline::stage::may_enter_a_durable_store`.
 fn should_cache_result(result: &ImportResult) -> bool {
     result.is_durable()
 }
@@ -2892,13 +2646,10 @@ fn import_request_for_detected(
         version,
         named: detected.named.clone(),
         import_kind: detected.import_kind,
-        // The COPY. `DetectedImport.runtime` is the one source of a document's runtime split
-        // (`document::script_regions`), and this line is the one derivation that carries it onto the
-        // request `pipeline::file_size` groups its builds by. Break it — a constant here — and an
-        // Astro file's Server and Client imports collapse into one bundle, `shared-core` is linked
-        // once for two payloads that each ship it, and the compressed total under-reports by ~49%
-        // with nothing failing (ADR-0005). Pinned by
-        // `tests/file_size_runtime.rs::a_mixed_runtime_astro_document_is_built_as_two_artifacts`.
+        // The one derivation carrying the runtime split onto the request `pipeline::file_size`
+        // groups builds by. A constant here collapses an Astro file's Server and Client imports
+        // into one bundle and under-reports the total (ADR-0005). Pinned by
+        // `tests/file_size_runtime.rs`.
         runtime: detected.runtime,
     })
 }
@@ -2944,9 +2695,8 @@ fn dependency_fingerprints(
     use crate::pipeline::analyze::FingerprintSource;
 
     let mut fingerprints = match source {
-        // The engine captured a fingerprint as it read each module, so the stored hash
-        // describes the exact bytes the size was measured from. Only the manifest and
-        // any binary module the plugin did not read need hashing here.
+        // The engine fingerprinted each module as it read it, so the hash describes the exact
+        // bytes measured. Only the manifest and unread binary modules are hashed here.
         Some(FingerprintSource::ReadTime {
             fingerprints,
             stat_paths,
@@ -2960,8 +2710,7 @@ fn dependency_fingerprints(
             );
             all
         }
-        // Static fallback: no graph was built, so there is nothing that was measured
-        // for these to be inconsistent with.
+        // Static fallback: no graph was built, so nothing measured can disagree with these.
         None => vec![
             resolved.package_root.join("package.json"),
             resolved.entry_path.clone(),
@@ -2971,13 +2720,12 @@ fn dependency_fingerprints(
         .collect(),
     };
 
-    // Two ids can canonicalize to the same real path (a symlinked workspace dep), so
-    // dedup is load-bearing, not cosmetic.
+    // Two ids can canonicalize to the same real path (a symlinked workspace dep).
     sort_and_dedup_fingerprints(&mut fingerprints);
     fingerprints
 }
-/// Lives here rather than in `ipc::server` because the streaming document handler builds one
-/// itself: a protocol error is a settled analysis with nothing left to build.
+/// A protocol-error analyze response. Lives here because the streaming document handler builds
+/// one itself.
 pub fn protocol_error_analyze_document_response(
     request: &AnalyzeDocumentRequest,
     message: String,
@@ -3013,13 +2761,12 @@ pub fn protocol_error_file_size_document_response(
     }
 }
 
-/// The runtime a direct `enumerate_exports` request resolves under, from the ONE document
-/// classifier (`document::runtime_at_offset`) so it cannot disagree with the size path.
+/// The runtime a direct `enumerate_exports` request resolves under, from the document classifier
+/// (`document::runtime_at_offset`) so it agrees with the size path.
 ///
-/// The request carries the cursor's UTF-16 offset when the caller has one; the daemon owns
-/// the classification (ADR-0002), reading the document from disk. Absent — a plain file, or
-/// an older client that never sent it — or unreadable, the answer is `Component`, which is
-/// the correct default for a document with no runtime-bearing regions.
+/// The daemon classifies (ADR-0002) from the document on disk at the cursor's UTF-16 offset.
+/// With no offset or an unreadable file the answer is `Component`, the default for a document
+/// with no runtime-bearing regions.
 fn runtime_for_enumeration(request: &EnumerateExportsRequest) -> ImportRuntime {
     let Some(offset) = request.cursor_offset else {
         return ImportRuntime::Component;
@@ -3069,10 +2816,7 @@ mod report_panic_isolation_tests {
             },
         };
 
-        // The `__IMPORTLENS_FORCE_PANIC__` sentinel (compiled in only under
-        // cfg(test)) makes the per-file analysis panic. A single bad file must
-        // be isolated - skipped from the report - rather than failing the whole
-        // workspace scan.
+        // The cfg(test) sentinel makes per-file analysis panic; the file is skipped, not fatal.
         let items = service.analyze_report_source(
             Path::new("bad.ts"),
             &request,
@@ -3090,14 +2834,8 @@ mod task_lifecycle_tests {
     use crate::cache::key::Freshness;
     use crate::ipc::protocol::{PROTOCOL_VERSION, WorkspaceReportBudgets, WorkspaceReportRequest};
 
-    // F1: the trailing re-check re-arms EXACTLY ONE more revalidation, and only when
-    // the entry is still `Stale` after a recompute. A fully deterministic
-    // mid-recompute timing repro is impractical — the second dependency change must
-    // land inside the synchronous recompute window, and freshness is content-hash
-    // based — so the DECISION is tested directly: `Stale` -> re-arm; every other
-    // outcome -> no re-run. The re-run is one-shot by construction (a straight-line
-    // second `analyze_and_cache`, not a loop), so a still-`Stale` second result is
-    // left for the next interactive read rather than spinning.
+    // The mid-recompute race is not deterministically reproducible, so the re-arm decision is
+    // tested directly: only `Stale` re-arms.
     #[test]
     fn swr_re_arms_one_trailing_revalidation_only_when_still_stale() {
         assert!(
@@ -3113,11 +2851,8 @@ mod task_lifecycle_tests {
         assert!(!should_rearm_revalidation(None));
     }
 
-    // F4-B: while a maintenance pass holds the in-progress claim, a second
-    // concurrent `run_cache_maintenance` must be a no-op. The old-detached-pass vs
-    // re-Hello-new-pass race is not deterministically reproducible, so the flag
-    // decision is tested directly: the claim is exclusive while held and frees on
-    // drop so the next pass can proceed.
+    // The overlapping-pass race is not deterministically reproducible, so the claim is tested
+    // directly: exclusive while held, freed on drop.
     #[test]
     fn maintenance_skips_when_already_running() {
         let guard = try_begin_cache_maintenance().expect("first claim should win");
@@ -3130,9 +2865,7 @@ mod task_lifecycle_tests {
         drop(next);
     }
 
-    // F4-A: a panic in the report AGGREGATION (outside per-file analysis) must
-    // surface as an explicit error response through the fire-and-forget spawn path,
-    // rather than unwinding the rayon job and dropping the `oneshot` sender.
+    // An aggregation panic surfaces as an error response, not a dropped `oneshot` sender.
     #[test]
     fn workspace_report_aggregation_panic_yields_error_response() {
         let service = std::sync::Arc::new(ImportLensService::new(None, false));
@@ -3142,8 +2875,7 @@ mod task_lifecycle_tests {
                 message_type: "workspace_report".to_owned(),
                 version: PROTOCOL_VERSION,
                 request_id: 77,
-                // Sentinel (compiled only under cfg(test)) panics inside the
-                // aggregation, exercising the catch_unwind.
+                // cfg(test) sentinel: panics inside the aggregation.
                 workspace_root: "__IMPORTLENS_FORCE_REPORT_PANIC__".to_owned(),
                 budgets: WorkspaceReportBudgets {
                     per_import_brotli_bytes: None,
@@ -3235,9 +2967,8 @@ mod analyze_and_cache_single_flight_tests {
 
     #[test]
     fn analyze_and_cache_follower_keeps_own_cache_write_when_leader_does_not_store() {
-        // The follower re-reads the process-global cache generation inside `analyze_and_cache`. A
-        // sibling test that bumps it in between would make the follower its own leader, and this
-        // test would fail for a reason that has nothing to do with single-flight.
+        // The follower re-reads the process-global generation; a sibling test bumping it would
+        // make the follower its own leader.
         let _generation = crate::cache::memory::hold_cache_generation_steady();
         let service = Arc::new(ImportLensService::new(None, false));
         let unique = std::time::SystemTime::now()
@@ -3313,26 +3044,16 @@ mod analyze_and_cache_single_flight_tests {
     }
 }
 
-/// **Property** over every durable store the daemon writes, quantified over **every** stage the
-/// daemon can produce that is not a property of the package's bytes.
+/// Property over every durable store the daemon writes, quantified over every stage that is not a
+/// property of the package's bytes. It hands each store a real result and asks what it kept, so
+/// it tests the stores' own gates, not a predicate a caller might forget.
 ///
-/// It quantifies over the STORES: it hands each one a real result and then asks the store what it
-/// kept. The previous version quantified over two *predicates* (`should_cache_result`,
-/// `FileSizeComputation::is_cacheable`) — and the stores themselves had no gate at all:
-/// `ImportCache::insert`, `DiskCache::insert_at_generation` and `FileSizeCache::insert` took
-/// anything they were given. It proved that two functions returned `false`, not that a transient
-/// result could not be written down, and the next caller who forgot to consult them would have
-/// written one with nothing failing. The gate now lives in each store; this proves it is there.
+/// The build-derived stores (`pipeline::full_package`, `pipeline::export_list`,
+/// `pipeline::build_memo`, `engine::dependency_paths`) are absent on purpose: their only inputs
+/// exist solely on the `Ok` side of a build, so a failure is unrepresentable there.
+/// `scripts/test/result-model-guards.test.mjs` fails if a result is plumbed into one.
 ///
-/// The daemon's four *build-derived* stores — `pipeline::full_package`, `pipeline::export_list`,
-/// `pipeline::build_memo` and `engine::dependency_paths` — are absent on purpose: none of them can
-/// be handed an `ImportResult` at all. Their only input is a `BundleArtifact` / `ExportEnumeration`,
-/// which exists solely on the `Ok` side of a build, so a failure of any kind is unrepresentable
-/// there rather than merely refused. `scripts/test/result-model-guards.test.mjs` fails if anyone
-/// plumbs a result into one of them.
-///
-/// The extension's two persisted histories (`workspaceState` / `globalState`) are the same property
-/// in TypeScript: `extension/test/analysis/transience.test.ts`.
+/// The extension's persisted histories are covered in `extension/test/analysis/transience.test.ts`.
 #[cfg(test)]
 mod every_durable_store_rejects_a_non_durable_outcome {
     use super::should_cache_result;
@@ -3350,9 +3071,8 @@ mod every_durable_store_rejects_a_non_durable_outcome {
     use crate::pipeline::stage as pipeline_stage;
     use std::path::PathBuf;
 
-    /// Every stage a durable store must REFUSE: request-local engine outcomes plus machine-local
-    /// pipeline work (`entry_metadata` and `compression`). DERIVED from the allowlist rather than
-    /// restated beside it, so a stage that changes classification changes this list with it.
+    /// Every stage a durable store must refuse: request-local engine outcomes plus machine-local
+    /// pipeline work. Derived from the allowlist, so a reclassified stage moves with it.
     fn non_durable_stages() -> Vec<&'static str> {
         stage::ALL
             .iter()
@@ -3410,10 +3130,8 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         }
     }
 
-    /// The L1 file-size aggregate, built the way the real fallback builds it — from per-import
-    /// results — rather than hand-assembled. A hand-assembled `FileSizeComputation` cannot see the
-    /// defect ADR-0006 invariant 4 names, because the bug is in how a result is *turned into* a
-    /// total.
+    /// The L1 file-size aggregate, built from per-import results the way the real fallback builds
+    /// it: ADR-0006 invariant 4 concerns how a result is turned into a total.
     fn file_total(results: Vec<(&str, ImportResult)>) -> FileSizeComputation {
         let sized = results
             .into_iter()
@@ -3422,7 +3140,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         per_import_totals_for_test(&sized)
     }
 
-    /// **The L1 import cache.** Not "the predicate the caller should have used" — the store.
+    /// The L1 import cache store itself.
     #[test]
     fn the_l1_import_cache_refuses_a_non_durable_result() {
         for stage in non_durable_stages() {
@@ -3445,13 +3163,9 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         }
     }
 
-    /// **The L1 import cache, the other transient shape**: a build that SUCCEEDED, whose
-    /// full-package comparison build then failed transiently. Its sizes are real; its
-    /// `truly_treeshakeable: false` is fabricated by the same accident, and caching it marks a
-    /// healthy package "not tree-shakeable" for a whole cache generation.
-    ///
-    /// This shape is REPRESENTABLE — a real state, deliberately kept — so the STORE is what must
-    /// refuse it.
+    /// The L1 import cache, other transient shape: a successful build whose full-package
+    /// comparison build failed transiently. The sizes are real but `truly_treeshakeable: false` is
+    /// an accident; caching it would mark a healthy package "not tree-shakeable".
     #[test]
     fn the_l1_import_cache_refuses_a_measurement_whose_comparison_build_degraded_transiently() {
         for stage in stage::ALL
@@ -3481,9 +3195,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         }
     }
 
-    /// **The L2 disk cache.** A store in its own right, and the worst one to poison: it outlives the
-    /// process. Gated independently of the L1 cache in front of it, so "the caller already checked"
-    /// is load-bearing nowhere.
+    /// The L2 disk cache: it outlives the process, and is gated independently of the L1 in front.
     #[test]
     fn the_l2_disk_cache_refuses_a_non_durable_result() {
         let dir = std::env::temp_dir().join(format!(
@@ -3512,8 +3224,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
             );
         }
 
-        // Control: the store is not simply broken. A deterministic failure IS persisted — it is a
-        // property of the package's bytes, and the entry expires with them.
+        // Control: a deterministic failure is persisted; it expires with the package's bytes.
         let entry = cached(ImportResult::unmeasured(
             "broken-lib",
             stage::PARSE,
@@ -3532,9 +3243,8 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// **The L1 file-size aggregate.** Quantified over every non-durable stage, over every DURABLE
-    /// one, and over the state no stage describes at all — an import still being measured — because
-    /// invariant 4 is about the total's INPUTS, not about anything having failed.
+    /// The L1 file-size aggregate, over every non-durable stage, every durable one, and an import
+    /// still being measured: invariant 4 is about the total's inputs, not about failure.
     #[test]
     fn the_l1_file_size_cache_refuses_a_floor() {
         let path = PathBuf::from("C:/ws/src/index.ts");
@@ -3560,10 +3270,8 @@ mod every_durable_store_rejects_a_non_durable_outcome {
             );
         }
 
-        // **The seventh instance.** A DETERMINISTIC failure is cached as a per-import fact
-        // (invariant 3) and STILL makes the file's total a floor (invariant 4). The two invariants
-        // are about different things, and conflating them is what this test was blind to: the total
-        // was cached, persisted as the file's permanent baseline, and passed by CI with exit 0.
+        // A deterministic failure is cached per import (invariant 3) and still makes the file's
+        // total a floor (invariant 4).
         for stage in durable_failure_stages() {
             let cache = FileSizeCache::new();
             let result = ImportResult::unmeasured("beta", stage, "no matching export", vec![]);
@@ -3584,7 +3292,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
             );
         }
 
-        // And the state no stage describes: an import whose own build has not landed yet.
+        // An import whose own build has not landed yet.
         let cache = FileSizeCache::new();
         let loading = per_import_totals_for_test(&[
             SizedImport::installed(request("alpha"), Some(measured("alpha", 100))),
@@ -3594,11 +3302,9 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         cache.insert(path.clone(), 1, loading);
         assert!(cache.get(&path, 1).is_none());
 
-        // And the shape `incomplete` structurally cannot see (ADR-0006, invariant 4, second half):
-        // every contributor Measured, `error: None`, a real number — and the file's OWN combined
-        // build failed, so that number is an un-deduplicated per-import sum, not a File Cost.
-        // `file_size.rs::a_failed_combined_build_degrades_the_total_even_with_every_import_measured`
-        // proves the flag is raised; this proves the STORE refuses it.
+        // What `incomplete` cannot see (ADR-0006, invariant 4): every contributor measured but the
+        // file's own combined build failed, so the number is an un-deduplicated per-import sum.
+        // `file_size.rs` proves the flag is raised; this proves the store refuses it.
         let cache = FileSizeCache::new();
         let mut over_counted = file_total(vec![
             ("alpha", measured("alpha", 100)),
@@ -3612,7 +3318,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
             "a degraded total is an OVER-count of the file, and just as unusable as a floor"
         );
 
-        // Control: every import measured — this really IS the file, and it must still cache.
+        // Control: every import measured, so the total caches.
         let cache = FileSizeCache::new();
         let complete = file_total(vec![
             ("alpha", measured("alpha", 100)),
@@ -3626,10 +3332,9 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         );
     }
 
-    /// The other half, and the owner's decision: a DETERMINISTIC per-import outcome IS cached, sizes
-    /// or no sizes. It is a property of the package's bytes, the cache is keyed by those bytes'
-    /// fingerprints, and refusing it would re-enter the engine for a broken package on every
-    /// analysis, forever, on one of only two permits.
+    /// The other half: a deterministic per-import outcome is cached, sizes or not. It is keyed by
+    /// the package bytes' fingerprints, and refusing it would rebuild a broken package on every
+    /// analysis.
     #[test]
     fn the_l1_import_cache_still_keeps_every_deterministic_outcome() {
         for stage in durable_failure_stages() {

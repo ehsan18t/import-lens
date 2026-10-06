@@ -31,11 +31,9 @@ fn scan_directory(directory: &Path, depth: usize, files: &mut Vec<PathBuf>) {
     };
 
     for entry in entries.flatten() {
-        // `DirEntry::file_type` does not follow symlinks, so Windows
-        // junctions/symlinked directories are skipped instead of recursed
-        // into (they can cycle back to an ancestor). This matches the old
-        // TypeScript scanner: VS Code's findFiles does not follow symlinked
-        // directories either.
+        // `DirEntry::file_type` does not follow symlinks, so junctions and
+        // symlinked directories (which can cycle back to an ancestor) are skipped,
+        // as VS Code's findFiles skips them.
         let Ok(file_type) = entry.file_type() else {
             continue;
         };

@@ -20,14 +20,10 @@ pub struct WorkspaceReportItem {
 /// The counters are computed from the same structured facts that produce the
 /// rows' warning strings, so a count never disagrees with the text beside it.
 ///
-/// **The report's unit is the IMPORT** (ADR-0004), and so is its budget. It used to warn a
-/// per-FILE budget too, computed by summing each source file's per-import brotli — a *Combined
-/// Import Cost*, which counts a module two imports share twice, and which no file ever ships. A
-/// file budget is judged against a **File Cost**: one bundle over all a file's imports, which
-/// exists only where a combined build was run for that file (`file_size_document`). The report has
-/// no such build behind a row, so it reached a verdict the editor and `importlens check` — both of
-/// which measure the File Cost — would contradict on the same file, under the same budget. It is
-/// gone; those two enforce the file budget (SRS FR-036i).
+/// **The report's unit is the IMPORT** (ADR-0004), and so is its budget. It judges no file budget:
+/// that needs a **File Cost** (one bundle over all a file's imports), and no report row has that
+/// build behind it. Summing a file's per-import brotli gives a *Combined Import Cost*, which no
+/// file ships. The editor and `importlens check` enforce the file budget (SRS FR-036i).
 pub struct WorkspaceReportRowSet {
     pub rows: Vec<WorkspaceReportRow>,
     pub conservative_count: u64,
@@ -66,7 +62,7 @@ pub fn build_report_rows(
 
 pub fn build_report_summary(row_set: &WorkspaceReportRowSet) -> WorkspaceReportSummary {
     let rows = &row_set.rows;
-    // The sum of independent Import Costs — a **Combined Import Cost**, which counts a dependency at
+    // The sum of independent Import Costs: a **Combined Import Cost**, which counts a dependency at
     // every site it is imported from and is therefore an upper bound, never a size (ADR-0004).
     //
     // Only a MEASURED row contributes. An unmeasured one has no bytes to add, and
@@ -98,9 +94,8 @@ fn is_conservative_item(item: &WorkspaceReportItem) -> bool {
 }
 
 /// A budget is judged against a **size**, and only a measured import has one (ADR-0006, invariant
-/// 5: no verdict from a floor). This used to ask `result.error.is_none()` — the negative check —
-/// which a transiently-degraded result with a fabricated size passed, so the report claimed a
-/// violation, or absolved one, on a number that never happened.
+/// 5: no verdict from a floor). Gate on `is_budgetable`, not `result.error.is_none()`: an
+/// error-free result can still be transiently degraded, a floor, or an upper bound.
 fn is_import_budget_violation(
     item: &WorkspaceReportItem,
     budgets: &WorkspaceReportBudgets,
@@ -124,7 +119,7 @@ fn row_for_item(
 ) -> WorkspaceReportRow {
     let result = item.result.as_ref();
     // `.and_then(...)`, never `.unwrap_or_default()`: an unmeasured import has NO size, and a
-    // zero here prints "0 B" in the exported report — the sentinel this model exists to abolish.
+    // zero here would print "0 B" in the exported report.
     WorkspaceReportRow {
         package_name: item.detected.package_name.clone(),
         specifier: item.detected.specifier.clone(),
@@ -282,13 +277,9 @@ fn build_duplicate_import_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateIm
 
 /// A module reached by more than one import, and the **two** numbers that describes.
 ///
-/// This used to add `module.bytes` once per importing row into a field called `total_bytes`, and the
-/// report rendered it "Total Bytes". A 100 kB `react-dom/index.js` reached by three imports came out
-/// as **300 kB** — a *Combined Import Cost* presented as the module's size (ADR-0004). The module's
-/// own size and the cost across its sites are different quantities and are now carried separately:
-/// the module **is** [`DuplicateModuleGroup::module_bytes`], and the sites together pay
-/// [`DuplicateModuleGroup::combined_import_cost_bytes`], which is an upper bound and is never a
-/// total.
+/// The module **is** [`DuplicateModuleGroup::module_bytes`]; the sites together pay
+/// [`DuplicateModuleGroup::combined_import_cost_bytes`], an upper bound that is never a total
+/// (ADR-0004). A 100 kB module reached by three imports is 100 kB, not 300 kB.
 fn build_duplicate_module_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateModuleGroup> {
     let mut groups = BTreeMap::<String, DuplicateModuleGroup>::new();
     for row in rows {
@@ -306,8 +297,8 @@ fn build_duplicate_module_groups(rows: &[WorkspaceReportRow]) -> Vec<DuplicateMo
                 });
             group.count += 1;
             // The module at its fullest. Each import's build renders it independently, and one that
-            // tree-shakes it harder does not make the module smaller than the other build measured
-            // it — so this is a max, never a sum and never an average of two builds that happened.
+            // tree-shakes it harder does not make it smaller than the other build measured it, so
+            // this is a max, never a sum or an average.
             group.module_bytes = group.module_bytes.max(module.bytes);
             group.combined_import_cost_bytes += module.bytes;
             group.specifiers.push(row.specifier.clone());
@@ -585,9 +576,9 @@ mod tests {
         );
     }
 
-    /// ADR-0006 §6: `.flatten().unwrap_or_default()` on these fields compiles and prints **"0 B"**
-    /// in an exported, shared report — the sentinel zero the whole model exists to abolish. The row
-    /// carries no number at all, and no aggregate counts it.
+    /// ADR-0006, invariant 1: `.flatten().unwrap_or_default()` on these fields would compile and
+    /// print **"0 B"** in an exported report. The row carries no number at all, and no aggregate
+    /// counts it.
     #[test]
     fn an_unmeasured_import_has_no_size_in_the_report_not_a_zero() {
         let items = vec![
@@ -632,9 +623,8 @@ mod tests {
 
     /// The report judges each import on its own and NEVER the file they sit in (ADR-0004). Two
     /// imports of 8 B each are both inside a 10 B per-import budget; their sum, 16 B, is a
-    /// *Combined Import Cost* — it counts whatever graph they share twice, so it is not a size and
-    /// there is no budget it can be judged against. This is where the report used to warn "File
-    /// budget exceeded", disagreeing with the editor and `importlens check` about the same file.
+    /// *Combined Import Cost*: it counts whatever graph they share twice, so it is not a size and
+    /// no budget can be judged against it.
     #[test]
     fn the_report_reaches_no_verdict_about_a_file_only_about_its_imports() {
         let items = vec![
@@ -682,10 +672,9 @@ mod tests {
 
     /// ADR-0004. The headline is a **Combined Import Cost**: the sum of independent Import Costs,
     /// which counts a dependency at EVERY site it is imported from. `react` in three files is three
-    /// Reacts — and `import React, { useState } from "react"` is TWO imports of react, so it is
-    /// counted twice. Nothing is deduplicated out of it, because deduplicating it would assert a
-    /// project-level bundle quantity this product does not model. It ranks and it apportions blame;
-    /// it is never a size, and the label — not the arithmetic — is what had to change.
+    /// Reacts, and `import React, { useState } from "react"` is TWO imports of react. Nothing is
+    /// deduplicated, because that would assert a project-level bundle quantity this product does
+    /// not model. It ranks and apportions blame; it is never a size.
     #[test]
     fn the_headline_is_a_combined_import_cost_that_counts_every_site() {
         let items = vec![
@@ -769,15 +758,10 @@ mod tests {
         assert!(group.vendored, "nested node_modules paths are vendored");
     }
 
-    /// ADR-0004, one table below the headline `52a7d5c` relabelled.
-    ///
-    /// `react-dom/index.js` is **100 kB**, and three imports reach it — `react-dom`,
-    /// `react-dom/client`, `react-dom/server`. This group added `module.bytes` once per importing
-    /// row into a field called `total_bytes`, and the report rendered it **"Total Bytes: 300 kB"**.
-    /// The module is not 300 kB and never was: that is a **Combined Import Cost** — the module
-    /// counted at every site that reaches it, an upper bound — wearing the one word ADR-0004 exists
-    /// to abolish. The size of the module and the sum across its sites are two different quantities,
-    /// so the group carries **both**, each named for what it is.
+    /// ADR-0004. `react-dom/index.js` is **100 kB**, and three imports reach it (`react-dom`,
+    /// `react-dom/client`, `react-dom/server`). The module is 100 kB; the 300 kB across its sites
+    /// is a **Combined Import Cost**, an upper bound and never a total. The group carries both,
+    /// each named for what it is.
     #[test]
     fn a_shared_module_is_its_own_size_and_the_sum_across_its_sites_is_never_a_total() {
         let module_path = "C:/ws/node_modules/react-dom/index.js";

@@ -31,17 +31,12 @@ use crate::cache::key::{
 
 /// Why a classified asset input could not be observed.
 ///
-/// The distinction is not cosmetic — it decides whether the whole result may be cached. A file that
-/// is NOT THERE is a deterministic fact about the package: its continued absence is exactly what a
-/// later freshness probe confirms, so it must not refuse the cache. A file that exists but could not
-/// be READ is a filesystem moment on this machine, and reusing a result built around it would cache
-/// a hiccup as a package fact.
+/// The distinction decides whether the whole result may be cached. A file that is NOT THERE is a
+/// deterministic fact about the package that a later freshness probe can confirm. A file that
+/// exists but could not be READ is a filesystem moment, and must not be cached as a package fact.
 ///
-/// Collapsing the two is what made an alternative-specifier probe expensive. napi-rs generates ~20
-/// platform-relative `require`s per package (`./crc32.win32-x64-msvc.node`, `./crc32.darwin-arm64.node`,
-/// …) and ships one; Rolldown asks the resolver about every one of them. Treating the 19 misses as
-/// unreadable made a perfectly good build emit "retry after the filesystem settles" and be refused by
-/// every cache forever — a full rebuild per request, for a package that measured correctly.
+/// Absence is common, not exceptional: napi-rs packages `require` one binary per platform triple
+/// and ship one, so treating the misses as unreadable would make every such build uncacheable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AssetInputFailure {
     /// Not on disk. Deterministic, and reusable: [`absent_file_fingerprint`] stays Fresh while it
@@ -67,12 +62,12 @@ pub(super) struct BuildState {
     total_source_bytes: AtomicUsize,
     limit_breach: Mutex<Option<String>>,
     /// Classified non-JavaScript modules the graph imported, keyed by canonical path. See
-    /// [`ImportLensPlugin::load`]; the pipeline processes them and counts their shipped bytes (B2).
+    /// [`ImportLensPlugin::load`]; the pipeline processes them and counts their shipped bytes.
     assets: Mutex<HashMap<PathBuf, CollectedAsset>>,
-    /// Classified assets this plugin could not observe, and WHY — the two answers are cached in
-    /// opposite directions, so the reason has to travel with the path rather than be re-derived.
+    /// Classified assets this plugin could not observe, and why: the two reasons are cached in
+    /// opposite directions, so the reason travels with the path.
     failed_asset_inputs: Mutex<HashMap<PathBuf, AssetInputFailure>>,
-    /// Directly imported files that ship but are outside the measured taxonomy — an image, an icon.
+    /// Directly imported files that ship but are outside the measured taxonomy (an image, an icon).
     /// Stubbed so they cannot fail the build, and disclosed so their bytes are not silently absent.
     unmeasured_assets: Mutex<BTreeMap<PathBuf, UncountedAsset>>,
     /// Bare specifiers this build turned into an import boundary because the resolver refused them.
@@ -97,7 +92,7 @@ impl BuildState {
         sorted
     }
 
-    /// Read-time fingerprints, plus the loaded paths that have none — modules the
+    /// Read-time fingerprints, plus the loaded paths that have none: modules the
     /// `load` hook handed back to Rolldown (non-UTF8 binary modules), which the
     /// caller must fingerprint by reading them itself.
     pub(super) fn read_time_fingerprints(&self) -> (Vec<FileFingerprint>, Vec<PathBuf>) {
@@ -119,8 +114,8 @@ impl BuildState {
     }
 
     /// The classified non-JavaScript modules this build's graph imported, sorted for a stable
-    /// result. Their bytes are NOT in the JavaScript chunk and they DO ship with the package, so
-    /// the pipeline processes them the way they ship and folds the result into the size (B2).
+    /// result. Their bytes are not in the JavaScript chunk but do ship, so the pipeline processes
+    /// them the way they ship and folds the result into the size.
     pub(super) fn sorted_assets(&self) -> Vec<CollectedAsset> {
         let assets = self
             .assets
@@ -131,9 +126,8 @@ impl BuildState {
         sorted
     }
 
-    /// Returns whether this call is the one that claimed the path. `false` means a duplicate hook
-    /// invocation, whose byte reservation the caller must release — the counted asset map reports
-    /// the same thing for the same reason.
+    /// Returns whether this call claimed the path. `false` means a duplicate hook invocation, whose
+    /// byte reservation the caller must release (as with `record_asset`).
     fn record_unmeasured_asset(&self, asset: UncountedAsset) -> bool {
         self.unmeasured_assets
             .lock()
@@ -152,9 +146,8 @@ impl BuildState {
             .collect()
     }
 
-    /// `Unreadable` always wins a path already recorded as `Absent`: it is the stricter observation,
-    /// and letting a later "not there" downgrade an earlier read failure would admit a filesystem
-    /// moment into a durable store by ordering luck.
+    /// `Unreadable` always wins over `Absent` for the same path, in either arrival order, so a
+    /// filesystem moment never reaches a durable store by ordering luck.
     pub(super) fn record_failed_asset_input(&self, path: PathBuf, failure: AssetInputFailure) {
         let mut inputs = self
             .failed_asset_inputs
@@ -173,7 +166,7 @@ impl BuildState {
             .insert(specifier);
     }
 
-    /// Sorted for a stable disclosure — a package's own module order is a concurrency race.
+    /// Sorted for a stable disclosure: module order is a concurrency race.
     pub(super) fn unresolved_externals(&self) -> Vec<String> {
         self.unresolved_externals
             .lock()
@@ -190,9 +183,8 @@ impl BuildState {
             .clone()
     }
 
-    /// Only the UNREADABLE ones. This drives the `asset_io` diagnostic and the `asset_io` failure
-    /// stage, and an absent input belongs in neither — nothing about it is transient, and nothing
-    /// about it needs the user to retry.
+    /// Only the UNREADABLE ones: this drives the transient `asset_io` diagnostic and failure stage,
+    /// and an absent input belongs in neither.
     pub(super) fn unreadable_asset_paths(&self) -> Vec<PathBuf> {
         let mut paths = self
             .failed_asset_inputs
@@ -207,9 +199,9 @@ impl BuildState {
         paths
     }
 
-    /// One fingerprint per unobserved input, each carrying the freshness its reason earns: an absent
-    /// file stays Fresh while it stays missing (so the result caches and self-heals on install), an
-    /// unreadable one can never be Fresh (so the result never enters a durable store).
+    /// One fingerprint per unobserved input: an absent file stays Fresh while it stays missing (so
+    /// the result caches and self-heals on install); an unreadable one is never Fresh (so the
+    /// result never enters a durable store).
     pub(super) fn asset_input_fingerprints(&self) -> Vec<FileFingerprint> {
         let mut fingerprints = self
             .failed_asset_inputs
@@ -238,8 +230,7 @@ impl BuildState {
         }
 
         // Never hold the lock across the syscall: `canonicalize` opens a file handle on
-        // Windows, and these hooks run concurrently across modules, so holding it would
-        // serialize every module's canonicalization behind one mutex.
+        // Windows, and holding it would serialize every concurrent module behind one mutex.
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         self.canonical
             .lock()
@@ -273,14 +264,10 @@ impl BuildState {
 
     /// Keeps the SMALLEST breach message, not the first one to arrive.
     ///
-    /// These hooks run on concurrently-spawned module tasks, so "first" means "whichever module the
-    /// runtime happened to finish first". A graph that breaches in more than one place — two
-    /// oversized modules, or an oversized module and the total-source cap — would then name a
-    /// different module on different runs of the same bytes, and that message is durable: a
-    /// `module_graph_limit` failure is deterministic, so it is cached (ADR-0006, invariant 3) and
-    /// the user is shown its message. The stage was never in doubt here; the message was. Ordering
-    /// by content rather than by arrival makes the whole answer a function of the bytes, which is
-    /// the same rule `engine::stage::rank` applies to the diagnostics beside it.
+    /// These hooks run on concurrent module tasks, so arrival order is a race, and a
+    /// `module_graph_limit` failure is deterministic and cached with its message (ADR-0006).
+    /// Ordering by content makes the message a function of the bytes, the same rule
+    /// `engine::stage::rank` applies to diagnostics.
     pub(super) fn record_breach(&self, message: &str) {
         let mut breach = self
             .limit_breach
@@ -347,14 +334,11 @@ impl BuildState {
 
 /// The filesystem-looking portion of a specifier or module id, with any loader suffix removed.
 ///
-/// One mechanism for both plugin hooks. `resolve_id` used its own copy of this and `load` had none,
-/// so the two halves disagreed about what a module id names: `./font.woff2?url` was recognised on
-/// the way in and unclassifiable on the way out.
+/// Shared by `resolve_id` and `load`, so both agree on what a module id like `./font.woff2?url`
+/// names.
 fn path_portion(specifier: &str) -> &str {
-    // A Windows verbatim (extended-length) path carries a literal `?` INSIDE its prefix —
-    // `\\?\C:\...` — and that `?` is part of the path, not a loader query. Scanning from index 0
-    // truncates every such module id to `\\`, which is what `fs::canonicalize` hands back on Windows
-    // for the whole graph. Skip the prefix, then look for a suffix in what follows.
+    // A Windows verbatim path (`\\?\C:\...`, what `fs::canonicalize` returns for the whole graph)
+    // carries a literal `?` INSIDE its prefix. Skip the prefix, then look for a suffix.
     const VERBATIM_PREFIX: &str = r"\\?\";
     let offset = if specifier.starts_with(VERBATIM_PREFIX) {
         VERBATIM_PREFIX.len()
@@ -401,21 +385,17 @@ fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Opt
 
 /// A specifier that names a subpath of ANOTHER package rather than a file inside this one.
 ///
-/// Path-like specifiers are deliberately excluded. A package that cannot find its own relative file
-/// really is broken, and failing is the honest answer; a BARE specifier names something across a
-/// package boundary, and a boundary we cannot cross is a boundary, not a fatality.
+/// Path-like specifiers are deliberately excluded: a package that cannot find its own relative file
+/// really is broken. A BARE specifier names something across a package boundary, and a boundary we
+/// cannot cross is a boundary, not a fatality.
 ///
-/// Rolldown already reasons exactly this way — an unresolvable bare import answered `NotFound` is
-/// externalized with a warning, which is why `tsdown` measures where esbuild refuses. But that arm
-/// keys on the error VARIANT, not the specifier's shape, and the interesting failures never reach
-/// it: when a package ships a file and declines to export it, oxc_resolver answers
-/// `PackagePathNotExported`, which falls to the catch-all and kills the whole build.
-/// `jest-resolve/build/defaultResolver` and `eslint/lib/rules` are both that — real files on disk,
-/// behind an `exports` map — and each is requested from a branch that never executes (a `try` whose
-/// `catch` has the older spelling, a version test against an eslint that is not installed).
+/// Rolldown externalizes an unresolvable bare import only when the resolver answers `NotFound`. A
+/// file that exists behind an `exports` map answers `PackagePathNotExported` and fails the whole
+/// build, typically from a branch that never executes (`jest-resolve/build/defaultResolver`,
+/// `eslint/lib/rules`).
 ///
-/// Restricting this to subpaths keeps the extra resolver call off the common path: a bare ROOT
-/// specifier that is simply not installed is the `NotFound` case Rolldown already handles.
+/// Restricted to subpaths to keep the extra resolver call off the common path: a bare ROOT
+/// specifier that is not installed is the `NotFound` case Rolldown already handles.
 fn is_bare_subpath_specifier(specifier: &str) -> bool {
     if specifier.starts_with("./")
         || specifier.starts_with("../")
@@ -430,8 +410,8 @@ fn is_bare_subpath_specifier(specifier: &str) -> bool {
     specifier.split('/').filter(|part| !part.is_empty()).count() >= required
 }
 
-/// A read that failed because the file is not there is a fact about the package; anything else —
-/// a permission denial, a locked file, a device error — is a moment on this machine.
+/// A read that failed because the file is not there is a fact about the package; anything else
+/// (a permission denial, a locked file, a device error) is a moment on this machine.
 fn failure_kind_of(error: &std::io::Error) -> AssetInputFailure {
     if error.kind() == std::io::ErrorKind::NotFound {
         AssetInputFailure::Absent
@@ -444,18 +424,16 @@ fn failure_kind_of(error: &std::io::Error) -> AssetInputFailure {
 async fn resolve_failure_kind(candidate: &Path) -> AssetInputFailure {
     match tokio::fs::metadata(candidate).await {
         Err(error) => failure_kind_of(&error),
-        // It exists but the resolver still refused it — an `exports` denial, a bad symlink target.
+        // It exists but the resolver still refused it (an `exports` denial, a bad symlink target).
         // Not an absence, so do not claim one.
         Ok(_) => AssetInputFailure::Unreadable,
     }
 }
 
-/// Atomically reserve bytes without ever moving the counter past `limit` on rejection.
+/// Atomically reserve bytes, leaving the counter untouched when the reservation does not fit.
 ///
-/// `fetch_add` is not suitable for a hard resource ceiling: it mutates first, so every rejected
-/// module permanently inflates the total and can manufacture follow-on breaches. `try_update`
-/// makes the check and increment one compare/exchange operation and leaves the counter untouched
-/// when the reservation does not fit.
+/// Not `fetch_add`: it mutates first, so every rejected module would permanently inflate the total
+/// and manufacture follow-on breaches.
 fn try_reserve_source_bytes(total: &AtomicUsize, bytes: usize, limit: usize) -> Result<(), usize> {
     total
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -496,88 +474,44 @@ fn reconcile_source_bytes(
 /// One pre-resolved entry the virtual module maps `import-lens:target/<i>` to, carrying its
 /// package's **root** manifest.
 ///
-/// Pre-resolving is the point (§6.1): the engine must never re-resolve the bare package
-/// specifier. But Rolldown builds a plugin-resolved `ResolvedId`'s `package_json` from
-/// `HookResolveIdOutput::package_json_path` and from **nothing else**, so pre-resolving without
-/// supplying the manifest leaves the entry module — and only the entry module — with no package
-/// metadata at all. Every *transitive* module is resolved by Rolldown and gets the real thing.
+/// Pre-resolving is the point (§6.1): the engine never re-resolves the bare package specifier.
+/// Rolldown builds a plugin-resolved `ResolvedId`'s `package_json` from
+/// `HookResolveIdOutput::package_json_path` alone, so without it the entry module (and only the
+/// entry module) would have no package metadata.
 ///
-/// Supplying it is metadata supply, not a semantic override (ADR-0002): we hand Rolldown a
-/// manifest, and it alone decides what that manifest means. `side_effects` stays `None` — §7.4
-/// reserves the side-effect decision for Rolldown.
+/// This is metadata supply, not a semantic override (ADR-0002): Rolldown alone decides what the
+/// manifest means, and `side_effects` stays `None` (§7.4).
 ///
-/// **It is the package-ROOT manifest, and that is not the same manifest for both of Rolldown's
-/// lookups.** `sideEffects` is read from the topmost manifest before the `node_modules` boundary —
-/// the package root, so our supply is exactly right, and that is why this exists. `"type"` is read
-/// from the *nearest* manifest above the file. One field cannot answer both: a package that nests
-/// a manifest between its root and its entry (the dual-package `esm/package.json`
-/// `{"type":"module"}` layout) still has its entry's module format decided by the root manifest.
-/// That gap predates supplying anything and cannot be closed at this API — known issue C6. Do not
-/// "fix" it by supplying the nearest manifest instead: that trades a rare format error for a
-/// common `sideEffects` error.
+/// **It is the package-ROOT manifest.** That is right for `sideEffects` (read from the package
+/// root) but not for `"type"` (read from the *nearest* manifest), so a nested
+/// `esm/package.json` `{"type":"module"}` does not reach the entry (known issue C6). Do not supply
+/// the nearest manifest instead: that trades a rare format error for a common `sideEffects` error.
 ///
-/// **The two paths must be spelled so Rolldown can relativize one against the other, and that is
-/// the whole of this type's job.** Rolldown answers `sideEffects` by
-/// `resolved_id.id.relative_path(package_json.realpath().parent())` and matching the *result*
-/// against the declared globs (`ecma_module_view_factory.rs`, `lazy_check_side_effects`). It does
-/// **not** re-derive the manifest's location: `try_get_package_json_or_create` takes the string we
-/// hand it verbatim ("User has the responsibility to ensure `path` is real path if needed"). So the
-/// package-relative path Rolldown matches is computed from **our two strings**, and if they do not
-/// share a root the relativization silently yields the whole absolute path instead.
+/// **Both paths must be canonical.** Rolldown matches `sideEffects` globs against the entry id
+/// relativized to the manifest's parent, using our strings verbatim. If they do not share a root
+/// (a `\\?\` verbatim id against a plain manifest path, or a pnpm store link or workspace junction
+/// on one side only), relativization yields the absolute path, and any glob containing a `/` is
+/// anchored and can never match it: Rolldown silently tree-shakes side effects the package
+/// declared. Fix the input, never the badge.
 ///
-/// It did not share a root. The id is `entry_path`, which is `fs::canonicalize` output — a Windows
-/// **`\\?\` verbatim** path — while the manifest was `package_root.join("package.json")`, built
-/// from the non-canonical document path. `sugar_path`'s `relative` splits a Windows root off each
-/// side, sees `//?/C:` against `C:`, takes its "different roots" branch and returns the target
-/// unchanged. `check_side_effects_for` then matched the globs against
-/// `\\?\C:\…\node_modules\refractor\lib\common.js`.
-///
-/// **That is not a near miss; it is a silent, one-directional corruption of retention, and it hid
-/// behind the matcher's own normalisation.** A pattern with no separator, or a `./` prefix, is
-/// prefixed with `**/` before matching — and `**/` happily swallows a whole absolute path, so
-/// `["index.js"]` still "matched" and every test we had passed. A pattern that **contains a `/`**
-/// is used VERBATIM and anchored, so it can **never** match an absolute path. Real packages use
-/// that form: `refractor` declares `["lib/all.js","lib/common.js"]` and its entry is
-/// `lib/common.js`, so Rolldown tree-shook away ~35 gated `refractor.register(lang)` statements and
-/// we reported **30,229 B** for a package that is really **113,152 B** — a 3.7x undercount, from a
-/// path *we* handed it.
-///
-/// The fix is the input, never the badge: [ADR-0002] makes Rolldown the authority on retention
-/// *given correct inputs*, and a badge taught to agree with a retention our own plugin corrupted
-/// would bless the wrong number. So the manifest path is **canonicalized**, which puts it in the
-/// same verbatim spelling as `entry_path` and — just as importantly — resolves the same symlinks:
-/// under pnpm, `node_modules/<name>` is a link into the store and a **workspace-linked** package's
-/// `node_modules/<name>` is a junction onto `packages/<name>`, so even two non-verbatim paths would
-/// not have shared a prefix. Canonical-vs-canonical is the only spelling that relativizes for all
-/// three layouts.
-///
-/// The id is deliberately left **exactly as it is**: `entry_path` is canonicalized upstream because
-/// read-time fingerprinting keys on that stable spelling (§8.3), and the `load` hook, the loaded
-/// path set and the module contributions all speak it. Nothing here needs the id to change — only
-/// the manifest had to come and meet it.
+/// The id stays as it is: `entry_path` is canonicalized upstream because read-time
+/// fingerprinting, the loaded path set and the module contributions key on it (§8.3).
 #[derive(Debug)]
 struct PreResolvedTarget {
     entry_path: PathBuf,
     /// The **canonical** `<package_root>/package.json`, or `None` when there is none to point at.
     ///
-    /// The guard is not caution, it is correctness: Rolldown *reads* this path
-    /// (`Resolver::try_get_package_json_or_create`) and an unreadable one fails the whole build
-    /// with `UNHANDLEABLE_ERROR: Failed to read or parse package.json`. A `BundleEntry` does not
-    /// promise its `package_root` holds a manifest — the pipeline's always does, because that is
-    /// how the root was found, but the engine's own qualification fixtures point at bare
-    /// directories. Absent a manifest there is simply nothing Rolldown would have found either.
+    /// Rolldown *reads* this path, and an unreadable one fails the whole build. A `BundleEntry`
+    /// does not promise its `package_root` holds a manifest (the qualification fixtures point at
+    /// bare directories).
     manifest_path: Option<String>,
 }
 
 impl PreResolvedTarget {
     fn for_entry(entry: &super::BundleEntry) -> Self {
         Self {
-            // Canonical on both sides or the relativization is junk, and `BundleEntry` promises
-            // only an absolute entry, not a canonical one — the pipeline's legacy-fallback
-            // resolution joins the manifest field onto the package root without canonicalizing. It
-            // is idempotent for the paths that already are canonical, which is nearly all of them,
-            // and it does not change what the daemon *tracks*: `load` and `module_parsed`
-            // canonicalize every path they record regardless.
+            // Canonical on both sides (see above): `BundleEntry` promises only an absolute entry,
+            // not a canonical one. Idempotent for the paths that already are canonical.
             entry_path: std::fs::canonicalize(&entry.entry_path)
                 .unwrap_or_else(|_| entry.entry_path.clone()),
             manifest_path: canonical_manifest_path(&entry.package_root)
@@ -588,10 +522,9 @@ impl PreResolvedTarget {
 
 /// The package manifest, spelled the way the entry id is spelled: canonical.
 ///
-/// `canonicalize` both proves it exists and resolves the links — see [`PreResolvedTarget`] for why
-/// both halves are load-bearing. The `is_file` check survives it because a *directory* named
-/// `package.json` canonicalizes just as happily as a file, and handing Rolldown a directory to read
-/// fails the entire build.
+/// `canonicalize` proves it exists and resolves the links (see [`PreResolvedTarget`]). The
+/// `is_file` check is still needed: a *directory* named `package.json` canonicalizes too, and
+/// handing Rolldown a directory to read fails the entire build.
 fn canonical_manifest_path(package_root: &Path) -> Option<PathBuf> {
     let manifest = std::fs::canonicalize(package_root.join("package.json")).ok()?;
     manifest.is_file().then_some(manifest)
@@ -606,11 +539,10 @@ pub(super) struct ImportLensPlugin {
 
 impl ImportLensPlugin {
     /// `targets` is indexed BY POSITION: the virtual entry emits `import-lens:target/<i>` for
-    /// `entries[i]` and `resolve_id` maps it back with `targets.get(i)`. A file-size build submits
-    /// several entries at once, each from a DIFFERENT package, so any reordering here hands one
-    /// package's manifest to another package's entry — which does not withhold a declaration, it
-    /// applies the wrong one. Never sort, dedup or filter this vector. Row 51 of the construct
-    /// matrix is what notices.
+    /// `entries[i]` and `resolve_id` maps it back with `targets.get(i)`. A file-size build mixes
+    /// entries from different packages, so any reordering applies one package's manifest to
+    /// another's entry. Never sort, dedup or filter this vector (row 51 of
+    /// `tests/candidate_matrix.rs` guards it).
     pub(super) fn for_request(request: &super::BundleRequest) -> Self {
         Self {
             entry_source: super::entry::virtual_entry_source(&request.entries),
@@ -728,11 +660,8 @@ impl Plugin for ImportLensPlugin {
                 ))
                 .into());
             };
-            // Pre-resolved absolute path (§6.1): never re-resolve the bare
-            // package specifier — but hand Rolldown the package manifest it would have
-            // found on the way, or the entry module classifies its own side effects from
-            // source alone while every module behind it uses the real declaration
-            // (see [`PreResolvedTarget`]).
+            // Pre-resolved absolute path (§6.1), plus the package manifest Rolldown would have
+            // found on the way (see [`PreResolvedTarget`]).
             return Ok(Some(HookResolveIdOutput {
                 package_json_path: target.manifest_path.clone(),
                 ..HookResolveIdOutput::from_id(target.entry_path.to_string_lossy().into_owned())
@@ -742,11 +671,8 @@ impl Plugin for ImportLensPlugin {
             && let Some(candidate) = supported_asset_observation_candidate(args.specifier, importer)
         {
             // Ask Rolldown's configured resolver (with this hook skipped) rather than joining a
-            // relative path ourselves. Client/Component builds apply package `browser` aliases
-            // here, and a raw join would silently measure the server asset or ignore a `false`
-            // mapping. Taking the successful result back through this hook still guarantees its
-            // final id reaches our observing `load`; retaining a failed relative or absolute
-            // candidate closes the resolve/load race without changing resolver semantics.
+            // relative path ourselves: Client/Component builds apply package `browser` aliases,
+            // and a raw join would measure the server asset or ignore a `false` mapping.
             let resolved = ctx
                 .resolve(
                     args.specifier,
@@ -765,16 +691,13 @@ impl Plugin for ImportLensPlugin {
                 }
                 Err(_) => {
                     // A bare, self-referential or aliased spelling has no filesystem location to
-                    // probe, so its failure is the resolver's deterministic verdict about the
-                    // package graph, not an unreadable file. It takes the same boundary path as any
-                    // other bare specifier the resolver refuses.
+                    // probe, so its failure is the resolver's deterministic verdict; it takes the
+                    // same boundary path as any other refused bare specifier.
                     if !candidate.is_absolute() {
                         return Ok(self.unresolved_boundary(args.specifier));
                     }
-                    // An alternative-specifier probe is the ordinary case here, not the exception:
-                    // napi-rs writes one `require` per platform triple and ships one file, so most
-                    // of these misses are a package fact, not a filesystem hiccup. Recording WHICH
-                    // is what lets a correct build still be cached.
+                    // Most misses here are a package fact (napi-rs platform probes), not a
+                    // filesystem hiccup; recording which lets a correct build still be cached.
                     let failure = resolve_failure_kind(&candidate).await;
                     self.state.record_failed_asset_input(candidate, failure);
                     // Let the normal resolver run once more so Rolldown retains its native resolve
@@ -784,10 +707,8 @@ impl Plugin for ImportLensPlugin {
             }
         }
 
-        // A cross-package subpath the resolver refuses is an import BOUNDARY, not a fatality — see
-        // [`is_bare_subpath_specifier`]. Externalizing it measures the graph that did bundle instead
-        // of discarding a whole package over one edge, and the specifier is recorded so the result
-        // discloses the boundary rather than pretending the edge was never there.
+        // A cross-package subpath the resolver refuses is an import BOUNDARY, externalized and
+        // recorded for disclosure (see [`is_bare_subpath_specifier`]).
         if let Some(importer) = args.importer
             && is_bare_subpath_specifier(args.specifier)
         {
@@ -813,21 +734,13 @@ impl Plugin for ImportLensPlugin {
         Ok(None)
     }
 
-    /// Reads real modules itself so their bytes can be fingerprinted at the moment
-    /// they are consumed (§8.3).
+    /// Reads real modules itself so their bytes are fingerprinted at the moment they are
+    /// consumed (§8.3). Re-reading after the build would record a file edited mid-analysis with
+    /// its NEW bytes against a size measured from the OLD ones, and that entry would probe
+    /// `Fresh` forever.
     ///
-    /// The cache stores a size alongside fingerprints of the files it was computed
-    /// from. Fingerprinting them *after* the build — by re-reading from disk — means
-    /// a file edited during the analysis window is recorded with its NEW bytes
-    /// against a size measured from the OLD ones. The entry then never self-heals:
-    /// every later freshness probe re-reads the file, matches the stored hash, and
-    /// answers `Fresh`, serving the stale size until that file changes again.
-    /// Hashing here closes the window — the hash describes exactly the bytes that
-    /// were measured — and removes a whole second pass over the graph's bytes.
-    ///
-    /// The bytes are read raw and hashed before Rolldown transforms anything, so a
-    /// `.ts` module hashes to its on-disk content rather than its transformed output,
-    /// which is what a later probe will compare against.
+    /// The bytes are hashed raw, before any transform, so a `.ts` module hashes to its on-disk
+    /// content, which is what a later probe compares against.
     async fn load(&self, _ctx: SharedLoadPluginContext, args: &HookLoadArgs<'_>) -> HookLoadReturn {
         if args.id == VIRTUAL_ENTRY_ID {
             return Ok(Some(HookLoadOutput {
@@ -837,30 +750,21 @@ impl Plugin for ImportLensPlugin {
             }));
         }
 
-        // Rolldown runtime helpers and other synthetic ids are not files. Real module
-        // ids are absolute paths; anything else is left to Rolldown.
-        // A module id can carry a loader suffix that is not part of the file name —
-        // `./font.woff2?url`, `./styles.css?inline`, `./data.json?raw`. oxc_resolver re-appends the
-        // query it parsed and Rolldown builds the id from that, so the suffix arrives here, and the
-        // raw id names no file (`?` is illegal in a Windows filename).
+        // Real module ids are absolute paths; synthetic ids are left to Rolldown. An id can carry
+        // a loader suffix (`./font.woff2?url`, `./data.json?raw`) that oxc_resolver re-appends,
+        // so the raw id may name no file.
         let literal = Path::new(args.id);
         let stripped = Path::new(path_portion(args.id));
         if !stripped.is_absolute() {
             return Ok(None);
         }
 
-        // §7.3: reject an oversized module BEFORE reading it. The limit exists to
-        // bound memory, so reading first would blow the very bound being enforced.
-        // `module_parsed` still enforces it on the transformed source, which also
-        // covers modules this hook hands back to Rolldown below.
-        // Resolve the identity BEFORE the stat/read pair. Canonicalizing after the read can pair
+        // Resolve the identity BEFORE the stat/read pair: canonicalizing after the read can pair
         // bytes from an old symlink target with the path of a newly-retargeted one.
         //
-        // Strip to rescue a loader suffix, never to lose a real file. `?` is illegal in a Windows
-        // filename but legal on Linux, and `#` is legal on both, so a stripped path that is not on
-        // disk means the suffix was part of the name — fall back to the literal id. The second stat
-        // runs only where the alternative was an outright build failure. Whichever file is chosen
-        // is the module's identity for `module_parsed` too.
+        // Strip to rescue a loader suffix, never to lose a real file: `?` is legal in a Linux
+        // filename and `#` everywhere, so a stripped path not on disk falls back to the literal
+        // id. Whichever file is chosen is the module's identity for `module_parsed` too.
         let mut path = stripped;
         let mut canonical = self.state.canonical_path(stripped);
         let mut stat = tokio::fs::metadata(&canonical).await;
@@ -888,15 +792,16 @@ impl Plugin for ImportLensPlugin {
                 if asset_class.is_some() {
                     let failure = failure_kind_of(&error);
                     self.state.record_failed_asset_input(canonical, failure);
-                    // Do not let the default loader reopen a recovering/growing asset outside this
-                    // plugin's source-byte reservations. The adapter promotes the retained cause
-                    // to `asset_io`, while this error keeps the build from consuming unobserved
-                    // bytes on a second path.
+                    // Do not let the default loader reopen the asset outside this plugin's
+                    // source-byte reservations; the adapter reports the retained cause.
                     return Err(error.into());
                 }
                 return Ok(None);
             }
         };
+        // §7.3: reject an oversized module BEFORE reading it, or reading would blow the memory
+        // bound being enforced. `module_parsed` also enforces it on the transformed source,
+        // covering modules this hook hands back to Rolldown.
         if metadata.len() > MAX_MODULE_SOURCE_BYTES as u64 {
             self.state.record_stat_fingerprint(&canonical, &metadata);
             return Err(self
@@ -907,17 +812,14 @@ impl Plugin for ImportLensPlugin {
                 .into());
         }
 
-        // Capture len+mtime from the stat taken BEFORE the read. Stat-after-read would
-        // pair the post-edit metadata with a hash of the pre-edit bytes, and the
-        // freshness fast path matches on len+mtime alone — so a file rewritten during
-        // the read would probe Fresh forever against bytes it was never measured from,
-        // which is the very failure this hook exists to prevent.
+        // len+mtime come from the stat taken BEFORE the read. Stat-after-read would pair
+        // post-edit metadata with a hash of pre-edit bytes, and the freshness fast path matches
+        // on len+mtime alone, so a file rewritten during the read would probe Fresh forever.
         let (len, modified_millis) = read_time_len_mtime_of(&metadata);
 
         // Direct assets become empty Rolldown modules, so `module_parsed` sees zero bytes for them.
-        // Reserve the stat length here, BEFORE reading, both to make the aggregate cap cover them
-        // and to keep a static oversized asset from allocating past the bound it is about to fail.
-        // The per-file check above makes this conversion safe on every supported architecture.
+        // Reserve the stat length BEFORE reading, so the aggregate cap covers them without first
+        // allocating past it. The per-file check above makes the `usize` conversion safe.
         let reserved_asset_bytes = if asset_class.is_some() {
             let metadata_bytes = usize::try_from(metadata.len())
                 .expect("a per-file-admitted asset length must fit usize");
@@ -945,28 +847,21 @@ impl Plugin for ImportLensPlugin {
             }
         };
 
-        // A non-JavaScript ASSET the package's own entry imports, intercepted BEFORE the UTF-8
-        // conversion below — a wasm or font is not UTF-8, and handing one back to Rolldown lets it
-        // perturb or fail the JS build, which is the number we need exact.
+        // A counted non-JavaScript ASSET, intercepted BEFORE the UTF-8 conversion: a wasm or font
+        // handed back to Rolldown can perturb or fail the JS build, and a stylesheet fails it
+        // outright (`UNSUPPORTED_FEATURE`).
         //
-        // Stylesheets have their own reason: Rolldown does not bundle CSS (loading one fails the
-        // whole build with `UNSUPPORTED_FEATURE`), so every package whose ESM entry does
-        // `import './styles.css'` (most UI kits) could not otherwise be measured.
-        //
-        // `ModuleType::Empty` makes the module link as nothing (and shims any binding imported from
-        // it, so `import styles from './x.css'` works too), so the JS graph measures exactly. The
-        // asset itself is recorded here with its kind, and the pipeline then processes it the way
-        // it really ships and folds those bytes into the Import Cost (B2) — they are neither
-        // fabricated into the JS number nor thrown away with it.
+        // `ModuleType::Empty` links it as nothing (shimming any imported binding), so the JS graph
+        // measures exactly; the asset is recorded with its kind and the pipeline counts the bytes
+        // it ships.
         if let Some(kind) = asset_kind {
             let reserved = reserved_asset_bytes
                 .expect("a classified asset must reserve its metadata length before reading");
             let asset = CollectedAsset::from_read(canonical, kind, &metadata, bytes);
             let actual = asset.bytes().len();
 
-            // A file may grow between metadata and read. The pre-read check is still the memory
-            // guard for stable files; this exact post-read check closes the concurrent-growth gap
-            // and fingerprints the bytes that made the deterministic failure true.
+            // A file may grow between metadata and read: this post-read check closes that gap and
+            // fingerprints the bytes that made the deterministic failure true.
             if actual > MAX_MODULE_SOURCE_BYTES {
                 self.state
                     .record_fingerprint(asset.path.clone(), asset.fingerprint.clone());
@@ -998,28 +893,19 @@ impl Plugin for ImportLensPlugin {
             }));
         }
 
-        // A file that ships but is outside the measured taxonomy — an image, an icon, a media file,
-        // a compiled native addon.
+        // A file that ships but is outside the measured taxonomy (an image, an icon, a media file,
+        // a native `.node` addon). Left to Rolldown, one of these fails the whole build: a binary
+        // fails its loader, and an `.svg` is parsed as JavaScript.
         //
-        // It is intercepted for the same reason a font is: left to Rolldown, ONE of these makes the
-        // whole package unmeasurable. A `.png` is not UTF-8, so its loader fails on `InvalidData`;
-        // an `.svg` IS valid UTF-8, so it is handed to OXC and parsed as JavaScript, which fails
-        // differently and just as fatally; a `.node` addon fails as the `.png` does, which is what
-        // took `@vscode/vsce` and `ovsx` down over one `keytar.node`. The user saw "unavailable"
-        // for a package whose JavaScript we could measure perfectly.
-        //
-        // Stubbing it to `Empty` lets the JS graph measure exactly, and the bytes are DISCLOSED
-        // rather than dropped: they ship, so a size that omits them is a floor and has to say so.
-        // Its length is charged against the graph's aggregate ceiling like any other asset, so
-        // stubbing cannot become a way to admit bytes no limit ever sees.
+        // Stubbed to `Empty` so the JS graph measures exactly, and DISCLOSED: the size omits
+        // bytes that ship, so it is a floor. Its length is still charged against the aggregate
+        // ceiling, so stubbing cannot admit bytes no limit sees.
         if asset_class == Some(AssetClass::Unmeasured) {
             let reserved = reserved_asset_bytes
                 .expect("a classified asset must reserve its metadata length before reading");
             let actual = bytes.len();
 
-            // Same post-read growth check the counted arm makes. The pre-read stat bounds a stable
-            // file; this closes the window where it grew between the stat and the read, and it
-            // fingerprints the bytes that made the deterministic failure true.
+            // Same post-read growth check as the counted arm.
             if actual > MAX_MODULE_SOURCE_BYTES {
                 self.record_read_time(&canonical, len, modified_millis, &bytes);
                 self.release_source_bytes(reserved);
@@ -1032,19 +918,16 @@ impl Plugin for ImportLensPlugin {
             }
 
             if let Err(error) = self.reconcile_source_bytes(reserved, actual) {
-                // Record the fingerprint BEFORE returning, as the counted arm does: this failure is
-                // deterministic and cacheable, and without the fingerprint it would not expire when
-                // the file that caused it changes.
+                // Fingerprint before returning: this failure is deterministic and cached, and must
+                // expire when the file that caused it changes.
                 self.record_read_time(&canonical, len, modified_millis, &bytes);
                 self.release_source_bytes(reserved);
                 return Err(error.into());
             }
             self.record_read_time(&canonical, len, modified_millis, &bytes);
 
-            // Release on a DUPLICATE, exactly as the counted arm does. Two module ids can
-            // canonicalize to one path (a pnpm symlink layout is the ordinary shape), and both
-            // charge their length against the aggregate ceiling. Only the first is ever accounted
-            // for, so without this the counter drifts up for the rest of the build.
+            // Release on a DUPLICATE, as the counted arm does: two module ids can canonicalize to
+            // one path (pnpm symlinks), and only the first is accounted for.
             if !self.state.record_unmeasured_asset(UncountedAsset {
                 path: canonical,
                 bytes: actual as u64,
@@ -1059,9 +942,8 @@ impl Plugin for ImportLensPlugin {
             }));
         }
 
-        // Hash BEFORE the UTF-8 conversion, so the conversion can consume the buffer. Doing it the
-        // other way needs a full copy of every module's source purely to keep the bytes alive for
-        // hashing, which is a graph-sized memcpy on a path that runs per keystroke.
+        // Hash BEFORE the UTF-8 conversion, so the conversion can consume the buffer without a
+        // graph-sized copy.
         self.record_read_time(&canonical, len, modified_millis, &bytes);
 
         // A binary module that is NOT a classified asset. Rolldown handles those itself; the caller
@@ -1142,13 +1024,9 @@ impl Plugin for ImportLensPlugin {
 mod tests {
     use super::*;
 
-    /// A Windows verbatim (extended-length) path carries a literal `?` inside its prefix, and
-    /// `fs::canonicalize` returns that form for the whole module graph on Windows. Treating it as a
-    /// loader query truncated every module id to `\\`, so the load hook stat'd a nonsense path,
-    /// handed every module back to Rolldown, and the file-size aggregate stopped being cacheable —
-    /// a whole-build failure from a one-character scan offset.
-    ///
-    /// The suffix cases below are what the helper is FOR; the verbatim case is what it must not eat.
+    /// A Windows verbatim path carries a literal `?` inside its prefix, and `fs::canonicalize`
+    /// returns that form for the whole module graph. The suffix cases are what the helper is FOR;
+    /// the verbatim case is what it must not eat.
     #[test]
     fn path_portion_strips_a_loader_suffix_without_eating_a_verbatim_prefix() {
         assert_eq!(
@@ -1222,9 +1100,8 @@ mod tests {
         );
     }
 
-    /// The other half of the same rule, and the one that pays for the napi-rs family: a file that is
-    /// simply NOT THERE is a deterministic fact, so it must neither refuse the cache nor claim the
-    /// filesystem needs to settle.
+    /// The other half of the same rule: a file that is simply NOT THERE is a deterministic fact,
+    /// so it must neither refuse the cache nor claim the filesystem needs to settle.
     #[test]
     fn an_absent_asset_observation_is_reusable_and_is_not_an_io_failure() {
         let state = BuildState::default();

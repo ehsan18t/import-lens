@@ -49,9 +49,8 @@ impl LifecycleState {
     }
 
     pub fn should_recycle(&self, now: Instant) -> Option<RecycleReason> {
-        // The 200k in-memory entry-count recycle is gone: the global disk-byte
-        // budget (Layer 2) now bounds capacity, and the memory working set is
-        // separately count-bounded. Only the idle-after-uptime recycle remains.
+        // Capacity is bounded by the disk-byte budget and the bounded memory working
+        // set, not by recycling.
         if now.saturating_duration_since(self.started_at) <= UPTIME_RECYCLE_AFTER {
             return None;
         }

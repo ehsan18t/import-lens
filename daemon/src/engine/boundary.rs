@@ -24,45 +24,29 @@ use super::{BundleArtifact, BundleFailure, BundleRequest, ImportRuntime, Rolldow
 /// build from serializing the daemon. The miss drain sizes its worker count
 /// from this.
 ///
-/// The memory bound is exact for builds that *finish*, and approximate for one that
-/// hits `BUILD_TIMEOUT`. Dropping a timed-out build future releases its permit at once,
-/// but the module tasks Rolldown already `tokio::spawn`ed keep running: they hold an
-/// `Arc` of the build's context (and the module sources they parsed), and this boundary
-/// has no join handle with which to wait for them. So while an abandoned graph is still
-/// resident, two fresh builds can be admitted and peak RSS can briefly reach ~3 graphs
-/// rather than 2. It is bounded — those tasks do complete and drop their state — and it
-/// can neither wedge the pool nor corrupt a result. Fixing it would mean tracking and
-/// joining Rolldown's internal tasks, which its public surface does not offer; the
-/// honest thing is to record the approximation here rather than to overstate the bound.
+/// The memory bound is approximate after a `BUILD_TIMEOUT`: the permit is released at once,
+/// but Rolldown's already-spawned module tasks keep the abandoned graph resident until they
+/// finish, so peak RSS can briefly reach ~3 graphs (known issue C2).
 pub const ENGINE_PERMITS: usize = 2;
 
 /// Upper bound on a single engine build.
 ///
-/// **It exists so a permit is never held forever, not to police slowness.** `catch_unwind` only
-/// sees a panic that unwinds *to us*, and the panic that matters does not. Rolldown fans every
-/// module out onto its own `tokio::spawn`ed task (`module_loader.rs`), and a panic in one of
-/// those tasks is swallowed by Tokio: the task dies without sending its `*Done` message, the
-/// loader's `remaining` counter never reaches zero, and — because the loader itself holds a
-/// clone of the message sender — its `rx.recv()` never returns `None` either. The build future
-/// parks forever. Nothing unwinds, so nothing is caught; the permit and the in-flight guard are
-/// never released, and `ENGINE_PERMITS` such packages wedge every later build in the daemon's
-/// lifetime. Dropping the timed-out future is the containment: it releases the permit and the
-/// `InFlight` guard, and the import degrades to one typed `timeout` failure.
+/// **It exists so a permit is never held forever, not to police slowness.** A panic inside one
+/// of Rolldown's `tokio::spawn`ed module tasks is swallowed by Tokio: the task never sends its
+/// `*Done` message and the loader (which holds its own sender clone) waits forever. Nothing
+/// unwinds, so `catch_unwind` cannot see it, and `ENGINE_PERMITS` such builds would wedge every
+/// later build. Dropping the timed-out future releases the permit and the `InFlight` guard, and
+/// the import degrades to one typed `timeout` failure (known issue C1).
 ///
-/// **It bounds a BUILD, and nothing else.** It does not bound a request, and it no longer needs
-/// to: an interactive request does not wait for the builds its imports miss on. It answers with
-/// what the cache already holds, and each build is delivered to the client over the push channel
-/// as it lands (`ipc::server`, `RefreshedResults`). A parked build therefore delays exactly one
-/// import's number, and cannot touch the response the other imports ride in — which is what the
-/// request-scoped engine budget was invented to do, at the price of degrading healthy packages
-/// and writing those degraded numbers to the cache. Deleted; this is the one timeout the design
-/// genuinely needs.
+/// **It bounds a build, not a request.** An interactive request answers from the cache and each
+/// build is pushed to the client as it lands (`ipc::server`, `RefreshedResults`), so a parked
+/// build delays only its own import. Do not add a request-scoped engine budget: it degrades
+/// healthy packages and caches the degraded numbers.
 ///
 /// 8s is 16x the §10.6 cold-p95 gate (500 ms) and ~160x the measured cold p95 (52 ms): a build
-/// that reaches it is pathological by construction. The limit is deliberately flat and not
-/// varied by `BundlePurpose` — no purpose identifies a deadline (`ImportSize` serves both the
-/// interactive path and the workspace report), and with no client waiting on a build, none has
-/// any reason to be cut shorter than another.
+/// that reaches it is pathological. It is flat across `BundlePurpose`, since no purpose
+/// identifies a deadline (`ImportSize` serves both the interactive path and the workspace
+/// report).
 const BUILD_TIMEOUT: Duration = Duration::from_secs(8);
 
 static PERMITS: Semaphore = Semaphore::const_new(ENGINE_PERMITS);
@@ -79,15 +63,9 @@ static STARTED: AtomicUsize = AtomicUsize::new(0);
 // Borrowing a static keeps the engine futures 'static for Runtime::spawn.
 static ENGINE: RolldownEngine = RolldownEngine;
 
-/// Rolldown parallelizes *within* a build — parsing, transforming and rendering
-/// modules across the runtime's workers. Sizing the runtime to `ENGINE_PERMITS`
-/// conflated two unrelated bounds: the permits exist to cap how many builds run at
-/// once (and so peak memory), while the runtime width decides how fast each of those
-/// builds can go. Two workers meant every build was pinned to two threads no matter
-/// how many cores the machine had.
-///
-/// The permits still bound concurrency and memory; this only lets each admitted build
-/// use the machine. Capped at 8: past that the daemon would contend with the editor
+/// Runtime width decides how fast each admitted build goes (Rolldown parallelizes within a
+/// build); `ENGINE_PERMITS` alone bounds how many builds run, and so peak memory. Do not size
+/// the runtime to the permit count. Capped at 8: past that the daemon contends with the editor
 /// and the Rayon pool for cores it cannot productively use.
 fn engine_runtime_workers() -> usize {
     std::thread::available_parallelism()
@@ -110,11 +88,8 @@ fn engine_runtime() -> &'static Runtime {
     })
 }
 
-/// Decrements on drop, so a build that never *completes* cannot leak the counter.
-/// `catch_unwind` sits inside the permit, so nothing unwinds through this guard — what
-/// it protects against is the future being dropped before it finishes: the
-/// `BUILD_TIMEOUT` cancellation above, and runtime shutdown. The semaphore permit
-/// already self-cleans on drop; the counters did not.
+/// Decrements on drop, so a build future dropped before it finishes (the `BUILD_TIMEOUT`
+/// cancellation, runtime shutdown) cannot leak the counter.
 struct InFlight;
 
 impl InFlight {
@@ -175,7 +150,7 @@ pub(crate) fn is_background() -> bool {
 }
 
 /// Everything that has to happen inside the permit: the in-flight guard, the build timeout, and
-/// the `catch_unwind`. However the build ends — value, unwind, or cancellation — the permit and
+/// the `catch_unwind`. However the build ends (value, unwind, or cancellation), the permit and
 /// the guard are released before this returns.
 async fn with_permit<T>(
     cap: Duration,
@@ -212,14 +187,9 @@ async fn with_permit<T>(
 
 /// Submit work to the engine runtime and block the calling thread until it completes.
 ///
-/// The build future is wrapped in `catch_unwind`: a Rolldown or OXC panic that unwinds to
-/// us becomes a typed `BundleFailure` for *this* import. Before this, a panicking task
-/// dropped the channel sender, `recv()` returned `Err`, and the `expect` panicked the
-/// calling analysis thread — destroying the whole batch, including every import already
-/// answered from cache.
-///
-/// The build limit covers the panic that never unwinds at all: one inside a module task
-/// Rolldown spawned, which parks the build forever. See `BUILD_TIMEOUT`.
+/// Every outcome, including a Rolldown or OXC panic, is a typed `BundleFailure` for *this*
+/// import, never a panic on the calling analysis thread (which would lose the whole batch).
+/// A panic that never unwinds is covered by `BUILD_TIMEOUT`.
 fn run_on_engine<T: Send + 'static>(
     cap: Duration,
     work: impl Future<Output = Result<T, BundleFailure>> + Send + 'static,
@@ -231,10 +201,8 @@ fn run_on_engine<T: Send + 'static>(
         let _ = sender.send(outcome);
     });
 
-    // The sender is dropped without a send only if the engine runtime itself is gone.
-    // That is not recoverable, but it is still THIS import's failure, not the calling
-    // thread's panic -- which is the entire point of this function. It is not a panic,
-    // so it does not get to inflate the panic count.
+    // The sender is dropped without a send only if the engine runtime itself is gone. That is
+    // still this import's failure, not a panic, so it does not inflate the panic count.
     receiver.recv().unwrap_or_else(|_| {
         Err(BundleFailure {
             stage: stage::ENGINE_GONE.to_owned(),
@@ -247,7 +215,7 @@ fn run_on_engine<T: Send + 'static>(
 }
 
 /// Rust panic payloads are `&str` for a literal `panic!` and `String` for a formatted one;
-/// anything else is opaque. Name what we can and stay honest about the rest.
+/// anything else is opaque.
 fn panic_failure(payload: &(dyn std::any::Any + Send)) -> BundleFailure {
     let detail = payload
         .downcast_ref::<&'static str>()
@@ -283,16 +251,14 @@ fn timeout_failure(limit: Duration) -> BundleFailure {
 
 /// Run one bundle build behind the daemon-wide permit pool, from a synchronous caller.
 ///
-/// The build limit is a property of this boundary, not of the request: §5 keeps `BundleRequest`
-/// a description of **what to build** — entries, runtime, purpose — which `adapter.rs` turns
-/// into an artifact. Admission control is owned here, and the engine has no business reading it.
+/// Admission control and the build limit are owned here, not carried on the request: §5 keeps
+/// `BundleRequest` a description of what to build.
 pub fn bundle_sync(request: BundleRequest) -> Result<BundleArtifact, BundleFailure> {
     run_on_engine(BUILD_TIMEOUT, ENGINE.bundle(request))
 }
 
-/// Synchronous export enumeration through the same permit pool and the same build limit (§8.4).
-/// An enumeration builds the same package graph as a size build, so it parks on exactly the same
-/// module task and must be held to exactly the same bound.
+/// Synchronous export enumeration through the same permit pool and build limit (§8.4). It
+/// builds the same package graph as a size build, so it can park the same way.
 pub fn enumerate_exports_sync(
     entry_path: PathBuf,
     runtime: ImportRuntime,
@@ -306,10 +272,8 @@ pub fn peak_in_flight() -> usize {
     PEAK_IN_FLIGHT.load(Ordering::Relaxed)
 }
 
-/// Total engine builds admitted through the permit pool since start. A build is
-/// the single most expensive thing the daemon does, so the count is the honest
-/// unit for "did that change actually stop doing work" — it is what the
-/// full-package memo's regression test measures.
+/// Total engine builds admitted through the permit pool since start: the unit tests use to
+/// prove a change stopped doing work.
 pub fn builds_started() -> usize {
     STARTED.load(Ordering::Relaxed)
 }
@@ -332,9 +296,8 @@ pub fn bundle_sync_for_test_panic() -> Result<BundleArtifact, BundleFailure> {
 /// what a panic inside a Rolldown-spawned module task looks like from here: no unwind, no value,
 /// just a parked future holding a permit.
 ///
-/// The caller supplies the limit so a test can play out in milliseconds what production plays
-/// out in seconds: `cap` stands in for `BUILD_TIMEOUT`. The code path is otherwise identical to
-/// `bundle_sync` — same permit, same timeout, same counters.
+/// `cap` stands in for `BUILD_TIMEOUT` so a test runs in milliseconds; the path is otherwise
+/// identical to `bundle_sync` (same permit, timeout, and counters).
 #[doc(hidden)]
 pub fn bundle_sync_for_test_hang(cap: Duration) -> Result<BundleArtifact, BundleFailure> {
     run_on_engine(

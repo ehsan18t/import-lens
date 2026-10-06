@@ -1,16 +1,14 @@
 //! Memo for export enumeration (§8.4).
 //!
-//! Completion asks a package "what do you export?", and the daemon answered with a
-//! full, uncached Rolldown build of the entire package graph — on every popup, for a
-//! list that only changes when the package's files do.
+//! Completion asks a package "what do you export?" on every popup; answering takes a full
+//! Rolldown build of the package graph, for a list that only changes when the package's files do.
 //!
-//! See [`crate::pipeline::build_memo`] for what makes this safe to cache. The enumeration
-//! is fingerprinted against exactly the freshness set the size path uses — its own
-//! read-time module fingerprints PLUS the package and first-party manifests
-//! (`analyze::manifest_augmented_fingerprints`, §8.3) — so it expires precisely when the
-//! export list would have gone wrong. Fingerprinting only the source modules left a
-//! first-party `package.json` edit (its `type`, `exports`, or `sideEffects`) serving the
-//! old list forever, since that edit moves no source file.
+//! See [`crate::pipeline::build_memo`] for what makes this safe to cache. The enumeration is
+//! fingerprinted against the same freshness set the size path uses: its own read-time module
+//! fingerprints plus the package and first-party manifests
+//! (`analyze::manifest_augmented_fingerprints`, §8.3). The manifests are required: a first-party
+//! `package.json` edit (`type`, `exports`, `sideEffects`) changes the list without moving any
+//! source file.
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -26,9 +24,8 @@ static MEMO: LazyLock<BuildMemo<ExportEnumeration>> =
 /// Enumerate a package entry's exports, reusing a previous build's answer while every
 /// file it was derived from is unchanged.
 ///
-/// A memo hit costs nothing; a miss is a full package-graph build, bounded — like every other
-/// build — by `boundary::BUILD_TIMEOUT`. Only a *successful* enumeration is memoized, so a build
-/// that timed out or panicked leaves nothing behind to be served as if it were an answer.
+/// A miss is a full package-graph build, bounded by `boundary::BUILD_TIMEOUT`. Only a successful
+/// enumeration is memoized, so a timed-out or panicked build leaves nothing to be served.
 pub fn enumerate_exports_cached(
     context: &AnalysisContext,
     package_root: &Path,

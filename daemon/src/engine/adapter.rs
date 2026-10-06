@@ -117,9 +117,8 @@ fn build_observations(
 }
 
 fn asset_io_diagnostic(state: &BuildState) -> Option<ImportDiagnostic> {
-    // Unreadable ONLY. An input that is simply absent is a deterministic fact about the package —
-    // saying "retry after the filesystem settles" about it is false, and routing it to the
-    // non-durable `asset_io` stage would refuse a correct measurement from every cache.
+    // Unreadable ONLY. An absent input is a deterministic fact about the package; routing it to
+    // the non-durable `asset_io` stage would refuse a correct measurement from every cache.
     let paths = state.unreadable_asset_paths();
     if paths.is_empty() {
         return None;
@@ -150,27 +149,20 @@ fn build_options(input: InputItem, cwd: PathBuf, runtime: ImportRuntime) -> Bund
         // Strict signatures keep every requested `__il_entry_*` alias alive
         // verbatim in the chunk's export list.
         preserve_entry_signatures: Some(PreserveEntrySignatures::Strict),
-        // Bool(false) inlines dynamic imports into the single chunk; 1.1.5
-        // has no separate inline-dynamic-imports option.
+        // Bool(false) inlines dynamic imports into the single chunk; the pinned
+        // Rolldown has no separate inline-dynamic-imports option.
         code_splitting: Some(CodeSplittingMode::Bool(false)),
-        // None is NOT off in 1.1.5 — it normalizes to dead-code-elimination
-        // minification. The raw chunk must stay byte-faithful (§8.1).
+        // None is NOT off: it normalizes to dead-code-elimination minification.
+        // The raw chunk must stay byte-faithful (§8.1).
         minify: Some(RawMinifyOptions::Bool(false)),
-        // An UNSET platform is derived from the format, and `Esm` derives
-        // `Platform::Browser` — which makes Rolldown append `browser` to the
-        // condition list on top of ours (rolldown_resolver::ResolverConfig::build)
-        // and inject a `process.env.NODE_ENV` define. Both corrupt measurement: the
-        // Server runtime would resolve a package's `browser` export condition, and
-        // the define would dead-code-eliminate branches the runtime keeps.
-        // `Neutral` appends nothing, leaving the per-runtime condition list from the
-        // shared resolver authoritative (§7.1).
+        // An UNSET platform derives `Browser` from `Esm`, which appends `browser` to
+        // our condition list and injects a `process.env.NODE_ENV` define; both
+        // corrupt measurement for the Server runtime. `Neutral` leaves the shared
+        // resolver's per-runtime condition list authoritative (§7.1).
         platform: Some(Platform::Neutral),
-        // Rolldown normalizes an UNSET attach_debug_info to `Simple`, which wraps
-        // every rendered module in `//#region <id>` / `//#endregion` comments. Those
-        // bytes land in `raw_bytes`, and `RenderedModule::rendered_length` sums every
-        // source in a module's vec — the wrappers included — so they are also charged
-        // inside the per-module contributions. Bundler metadata billed to the user as
-        // package cost (§8.1/§8.2).
+        // An UNSET attach_debug_info normalizes to `Simple`, which wraps every module
+        // in `//#region` comments that land in `raw_bytes` and in each module's
+        // `rendered_length` (§8.1/§8.2).
         experimental: Some(ExperimentalOptions {
             attach_debug_info: Some(AttachDebugInfo::None),
             ..ExperimentalOptions::default()
@@ -181,10 +173,9 @@ fn build_options(input: InputItem, cwd: PathBuf, runtime: ImportRuntime) -> Bund
 }
 
 /// Node builtins stay external (§7.1), matched by exact string equality, the same test
-/// Rolldown applies to a string list. Built once, so a build clones an `Arc` instead of
-/// allocating the list. Rolldown asks this about every specifier and every resolved id
-/// (about 4,600 calls for one lodash-es build), so the answer must not allocate: it is a
-/// zero-sized future, and a length check rejects paths before the set lookup.
+/// Rolldown applies to a string list. Rolldown asks this about every specifier and every
+/// resolved id (about 4,600 calls for one lodash-es build), so the answer must not allocate:
+/// it is a zero-sized future, and a length check rejects paths before the set lookup.
 static BUILTIN_EXTERNAL: LazyLock<IsExternal> = LazyLock::new(|| {
     let mut specifiers =
         HashSet::with_capacity(NODE_BUILTIN_MODULES.len() * 2 + NODE_PREFIX_ONLY_MODULES.len());
@@ -302,19 +293,16 @@ async fn build_with_unbound_import_retry(
 /// Whether a failed build may be retried with the unmatched binding stubbed.
 ///
 /// Rolldown raises an unmatched import at `Severity::Error`, so one broken edge **anywhere** in a
-/// package's graph leaves the whole package unmeasured — a package four levels away can drop an
-/// export in a patch release and every dependent becomes unmeasurable.
+/// package's graph would leave the whole package unmeasured.
 ///
-/// Stubbing is sound for an edge BETWEEN dependencies: the user asked for the package, not for that
-/// binding, and every module still renders at its true bytes. It is refused when the build's ENTRY
-/// is the importer. For a size build that is the virtual entry, which imports exactly the export the
-/// user **requested**; guessing that one is what the SRS forbids, and it would turn a typo into a
-/// confident size. For export enumeration it is the real entry, whose own export surface is the
-/// answer, so a stub there would offer a name that does not exist.
+/// Stubbing is sound for an edge BETWEEN dependencies: every module still renders at its true
+/// bytes. It is refused when the build's ENTRY is the importer. For a size build that is the
+/// virtual entry, which imports exactly the export the user requested; guessing it is what the
+/// SRS forbids and would turn a typo into a confident size. For export enumeration it is the real
+/// entry, whose export surface is the answer, so a stub would offer a name that does not exist.
 ///
-/// `ambiguous_export` is excluded on purpose: `shim_missing_exports` only rewrites a `NoMatch`
-/// binding, so a name lost to conflicting star providers fails the retry exactly as it failed the
-/// first attempt, and retrying it would only cost a second build.
+/// `ambiguous_export` is excluded: `shim_missing_exports` only rewrites a `NoMatch` binding, so
+/// the retry would fail identically.
 fn is_internal_unbound_import(failure: &BundleFailure, entry_stable_ids: &[String]) -> bool {
     // No recorded entry means nothing can be protected, so nothing may be stubbed.
     !entry_stable_ids.is_empty()
@@ -355,25 +343,20 @@ fn translate(
         });
     }
 
-    // Two sources, one meaning: bytes this build knows ship and cannot count. Rolldown emitting an
-    // asset beside the chunk (nothing does today), and a directly imported file outside the
-    // measured taxonomy. They share a disclosure because the user's question is the same for both.
+    // Two sources, one disclosure: bytes this build knows ship and cannot count. An asset Rolldown
+    // emitted beside the chunk, and a directly imported file outside the measured taxonomy.
     let mut emitted = emitted_assets(&output);
     emitted.extend(state.unmeasured_assets());
     emitted.sort_by(|left, right| left.path.cmp(&right.path));
     let mut diagnostics = contract_diagnostics(&output.warnings);
-    // Carried from the attempt that FAILED, because a stubbed build reports nothing: Rolldown
-    // synthesizes the symbol and emits no diagnostic at all, so without these the broken edge comes
-    // back as a High-confidence size with the breakage invisible. They are the whole disclosure, and
-    // they are what holds the result at Medium.
+    // Carried from the attempt that FAILED, because a stubbed build emits no diagnostic. They are
+    // the whole disclosure, and what holds the result at Medium rather than High confidence.
     if !unbound_imports.is_empty() {
         diagnostics.extend(unbound_imports);
         diagnostics.push(ImportDiagnostic {
             stage: stage::MISSING_EXPORT.to_owned(),
-            // A FLOOR, and it must say so. Binding to an export that existed would retain whatever
-            // implements it — `walk` was a re-export from a separate `walk.js` one release earlier —
-            // so a stub measures the graph as installed and not the graph a working version would
-            // have. Claiming this is the package's real cost would be a wrong number.
+            // A FLOOR, and it must say so: a real binding would retain whatever implements it, so
+            // a stub measures the graph as installed, not the graph a working version would have.
             message: "a dependency imports a binding its source module does not export; the graph \
                       was measured with that binding stubbed, so whatever the real binding would \
                       have retained is NOT in this size, and the import named above is `undefined` \
@@ -390,10 +373,8 @@ fn translate(
         });
     }
     // A boundary the package did not ask for. Rolldown externalizes an unresolvable bare specifier
-    // it answers `NotFound`, and the plugin extends that to the denial variants so one refused
-    // subpath cannot discard a whole package's measurement. Saying so is not optional: the graph
-    // behind such an edge is absent from the number, and an undisclosed absence is the one failure
-    // this product cannot have.
+    // it answers `NotFound`, and the plugin extends that to the denial variants. The graph behind
+    // such an edge is absent from the number, so it must be disclosed.
     for specifier in state.unresolved_externals() {
         diagnostics.push(ImportDiagnostic {
             stage: diagnostic_stage::EXTERNAL.to_owned(),
@@ -425,16 +406,13 @@ fn translate(
     })
 }
 
-/// The build must produce exactly one JavaScript **chunk** (§7.1). More than one means Rolldown
-/// code-split the graph, and we measure a chunk — so a size taken from one of several would
-/// under-report the package by however much is in the others. That is a typed `output_shape`
-/// failure and stays one.
+/// The build must produce exactly one JavaScript **chunk** (§7.1): a size taken from one of
+/// several code-split chunks would under-report the package, so that is a typed `output_shape`
+/// failure.
 ///
-/// An emitted **asset** is not an output shape failure: it does not make the chunk wrong, it makes
-/// it incomplete, and [`uncounted_assets_diagnostic`] says so without destroying the measurement.
-/// Rolldown emits no asset for a stylesheet (the plugin stubs CSS before Rolldown would reject it,
-/// FR-018a), so this arm only counts what a plugin or a future Rolldown might emit. "One chunk" is
-/// the invariant; "no assets" is not.
+/// An emitted **asset** is not: it makes the chunk incomplete, not wrong, and
+/// [`uncounted_assets_diagnostic`] discloses it. Rolldown emits no asset for a stylesheet (the
+/// plugin stubs CSS, FR-018a). "One chunk" is the invariant; "no assets" is not.
 fn single_chunk(
     output: &rolldown::BundleOutput,
     state: &BuildState,
@@ -477,10 +455,8 @@ fn single_chunk(
 /// Bytes this build knows about that it cannot process, named and totalled.
 ///
 /// The stylesheets, wasm and fonts the graph imported are NOT here: the plugin classifies them and
-/// the pipeline processes them the way they ship and counts them (B2). What is left is anything
-/// **Rolldown itself emitted** beside the chunk — nothing does today, CSS included, but the
-/// output-shape guard no longer treats one as fatal, so it must not be silent either. There is no
-/// file on disk behind an emitted asset to run a processor over, so it is disclosed, not counted.
+/// the pipeline counts them. This is anything **Rolldown itself emitted** beside the chunk; there
+/// is no file on disk behind it to process, so it is disclosed, not counted.
 ///
 /// See [`diagnostic_stage::UNCOUNTED_ASSETS`] for why disclosing bytes costs the result its High
 /// confidence rather than being exempted.
@@ -511,22 +487,16 @@ fn uncounted_assets_diagnostic(assets: &[UncountedAsset]) -> Option<ImportDiagno
 
 fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> BundleFailure {
     let loaded_paths = state.sorted_loaded_paths();
-    // NOT `loaded_paths`. That set is recorded at `module_parsed`, so the one module it can never
-    // contain is the module that failed to parse — which is precisely the one a cached failure has
-    // to expire against. The read-time map is populated in `load`, before Rolldown parses anything,
-    // so it has every module whose bytes this build actually read.
+    // NOT `loaded_paths`: that set is recorded at `module_parsed`, so it never contains the module
+    // that failed to parse, which is the one a cached failure must expire against. The read-time
+    // map is populated in `load`, before parsing.
     let (read_time_fingerprints, _) = build_observations(state);
-    // A breach preempts every diagnostic below, and the ranking agrees: `MODULE_GRAPH_LIMIT` is the
-    // first deterministic stage in `engine::stage`, because a blown graph limit is a fact about the
-    // WHOLE build — it was too big to complete — and not about any one module in it. The two used to
-    // disagree: the stage was ranked where the breach is DETECTED (the plugin's `load` hook, after
-    // resolve), so the declared order promised `resolve` would win a build this arm has always
-    // answered `module_graph_limit`.
+    // A breach preempts every diagnostic below, matching `engine::stage`, where
+    // `MODULE_GRAPH_LIMIT` is the first deterministic stage: it is a fact about the WHOLE build.
     //
-    // It is not a redundant fast path. `stage_for` maps Rolldown event kinds, and NONE of them is a
-    // graph-limit breach — the limit is ours, enforced in the plugin — so the ranking below can
-    // never produce this stage. Remove this arm and a breaching build reports the resolve error of
-    // some module inside a graph that was abandoned: the shrapnel, with the reason hidden.
+    // Not a redundant fast path: no Rolldown event kind is a graph-limit breach (the limit is
+    // enforced in the plugin), so the ranking below can never produce this stage. Without this arm
+    // a breaching build reports some resolve error from the abandoned graph.
     if let Some(breach) = state.take_breach() {
         return BundleFailure {
             stage: stage::MODULE_GRAPH_LIMIT.to_owned(),
@@ -537,12 +507,10 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
         };
     }
 
-    // BELOW the breach, deliberately. An unreadable asset input is request-local and says "retry
-    // after the filesystem settles"; a blown graph limit is a permanent fact about the package. When
-    // both are true the breach is the answer, because reporting the transient one erases a DURABLE
-    // stage: `ASSET_IO` is absent from `DURABLE_RESULT_STAGES` while `MODULE_GRAPH_LIMIT` is in it,
-    // so the mislabel also refuses the failure from every cache and rebuilds the oversized graph on
-    // every keystroke. This arm used to sit above the breach and did exactly that.
+    // BELOW the breach, deliberately. An unreadable asset input is request-local; a blown graph
+    // limit is permanent. `ASSET_IO` is absent from `DURABLE_RESULT_STAGES` while
+    // `MODULE_GRAPH_LIMIT` is in it, so reporting the transient one would refuse the failure from
+    // every cache and rebuild the oversized graph on every keystroke.
     if let Some(asset_io) = asset_io_diagnostic(state) {
         let mut diagnostics = contract_diagnostics(&diagnostics);
         diagnostics.push(asset_io.clone());
@@ -555,20 +523,17 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
         };
     }
 
-    // THE EARLIEST STAGE PRESENT, not the first diagnostic in the vector. Rolldown accumulates
-    // these from module tasks it runs concurrently, so their order is a race — and this stage is
-    // what the user sees (ADR-0006: a failed build has no size, so the stage is the whole answer)
-    // AND what the cache stores. Ranking by pipeline position makes it a fact about the bytes.
-    // `engine::stage::rank` is where the order lives, and why.
+    // THE EARLIEST STAGE PRESENT, not the first diagnostic in the vector: Rolldown accumulates
+    // these from concurrent module tasks, so their order is a race, and this stage is both what the
+    // user sees (ADR-0006) and what the cache stores. `engine::stage::rank` holds the order.
     let failure_stage = diagnostics
         .iter()
         .map(stage_for)
         .min_by_key(|candidate| stage::rank(candidate))
         .unwrap_or(stage::LINK);
     let (read_time_fingerprints, _) = build_observations(state);
-    // Rendered from the SAME ordering, for the same reason: the message and the diagnostic list are
-    // durable values too, and a message whose lines are shuffled by task timing is a different
-    // cached answer for unchanged bytes.
+    // Rendered from the SAME ordering: the message and diagnostic list are cached too, and must not
+    // depend on task timing.
     let diagnostics = contract_diagnostics(&diagnostics);
     let message = if diagnostics.is_empty() {
         "rolldown build failed without diagnostics".to_owned()
@@ -609,18 +574,13 @@ fn stage_for(diagnostic: &BuildDiagnostic) -> &'static str {
 /// machine code plus the rendered message, never a Rolldown type or Debug
 /// representation.
 ///
-/// **Errors and warnings go through the very same mapping.** Warnings used to be stamped
-/// `generate` wholesale, which mislabelled the one diagnostic a user is most likely to meet: an
-/// unresolved import is a **warning** — Rolldown externalizes it and the build SUCCEEDS (construct
-/// matrix rows 24/25) — so the note saying "this package imports something that is not installed
-/// and its bytes are not in this number" arrived labelled as a code-generation problem, on a
-/// perfectly good measurement. A diagnostic's stage is where it came from; which side of the
-/// build it landed on does not change that.
+/// **Errors and warnings go through the same mapping.** A diagnostic's stage is where it came
+/// from, not which side of the build it landed on: an unresolved import is a warning (Rolldown
+/// externalizes it and the build succeeds) and must still read as `resolve`.
 ///
-/// **Sorted, because the input order is a race.** Rolldown accumulates both vectors from module
-/// tasks it runs concurrently, and these diagnostics are cached on the result. Ordering them by
-/// rank, then by text, makes the stored value a function of the bytes rather than of the machine
-/// the build happened to run on.
+/// **Sorted, because the input order is a race.** Rolldown accumulates both vectors from
+/// concurrent module tasks, and these diagnostics are cached; ordering by rank, then text, makes
+/// the stored value a function of the bytes.
 fn contract_diagnostics(diagnostics: &[BuildDiagnostic]) -> Vec<ImportDiagnostic> {
     let mut contract: Vec<ImportDiagnostic> = diagnostics
         .iter()
@@ -680,12 +640,9 @@ mod tests {
         }
     }
 
-    /// The gate deciding whether a failed build may be retried with the unmatched binding stubbed.
-    /// It is the whole of what separates "a dependency's broken edge is measured and disclosed" from
-    /// "a typo in the user's own import comes back as a confident size".
-    ///
-    /// A Guard as much as a Logic test: loosening any arm — dropping the entry check, admitting
-    /// `ambiguous_export`, accepting a mixed diagnostic list — turns it red.
+    /// The gate separating "a dependency's broken edge is measured and disclosed" from "a typo in
+    /// the user's own import comes back as a confident size". Loosening any arm (the entry check,
+    /// admitting `ambiguous_export`, accepting a mixed diagnostic list) turns it red.
     #[test]
     fn only_an_internal_missing_export_may_be_retried_with_a_stub() {
         let failure = |diagnostics: Vec<ImportDiagnostic>| BundleFailure {
@@ -759,16 +716,10 @@ mod tests {
         );
     }
 
-    /// A missing optional asset says "retry after the filesystem settles"; a blown graph limit is a
-    /// permanent fact about the package. When both are recorded, the breach has to win.
-    ///
-    /// Reporting the transient one instead does two things, and the second is the expensive one:
-    /// the user is told to retry a condition that will never change, and — because `asset_io` is
-    /// absent from `DURABLE_RESULT_STAGES` while `module_graph_limit` is in it — the failure is
-    /// refused by every durable store, so the oversized graph is rebuilt on every keystroke.
-    ///
-    /// This is a Guard: the asset arm was once inserted ABOVE the breach, contradicting the ordering
-    /// comment in this very file. Re-inserting it there turns this red.
+    /// An unreadable asset input is transient; a blown graph limit is a permanent fact about the
+    /// package. When both are recorded the breach must win, or the failure is refused by every
+    /// durable store and the oversized graph is rebuilt on every keystroke. Moving the asset arm
+    /// above the breach turns this red.
     #[test]
     fn a_durable_breach_outranks_a_transient_asset_read_failure() {
         let state = BuildState::default();
