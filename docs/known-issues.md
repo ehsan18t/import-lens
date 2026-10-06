@@ -745,9 +745,9 @@ From the release review's improvement list. All real; none blocking. Each is a k
 
 | # | Item |
 | --- | --- |
-| P1 | **Prewarm priority inversion.** A user typing an import can queue behind two in-progress prewarm builds. Reserve an interactive permit. |
 | P9 | **The completion path still hash-verifies every first-party file of the package graph on every popup.** Installed modules are re-checked once per `REVERIFY_TTL` (measured: 2,000 installed modules, about 41 ms per lookup down to about 3 µs, debug build, Windows), but a first-party package's own files are re-read and re-hashed per keystroke inside its import's braces. That part stays: nothing reports a first-party edit (D3 in `cache/memory.rs`), and an equal-length, mtime-preserving rewrite defeats a len+mtime check, so any window would serve a stale export list. |
 | P10 | **`ENGINE_PERMITS` is 2, tried at 4 (Task 13), measured, reverted.** Not deferred; see the outcome below. |
+| P11 | **An interactive request that joins a prewarm's in-flight analysis waits at prewarm priority.** Prewarm builds hold at most `ENGINE_PERMITS - 1` permits, so a user's own builds never queue behind them. But a namespace or default import whose cache key a prewarm is already building joins that single-flight build, which may be queued behind the few other prewarm builds already inside the boundary (at most the drain width; foreground work cancels the rest). Bounded and rare (prewarm builds only namespace and default imports); promoting a flight's priority on join is not worth the mechanism. |
 
 **P10 outcome (Task 13, measured 2026-07-15, reverted).** Raising `engine_permits()` to
 `available_parallelism().clamp(2, 4)` was implemented and measured against the section 10.6 gate on an 8+-core
@@ -781,6 +781,7 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| P1 | A user's interactive build could queue behind prewarm builds holding every engine permit | 2026-10-06 |
 | P5 | The 32-entry dependency-path index evicted an arbitrary set, so a first-party set in use could lose its deep-module freshness signal | 2026-10-06 |
 | P7 | Every build rebuilt the fixed builtin-external list (about 180 `String`s) and the resolve options | 2026-10-06 |
 | P4 | The linked chunk was copied purely to move it into the artifact | 2026-10-06 |

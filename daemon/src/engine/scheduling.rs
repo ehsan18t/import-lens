@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use super::boundary::ENGINE_PERMITS;
+use super::boundary::{ENGINE_PERMITS, is_background, run_as_background};
 
 /// Two permits, but a worker keeps running after it releases one: minify, compress,
 /// fingerprint, insert. At exactly `ENGINE_PERMITS` workers that post-build tail
@@ -40,11 +40,12 @@ where
     let workers = workers.min(items.len());
     let cursor = AtomicUsize::new(0);
     let completed = Mutex::new(Vec::with_capacity(items.len()));
+    let background = is_background();
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
-                loop {
+                let drain = || loop {
                     let index = cursor.fetch_add(1, Ordering::Relaxed);
                     let Some(item) = items.get(index) else {
                         break;
@@ -54,6 +55,12 @@ where
                         .lock()
                         .expect("drain results should not be poisoned")
                         .push(result);
+                };
+                // A worker's builds keep the priority of the caller that queued them.
+                if background {
+                    run_as_background(drain);
+                } else {
+                    drain();
                 }
             });
         }
@@ -200,8 +207,23 @@ mod tests {
 
     use super::{
         MISS_DRAIN_WORKERS, drain_classified, drain_misses_owned, drain_ordered,
-        drain_ordered_owned,
+        drain_ordered_owned, is_background, run_as_background,
     };
+
+    /// A prewarm drain's builds run on worker threads; each must still be admitted as
+    /// background work, and an interactive drain's must not be.
+    #[test]
+    fn drain_workers_keep_the_callers_build_priority() {
+        let items: Vec<usize> = (0..MISS_DRAIN_WORKERS * 2).collect();
+        let marks = |items: &[usize]| drain_ordered(items, |_, _| is_background());
+
+        assert!(run_as_background(|| marks(&items)).iter().all(|mark| *mark));
+        assert!(marks(&items).iter().all(|mark| !*mark));
+        assert!(
+            !is_background(),
+            "the mark is restored when the work returns"
+        );
+    }
 
     /// The classified drain reorders by construction: hits settle on the Rayon pool
     /// while misses queue for the engine, so the two halves finish interleaved and

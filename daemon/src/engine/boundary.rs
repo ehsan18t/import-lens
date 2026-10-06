@@ -7,6 +7,7 @@
 //! bounded miss drain (`scheduling`), preserving final input order without
 //! parking the global Rayon pool.
 
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -65,6 +66,13 @@ pub const ENGINE_PERMITS: usize = 2;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(8);
 
 static PERMITS: Semaphore = Semaphore::const_new(ENGINE_PERMITS);
+/// The engine permits background builds may hold at once; see [`run_as_background`].
+static BACKGROUND_PERMITS: Semaphore = Semaphore::const_new(ENGINE_PERMITS - 1);
+const _: () = assert!(
+    ENGINE_PERMITS >= 2,
+    "a permit must remain for interactive builds"
+);
+static WAITING: AtomicUsize = AtomicUsize::new(0);
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static PEAK_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static STARTED: AtomicUsize = AtomicUsize::new(0);
@@ -124,17 +132,75 @@ impl Drop for InFlight {
     }
 }
 
+/// Counts a build from submission to admission; decrements on drop for the same reason
+/// `InFlight` does.
+struct Waiting;
+
+impl Waiting {
+    fn enter() -> Self {
+        WAITING.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        WAITING.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    static BACKGROUND: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `work` with every engine build it starts on this thread admitted as background work.
+///
+/// Prewarm runs under this. A background build may hold at most `ENGINE_PERMITS - 1` permits,
+/// so however much prewarm is queued, one permit is always held by or free for an interactive
+/// build: a user's import never queues behind prewarm builds holding every permit. The miss
+/// drain carries the mark onto its worker threads.
+pub fn run_as_background<R>(work: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BACKGROUND.with(|background| background.set(self.0));
+        }
+    }
+    let _restore = Restore(BACKGROUND.with(|background| background.replace(true)));
+    work()
+}
+
+pub(crate) fn is_background() -> bool {
+    BACKGROUND.with(Cell::get)
+}
+
 /// Everything that has to happen inside the permit: the in-flight guard, the build timeout, and
 /// the `catch_unwind`. However the build ends — value, unwind, or cancellation — the permit and
 /// the guard are released before this returns.
 async fn with_permit<T>(
     cap: Duration,
+    background: bool,
     work: impl Future<Output = Result<T, BundleFailure>>,
 ) -> Result<T, BundleFailure> {
+    let waiting = Waiting::enter();
+    // Always background-then-engine, and interactive builds take only the engine permit, so
+    // no cycle can form. Both semaphores are FIFO, so a queued background build is admitted
+    // in turn and cannot be starved by a stream of interactive builds.
+    let _background = if background {
+        Some(
+            BACKGROUND_PERMITS
+                .acquire()
+                .await
+                .expect("background permit semaphore is never closed"),
+        )
+    } else {
+        None
+    };
     let _permit = PERMITS
         .acquire()
         .await
         .expect("engine permit semaphore is never closed");
+    drop(waiting);
 
     let _in_flight = InFlight::enter();
     match tokio::time::timeout(cap, AssertUnwindSafe(work).catch_unwind()).await {
@@ -159,8 +225,9 @@ fn run_on_engine<T: Send + 'static>(
     work: impl Future<Output = Result<T, BundleFailure>> + Send + 'static,
 ) -> Result<T, BundleFailure> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let background = is_background();
     engine_runtime().spawn(async move {
-        let outcome = with_permit(cap, work).await;
+        let outcome = with_permit(cap, background, work).await;
         let _ = sender.send(outcome);
     });
 
@@ -245,6 +312,13 @@ pub fn peak_in_flight() -> usize {
 /// full-package memo's regression test measures.
 pub fn builds_started() -> usize {
     STARTED.load(Ordering::Relaxed)
+}
+
+/// Builds submitted to the boundary and not yet admitted. Lets the admission test know every
+/// build it started has reached the semaphores before it measures who gets in.
+#[doc(hidden)]
+pub fn builds_waiting() -> usize {
+    WAITING.load(Ordering::Relaxed)
 }
 
 /// Drives a build future that panics, through the real permit/runtime path. Exists so the
