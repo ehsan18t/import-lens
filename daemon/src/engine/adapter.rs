@@ -2,8 +2,12 @@
 //! places allowed to import the `rolldown` crate family; every public
 //! surface translates to the contract types in `mod.rs`.
 
+use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll};
 
 use rolldown::plugin::Pluginable;
 use rolldown::{
@@ -141,7 +145,7 @@ fn build_options(input: InputItem, cwd: PathBuf, runtime: ImportRuntime) -> Bund
     BundlerOptions {
         input: Some(vec![input]),
         cwd: Some(cwd),
-        external: Some(builtin_external()),
+        external: Some(BUILTIN_EXTERNAL.clone()),
         format: Some(OutputFormat::Esm),
         // Strict signatures keep every requested `__il_entry_*` alias alive
         // verbatim in the chunk's export list.
@@ -171,26 +175,67 @@ fn build_options(input: InputItem, cwd: PathBuf, runtime: ImportRuntime) -> Bund
             attach_debug_info: Some(AttachDebugInfo::None),
             ..ExperimentalOptions::default()
         }),
-        resolve: Some(mapped_resolve_options(runtime)),
+        resolve: Some(resolve_options_for(runtime)),
         ..BundlerOptions::default()
     }
 }
 
-/// Node builtins stay external (§7.1); Rolldown matches these against the
-/// raw specifier by exact string equality.
-fn builtin_external() -> IsExternal {
+/// Node builtins stay external (§7.1), matched by exact string equality, the same test
+/// Rolldown applies to a string list. Built once, so a build clones an `Arc` instead of
+/// allocating the list. Rolldown asks this about every specifier and every resolved id
+/// (about 4,600 calls for one lodash-es build), so the answer must not allocate: it is a
+/// zero-sized future, and a length check rejects paths before the set lookup.
+static BUILTIN_EXTERNAL: LazyLock<IsExternal> = LazyLock::new(|| {
     let mut specifiers =
-        Vec::with_capacity(NODE_BUILTIN_MODULES.len() * 2 + NODE_PREFIX_ONLY_MODULES.len());
+        HashSet::with_capacity(NODE_BUILTIN_MODULES.len() * 2 + NODE_PREFIX_ONLY_MODULES.len());
     for module in NODE_BUILTIN_MODULES {
-        specifiers.push((*module).to_owned());
-        specifiers.push(format!("node:{module}"));
+        specifiers.insert((*module).to_owned());
+        specifiers.insert(format!("node:{module}"));
     }
     // Prefix-only builtins carry their `node:` prefix already, and must NOT be added
     // bare: the bare spelling belongs to whatever npm package owns that name.
     for module in NODE_PREFIX_ONLY_MODULES {
-        specifiers.push((*module).to_owned());
+        specifiers.insert((*module).to_owned());
     }
-    IsExternal::from(specifiers)
+    let longest = specifiers.iter().map(String::len).max().unwrap_or(0);
+    IsExternal::Fn(Some(Arc::new(
+        move |specifier: &str, _importer, _is_resolved| {
+            if specifier.len() <= longest && specifiers.contains(specifier) {
+                Box::pin(Answer::<_, true>(PhantomData))
+            } else {
+                Box::pin(Answer::<_, false>(PhantomData))
+            }
+        },
+    )))
+});
+
+/// A ready `Ok(EXTERNAL)` that is zero-sized, so boxing it does not allocate.
+struct Answer<E, const EXTERNAL: bool>(PhantomData<fn() -> E>);
+
+impl<E, const EXTERNAL: bool> Future for Answer<E, EXTERNAL> {
+    type Output = Result<bool, E>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(Ok(EXTERNAL))
+    }
+}
+
+/// The mapped resolve options per runtime, built once; each build clones its runtime's.
+fn resolve_options_for(runtime: ImportRuntime) -> ResolveOptions {
+    static MAPPED: LazyLock<[ResolveOptions; 3]> = LazyLock::new(|| {
+        [
+            ImportRuntime::Component,
+            ImportRuntime::Client,
+            ImportRuntime::Server,
+        ]
+        .map(mapped_resolve_options)
+    });
+    let [component, client, server] = &*MAPPED;
+    match runtime {
+        ImportRuntime::Component => component.clone(),
+        ImportRuntime::Client => client.clone(),
+        ImportRuntime::Server => server.clone(),
+    }
 }
 
 /// The direct resolver's per-runtime configuration is the single source of
@@ -596,6 +641,44 @@ fn contract_diagnostics(diagnostics: &[BuildDiagnostic]) -> Vec<ImportDiagnostic
 mod tests {
     use super::*;
     use crate::engine::plugin::{AssetInputFailure, BuildState};
+
+    fn is_builtin_external(specifier: &str) -> bool {
+        use futures_util::FutureExt;
+        BUILTIN_EXTERNAL
+            .call(specifier, None, false)
+            .now_or_never()
+            .expect("the builtin answer is ready at once")
+            .expect("the builtin answer cannot fail")
+    }
+
+    /// Every builtin stays external under both spellings, a prefix-only builtin only under its
+    /// `node:` spelling (the bare name belongs to an npm package), and nothing else is external.
+    #[test]
+    fn exactly_the_node_builtins_are_external() {
+        for module in NODE_BUILTIN_MODULES {
+            assert!(is_builtin_external(module), "{module}");
+            assert!(
+                is_builtin_external(&format!("node:{module}")),
+                "node:{module}"
+            );
+        }
+        for module in NODE_PREFIX_ONLY_MODULES {
+            assert!(is_builtin_external(module), "{module}");
+            let bare = module
+                .strip_prefix("node:")
+                .expect("prefix-only builtins carry node:");
+            assert!(!is_builtin_external(bare), "{bare} is an npm package name");
+        }
+        for specifier in [
+            "react",
+            "./fs",
+            "fs/",
+            "node:react",
+            "C:/pkg/node_modules/fs/index.js",
+        ] {
+            assert!(!is_builtin_external(specifier), "{specifier}");
+        }
+    }
 
     /// The gate deciding whether a failed build may be retried with the unmatched binding stubbed.
     /// It is the whole of what separates "a dependency's broken edge is measured and disclosed" from
