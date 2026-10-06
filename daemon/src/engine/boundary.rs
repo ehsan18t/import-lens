@@ -81,6 +81,11 @@ fn engine_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(engine_runtime_workers())
+            // Rolldown reads every module through `spawn_blocking` here. Tokio's default of 512
+            // lets one build grow 80 to 150 reader threads, each keeping an allocator heap until
+            // its keep-alive expires; the reads are short, so queueing them costs nothing. Never
+            // `block_in_place` on this runtime: against a capped pool it can deadlock.
+            .max_blocking_threads(engine_runtime_workers())
             .thread_name("il-engine")
             .enable_all()
             .build()
