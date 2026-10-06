@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -60,6 +60,7 @@ pub(super) fn collect_referenced_assets(
     let mut uncounted = BTreeMap::new();
     let mut omissions = BTreeSet::new();
     let mut external = BTreeSet::new();
+    let mut located = HashSet::new();
 
     let mut dependencies = dependencies.into_iter();
     while should_continue() {
@@ -68,7 +69,7 @@ pub(super) fn collect_referenced_assets(
         };
         match dependency {
             Dependency::Url(dependency) => {
-                match collect_supported_asset(dependency, stat, read_asset) {
+                match collect_supported_asset(dependency, &mut located, stat, read_asset) {
                     Some(SupportedAsset::Collected(asset)) => {
                         assets.entry(asset.path.clone()).or_insert(asset);
                     }
@@ -84,8 +85,8 @@ pub(super) fn collect_referenced_assets(
                     Some(SupportedAsset::External(message)) => {
                         external.insert(message);
                     }
-                    // Nothing at all: a `data:` payload already inside the counted CSS text, or a bare
-                    // fragment pointing at the current document.
+                    // Nothing at all: a `data:` payload already inside the counted CSS text, a bare
+                    // fragment pointing at the current document, or a file already located.
                     None => {}
                 }
             }
@@ -138,8 +139,12 @@ fn external_import(dependency: ImportDependency) -> Option<String> {
     ))
 }
 
+/// `located` holds every file path this collection has already examined. An icon font names the
+/// same few files from dozens of rules, and each repeat would cost a canonicalize (a handle open on
+/// Windows) and a stat for a file already in its bucket, its fingerprint already in the ledger.
 fn collect_supported_asset(
     dependency: UrlDependency,
+    located: &mut HashSet<PathBuf>,
     stat: &impl Fn(&Path) -> std::io::Result<fs::Metadata>,
     read_asset: &impl Fn(&Path, AssetKind) -> std::io::Result<CollectedAsset>,
 ) -> Option<SupportedAsset> {
@@ -190,6 +195,9 @@ fn collect_supported_asset(
     }
 
     let path = source_file.parent()?.join(resource);
+    if !located.insert(path.clone()) {
+        return None;
+    }
     let path = fs::canonicalize(&path).unwrap_or(path);
     let metadata = stat(&path);
     let raw_bytes = metadata.as_ref().map_or(0, |metadata| metadata.len());
@@ -304,5 +312,57 @@ fn hex_value(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lightningcss::dependencies::{Location, SourceRange};
+    use std::cell::Cell;
+
+    fn url_in(sheet: &Path, url: &str) -> Dependency {
+        let at = Location { line: 1, column: 1 };
+        Dependency::Url(UrlDependency {
+            url: url.to_owned(),
+            placeholder: String::new(),
+            loc: SourceRange {
+                file_path: sheet.to_string_lossy().into_owned(),
+                start: at,
+                end: at,
+            },
+        })
+    }
+
+    #[test]
+    fn a_file_named_by_many_rules_is_located_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-css-located-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("fixture dir");
+        let files = ["a.png", "b.png", "c.png"];
+        for file in files {
+            fs::write(dir.join(file), [7_u8; 16]).expect("fixture file");
+        }
+        let sheet = dir.join("index.css");
+        let stats = Cell::new(0_usize);
+
+        let collected = collect_referenced_assets(
+            (0..50).map(|rule| url_in(&sheet, &format!("./{}", files[rule % files.len()]))),
+            &|path| {
+                stats.set(stats.get() + 1);
+                fs::metadata(path)
+            },
+            &|path, _| panic!("an image is disclosed, never read: {}", path.display()),
+            &|| true,
+        );
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(stats.get(), files.len(), "one stat per file, not per rule");
+        assert_eq!(collected.uncounted.len(), files.len());
+        assert!(collected.uncounted.iter().all(|asset| asset.bytes == 16));
+        assert!(collected.omissions.is_empty(), "{:?}", collected.omissions);
     }
 }

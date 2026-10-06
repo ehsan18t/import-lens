@@ -280,24 +280,12 @@ stats are not charged to the byte ledger because a stat moves no bytes.
 Recorded rather than fixed because the bound already exists and adding a second accounting mechanism
 for zero-byte operations would be more machinery than the risk justifies.
 
-### D28: A CSS `url()` reference is canonicalized and stat'd before dedup
-**Status: Accepted** · Measured 2026-07-19
+### D28: A counted CSS resource is canonicalized more than once per build
+**Status: Accepted** · Measured 2026-07-19, narrowed 2026-10-06
 
-`collect_supported_asset` canonicalizes and stats every `url()` reference before the collection that
-would deduplicate them, so an icon-font stylesheet naming three files across fifty rules pays fifty
-pairs rather than three. The ledger's snapshot then canonicalizes again for a first-time counted
-resource. `plugin.rs` memoizes `canonicalize` for exactly this reason — on Windows it is a
-file-handle open — and this path has no such memo.
+`collect_referenced_assets` examines each file a stylesheet's `url()` references name once per collection, so an icon-font sheet naming three files from fifty rules pays three canonicalize-and-stat pairs, not fifty. What remains: a first-time counted font or wasm file is canonicalized twice more by the ledger's snapshot (`snapshot_if_present`, then `snapshot`), and each per-sheet retry collects its own sheet's references again. On Windows a canonicalize is a file-handle open, about 0.12 ms per reference as measured when every repeat paid it.
 
-Measured, release build, 20 runs: 50 references across 3 files costs **8.20 ms** per asset stage
-against **2.40 ms** for 3 references across the same 3 files. About **0.12 ms per reference**, so the
-worst realistic shape spends roughly 6 ms more than it needs to, per keystroke.
-
-Accepted rather than fixed: that is a fifth of the +33 ms the product already accepted to halve
-brotli overstatement, it moves no number and can wedge nothing, and a memo on this path sits directly
-on the read that freshness is derived from -- a cache there is worth more care than 6 ms buys. Revisit
-if the asset stage ever shows up in a p95 regression; the fix is a per-build memo keyed on the
-requested path, mirroring the one the plugin already has.
+Accepted: it moves no number and can wedge nothing, and a memo on the snapshot path sits directly on the read that freshness is derived from, which is worth more care than a fraction of a millisecond buys. Revisit if the asset stage shows up in a p95 regression.
 
 ### D24: A loader suffix on a non-JavaScript, non-asset module still fails the build
 **Status: Accepted** · Blocker identified 2026-07-19
