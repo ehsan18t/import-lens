@@ -17,7 +17,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args(env::args().skip(1))?;
     let pipe = args.pipe.ok_or("missing required --pipe argument")?;
 
+    // The IPC runtime only multiplexes one connection's frames; every handler runs on the
+    // blocking pool and every build on the engine runtime, so a worker per core would only
+    // add idle threads, each holding its own allocator heap.
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()?;
     let result = runtime.block_on(run_server(&pipe, args.storage));
