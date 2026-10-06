@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -19,21 +19,25 @@ use std::{
 const REGISTRY_PERSIST_BATCH: usize = 16;
 
 /// On-disk schema version for the registry metadata file. Bumping this (any
-/// format change to the persisted entries) makes `load_entries` wipe a file
+/// format change to the persisted entries) makes `load_snapshot` wipe a file
 /// written under a different version instead of misparsing it. Scoped to the
 /// registry file only: a bundle-cache bump never touches this and vice-versa
 /// (§11).
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 
 /// Versioned envelope wrapping the persisted entry map. Storing the bare
-/// `HashMap` gave `load_entries` no way to tell a schema change from valid data;
+/// `HashMap` gave the loader no way to tell a schema change from valid data;
 /// wrapping it lets the loader detect a wrong `schema_version` (or a
 /// pre-envelope bare-map file, which simply fails to parse as this struct) and
 /// wipe rather than misinterpret stale bytes.
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct RegistrySnapshot {
     schema_version: u32,
     entries: HashMap<String, RegistryPackageMetadataEntry>,
+    /// Unix millis of the last `clear()` by any daemon sharing the file. A daemon that still holds
+    /// entries from before it drops them instead of writing them back.
+    #[serde(default)]
+    cleared_at: u64,
 }
 
 /// Borrowing twin of `RegistrySnapshot` used only to MEASURE the serialized
@@ -44,12 +48,15 @@ struct RegistrySnapshot {
 struct RegistrySnapshotRef<'a> {
     schema_version: u32,
     entries: &'a HashMap<String, RegistryPackageMetadataEntry>,
+    cleared_at: u64,
 }
 
 #[derive(Debug)]
 pub struct RegistryMetadataCache {
     path: PathBuf,
     entries: Mutex<HashMap<String, RegistryPackageMetadataEntry>>,
+    /// The newest `cleared_at` this process has applied to `entries`.
+    cleared_at: AtomicU64,
     persist_lock: Mutex<()>,
     unpersisted_writes: AtomicUsize,
 }
@@ -57,10 +64,11 @@ pub struct RegistryMetadataCache {
 impl RegistryMetadataCache {
     pub fn new(storage_path: PathBuf) -> Self {
         let path = storage_path.join(REGISTRY_CACHE_FILE_NAME);
-        let entries = load_entries(&path);
+        let snapshot = load_snapshot(&path);
         Self {
             path,
-            entries: Mutex::new(entries),
+            entries: Mutex::new(snapshot.entries),
+            cleared_at: AtomicU64::new(snapshot.cleared_at),
             persist_lock: Mutex::new(()),
             unpersisted_writes: AtomicUsize::new(0),
         }
@@ -70,8 +78,22 @@ impl RegistryMetadataCache {
         Self {
             path: PathBuf::new(),
             entries: Mutex::new(HashMap::new()),
+            cleared_at: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             unpersisted_writes: AtomicUsize::new(0),
+        }
+    }
+
+    /// Apply a clear another daemon recorded in the shared file: drop every entry this process
+    /// still holds from before it. Called under the entries lock, before a merge with disk.
+    fn adopt_clear(
+        &self,
+        entries: &mut HashMap<String, RegistryPackageMetadataEntry>,
+        cleared_at: u64,
+    ) {
+        if cleared_at > self.cleared_at.load(Ordering::Acquire) {
+            entries.retain(|_, entry| entry.updated_at > cleared_at);
+            self.cleared_at.store(cleared_at, Ordering::Release);
         }
     }
 
@@ -124,7 +146,7 @@ impl RegistryMetadataCache {
         if had == 0 {
             return Ok(());
         }
-        if let Err(error) = self.persist_snapshot(None, true) {
+        if let Err(error) = self.persist_snapshot() {
             // Restore the dirty count so a later flush retries.
             self.unpersisted_writes.fetch_add(had, Ordering::AcqRel);
             return Err(error);
@@ -176,6 +198,8 @@ impl RegistryMetadataCache {
                 return Err("registry cache lock poisoned".to_owned());
             };
             entries.clear();
+            self.cleared_at
+                .fetch_max(crate::time::unix_millis_now(), Ordering::AcqRel);
             self.unpersisted_writes.store(0, Ordering::Release);
             entries.clone()
         };
@@ -253,14 +277,9 @@ impl RegistryMetadataCache {
             // Merge before pruning so the prune/evict operate on the union of every
             // process's writes and the authoritative write below cannot silently
             // clobber a sibling window's fresh disjoint entries.
-            for (key, on_disk) in load_entries(&self.path) {
-                let keep_ours = entries
-                    .get(&key)
-                    .is_some_and(|ours| ours.updated_at >= on_disk.updated_at);
-                if !keep_ours {
-                    entries.insert(key, on_disk);
-                }
-            }
+            let on_disk = load_snapshot(&self.path);
+            self.adopt_clear(&mut entries, on_disk.cleared_at);
+            merge_newest(&mut entries, on_disk.entries);
             let mut removed = prune_expired_entries(&mut entries, now_ms, retention_ms);
             if let Some(max_bytes) = max_bytes {
                 removed += evict_oldest_over_budget(&mut entries, max_bytes);
@@ -292,55 +311,29 @@ impl RegistryMetadataCache {
         )
     }
 
-    /// Writes the current snapshot. `prune_older_than = Some((now, retention))`
-    /// drops entries past the retention window from the snapshot before writing,
-    /// so the orphan purge's deletions stick; `None` keeps every entry (the
-    /// default flush path — automatic pruning would break tests that persist
-    /// entries with synthetic timestamps).
+    /// Writes the current snapshot unioned with the on-disk view. The file is shared by every
+    /// workspace's daemon, so another process may have persisted entries since this one loaded:
+    /// the newest `updated_at` per package wins instead of this write clobbering theirs. A clear
+    /// another daemon recorded is applied first, so the entries it removed are not written back.
+    /// A tiny cross-process read->rename window remains.
     ///
-    /// `union == true` merges the on-disk view in before writing — the
-    /// cross-process safety for normal flushes. `union == false` writes exactly
-    /// the in-memory snapshot (after any prune), AUTHORITATIVELY: it does not
-    /// merge the on-disk entries back in, which is what lets a `clear()` (or a
-    /// retention deletion) actually shrink the shared file instead of being
-    /// resurrected from disk on the next save.
-    fn persist_snapshot(
-        &self,
-        prune_older_than: Option<(u64, u64)>,
-        union: bool,
-    ) -> Result<(), String> {
+    /// The authoritative writes (`clear`, the maintenance compaction) do not come through here:
+    /// a union would merge the entries they just dropped straight back in.
+    fn persist_snapshot(&self) -> Result<(), String> {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
         let Ok(_persist_guard) = self.persist_lock.lock() else {
             return Err("registry cache persist lock poisoned".to_owned());
         };
-        let Ok(mut snapshot) = self.entries.lock().map(|entries| entries.clone()) else {
+        let on_disk = load_snapshot(&self.path);
+        let Ok(mut snapshot) = self.entries.lock().map(|mut entries| {
+            self.adopt_clear(&mut entries, on_disk.cleared_at);
+            entries.clone()
+        }) else {
             return Err("registry cache lock poisoned".to_owned());
         };
-        // The registry cache is shared across every workspace's daemon via global
-        // storage. Another process may have persisted entries since we loaded, so
-        // union the on-disk view in (keeping the newest `updated_at` per package)
-        // before this full-snapshot write, instead of clobbering their entries.
-        // A tiny cross-process read->rename race window remains, but this turns
-        // "clobber everything another process wrote" into "clobber only what it
-        // wrote in the few ms between our read and rename".
-        //
-        // An authoritative write (`union == false`) intentionally skips this: the
-        // caller wants the in-memory snapshot to become the file verbatim.
-        if union {
-            for (key, on_disk) in load_entries(&self.path) {
-                let keep_ours = snapshot
-                    .get(&key)
-                    .is_some_and(|ours| ours.updated_at >= on_disk.updated_at);
-                if !keep_ours {
-                    snapshot.insert(key, on_disk);
-                }
-            }
-        }
-        if let Some((now_ms, retention_ms)) = prune_older_than {
-            prune_expired_entries(&mut snapshot, now_ms, retention_ms);
-        }
+        merge_newest(&mut snapshot, on_disk.entries);
         self.write_snapshot(&snapshot)
     }
 
@@ -361,6 +354,7 @@ impl RegistryMetadataCache {
         let bytes = serde_json::to_vec(&RegistrySnapshotRef {
             schema_version: REGISTRY_SCHEMA_VERSION,
             entries: snapshot,
+            cleared_at: self.cleared_at.load(Ordering::Acquire),
         })
         .map_err(|error| error.to_string())?;
         // Persist atomically: a direct `fs::write` to the live path can truncate the
@@ -368,7 +362,7 @@ impl RegistryMetadataCache {
         // snapshot to a temp file, then rename it over the target.
         // Per-process temp name: the cache lives in shared global storage, so a
         // fixed temp path would let two windows' writes interleave into one file
-        // and rename corrupt JSON into place (which load_entries then silently
+        // and rename corrupt JSON into place (which load_snapshot then silently
         // resets to empty). Each process writes its own complete, merged file;
         // renames are atomic and the last one wins with a superset snapshot.
         let temp_path = self
@@ -389,9 +383,9 @@ pub fn cache_key(package_name: &str) -> String {
     package_name.to_owned()
 }
 
-fn load_entries(path: &Path) -> HashMap<String, RegistryPackageMetadataEntry> {
+fn load_snapshot(path: &Path) -> RegistrySnapshot {
     let Ok(contents) = fs::read_to_string(path) else {
-        return HashMap::new();
+        return RegistrySnapshot::default();
     };
     // Wipe on schema mismatch: a parse failure (e.g. a pre-envelope bare-map
     // file, or a truncated/corrupt write) or a `schema_version` this build does
@@ -399,8 +393,23 @@ fn load_entries(path: &Path) -> HashMap<String, RegistryPackageMetadataEntry> {
     // sanctioned one-time cold-cache moment (§11), scoped to the registry file —
     // it never touches the bundle shards.
     match serde_json::from_str::<RegistrySnapshot>(&contents) {
-        Ok(snapshot) if snapshot.schema_version == REGISTRY_SCHEMA_VERSION => snapshot.entries,
-        _ => HashMap::new(),
+        Ok(snapshot) if snapshot.schema_version == REGISTRY_SCHEMA_VERSION => snapshot,
+        _ => RegistrySnapshot::default(),
+    }
+}
+
+/// Merge `on_disk` into `entries`, keeping the newest `updated_at` per package.
+fn merge_newest(
+    entries: &mut HashMap<String, RegistryPackageMetadataEntry>,
+    on_disk: HashMap<String, RegistryPackageMetadataEntry>,
+) {
+    for (key, on_disk) in on_disk {
+        let keep_ours = entries
+            .get(&key)
+            .is_some_and(|ours| ours.updated_at >= on_disk.updated_at);
+        if !keep_ours {
+            entries.insert(key, on_disk);
+        }
     }
 }
 
@@ -410,18 +419,25 @@ fn prune_expired_entries(
     retention_ms: u64,
 ) -> usize {
     let before = entries.len();
-    entries.retain(|_, entry| now_ms.saturating_sub(entry.updated_at) <= retention_ms);
+    // A failure for a package never fetched successfully has no `updated_at` to age by, so its
+    // open retry window is what keeps it.
+    entries.retain(|_, entry| {
+        entry.retry_after.is_some_and(|retry_at| retry_at > now_ms)
+            || now_ms.saturating_sub(entry.updated_at) <= retention_ms
+    });
     before - entries.len()
 }
 
-/// Serialized length of the versioned envelope for `entries`, measured exactly
-/// as `persist_snapshot` writes it, so a size-cap check matches the eventual
-/// on-disk file size. Borrows the map (via `RegistrySnapshotRef`) to avoid
-/// cloning it on every measurement.
+/// Serialized length of the versioned envelope for `entries`, measured the way
+/// `write_snapshot` writes it, so a size-cap check matches the eventual on-disk
+/// file size. `cleared_at` is measured at its widest, so the estimate never falls
+/// short. Borrows the map (via `RegistrySnapshotRef`) to avoid cloning it on
+/// every measurement.
 fn snapshot_bytes(entries: &HashMap<String, RegistryPackageMetadataEntry>) -> u64 {
     serde_json::to_vec(&RegistrySnapshotRef {
         schema_version: REGISTRY_SCHEMA_VERSION,
         entries,
+        cleared_at: u64::MAX,
     })
     .map(|bytes| bytes.len() as u64)
     .unwrap_or(0)
