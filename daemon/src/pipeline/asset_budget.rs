@@ -605,8 +605,20 @@ impl AssetProcessingContext {
     }
 }
 
+/// A missing file cannot be canonicalized, but its directory usually can. Spelling it through the
+/// canonical directory keeps an absent observation and a later read of the same file under one
+/// identity, so the two are seen as conflicting rather than as two unrelated paths.
 fn canonical_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .zip(path.file_name())
+            .and_then(|(parent, name)| {
+                std::fs::canonicalize(parent)
+                    .ok()
+                    .map(|parent| parent.join(name))
+            })
+            .unwrap_or_else(|| path.to_path_buf())
+    })
 }
 
 fn metadata_bytes(metadata: &std::fs::Metadata, path: &Path) -> std::io::Result<usize> {

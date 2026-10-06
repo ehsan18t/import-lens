@@ -36,13 +36,6 @@ pub(crate) struct CssDependencyFailure {
     pub path: PathBuf,
     pub raw_bytes: u64,
     pub message: String,
-    /// WHY the read failed. A target that simply is not there is a deterministic fact about the
-    /// package and must take the absent-state sentinel, so that supplying the file invalidates the
-    /// result; a permission error or a lock is a fact about this machine right now and stays
-    /// request-local. Carrying the kind here is what lets the caller tell them apart; hardcoding
-    /// "not missing" instead leaves every stale `url()` target permanently non-durable, and tells
-    /// the user the result "reflects a changing or unavailable filesystem" about a stable package.
-    pub kind: std::io::ErrorKind,
 }
 
 enum SupportedAsset {
@@ -207,26 +200,21 @@ fn collect_supported_asset(
     let metadata = stat(&path);
     let raw_bytes = metadata.as_ref().map_or(0, |metadata| metadata.len());
 
-    // A resolvable path that cannot be stat'd is `Unreadable`, NOT `Omitted`, and the distinction is
-    // load-bearing for freshness: `Unreadable` carries the path into `failed_paths`, which is what
-    // makes the result never-fresh so that ADDING the missing file invalidates it. `Omitted` has no
-    // path to fingerprint and is reserved for references that never resolved to one.
-    let unreadable = |message: String, kind: std::io::ErrorKind| {
+    // A resolvable path that cannot be stat'd is `Unreadable`, NOT `Omitted`: it names a file, and
+    // `stat` has already recorded its absence or failure in the ledger, so ADDING the missing file
+    // invalidates the result. `Omitted` is reserved for references that never resolved to a path.
+    let unreadable = |message: String| {
         Some(SupportedAsset::Unreadable(CssDependencyFailure {
             message,
             path: path.clone(),
             raw_bytes,
-            kind,
         }))
     };
-    if let Err(error) = metadata.as_ref() {
-        return unreadable(
-            format!(
-                "CSS resource {} could not be read, so its shipped bytes are not in this size",
-                path.display()
-            ),
-            error.kind(),
-        );
+    if metadata.is_err() {
+        return unreadable(format!(
+            "CSS resource {} could not be read, so its shipped bytes are not in this size",
+            path.display()
+        ));
     }
 
     // Outside the counted taxonomy — an image, an SVG, anything the processors do not handle. The
@@ -247,13 +235,10 @@ fn collect_supported_asset(
 
     match read_asset(&path, kind) {
         Ok(asset) => Some(SupportedAsset::Collected(asset)),
-        Err(error) => {
-            let error_kind = error.kind();
-            unreadable(
-                format!("failed to read CSS resource {}: {error}", path.display()),
-                error_kind,
-            )
-        }
+        Err(error) => unreadable(format!(
+            "failed to read CSS resource {}: {error}",
+            path.display()
+        )),
     }
 }
 
