@@ -746,7 +746,6 @@ From the release review's improvement list. All real; none blocking. Each is a k
 | # | Item |
 | --- | --- |
 | P1 | **Prewarm priority inversion.** A user typing an import can queue behind two in-progress prewarm builds. Reserve an interactive permit. |
-| P4 | **Avoid copying the linked chunk.** A multi-megabyte `clone()` purely to move it into the artifact. |
 | P5 | **LRU the dependency-path index.** Capped at 32 entries with an arbitrary eviction victim; a monorepo thrashes it and first-party freshness degrades nondeterministically. |
 | P7 | **Rebuild fixed option data once, not per build.** About 180 `String`s allocated per build; `LazyLock` candidates. |
 | P9 | **The completion path still hash-verifies every first-party file of the package graph on every popup.** Installed modules are re-checked once per `REVERIFY_TTL` (measured: 2,000 installed modules, about 41 ms per lookup down to about 3 µs, debug build, Windows), but a first-party package's own files are re-read and re-hashed per keystroke inside its import's braces. That part stays: nothing reports a first-party edit (D3 in `cache/memory.rs`), and an equal-length, mtime-preserving rewrite defeats a len+mtime check, so any window would serve a stale export list. |
@@ -784,6 +783,7 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| P4 | The linked chunk was copied purely to move it into the artifact | 2026-10-06 |
 | P2 | Types-only and unresolvable imports, which never build, queued in the engine miss drain and re-resolved there | 2026-10-06 |
 | P6 | `drain_ordered` ran 2 workers where the other miss drains ran 4, idling a permit during the post-build tail | 2026-10-06 |
 | P8 | The miss drain spawned an OS thread even for a single miss the caller could run itself | 2026-10-06 |

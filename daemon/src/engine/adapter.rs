@@ -359,15 +359,21 @@ fn translate(
         });
     }
     let (read_time_fingerprints, unhashed_paths) = build_observations(state);
+    let exported_names = chunk.exports.iter().map(|name| name.to_string()).collect();
+
+    // The output holds the chunk's other reference; once it is gone the code moves out
+    // instead of being copied.
+    drop(output);
+    let code = Arc::try_unwrap(chunk).map_or_else(|shared| shared.code.clone(), |owned| owned.code);
 
     Ok(BundleArtifact {
-        code: chunk.code.clone(),
+        code,
         graph_source_bytes: state.graph_source_bytes(),
         loaded_paths: state.sorted_loaded_paths(),
         read_time_fingerprints,
         unhashed_paths,
         contributions,
-        exported_names: chunk.exports.iter().map(|name| name.to_string()).collect(),
+        exported_names,
         diagnostics,
         assets: state.sorted_assets(),
         emitted_assets: emitted,
