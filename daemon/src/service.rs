@@ -146,6 +146,8 @@ impl CachedDocumentAnalysis {
 }
 
 const SLOW_CACHE_LOOKUP_LOG_THRESHOLD: Duration = Duration::from_millis(25);
+/// The most pieces a workspace report splits its files into on the shared CPU pool.
+const REPORT_WIDTH: usize = 4;
 
 #[derive(Clone)]
 struct ComputedAnalysis {
@@ -226,18 +228,17 @@ fn registry_hint_result_from_lookup(
     }
 }
 
-// Not `Debug`: `RegistryHintService` holds trait objects and `RegistryRefreshExecutor` a pool.
+// Not `Debug`: `RegistryHintService` holds trait objects.
 pub struct ImportLensService {
     cache_registry: ProjectCacheRegistry,
     analysis_flights: AnalysisFlightRegistry<ComputedAnalysis>,
     registry_hints: crate::registry::service::RegistryHintService,
-    registry_executor: crate::registry::executor::RegistryRefreshExecutor,
-    report_executor: crate::report::executor::WorkspaceReportExecutor,
+    registry_lane: std::sync::Arc<crate::lanes::Lane>,
     // Registry-metadata store byte budget (`importLens.registryCacheMaxSizeMB`, from Hello);
     // the maintenance pass caps the registry store at this.
     registry_cache_max_size_bytes: u64,
     // Set only by `new_with_registry_hints_for_tests`: the IPC server's Hello handler then keeps
-    // `registry_hints`/`registry_executor` across the rebuild, so an injected fake
+    // `registry_hints` and `registry_lane` across the rebuild, so an injected fake
     // `RegistryHttpClient` survives the handshake. See `ipc/server.rs`'s `Hello` handling.
     preserve_registry_across_hello: bool,
 }
@@ -269,16 +270,11 @@ impl ImportLensService {
                 )
             })
             .unwrap_or_else(crate::registry::service::RegistryHintService::disabled);
-        let registry_executor = crate::registry::executor::RegistryRefreshExecutor::new(
-            crate::registry::constants::REGISTRY_REFRESH_CONCURRENCY,
-        );
-        let report_executor = crate::report::executor::WorkspaceReportExecutor::new();
         Self {
             cache_registry,
             analysis_flights: AnalysisFlightRegistry::new(),
             registry_hints,
-            registry_executor,
-            report_executor,
+            registry_lane: crate::lanes::registry(),
             registry_cache_max_size_bytes: registry_cache_max_size_mb.saturating_mul(1024 * 1024),
             preserve_registry_across_hello: false,
         }
@@ -293,10 +289,7 @@ impl ImportLensService {
             cache_registry: ProjectCacheRegistry::new(None, false, 512),
             analysis_flights: AnalysisFlightRegistry::new(),
             registry_hints,
-            registry_executor: crate::registry::executor::RegistryRefreshExecutor::new(
-                crate::registry::constants::REGISTRY_REFRESH_CONCURRENCY,
-            ),
-            report_executor: crate::report::executor::WorkspaceReportExecutor::new(),
+            registry_lane: crate::lanes::registry(),
             registry_cache_max_size_bytes:
                 crate::registry::constants::REGISTRY_CACHE_MAX_SIZE_BYTES,
             preserve_registry_across_hello: true,
@@ -310,7 +303,7 @@ impl ImportLensService {
     }
 
     /// Rebuilds only the cache registry for a new Hello, keeping `registry_hints` and
-    /// `registry_executor`. Called only when `preserve_registry_across_hello()` is true;
+    /// `registry_lane`. Called only when `preserve_registry_across_hello()` is true;
     /// production rebuilds via `new_with_cache_policy` so `hello.storage_path` stays the
     /// source of truth for registry configuration.
     pub fn rebuild_cache_registry_for_hello(
@@ -328,8 +321,7 @@ impl ImportLensService {
             ),
             analysis_flights: self.analysis_flights,
             registry_hints: self.registry_hints,
-            registry_executor: self.registry_executor,
-            report_executor: self.report_executor,
+            registry_lane: self.registry_lane,
             registry_cache_max_size_bytes: registry_cache_max_size_mb.saturating_mul(1024 * 1024),
             preserve_registry_across_hello: self.preserve_registry_across_hello,
         }
@@ -364,15 +356,15 @@ impl ImportLensService {
     }
 
     pub fn spawn_registry_refresh(&self, job: impl FnOnce() + Send + 'static) {
-        self.registry_executor.spawn(job);
+        self.registry_lane.spawn(job);
     }
 
-    /// Fans a bulk "refresh dependency block" onto the isolated registry pool.
+    /// Fans a bulk "refresh dependency block" onto the registry lane.
     ///
     /// * **Cache first.** One cache-only pre-pass streams cache-eligible results
     ///   immediately; only the rest are enqueued for network refresh.
-    /// * **Bounded in flight.** Each target is a `spawn` onto the
-    ///   `REGISTRY_REFRESH_CONCURRENCY`-thread pool; the pool is the in-flight cap.
+    /// * **Bounded in flight.** Each target is a `spawn` onto the registry lane, whose
+    ///   width (`REGISTRY_REFRESH_CONCURRENCY`) is the in-flight cap.
     /// * **Cancellable.** Each job re-reads `cancelled` before its fetch. Once a
     ///   newer block supersedes this one (or the connection ends), queued jobs
     ///   report `None` without an error; jobs in flight finish.
@@ -527,10 +519,13 @@ impl ImportLensService {
         // One resolver per report run: files in one directory share a .importlensignore walk, and
         // edits between reports are re-read.
         let ignore_resolver = IgnoreRuleResolver::default();
-        // Reading and import detection need no engine permit, so this runs at the width of the
-        // report's dedicated pool; only the misses go through the engine drain.
+        // Reading and import detection need no engine permit, so this fans out, but in at most
+        // `REPORT_WIDTH` pieces: the report shares the CPU pool with interactive work, and an
+        // unbounded fan-out would queue the editor's requests behind every file of the workspace.
+        // Only the misses go through the engine drain.
         let items = files
             .par_iter()
+            .with_min_len(files.len().div_ceil(REPORT_WIDTH).max(1))
             .flat_map_iter(|source_path| {
                 let source = match fs::read_to_string(source_path) {
                     Ok(source) => source,
@@ -636,7 +631,7 @@ impl ImportLensService {
         tx: tokio::sync::oneshot::Sender<WorkspaceReportResponse>,
     ) {
         let service = std::sync::Arc::clone(self);
-        self.report_executor.spawn(move || {
+        crate::lanes::background().spawn(move || {
             let _ = tx.send(service.build_workspace_report_on_worker(request));
         });
     }

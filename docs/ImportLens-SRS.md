@@ -473,7 +473,7 @@ Every requested surface must carry a unique entry alias so strict entry signatur
 
 **FR-022** (High) - The daemon must detect when a package is not genuinely tree-shakeable by comparing the named-export minified size against the full-package minified size. If the named-export minified size exceeds 95% of the full-package minified size, `truly_treeshakeable` must be set to `false` in the response.
 
-**FR-023** (High) - The daemon must process all imports of a single request concurrently. Resolve-only work and cache classification remain on the global Rayon thread pool, which must be sized to `max(1, available_parallelism - 2)` to leave headroom for VS Code's renderer and extension host threads (`std::thread::available_parallelism()`; the `num_cpus` crate must not be used). Cache misses that require a bundler build must run as async work behind a daemon-wide two-permit execution boundary and must never be invoked from an outer global-Rayon parallel loop, because Rolldown owns its own internal Rayon parallelism and nesting the two oversubscribes the pool. Cache hits bypass the boundary and never construct a bundler. Document, specifier, package.json and file-size responses must preserve input ordering even when misses complete out of order; streamed results may arrive in completion order, addressed by their identity or index.
+**FR-023** (High) - The daemon must process all imports of a single request concurrently. Resolve-only work and cache classification remain on the global Rayon thread pool, which must be sized to `max(1, available_parallelism - 2)` to leave headroom for VS Code's renderer and extension host threads (`std::thread::available_parallelism()`; the `num_cpus` crate must not be used). It is the daemon's only CPU pool (ADR-0007): background work (prewarm, workspace reports) shares it through a lane that runs at most half its width at once, and a workspace report splits its files into at most four pieces, so interactive work always finds free workers. Registry refresh is network I/O and runs on a separate lane of at most `REGISTRY_REFRESH_CONCURRENCY` plain threads that exit when its queue drains. Post-build asset processing keeps its own two threads: a caller waits for it with a deadline, and on a shared pool an admitted job could queue past that deadline. Cache misses that require a bundler build must run as async work behind a daemon-wide two-permit execution boundary and must never be invoked from an outer global-Rayon parallel loop, because Rolldown owns its own internal Rayon parallelism and nesting the two oversubscribes the pool. Cache hits bypass the boundary and never construct a bundler. Document, specifier, package.json and file-size responses must preserve input ordering even when misses complete out of order; streamed results may arrive in completion order, addressed by their identity or index.
 
 **FR-024** (Critical) - The Rust daemon must operate exclusively via static AST analysis. It is prohibited from evaluating, executing, or interpreting any code found within third-party packages. No `eval`, subprocess execution, or dynamic code loading of any kind is permitted.
 
@@ -1908,14 +1908,13 @@ import-lens/
 │       │   ├── types.rs               # normalized npm package metadata and cache entry types
 │       │   ├── client.rs              # bounded ureq npm registry HTTP client
 │       │   ├── cache.rs               # persistent JSON package metadata cache (atomic writes)
-│       │   ├── service.rs             # refresh modes, single-flight de-dup, retry, stale fallback
-│       │   └── executor.rs            # dedicated registry refresh worker pool
+│       │   └── service.rs             # refresh modes, single-flight de-dup, retry, stale fallback
 │       ├── report/
 │       │   ├── mod.rs
-│       │   ├── executor.rs            # bounded workspace report worker pool
 │       │   ├── scanner.rs             # symlink-safe workspace source scanner
 │       │   └── model.rs               # report rows, summary counts, duplicate groups, treemap
 │       ├── lifecycle.rs                # Graceful shutdown, self-recycle (NFR-004a), recycle counter write (NFR-004b)
+│       ├── lanes.rs                   # Background and registry lanes over the one CPU pool (ADR-0007)
 │       └── prefetch.rs                # Background pre-warm logic
 │
 ├── dist/                              # Build output (gitignored)

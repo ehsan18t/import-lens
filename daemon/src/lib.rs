@@ -4,6 +4,7 @@ pub mod cache;
 pub mod document;
 pub mod engine;
 pub mod ipc;
+pub mod lanes;
 pub mod lifecycle;
 pub mod logging;
 pub mod pipeline;

@@ -66,7 +66,7 @@ impl Drop for AbortOnDrop {
 
 /// The active bulk registry-refresh block per source manifest for one connection. A newer bulk
 /// request cancels only the block for the same source, and an ending connection cancels all of
-/// them (decision-log D11). Cancellation flips a shared `AtomicBool` that registry pool jobs
+/// them (decision-log D11). Cancellation flips a shared `AtomicBool` that registry lane jobs
 /// re-read before each fetch; skipped work surfaces no error.
 ///
 /// Keyed per source, never per connection: refreshing `backend/package.json` must not cancel the

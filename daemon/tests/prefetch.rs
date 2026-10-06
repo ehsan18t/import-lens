@@ -1,9 +1,7 @@
 use import_lens_daemon::{
     cache::key::{CacheIdentity, decode_cache_identity},
     ipc::protocol::ImportKind,
-    prefetch::{
-        CancellationToken, Prefetcher, package_json_dependency_names, prewarm_pool, prewarm_root,
-    },
+    prefetch::{CancellationToken, Prefetcher, package_json_dependency_names, prewarm_root},
     service::ImportLensService,
 };
 use std::{
@@ -241,12 +239,4 @@ fn prefetcher_drop_cancels_current_generation() {
     drop(prefetcher);
 
     assert!(!cancellation.is_current(generation));
-}
-
-#[test]
-fn prewarm_pool_reuses_one_fallible_thread_pool() {
-    let first = prewarm_pool().expect("prewarm pool should build") as *const rayon::ThreadPool;
-    let second = prewarm_pool().expect("prewarm pool should be reused") as *const rayon::ThreadPool;
-
-    assert_eq!(first, second);
 }

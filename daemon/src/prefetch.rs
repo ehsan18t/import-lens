@@ -12,7 +12,6 @@ use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 use oxc_syntax::module_record::{ExportEntry, ExportExportName};
-use rayon::ThreadPoolBuilder;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -24,7 +23,6 @@ use std::{
     },
 };
 
-static PREWARM_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 const RECENT_PREWARM_LIMIT: usize = 20;
 const DEFAULT_EXPORT_MEMO_LIMIT: usize = 512;
 
@@ -121,16 +119,11 @@ impl Prefetcher {
 }
 
 /// Runs the prewarm coordination (dependency enumeration and fan-out) on the
-/// bounded `PREWARM_POOL`. Every engine build the job starts is background work,
-/// so prewarm never holds the permit interactive builds rely on. The job checks
-/// its generation, so a superseded dispatch bails.
+/// background lane. Every engine build the job starts is background work, so
+/// prewarm never holds the permit interactive builds rely on. The job checks its
+/// generation, so a superseded dispatch bails.
 fn dispatch_prewarm(job: impl FnOnce() + Send + 'static) {
-    match prewarm_pool() {
-        Ok(pool) => pool.spawn(|| run_as_background(job)),
-        Err(error) => {
-            crate::logging::log_debug("prefetch", format!("prewarm dispatch skipped: {error}"));
-        }
-    }
+    crate::lanes::background().spawn(|| run_as_background(job));
 }
 
 impl Drop for Prefetcher {
@@ -417,26 +410,6 @@ fn prewarm_request(package_name: &str, version: &str, import_kind: ImportKind) -
     }
 }
 
-fn prewarm_thread_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|value| (value.get() / 2).max(1))
-        .unwrap_or(1)
-}
-
-pub fn prewarm_pool() -> Result<&'static rayon::ThreadPool, String> {
-    if PREWARM_POOL.get().is_none() {
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(prewarm_thread_count())
-            .build()
-            .map_err(|error| format!("failed to build prewarm thread pool: {error}"))?;
-        let _ = PREWARM_POOL.set(pool);
-    }
-
-    PREWARM_POOL
-        .get()
-        .ok_or_else(|| "failed to initialize prewarm thread pool".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::dispatch_prewarm;
@@ -444,14 +417,14 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn dispatch_prewarm_runs_job_on_bounded_pool() {
+    fn dispatch_prewarm_runs_job_on_the_background_lane() {
         let (tx, rx) = mpsc::channel();
         dispatch_prewarm(move || {
             let _ = tx.send(());
         });
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-            "dispatch_prewarm should run the job on the bounded prewarm pool"
+            "dispatch_prewarm should run the job on the background lane"
         );
     }
 }
