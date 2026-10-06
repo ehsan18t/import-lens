@@ -483,23 +483,6 @@ it fails the test.
 **Static analysis is the second line here, not the first.** The real enforcement is that a degraded result has
 no size to misuse: the size fields are `Option`, and the durability gate lives inside each store.
 
-### G4: Changing the compression format does not re-render the status-bar size until the next edit
-**Status: Accepted** · Stale but correctly labelled, never a wrong number · Found in the 2026-07-16 module audit (E7)
-
-Changing `importLens.compression` routes through the generic `affectsConfiguration("importLens")` arm to a
-`uiOnly` refresh (`configChange.ts:24`, then `extension.ts:352`, then `configRefresh.ts:44-52`), which
-reapplies decorations and insights but does NOT call `actions.schedule`, so `analyze` and `updateFileSize`
-never re-run and the status bar keeps the figure from the prior analysis.
-
-**What actually happens.** The frozen figure is shown with its own (old) compression label, for example
-`IL: 1.2 kB brotli`, a correct brotli count correctly labelled brotli, just not yet recomputed in the
-newly-selected format. It self-heals on the next edit or editor focus change (`onDidChangeActiveTextEditor`
-then `schedule`). No wrong number, no wedge; the label discloses the basis.
-
-**Why it is not fixed:** presentation-only, self-healing, basis disclosed (the R1/S1/G3 class).
-**What would fix it:** have the `uiOnly` compression-change path recompute the visible size label for the new
-format (it already holds every compression's bytes per import).
-
 ### K3: Disk-cache bookkeeping (summary byte total, shard id, budget axis) is best-effort and can drift
 **Status: Accepted** · Feeds eviction and observability only, never an import number · Found in the 2026-07-16 module audit (D5)
 

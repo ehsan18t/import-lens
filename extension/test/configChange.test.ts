@@ -9,3 +9,7 @@ const event = (changed: string) => ({
 test("cache storage policy settings restart the daemon", () => {
   assert.equal(classifyImportLensConfigChange(event("importLens.cacheMaxSizeMB")), "daemonRestart");
 });
+
+test("a compression change re-reads the file size instead of only redrawing", () => {
+  assert.equal(classifyImportLensConfigChange(event("importLens.compression")), "reanalyze");
+});

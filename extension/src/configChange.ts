@@ -21,6 +21,12 @@ export const classifyImportLensConfigChange = (
     return "reanalyze";
   }
 
+  // The status bar keeps only the figure it rendered, in the format it rendered it in. The File
+  // Cost in another format is in the daemon's file-size response, so a new format needs a new read.
+  if (event.affectsConfiguration("importLens.compression")) {
+    return "reanalyze";
+  }
+
   if (event.affectsConfiguration("importLens")) {
     return "uiOnly";
   }
