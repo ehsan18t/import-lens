@@ -483,32 +483,15 @@ it fails the test.
 **Static analysis is the second line here, not the first.** The real enforcement is that a degraded result has
 no size to misuse: the size fields are `Option`, and the durability gate lives inside each store.
 
-### K3: Disk-cache bookkeeping (summary byte total, shard id, budget axis) is best-effort and can drift
+### K3: Disk-cache budget is enforced on logical bytes, and shard ids can collide
 **Status: Accepted** · Feeds eviction and observability only, never an import number · Found in the 2026-07-16 module audit (D5)
 
-Three independent bookkeeping approximations, none on the number-serving path:
+Two independent bookkeeping approximations, neither on the number-serving path:
 
-- **Summary `total_bytes` drift.** `heal_summary_if_inconsistent` (`disk.rs`) rebuilds only when
-  `cache_len != summary_count`; a `total_bytes` underflow silently floors at 0 (`write_summary` `.max(0)`)
-  with the count still correct, undetected until a full rescan. It feeds
-  `ProjectCacheStatus.total_bytes` and the eviction budget: a low value under-evicts (disk overage), a high
-  value over-evicts (extra rebuilds), both cost only rebuilds, never a wrong served number.
-- **Budget enforced on logical bytes, gated on physical ones.** `run_maintenance` skips its pass while the summed
-  `.redb` file sizes are within `cacheMaxSizeMB`, but `BudgetCoordinator` evicts only until the summed value
-  bytes reach the low-water mark. File size also carries keys (stored twice, with the recency index), B-tree
-  pages and free pages, so the cache can sit with values under budget and files over it: the pass then evicts
-  nothing, runs the zero-threshold idle compaction, and leaves the files above the budget with no warning
-  (`still_over_budget` reads logical bytes). Maintenance runs once per project open (decision-log D3), so this
-  costs one redundant pass per open, not a loop; Manage Cache shows both `total_size_bytes` (physical) and
-  `total_bytes` (logical).
-- **Shard-id collision.** `project_cache_shard_id` (`project.rs`) is 64-bit FNV-1a; two roots can map to
-  one redb shard. Entries stay isolated (keyed by `package_root` and `entry_path`), so no cross-read of a wrong
-  number; a read only crosses projects when both resolve the identical absolute entry (the same bytes, so the
-  shared measurement is correct). Effect is limited to co-mingled cache-management display and a shared eviction
-  budget; a 64-bit collision over a user's projects is negligible.
+- **Budget enforced on logical bytes, gated on physical ones.** `run_maintenance` skips its pass while the summed `.redb` file sizes are within `cacheMaxSizeMB`, but `BudgetCoordinator` evicts only until the summed value bytes reach the low-water mark. File size also carries keys (stored twice, with the recency index), B-tree pages and free pages, so the cache can sit with values under budget and files over it. The pass then compacts at a zero fragmentation threshold and, if the files are still over budget, logs a warning naming both figures; it does not evict further. Maintenance runs once per connection (60 s after the Hello), so this costs one redundant pass per connection, not a loop. Manage Cache shows both `total_size_bytes` (physical) and `total_bytes` (logical). The SRS settings table calls `cacheMaxSizeMB` a disk-byte budget, which the files can exceed by that overhead.
+- **Shard-id collision.** `project_cache_shard_id` (`project.rs`) is 64-bit FNV-1a; two roots can map to one redb shard. Entries stay isolated (keyed by `package_root` and `entry_path`), so no cross-read of a wrong number; a read only crosses projects when both resolve the identical absolute entry (the same bytes, so the shared measurement is correct). Effect is limited to co-mingled cache-management display and a shared eviction budget. Widening the id would orphan every existing shard for a negligible risk.
 
-**Why it is accepted:** the cache is rebuildable and keyed by dependency fingerprints, so bookkeeping drift can
-waste rebuilds or disk but can never surface a wrong import cost or lose a durable answer.
+**Why it is accepted:** the cache is rebuildable and keyed by dependency fingerprints, so bookkeeping drift can waste rebuilds or disk but can never surface a wrong import cost or lose a durable answer. A summary byte total driven negative is drift and is rebuilt from a scan in the same transaction.
 
 ### I1: A rare wire-level failure degrades gracefully (connection teardown or dropped reply), never a wrong number
 **Status: Accepted** · Found in the 2026-07-16 module audit (D6)

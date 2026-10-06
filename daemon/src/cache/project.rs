@@ -263,6 +263,20 @@ impl ProjectCacheRegistry {
             self.total_shard_file_bytes(),
             self.coordinator.budget_bytes(),
         );
+        // Eviction stops at the logical (value-byte) low-water mark, so key, index and
+        // page overhead can leave the files over budget even after compaction.
+        let physical_bytes = self.total_shard_file_bytes();
+        if !eviction.still_over_budget && physical_bytes > self.coordinator.budget_bytes() {
+            crate::logging::log_warn(
+                "cache",
+                format!(
+                    "cache files total {} MB after eviction and compaction, over the {} MB \
+                     budget: the budget counts stored values, not key, index or page overhead",
+                    physical_bytes / (1024 * 1024),
+                    self.coordinator.budget_bytes() / (1024 * 1024)
+                ),
+            );
+        }
 
         MaintenanceOutcome {
             eviction,

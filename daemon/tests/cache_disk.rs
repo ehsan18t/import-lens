@@ -1104,3 +1104,50 @@ fn opening_a_v7_shard_without_summary_rows_heals_by_rebuilding() {
     drop(disk);
     fs::remove_dir_all(storage).expect("cleanup");
 }
+
+#[test]
+fn a_removal_that_would_drive_the_byte_total_negative_rebuilds_the_summary() {
+    const SUMMARY_TABLE: TableDefinition<&str, u64> = TableDefinition::new("summary");
+    let storage = temp_storage();
+    fs::create_dir_all(&storage).expect("storage dir");
+
+    // The row count agrees with SUMMARY, so the open-time heal (which compares counts
+    // only) passes it; the byte total is drifted low.
+    let mut row_len = 0_u64;
+    {
+        let db = Database::create(db_path(&storage)).expect("create db");
+        let write = db.begin_write().expect("begin");
+        {
+            let mut meta = write.open_table(METADATA_TABLE).expect("meta table");
+            meta.insert(SCHEMA_VERSION_KEY, CURRENT_SCHEMA_VERSION)
+                .expect("write schema version");
+            let mut cache = write.open_table(CACHE_TABLE).expect("cache table");
+            for (key, seq) in [("k1", 20_u64), ("k2", 10)] {
+                let mut value = seq.to_le_bytes().to_vec();
+                value.extend_from_slice(b"payload");
+                row_len = value.len() as u64;
+                cache.insert(key, value.as_slice()).expect("write row");
+            }
+            let mut summary = write.open_table(SUMMARY_TABLE).expect("summary table");
+            summary.insert("entry_count", 2).expect("write count");
+            summary
+                .insert("total_bytes", 1)
+                .expect("write drifted total");
+            summary.insert("max_seq", 20).expect("write max seq");
+        }
+        write.commit().expect("commit");
+    }
+
+    let disk = DiskCache::new(Some(storage.clone()), true);
+    disk.remove("k1");
+
+    let rollup = disk.shard_rollup();
+    assert_eq!(rollup.entry_count, 1);
+    assert_eq!(
+        rollup.total_bytes, row_len,
+        "an underflow is drift: rebuild from a scan, never floor the total at zero"
+    );
+
+    drop(disk);
+    fs::remove_dir_all(storage).expect("cleanup");
+}

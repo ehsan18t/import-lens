@@ -1275,7 +1275,7 @@ fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> R
         .begin_write()
         .map_err(|error| format!("failed to begin cache write: {error}"))?;
 
-    {
+    let summary_consistent = {
         let mut cache = write_txn
             .open_table(CACHE_TABLE)
             .map_err(|error| format!("failed to open cache table: {error}"))?;
@@ -1287,7 +1287,7 @@ fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> R
             .map_err(|error| format!("failed to open seq index table: {error}"))?;
 
         // Deltas fold into locals and the summary is written once; i128 so a
-        // replace with a smaller value never underflows before the final clamp.
+        // replace with a smaller value goes negative instead of wrapping.
         let mut total_bytes = read_summary_field(&summary, SUMMARY_TOTAL_BYTES) as i128;
         let mut entry_count = read_summary_field(&summary, SUMMARY_ENTRY_COUNT) as i128;
         let mut max_seq = read_summary_field(&summary, SUMMARY_MAX_SEQ);
@@ -1322,7 +1322,10 @@ fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> R
             max_seq = max_seq.max(new_seq);
         }
 
-        write_summary(&mut summary, total_bytes, entry_count, Some(max_seq))?;
+        write_summary(&mut summary, total_bytes, entry_count, Some(max_seq))?
+    };
+    if !summary_consistent {
+        rebuild_summary_in_txn(&write_txn)?;
     }
 
     write_txn
@@ -1359,27 +1362,36 @@ fn read_summary_field<T: ReadableTable<&'static str, u64>>(table: &T, field: &st
         .unwrap_or(0)
 }
 
-/// Writes `total_bytes`/`entry_count` (clamped non-negative) back to SUMMARY, and
-/// `max_seq` when supplied. Removals pass `None`: the high-water mark only advances
-/// on insert.
+/// Writes `total_bytes`/`entry_count` back to SUMMARY, and `max_seq` when supplied.
+/// Removals pass `None`: the high-water mark only advances on insert.
+///
+/// Every delta is exact against the stored row it replaces or removes, so a negative
+/// result means the summary had already drifted. That writes nothing and returns
+/// `false`: the caller rebuilds from a scan in the same transaction, because a clamp
+/// to zero would keep the drift and hide it from the count-only heal check.
 fn write_summary(
     summary: &mut redb::Table<'_, &'static str, u64>,
     total_bytes: i128,
     entry_count: i128,
     max_seq: Option<u64>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let (Ok(total_bytes), Ok(entry_count)) =
+        (u64::try_from(total_bytes), u64::try_from(entry_count))
+    else {
+        return Ok(false);
+    };
     summary
-        .insert(SUMMARY_TOTAL_BYTES, total_bytes.max(0) as u64)
+        .insert(SUMMARY_TOTAL_BYTES, total_bytes)
         .map_err(|error| format!("failed to write summary total bytes: {error}"))?;
     summary
-        .insert(SUMMARY_ENTRY_COUNT, entry_count.max(0) as u64)
+        .insert(SUMMARY_ENTRY_COUNT, entry_count)
         .map_err(|error| format!("failed to write summary entry count: {error}"))?;
     if let Some(max_seq) = max_seq {
         summary
             .insert(SUMMARY_MAX_SEQ, max_seq)
             .map_err(|error| format!("failed to write summary max seq: {error}"))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Removes `keys` from CACHE_TABLE inside `write_txn`, maintaining SUMMARY and
@@ -1422,7 +1434,11 @@ fn maintain_removals<'a>(
         }
     }
 
-    write_summary(&mut summary, total_bytes, entry_count, None)?;
+    let summary_consistent = write_summary(&mut summary, total_bytes, entry_count, None)?;
+    drop((cache, summary, seq_index));
+    if !summary_consistent {
+        rebuild_summary_in_txn(write_txn)?;
+    }
     Ok(freed)
 }
 
@@ -1471,6 +1487,7 @@ fn rebuild_summary_in_txn(write_txn: &WriteTransaction) -> Result<(), String> {
         entry_count as i128,
         Some(max_seq),
     )
+    .map(|_| ())
 }
 
 // Orders `(key, last_seq)` pairs highest-`last_seq` first (most recent), with the
