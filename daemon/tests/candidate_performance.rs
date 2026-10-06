@@ -57,8 +57,8 @@ use import_lens_daemon::engine::{
 };
 use import_lens_daemon::ipc::codec::{decode_payload, message_frame_codec, payload_bytes};
 use import_lens_daemon::ipc::protocol::{
-    AnalyzeDocumentRequest, AnalyzeDocumentResponse, HelloMessage, ImportAnalysisItem,
-    ImportResult, PROTOCOL_VERSION, RefreshedResultsResponse,
+    AnalyzeDocumentRequest, AnalyzeDocumentResponse, CacheInvalidateAllMessage, HelloMessage,
+    ImportAnalysisItem, ImportResult, PROTOCOL_VERSION, RefreshedResultsResponse,
 };
 use std::env;
 use std::fs;
@@ -67,6 +67,31 @@ use std::time::{Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 mod common;
+
+/// The NFR-004 comparison set: independent packages, shared transitive dependencies, a CJS package,
+/// and repeated different exports from single packages.
+const TWENTY_IMPORT_BATCH: &[(&str, &str)] = &[
+    ("css-tree", "parse"),
+    ("css-tree", "generate"),
+    ("css-tree", "walk"),
+    ("date-fns", "format"),
+    ("date-fns", "addDays"),
+    ("date-fns", "parseISO"),
+    ("date-fns", "subDays"),
+    ("lodash-es", "debounce"),
+    ("lodash-es", "throttle"),
+    ("lodash-es", "cloneDeep"),
+    ("lodash-es", "merge"),
+    ("lodash", "debounce"),
+    ("zod", "z"),
+    ("zod", "ZodError"),
+    ("react", "useState"),
+    ("react", "useEffect"),
+    ("react", "useMemo"),
+    ("uuid", "v4"),
+    ("uuid", "v1"),
+    ("uuid", "validate"),
+];
 
 /// §10.6: "five warm-up runs followed by at least 30 recorded runs".
 const WARMUP_RUNS: usize = 5;
@@ -674,36 +699,16 @@ async fn shipped_daemon_cache_hit_p95_and_idle_rss_stay_under_release_thresholds
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "release-only candidate measurement; requires installed fixtures (scripts/prepare-candidate-fixtures.mjs)"]
 async fn shipped_daemon_twenty_import_batch_peak_rss_stays_under_release_threshold() {
-    const BATCH: &[(&str, &str)] = &[
-        ("css-tree", "parse"),
-        ("css-tree", "generate"),
-        ("css-tree", "walk"),
-        ("date-fns", "format"),
-        ("date-fns", "addDays"),
-        ("date-fns", "parseISO"),
-        ("date-fns", "subDays"),
-        ("lodash-es", "debounce"),
-        ("lodash-es", "throttle"),
-        ("lodash-es", "cloneDeep"),
-        ("lodash-es", "merge"),
-        ("lodash", "debounce"),
-        ("zod", "z"),
-        ("zod", "ZodError"),
-        ("react", "useState"),
-        ("react", "useEffect"),
-        ("react", "useMemo"),
-        ("uuid", "v4"),
-        ("uuid", "v1"),
-        ("uuid", "validate"),
-    ];
-
     let workspace = common::engine_fixtures::fixtures_workspace();
     let mut session = start_daemon(&workspace).await;
 
-    let (response, elapsed) =
-        timed_document(&mut session, &document_of(&workspace, 1, BATCH)).await;
+    let (response, elapsed) = timed_document(
+        &mut session,
+        &document_of(&workspace, 1, TWENTY_IMPORT_BATCH),
+    )
+    .await;
 
-    assert_measured(&response, BATCH.len());
+    assert_measured(&response, TWENTY_IMPORT_BATCH.len());
     // Read before the `Drop` kills the daemon: a dead process has no working set to report.
     let peak = peak_working_set_bytes(session.process_id());
 
@@ -714,6 +719,59 @@ async fn shipped_daemon_twenty_import_batch_peak_rss_stays_under_release_thresho
     assert!(
         peak < 400 * 1024 * 1024,
         "20-import batch peak RSS exceeded the 400 MB gate (NFR-004): {peak} bytes"
+    );
+}
+
+/// The most Retained Memory (ADR-0007) a full cache clear may leave behind.
+const RETAINED_MEMORY_LIMIT_BYTES: u64 = 60 * 1024 * 1024;
+
+// ADR-0007: Retained Memory. After a heavy session and a full cache clear, live data is near zero, so
+// whatever stays resident is memory no allocation needs: freed pages a thread's heap kept, and the
+// stacks of threads that only wait. It grows with thread count, not with the project, which is why
+// this bound is absolute while no gate caps RSS with the cache populated.
+//
+// On these fixtures, 33 MB (Windows) and 38 MB (Linux) with one CPU pool and idle reclaim; without
+// them, 81 MB and 84 MB. The settle wait covers the reclaim sweep, which runs two seconds after
+// activity stops.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "release-only candidate measurement; requires installed fixtures (scripts/prepare-candidate-fixtures.mjs)"]
+async fn shipped_daemon_retained_memory_after_a_full_clear_stays_bounded() {
+    let workspace = common::engine_fixtures::fixtures_workspace();
+    let mut session = start_daemon(&workspace).await;
+
+    for (index, chunk) in TWENTY_IMPORT_BATCH.chunks(4).enumerate() {
+        let (response, _) = timed_document(
+            &mut session,
+            &document_of(&workspace, index as u64 + 1, chunk),
+        )
+        .await;
+        assert_measured(&response, chunk.len());
+    }
+    let (response, _) = timed_document(
+        &mut session,
+        &document_of(&workspace, 100, TWENTY_IMPORT_BATCH),
+    )
+    .await;
+    assert_measured(&response, TWENTY_IMPORT_BATCH.len());
+
+    send(
+        &mut session.framed,
+        &CacheInvalidateAllMessage {
+            message_type: "cache_invalidate_all".to_owned(),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let retained = working_set_bytes(session.process_id());
+
+    eprintln!(
+        "shipped daemon after a full cache clear: {} MB resident",
+        retained / (1024 * 1024)
+    );
+    assert!(
+        retained < RETAINED_MEMORY_LIMIT_BYTES,
+        "the daemon kept {retained} bytes resident after a full cache clear (limit \
+         {RETAINED_MEMORY_LIMIT_BYTES}): idle threads are holding freed memory (ADR-0007)"
     );
 }
 

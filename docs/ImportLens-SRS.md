@@ -859,6 +859,8 @@ The system must handle all failure conditions gracefully. No error scenario may 
 
 **NFR-004c** (High) - When a lifecycle recycle is triggered (NFR-004a), the daemon must abort any in-progress pre-warm jobs (FR-028) immediately before beginning the flush-and-exit sequence. Pre-warm jobs are low-priority background work; they must not delay a recycle. Any pre-warm entries that were computed but not yet written to `papaya` at the time of abort are discarded. They will be recomputed in the next session when the relevant `package.json` is opened again.
 
+**NFR-004d** (High) - The daemon must not hold Retained Memory: resident memory that no live allocation needs (freed pages a thread's allocator heap kept, and the stacks of threads that only wait). Every long-lived thread must return its heap's freed pages once it goes idle (ADR-0007), and the daemon must run background work on its one CPU pool rather than on dedicated pools. Retained Memory grows with thread count, not with the project, so it is gated after a heavy session and a full cache clear, where live data is near zero: the shipped daemon must then stay under 60 MB resident (`shipped_daemon_retained_memory_after_a_full_clear_stays_bounded`). No requirement caps resident memory with the cache populated beyond NFR-004, because a large project legitimately holds more live data.
+
 **NFR-005** (High) - The daemon must start and be ready to accept connections within 500ms of being spawned.
 
 **NFR-006** (High) - The Node.js extension host memory footprint must remain flat during rapid, continuous typing over a sustained 5-minute period. This must be verifiable via memory profiling as defined in AC-005.
