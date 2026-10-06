@@ -21,8 +21,8 @@ const MISS_DRAIN_WORKERS: usize = ENGINE_PERMITS + 2;
 /// Run `run` over every item with a fixed number of scoped worker threads, returning
 /// `(index, result)` in completion order.
 ///
-/// A lone item runs on the caller: the caller blocks on the result either way, and an OS
-/// thread spawn costs more than many a classified miss.
+/// A lone item runs on the caller when the caller is not a rayon worker: the caller blocks on
+/// the result either way, and an OS thread spawn costs more than many a classified miss.
 fn drain_bounded<T, R, F>(items: &[T], workers: usize, run: F) -> Vec<(usize, R)>
 where
     T: Sync,
@@ -321,6 +321,28 @@ mod tests {
     }
 
     /// A lone miss must not pay for a thread spawn: every drain blocks its caller anyway.
+    #[test]
+    fn a_lone_item_never_runs_on_a_rayon_worker() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("rayon pool");
+        let (worker, ran_on) = pool.install(|| {
+            let worker = thread::current().id();
+            let ran_on = Mutex::new(None);
+            drain_misses_owned(vec![0], |_| {
+                *ran_on.lock().expect("thread id") = Some(thread::current().id());
+            });
+            (worker, ran_on.into_inner().expect("thread id"))
+        });
+
+        assert_ne!(
+            ran_on,
+            Some(worker),
+            "a build led on a rayon worker can deadlock under a stolen follower of its own flight"
+        );
+    }
+
     #[test]
     fn a_lone_item_runs_on_the_calling_thread() {
         let caller = thread::current().id();

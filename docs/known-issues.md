@@ -787,7 +787,7 @@ resolves to nothing is worse than the bloat.
 | P4 | The linked chunk was copied purely to move it into the artifact | 2026-10-06 |
 | P2 | Types-only and unresolvable imports, which never build, queued in the engine miss drain and re-resolved there | 2026-10-06 |
 | P6 | `drain_ordered` ran 2 workers where the other miss drains ran 4, idling a permit during the post-build tail | 2026-10-06 |
-| P8 | The miss drain spawned an OS thread even for a single miss the caller could run itself | 2026-10-06 |
+| P8 | The miss drain spawned an OS thread even for a single miss the caller could run itself (still spawned on a rayon worker, where running inline can deadlock a single-flight) | 2026-10-06 |
 | R2 | The legacy entry-field fallback searched `module`, `browser`, `main`, against the resolver's own per-runtime order | 2026-10-06 |
 | G2 | A failed (unmeasured) import was counted and badged as a "Conservative estimate" in the workspace report | 2026-10-06 |
 | K2 | The project-cache metadata and the recycle timestamp were written in place, so a crash mid-write could tear them | 2026-10-06 |
