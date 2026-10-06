@@ -68,7 +68,9 @@ fn direct_binary_assets_use_the_snapshot_captured_by_the_engine() {
         let expected_hash = match asset.kind {
             AssetKind::Font => content_hash(&[0x31; FONT_A]),
             AssetKind::Wasm => content_hash(&[0x42; WASM_A]),
-            AssetKind::Css => panic!("the binary fixture should not collect CSS"),
+            AssetKind::Css | AssetKind::Image => {
+                panic!("the fixture collects only a font and a wasm: {asset:?}")
+            }
         };
         assert_eq!(
             asset.fingerprint.content_hash,
@@ -380,10 +382,10 @@ fn a_refused_bare_asset_subpath_is_a_disclosed_boundary_not_an_io_failure() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// An image a counted stylesheet references is disclosed with its byte count, so that count is a
-/// cached fact about the file and must expire when the file is resized or removed.
+/// An image a counted stylesheet references is counted at its byte size, so that count is a cached
+/// fact about the file and must expire when the file is resized or removed.
 #[test]
-fn a_css_referenced_image_disclosure_expires_when_the_image_changes() {
+fn a_css_referenced_image_count_expires_when_the_image_changes() {
     let root = common::temp_workspace("import-lens-asset-css-image");
     let package_root = root.join("node_modules").join("sprite-lib");
     write_file(
@@ -406,11 +408,11 @@ fn a_css_referenced_image_disclosure_expires_when_the_image_changes() {
     let (result, fingerprints) = analyze_fixture(&root, "sprite-lib");
     assert!(
         result
-            .diagnostics
+            .asset_breakdown
             .iter()
-            .any(|diagnostic| diagnostic.stage == "uncounted_assets"
-                && diagnostic.message.contains("4000")),
-        "the image is disclosed with its size: {result:?}"
+            .any(|contribution| contribution.kind == AssetKind::Image
+                && contribution.raw_bytes == 4000),
+        "the image is counted at its size: {result:?}"
     );
     let sprite = fs::canonicalize(package_root.join("sprite.png"))
         .expect("sprite should canonicalize")
@@ -419,9 +421,7 @@ fn a_css_referenced_image_disclosure_expires_when_the_image_changes() {
     let fingerprint = fingerprints
         .iter()
         .find(|fingerprint| fingerprint.path == sprite)
-        .unwrap_or_else(|| {
-            panic!("the disclosed image must be a freshness input: {fingerprints:?}")
-        })
+        .unwrap_or_else(|| panic!("the counted image must be a freshness input: {fingerprints:?}"))
         .clone();
     assert_eq!(check_fingerprint(&fingerprint), Freshness::Fresh);
 
@@ -429,7 +429,7 @@ fn a_css_referenced_image_disclosure_expires_when_the_image_changes() {
     assert_eq!(
         check_fingerprint(&fingerprint),
         Freshness::Stale,
-        "resizing the image must expire its cached disclosure"
+        "resizing the image must expire its cached count"
     );
     fs::remove_dir_all(&root).ok();
 }

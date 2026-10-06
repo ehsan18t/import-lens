@@ -7,8 +7,8 @@ use super::AssetKind;
 pub(crate) enum AssetClass {
     /// Processed the way it ships and folded into the size.
     Counted(AssetKind),
-    /// Ships as its own file, but outside the measured taxonomy: an image, an icon, a media file,
-    /// a compiled native addon.
+    /// Ships as its own file, but outside the measured taxonomy: a media file or a compiled native
+    /// addon.
     ///
     /// It must still be intercepted. Left to Rolldown, a `.png` fails its UTF-8 loader and an
     /// `.svg` is parsed as JavaScript; either way one such import would make the whole package
@@ -41,8 +41,10 @@ pub(crate) fn classify_asset_class(path: &Path) -> Option<AssetClass> {
         }
         "wasm" => Some(AssetClass::Counted(AssetKind::Wasm)),
         "woff" | "woff2" | "ttf" | "otf" | "eot" => Some(AssetClass::Counted(AssetKind::Font)),
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "avif" | "ico" | "bmp" | "mp4"
-        | "webm" | "mp3" | "wav" | "ogg" | "node" => Some(AssetClass::Unmeasured),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "avif" | "ico" | "bmp" => {
+            Some(AssetClass::Counted(AssetKind::Image))
+        }
+        "mp4" | "webm" | "mp3" | "wav" | "ogg" | "node" => Some(AssetClass::Unmeasured),
         _ => None,
     }
 }

@@ -248,3 +248,23 @@ test("every client refuses a frame the daemon would tear the connection down for
   );
   assert.equal(cliLimit, daemon, "the CLI would send frames the daemon drops the connection on");
 });
+
+// Drift check. The asset taxonomy is declared by the daemon (`engine::AssetKind`, serialized
+// snake_case) and again by the extension, whose labels are keyed by it. A kind the daemon adds and
+// the extension does not know still renders (the label falls back to the wire name), so nothing
+// fails on its own when the two copies part.
+test("the extension knows every asset kind the daemon puts on the wire", () => {
+  const rustEnum = /pub enum AssetKind \{([^}]*)\}/u.exec(repoFile("daemon/src/engine/mod.rs"));
+  assert.ok(rustEnum, "the daemon must still declare AssetKind");
+  const daemonKinds = [...rustEnum[1].matchAll(/^\s*([A-Z]\w*),/gmu)]
+    .map((variant) => variant[1].replace(/(?<!^)([A-Z])/gu, "_$1").toLowerCase())
+    .sort();
+
+  const tsUnion = /export type AssetKind = ([^;]+);/u.exec(
+    repoFile("extension/src/ipc/protocol.ts"),
+  );
+  assert.ok(tsUnion, "the extension must still declare AssetKind");
+  const extensionKinds = [...tsUnion[1].matchAll(/"(\w+)"/gu)].map((kind) => kind[1]).sort();
+
+  assert.deepEqual(extensionKinds, daemonKinds);
+});

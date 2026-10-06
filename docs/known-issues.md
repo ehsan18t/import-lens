@@ -191,22 +191,6 @@ module source (`MAX_MODULE_SOURCE_BYTES`) through the asset read ledger, though 
 the 16 MiB build-wide CSS work limit are both tighter, so one of those refuses an oversized child first. A tree
 that breaches the budget is refused rather than mismeasured.
 
-### D13: An image referenced from counted CSS is disclosed, not counted
-**Status: Accepted scope** · Decided 2026-07-18 while fixing the silent-drop defect
-
-A stylesheet's `url()` graph can reference kinds outside the processed taxonomy — images, SVG. Those bytes
-ship, so they are disclosed at their real size under `uncounted_assets`, which makes the result a floor and
-holds it at Medium confidence (FR-018b).
-
-They are **not counted**, and the distinction is deliberate rather than technical. An image needs no processor
-— its shipped size is its raw bytes compressed, exactly like a font — so counting it would be easy. What stops
-it is that counting changes what the number *means* for a whole category of packages, and the esbuild oracle
-and every accuracy baseline would have to be re-measured to confirm the two sides still agree on what a build
-emits for an image reference. That is a measurement task, not a code change, and it is not this fix.
-
-The cost of the current choice is real and should not be hidden: a UI kit shipping sprites reads Medium with a
-floor rather than High with a total. That is the honest reading of what we know.
-
 ### D14: Runtime-fetched CSS resources are disclosed but never counted
 **Status: Accepted scope** · Decided 2026-07-18
 

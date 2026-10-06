@@ -32,6 +32,7 @@ const assetKindLabels: Readonly<Record<AssetKind, string>> = {
   css: "CSS",
   wasm: "wasm",
   font: "Fonts",
+  image: "Images",
 };
 
 /**

@@ -57,7 +57,7 @@ export interface ImportRequest {
  * through; there is no size to misuse now. Use `measuredSizes()` in `ui/format.ts` to ask.
  */
 /** What a non-JavaScript asset ships as. Mirrors the daemon's `engine::AssetKind` (snake_case). */
-export type AssetKind = "css" | "wasm" | "font";
+export type AssetKind = "css" | "wasm" | "font" | "image";
 
 /**
  * One asset kind's contribution to an import's size: every artifact of that kind, each

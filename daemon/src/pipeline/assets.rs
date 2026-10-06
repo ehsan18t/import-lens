@@ -1035,7 +1035,7 @@ fn count_assets(
     }
     let all_assets: Vec<CollectedAsset> = assets_by_path.into_values().collect();
 
-    for kind in [AssetKind::Wasm, AssetKind::Font] {
+    for kind in AssetKind::BINARY {
         process_binary_kind(&all_assets, kind, processed, context);
     }
 }
@@ -1816,10 +1816,10 @@ mod tests {
         );
     }
 
-    /// The headline claims to be the import's full cost, so a shipped file it does not include has
-    /// to say so: an image outside the counted taxonomy is disclosed, never silently dropped.
+    /// An image a counted stylesheet references ships as its own file, so it is counted at its real
+    /// size, like a font.
     #[test]
-    fn an_image_referenced_by_css_is_disclosed_with_its_real_size() {
+    fn an_image_referenced_by_css_is_counted_at_its_real_size() {
         let fixture = Fixture::new(
             "image-url",
             &[("index.css", ".a { background-image: url('./bg.png') }\n")],
@@ -1829,17 +1829,41 @@ mod tests {
         let bundle = bundle_css(&fixture.path("index.css"))
             .expect("an image reference must not fail the stylesheet");
         assert_eq!(
+            bundle
+                .referenced_assets
+                .iter()
+                .map(|asset| (asset.kind, asset.raw_bytes()))
+                .collect::<Vec<_>>(),
+            vec![(AssetKind::Image, 4096)],
+            "{bundle:?}"
+        );
+        assert!(bundle.referenced_uncounted.is_empty(), "{bundle:?}");
+    }
+
+    /// The headline claims to be the import's full cost, so a shipped file it does not include has
+    /// to say so: a media file outside the counted taxonomy is disclosed, never silently dropped.
+    #[test]
+    fn a_media_file_referenced_by_css_is_disclosed_with_its_real_size() {
+        let fixture = Fixture::new(
+            "media-url",
+            &[("index.css", ".a { background-image: url('./clip.mp4') }\n")],
+        );
+        fixture.write_bytes("clip.mp4", &[7u8; 4096]);
+
+        let bundle = bundle_css(&fixture.path("index.css"))
+            .expect("a media reference must not fail the stylesheet");
+        assert_eq!(
             bundle.referenced_uncounted.len(),
             1,
-            "the shipped image must be disclosed: {bundle:?}"
+            "the shipped media file must be disclosed: {bundle:?}"
         );
         assert_eq!(
             bundle.referenced_uncounted[0].bytes, 4096,
-            "the disclosure must carry the image's real size, not a zero: {bundle:?}"
+            "the disclosure must carry the file's real size, not a zero: {bundle:?}"
         );
         assert!(
             bundle.dependency_omissions.is_empty(),
-            "a resolvable image is a sized disclosure, not an unknown omission: {bundle:?}"
+            "a resolvable media file is a sized disclosure, not an unknown omission: {bundle:?}"
         );
     }
 

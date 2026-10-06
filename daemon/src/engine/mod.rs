@@ -110,8 +110,8 @@ pub fn uncounted_assets_message(assets: &[UncountedAsset], total_is_floor: bool)
 
 /// What a non-JavaScript module ships as, which decides how it is processed.
 ///
-/// CSS needs a processor (Lightning CSS resolves its `@import` tree and minifies it). A wasm or
-/// font has none: its shipped size is its raw bytes, compressed.
+/// CSS needs a processor (Lightning CSS resolves its `@import` tree and minifies it). A wasm,
+/// font or image has none: its shipped size is its raw bytes, compressed.
 ///
 /// This crosses the wire inside [`crate::ipc::protocol::AssetContribution`], so the snake_case
 /// spellings are the contract the extension matches on.
@@ -123,6 +123,12 @@ pub enum AssetKind {
     Css,
     Wasm,
     Font,
+    Image,
+}
+
+impl AssetKind {
+    /// The kinds shipped as their own file, sized as raw bytes compressed: every kind but CSS.
+    pub const BINARY: [Self; 3] = [Self::Wasm, Self::Font, Self::Image];
 }
 
 #[derive(Debug, Clone)]

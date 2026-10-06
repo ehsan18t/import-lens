@@ -8,10 +8,10 @@
 //     - typescript package: the `graph.rs` TypeScript transform path, the only place
 //       the daemon transforms real TS. A lowered `enum` and `namespace` both codegen
 //       as IIFEs, so this doubles as coverage of the minifier's unused-IIFE analysis.
-//     - emitted asset: JS imports CSS whose surviving `url()` references a local WOFF2;
-//       esbuild and Import Lens must both emit/count that font exactly once. This reaches the
+//     - emitted asset: JS imports CSS whose surviving `url()` references a local WOFF2 and a PNG;
+//       esbuild and Import Lens must both emit/count each exactly once. This reaches the
 //       font INDIRECTLY, through CSS — it does not cover a binary imported from JavaScript.
-//     - direct binary import: JS imports a `.wasm` AND a `.woff2` straight from source, the shape
+//     - direct binary import: JS imports a `.wasm`, a `.woff2` AND a `.png` straight from source, the shape
 //       where the daemon stubs the module to `ModuleType::Empty` at the `load` hook and counts the
 //       file's raw bytes as a separate artifact. That stubbing deletes the URL reference code a
 //       real file-loader build emits, so it is a MODEL, and this is the only place the model is
@@ -55,10 +55,13 @@ const typedPackageName = "importlens-accuracy-ts-fixture";
 const assetPackageName = "importlens-accuracy-asset-fixture";
 const binaryPackageName = "importlens-accuracy-binary-fixture";
 const emittedFontBytes = 8 * 1024;
+// The image a stylesheet references through `url()`, sized apart from every other artifact.
+const emittedImageBytes = 3 * 1024;
 // The direct-import fixture's two binaries. Deliberately DIFFERENT sizes from each other and from
 // `emittedFontBytes`, so a mixed-up artifact shows as a byte mismatch rather than a silent pass.
 const directWasmBytes = 6 * 1024;
 const directFontBytes = 10 * 1024;
+const directImageBytes = 5 * 1024;
 // Tolerances for the direct-import benchmark. Both are far TIGHTER than the global 25%, which is
 // the point: this is the only fixture with no compressor-gap noise to hide behind.
 //
@@ -203,11 +206,14 @@ const main = async () => {
         version: "1.0.0",
         named: "widget",
         expectsStylesheet: true,
-        expectedAssets: [{ extension: ".woff2", kind: "font", bytes: emittedFontBytes }],
+        expectedAssets: [
+          { extension: ".woff2", kind: "font", bytes: emittedFontBytes },
+          { extension: ".png", kind: "image", bytes: emittedImageBytes },
+        ],
         minifiedTolerance: 0.02,
       },
       {
-        label: "direct JS import of wasm and font",
+        label: "direct JS import of wasm, font and image",
         activeDocumentPath: fixture.binaryActiveDocumentPath,
         package: binaryPackageName,
         version: "1.0.0",
@@ -215,6 +221,7 @@ const main = async () => {
         expectedAssets: [
           { extension: ".wasm", kind: "wasm", bytes: directWasmBytes },
           { extension: ".woff2", kind: "font", bytes: directFontBytes },
+          { extension: ".png", kind: "image", bytes: directImageBytes },
         ],
         // See the measurement note above `binaryModelTolerances`.
         tolerance: binaryModelTolerances.brotli,
@@ -621,7 +628,8 @@ const writeBinaryFixture = async (workspace, sourceRoot) => {
     [
       `import wasmUrl from "./probe.wasm";`,
       `import fontUrl from "./probe.woff2";`,
-      `export const widget = () => wasmUrl + fontUrl;`,
+      `import imageUrl from "./probe.png";`,
+      `export const widget = () => wasmUrl + fontUrl + imageUrl;`,
       ``,
     ].join("\n"),
     "utf8",
@@ -633,6 +641,10 @@ const writeBinaryFixture = async (workspace, sourceRoot) => {
   await writeFile(
     path.join(packageRoot, "probe.woff2"),
     incompressibleBytes(directFontBytes, 0x6d2b79f5),
+  );
+  await writeFile(
+    path.join(packageRoot, "probe.png"),
+    incompressibleBytes(directImageBytes, 0x2545f491),
   );
 
   const activeDocumentPath = path.join(sourceRoot, "binary-entry.js");
@@ -684,7 +696,8 @@ const writeAssetFixture = async (workspace, sourceRoot) => {
   );
   await writeFile(
     path.join(packageRoot, "layout.css"),
-    `@import "./shared.css";\n.panel { display: grid; grid-template-columns: 1fr 1fr; }\n`,
+    `@import "./shared.css";\n.panel { display: grid; grid-template-columns: 1fr 1fr; }\n` +
+      `.logo { background-image: url("./logo.png"); }\n`,
     "utf8",
   );
   // Deliberately BULKY, and that is a property of the gate rather than of the fixture. This
@@ -701,6 +714,7 @@ const writeAssetFixture = async (workspace, sourceRoot) => {
   ).join("\n");
   await writeFile(path.join(packageRoot, "shared.css"), `${sharedRules}\n`, "utf8");
   await writeFile(path.join(packageRoot, "probe.woff2"), deterministicBytes(emittedFontBytes));
+  await writeFile(path.join(packageRoot, "logo.png"), deterministicBytes(emittedImageBytes));
 
   const activeDocumentPath = path.join(sourceRoot, "asset-entry.js");
   await writeFile(activeDocumentPath, `export { widget } from "${assetPackageName}";\n`, "utf8");
@@ -831,7 +845,7 @@ const esbuildNamedSize = async (
     // `.wasm`, so `import u from "./x.wasm"` is a hard build error without this line. Under `file`
     // esbuild emits the binary as its own artifact and a JS module exporting the URL — the JS half
     // is exactly what the daemon stubs away, which is the difference that benchmark quantifies.
-    loader: { ".woff2": "file", ".wasm": "file" },
+    loader: { ".woff2": "file", ".wasm": "file", ".png": "file" },
     logLevel: "silent",
   });
 

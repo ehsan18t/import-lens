@@ -219,12 +219,12 @@ fn collect_supported_asset(
         ));
     }
 
-    // Outside the counted taxonomy (an image, an SVG): the bytes ship, so they are disclosed at
-    // full size, and `stat` above expires that disclosure when the file changes. Only a wasm or
-    // font is counted here; a `url()` naming a stylesheet is not, because Lightning CSS inlines
-    // `@import` children into the one bundled sheet and counting it again would double it.
+    // Outside the counted taxonomy (a media file): the bytes ship, so they are disclosed at full
+    // size, and `stat` above expires that disclosure when the file changes. Only a binary kind is
+    // counted here; a `url()` naming a stylesheet is not, because Lightning CSS inlines `@import`
+    // children into the one bundled sheet and counting it again would double it.
     let counted_kind = classify_asset_class(&path).and_then(|class| match class {
-        AssetClass::Counted(kind @ (AssetKind::Wasm | AssetKind::Font)) => Some(kind),
+        AssetClass::Counted(kind) if AssetKind::BINARY.contains(&kind) => Some(kind),
         _ => None,
     });
     let Some(kind) = counted_kind else {
@@ -342,7 +342,7 @@ mod tests {
             std::thread::current().id()
         ));
         fs::create_dir_all(&dir).expect("fixture dir");
-        let files = ["a.png", "b.png", "c.png"];
+        let files = ["a.mp4", "b.mp4", "c.mp4"];
         for file in files {
             fs::write(dir.join(file), [7_u8; 16]).expect("fixture file");
         }
@@ -355,7 +355,7 @@ mod tests {
                 stats.set(stats.get() + 1);
                 fs::metadata(path)
             },
-            &|path, _| panic!("an image is disclosed, never read: {}", path.display()),
+            &|path, _| panic!("a media file is disclosed, never read: {}", path.display()),
             &|| true,
         );
         fs::remove_dir_all(&dir).ok();

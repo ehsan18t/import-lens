@@ -2965,8 +2965,8 @@ fn analyze_local_assets_referenced_by_css_are_counted_in_the_import_cost() {
 /// A directly imported `.png` is not UTF-8, so Rolldown's own loader failed on `InvalidData` and the
 /// entire build died — the user saw "unavailable" for a package whose JavaScript measures perfectly.
 /// An `.svg` is valid UTF-8, so it reached OXC instead and was parsed as JavaScript, which failed
-/// just as fatally by a different route. Both are now stubbed like any other asset: the JS graph
-/// measures, and the shipped bytes are disclosed rather than dropped.
+/// just as fatally by a different route. Both are stubbed like any other asset: the JS graph
+/// measures, and each image is counted at its real size, like a font.
 #[test]
 fn analyze_measures_a_package_that_directly_imports_an_image() {
     let workspace = temp_workspace();
@@ -3020,19 +3020,21 @@ fn analyze_measures_a_package_that_directly_imports_an_image() {
         common::measured_sizes(&result).raw_bytes > 0,
         "the JavaScript graph must still be measured: {result:?}"
     );
-    let disclosure = result
-        .diagnostics
+    let svg_bytes =
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"8\" height=\"8\"/></svg>".len()
+            as u64;
+    let images = result
+        .asset_breakdown
         .iter()
-        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
-        .expect("shipped bytes the size omits must be disclosed");
+        .find(|contribution| contribution.kind == AssetKind::Image)
+        .expect("both imported images must be counted: {result:?}");
+    assert_eq!(images.raw_bytes, 16_384 + svg_bytes, "{result:?}");
     assert!(
-        disclosure.message.contains("logo.png") && disclosure.message.contains("mark.svg"),
-        "both shipped files must be named: {disclosure:?}"
-    );
-    assert_ne!(
-        result.confidence,
-        ConfidenceLevel::High,
-        "a size that omits shipped bytes cannot claim High confidence: {result:?}"
+        result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.stage != "uncounted_assets"),
+        "a counted image is not an omission: {result:?}"
     );
 }
 
@@ -3303,12 +3305,10 @@ fn analyze_does_not_report_io_trouble_for_platform_addons_a_package_never_shippe
     );
 }
 
-/// The headline claims to be the import's full cost. An image is outside the counted taxonomy, and
-/// the closed `AssetKind` set used to drop it through a bare `None`: out of the number, out of every
-/// disclosure, still High confidence — a package advertising a total it was short by. Disclosing it
-/// is what restores `incomplete`, which is what re-closes the cache and budget paths behind it.
+/// An image a counted stylesheet references ships as its own file, so it is counted under its own
+/// kind at its real size, never folded into another kind and never left out of the number.
 #[test]
-fn analyze_discloses_an_image_referenced_by_counted_css_instead_of_dropping_it() {
+fn analyze_counts_an_image_referenced_by_counted_css() {
     let workspace = temp_workspace();
     write_package(
         &workspace,
@@ -3354,21 +3354,20 @@ fn analyze_discloses_an_image_referenced_by_counted_css_instead_of_dropping_it()
             .iter()
             .all(|contribution| contribution.kind != AssetKind::Font
                 && contribution.kind != AssetKind::Wasm),
-        "an image is disclosed, not counted as some other kind: {result:?}"
+        "an image is counted as an image, not as some other kind: {result:?}"
     );
-    let disclosure = result
-        .diagnostics
+    let image = result
+        .asset_breakdown
         .iter()
-        .find(|diagnostic| diagnostic.stage == "uncounted_assets")
-        .expect("a shipped image the size omits must be disclosed as uncounted");
+        .find(|contribution| contribution.kind == AssetKind::Image)
+        .expect("the referenced image must be counted: {result:?}");
+    assert_eq!(image.raw_bytes, 64 * 1024, "{result:?}");
     assert!(
-        disclosure.message.contains("65536"),
-        "the disclosure must carry the image's real size: {disclosure:?}"
-    );
-    assert_ne!(
-        result.confidence,
-        ConfidenceLevel::High,
-        "a size that omits shipped bytes cannot claim High confidence: {result:?}"
+        result
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.stage != "uncounted_assets"),
+        "a counted image is not an omission: {result:?}"
     );
 }
 
