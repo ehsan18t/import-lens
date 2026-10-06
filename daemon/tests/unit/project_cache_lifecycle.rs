@@ -113,3 +113,54 @@ fn remove_shard_by_id_waits_for_the_shard_load_lock() {
     drop(registry);
     std::fs::remove_dir_all(storage).ok();
 }
+
+/// A shard whose disk cannot be opened (another daemon holds the file lock, the directory is
+/// read-only, a maintenance pass holds it) must keep one memory layer across requests instead of
+/// a fresh, empty one per request, and must still regain persistence once the disk is free.
+#[test]
+fn a_shard_without_its_disk_keeps_its_memory_and_retries_the_open() {
+    let storage = temp_storage("disk-retry");
+    let root = storage.join("app");
+    std::fs::create_dir_all(&root).expect("project root");
+    let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512);
+    let shard_id = project_cache_shard_id(&root);
+    let shard_dir = storage.join(&shard_id);
+    std::fs::create_dir_all(&shard_dir).expect("shard dir");
+    let held = redb::Database::create(shard_dir.join(SHARD_DB_FILE_NAME)).expect("hold the db");
+
+    let degraded = registry.cache_for_root(&root);
+    assert!(!degraded.disk_available());
+    degraded.insert("react@18.3.1::default".to_owned(), result("react"));
+
+    let next_request = registry.cache_for_root(&root);
+    assert!(
+        Arc::ptr_eq(&degraded, &next_request),
+        "every request must share the degraded shard's memory layer"
+    );
+    assert!(next_request.get("react@18.3.1::default").is_some());
+
+    drop(held);
+    assert!(
+        !registry.cache_for_root(&root).disk_available(),
+        "the retry waits for its backoff instead of reopening on every request"
+    );
+
+    // Let the backoff elapse.
+    if let Some(shard) = registry.loaded.lock().unwrap().get_mut(&shard_id) {
+        shard.disk_retry = Some(DiskRetry::starting_at(0));
+    }
+    let healed = registry.cache_for_root(&root);
+    assert!(Arc::ptr_eq(&degraded, &healed), "the shard heals in place");
+    assert!(
+        healed.disk_available(),
+        "a due retry reopens the freed disk"
+    );
+    assert!(
+        shard_dir.join(SHARD_METADATA_FILE_NAME).exists(),
+        "a healed shard is listed again"
+    );
+    assert!(healed.get("react@18.3.1::default").is_some());
+
+    drop((degraded, next_request, healed, registry));
+    std::fs::remove_dir_all(storage).ok();
+}

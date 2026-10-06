@@ -45,7 +45,7 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// caused it — attributed, dated, and unable to drift from the code the way a hand-kept list can.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.2.x+18"
+        "rolldown-1.2.x+19"
     };
 }
 
@@ -57,8 +57,8 @@ pub struct FileFingerprint {
     pub path: String,
     pub len: u64,
     pub modified_millis: u64,
-    /// xxh3 of the bytes read during analysis. Absent for fingerprints built by
-    /// a pure stat (`file_fingerprint`). Skipped when None so the serialized key
+    /// xxh3 of the bytes read during analysis. Absent for a stat-only fingerprint
+    /// (`file_fingerprint_with_hash(path, None)`). Skipped when None so the serialized key
     /// stays identical to the pre-content-hash format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<u64>,
@@ -156,16 +156,6 @@ pub fn decode_cache_identity(key: &str) -> Option<CacheIdentity> {
     let encoded = key.strip_prefix(PREFIX.as_str())?;
     let bytes = hex_decode(encoded)?;
     rmp_serde::from_slice(&bytes).ok()
-}
-
-pub fn cache_key_matches_package(key: &str, package_name: &str) -> bool {
-    if let Some(identity) = decode_cache_identity(key) {
-        return identity.package_name == package_name;
-    }
-
-    let root_prefix = format!("{package_name}@");
-    let subpath_prefix = format!("{package_name}/");
-    key.starts_with(&root_prefix) || key.starts_with(&subpath_prefix)
 }
 
 /// Definitive-absence test for reclaim/delete paths. Unlike `Path::exists()`
@@ -271,15 +261,6 @@ pub fn cache_key_matches_any_package(key: &str, package_names: &HashSet<String>)
     package_names.iter().any(|package_name| {
         key.starts_with(&format!("{package_name}@")) || key.starts_with(&format!("{package_name}/"))
     })
-}
-
-pub fn fingerprints_for_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<FileFingerprint> {
-    let mut fingerprints = paths
-        .into_iter()
-        .filter_map(file_fingerprint)
-        .collect::<Vec<_>>();
-    sort_and_dedup_fingerprints(&mut fingerprints);
-    fingerprints
 }
 
 /// Put fingerprint sets in deterministic cache-key order while preserving conflicting snapshots.
@@ -394,32 +375,10 @@ pub fn check_fingerprint(stored: &FileFingerprint) -> Freshness {
 
     // mtime/len differ. With a content hash we can tell a real change from a
     // no-op touch; without one we can only assume Stale.
-    let Some(expected) = stored.content_hash else {
-        return Freshness::Stale;
-    };
-    match fs::read(&stored.path) {
-        Ok(bytes) if content_hash(&bytes) == expected => Freshness::Fresh,
-        Ok(_) => Freshness::Stale,
-        Err(error) => classify_stat_error(error.kind()),
+    match stored.content_hash {
+        Some(expected) => verify_content_hash(&stored.path, expected),
+        None => Freshness::Stale,
     }
-}
-
-/// Worst-case freshness across a set. `Unknown` dominates so a transient error on
-/// any file never triggers a destructive decision; otherwise Gone, then Stale.
-pub fn check_fingerprints(fingerprints: &[FileFingerprint]) -> Freshness {
-    let mut worst = Freshness::Fresh;
-    for fingerprint in fingerprints {
-        match check_fingerprint(fingerprint) {
-            Freshness::Unknown => return Freshness::Unknown,
-            // The `Unknown` arm returns early, so `worst` is never `Unknown` here;
-            // and the `Stale` arm below only upgrades `Fresh`, so it can never
-            // downgrade a `Gone`. Precedence stays Unknown > Gone > Stale > Fresh.
-            Freshness::Gone => worst = Freshness::Gone,
-            Freshness::Stale if matches!(worst, Freshness::Fresh) => worst = Freshness::Stale,
-            _ => {}
-        }
-    }
-    worst
 }
 
 /// Like `check_fingerprint`, but never trusts the mtime+len pre-filter when a
@@ -427,10 +386,16 @@ pub fn check_fingerprints(fingerprints: &[FileFingerprint]) -> Freshness {
 /// first-party/linked source files (probed every get), where a mtime-preserving,
 /// equal-length rewrite would otherwise be served stale (X-7).
 pub fn check_fingerprint_strict(stored: &FileFingerprint) -> Freshness {
-    let Some(expected) = stored.content_hash else {
-        return check_fingerprint(stored); // no hash to verify — mtime+len is all we have
-    };
-    match fs::read(&stored.path) {
+    match stored.content_hash {
+        Some(expected) => verify_content_hash(&stored.path, expected),
+        // No hash to verify: mtime+len is all there is.
+        None => check_fingerprint(stored),
+    }
+}
+
+/// Re-reads `path` and compares its content hash with the stored one.
+fn verify_content_hash(path: &str, expected: u64) -> Freshness {
+    match fs::read(path) {
         Ok(bytes) if content_hash(&bytes) == expected => Freshness::Fresh,
         Ok(_) => Freshness::Stale,
         Err(error) => classify_stat_error(error.kind()),
@@ -440,7 +405,8 @@ pub fn check_fingerprint_strict(stored: &FileFingerprint) -> Freshness {
 /// Worst-case freshness across a set, hash-verifying first-party (non-node_modules)
 /// files strictly while keeping the cheap `check_fingerprint` pre-filter for
 /// node_modules files (which cannot silently change without a generation bump).
-/// Same precedence as `check_fingerprints`: Unknown > Gone > Stale > Fresh.
+/// Precedence: Unknown > Gone > Stale > Fresh, so a transient error on any file
+/// never triggers a destructive decision.
 pub fn check_fingerprints_strict(fingerprints: &[FileFingerprint]) -> Freshness {
     let mut worst = Freshness::Fresh;
     for fingerprint in fingerprints {
@@ -451,6 +417,7 @@ pub fn check_fingerprints_strict(fingerprints: &[FileFingerprint]) -> Freshness 
         };
         match freshness {
             Freshness::Unknown => return Freshness::Unknown,
+            // `Stale` only upgrades `Fresh`, so it never downgrades a `Gone`.
             Freshness::Gone => worst = Freshness::Gone,
             Freshness::Stale if matches!(worst, Freshness::Fresh) => worst = Freshness::Stale,
             _ => {}
@@ -459,18 +426,9 @@ pub fn check_fingerprints_strict(fingerprints: &[FileFingerprint]) -> Freshness 
     worst
 }
 
-/// Back-compatible boolean: true only when every fingerprint is `Fresh`.
-pub fn fingerprints_are_current(fingerprints: &[FileFingerprint]) -> bool {
-    matches!(check_fingerprints(fingerprints), Freshness::Fresh)
-}
-
 fn encode_cache_identity(identity: &CacheIdentity) -> String {
     let bytes = rmp_serde::to_vec(identity).unwrap_or_default();
     format!("v{CACHE_KEY_VERSION}:{}", hex_encode(&bytes))
-}
-
-fn file_fingerprint(path: impl AsRef<Path>) -> Option<FileFingerprint> {
-    file_fingerprint_with_hash(path, None)
 }
 
 /// Stat `path` for len+mtime and attach an already-computed content hash (from
@@ -554,20 +512,9 @@ pub fn fingerprints_are_reusable(fingerprints: &[FileFingerprint]) -> bool {
         && !fingerprints_have_conflicting_snapshots(fingerprints)
 }
 
-/// Len + mtime captured at the moment a module's bytes are read during analysis,
-/// using the same mtime derivation as `check_fingerprint` so a later probe of an
-/// unchanged file hits the `Fresh` pre-filter. Returns `(len, modified_millis)`;
-/// falls back to `(0, 0)` when the stat fails — the caller already holds the bytes,
-/// so a missed stat only weakens the pre-filter, never correctness (the content
-/// hash still decides).
-pub fn read_time_len_mtime(path: impl AsRef<Path>) -> (u64, u64) {
-    match fs::metadata(path.as_ref()) {
-        Ok(metadata) => read_time_len_mtime_of(&metadata),
-        Err(_) => (0, 0),
-    }
-}
-
-/// Same, from a stat the caller already took.
+/// Len + mtime of a module read during analysis, from a stat the caller already
+/// took, using the same mtime derivation as `check_fingerprint` so a later probe
+/// of an unchanged file hits the `Fresh` pre-filter.
 ///
 /// The stat MUST be the one taken *before* the bytes were read. Stat-after-read
 /// records the post-edit len+mtime against a hash of the pre-edit bytes, and
@@ -584,14 +531,11 @@ pub fn read_time_len_mtime_of(metadata: &std::fs::Metadata) -> (u64, u64) {
 /// re-stat'ing, for a path that is ALREADY the canonical module key (the module
 /// graph keys every module by its `fs::canonicalize`d path).
 ///
-/// `normalize_identity_path` would re-`canonicalize` that path — an idempotent no-op
-/// on an already-canonical path — so this skips the syscall and applies only the
-/// `\` → `/` identity-path normalization directly. The result is byte-identical to
-/// `normalize_identity_path(canonical_path)`: on an already-canonical existing path
-/// `fs::canonicalize` returns it unchanged, and if the file has since disappeared
-/// `normalize_identity_path` falls back to that same raw path we forward-slash here.
-/// An unchanged file still matches the pre-filter, and a file changed *after* analysis
-/// yields a mismatched len/mtime (closing the post-analysis TOCTOU window).
+/// Skips the `canonicalize` that `normalize_identity_path` would repeat, so the
+/// result is byte-identical to `normalize_identity_path(canonical_path)` only while
+/// the input really is canonical; a non-canonical input would key the fingerprint
+/// off a path a later probe never matches. Debug builds assert the round trip (a
+/// file deleted since analysis cannot be canonicalized and is accepted).
 pub fn file_fingerprint_from_read_time(
     canonical_path: impl AsRef<Path>,
     len: u64,
@@ -599,14 +543,6 @@ pub fn file_fingerprint_from_read_time(
     content_hash: u64,
 ) -> FileFingerprint {
     let path_ref = canonical_path.as_ref();
-    // C8 precondition: `path_ref` MUST already be canonical (the module graph's
-    // `fs::canonicalize`d module key). This fn deliberately skips the canonicalize
-    // syscall and only forward-slashes the path, so a non-canonical input would key the
-    // fingerprint off a path a later probe's canonical path never matches. `canonicalize`
-    // is idempotent on a canonical path, so in debug/test builds assert the input
-    // round-trips; a file deleted since analysis (canonicalize errors) is accepted
-    // (`unwrap_or(true)`) — the fingerprint then falls back to the raw path exactly as
-    // documented above. Compiles out entirely in release.
     debug_assert!(
         std::fs::canonicalize(path_ref)
             .map(|resolved| resolved.as_path() == path_ref)
@@ -615,7 +551,7 @@ pub fn file_fingerprint_from_read_time(
         path_ref.display()
     );
     FileFingerprint {
-        path: path_ref.to_string_lossy().replace('\\', "/"),
+        path: identity_path_string(path_ref),
         len,
         modified_millis,
         content_hash: Some(content_hash),
@@ -623,10 +559,21 @@ pub fn file_fingerprint_from_read_time(
 }
 
 fn normalize_identity_path(path: impl AsRef<Path>) -> String {
-    fs::canonicalize(path.as_ref())
-        .unwrap_or_else(|_| PathBuf::from(path.as_ref()))
-        .to_string_lossy()
-        .replace('\\', "/")
+    let path = path.as_ref();
+    identity_path_string(&fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)))
+}
+
+/// The stored spelling of a path in cache keys and fingerprints, which are also
+/// stat'd later. `/`-separated on Windows, where `\` is a separator; verbatim
+/// elsewhere, where `\` is an ordinary file-name character and rewriting it would
+/// name a different file.
+pub fn identity_path_string(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -783,6 +730,37 @@ mod tests {
             Freshness::Stale,
             "creating the file is what re-measures the package"
         );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn identity_paths_rewrite_backslashes_only_where_they_are_separators() {
+        let spelled = identity_path_string(Path::new(r"C:\ws\node_modules\x\a\b.js"));
+        if cfg!(windows) {
+            assert_eq!(spelled, "C:/ws/node_modules/x/a/b.js");
+        } else {
+            assert_eq!(spelled, r"C:\ws\node_modules\x\a\b.js");
+        }
+    }
+
+    /// On POSIX `a\b.css` is one file name. Stored as `a/b.css`, the absent check would stat a
+    /// path nobody creates and stay Fresh after the real file appears.
+    #[cfg(unix)]
+    #[test]
+    fn an_absent_input_with_a_backslash_in_its_name_expires_when_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-absent-backslash-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let missing = dir.join(r"a\b.css");
+        let fingerprint = absent_file_fingerprint(&missing);
+        assert_eq!(check_fingerprint(&fingerprint), Freshness::Fresh);
+
+        std::fs::write(&missing, b".a { color: red }").expect("create the input");
+        assert_eq!(check_fingerprint(&fingerprint), Freshness::Stale);
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -982,9 +960,9 @@ mod tests {
     }
 
     #[test]
-    fn check_fingerprints_precedence_across_real_files() {
+    fn check_fingerprints_strict_precedence_across_real_files() {
         // Empty set is Fresh.
-        assert_eq!(check_fingerprints(&[]), Freshness::Fresh);
+        assert_eq!(check_fingerprints_strict(&[]), Freshness::Fresh);
 
         let dir = std::env::temp_dir().join(format!(
             "il-fp-prec-{}-{:?}",
@@ -1029,19 +1007,19 @@ mod tests {
         // Precedence across a set: Gone > Stale > Fresh (Unknown has no portable
         // Windows repro, so it is covered only by the empty-set + unit cases).
         assert_eq!(
-            check_fingerprints(std::slice::from_ref(&fresh_fp)),
+            check_fingerprints_strict(std::slice::from_ref(&fresh_fp)),
             Freshness::Fresh
         );
         assert_eq!(
-            check_fingerprints(&[fresh_fp.clone(), stale_fp.clone()]),
+            check_fingerprints_strict(&[fresh_fp.clone(), stale_fp.clone()]),
             Freshness::Stale
         );
         assert_eq!(
-            check_fingerprints(&[fresh_fp.clone(), gone_fp.clone()]),
+            check_fingerprints_strict(&[fresh_fp.clone(), gone_fp.clone()]),
             Freshness::Gone
         );
         assert_eq!(
-            check_fingerprints(&[stale_fp, gone_fp]),
+            check_fingerprints_strict(&[stale_fp, gone_fp]),
             Freshness::Gone,
             "Gone must dominate Stale regardless of order"
         );
@@ -1098,10 +1076,6 @@ mod tests {
 
         // The cheap pre-filter is fooled — proves the blind spot is real here.
         assert_eq!(check_fingerprint(&stored), Freshness::Fresh);
-        assert_eq!(
-            check_fingerprints(std::slice::from_ref(&stored)),
-            Freshness::Fresh
-        );
 
         // Strict hash-verifies unconditionally, regardless of the mtime+len match.
         assert_eq!(check_fingerprint_strict(&stored), Freshness::Stale);

@@ -30,8 +30,8 @@ const SUMMARY_TABLE: TableDefinition<&str, u64> = TableDefinition::new("summary"
 const SUMMARY_TOTAL_BYTES: &str = "total_bytes";
 const SUMMARY_ENTRY_COUNT: &str = "entry_count";
 // Recency high-water: the largest `last_seq` ever inserted. Advances on insert,
-// is left untouched by removals (a high-water mark), and is recomputed by a full
-// scan in `rebuild_summary_from_scan`. Used to keep the recency clock ahead of
+// is left untouched by removals (a high-water mark), and is recomputed by the
+// heal-on-open scan. Used to keep the recency clock ahead of
 // persisted seqs in O(1) (and by C5's startup seed).
 const SUMMARY_MAX_SEQ: &str = "max_seq";
 // Secondary index: ascending `(last_seq, key)` → the evictor's lowest-N is a
@@ -58,6 +58,13 @@ const SEQ_INDEX_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("
 // opened; it is harmless dead space reclaimed by the compactor.
 const CURRENT_SCHEMA_VERSION: u64 = 8;
 const INSERT_FLUSH_BATCH: usize = 64;
+/// Queue ceiling, reachable only while flushes keep failing: past it the least
+/// recently used queued inserts are dropped. They are rebuildable and still live
+/// in the memory layer.
+const MAX_PENDING_INSERTS: usize = 16 * INSERT_FLUSH_BATCH;
+/// After a failed flush, inserts stop triggering flushes for this long; explicit
+/// flushes (recycle, shutdown, maintenance reads) still try.
+const FLUSH_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// Compact a shard when more than this fraction of its `.redb` file is
 /// reclaimable free space (redb reuses freed pages rather than shrinking).
 pub const COMPACT_THRESHOLD: f64 = 0.5;
@@ -69,12 +76,11 @@ pub const COMPACT_THRESHOLD: f64 = 0.5;
 const COMPACT_IDLE: Duration = Duration::from_secs(5);
 
 // Every CACHE_TABLE value is `[last_seq: u64 LE, 8 bytes][msgpack CacheEnvelope]`.
-// The recency readers that still scan CACHE_TABLE (`recent_keys`, and the
-// summary rebuild/heal) only need `last_seq` + the value length; the fixed prefix
-// lets them read it without deserializing the full envelope (ImportResult +
-// contributions + fingerprints — KBs and dozens of allocations per entry).
-// `shard_rollup`/`lowest_seq_keys` no longer scan at all — they read the summary
-// and the `(last_seq, key)` index directly.
+// Index and summary maintenance, and the heal-on-open rebuild, need only
+// `last_seq` + the value length; the fixed prefix gives them that without
+// deserializing the full envelope (ImportResult + contributions + fingerprints).
+// Recency readers (`recent_keys`, `lowest_seq_keys`, `shard_rollup`) read the
+// `(last_seq, key)` index and the summary, never CACHE_TABLE.
 const SEQ_PREFIX_LEN: usize = 8;
 
 /// redb's page cache defaults to 1 GiB per database and fills with every page read or
@@ -92,6 +98,10 @@ fn create_database(path: &Path) -> Result<Database, redb::DatabaseError> {
 #[cfg(test)]
 #[path = "../../tests/unit/cache_disk_test_support.rs"]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+#[path = "../../tests/unit/cache_disk_compaction.rs"]
+mod cache_disk_compaction_tests;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEnvelope {
@@ -158,10 +168,29 @@ pub struct DiskCache {
     // the user is actively analyzing is never compacted (§5.5 / Finding 12). A
     // heuristic, not a correctness gate — a relaxed store/load is enough.
     last_access: AtomicU64,
+    // Unix millis before which an insert must not trigger a flush, set by a failed
+    // flush (`FLUSH_RETRY_BACKOFF`); 0 when the last flush succeeded.
+    flush_retry_after: AtomicU64,
+    // Where an enabled shard lives, kept so a failed open can be retried
+    // (`reopen_if_unavailable`). None when the disk cache is disabled.
+    storage_path: Option<PathBuf>,
 }
 
 impl DiskCache {
     pub fn new(storage_path: Option<PathBuf>, enabled: bool) -> Self {
+        Self::open(storage_path, enabled, true)
+    }
+
+    /// Opens a shard that must already exist, never creating its directory or
+    /// database. For maintenance and observability passes, which open shards from
+    /// an earlier directory listing: recreating one that was removed since would
+    /// leave a database with no project metadata, which no listing, eviction or
+    /// removal ever finds again.
+    pub fn open_existing(storage_path: Option<PathBuf>, enabled: bool) -> Self {
+        Self::open(storage_path, enabled, false)
+    }
+
+    fn open(storage_path: Option<PathBuf>, enabled: bool, create_missing: bool) -> Self {
         if !enabled {
             return Self::disabled();
         }
@@ -171,8 +200,10 @@ impl DiskCache {
             None => return Self::disabled(),
         };
 
+        let db = Self::open_database(&storage_path, create_missing);
         Self {
-            db: RwLock::new(Self::open_database(&storage_path)),
+            db: RwLock::new(db),
+            storage_path: Some(storage_path),
             pending_inserts: Mutex::new(HashMap::new()),
             clear_generation: AtomicU64::new(0),
             clear_lock: Mutex::new(()),
@@ -184,6 +215,7 @@ impl DiskCache {
             // stamps `now` and protects an actively-analyzed shard; the brief
             // open->first-access window reading as idle is benign.
             last_access: AtomicU64::new(0),
+            flush_retry_after: AtomicU64::new(0),
         }
     }
 
@@ -206,13 +238,10 @@ impl DiskCache {
         );
     }
 
-    /// Test-only seam: pushes the last-access clock to the epoch so the shard
-    /// reads as idle to `compact_if_fragmented`, letting a test exercise the
-    /// idle gate without sleeping `COMPACT_IDLE`. `#[doc(hidden)]` and not part
-    /// of the supported API — the idle window is wall-clock based, so there is
-    /// otherwise no deterministic way to make a just-written shard read as idle.
-    #[doc(hidden)]
-    pub fn mark_idle_for_test(&self) {
+    /// Pushes the last-access clock to the epoch so the shard reads as idle to
+    /// `compact_if_fragmented` without sleeping `COMPACT_IDLE`.
+    #[cfg(test)]
+    pub(crate) fn mark_idle_for_test(&self) {
         self.last_access
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -253,22 +282,44 @@ impl DiskCache {
     }
 
     fn get_entry(&self, key: &str) -> Option<(CachedImport, crate::cache::key::Freshness)> {
-        // Read-your-writes: a queued insert not yet flushed is not in the table.
-        if let Some(entry) = self.pending_insert_entry(key) {
-            // A pending hit is a real access on an enabled shard — stamp it.
+        // Read-your-writes: a queued insert not yet flushed is not in the table. Its
+        // bytes passed the durability gate on the way in.
+        let mut cached = if let Some(pending) = self.pending_insert(key) {
             self.stamp_access();
-            return Some(entry);
+            pending
+        } else {
+            self.read_committed(key)?
+        };
+        // First-party-ness is key-derived; stamp it once at hydration so the
+        // per-hit gate never has to re-decode the identity.
+        cached.first_party = crate::cache::key::cache_key_is_first_party(key);
+        // Hash-verified per FINGERPRINT on this cold path too, exactly as the memory
+        // read does, so a restart cannot re-arm the X-7 / D18 blind spot.
+        let freshness =
+            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
+        match freshness {
+            crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
+                self.remove(key);
+                None
+            }
+            // Unknown is transient: keep the entry.
+            crate::cache::key::Freshness::Fresh | crate::cache::key::Freshness::Unknown => {
+                Some((cached, freshness))
+            }
         }
+    }
 
+    /// Decodes the committed row for `key`, evicting one that is undecodable or not
+    /// durable.
+    fn read_committed(&self, key: &str) -> Option<CachedImport> {
         // Scope the read guard: `remove` re-acquires the db lock, and a re-entrant
         // read while a compaction writer is queued deadlocks (std `RwLock` blocks
         // new readers behind a queued writer, and its docs say a re-entrant `read`
         // may deadlock). Decide inside the scope, drop the guard, THEN remove.
         let decoded = {
             let db_guard = self.db_read()?;
-            // Stamp only once the DB is confirmed open (after the disabled
-            // short-circuit), so a no-op cache skips the clock syscall. Before the
-            // table read, so a get MISS still counts as shard activity.
+            // Stamp only once the DB is confirmed open, and before the table read so a
+            // miss still counts as shard activity.
             self.stamp_access();
             let db = db_guard.as_ref().expect("db present under read guard");
             let read_txn = db.begin_read().ok()?;
@@ -277,18 +328,14 @@ impl DiskCache {
             decode_cached_result(value.value())
         };
 
-        let Some(mut cached) = decoded else {
+        let Some(cached) = decoded else {
             // Undecodable row (corrupt or written by an incompatible build).
             self.remove(key);
             return None;
         };
-        // **The durability gate is on the READ too, not only on `insert_at_generation`**
-        // (ADR-0006, invariant 3). A write-side gate protects a store from what it is handed
-        // today; it does nothing about what is already on disk. L2 outlives the process, so a row
-        // written by a build that predates the gate — or by any future path that reaches redb some
-        // other way — would be decoded, served, and re-promoted into L1 forever, and every read
-        // path (`get_with_freshness`, and the prewarm's `load_recent`) goes through here. Refusing
-        // and removing it costs one rebuild.
+        // The durability gate is on the READ too (ADR-0006, invariant 3): L2 outlives
+        // the process, so a row written before the write gate existed would otherwise
+        // be served and re-promoted into L1 forever. Refusing it costs one rebuild.
         if !cached.result.is_durable()
             || !crate::cache::key::fingerprints_are_reusable(&cached.dependency_fingerprints)
         {
@@ -302,30 +349,7 @@ impl DiskCache {
             self.remove(key);
             return None;
         }
-        // First-party-ness is key-derived; stamp it once at hydration so the
-        // per-hit gate never has to re-decode the identity.
-        cached.first_party = crate::cache::key::cache_key_is_first_party(key);
-        // First-party (workspace / npm-link / file:) source files can be rewritten
-        // equal-length with a preserved mtime, which the cheap pre-filter would miss
-        // (X-7). Hash-verify them strictly on the cold disk-hydration path too, so the
-        // blind spot isn't served even on the first hit before memory hydration.
-        // node_modules files stay on the cheap pre-filter inside the strict variant.
-        // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
-        // stylesheet's `url()` reached outside the package root (D18). Routing by entry meant that
-        // file's stored content hash was never consulted, and a rehydrate from disk re-armed the
-        // same blind spot, so a restart did not clear it either.
-        let freshness =
-            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
-        match freshness {
-            crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
-                self.remove(key);
-                None
-            }
-            // Fresh OR Unknown → keep and return the entry (Unknown must not delete).
-            crate::cache::key::Freshness::Fresh | crate::cache::key::Freshness::Unknown => {
-                Some((cached, freshness))
-            }
-        }
+        Some(cached)
     }
 
     /// The current clear generation. A writer captures this BEFORE deriving the bytes
@@ -429,7 +453,12 @@ impl DiskCache {
         let should_flush = match self.pending_inserts.lock() {
             Ok(mut pending) => {
                 pending.insert(key.to_owned(), (generation, bytes));
+                shed_oldest_pending_inserts(&mut pending);
                 pending.len() >= INSERT_FLUSH_BATCH
+                    && crate::time::unix_millis_now()
+                        >= self
+                            .flush_retry_after
+                            .load(std::sync::atomic::Ordering::Relaxed)
             }
             Err(_) => return Err("cache pending-insert lock poisoned".to_owned()),
         };
@@ -480,56 +509,42 @@ impl DiskCache {
             return;
         }
 
-        if let Err(error) = write_pending_inserts(db, &kept) {
-            if let Ok(mut current) = self.pending_inserts.lock() {
-                // Re-queue only the entries we tried to write, preserving their
-                // (still-current) generation tag so a later flush retries them.
-                for (key, bytes) in kept {
-                    current.entry(key).or_insert((generation, bytes));
+        match write_pending_inserts(db, &kept) {
+            Ok(()) => self
+                .flush_retry_after
+                .store(0, std::sync::atomic::Ordering::Relaxed),
+            Err(error) => {
+                self.flush_retry_after.store(
+                    crate::time::unix_millis_now()
+                        .saturating_add(FLUSH_RETRY_BACKOFF.as_millis() as u64),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Ok(mut current) = self.pending_inserts.lock() {
+                    // Re-queue only the entries we tried to write, preserving their
+                    // (still-current) generation tag so a later flush retries them.
+                    for (key, bytes) in kept {
+                        current.entry(key).or_insert((generation, bytes));
+                    }
+                    shed_oldest_pending_inserts(&mut current);
                 }
+                cache_warn(format!("failed to flush cache inserts: {error}"));
             }
-            cache_warn(format!("failed to flush cache inserts: {error}"));
         }
     }
 
-    fn pending_insert_entry(
-        &self,
-        key: &str,
-    ) -> Option<(CachedImport, crate::cache::key::Freshness)> {
+    /// The queued-but-unflushed entry for `key`, served only while its generation
+    /// still matches: a `clear()` that superseded it must not be undone by a read,
+    /// exactly as `flush_pending_inserts` drops it before the disk (RB-3).
+    fn pending_insert(&self, key: &str) -> Option<CachedImport> {
         let bytes = {
             let pending = self.pending_inserts.lock().ok()?;
-            // Value is `(clear_generation, bytes)`. Serve a queued-but-unflushed entry on
-            // a get ONLY while its generation still matches: a clear() that superseded it
-            // (bumping the generation) must not be undone by a get reading stale pending
-            // bytes, exactly as `flush_pending_inserts` drops it before the disk (RB-3).
             let (entry_generation, bytes) = pending.get(key)?;
             if *entry_generation != self.clear_generation() {
                 return None;
             }
             bytes.clone()
         };
-        let mut cached = decode_cached_result(&bytes)?;
-        cached.first_party = crate::cache::key::cache_key_is_first_party(key);
-        // First-party (workspace / npm-link / file:) source files can be rewritten
-        // equal-length with a preserved mtime, which the cheap pre-filter would miss
-        // (X-7). Hash-verify them strictly on the cold disk-hydration path too, so the
-        // blind spot isn't served even on the first hit before memory hydration.
-        // node_modules files stay on the cheap pre-filter inside the strict variant.
-        // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
-        // stylesheet's `url()` reached outside the package root (D18). Routing by entry meant that
-        // file's stored content hash was never consulted, and a rehydrate from disk re-armed the
-        // same blind spot, so a restart did not clear it either.
-        let freshness =
-            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
-        match freshness {
-            crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
-                self.remove(key);
-                return None;
-            }
-            // Fresh OR Unknown → keep and return the entry (Unknown must not delete).
-            crate::cache::key::Freshness::Fresh | crate::cache::key::Freshness::Unknown => {}
-        }
-        Some((cached, freshness))
+        decode_cached_result(&bytes)
     }
 
     pub fn remove(&self, key: &str) {
@@ -555,11 +570,9 @@ impl DiskCache {
         }
     }
 
-    /// Returns the `limit` most-recently-used keys, highest `last_seq` first.
-    /// Recency now lives in each entry's envelope (there is no separate recents
-    /// table), so this scans CACHE_TABLE and decodes each value's `last_seq`. Used
-    /// only at startup preload and prewarm, so the full scan is off the hot path
-    /// (it shares the same cost model as the byte-budget rollup scan).
+    /// Returns the `limit` most-recently-used keys, highest `last_seq` first, ties
+    /// by key ascending. A reverse range read of the `(last_seq, key)` index, so a
+    /// cold open's preload costs O(limit) rows, not a scan of the shard.
     pub fn recent_keys(&self, limit: usize) -> Vec<String> {
         if limit == 0 {
             return Vec::new();
@@ -579,33 +592,35 @@ impl DiskCache {
                 return Vec::new();
             }
         };
-        let table = match read_txn.open_table(CACHE_TABLE) {
-            Ok(table) => table,
+        let seq_index = match read_txn.open_table(SEQ_INDEX_TABLE) {
+            Ok(seq_index) => seq_index,
             Err(error) => {
-                cache_warn(format!("failed to open cache table: {error}"));
+                cache_warn(format!("failed to open seq index for recent keys: {error}"));
                 return Vec::new();
             }
         };
-        let iter = match table.iter() {
+        let iter = match seq_index.iter() {
             Ok(iter) => iter,
             Err(error) => {
-                cache_warn(format!("failed to iterate cache table: {error}"));
+                cache_warn(format!("failed to iterate seq index: {error}"));
                 return Vec::new();
             }
         };
-        let mut keys = iter
-            .filter_map(|entry| {
-                let (key, value) = entry.ok()?;
-                let last_seq = decode_last_seq(value.value());
-                Some((key.value().to_owned(), last_seq))
-            })
-            .collect::<Vec<_>>();
-
-        if keys.len() > limit {
-            keys.select_nth_unstable_by(limit, compare_recent_keys);
-            keys.truncate(limit);
+        // Walk the index from the highest seq down. It orders equal seqs by key
+        // ascending, so reversed they come key-descending: keep every row tied with
+        // the last one taken, then let the sort pick the same `limit` keys a full
+        // sort would.
+        let mut keys: Vec<(String, u64)> = Vec::with_capacity(limit);
+        for entry in iter.rev() {
+            let Ok((row, _)) = entry else { continue };
+            let (seq, key) = row.value();
+            if keys.len() >= limit && keys.last().is_some_and(|(_, last)| *last != seq) {
+                break;
+            }
+            keys.push((key.to_owned(), seq));
         }
         keys.sort_by(compare_recent_keys);
+        keys.truncate(limit);
         keys.into_iter().map(|(key, _)| key).collect()
     }
 
@@ -790,10 +805,6 @@ impl DiskCache {
                 0
             }
         }
-    }
-
-    pub fn invalidate_package(&self, package_name: &str) {
-        self.invalidate_packages(&HashSet::from([package_name.to_owned()]));
     }
 
     /// Evicts every entry belonging to any package in `package_names` in a single
@@ -1029,36 +1040,6 @@ impl DiskCache {
         }
     }
 
-    /// Recomputes SUMMARY (`total_bytes`/`entry_count`/`max_seq`) and rebuilds
-    /// SEQ_INDEX from a full CACHE_TABLE scan, writing them authoritatively. The
-    /// drift oracle for tests and the heal fallback if incremental maintenance
-    /// ever misses a mutation site. No-op when disk caching is disabled.
-    pub fn rebuild_summary_from_scan(&self) {
-        // Flush first so the scan sees every queued insert, exactly as the read
-        // paths do before consulting the summary.
-        self.flush_pending_inserts();
-
-        let db_guard = self.db_read();
-        let db = match db_guard.as_ref().and_then(|guard| guard.as_ref()) {
-            Some(db) => db,
-            None => return,
-        };
-        let Ok(write_txn) = db.begin_write() else {
-            return;
-        };
-        match rebuild_summary_in_txn(&write_txn) {
-            Ok(()) => {
-                if let Err(error) = write_txn.commit() {
-                    cache_warn(format!("failed to commit cache summary rebuild: {error}"));
-                }
-            }
-            Err(error) => {
-                cache_warn(format!("failed to rebuild cache summary: {error}"));
-                let _ = write_txn.abort();
-            }
-        }
-    }
-
     /// Rebuilds the summary/index when the persisted `entry_count` disagrees with
     /// the actual CACHE_TABLE row count. The len check is O(1) (redb tracks both),
     /// so a correctly-maintained shard pays only that; the O(N) scan runs once,
@@ -1108,11 +1089,37 @@ impl DiskCache {
             // immaterial; 0 (the `Default` for the enabled-but-never-opened case
             // too) simply reads as idle.
             last_access: AtomicU64::new(0),
+            flush_retry_after: AtomicU64::new(0),
+            storage_path: None,
         }
     }
 
-    fn open_database(storage_path: &Path) -> Option<Database> {
-        if let Err(error) = fs::create_dir_all(storage_path) {
+    /// Retries the open of an enabled shard whose database is not open, creating it
+    /// if missing. Returns whether a database is open afterwards.
+    pub fn reopen_if_unavailable(&self) -> bool {
+        if self.is_available() {
+            return true;
+        }
+        let Some(storage_path) = self.storage_path.as_ref() else {
+            return false;
+        };
+        // Opened outside the lock so readers are not stalled on the open's I/O.
+        let Some(opened) = Self::open_database(storage_path, true) else {
+            return false;
+        };
+        let mut guard = self.db.write().unwrap_or_else(|poison| poison.into_inner());
+        if guard.is_none() {
+            *guard = Some(opened);
+        }
+        true
+    }
+
+    fn open_database(storage_path: &Path, create_missing: bool) -> Option<Database> {
+        if !create_missing {
+            if !storage_path.join(CACHE_DB_FILE_NAME).is_file() {
+                return None;
+            }
+        } else if let Err(error) = fs::create_dir_all(storage_path) {
             cache_warn(format!(
                 "failed to create cache directory {}: {error}",
                 storage_path.display()
@@ -1387,6 +1394,10 @@ fn fragmentation_ratio(db: &Database) -> f64 {
 }
 
 fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> Result<(), String> {
+    #[cfg(test)]
+    if test_support::should_fail_flush(pending.keys()) {
+        return Err("forced cache flush failure".to_owned());
+    }
     let write_txn = db
         .begin_write()
         .map_err(|error| format!("failed to begin cache write: {error}"))?;
@@ -1445,6 +1456,24 @@ fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> R
     write_txn
         .commit()
         .map_err(|error| format!("failed to commit cache write: {error}"))
+}
+
+/// Drops the least recently used queued inserts once the queue passes
+/// `MAX_PENDING_INSERTS`, which only failing flushes allow. Sheds a batch at a time
+/// so a queue pinned at the ceiling does not sort on every insert.
+fn shed_oldest_pending_inserts(pending: &mut HashMap<String, (u64, Vec<u8>)>) {
+    if pending.len() <= MAX_PENDING_INSERTS {
+        return;
+    }
+    let mut by_recency = pending
+        .iter()
+        .map(|(key, (_, bytes))| (decode_last_seq(bytes), key.clone()))
+        .collect::<Vec<_>>();
+    by_recency.sort_unstable();
+    let excess = pending.len() - (MAX_PENDING_INSERTS - INSERT_FLUSH_BATCH);
+    for (_, key) in by_recency.into_iter().take(excess) {
+        pending.remove(&key);
+    }
 }
 
 /// Reads a `u64` summary field, defaulting to `0` when the key is absent (a fresh
@@ -1527,9 +1556,8 @@ fn maintain_removals<'a>(
 }
 
 /// Recomputes SUMMARY and rebuilds SEQ_INDEX from a full CACHE_TABLE scan inside
-/// `write_txn` (caller commits). The authoritative source of truth: the drift
-/// oracle for tests and the heal fallback if incremental maintenance ever misses
-/// a site.
+/// `write_txn` (caller commits): the heal fallback if incremental maintenance
+/// ever misses a site.
 fn rebuild_summary_in_txn(write_txn: &WriteTransaction) -> Result<(), String> {
     let cache = write_txn
         .open_table(CACHE_TABLE)
@@ -1944,6 +1972,56 @@ mod tests {
         assert!(
             disk.get("v4:asset:legacy").is_none(),
             "the L2 read boundary must evict a pre-fix unverifiable observation"
+        );
+
+        drop(disk);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On a full disk or a read-only remount every flush fails. Retrying the whole backlog on each
+    /// insert past the batch size made the cost O(N) per insert, and re-queueing every failed entry
+    /// let the queue hold one serialized envelope per distinct key for the rest of the process.
+    #[test]
+    fn a_failing_disk_neither_retries_every_insert_nor_grows_the_queue_without_bound() {
+        use super::{DiskCache, MAX_PENDING_INSERTS, test_support};
+
+        let dir = std::env::temp_dir().join(format!(
+            "il-flush-backoff-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let disk = DiskCache::new(Some(dir.clone()), true);
+        let token = test_support::unique_failure_token("flush-backoff");
+        test_support::fail_flushes_containing(&token);
+        let key = |index: usize| format!("v4:{token}:{index}");
+
+        let inserted = MAX_PENDING_INSERTS * 2;
+        for index in 0..inserted {
+            disk.insert(&key(index), &sample_cached(index as u64 + 1))
+                .expect("a queued insert is not an error");
+        }
+
+        assert_eq!(
+            test_support::take_flush_attempts_for_token(&token),
+            1,
+            "one failed flush, then inserts back off instead of retrying the backlog"
+        );
+        assert!(disk.pending_inserts.lock().unwrap().len() <= MAX_PENDING_INSERTS);
+        assert!(
+            disk.get(&key(inserted - 1)).is_some(),
+            "the newest entries stay queued"
+        );
+        assert!(
+            disk.get(&key(0)).is_none(),
+            "the least recently used are shed"
+        );
+
+        test_support::stop_failing_flushes_containing(&token);
+        disk.flush_pending_inserts();
+        assert!(disk.pending_inserts.lock().unwrap().is_empty());
+        assert!(
+            disk.get(&key(inserted - 1)).is_some(),
+            "a recovered disk persists the queue"
         );
 
         drop(disk);

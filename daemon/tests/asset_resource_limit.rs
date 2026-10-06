@@ -5,7 +5,7 @@
 
 use std::fs;
 
-use import_lens_daemon::cache::key::fingerprints_are_current;
+use import_lens_daemon::cache::key::{Freshness, check_fingerprints_strict};
 use import_lens_daemon::ipc::protocol::{
     BatchRequest, ImportKind, ImportRequest, ImportResult, ImportRuntime, MeasuredSizes,
     PROTOCOL_VERSION,
@@ -97,7 +97,7 @@ fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
         panic!("a durable asset-limit failure must carry its exact freshness inputs");
     };
     assert!(
-        fingerprints_are_current(&fingerprints),
+        check_fingerprints_strict(&fingerprints) == Freshness::Fresh,
         "the captured failure inputs should initially be current: {fingerprints:?}"
     );
     assert!(
@@ -164,7 +164,7 @@ fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
 
     fs::write(package_root.join("oversized.woff2"), [0x51; 32]).expect("shrink the offending font");
     assert!(
-        !fingerprints_are_current(&fingerprints),
+        check_fingerprints_strict(&fingerprints) != Freshness::Fresh,
         "fixing only the offending asset must expire a cached deterministic rejection"
     );
     let recovered = analyze_import(&context, &request);

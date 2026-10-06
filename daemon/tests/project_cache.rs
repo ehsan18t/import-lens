@@ -1,7 +1,7 @@
 use import_lens_daemon::{
     cache::{
         disk::DiskCache,
-        key::fingerprints_for_paths,
+        key::file_fingerprint_with_hash,
         memory::CachedImport,
         project::{
             ProjectCacheRegistry, normalize_project_root, project_cache_shard_id,
@@ -335,7 +335,7 @@ fn project_cache_registry_invalidates_unloaded_shards_without_recent_preload() {
         cache.insert_with_fingerprints(
             "vue@3.4.0::default".to_owned(),
             result("vue"),
-            fingerprints_for_paths([stale_dependency.clone()]),
+            vec![file_fingerprint_with_hash(&stale_dependency, None).expect("stat the dependency")],
         );
         cache.insert("react@18.3.1::default".to_owned(), result("react"));
     }
@@ -651,7 +651,7 @@ fn byte_budget_evicts_oldest_entries_across_shards_respecting_the_floor() {
         "test fixture must exceed the budget ({total_before} <= {budget_bytes})"
     );
 
-    let outcome = registry.evict_to_budget();
+    let outcome = registry.run_maintenance(true).eviction;
     assert!(outcome.evicted_bytes > 0, "eviction must free bytes");
 
     let rollup_a = cache_a.shard_rollup();
@@ -733,7 +733,7 @@ fn byte_budget_pages_past_memory_hot_keys_instead_of_retiring_the_shard() {
         assert!(cache.get(key).is_some(), "hot fixture entry should hydrate");
     }
 
-    let outcome = registry.evict_to_budget();
+    let outcome = registry.run_maintenance(true).eviction;
 
     assert!(
         outcome.evicted_bytes > 0,
@@ -767,41 +767,36 @@ fn byte_budget_pages_past_memory_hot_keys_instead_of_retiring_the_shard() {
     fs::remove_dir_all(storage).expect("temp storage should be removed");
 }
 
+/// Maintenance and status open every shard from a directory listing taken first. A shard whose
+/// database is gone by the time it is opened (a Remove racing the pass) must not be recreated:
+/// once its metadata is gone too, nothing would ever list, evict or remove that file again.
 #[test]
-fn a_racing_shard_open_degrades_one_call_and_heals_on_the_next() {
-    let storage = common::temp_workspace("import-lens-project-cache-open-race");
+fn maintenance_and_status_never_recreate_a_shard_database() {
+    let storage = common::temp_workspace("import-lens-project-cache-no-recreate");
     let root = storage.join("app");
     fs::create_dir_all(&root).expect("project root");
-    let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512);
+    {
+        let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512);
+        registry.cache_for_root(&root);
+    }
+    let shard_db = storage
+        .join(project_cache_shard_id(&root))
+        .join(CACHE_DB_FILE_NAME);
+    fs::remove_file(&shard_db).expect("remove the shard database");
 
-    // Simulate a maintenance pass (eviction / invalidation / orphan purge)
-    // holding this shard's redb file when the project loads: redb allows one
-    // Database per file per process, so the load's open fails.
-    let shard_dir = storage.join(project_cache_shard_id(&root));
-    fs::create_dir_all(&shard_dir).expect("shard dir");
-    let held = Database::create(shard_dir.join(CACHE_DB_FILE_NAME)).expect("hold the db file");
+    let registry = ProjectCacheRegistry::new_with_budget_bytes(Some(storage.clone()), true, 512, 1);
+    registry.status_for_root(None);
+    registry.run_maintenance(true);
+    registry.invalidate_package("react");
+    registry.purge_orphans();
+    registry.seed_recency_clock_from_disk();
 
-    // The racing call serves a memory-only cache and must NOT register it:
-    // registering would silently disable this project's persistence forever.
-    let degraded = registry.cache_for_root(&root);
     assert!(
-        !degraded.disk_available(),
-        "the racing open must degrade to memory-only"
+        !shard_db.exists(),
+        "a temp open from a listing must never create the database it lists"
     );
 
-    // Once the maintenance pass releases the file, the next call must retry the
-    // open and come back with real persistence.
-    drop(held);
-    let healed = registry.cache_for_root(&root);
-    assert!(
-        healed.disk_available(),
-        "the shard must heal on the next load instead of staying disabled"
-    );
-    healed.insert("react@18.3.1::default".to_owned(), result("react"));
-    healed.flush_to_disk().expect("flush should succeed");
-    assert!(healed.get("react@18.3.1::default").is_some());
-
-    drop((degraded, healed, registry));
+    drop(registry);
     fs::remove_dir_all(storage).expect("temp storage should be removed");
 }
 

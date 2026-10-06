@@ -76,7 +76,7 @@ fn import_cache_invalidates_package_prefixes() {
         result("lodash-es", false),
     );
 
-    cache.invalidate_package("react");
+    cache.invalidate_packages(&std::collections::HashSet::from(["react".to_owned()]));
 
     assert!(cache.get("react@18.3.1::default").is_none());
     assert!(cache.get("lodash-es@4.17.21::debounce").is_some());
@@ -224,7 +224,7 @@ fn import_cache_invalidates_subpath_entries() {
         result("lodash-es", false),
     );
 
-    cache.invalidate_package("svelte");
+    cache.invalidate_packages(&std::collections::HashSet::from(["svelte".to_owned()]));
 
     assert!(cache.get("svelte@5.0.0::*").is_none());
     assert!(cache.get("svelte/transition@5.0.0::fade").is_none());
@@ -234,7 +234,7 @@ fn import_cache_invalidates_subpath_entries() {
 
 #[test]
 fn cache_hit_skips_fingerprint_restat_until_generation_bumps() {
-    use import_lens_daemon::cache::key::fingerprints_for_paths;
+    use import_lens_daemon::cache::key::file_fingerprint_with_hash;
     use import_lens_daemon::cache::memory::bump_cache_generation;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -246,7 +246,7 @@ fn cache_hit_skips_fingerprint_restat_until_generation_bumps() {
     std::fs::create_dir_all(&dir).expect("temp dir");
     let dep = dir.join("dep.js");
     std::fs::write(&dep, "export const x = 1;").expect("dep file");
-    let fp = fingerprints_for_paths(vec![dep.clone()]);
+    let fp = vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")];
 
     let cache = ImportCache::new(None, false);
     cache.insert_with_fingerprints("v3:aa".to_owned(), result("dep", false), fp);
@@ -279,7 +279,7 @@ fn get_if_fresh_cold_daemon_serves_fresh_but_never_serves_unknown() {
     // None on Unknown across BOTH the memory working set and the disk cache, so the
     // caller recomputes. The control — a genuinely Fresh cold disk entry — must
     // still be served, so the fix does not over-recompute.
-    use import_lens_daemon::cache::key::{file_fingerprint_with_hash, fingerprints_for_paths};
+    use import_lens_daemon::cache::key::file_fingerprint_with_hash;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -305,7 +305,7 @@ fn get_if_fresh_cold_daemon_serves_fresh_but_never_serves_unknown() {
     // Stale (evict), not Unknown. The hash value is irrelevant — the directory read
     // fails before any comparison.
     let unknown_fp = vec![file_fingerprint_with_hash(&unknown_dep, Some(0x1234_5678)).expect("fp")];
-    let fresh_fp = fingerprints_for_paths([fresh_dep.clone()]);
+    let fresh_fp = vec![file_fingerprint_with_hash(&fresh_dep, None).expect("stat the dependency")];
 
     // Seed the DISK cache, then DROP it so the redb file is flushed and closed (a
     // real cold daemon reopens the shard fresh, with nothing in the working set).
