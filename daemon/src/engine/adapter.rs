@@ -328,15 +328,6 @@ fn translate(
             ),
         });
     }
-    // There used to be a `side_effects` diagnostic here, pushed for EVERY glob declaration: "matched
-    // paths are unavailable from public bundler metadata, so side-effect confidence is
-    // conservative". Its premise was retracted (§10.7) and the daemon now matches the entry with
-    // `fast_glob` — Rolldown's own matcher — so the matched paths are not unavailable at all: the
-    // one that decides the badge is answered exactly. The diagnostic was the last thing holding
-    // every `["**/*.css"]` package below High confidence, and it also made `BundleEntry` carry a
-    // `reported_side_effects` nobody else read. Both are gone. Rolldown still owns retention
-    // (FR-021); the daemon only reports what the package declared about the entry it measured.
-
     let (read_time_fingerprints, unhashed_paths) = build_observations(state);
 
     Ok(BundleArtifact {
@@ -348,7 +339,6 @@ fn translate(
         contributions,
         exported_names: chunk.exports.iter().map(|name| name.to_string()).collect(),
         diagnostics,
-        matched_side_effect_paths: Vec::new(),
         assets: state.sorted_assets(),
         emitted_assets: emitted,
     })
