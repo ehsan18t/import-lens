@@ -512,19 +512,8 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
 
 fn stage_for(diagnostic: &BuildDiagnostic) -> &'static str {
     match diagnostic.kind() {
-        EventKind::MissingExportError => {
-            // 1.1.5 reports a name lost to conflicting star providers through
-            // the missing-export path; keep the contract's distinction (§12).
-            if diagnostic
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("ambiguous")
-            {
-                stage::AMBIGUOUS_EXPORT
-            } else {
-                stage::MISSING_EXPORT
-            }
-        }
+        EventKind::MissingExportError => stage::MISSING_EXPORT,
+        // The pinned Rolldown's only producer of a name claimed by conflicting star providers.
         EventKind::AmbiguousExternalNamespaceError => stage::AMBIGUOUS_EXPORT,
         EventKind::ParseError | EventKind::JsonParseError | EventKind::TransformError => {
             stage::PARSE

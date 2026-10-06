@@ -209,6 +209,34 @@ async fn matrix_07_ambiguous_star_providers() {
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
 
+// A missing binding is `missing_export` whatever it is called: the stage comes from the event kind,
+// never from words in the message, so an internal edge named like this is still stubbed and sized.
+#[tokio::test]
+async fn a_missing_binding_named_ambiguous_is_still_a_missing_export() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { isAmbiguous } from './parser.js';\nexport const present = () => isAmbiguous;",
+    );
+    write_source(&root, "parser.js", "export const parse = 1;");
+
+    let measured = run(&root, "entry.js", named(&["present"])).await;
+    let requested = run(&root, "entry.js", named(&["absentAmbiguous"])).await;
+    fs::remove_dir_all(&root).expect("temp workspace should be removed");
+
+    let artifact = measured.expect("an internal unbound edge must be stubbed and measured");
+    assert!(
+        artifact.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "missing_export" && diagnostic.message.contains("isAmbiguous")
+        }),
+        "{:?}",
+        artifact.diagnostics
+    );
+    let failure = requested.expect_err("a missing requested export must fail");
+    assert_eq!(failure.stage, "missing_export", "{failure:?}");
+}
+
 // Row 8: `export * as ns` produces a valid namespace object.
 #[tokio::test]
 async fn matrix_08_star_as_namespace_reexport() {
