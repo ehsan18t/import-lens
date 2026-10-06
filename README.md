@@ -167,7 +167,10 @@ Create a `.importlensignore` file (gitignore-style) to skip generated files or k
 package:large-package
 import:@internal/*
 path:src/generated/**
+path:/scripts/**
 ```
+
+A path rule matches at any depth, unless it starts with `/`: then it is anchored to the directory holding the `.importlensignore`.
 
 Framework virtual modules and common app aliases (`astro:*`, `virtual:*`, `$app/*`, `$env/*`, `@/*`) are ignored automatically because they are not npm dependencies.
 

@@ -750,7 +750,7 @@ This is one trade, not two independent losses. The same synthetic namespace that
 
 **FR-036o** (Medium) - The extension must provide a static SVG history panel generated from existing bundle impact history data. The webview must keep scripts disabled.
 
-**FR-036p** (Medium) - The extension must support `.importlensignore` using gitignore-style package, path, and import-pattern rules to suppress analysis and decorations for matching imports.
+**FR-036p** (Medium) - The extension must support `.importlensignore` using gitignore-style package, path, and import-pattern rules to suppress analysis and decorations for matching imports. The nearest `.importlensignore` at or above the document applies. A path rule with a leading `/` (`path:/src/legacy/**`) is anchored to the directory holding that file; any other path rule matches at any depth.
 
 **FR-036q** (High) - The daemon must own workspace report source scanning and report data aggregation. The extension host may request a workspace report for a workspace root and render the returned report model, but it must not enumerate/open every source file or rebuild duplicate-import/shared-module summaries itself. The request carries the editor's current **per-import** budget so those warnings remain user-configurable while the aggregation stays daemon-owned; it carries no per-file budget, because a report row has no File Cost behind it and the file budget is enforced by the editor and `importlens check` (FR-036i). The daemon scan is read-only, limited to supported source extensions, and skips `node_modules`, `dist`, `build`, `out`, and `coverage` directories.
 

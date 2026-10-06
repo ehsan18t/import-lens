@@ -1,6 +1,6 @@
 use import_lens_daemon::document::{
-    analyze_imports, package_json_dependency_entries, package_json_dependency_sections,
-    parse_import_lens_ignore, should_ignore_import,
+    IgnoreRuleResolver, analyze_imports, package_json_dependency_entries,
+    package_json_dependency_sections, parse_import_lens_ignore, should_ignore_import,
 };
 use import_lens_daemon::ipc::protocol::{ImportKind, ImportRuntime};
 
@@ -167,7 +167,7 @@ fn import_lens_ignore_rules_match_package_import_and_path() {
         "path:src/generated/**",
     ]
     .join("\n");
-    let rules = parse_import_lens_ignore(&source);
+    let rules = parse_import_lens_ignore(&source, std::path::Path::new("C:/repo"));
     let imports = analyze_imports("src/app.ts", "import value from '@internal/ui';")
         .expect("import should parse");
 
@@ -189,6 +189,41 @@ fn import_lens_ignore_rules_match_package_import_and_path() {
         "C:/repo/src/app.ts",
         &rules
     ));
+}
+
+/// A leading `/` anchors a path rule to the directory holding the `.importlensignore`, as in
+/// gitignore, while the document path the daemon matches against is absolute.
+#[test]
+fn an_anchored_path_rule_matches_relative_to_the_ignore_file() {
+    let root = std::env::temp_dir().join(format!(
+        "import-lens-anchored-ignore-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let legacy = root.join("src").join("legacy");
+    std::fs::create_dir_all(&legacy).expect("legacy dir");
+    std::fs::write(root.join(".importlensignore"), "path:/src/legacy/**\n").expect("ignore file");
+
+    let react =
+        analyze_imports("src/app.ts", "import React from 'react';").expect("react should parse");
+    let matches = |document: &std::path::Path| {
+        let rules = IgnoreRuleResolver::default().rules_for(document);
+        should_ignore_import(&react[0], &document.to_string_lossy(), &rules)
+    };
+
+    assert!(
+        matches(&legacy.join("a.ts")),
+        "an anchored rule must match under its directory"
+    );
+    assert!(
+        !matches(&root.join("lib").join("src").join("legacy").join("a.ts")),
+        "an anchored rule must not match the same shape deeper in the tree"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

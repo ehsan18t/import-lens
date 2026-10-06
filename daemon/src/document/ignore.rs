@@ -6,6 +6,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// The rules of one `.importlensignore` file and the directory it sits in, which is what a path
+/// rule with a leading `/` is anchored to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportLensIgnore {
+    pub base_directory: PathBuf,
+    pub rules: Vec<ImportLensIgnoreRule>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportLensIgnoreRule {
     pub kind: ImportLensIgnoreRuleKind,
@@ -19,36 +27,42 @@ pub enum ImportLensIgnoreRuleKind {
     Path,
 }
 
-pub fn parse_import_lens_ignore(contents: &str) -> Vec<ImportLensIgnoreRule> {
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(parse_rule_line)
-        .collect()
+pub fn parse_import_lens_ignore(contents: &str, base_directory: &Path) -> ImportLensIgnore {
+    ImportLensIgnore {
+        base_directory: base_directory.to_path_buf(),
+        rules: contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(parse_rule_line)
+            .collect(),
+    }
 }
 
 pub fn should_ignore_import(
     detected: &DetectedImport,
     source_file: &str,
-    rules: &[ImportLensIgnoreRule],
+    ignore: &ImportLensIgnore,
 ) -> bool {
-    rules.iter().any(|rule| match rule.kind {
+    ignore.rules.iter().any(|rule| match rule.kind {
         ImportLensIgnoreRuleKind::Package => {
             glob_matches_exact(&rule.pattern, &detected.package_name)
         }
         ImportLensIgnoreRuleKind::Import => glob_matches_exact(&rule.pattern, &detected.specifier),
-        ImportLensIgnoreRuleKind::Path => glob_matches_path(&rule.pattern, source_file),
+        ImportLensIgnoreRuleKind::Path => {
+            glob_matches_path(&rule.pattern, source_file, &ignore.base_directory)
+        }
     })
 }
 
-pub fn load_import_lens_ignore(start_file_path: &Path) -> Vec<ImportLensIgnoreRule> {
+pub fn load_import_lens_ignore(start_file_path: &Path) -> ImportLensIgnore {
     let Some(ignore_path) = find_import_lens_ignore(start_file_path) else {
-        return Vec::new();
+        return ImportLensIgnore::default();
     };
+    let base_directory = ignore_path.parent().unwrap_or(Path::new(""));
 
-    fs::read_to_string(ignore_path)
-        .map(|contents| parse_import_lens_ignore(&contents))
+    fs::read_to_string(&ignore_path)
+        .map(|contents| parse_import_lens_ignore(&contents, base_directory))
         .unwrap_or_default()
 }
 
@@ -63,11 +77,11 @@ pub fn load_import_lens_ignore(start_file_path: &Path) -> Vec<ImportLensIgnoreRu
 /// operation can use a throwaway resolver.
 #[derive(Default)]
 pub struct IgnoreRuleResolver {
-    by_directory: Mutex<HashMap<PathBuf, Arc<Vec<ImportLensIgnoreRule>>>>,
+    by_directory: Mutex<HashMap<PathBuf, Arc<ImportLensIgnore>>>,
 }
 
 impl IgnoreRuleResolver {
-    pub fn rules_for(&self, active_document_path: &Path) -> Arc<Vec<ImportLensIgnoreRule>> {
+    pub fn rules_for(&self, active_document_path: &Path) -> Arc<ImportLensIgnore> {
         let directory = active_document_path
             .parent()
             .map(Path::to_path_buf)
@@ -132,12 +146,18 @@ fn parse_rule_line(line: &str) -> ImportLensIgnoreRule {
     }
 }
 
-fn glob_matches_path(pattern: &str, file_path: &str) -> bool {
+/// A pattern with a leading `/` is anchored to the ignore file's directory, as in gitignore; any
+/// other pattern matches the path or any suffix of it that starts after a `/`.
+fn glob_matches_path(pattern: &str, file_path: &str, base_directory: &Path) -> bool {
     let normalized_pattern = normalize_path(pattern);
     let normalized_path = normalize_path(file_path);
 
-    if normalized_pattern.starts_with('/') {
-        return glob_matches_exact(&normalized_pattern, &normalized_path);
+    if let Some(anchored) = normalized_pattern.strip_prefix('/') {
+        let base = normalize_path(&base_directory.to_string_lossy());
+        return normalized_path
+            .strip_prefix(base.trim_end_matches('/'))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|relative| glob_matches_exact(anchored, relative));
     }
 
     glob_matches_exact(&normalized_pattern, &normalized_path)
@@ -219,7 +239,7 @@ mod tests {
         let first = resolver.rules_for(&dir.join("a.ts"));
         let same_dir = resolver.rules_for(&dir.join("b.ts"));
 
-        assert_eq!(first.len(), 1);
+        assert_eq!(first.rules.len(), 1);
         assert!(
             Arc::ptr_eq(&first, &same_dir),
             "same-directory lookups should return the cached rules"
@@ -236,7 +256,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &after_edit));
 
         let fresh = IgnoreRuleResolver::default().rules_for(&dir.join("a.ts"));
-        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh.rules.len(), 2);
 
         let _ = fs::remove_dir_all(&dir);
     }
