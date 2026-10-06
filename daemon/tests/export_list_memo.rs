@@ -4,6 +4,10 @@
 //! full, uncached Rolldown build of the entire package graph — on every popup, for a
 //! list that only changes when the package's files do.
 //!
+//! The package is first-party (outside `node_modules`), whose edits no watcher reports, so the
+//! memo must see one on the very next lookup. An installed package's inputs are re-checked once
+//! per `REVERIFY_TTL` and on every cache-generation bump, like the import cache's.
+//!
 //! Measured through the engine's own build counter, which is the honest unit. Both the
 //! counter and the memo are process-global, so this test owns its binary.
 
@@ -16,7 +20,7 @@ use std::{fs, path::Path, path::PathBuf};
 mod common;
 
 fn write_package(workspace: &Path) -> PathBuf {
-    let root = workspace.join("node_modules").join("pkg");
+    let root = workspace.join("packages").join("pkg");
     fs::create_dir_all(&root).expect("package root should be created");
     fs::write(
         root.join("index.js"),
@@ -28,7 +32,7 @@ fn write_package(workspace: &Path) -> PathBuf {
 }
 
 fn write_alpha(workspace: &Path, body: &str) {
-    let path = workspace.join("node_modules").join("pkg").join("alpha.js");
+    let path = workspace.join("packages").join("pkg").join("alpha.js");
     fs::write(path, format!("export const alpha = () => '{body}';\n")).expect("alpha");
 }
 

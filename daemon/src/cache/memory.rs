@@ -43,7 +43,7 @@ fn memory_weight(cached: &CachedImport) -> usize {
 // skips the re-stat. The TTL backstops a node_modules change with no invalidation
 // event (a watcher-excluded folder).
 static CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
-const REVERIFY_TTL: Duration = Duration::from_secs(30);
+pub(crate) const REVERIFY_TTL: Duration = Duration::from_secs(30);
 
 pub fn bump_cache_generation() {
     CACHE_GENERATION.fetch_add(1, Ordering::Release);

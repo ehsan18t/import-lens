@@ -727,7 +727,7 @@ From the release review's improvement list. All real; none blocking. Each is a k
 | P6 | **`drain_ordered` uses 2 workers where `drain_classified` uses 4.** package.json analysis and both prefetch drains idle a permit with work queued. |
 | P7 | **Rebuild fixed option data once, not per build.** About 180 `String`s allocated per build; `LazyLock` candidates. |
 | P8 | **The miss drain spawns fresh OS threads per call.** A single cache miss spawns a thread to do work the caller could do inline; a 500-file report can perform hundreds of thread creations. |
-| P9 | **The completion path re-verifies a whole package graph on every popup.** Re-reads and re-hashes every non-`node_modules` file per keystroke inside an import's braces. |
+| P9 | **The completion path still hash-verifies every first-party file of the package graph on every popup.** Installed modules are re-checked once per `REVERIFY_TTL` (measured: 2,000 installed modules, about 41 ms per lookup down to about 3 µs, debug build, Windows), but a first-party package's own files are re-read and re-hashed per keystroke inside its import's braces. That part stays: nothing reports a first-party edit (D3 in `cache/memory.rs`), and an equal-length, mtime-preserving rewrite defeats a len+mtime check, so any window would serve a stale export list. |
 | P10 | **`ENGINE_PERMITS` is 2, tried at 4 (Task 13), measured, reverted.** Not deferred; see the outcome below. |
 
 **P10 outcome (Task 13, measured 2026-07-15, reverted).** Raising `engine_permits()` to

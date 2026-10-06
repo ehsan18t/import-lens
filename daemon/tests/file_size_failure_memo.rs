@@ -5,6 +5,10 @@
 //! derived from and the cache generation, so fixing the broken module, or an invalidation, builds
 //! again.
 //!
+//! The module that breaks is first-party (the package re-exports it from the workspace), whose
+//! edits no watcher reports, so the memo must see a fix on the very next request. Installed inputs
+//! are re-checked once per `REVERIFY_TTL` and on every generation bump, like the import cache's.
+//!
 //! Measured through the engine's own build counter. The counter and the memo are process-global,
 //! so this test owns its binary.
 
@@ -28,6 +32,11 @@ fn write_package(workspace: &Path, name: &str, source: &str) {
     )
     .expect("manifest");
     fs::write(root.join("index.js"), source).expect("entry");
+}
+
+fn write_shared(workspace: &Path, source: &str) {
+    fs::create_dir_all(workspace.join("src")).expect("src");
+    fs::write(workspace.join("src").join("shared.js"), source).expect("shared module");
 }
 
 fn import(name: &str) -> SizedImport {
@@ -69,7 +78,12 @@ const FIXED: &str = "export const value = 2;\n";
 fn a_deterministic_combined_build_failure_is_built_once_until_its_bytes_change() {
     let workspace = common::temp_workspace("import-lens-file-size-failure-memo");
     write_package(&workspace, "good", "export const value = 1;\n");
-    write_package(&workspace, "broken", BROKEN);
+    write_package(
+        &workspace,
+        "broken",
+        "export { value } from '../../src/shared.js';\n",
+    );
+    write_shared(&workspace, BROKEN);
 
     let (first, builds) = size(&workspace);
     assert_eq!(builds, 1, "a cold request builds once");
@@ -95,7 +109,7 @@ fn a_deterministic_combined_build_failure_is_built_once_until_its_bytes_change()
         (first.degraded, first.incomplete)
     );
 
-    write_package(&workspace, "broken", FIXED);
+    write_shared(&workspace, FIXED);
     let (fixed, builds) = size(&workspace);
     assert_eq!(builds, 1, "fixing the broken module must expire the memo");
     assert!(
@@ -104,7 +118,7 @@ fn a_deterministic_combined_build_failure_is_built_once_until_its_bytes_change()
         stages(&fixed)
     );
 
-    write_package(&workspace, "broken", BROKEN);
+    write_shared(&workspace, BROKEN);
     let (_, builds) = size(&workspace);
     assert_eq!(builds, 1, "breaking it again builds once");
     let (_, builds) = size(&workspace);
