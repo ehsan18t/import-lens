@@ -396,7 +396,7 @@ invent a number) or bounded behaviours we chose. Revisit only if the blast radiu
 
 ## Path aliases
 
-A1, A2 and A4 degrade to a **floor** (the file's total is flagged incomplete, is not cached, and `importlens
+A1 and A2 degrade to a **floor** (the file's total is flagged incomplete, is not cached, and `importlens
 check` declines to judge it); A3 errs the other way and flags nothing. Neither direction invents a number. That
 is why none of them is fixed.
 
@@ -426,11 +426,6 @@ document governed by `tsconfig.app.json`.
 This is the price of making the answer document-independent, which is what fixed the `.vue`, `.svelte`,
 `.astro` breakage: asking "which project owns this document?" is exactly the question that kept producing
 regressions. It errs toward "flag nothing" and cannot invent a number.
-
-### A4: A file total can keep an old alias classification for up to 30 seconds
-**Status: Accepted**
-
-The alias tables and their `references` graph are re-read on every request, so a `tsconfig.json` or `jsconfig.json` edit is seen on the next analysis whether or not the VS Code watcher reported it. The L1 file-total cache keys on the import classification (`path_alias` versus `not_installed`) and lives for 30 seconds, so an edit the watcher did not report (a referenced config outside the workspace folder) can leave a file total classified the old way until that entry expires. `importlens check` is unaffected: the CLI spawns a fresh daemon per run.
 
 ## Engine and concurrency
 

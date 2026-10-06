@@ -1554,6 +1554,41 @@ fn a_workspace_config_change_invalidates_the_memoized_alias_table() {
 /// So the alias resolvers are built per query and memoize no filesystem fact. **This test creates the
 /// target mid-flight and asserts the floor lifts with no invalidation and no restart** — the same
 /// `ImportLensService`, the same process.
+/// The other direction, and the one a cache can get wrong: a complete total is cached while the
+/// alias resolves, then the alias table loses the entry with nothing invalidated (an edit no watcher
+/// reported). The very next read must see the import as unresolved, not serve the cached total.
+#[test]
+fn removing_an_alias_reclassifies_the_next_read_without_any_invalidation() {
+    let workspace = temp_workspace();
+    write_package(&workspace);
+    write_workspace_manifest(&workspace, "");
+    write_tsconfig_alias(&workspace);
+    let service = ImportLensService::new(None, false);
+    let source = "import { value } from 'tiny-lib';\nimport { Button } from '@app/components';";
+
+    let aliased =
+        service.handle_file_size_document(file_size_document_request(&workspace, 430, source));
+    assert!(
+        !aliased.incomplete,
+        "test setup: the alias resolves: {aliased:?}"
+    );
+
+    fs::write(
+        workspace.join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":"."}}"#,
+    )
+    .expect("tsconfig should be rewritten");
+    let unaliased =
+        service.handle_file_size_document(file_size_document_request(&workspace, 431, source));
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
+    assert!(
+        unaliased.incomplete,
+        "the alias is gone, so the specifier resolves to nothing and the total is a floor; serving \
+         the cached complete total would judge a file against bytes it no longer has: {unaliased:?}"
+    );
+}
+
 #[test]
 fn creating_the_alias_target_lifts_the_floor_without_any_invalidation() {
     let workspace = temp_workspace();
