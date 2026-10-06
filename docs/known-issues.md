@@ -380,25 +380,6 @@ and it must be a deliberate decision, not smuggled in as a bug fix.
 **Why it is not fixed now:** removing them means rewriting those call sites across six test files onto the production reads, and choosing per test which production policy it meant to assert. That is test churn with no effect on the product, deferred until the cache tests are next reworked.
 **What would fix it:** delete the three methods and move each test to the production read whose policy it is asserting.
 
-### G0: The legacy `performance.rs` smoke suite still claims to gate the NFR numbers, at 8x loose
-**Status: Deferred** · Not an active hole, but a second suite that appears to gate what it does not
-
-`daemon/tests/performance.rs` (the pre-existing synthetic-fixture smoke suite) asserts the literal NFR numbers,
-`threshold_ms(500)` for a cache miss and `threshold_ms(50)` for a cache hit, with a default multiplier of 6,
-and CI's `pnpm test:performance` step sets 8. So it enforces a 4000 ms "cache miss" and a 400 ms "cache hit"
-against a hard 50 ms Critical requirement.
-
-**This is not a coverage hole today.** `candidate_performance` now genuinely gates NFR-002 at an absolute,
-unscaled 50 ms on every PR, proven by mutation (an 80 ms sleep on the cache-hit path turns it red at 89 ms).
-The real gate works.
-
-But it is exactly the shape of the trap that hid the dark gate for months: a suite whose name and thresholds
-suggest it enforces a requirement, which in fact enforces something 8x looser. The next person to read it will
-believe it.
-
-**Fix:** either stop it naming the NFR numbers (they are its own smoke thresholds, not the requirements), or
-delete it now that a real gate exists.
-
 ### C7: The engine-permit scheduling model is a repeat source of nondeterminism
 **Status: Watch** · Design-health watch. Becomes a redesign task if a THIRD genuine code-level race appears here.
 

@@ -6,7 +6,6 @@ echo "Building inside Docker container..."
 pnpm install --frozen-lockfile
 pnpm check
 pnpm test
-pnpm test:performance
 
 # zig handles the unix targets; it cannot emit the MSVC ABI, so Windows takes the
 # cargo-xwin path. Which target needs which compiler is decided in targets.mjs,

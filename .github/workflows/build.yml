@@ -30,7 +30,6 @@ jobs:
     uses: ./.github/workflows/validate.yml
     with:
       requested_version: ${{ inputs.version }}
-      run_performance: true
       run_coverage: true
       # A release must not ship without the real-package correctness gates.
       run_candidate_packages: true

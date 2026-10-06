@@ -20,11 +20,6 @@ on:
         required: false
         default: false
         type: boolean
-      run_performance:
-        description: "Run the performance smoke test."
-        required: false
-        default: false
-        type: boolean
       run_coverage:
         description: "Run the Rust coverage gate (installs cargo-llvm-cov)."
         required: false
@@ -154,12 +149,8 @@ jobs:
       # The §10.6 absolute performance and memory gates: cold import p95, daemon startup, cache-hit
       # response, idle RSS, and the 20-import batch -- every one of them read from the SHIPPED
       # DAEMON BINARY over the real IPC transport. They are `#[ignore]`d and need the same installed
-      # fixtures as the steps above -- and until now NOTHING invoked them, so the suite written to
-      # protect this engine had never run once. `Run performance smoke test` below is a DIFFERENT
-      # file (the legacy synthetic suite) and is not a substitute; it is also gated on
-      # `run_performance`, which only `build.yml`'s workflow_dispatch ever sets. This step is gated
-      # on `run_candidate_packages`, which `ci.yml` sets on every pull request -- which is the whole
-      # point. `--release`: a debug-build timing gate is meaningless.
+      # fixtures as the steps above. This step is gated on `run_candidate_packages`, which `ci.yml`
+      # sets on every pull request. `--release`: a debug-build timing gate is meaningless.
       - name: Run real-package performance gates
         if: ${{ inputs.run_candidate_packages }}
         env:
@@ -180,12 +171,6 @@ jobs:
           IMPORT_LENS_PERF_MULTIPLIER: 2
         # --test-threads=1: timing gates that contend with each other are noisy gates.
         run: cargo test -p import-lens-daemon --release --locked --test candidate_performance -- --ignored --nocapture --test-threads=1
-
-      - name: Run performance smoke test
-        if: ${{ inputs.run_performance }}
-        env:
-          IMPORT_LENS_PERF_MULTIPLIER: 8
-        run: pnpm test:performance
 
       - name: Run accuracy tests
         if: ${{ inputs.run_accuracy }}

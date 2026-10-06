@@ -218,7 +218,6 @@
     "test:scripts": "node --test \"scripts/**/*.test.mjs\"",
     "test:rust": "cargo test --workspace --locked",
     "test:accuracy": "node scripts/accuracy-compare.mjs",
-    "test:performance": "cargo test -p import-lens-daemon --release --locked --test performance -- --ignored --nocapture",
     "coverage:rust": "node scripts/check-coverage.mjs",
     "build:daemon": "node scripts/build-daemon.mjs",
     "build:daemon:win32-x64": "node scripts/build-daemon.mjs win32-x64",

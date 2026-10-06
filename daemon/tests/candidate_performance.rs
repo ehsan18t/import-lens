@@ -1,5 +1,5 @@
 //! The §10.6 runtime performance and memory gates, over the pinned REAL packages. Release-only and
-//! explicitly ignored, mirroring daemon/tests/performance.rs:
+//! explicitly ignored:
 //!
 //! ```text
 //! node scripts/prepare-candidate-fixtures.mjs
@@ -9,11 +9,8 @@
 //!     --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! **Until 2026-07-14 nothing invoked this file.** It is `#[ignore]`d and needs installed fixtures,
-//! and no workflow step and no package.json script named it — while `pnpm test:performance`, which
-//! CI *does* call, runs `daemon/tests/performance.rs`: the legacy suite over synthetic fixtures, a
-//! different file. So a gate appeared to run and did not. `validate.yml` runs it now, on the same
-//! installed fixtures as `candidate_packages`, on every pull request.
+//! `validate.yml` runs it on the same installed fixtures as `candidate_packages`, on every pull
+//! request.
 //!
 //! **Every gate here is measured against the SHIPPED DAEMON BINARY, over the real IPC transport,
 //! over a real package.** That is not ceremony. Each §10.6 number is a claim about the process the
