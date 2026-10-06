@@ -646,12 +646,10 @@ fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
 
     encoded
         .as_bytes()
-        .chunks_exact(2)
-        .map(|chunk| {
-            let high = hex_value(chunk[0])?;
-            let low = hex_value(chunk[1])?;
-            Some((high << 4) | low)
-        })
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| Some((hex_value(high)? << 4) | hex_value(low)?))
         .collect()
 }
 
