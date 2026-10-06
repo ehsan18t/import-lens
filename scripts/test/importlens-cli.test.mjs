@@ -624,8 +624,8 @@ test("resolveCliStoragePaths keeps daemon cache outside the project directory", 
 test("createDaemonClient resolves concurrent responses by request id", async () => {
   const socket = new FakeSocket();
   const client = createDaemonClient(socket);
-  const first = client.request({ type: "file_size", request_id: 1 }, 100);
-  const second = client.request({ type: "file_size", request_id: 2 }, 100);
+  const first = client.request({ type: "file_size_document", request_id: 1 }, 100);
+  const second = client.request({ type: "file_size_document", request_id: 2 }, 100);
 
   socket.emit("data", frame({ request_id: 2, ok: "second" }));
   socket.emit("data", frame({ request_id: 1, ok: "first" }));
@@ -641,13 +641,13 @@ test("createDaemonClient rejects pending requests on timeout and close", async (
   const timeoutClient = createDaemonClient(timeoutSocket);
 
   await assert.rejects(
-    () => timeoutClient.request({ type: "file_size", request_id: 3 }, 1),
+    () => timeoutClient.request({ type: "file_size_document", request_id: 3 }, 1),
     /timed out/u,
   );
 
   const closeSocket = new FakeSocket();
   const closeClient = createDaemonClient(closeSocket);
-  const pending = closeClient.request({ type: "file_size", request_id: 4 }, 100);
+  const pending = closeClient.request({ type: "file_size_document", request_id: 4 }, 100);
   closeSocket.emit("close");
 
   await assert.rejects(pending, /IPC socket closed/u);
@@ -656,7 +656,7 @@ test("createDaemonClient rejects pending requests on timeout and close", async (
 test("createDaemonClient rejects pending requests on malformed frames", async () => {
   const socket = new FakeSocket();
   const client = createDaemonClient(socket);
-  const pending = client.request({ type: "file_size", request_id: 5 }, 100);
+  const pending = client.request({ type: "file_size_document", request_id: 5 }, 100);
   const invalidPayload = Buffer.from([0xc1]);
   const header = Buffer.allocUnsafe(4);
   header.writeUInt32BE(invalidPayload.length, 0);

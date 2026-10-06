@@ -22,7 +22,6 @@ import type {
   EnumerateExportsResponse,
   FileSizeDocumentRequest,
   FileSizeDocumentResponse,
-  FileSizeResponse,
   RefreshedResultsResponse,
   RefreshRegistryHintsRequest,
   RefreshRegistryHintsResponse,
@@ -635,19 +634,11 @@ const isEnumerateExportsResponse = (value: unknown): value is EnumerateExportsRe
 };
 
 const isFileSizeDocumentResponse = (value: unknown): value is FileSizeDocumentResponse => {
-  if (!isFileSizeResponse(value)) {
-    return false;
-  }
-
-  return Array.isArray((value as Partial<FileSizeDocumentResponse>).states);
-};
-
-const isFileSizeResponse = (value: unknown): value is FileSizeResponse => {
   if (!value || typeof value !== "object") {
     return false;
   }
 
-  const candidate = value as Partial<FileSizeResponse>;
+  const candidate = value as Partial<FileSizeDocumentResponse>;
   return (
     typeof candidate.version === "number" &&
     typeof candidate.request_id === "number" &&
@@ -657,6 +648,7 @@ const isFileSizeResponse = (value: unknown): value is FileSizeResponse => {
     typeof candidate.brotli_bytes === "number" &&
     typeof candidate.zstd_bytes === "number" &&
     Array.isArray(candidate.imports) &&
+    Array.isArray(candidate.states) &&
     (candidate.error === null || typeof candidate.error === "string") &&
     Array.isArray(candidate.diagnostics)
   );

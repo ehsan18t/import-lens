@@ -422,11 +422,6 @@ degradation, never a wrong size and never a wedge.
 
 Each engine worker keeps a stack and an allocator heap. Four workers saved about 10 MB of idle RSS on Linux over a 60-file, 25-package session, but rounds ran about 12 percent slower (10.8 to 11.6 s against 9.7 to 9.9 s), because Rolldown parallelizes within a build. Speed wins: the workers stay at `min(cores, 8)`.
 
-### P1: The extension's protocol types still declare `FileSizeRequest`
-**Status: Accepted**
-
-`extension/src/ipc/protocol.ts` declares a `FileSizeRequest` interface and lists it in the `ClientMessage` union, but the daemon no longer accepts that message and no extension code builds one. Nothing sends it, so nothing breaks; deleting the type is a cleanup for the next protocol change.
-
 ### G1: The negative-`error` Guard catches 18 of 24 spellings
 **Status: Accepted** · The number is machine-pinned, not claimed
 

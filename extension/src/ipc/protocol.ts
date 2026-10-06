@@ -424,33 +424,6 @@ export interface EnumerateExportsResponse {
   diagnostics: ImportDiagnostic[];
 }
 
-export interface FileSizeRequest {
-  type: "file_size";
-  version: number;
-  request_id: number;
-  workspace_root: string;
-  active_document_path: string;
-  imports: ImportRequest[];
-}
-
-export interface FileSizeResponse {
-  version: number;
-  request_id: number;
-  raw_bytes: number;
-  minified_bytes: number;
-  gzip_bytes: number;
-  brotli_bytes: number;
-  zstd_bytes: number;
-  imports: ImportResult[];
-  // The same two flags, with the same meanings, as on `FileSizeDocumentResponse`. The daemon has
-  // always computed them for this surface too; omitting them here made it the one response where a
-  // floor and a measurement are indistinguishable.
-  incomplete?: boolean;
-  degraded?: boolean;
-  error: string | null;
-  diagnostics: ImportDiagnostic[];
-}
-
 export interface CompleteImportMembersRequest {
   type: "complete_import_members";
   version: number;
@@ -698,7 +671,6 @@ export type ClientMessage =
   | NodeModulesChangedMessage
   | VisibleDocumentsMessage
   | EnumerateExportsRequest
-  | FileSizeRequest
   | FileSizeDocumentRequest
   | CompleteImportMembersRequest
   | CacheStatusRequest
