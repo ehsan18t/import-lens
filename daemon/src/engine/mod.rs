@@ -87,13 +87,12 @@ pub struct UncountedAsset {
 /// and they had grown separate copies of the same sentence. One definition means the user reads the
 /// same words for the same fact, and a change to how this is phrased cannot land in only one of them.
 ///
-/// An asset whose bytes could not be stat'd contributes 0 to the sum, so the total is qualified
-/// rather than stated flatly: understating the shortfall is the failure mode this wording exists to
-/// avoid, and "totalling 0 bytes" reads as though the omission does not matter when the truth is
-/// that its size is unknown.
-pub fn uncounted_assets_message(assets: &[UncountedAsset]) -> String {
+/// The total is qualified rather than stated flatly whenever it may understate the shortfall: an
+/// asset whose bytes could not be stat'd contributes 0, and `total_is_floor` says the listed rows
+/// are not everything missing (a resource limit stopped the walk before the files they reach).
+pub fn uncounted_assets_message(assets: &[UncountedAsset], total_is_floor: bool) -> String {
     let disclosed_bytes: u64 = assets.iter().map(|asset| asset.bytes).sum();
-    let total = if assets.iter().all(|asset| asset.bytes > 0) {
+    let total = if !total_is_floor && assets.iter().all(|asset| asset.bytes > 0) {
         format!("totalling {disclosed_bytes} bytes")
     } else if disclosed_bytes > 0 {
         format!("totalling at least {disclosed_bytes} bytes")

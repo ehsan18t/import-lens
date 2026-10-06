@@ -24,8 +24,10 @@ const CEILING_BYTES: usize = 64 * 1024;
 fn discloses_the_breach(
     diagnostics: &[import_lens_daemon::ipc::protocol::ImportDiagnostic],
 ) -> bool {
+    // The listed rows cannot cover the font the walk stopped at, so the total must read as a floor.
     diagnostics.iter().any(|diagnostic| {
         diagnostic.stage == "uncounted_assets"
+            && diagnostic.message.contains("totalling at least")
             && diagnostic
                 .details
                 .iter()

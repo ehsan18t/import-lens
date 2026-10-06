@@ -717,6 +717,9 @@ pub struct ProcessedAssets {
     /// error: `incomplete` never fired, so a total missing real shipped bytes was cached and
     /// recorded as a file's permanent baseline.
     pub css_dependency_omissions: Vec<String>,
+    /// The `uncounted` rows are a lower bound on what is missing: a resource limit stopped the
+    /// walk, so the `@import` children and `url()` resources those rows reach are missing too.
+    pub uncounted_total_is_floor: bool,
     /// Runtime-fetched resources a counted stylesheet references. Disclosed, but the measured bytes
     /// are exact without them, so this must not touch completeness or budgetability.
     pub css_dependency_external: Vec<String>,
@@ -786,7 +789,10 @@ pub fn uncounted_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
 
     Some(ImportDiagnostic {
         stage: diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
-        message: crate::engine::uncounted_assets_message(&processed.uncounted),
+        message: crate::engine::uncounted_assets_message(
+            &processed.uncounted,
+            processed.uncounted_total_is_floor,
+        ),
         details: processed.failures.clone(),
     })
 }
@@ -985,6 +991,7 @@ fn disclose_budget_breach(
         read_paths: failure.read_paths,
         read_time_fingerprints: failure.read_time_fingerprints,
         failures: vec![failure.message],
+        uncounted_total_is_floor: true,
         uncounted: assets
             .iter()
             .map(|asset| UncountedAsset {

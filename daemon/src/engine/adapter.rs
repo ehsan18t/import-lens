@@ -456,7 +456,7 @@ fn uncounted_assets_diagnostic(assets: &[UncountedAsset]) -> Option<ImportDiagno
 
     Some(ImportDiagnostic {
         stage: diagnostic_stage::UNCOUNTED_ASSETS.to_owned(),
-        message: super::uncounted_assets_message(assets),
+        message: super::uncounted_assets_message(assets, false),
     })
 }
 
