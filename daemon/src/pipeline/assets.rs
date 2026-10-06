@@ -30,7 +30,7 @@ use crate::pipeline::asset_boundary::{self, AssetBoundaryError, AssetDeadline};
 use crate::pipeline::asset_budget::AssetBudgetLimits;
 use crate::pipeline::asset_budget::{AssetBudgetFailure, AssetBudgetStage, AssetProcessingContext};
 use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
-use crate::pipeline::css_dependencies::collect_referenced_assets;
+use crate::pipeline::css_dependencies::{collect_referenced_assets, is_remote_reference};
 use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider};
 use lightningcss::dependencies::DependencyOptions;
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions};
@@ -392,12 +392,12 @@ impl SourceProvider for TrackingProvider {
         specifier: &str,
         originating_file: &Path,
     ) -> Result<ResolveResult, Self::Error> {
-        // A REMOTE `@import` (`@import url("https://fonts.googleapis.com/…")`) has no file behind it
-        // and is not ours to inline — a real bundler leaves it in the sheet as an import, and so do
-        // we. Reporting it as external keeps the rest of the stylesheet counted; treating it as a
-        // resolve failure would sink the whole set to raw disclosure over a shape ordinary packages
-        // ship.
-        if is_remote_specifier(specifier) {
+        // A REMOTE `@import` (`@import url("https://fonts.googleapis.com/…")`, or any other scheme
+        // such as `data:`) has no file behind it and is not ours to inline — a real bundler leaves
+        // it in the sheet as an import, and so do we. Reporting it as external keeps the rest of
+        // the stylesheet counted; treating it as a resolve failure would sink the whole set to raw
+        // disclosure over a shape ordinary packages ship.
+        if is_remote_reference(specifier) {
             return Ok(ResolveResult::External(specifier.to_owned()));
         }
 
@@ -425,12 +425,6 @@ impl SourceProvider for TrackingProvider {
             std::fs::canonicalize(&resolved).unwrap_or(resolved),
         ))
     }
-}
-
-/// An `@import` that names a network resource rather than a file on disk.
-fn is_remote_specifier(specifier: &str) -> bool {
-    let lower = specifier.trim().to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("//")
 }
 
 /// A reachable stylesheet set processed as it ships: the bundled bytes before and after
@@ -2051,6 +2045,34 @@ mod tests {
             fingerprints[0],
             crate::cache::key::absent_file_fingerprint(bundle.referenced_failures[0].path.clone()),
             "a missing target takes the absent-state sentinel: {fingerprints:?}"
+        );
+    }
+
+    /// `@import` and `url()` share one remote predicate, so an `@import` with any URL scheme is left
+    /// in the sheet rather than joined onto the sheet's directory as a file that cannot be read.
+    #[test]
+    fn a_data_import_is_external_and_does_not_sink_the_stylesheet() {
+        let fixture = Fixture::new(
+            "data-import",
+            &[(
+                "index.css",
+                "@import url(\"data:text/css,.inline{color:red}\");\n.a { color: blue }\n",
+            )],
+        );
+        let assets = vec![css_asset(&fixture.path("index.css"))];
+
+        let processed = process_assets_for_test(&assets);
+
+        assert!(
+            processed.uncounted.is_empty() && processed.failed_paths.is_empty(),
+            "a data: @import names no file: {processed:?}"
+        );
+        assert!(
+            processed
+                .contributions
+                .iter()
+                .any(|contribution| contribution.kind == AssetKind::Css),
+            "the stylesheet must be counted: {processed:?}"
         );
     }
 

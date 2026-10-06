@@ -276,19 +276,24 @@ fn resource_path(specifier: &str) -> Option<PathBuf> {
 ///
 /// Protocol-relative (`//cdn/x.woff2`) counts. Omitting that form makes a CDN font read as an
 /// unlocatable LOCAL file, which keeps the number correct but labels it a floor and drops its budget
-/// verdict. Both discovery boundaries — `@import` and `url()` — must answer this the same way.
-fn is_remote_reference(value: &str) -> bool {
+/// verdict. The one predicate for both discovery boundaries: `url()` here, and `@import` through
+/// the stylesheet bundler's resolve.
+pub(super) fn is_remote_reference(value: &str) -> bool {
+    let value = value.trim();
     value.starts_with("//") || has_url_scheme(value)
 }
 
+/// A single-letter "scheme" is a Windows drive (`C:\pkg\a.css`), which is how the synthetic union
+/// entry spells every sheet it imports; reading it as a URL would externalize the whole set.
 fn has_url_scheme(value: &str) -> bool {
     let Some((scheme, _)) = value.split_once(':') else {
         return false;
     };
     let mut characters = scheme.chars();
-    characters
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
+    scheme.len() > 1
+        && characters
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
         && characters.all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
         })
