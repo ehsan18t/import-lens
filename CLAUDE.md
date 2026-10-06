@@ -109,10 +109,6 @@ fewer lines. Shorter code that is harder to verify is not smaller — the review
 go away. When a reduction and a guarantee genuinely conflict, keep the guarantee and record the
 larger size honestly.
 
-## Orchestration Default
-
-- **lean-orchestration is the default execution mode — no `/lean` needed.** Start every non-trivial task (feature, bug hunt, review/audit, design critique, refactor, mixed prompt) by invoking the `lean-orchestration` skill and following its routing. Step 0 of the skill still governs small work: quick lookups, tight debug loops, and small single-file changes stay inline. Full multi-agent/Workflow fan-outs only when explicitly requested. The skill and role agents live under `.claude/`; see `docs/lean-orchestration-setup.md`.
-
 ## Implementation Workflow
 
 - Treat a reviewer's or subagent's findings as hypotheses — reproduce each against the code before fixing it.
