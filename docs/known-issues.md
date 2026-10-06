@@ -401,12 +401,31 @@ or antivirus. Not a code defect, but it will bite anyone trying to push.
 
 **Workaround:** `cargo test -j 2`.
 
+### M1: With the cache populated, a heavy session holds about 70 to 100 MB more than its live data
+**Status: Deferred**
+
+Over a 60-file workspace importing 25 packages, the daemon idles at about 130 MB resident on Linux and 156 MB working set on Windows while its live heap is 15 to 45 MB; about 95 MB of the Linux figure is allocator arenas. After a full cache clear it drops to 80 MB (Linux) and 76 MB (Windows), and on the release-gate fixtures to 31 to 38 MB.
+
+Idle reclaim (ADR-0007) returns every page an idle thread no longer uses, but not a page that still holds one live block. Cache entries and resolver state are allocated by whichever handler or worker thread computed them, interleaved with the transient allocations of the build that produced them, so after the build is freed many pages stay resident for a few live blocks each. Collecting harder, collecting on thread exit, mimalloc's `page_reclaim_on_free` and `page_full_retain` options, and running the connection loop on a worker were each measured and moved nothing.
+
+Not fixed now because it is neither a wrong number nor a wedge, and the size does not grow over a session. The likely fix is to allocate long-lived results (cache entries, resolver caches) from a dedicated mimalloc heap so they share pages with each other instead of with build garbage.
+
 ---
 
 # Priority 2: accepted, minor or cosmetic
 
 Known, non-blocking, and low value to fix. Each is a wrong badge, a presentation detail, or a graceful
 degradation, never a wrong size and never a wedge.
+
+### M2: The engine runtime keeps eight workers although only two builds run at once
+**Status: Accepted**
+
+Each engine worker keeps a stack and an allocator heap. Four workers saved about 10 MB of idle RSS on Linux over a 60-file, 25-package session, but rounds ran about 12 percent slower (10.8 to 11.6 s against 9.7 to 9.9 s), because Rolldown parallelizes within a build. Speed wins: the workers stay at `min(cores, 8)`.
+
+### P1: The extension's protocol types still declare `FileSizeRequest`
+**Status: Accepted**
+
+`extension/src/ipc/protocol.ts` declares a `FileSizeRequest` interface and lists it in the `ClientMessage` union, but the daemon no longer accepts that message and no extension code builds one. Nothing sends it, so nothing breaks; deleting the type is a cleanup for the next protocol change.
 
 ### G1: The negative-`error` Guard catches 18 of 24 spellings
 **Status: Accepted** · The number is machine-pinned, not claimed
