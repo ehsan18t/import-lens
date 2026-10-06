@@ -418,13 +418,14 @@ impl ImportResult {
             })
     }
 
-    /// Whether a successful build disclosed supported asset bytes that are absent from its five
-    /// sizes. The result may still be reusable when the omission is deterministic, but the number
-    /// is a floor and cannot stand in for a complete File Cost.
-    pub fn has_uncounted_assets(&self) -> bool {
+    /// Whether a successful build disclosed bytes that are absent from its five sizes
+    /// ([`crate::pipeline::stage::marks_a_floor`]). The result may still be reusable when the
+    /// omission is deterministic, but the number is a floor and cannot stand in for a complete
+    /// File Cost.
+    pub fn is_floor(&self) -> bool {
         self.diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.stage == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS)
+            .any(|diagnostic| crate::pipeline::stage::marks_a_floor(&diagnostic.stage))
     }
 
     /// A declarations-only package: it resolves to no runtime entry because it ships no runtime

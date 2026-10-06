@@ -373,11 +373,12 @@ fn translate(
         });
     }
     // A boundary the package did not ask for. Rolldown externalizes an unresolvable bare specifier
-    // it answers `NotFound`, and the plugin extends that to the denial variants. The graph behind
-    // such an edge is absent from the number, so it must be disclosed.
+    // it answers `NotFound` (reported at `resolve` from its warning), and the plugin extends that to
+    // the denial variants, reported here at the same stage. The graph behind such an edge is absent
+    // from the number, so the result is a floor.
     for specifier in state.unresolved_externals() {
         diagnostics.push(ImportDiagnostic {
-            stage: diagnostic_stage::EXTERNAL.to_owned(),
+            stage: stage::RESOLVE.to_owned(),
             message: format!(
                 "could not resolve '{specifier}'; kept as an import boundary, so anything it would \
                  have pulled in is NOT in this size"

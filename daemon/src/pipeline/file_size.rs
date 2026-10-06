@@ -108,7 +108,7 @@ pub struct FileSizeComputation {
     /// own (ADR-0005).
     pub asset_breakdown: Vec<AssetContribution>,
     /// Bytes that belong in these totals are absent: an import contributed no measurement, or a
-    /// successful build disclosed supported `uncounted_assets`. The totals are then a lower bound:
+    /// successful build disclosed a floor ([`crate::pipeline::stage::marks_a_floor`]). The totals are then a lower bound:
     /// safe to show beside the diagnostics that say so (FR-024a: a floor beats a zero), never safe
     /// to cache, persist, or compare against a baseline (ADR-0006, invariant 4).
     ///
@@ -120,12 +120,13 @@ pub struct FileSizeComputation {
     ///   how many bytes the import contributes, which is the only question a total asks.
     /// * **Unresolved**: not an entry of the combined build, so its bytes are absent however well
     ///   that build went.
-    /// * **Measured but partial**: `uncounted_assets` identifies supported shipped bytes absent
-    ///   from real JavaScript/asset sizes.
+    /// * **Measured but partial**: `uncounted_assets` (supported shipped assets absent from the
+    ///   sizes), `resolve` (an unresolvable specifier kept as an import boundary) or
+    ///   `missing_export` (a stubbed binding) on a build that succeeded.
     ///
     /// No other signal sees this: `error` is `None` (the sum succeeded), and the stage scan in
     /// [`Self::is_cacheable`] sees only request-local stages (a still-building import has no stage,
-    /// and `uncounted_assets` is deliberately reusable at the import level).
+    /// and a floor disclosure is deliberately reusable at the import level).
     pub incomplete: bool,
     /// The file's own combined build failed, so these totals fell back to a sum of per-import costs
     /// with no shared-module deduplication. That is a different quantity from a File Cost
@@ -557,10 +558,15 @@ fn compute_file_size_with(
             ));
         }
 
-        // An `uncounted_assets` disclosure, or any engine-emitted asset, means shipped bytes are
-        // absent from all five totals: a floor, never cached, persisted, or judged as File Cost
-        // (though deterministic asset fallbacks stay reusable per import).
-        totals.incomplete |= !artifact.emitted_assets.is_empty() || assets.has_uncounted_assets();
+        // A floor disclosure from the build or its asset stage, or any engine-emitted asset, means
+        // shipped bytes are absent from all five totals: a floor, never cached, persisted, or
+        // judged as File Cost (though each deterministic disclosure stays reusable per import).
+        totals.incomplete |= !artifact.emitted_assets.is_empty()
+            || assets.has_uncounted_assets()
+            || artifact
+                .diagnostics
+                .iter()
+                .any(|diagnostic| crate::pipeline::stage::marks_a_floor(&diagnostic.stage));
 
         any_sized = true;
         totals.raw_bytes += artifact.code.len() as u64 + asset_sizes.raw_bytes;
@@ -603,8 +609,8 @@ struct RuntimeGroup {
 #[derive(Default)]
 struct PerImportTotals {
     sized_any: bool,
-    /// Bytes that belong in this sum are absent: an import was not Measured, or was Measured with
-    /// an `uncounted_assets` disclosure. The sum then falls short of the file by an unknown amount.
+    /// Bytes that belong in this sum are absent: an import was not Measured, or was Measured as a
+    /// floor. The sum then falls short of the file by an unknown amount.
     missing_inputs: bool,
     raw_bytes: u64,
     minified_bytes: u64,
@@ -681,11 +687,13 @@ fn per_import_totals(
             continue;
         };
 
-        if result.has_uncounted_assets() {
+        if result.is_floor() {
             totals.missing_inputs = true;
-            for disclosure in result.diagnostics.iter().filter(|diagnostic| {
-                diagnostic.stage == crate::engine::diagnostic_stage::UNCOUNTED_ASSETS
-            }) {
+            for disclosure in result
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| crate::pipeline::stage::marks_a_floor(&diagnostic.stage))
+            {
                 let mut details = vec![specifier.clone()];
                 details.extend(disclosure.details.iter().cloned());
                 diagnostics.push(diagnostic(
@@ -1026,6 +1034,33 @@ mod tests {
         );
     }
 
+    /// An unresolvable specifier kept as a boundary and a stubbed binding both leave the import
+    /// Measured with bytes missing; a builtin boundary leaves nothing missing.
+    #[test]
+    fn a_measured_import_that_is_a_floor_makes_the_fallback_a_floor() {
+        for (stage, is_floor) in [
+            (crate::engine::stage::RESOLVE, true),
+            (crate::engine::stage::MISSING_EXPORT, true),
+            (crate::engine::diagnostic_stage::EXTERNAL, false),
+        ] {
+            let mut measured = result("boundary-lib", 100);
+            measured.diagnostics.push(ImportDiagnostic {
+                stage: stage.to_owned(),
+                message: "disclosed beside the number".to_owned(),
+                details: Vec::new(),
+            });
+
+            let totals = absorb(&[SizedImport::installed(
+                request("boundary-lib"),
+                Some(measured),
+            )]);
+
+            assert_eq!(totals.raw_bytes, 100, "{stage}");
+            assert_eq!(totals.incomplete, is_floor, "{stage}");
+            assert_eq!(totals.is_cacheable(), !is_floor, "{stage}");
+        }
+    }
+
     #[test]
     fn a_measured_import_with_imprecise_assets_is_not_a_floor() {
         let mut high = result("asset-lib", 100);
@@ -1226,6 +1261,50 @@ mod tests {
             "the user is still told why that import contributes nothing: {:?}",
             totals.diagnostics
         );
+    }
+
+    /// The combined build measures a graph whose dependency asks for a subpath its host refuses to
+    /// export: the edge is kept as a boundary, so the file's total is a floor.
+    #[test]
+    fn a_combined_build_with_an_unresolvable_boundary_is_a_floor() {
+        let fixture = Fixture::new("unresolved-boundary");
+        fixture
+            .package_file(
+                "host-lib",
+                "package.json",
+                r#"{"version":"1.0.0","main":"index.js","exports":{".":"./index.js"}}"#,
+            )
+            .package_file("host-lib", "index.js", "export const open = 1;\n")
+            .package_file(
+                "host-lib",
+                "internal/secret.js",
+                "export const secret = 2;\n",
+            )
+            .package(
+                "consumer-lib",
+                "import { secret } from 'host-lib/internal/secret';\nexport const value = secret;\n",
+            );
+
+        let totals = compute_file_size(
+            &fixture.context(),
+            &[SizedImport::installed(
+                request("consumer-lib"),
+                Some(result("consumer-lib", 10)),
+            )],
+        );
+
+        assert!(totals.error.is_none(), "{:?}", totals.diagnostics);
+        assert!(!totals.degraded, "the combined build succeeded");
+        assert!(
+            totals.raw_bytes > 0,
+            "the graph that did bundle is measured"
+        );
+        assert!(
+            totals.incomplete,
+            "the bytes behind the boundary are absent from the total: {:?}",
+            totals.diagnostics
+        );
+        assert!(!totals.is_cacheable());
     }
 
     /// The native-binary-only twin of the check above: a `bin`-only package (Biome) is answered

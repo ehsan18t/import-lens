@@ -3171,7 +3171,7 @@ fn analyze_keeps_measuring_when_a_package_refuses_to_export_a_subpath() {
     );
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.stage == "external"
+            diagnostic.stage == "resolve"
                 && diagnostic.message.contains("host-lib/internal/secret")
                 && diagnostic.message.contains("NOT in this size")
         }),

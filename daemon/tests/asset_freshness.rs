@@ -368,7 +368,7 @@ fn a_refused_bare_asset_subpath_is_a_disclosed_boundary_not_an_io_failure() {
             result
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.stage == "external"
+                .any(|diagnostic| diagnostic.stage == "resolve"
                     && diagnostic.message.contains(specifier)),
             "{specifier}: the boundary must be disclosed: {result:?}"
         );

@@ -160,6 +160,25 @@ pub fn prevents_budget_verdict(stage: &str) -> bool {
     NON_BUDGETABLE_RESULT_STAGES.contains(&stage)
 }
 
+/// Whether a diagnostic of `stage` on a **measured** result, or on a successful build, says shipped
+/// bytes are absent from the number, which makes it a floor:
+///
+/// * `uncounted_assets`: supported assets the import ships that the size omits;
+/// * `resolve`: a specifier the build could not resolve and kept as an import boundary, so anything
+///   it would have pulled in is absent;
+/// * `missing_export`: a binding stubbed between two dependencies, so whatever the real binding
+///   would retain is absent.
+///
+/// `external` is not one: a builtin boundary is one the import never ships.
+pub fn marks_a_floor(stage: &str) -> bool {
+    [
+        diagnostic_stage::UNCOUNTED_ASSETS,
+        engine_stage::RESOLVE,
+        engine_stage::MISSING_EXPORT,
+    ]
+    .contains(&stage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

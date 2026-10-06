@@ -317,33 +317,13 @@ Today an unbuildable import reports no size. A graph-limit breach means much of 
 stopped, so a real floor exists: "at least 4 MB; graph limit exceeded" is strictly better than a blank. The
 engine currently discards the partial graph on failure, so this needs plumbing through the engine boundary.
 
-### D29: A measured-but-floor import does not flag its file total incomplete
-**Status: Deferred** · Pre-existing, and now with one more way to reach it
-
-`FileSizeComputation::incomplete` (on the wire, `FileSizeDocumentResponse::incomplete`) has exactly two
-triggers: an import that was **not measured**, or a disclosed `uncounted_assets` omission. An import that *was*
-measured but is knowingly a **floor** sets neither, so the file total is presented as complete while summing
-slightly less than the file.
-
-Two things produce such an import. An unresolvable bare specifier kept as an `external` boundary — "anything it
-would have pulled in is NOT in this size" — which has behaved this way since that disclosure existed. And, now,
-a stubbed unmatched binding under `missing_export`: binding to an export that really existed would retain
-whatever implements it, so the measured graph is the one *as installed*.
-
-**Why it is not fixed here.** No number is undisclosed — both carry a named diagnostic and cap the import at
-Medium confidence — and the gap is at the aggregate surface, which is a different fix from the one this change
-was making. Per-import and per-asset floors are already structural rather than prose; this is the third member of
-that family, and it wants that same treatment: a floor that a
-consumer can see without reading diagnostic text. Doing it means deciding whether `incomplete` should key on
-"a contributor is a floor" rather than "a contributor is missing", which changes what every durable store and
-budget check does with an `external` boundary — far past the blast radius of the change that found it.
-
 ### D4: A file with one unmeasurable import can never cache its total
 **Status: Deferred** · A performance cost of an invariant we want
 
 An aggregate missing a contributor's bytes is a **floor**, and a floor is never cached. So a file containing
-one permanently-broken import, or one deterministically unprocessable supported asset, re-runs its combined
-build and asset tail on every size request. The per-import deterministic outcome is still cached; the file
+one permanently-broken import, one deterministically unprocessable supported asset, or one import measured as
+a floor (an unresolvable specifier kept as a boundary, a stubbed binding) re-runs its combined build and asset
+tail on every size request, and `importlens check` declines to judge it (exit 3, D5). The per-import deterministic outcome is still cached; the file
 aggregate cannot be, because it is not a complete File Cost.
 
 A memo of the deterministic build failure was implemented and reverted (2026-10-06): it is not safe with the
