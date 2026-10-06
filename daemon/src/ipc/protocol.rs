@@ -457,7 +457,7 @@ impl ImportResult {
 
         self.unmeasured_stage
             .as_deref()
-            .is_none_or(&stage_is_durable)
+            .is_none_or(stage_is_durable)
             && self
                 .diagnostics
                 .iter()
