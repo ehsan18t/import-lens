@@ -120,10 +120,12 @@ failure this repository has been bitten by before.
 
 Re-verified 2026-07-18, and the other two blockers are structural rather than incremental. Rolldown's
 `HookLoadArgs` carries `id`, `module_idx` and `asserted_module_type` and no importer at all; `resolve_id` has
-the importer and discards it on the success path, so no asset-to-package mapping exists anywhere to build on
-(the importer is read only in `plugin.rs`'s resolve hook and is never retained). And the `sideEffects`
-patterns are collapsed to a bool deliberately: `resolver.rs` says in prose that retaining them "invited a
-second reading of them", which is precisely the second reading D7 would need.
+the importer and discards it on the success path, so the daemon keeps no asset-to-package mapping to build on
+(the importer is read only in `plugin.rs`'s resolve hook and is never retained). Rolldown's own `ModuleInfo`
+has an `importers` field, but it is empty when `module_parsed` fires, and whether it is filled after linking
+is unverified. And the `sideEffects` patterns are collapsed to a bool deliberately: `resolver.rs` says that
+collapsing them means nothing downstream can read them a second way, which is precisely the second reading D7
+would need.
 
 Accepted rather than Deferred, because Deferred says "worth doing, not now" and this is not queued work: it is
 a measured non-shape in the ecosystem whose fix conflicts with a Critical requirement. Revisit only if the
@@ -160,8 +162,9 @@ shared ledger during retry, and a ledger breach ends as the disclosed floor: the
 collected asset is disclosed at its raw size under `uncounted_assets`, none counted. Tests that want to observe
 the per-sheet degradation itself lift the ledger with `AssetBudgetLimits::unbounded_css_work`.
 
-The file count doubles as the depth bound, because a chain of N files costs N reads and nothing else can see
-depth from where the bound is applied. 256 stops the walk roughly three times short of where a release build's
+The file count doubles as the depth bound, because a chain of N files costs N reads. A separate depth bound is
+possible (the provider's `resolve` sees every parent-to-child edge), but it buys nothing real: no real
+stylesheet tree is broad enough to hit 256 files, and the build-wide ledger would cap it anyway. 256 stops the walk roughly three times short of where a release build's
 stack gives out, and is far more than any real stylesheet's tree. It cannot simply be raised on the grounds that
 a flat set of many sheets carries no stack risk: the bound cannot tell breadth from depth, and giving the walk
 its own larger stack does not help either, because Lightning CSS drives the `@import` graph on `rayon` workers
@@ -246,8 +249,8 @@ D7's recorded blocker is "needs per-asset package attribution first". That was r
 attribution was the only missing piece. Re-examination found three separate blockers:
 
 - Rolldown's `load` hook has **no importer parameter**. `args.id` is the asset's own id; the importer
-  exists only in `resolve_id`, which discards it. Nothing anywhere maps an asset path back to the
-  module that imported it.
+  exists only in `resolve_id`, which discards it. Nothing in the daemon maps an asset path back to the
+  module that imported it (Rolldown's `ModuleInfo::importers` is empty at `module_parsed`).
 - `sideEffects` patterns are **collapsed to a bool at parse time** (`SideEffectsMode::Array { entry_matches }`).
   The patterns are deliberately not retained, so the value cannot be re-asked about a different path.
 - The engine boundary contract states the daemon's own reading of `sideEffects` is "reporting
@@ -407,27 +410,6 @@ or antivirus. Not a code defect, but it will bite anyone trying to push.
 Known, non-blocking, and low value to fix. Each is a wrong badge, a presentation detail, or a graceful
 degradation, never a wrong size and never a wedge.
 
-### R1: The "Conservative estimate" warning is path-dependent (interactive versus prefetch)
-**Status: Accepted** · Wrong badge, never a wrong size · Found in the 2026-07-16 module audit (D2)
-
-The resolver computes `is_cjs` from oxc's real resolution on the interactive path (`resolver.rs:133`) but
-passes `false` as the resolver's verdict on the prefetch-refill path (`resolved_from_cache_identity`,
-`resolver.rs:148-158`, reached from `prefetch.rs`). `resolved_entry_is_commonjs` classifies from the extension,
-manifest fields, `exports` conditions and `type` first, so that `false` decides only an entry none of those
-classify, in practice an extensionless one. `CacheIdentity` carries no `is_cjs` (`cache/key.rs`), so the two
-paths share one cache key. The value flows only into `result.is_cjs`, whose single consumer is the
-"Conservative estimate" warning (`is_conservative_item` in `report/model.rs`: a measured size with
-`is_cjs || side_effects || !truly_treeshakeable`).
-
-**What actually happens.** For an extensionless CommonJS entry, the same package can show the warning when
-first measured on the interactive path and hide it when the row was populated by prefetch (or the reverse). The
-measured bytes are identical either way: `is_cjs` reaches no build input (`minify_source` always parses the
-Rolldown output as an ES module, and it is not a `BundleRequest` field). Only the warning flips.
-
-**Why it is not fixed:** a badge-consistency issue with no size impact (the S1 class).
-**What would fix it:** resolve the entry's format on the prefetch path instead of passing `false`, or fold
-`is_cjs` into `CacheIdentity` so the two paths cannot share a row.
-
 ### G1: The negative-`error` Guard catches 18 of 24 spellings
 **Status: Accepted** · The number is machine-pinned, not claimed
 
@@ -457,13 +439,14 @@ Two independent bookkeeping approximations, neither on the number-serving path:
 Two graceful-degradation paths in the daemon's connection loop, neither able to corrupt a number:
 
 - **Oversized or malformed frame tears the connection.** A frame-decode `Err` (for example larger than
-  `MAX_FRAME_BYTES` = 32 MiB) calls `close_connection` and returns (`server.rs:539-551`), unlike the
-  payload-decode arm which `continue`s. But `close_connection` cancels all cancellable work, runs
-  `wait_for_active_tasks`, then `flush_cache()` unconditionally (`server.rs:1266-1288`), so no measured
-  result is lost and the extension respawns the daemon. A trusted client on the mirrored TS codec does not
+  `MAX_FRAME_BYTES` = 32 MiB) calls `close_connection` and returns, unlike the payload-decode arm which
+  `continue`s. `close_connection` cancels all cancellable work, waits for the invalidation to settle, aborts
+  maintenance, joins in-flight tasks for up to `TASK_JOIN_TIMEOUT` (2 s), then calls `flush_cache()`
+  unconditionally. Every result already measured is persisted; a build still running past the 2 s join is
+  abandoned unmeasured, and the extension respawns the daemon. A trusted client on the mirrored TS codec does not
   emit a 32 MiB frame.
 - **A reply that fails to serialize is dropped.** `queue_outbound` logs and returns on a
-  `rmp_serde::to_vec_named` `Err` (through `payload_bytes`, `server.rs:339-349`) with no retry; the client's
+  `rmp_serde::to_vec_named` `Err` (through `codec.rs`'s `payload_bytes`) with no retry; the client's
   `request_id` stays unanswered until its own timeout, showing Loading or timeout, never a wrong size.
   Dropping one frame (rather than tearing the connection) preserves the warm cache and every other in-flight
   request. `to_vec_named` on these plain `String`, `u64`, `Vec`, `Option` structs does not fail in practice.
@@ -605,7 +588,9 @@ where it was.
 
 **Why it is not fixed.** Swapping in the nearest manifest would break the `sideEffects` half, the half that
 stops a `"sideEffects": false` package's entry keeping statements Rollup and webpack drop, which is a strictly
-larger error on a far more common layout. There is no third option through this API.
+larger error on a far more common layout. `HookResolveIdOutput` also has a `side_effects` field, so the nearest
+manifest could be supplied with `sideEffects` decided by the plugin, but that makes the daemon's reading decide
+retention, which SRS section 7.4, FR-021 and ADR-0002 forbid. There is no third option the SRS allows.
 
 **What would fix it:** an upstream Rolldown resolve-hook field that accepts the nearest manifest separately from
 the package-root one; or resolving the entry through Rolldown instead of pre-resolving it, which FR-017 and
@@ -627,9 +612,9 @@ From the release review's improvement list. All real; none blocking. Each is a k
 
 | # | Item |
 | --- | --- |
-| P9 | **The completion path still hash-verifies every first-party file of the package graph on every popup.** Installed modules are re-checked once per `REVERIFY_TTL` (measured: 2,000 installed modules, about 41 ms per lookup down to about 3 µs, debug build, Windows), but a first-party package's own files are re-read and re-hashed per keystroke inside its import's braces. That part stays: nothing reports a first-party edit (D3 in `cache/memory.rs`), and an equal-length, mtime-preserving rewrite defeats a len+mtime check, so any window would serve a stale export list. |
+| P9 | **The completion path still hash-verifies every first-party file of the package graph on every popup.** Installed modules are re-checked once per `REVERIFY_TTL` (measured: 2,000 installed modules, about 41 ms per lookup down to about 3 µs, debug build, Windows), but a first-party package's own files are re-read and re-hashed on every completion popup inside its import's braces. That part stays: nothing reports a first-party edit (see the header of `cache/build_memo.rs`), and an equal-length, mtime-preserving rewrite defeats a len+mtime check, so any window would serve a stale export list. |
 | P10 | **`ENGINE_PERMITS` is 2, tried at 4 (Task 13), measured, reverted.** Not deferred; see the outcome below. |
-| P11 | **An interactive request that joins a prewarm's in-flight analysis waits at prewarm priority.** Prewarm builds hold at most `ENGINE_PERMITS - 1` permits, so a user's own builds never queue behind them. But a namespace or default import whose cache key a prewarm is already building joins that single-flight build, which may be queued behind the few other prewarm builds already inside the boundary (at most the drain width; foreground work cancels the rest). Bounded and rare (prewarm builds only namespace and default imports); promoting a flight's priority on join is not worth the mechanism. |
+| P11 | **An interactive request that joins a prewarm's in-flight analysis waits at prewarm priority.** Prewarm builds hold at most `ENGINE_PERMITS - 1` permits, so a user's own builds never queue behind them. But an import whose cache key a prewarm is already building joins that single-flight build, which may be queued behind the few other prewarm builds already inside the boundary (at most the drain width; foreground work cancels the rest). Bounded and rare (the recent-prewarm job rebuilds only recently used cache keys, of any import kind, that are missing); promoting a flight's priority on join is not worth the mechanism. |
 
 **P10 outcome (Task 13, measured 2026-07-15, reverted).** Raising `engine_permits()` to
 `available_parallelism().clamp(2, 4)` was implemented and measured against the section 10.6 gate on an 8+-core
