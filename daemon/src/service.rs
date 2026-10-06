@@ -1271,10 +1271,8 @@ impl ImportLensService {
             // the same transient error, and could overwrite the good cached value with an
             // error result. The re-probe itself re-stats the dependency, so for a
             // graduated key it doubles as the active re-check that heals it on a later get.
-            if matches!(
-                cache.probe_freshness(&key),
-                Some(crate::cache::key::Freshness::Unknown)
-            ) {
+            let freshness = cache.probe_freshness(&key);
+            if matches!(freshness, Some(crate::cache::key::Freshness::Unknown)) {
                 continue;
             }
             // Dedupe only within one document generation. The real cache key remains
@@ -1289,14 +1287,22 @@ impl ImportLensService {
             let Some(_guard) = cache.begin_revalidation(&claim_key) else {
                 continue;
             };
-            let mut result = self.analyze_and_cache(
-                cache.as_ref(),
-                &context,
-                &import_request,
-                key.clone(),
-                resolved.clone(),
-                || true,
-            );
+            // `Fresh` again: another request rebuilt the entry after this one was served
+            // stale, so the client is owed that value, not a second build of it.
+            let healed = matches!(freshness, Some(crate::cache::key::Freshness::Fresh))
+                .then(|| cache.get_if_fresh_and_promote(&key))
+                .flatten();
+            let mut result = match healed {
+                Some(result) => result,
+                None => self.analyze_and_cache(
+                    cache.as_ref(),
+                    &context,
+                    &import_request,
+                    key.clone(),
+                    resolved.clone(),
+                    || true,
+                ),
+            };
             // F1 trailing re-check: if a dependency changed AGAIN while this recompute
             // ran, the value just inserted already reflects the older state and
             // `probe_freshness` re-stats it to `Stale`. A concurrent stale serve during

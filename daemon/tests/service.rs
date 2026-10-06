@@ -2031,6 +2031,45 @@ fn revalidate_document_sizes_recomputes_only_stale_specifiers() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
+/// A served-stale import whose entry is Fresh again when its revalidation runs (another request
+/// already rebuilt it) is pushed from the cache. Rebuilding it would spend an engine permit on a
+/// value the cache already holds.
+#[test]
+fn revalidation_pushes_an_entry_that_is_fresh_again_without_rebuilding_it() {
+    use std::collections::HashSet;
+
+    let workspace = temp_workspace();
+    write_tiny_package_with_source(&workspace, "export const value = 'tiny';");
+    let service = ImportLensService::new(None, false);
+    let request = FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        source: "import { value } from 'tiny-lib';".to_owned(),
+        force_fresh: false,
+        analysis_generation: None,
+    };
+    let built = service.handle_file_size_document(request.clone());
+    assert!(
+        !built.imports[0].cache_hit,
+        "precondition: the first read builds the entry: {built:?}"
+    );
+
+    let stale = HashSet::from(["tiny-lib".to_owned()]);
+    let (_, _, results, _) = service
+        .revalidate_document_sizes(&request, &stale, || true)
+        .expect("the served-stale import should still be pushed");
+
+    fs::remove_dir_all(&workspace).ok();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].cache_hit,
+        "a Fresh entry must be pushed from the cache, not rebuilt: {results:?}"
+    );
+}
+
 #[test]
 fn revalidate_document_sizes_bails_when_superseded() {
     use std::collections::HashSet;
