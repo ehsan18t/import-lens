@@ -377,29 +377,6 @@ Two independent bookkeeping approximations, neither on the number-serving path:
 
 **Why it is accepted:** the cache is rebuildable and keyed by dependency fingerprints, so bookkeeping drift can waste rebuilds or disk but can never surface a wrong import cost or lose a durable answer. A summary byte total driven negative is drift and is rebuilt from a scan in the same transaction.
 
-### I1: A rare wire-level failure degrades gracefully (connection teardown or dropped reply), never a wrong number
-**Status: Accepted** · Found in the 2026-07-16 module audit (D6)
-
-Two graceful-degradation paths in the daemon's connection loop, neither able to corrupt a number:
-
-- **Oversized or malformed frame tears the connection.** A frame-decode `Err` (for example larger than
-  `MAX_FRAME_BYTES` = 32 MiB) calls `close_connection` and returns, unlike the payload-decode arm which
-  `continue`s. `close_connection` cancels all cancellable work, waits for the invalidation to settle, aborts
-  maintenance, joins in-flight tasks for up to `TASK_JOIN_TIMEOUT` (2 s), then calls `flush_cache()`
-  unconditionally. Every result already measured is persisted; a build still running past the 2 s join is
-  abandoned unmeasured, and the extension respawns the daemon. A trusted client on the mirrored TS codec does not
-  emit a 32 MiB frame.
-- **A reply that fails to serialize is dropped.** `queue_outbound` logs and returns on a
-  `rmp_serde::to_vec_named` `Err` (through `codec.rs`'s `payload_bytes`) with no retry; the client's
-  `request_id` stays unanswered until its own timeout, showing Loading or timeout, never a wrong size.
-  Dropping one frame (rather than tearing the connection) preserves the warm cache and every other in-flight
-  request. `to_vec_named` on these plain `String`, `u64`, `Vec`, `Option` structs does not fail in practice.
-
-**Why it is accepted:** both are last-resort paths for inputs a trusted client does not produce, and both fail
-toward "no answer" (client retries, daemon respawns), never toward a fabricated or misrouted number. Handler
-panics are converted to routed protocol errors (`response_from_join`), so a panic does not wedge a request
-either.
-
 ### E2: Windows ARM64 (`win32-arm64`) is a declared target with no shipped binary or hash, so the daemon never starts
 **Status: Accepted** · Fail-safe · Out of the current release scope (Windows x64) · Found in the 2026-07-16 module audit (E1 module)
 

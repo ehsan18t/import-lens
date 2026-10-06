@@ -324,16 +324,37 @@ fn queue_outbound<T: Serialize>(outbound: &mpsc::UnboundedSender<OutboundFrame>,
     }
 }
 
+/// Queues a request's response. One that cannot be encoded is replaced by `fallback`, the request's
+/// protocol error carrying the encoder's reason: a dropped response would leave the client waiting
+/// out its timeout. Streamed partials go through [`queue_outbound`] instead, because the final
+/// response carries everything a partial did.
+fn queue_response<T: Serialize>(
+    outbound: &mpsc::UnboundedSender<OutboundFrame>,
+    response: &T,
+    fallback: impl FnOnce(String) -> T,
+) {
+    match payload_bytes(response) {
+        Ok(frame) => {
+            let _ = outbound.send(frame);
+        }
+        Err(error) => {
+            let message = format!("the response could not be encoded: {error}");
+            logging::log_warn("ipc", message.clone());
+            queue_outbound(outbound, &fallback(message));
+        }
+    }
+}
+
 /// Run one request's handler off the connection loop and queue its response on the outbound
 /// channel, like any push.
 ///
 /// `on_error` builds the request-scoped protocol error when the handler's blocking task panics or
-/// is cancelled.
+/// is cancelled, or its response cannot be encoded.
 fn spawn_request<T, R>(
     active_tasks: &mut Vec<JoinHandle<()>>,
     outbound: &mpsc::UnboundedSender<OutboundFrame>,
     request_for_error: R,
-    on_error: impl FnOnce(&R, String) -> T + Send + 'static,
+    on_error: impl Fn(&R, String) -> T + Send + Sync + 'static,
     handler: impl FnOnce() -> T + Send + 'static,
 ) where
     T: Serialize + Send + 'static,
@@ -342,8 +363,10 @@ fn spawn_request<T, R>(
     let outbound = outbound.clone();
     let handle = tokio::spawn(async move {
         let response =
-            response_from_join(spawn_blocking_noted(handler), &request_for_error, on_error).await;
-        queue_outbound(&outbound, &response);
+            response_from_join(spawn_blocking_noted(handler), &request_for_error, &on_error).await;
+        queue_response(&outbound, &response, |message| {
+            on_error(&request_for_error, message)
+        });
     });
     track_active_task(active_tasks, handle);
 }
@@ -919,7 +942,7 @@ where
                         })
                         .collect();
 
-                    queue_outbound(
+                    queue_response(
                         &outbound,
                         &RefreshRegistryHintsResponse {
                             version,
@@ -928,6 +951,14 @@ where
                             indexes: None,
                             error: None,
                             diagnostics: Vec::new(),
+                        },
+                        |message| RefreshRegistryHintsResponse {
+                            version,
+                            request_id,
+                            results: Vec::new(),
+                            indexes: None,
+                            error: Some(message.clone()),
+                            diagnostics: vec![ImportDiagnostic::for_stage("protocol", &message)],
                         },
                     );
                 });
@@ -963,7 +994,9 @@ where
                             "workspace report worker stopped before sending a response",
                         )
                     });
-                    queue_outbound(&outbound, &response);
+                    queue_response(&outbound, &response, |message| {
+                        workspace_report_protocol_error(&request_for_error, &message)
+                    });
                 });
                 track_active_task(&mut active_tasks, forwarder);
                 continue;
@@ -1264,7 +1297,9 @@ fn spawn_document_analysis(
             })
             .await;
 
-        queue_outbound(&outbound, &analysis.response);
+        queue_response(&outbound, &analysis.response, |message| {
+            protocol_error_analyze_document_response(&request_for_error, message)
+        });
 
         if analysis.pending.is_empty() {
             return;
@@ -1364,7 +1399,9 @@ fn spawn_file_size_document(
             .filter(|result| matches!(result.freshness.kind, FreshnessKind::Stale))
             .map(|result| result.specifier.clone())
             .collect::<std::collections::HashSet<_>>();
-        queue_outbound(&outbound, &response);
+        queue_response(&outbound, &response, |message| {
+            protocol_error_file_size_document_response(&request_for_error, message)
+        });
         // Release the gate: revalidation has its own supersession and single-flight.
         drop(permit);
 
@@ -1405,7 +1442,7 @@ fn spawn_streaming_forwarder<T, R>(
     mut partial_rx: mpsc::UnboundedReceiver<T>,
     response_handle: JoinHandle<T>,
     request_for_error: R,
-    on_error: impl FnOnce(&R, String) -> T + Send + 'static,
+    on_error: impl Fn(&R, String) -> T + Send + Sync + 'static,
 ) -> JoinHandle<()>
 where
     T: Serialize + Send + 'static,
@@ -1418,8 +1455,10 @@ where
         }
 
         let final_response =
-            response_from_join(response_handle, &request_for_error, on_error).await;
-        queue_outbound(&outbound, &final_response);
+            response_from_join(response_handle, &request_for_error, &on_error).await;
+        queue_response(&outbound, &final_response, |message| {
+            on_error(&request_for_error, message)
+        });
     })
 }
 
@@ -1610,12 +1649,43 @@ fn restrict_unix_socket_permissions(pipe_name: &str) -> Result<(), Box<dyn Error
 mod tests {
     use super::{
         DocumentBuildGate, DocumentTaskLifecycle, RegistryRefreshLifecycle, TASK_JOIN_TIMEOUT,
-        reap_finished_tasks, wait_for_active_tasks,
+        queue_response, reap_finished_tasks, wait_for_active_tasks,
     };
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::task::JoinHandle;
+
+    /// A reply that serializes to its text, or fails to serialize at all.
+    enum Reply {
+        Unencodable,
+        Text(String),
+    }
+
+    impl serde::Serialize for Reply {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            match self {
+                Self::Unencodable => Err(serde::ser::Error::custom("refuses to encode")),
+                Self::Text(text) => serializer.serialize_str(text),
+            }
+        }
+    }
+
+    /// A response that cannot be encoded still answers its request, with the fallback naming why,
+    /// instead of leaving the client to wait out its timeout.
+    #[test]
+    fn an_unencodable_response_is_replaced_by_its_fallback() {
+        let (outbound, mut frames) = tokio::sync::mpsc::unbounded_channel();
+
+        queue_response(&outbound, &Reply::Unencodable, Reply::Text);
+
+        let frame = frames
+            .try_recv()
+            .expect("the request must still be answered");
+        let text: String = crate::ipc::codec::decode_payload(&frame).expect("fallback frame");
+        assert!(text.contains("refuses to encode"), "{text}");
+        assert!(frames.try_recv().is_err(), "exactly one frame per response");
+    }
 
     /// Shutdown must not be hostage to a build it cannot cancel (see `TASK_JOIN_TIMEOUT`). The
     /// handles it gives up on are kept and reported, not silently dropped.

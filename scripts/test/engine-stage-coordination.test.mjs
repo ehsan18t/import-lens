@@ -215,3 +215,36 @@ test("every client speaks the protocol version the daemon declares", () => {
     "the accuracy harness negotiates an older protocol and measures against a stale wire shape",
   );
 });
+
+// Drift check. The frame limit is declared by the daemon and by each client that writes frames. The
+// daemon tears the connection down on a larger frame, so a client whose own limit is higher turns
+// one oversized request into a lost connection instead of one failed request.
+const frameLimit = (text, pattern, where) => {
+  const declaration = pattern.exec(text);
+  assert.ok(declaration, `${where} must still declare its frame limit`);
+  return declaration[1]
+    .split("*")
+    .map((factor) => Number(factor.trim()))
+    .reduce((product, factor) => product * factor, 1);
+};
+
+test("every client refuses a frame the daemon would tear the connection down for", () => {
+  const daemon = frameLimit(
+    repoFile("daemon/src/ipc/codec.rs"),
+    /pub const MAX_FRAME_BYTES: usize = ([\d\s*]+);/u,
+    "the daemon",
+  );
+  const extension = frameLimit(
+    repoFile("extension/src/ipc/codec.ts"),
+    /const maxFrameBytes = ([\d\s*]+);/u,
+    "the extension",
+  );
+  const cliLimit = frameLimit(cli, /^const maxFrameBytes = ([\d\s*]+);$/mu, "the CLI");
+
+  assert.equal(
+    extension,
+    daemon,
+    "the extension would send frames the daemon drops the connection on",
+  );
+  assert.equal(cliLimit, daemon, "the CLI would send frames the daemon drops the connection on");
+});

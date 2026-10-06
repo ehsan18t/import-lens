@@ -12,6 +12,9 @@ import { decode, encode } from "@msgpack/msgpack";
 
 const execFile = promisify(execFileCallback);
 const protocolVersion = 8;
+// The daemon tears the connection down on a larger frame, so one oversized file would fail every
+// file of the run; refusing it here fails that file alone.
+const maxFrameBytes = 32 * 1024 * 1024;
 const supportedExtensions = new Set([
   ".js",
   ".jsx",
@@ -740,6 +743,9 @@ export const createDaemonClient = (socket) => {
 
   const send = (message) => {
     const payload = Buffer.from(encode(message));
+    if (payload.length > maxFrameBytes) {
+      throw new RangeError(`IPC frame is too large: ${payload.length} bytes`);
+    }
     const header = Buffer.allocUnsafe(4);
     header.writeUInt32BE(payload.length, 0);
     socket.write(Buffer.concat([header, payload]));
