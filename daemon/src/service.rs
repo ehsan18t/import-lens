@@ -703,7 +703,12 @@ impl ImportLensService {
                     item.message.clone()
                 },
                 detected: item.detected,
-                result: item.result,
+                // The report holds every row until all files finish and never reads the
+                // per-module contributions, which are sized to the build graph.
+                result: item.result.map(|mut result| {
+                    result.internal_contributions = Vec::new();
+                    result
+                }),
             })
             .collect()
     }

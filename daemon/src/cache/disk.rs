@@ -77,6 +77,18 @@ const COMPACT_IDLE: Duration = Duration::from_secs(5);
 // and the `(last_seq, key)` index directly.
 const SEQ_PREFIX_LEN: usize = 8;
 
+/// redb's page cache defaults to 1 GiB per database and fills with every page read or
+/// written, so a full scan (`recent_keys`, eviction, compaction) would leave the whole
+/// shard resident. The in-memory `ImportCache` is the hot tier; redb only needs enough
+/// to keep the B-tree interior pages warm.
+const REDB_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+fn create_database(path: &Path) -> Result<Database, redb::DatabaseError> {
+    redb::Builder::new()
+        .set_cache_size(REDB_CACHE_BYTES)
+        .create(path)
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/cache_disk_test_support.rs"]
 pub(crate) mod test_support;
@@ -1110,7 +1122,7 @@ impl DiskCache {
 
         let db_path = storage_path.join(CACHE_DB_FILE_NAME);
         let db_existed = db_path.exists();
-        let db = match Database::create(&db_path) {
+        let db = match create_database(&db_path) {
             Ok(db) => db,
             // The file is already open elsewhere in this process (redb allows one
             // Database per file). This happens when a temp open for a maintenance
@@ -1228,7 +1240,7 @@ impl DiskCache {
             return None;
         }
 
-        let db = match Database::create(db_path) {
+        let db = match create_database(db_path) {
             Ok(db) => db,
             Err(error) => {
                 cache_warn(format!(

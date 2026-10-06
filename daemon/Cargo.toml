@@ -29,6 +29,11 @@ httpdate = "^1"
 # because `bundler`'s `ResolveResult` carries an ungated `#[serde(untagged)]` (a
 # feature-gating hole in this alpha); serde is already in our tree, so it costs
 # nothing. `browserslist` stays off to keep output deterministic.
+# Allocator. glibc malloc keeps each worker thread's peak resident after the build that
+# grew it, which measured 1.3 GB idle on Linux. mimalloc only beats that with transparent
+# huge pages off (`no_thp`) and purging on free (set in main.rs): 245 MB idle, same speed.
+libmimalloc-sys = { version = "^0.1", default-features = false, features = ["extended", "no_thp"] }
+mimalloc = { version = "^0.1", default-features = false }
 lightningcss = { version = "=1.0.0-alpha.71", default-features = false, features = ["bundler", "serde"] }
 oxc_allocator = "=0.140.0"
 oxc_codegen = "=0.140.0"
