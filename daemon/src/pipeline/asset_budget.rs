@@ -271,11 +271,13 @@ impl AssetProcessingContext {
             .snapshot_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(asset) = self.snapshot_if_present(&requested_path) {
-            self.check_deadline()?;
-            return Ok(asset);
-        }
-        let path = canonical_path(&requested_path);
+        let path = match self.snapshot_if_present(&requested_path) {
+            Ok(asset) => {
+                self.check_deadline()?;
+                return Ok(asset);
+            }
+            Err(canonical) => canonical,
+        };
         self.lock_state()
             .aliases
             .insert(requested_path, path.clone());
@@ -317,16 +319,21 @@ impl AssetProcessingContext {
         }
     }
 
-    fn snapshot_if_present(&self, path: &Path) -> Option<CollectedAsset> {
+    /// The snapshot already taken for `path`, or on a miss the canonical path it was looked up
+    /// under, so the caller reading the file does not canonicalize the same path a second time.
+    fn snapshot_if_present(&self, path: &Path) -> Result<CollectedAsset, PathBuf> {
         {
             let state = self.lock_state();
             let identity = state.aliases.get(path).map_or(path, PathBuf::as_path);
             if let Some(asset) = state.snapshots.get(identity) {
-                return Some(asset.clone());
+                return Ok(asset.clone());
             }
         }
         let canonical = canonical_path(path);
-        self.lock_state().snapshots.get(&canonical).cloned()
+        match self.lock_state().snapshots.get(&canonical) {
+            Some(asset) => Ok(asset.clone()),
+            None => Err(canonical),
+        }
     }
 
     /// One snapshot by canonical path, for a retry that needs the bytes an earlier attempt read.

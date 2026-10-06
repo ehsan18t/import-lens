@@ -258,13 +258,6 @@ It would also cost accuracy. A monorepo package legitimately referencing a share
 is a real shape, and a containment check would stop counting bytes that genuinely ship — turning a
 correct number into a floor to prevent something that is not a defect.
 
-### D28: A counted CSS resource is canonicalized more than once per build
-**Status: Accepted** · Measured 2026-07-19, narrowed 2026-10-06
-
-`collect_referenced_assets` examines each file a stylesheet's `url()` references name once per collection, so an icon-font sheet naming three files from fifty rules pays three canonicalize-and-stat pairs, not fifty. What remains: a first-time counted font or wasm file is canonicalized twice more by the ledger's snapshot (`snapshot_if_present`, then `snapshot`), and each per-sheet retry collects its own sheet's references again. On Windows a canonicalize is a file-handle open, about 0.12 ms per reference as measured when every repeat paid it.
-
-Accepted: it moves no number and can wedge nothing, and a memo on the snapshot path sits directly on the read that freshness is derived from, which is worth more care than a fraction of a millisecond buys. Revisit if the asset stage shows up in a p95 regression.
-
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
 
