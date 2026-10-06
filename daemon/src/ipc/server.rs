@@ -1046,9 +1046,13 @@ where
             }
             ClientMessage::PrewarmPackageJson(message) if hello_received => {
                 let package_json_path = PathBuf::from(message.package_json_path);
+                let root = message.workspace_root.map_or_else(
+                    || prewarm_root(connection_workspace_root.as_deref(), &package_json_path),
+                    PathBuf::from,
+                );
                 prefetcher.prewarm_package_json(
                     std::sync::Arc::clone(&service),
-                    prewarm_root(connection_workspace_root.as_deref(), &package_json_path),
+                    root,
                     package_json_path,
                     PathBuf::from(message.active_document_path),
                 );

@@ -308,3 +308,30 @@ fn client_message_decodes_cache_management_requests() {
 fn decode_client_message(value: serde_json::Value) -> ClientMessage {
     rmp_serde::from_slice(&msgpack(&value)).expect("message should decode")
 }
+
+#[test]
+fn a_prewarm_carries_the_client_analysis_root_when_it_sends_one() {
+    let with_root = decode_client_message(serde_json::json!({
+        "type": "prewarm_package_json",
+        "package_json_path": "/repo/packages/app/package.json",
+        "active_document_path": "/repo/packages/app/package.json",
+        "workspace_root": "/repo/packages/app",
+    }));
+    let ClientMessage::PrewarmPackageJson(message) = with_root else {
+        panic!("expected a prewarm message");
+    };
+    assert_eq!(
+        message.workspace_root.as_deref(),
+        Some("/repo/packages/app")
+    );
+
+    let without_root = decode_client_message(serde_json::json!({
+        "type": "prewarm_package_json",
+        "package_json_path": "/repo/package.json",
+        "active_document_path": "/repo/package.json",
+    }));
+    let ClientMessage::PrewarmPackageJson(message) = without_root else {
+        panic!("an older client's prewarm must still decode");
+    };
+    assert_eq!(message.workspace_root, None);
+}

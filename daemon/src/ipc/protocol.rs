@@ -1069,6 +1069,11 @@ pub struct PrewarmPackageJsonMessage {
     pub message_type: String,
     pub package_json_path: String,
     pub active_document_path: String,
+    /// The analysis root the client uses for files governed by this manifest, so the prewarm fills
+    /// the shard interactive analysis reads. Absent from older clients: the daemon then derives it
+    /// from the connection's workspace root (`prefetch::prewarm_root`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// The watcher's "something the daemon memoized is no longer true" message.
