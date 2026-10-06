@@ -4,8 +4,8 @@
 //! this module; only misses pay for a permit.
 //!
 //! Size-producing service and prewarm loops feed this boundary through the
-//! two-worker scheduler, preserving final input order without parking the
-//! global Rayon pool.
+//! bounded miss drain (`scheduling`), preserving final input order without
+//! parking the global Rayon pool.
 
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -20,8 +20,8 @@ use tokio::sync::Semaphore;
 use super::{BundleArtifact, BundleFailure, BundleRequest, ImportRuntime, RolldownEngine, stage};
 
 /// Spec §9: two concurrent builds bound peak memory while keeping one slow
-/// build from serializing the daemon. Public so miss-draining loops size
-/// their worker count to the permit count instead of parking extra threads.
+/// build from serializing the daemon. The miss drain sizes its worker count
+/// from this.
 ///
 /// The memory bound is exact for builds that *finish*, and approximate for one that
 /// hits `BUILD_TIMEOUT`. Dropping a timed-out build future releases its permit at once,

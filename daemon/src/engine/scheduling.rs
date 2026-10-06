@@ -70,7 +70,7 @@ where
     R: Send,
     F: Fn(usize, &T) -> R + Sync,
 {
-    let mut pairs = drain_bounded(items, ENGINE_PERMITS, |index, item| {
+    let mut pairs = drain_bounded(items, MISS_DRAIN_WORKERS, |index, item| {
         (index, run(index, item))
     });
     pairs.sort_by_key(|(index, _)| *index);
@@ -200,7 +200,8 @@ mod tests {
     };
 
     use super::{
-        ENGINE_PERMITS, drain_classified, drain_misses_owned, drain_ordered, drain_ordered_owned,
+        MISS_DRAIN_WORKERS, drain_classified, drain_misses_owned, drain_ordered,
+        drain_ordered_owned,
     };
 
     /// The classified drain reorders by construction: hits settle on the Rayon pool
@@ -287,10 +288,11 @@ mod tests {
     }
 
     #[test]
-    fn caps_work_at_the_engine_permit_count() {
+    fn caps_work_at_the_miss_drain_width() {
+        let items: Vec<usize> = (0..MISS_DRAIN_WORKERS * 2).collect();
         let in_flight = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        let output = drain_ordered(&[0, 1, 2, 3], |_, item| {
+        let output = drain_ordered(&items, |_, item| {
             let current = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             peak.fetch_max(current, Ordering::AcqRel);
             thread::sleep(Duration::from_millis(10));
@@ -298,8 +300,8 @@ mod tests {
             *item
         });
 
-        assert_eq!(output, vec![0, 1, 2, 3]);
-        assert_eq!(peak.load(Ordering::Acquire), ENGINE_PERMITS);
+        assert_eq!(output, items);
+        assert_eq!(peak.load(Ordering::Acquire), MISS_DRAIN_WORKERS);
     }
 
     /// A lone miss must not pay for a thread spawn: every drain blocks its caller anyway.
