@@ -163,6 +163,19 @@ pub struct DiskCache {
 
 impl DiskCache {
     pub fn new(storage_path: Option<PathBuf>, enabled: bool) -> Self {
+        Self::open(storage_path, enabled, true)
+    }
+
+    /// Opens a shard that must already exist, never creating its directory or
+    /// database. For maintenance and observability passes, which open shards from
+    /// an earlier directory listing: recreating one that was removed since would
+    /// leave a database with no project metadata, which no listing, eviction or
+    /// removal ever finds again.
+    pub fn open_existing(storage_path: Option<PathBuf>, enabled: bool) -> Self {
+        Self::open(storage_path, enabled, false)
+    }
+
+    fn open(storage_path: Option<PathBuf>, enabled: bool, create_missing: bool) -> Self {
         if !enabled {
             return Self::disabled();
         }
@@ -173,7 +186,7 @@ impl DiskCache {
         };
 
         Self {
-            db: RwLock::new(Self::open_database(&storage_path)),
+            db: RwLock::new(Self::open_database(&storage_path, create_missing)),
             pending_inserts: Mutex::new(HashMap::new()),
             clear_generation: AtomicU64::new(0),
             clear_lock: Mutex::new(()),
@@ -1063,8 +1076,12 @@ impl DiskCache {
         }
     }
 
-    fn open_database(storage_path: &Path) -> Option<Database> {
-        if let Err(error) = fs::create_dir_all(storage_path) {
+    fn open_database(storage_path: &Path, create_missing: bool) -> Option<Database> {
+        if !create_missing {
+            if !storage_path.join(CACHE_DB_FILE_NAME).is_file() {
+                return None;
+            }
+        } else if let Err(error) = fs::create_dir_all(storage_path) {
             cache_warn(format!(
                 "failed to create cache directory {}: {error}",
                 storage_path.display()

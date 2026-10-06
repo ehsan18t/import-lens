@@ -189,11 +189,7 @@ impl ProjectCacheRegistry {
                 continue;
             }
             scanned_shards += 1;
-            let cache = ImportCache::new_with_recent_preload_limit(
-                Some(cache_path),
-                self.enable_disk_cache,
-                0,
-            );
+            let cache = ImportCache::open_existing(cache_path, self.enable_disk_cache);
             crate::cache::recency::RecencyClock::observe(cache.summary_max_seq());
         }
 
@@ -293,10 +289,9 @@ impl ProjectCacheRegistry {
             if loaded_ids.contains(&shard_id) || cache_path.as_os_str().is_empty() {
                 continue;
             }
-            let cache = Arc::new(ImportCache::new_with_recent_preload_limit(
-                Some(cache_path),
+            let cache = Arc::new(ImportCache::open_existing(
+                cache_path,
                 self.enable_disk_cache,
-                0,
             ));
             targets.push(ShardTarget { shard_id, cache });
         }
@@ -591,10 +586,9 @@ impl ProjectCacheRegistry {
                         scrubbed.saturating_add(cache.purge_orphan_entries(analyzer_version));
                 }
             } else if !shard.cache_path.is_empty() {
-                let cache = ImportCache::new_with_recent_preload_limit(
-                    Some(PathBuf::from(&shard.cache_path)),
+                let cache = ImportCache::open_existing(
+                    PathBuf::from(&shard.cache_path),
                     self.enable_disk_cache,
-                    0,
                 );
                 scrubbed = scrubbed.saturating_add(cache.purge_orphan_entries(analyzer_version));
             }
@@ -674,11 +668,7 @@ impl ProjectCacheRegistry {
             if loaded_ids.contains(&shard_id) || cache_path.as_os_str().is_empty() {
                 continue;
             }
-            let cache = ImportCache::new_with_recent_preload_limit(
-                Some(cache_path),
-                self.enable_disk_cache,
-                0,
-            );
+            let cache = ImportCache::open_existing(cache_path, self.enable_disk_cache);
             cache.invalidate_packages(&package_set);
         }
     }

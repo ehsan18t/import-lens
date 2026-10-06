@@ -767,6 +767,39 @@ fn byte_budget_pages_past_memory_hot_keys_instead_of_retiring_the_shard() {
     fs::remove_dir_all(storage).expect("temp storage should be removed");
 }
 
+/// Maintenance and status open every shard from a directory listing taken first. A shard whose
+/// database is gone by the time it is opened (a Remove racing the pass) must not be recreated:
+/// once its metadata is gone too, nothing would ever list, evict or remove that file again.
+#[test]
+fn maintenance_and_status_never_recreate_a_shard_database() {
+    let storage = common::temp_workspace("import-lens-project-cache-no-recreate");
+    let root = storage.join("app");
+    fs::create_dir_all(&root).expect("project root");
+    {
+        let registry = ProjectCacheRegistry::new(Some(storage.clone()), true, 512);
+        registry.cache_for_root(&root);
+    }
+    let shard_db = storage
+        .join(project_cache_shard_id(&root))
+        .join(CACHE_DB_FILE_NAME);
+    fs::remove_file(&shard_db).expect("remove the shard database");
+
+    let registry = ProjectCacheRegistry::new_with_budget_bytes(Some(storage.clone()), true, 512, 1);
+    registry.status_for_root(None);
+    registry.run_maintenance(true);
+    registry.invalidate_package("react");
+    registry.purge_orphans();
+    registry.seed_recency_clock_from_disk();
+
+    assert!(
+        !shard_db.exists(),
+        "a temp open from a listing must never create the database it lists"
+    );
+
+    drop(registry);
+    fs::remove_dir_all(storage).expect("temp storage should be removed");
+}
+
 #[test]
 fn a_racing_shard_open_degrades_one_call_and_heals_on_the_next() {
     let storage = common::temp_workspace("import-lens-project-cache-open-race");

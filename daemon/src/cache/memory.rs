@@ -194,14 +194,28 @@ impl ImportCache {
         Self::new_with_recent_preload_limit(storage_path, enable_disk_cache, RECENT_PRELOAD_LIMIT)
     }
 
+    /// A cache over a shard that must already exist (see `DiskCache::open_existing`),
+    /// with no recent-entry preload: for maintenance and observability passes.
+    pub fn open_existing(storage_path: PathBuf, enable_disk_cache: bool) -> Self {
+        Self::with_disk(
+            DiskCache::open_existing(Some(storage_path), enable_disk_cache),
+            0,
+        )
+    }
+
     pub fn new_with_recent_preload_limit(
         storage_path: Option<PathBuf>,
         enable_disk_cache: bool,
         recent_preload_limit: usize,
     ) -> Self {
-        let memory = HashMap::new();
-        let disk = DiskCache::new(storage_path, enable_disk_cache);
+        Self::with_disk(
+            DiskCache::new(storage_path, enable_disk_cache),
+            recent_preload_limit,
+        )
+    }
 
+    fn with_disk(disk: DiskCache, recent_preload_limit: usize) -> Self {
+        let memory = HashMap::new();
         {
             let pinned = memory.pin();
             for (key, cached) in disk.load_recent(recent_preload_limit) {
