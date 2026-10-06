@@ -52,6 +52,16 @@ impl AssetBudgetLimits {
         }
     }
 
+    /// Production limits with a build-wide CSS work ledger of `reads`, so a test can breach it
+    /// part-way through processing instead of at construction.
+    #[cfg(test)]
+    pub(crate) fn css_work_reads(reads: usize) -> Self {
+        Self {
+            max_css_work_reads: reads,
+            ..Self::production()
+        }
+    }
+
     pub(crate) fn production() -> Self {
         Self {
             max_unique_files: MAX_GRAPH_MODULES,

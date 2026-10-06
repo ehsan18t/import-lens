@@ -414,9 +414,9 @@ pub(crate) fn analyze_with_rolldown_engine(
 
     // The package's non-JavaScript assets, processed the way they really ship, so their bytes JOIN
     // the Import Cost instead of being disclosed beside a number that excluded them (B2). Each
-    // artifact is compressed on its own and summed (ADR-0005). Ordinary parse/compression failures
-    // still disclose raw bytes, but a whole-build resource/deadline breach has no coherent partial
-    // measurement and therefore returns one typed Unmeasured result.
+    // artifact is compressed on its own and summed (ADR-0005). Parse/compression failures and a
+    // resource-ledger breach disclose raw bytes beside the measured JavaScript; only a request-local
+    // stage failure (deadline, panic, lost runtime) leaves the import Unmeasured.
     let assets = process_assets_bounded(
         artifact.assets.clone(),
         artifact.graph_source_bytes,

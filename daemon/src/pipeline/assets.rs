@@ -28,7 +28,7 @@ use crate::ipc::protocol::{AssetContribution, ImportDiagnostic, MeasuredSizes};
 use crate::pipeline::asset_boundary::{self, AssetBoundaryError, AssetDeadline};
 #[cfg(test)]
 use crate::pipeline::asset_budget::AssetBudgetLimits;
-use crate::pipeline::asset_budget::{AssetBudgetFailure, AssetProcessingContext};
+use crate::pipeline::asset_budget::{AssetBudgetFailure, AssetBudgetStage, AssetProcessingContext};
 use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
 use crate::pipeline::css_dependencies::collect_referenced_assets;
 use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider};
@@ -1155,38 +1155,29 @@ pub fn process_assets_bounded(
     .map_err(boundary_failure)?
 }
 
-/// Process every reachable asset the build collected, the way each really ships.
-///
-/// Never fails on an asset it cannot process: that falls back to the raw-byte disclosure that was
-/// the whole behaviour before B2, so the result is a strict improvement or a tie. It DOES fail when
-/// the shared build ledger is exhausted, which is a fact about the build rather than about any one
-/// asset.
-/// Fold a resource-ledger breach into the result as a DISCLOSURE rather than an error.
+/// A resource-ledger breach as a DISCLOSURE rather than an error: every collected asset at its raw
+/// size, none counted, with the observations that expire it.
 ///
 /// The import's JavaScript is measured before this stage runs, so failing the stage throws away a
-/// complete measurement and reports the whole import Unmeasured — below the pre-B2 floor FR-018a
-/// promises never to go under. A breach is exactly what a disclosure is for: the number stands, and
-/// it says what it could not reach. Freshness travels with it, so the result still invalidates when
-/// the files it did observe change.
+/// complete measurement and reports the whole import Unmeasured, below the pre-B2 floor FR-018a
+/// promises never to go under. The number stands and says what it could not reach.
 fn disclose_budget_breach(
-    processed: &mut ProcessedAssets,
     assets: &[CollectedAsset],
     failure: AssetBudgetFailure,
-) {
-    processed.read_paths.extend(failure.read_paths);
-    processed
-        .read_time_fingerprints
-        .extend(failure.read_time_fingerprints);
-    processed.failures.push(failure.message);
-    processed.uncounted.extend(
-        assets
+) -> ProcessedAssets {
+    let mut processed = ProcessedAssets {
+        read_paths: failure.read_paths,
+        read_time_fingerprints: failure.read_time_fingerprints,
+        failures: vec![failure.message],
+        uncounted: assets
             .iter()
-            .filter(|asset| asset.kind == AssetKind::Css)
             .map(|asset| UncountedAsset {
                 path: asset.path.clone(),
                 bytes: asset.raw_bytes(),
-            }),
-    );
+            })
+            .collect(),
+        ..ProcessedAssets::default()
+    };
     if processed.uncounted.is_empty() {
         // Nothing sizeable to disclose, but bytes were still left unread. Without this the result
         // would read complete, which is the one thing a breach must never let it do.
@@ -1196,22 +1187,61 @@ fn disclose_budget_breach(
                 .to_owned(),
         );
     }
+    processed.read_paths.sort();
+    processed.read_paths.dedup();
+    sort_and_dedup_fingerprints(&mut processed.read_time_fingerprints);
+    processed
 }
 
+/// Process every reachable asset the build collected, the way each really ships.
+///
+/// Never fails on an asset it cannot process: that falls back to the raw-byte disclosure that was
+/// the whole behaviour before B2. A breach of the shared ledger, whenever it is detected, is a
+/// deterministic fact about the build and becomes [`disclose_budget_breach`]'s floor. Only the
+/// deadline fails the stage, because a timeout is request-local and must never be cached.
 fn process_assets(
     assets: &[CollectedAsset],
     context: Arc<AssetProcessingContext>,
 ) -> Result<ProcessedAssets, AssetBudgetFailure> {
     let mut processed = ProcessedAssets::default();
-    if let Some(failure) = context.failure() {
-        disclose_budget_breach(&mut processed, assets, failure);
-        return Ok(processed);
+    if context.failure().is_none() {
+        count_assets(assets, &mut processed, &context);
     }
-    if assets.is_empty() {
-        return Ok(processed);
+    match context.failure() {
+        None => {}
+        Some(failure) if failure.stage == AssetBudgetStage::Timeout => return Err(failure),
+        Some(failure) => return Ok(disclose_budget_breach(assets, failure)),
     }
 
-    let referenced_assets = process_stylesheets(assets, &mut processed, context.clone())?;
+    // The shared ledger also observes metadata reservations that fail before a provider read and
+    // exact snapshots served across retry providers. Merge that whole history on success so a
+    // later successful retry cannot erase an earlier conflicting/failed observation from cache
+    // freshness merely because both used the same path.
+    processed.read_paths.extend(context.read_paths());
+    processed
+        .read_time_fingerprints
+        .extend(context.freshness_fingerprints());
+
+    processed
+        .contributions
+        .sort_by_key(|contribution| contribution.kind);
+    processed.read_paths.sort();
+    processed.read_paths.dedup();
+    sort_and_dedup_fingerprints(&mut processed.read_time_fingerprints);
+    Ok(processed)
+}
+
+/// Count every asset into `processed`, stopping as soon as the shared ledger records a failure.
+/// Partial work is left for [`process_assets`] to discard.
+fn count_assets(
+    assets: &[CollectedAsset],
+    processed: &mut ProcessedAssets,
+    context: &Arc<AssetProcessingContext>,
+) {
+    let referenced_assets = process_stylesheets(assets, processed, context.clone());
+    if context.failure().is_some() {
+        return;
+    }
     let mut assets_by_path: BTreeMap<PathBuf, CollectedAsset> = assets
         .iter()
         .cloned()
@@ -1238,28 +1268,8 @@ fn process_assets(
         .extend(all_assets.iter().map(|asset| asset.fingerprint.clone()));
 
     for kind in [AssetKind::Wasm, AssetKind::Font] {
-        process_binary_kind(&all_assets, kind, &mut processed, &context)?;
+        process_binary_kind(&all_assets, kind, processed, context);
     }
-
-    // The shared ledger also observes metadata reservations that fail before a provider read and
-    // exact snapshots served across retry providers. Merge that whole history on success so a
-    // later successful retry cannot erase an earlier conflicting/failed observation from cache
-    // freshness merely because both used the same path.
-    processed.read_paths.extend(context.read_paths());
-    processed
-        .read_time_fingerprints
-        .extend(context.freshness_fingerprints());
-
-    processed
-        .contributions
-        .sort_by_key(|contribution| contribution.kind);
-    processed.read_paths.sort();
-    processed.read_paths.dedup();
-    sort_and_dedup_fingerprints(&mut processed.read_time_fingerprints);
-    if let Some(failure) = context.failure() {
-        return Err(failure);
-    }
-    Ok(processed)
 }
 
 /// The settled result of bundling the stylesheet set, named rather than a bare tuple so that the
@@ -1288,14 +1298,14 @@ fn process_stylesheets(
     assets: &[CollectedAsset],
     processed: &mut ProcessedAssets,
     context: Arc<AssetProcessingContext>,
-) -> Result<Vec<CollectedAsset>, AssetBudgetFailure> {
+) -> Vec<CollectedAsset> {
     let entries: Vec<CollectedAsset> = assets
         .iter()
         .filter(|asset| asset.kind == AssetKind::Css)
         .cloned()
         .collect();
     if entries.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     // One artifact for the whole set is the right answer (it is how CSS ships, and it dedupes what
@@ -1392,9 +1402,9 @@ fn process_stylesheets(
             })
         });
 
-    if let Some(failure) = context.failure() {
-        disclose_budget_breach(processed, assets, failure);
-        return Ok(Vec::new());
+    // A ledger failure settles the whole stage; `process_assets` owns its one disclosure.
+    if context.failure().is_some() {
+        return Vec::new();
     }
 
     let mut referenced_assets = Vec::new();
@@ -1509,7 +1519,7 @@ fn process_stylesheets(
         }
     }
 
-    Ok(referenced_assets)
+    referenced_assets
 }
 
 /// Compress a bundled stylesheet as its own artifact — never concatenated with anything else first,
@@ -1570,25 +1580,25 @@ fn process_binary_kind(
     kind: AssetKind,
     processed: &mut ProcessedAssets,
     context: &AssetProcessingContext,
-) -> Result<(), AssetBudgetFailure> {
-    process_binary_kind_with(assets, kind, processed, context, &compress_asset_bytes)
+) {
+    process_binary_kind_with(assets, kind, processed, context, &compress_asset_bytes);
 }
 
+/// An expired deadline stops the loop; the context retains the typed failure for
+/// [`process_assets`] to settle.
 fn process_binary_kind_with(
     assets: &[CollectedAsset],
     kind: AssetKind,
     processed: &mut ProcessedAssets,
     context: &AssetProcessingContext,
     compress: &dyn Fn(&[u8]) -> Result<CompressionSizes, String>,
-) -> Result<(), AssetBudgetFailure> {
+) {
     let mut sizes = MeasuredSizes::ZERO;
     let mut counted = false;
 
     for asset in assets.iter().filter(|asset| asset.kind == kind) {
         if context.check_deadline().is_err() {
-            return Err(context
-                .failure()
-                .expect("an expired asset deadline must retain a typed failure"));
+            return;
         }
         let measured = compress(asset.bytes())
             .map_err(|error| format!("failed to compress {}: {error}", asset.path.display()))
@@ -1616,9 +1626,7 @@ fn process_binary_kind_with(
             }
         }
         if context.check_deadline().is_err() {
-            return Err(context
-                .failure()
-                .expect("an expired asset deadline must retain a typed failure"));
+            return;
         }
     }
 
@@ -1632,7 +1640,6 @@ fn process_binary_kind_with(
             zstd_bytes: sizes.zstd_bytes,
         });
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2235,17 +2242,12 @@ mod tests {
         );
     }
 
-    /// When the union AND every per-sheet retry fail, each stylesheet must be disclosed ONCE. The
-    /// retry used to report each failure as it went and then hand back an error, so the outer arm
-    /// disclosed them all a second time and the diagnostic doubled its own count and byte total — a
-    /// wrong number in the one place that exists to be honest about what is missing.
     /// A resource-ledger breach must not cost the import its JavaScript.
     ///
     /// That measurement is already complete when this stage runs, so failing the stage reports the
     /// whole import Unmeasured for a package whose code measured perfectly — and the verdict is
     /// durable, so it is cached rather than retried. Disclosing the bytes the breach could not reach
     /// IS the pre-B2 floor: the number stands and says what is missing from it.
-
     #[test]
     fn a_ledger_breach_discloses_the_stylesheet_rather_than_failing_the_import() {
         let fixture = Fixture::new("breach", &[("index.css", ".a { color: red }\n")]);
@@ -2274,6 +2276,65 @@ mod tests {
         );
     }
 
+    /// The same floor when the breach is detected MID-RUN rather than when the ledger is built: the
+    /// union reads its way past the build-wide CSS work limit. Every collected asset is disclosed
+    /// exactly once, a direct font included, and nothing is counted.
+    #[test]
+    fn a_ledger_breach_during_processing_discloses_every_asset_once() {
+        let fixture = Fixture::new(
+            "midrun-breach",
+            &[
+                ("a-child.css", ".a-child { color: red }\n"),
+                ("b-child.css", ".b-child { color: blue }\n"),
+                ("a.css", "@import \"./a-child.css\";\n.a { color: red }\n"),
+                ("b.css", "@import \"./b-child.css\";\n.b { color: blue }\n"),
+            ],
+        );
+        let font_path = fixture.write_bytes("probe.woff2", &[0x51; 64]);
+        let assets = vec![
+            css_asset(&fixture.path("a.css")),
+            css_asset(&fixture.path("b.css")),
+            read_collected_asset(&font_path, AssetKind::Font).expect("font snapshot"),
+        ];
+        let context = test_context_with(&assets, AssetBudgetLimits::css_work_reads(3));
+        assert!(
+            context.failure().is_none(),
+            "the premise is a ledger that breaches during processing, not at construction"
+        );
+
+        let processed = process_assets(&assets, context)
+            .expect("a ledger breach must not fail the asset stage");
+
+        assert!(
+            processed.contributions.is_empty(),
+            "a breached stage counts nothing: {processed:?}"
+        );
+        let mut disclosed = processed
+            .uncounted
+            .iter()
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>();
+        disclosed.sort();
+        let mut expected = assets
+            .iter()
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            disclosed, expected,
+            "each asset exactly once: {processed:?}"
+        );
+        assert!(
+            processed
+                .failures
+                .iter()
+                .any(|failure| failure.contains("CSS read")),
+            "the breach is named: {processed:?}"
+        );
+    }
+
+    /// When the union AND every per-sheet retry fail, each stylesheet is disclosed exactly once, so
+    /// the disclosure cannot double its own count and byte total.
     #[test]
     fn a_set_where_every_stylesheet_fails_discloses_each_of_them_exactly_once() {
         let fixture = Fixture::new(
@@ -2485,8 +2546,7 @@ mod tests {
             &mut processed,
             &test_context(&[]),
             &|_| Err("injected failure".to_owned()),
-        )
-        .expect("a per-asset compressor failure falls back instead of aborting the stage");
+        );
 
         assert_eq!(processed.uncounted.len(), 1);
         assert!(processed.contributions.is_empty());
