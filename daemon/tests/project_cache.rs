@@ -400,15 +400,15 @@ fn invalidate_packages_on_a_loaded_shard_drops_only_the_named_packages() {
     registry.invalidate_packages(&["react".to_owned(), "vue".to_owned()]);
 
     assert!(
-        cache.get("react@18.3.1::default").is_none(),
+        cache.get_for_prewarm("react@18.3.1::default").is_none(),
         "the loaded shard must have react invalidated"
     );
     assert!(
-        cache.get("vue@3.4.0::default").is_none(),
+        cache.get_for_prewarm("vue@3.4.0::default").is_none(),
         "the loaded shard must have vue invalidated"
     );
     assert!(
-        cache.get("lodash@4.17.21::default").is_some(),
+        cache.get_for_prewarm("lodash@4.17.21::default").is_some(),
         "an unrelated package must survive invalidation"
     );
 
@@ -725,12 +725,15 @@ fn byte_budget_pages_past_memory_hot_keys_instead_of_retiring_the_shard() {
     let cache = registry.cache_for_root(&root);
 
     // Make the lowest EVICTION_BATCH persisted-seq entries memory-hot: an
-    // interactive get hydrates + promotes them (last_seq past the persisted seq),
+    // interactive read hydrates + promotes them (last_seq past the persisted seq),
     // with no flush, so the disk index still ranks them lowest while memory knows
     // they are the live working set.
     let hot: Vec<String> = (0..EVICTION_BATCH).map(key_of).collect();
     for key in &hot {
-        assert!(cache.get(key).is_some(), "hot fixture entry should hydrate");
+        assert!(
+            cache.get_with_result_freshness(key).is_some(),
+            "hot fixture entry should hydrate"
+        );
     }
 
     let outcome = registry.run_maintenance(true).eviction;
@@ -759,7 +762,7 @@ fn byte_budget_pages_past_memory_hot_keys_instead_of_retiring_the_shard() {
     // entry must still be served after the eviction pass.
     for key in &hot {
         assert!(
-            cache.get(key).is_some(),
+            cache.get_for_prewarm(key).is_some(),
             "a memory-hot entry must survive eviction: {key}"
         );
     }

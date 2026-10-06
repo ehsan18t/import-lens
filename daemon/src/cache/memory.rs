@@ -82,7 +82,7 @@ pub struct CachedImport {
     // Runtime verification state (not persisted): the generation and monotonic
     // instant at which this entry's fingerprints were last confirmed current.
     pub verified_generation: u64,
-    // `None` = never verified this run (fresh decode from disk): the next `get`
+    // `None` = never verified this run (fresh decode from disk): the next read
     // re-verifies. Monotonic so a backward clock jump cannot extend the window.
     pub verified_at: Option<Instant>,
     // Recency sequence of the last interactive hit; drives LRU eviction for both
@@ -160,10 +160,9 @@ impl Drop for RevalidationGuard<'_> {
 /// Read semantics for the shared cache-read path (`ImportCache::read`).
 #[derive(Clone, Copy)]
 enum ReadIntent {
-    /// Interactive or bulk read: serves the last-known value even on a transient
-    /// `Unknown`, and promotes LRU recency when `promote` is set (an interactive hit
-    /// does; a prewarm scan does not, for scan resistance).
-    Serve { promote: bool },
+    /// Bulk read: serves the last-known value even on a transient `Unknown`, and
+    /// never promotes LRU recency (scan resistance).
+    Serve,
     /// Force-fresh read: serves only a value verified `Fresh` against disk. Every
     /// other state yields `None` so the caller recomputes; an `Unknown` entry is kept
     /// (never deleted, served, or hydrated). Promotes recency when `promote` is set.
@@ -173,7 +172,8 @@ enum ReadIntent {
 impl ReadIntent {
     fn promotes(self) -> bool {
         match self {
-            Self::Serve { promote } | Self::RequireFresh { promote } => promote,
+            Self::Serve => false,
+            Self::RequireFresh { promote } => promote,
         }
     }
 }
@@ -230,15 +230,10 @@ impl ImportCache {
         }
     }
 
-    /// Interactive read: promotes the entry's recency (bumps `last_seq`) on a hit.
-    pub fn get(&self, key: &str) -> Option<ImportResult> {
-        self.read(key, ReadIntent::Serve { promote: true })
-    }
-
     /// Bulk/prewarm read: does not promote recency, so a workspace scan or a
     /// prefetcher dedup check cannot evict the user's warm working set.
     pub fn get_for_prewarm(&self, key: &str) -> Option<ImportResult> {
-        self.read(key, ReadIntent::Serve { promote: false })
+        self.read(key, ReadIntent::Serve)
     }
 
     /// Force-fresh read (CI / `importlens check`): returns the cached value only when
@@ -258,7 +253,7 @@ impl ImportCache {
         self.read(key, ReadIntent::RequireFresh { promote: true })
     }
 
-    /// Read for `get`/`get_for_prewarm` (serve) and `get_if_fresh` (force-fresh): a
+    /// Read for `get_for_prewarm` (serve) and `get_if_fresh` (force-fresh): a
     /// stale entry is evicted, and a force-fresh read refuses an unverified one.
     fn read(&self, key: &str, intent: ReadIntent) -> Option<ImportResult> {
         let require_fresh = matches!(intent, ReadIntent::RequireFresh { .. });
@@ -267,7 +262,7 @@ impl ImportCache {
         (!require_fresh || freshness == Freshness::Fresh).then_some(result)
     }
 
-    /// Stale-while-revalidate read: like `get`, but on `Stale` it serves the last-known
+    /// Stale-while-revalidate read: like `get_for_prewarm`, but on `Stale` it serves the last-known
     /// value flagged `Stale { revalidating: true }` so the caller can answer instantly
     /// and recompute in the background. `Gone` evicts and returns `None`; a transient
     /// `Unknown` is served as `Stale { revalidating: true }` and surfaces as
@@ -982,7 +977,7 @@ mod tests {
         assert!(cache.memory_len() * entry_weight <= MAX_MEMORY_WEIGHT_BYTES);
         assert!(cache.memory_len() < 6);
         assert!(
-            cache.get("key-5").is_some(),
+            cache.get_for_prewarm("key-5").is_some(),
             "the most recent entry survives"
         );
     }
@@ -1020,26 +1015,26 @@ mod tests {
     }
 
     #[test]
-    fn interactive_get_promotes_recency_bulk_read_does_not() {
+    fn interactive_read_promotes_recency_bulk_read_does_not() {
         let cache = ImportCache::new(None, false);
         cache.insert("v4:react".to_owned(), minimal_result("react"));
 
         let seq0 = last_seq_of(&cache, "v4:react");
 
-        // Interactive get bumps last_seq.
-        assert!(cache.get("v4:react").is_some());
+        // Interactive read bumps last_seq.
+        assert!(cache.get_if_fresh_and_promote("v4:react").is_some());
         let seq1 = last_seq_of(&cache, "v4:react");
         assert!(
             seq1 > seq0,
-            "interactive get must promote recency: {seq0} -> {seq1}"
+            "interactive read must promote recency: {seq0} -> {seq1}"
         );
 
-        // A second interactive get bumps it again.
-        assert!(cache.get("v4:react").is_some());
+        // A second interactive read bumps it again.
+        assert!(cache.get_if_fresh_and_promote("v4:react").is_some());
         let seq2 = last_seq_of(&cache, "v4:react");
         assert!(
             seq2 > seq1,
-            "each interactive get promotes: {seq1} -> {seq2}"
+            "each interactive read promotes: {seq1} -> {seq2}"
         );
 
         // A bulk/prewarm read does not change last_seq.
@@ -1100,9 +1095,9 @@ mod tests {
             "a fresh insert is born with last_seq == persisted_seq"
         );
 
-        // Promote it: an interactive get bumps last_seq above the persisted (born) seq
+        // Promote it: an interactive read bumps last_seq above the persisted (born) seq
         // WITHOUT flushing, so disk still holds the low born seq.
-        assert!(cache.get(&victim).is_some());
+        assert!(cache.get_if_fresh_and_promote(&victim).is_some());
         let promoted = last_seq_of(&cache, &victim);
         assert!(
             promoted > born,
@@ -1169,7 +1164,7 @@ mod tests {
 
         // A normal read still rides the fast path and serves the now-stale value.
         assert!(
-            cache.get(&key).is_some(),
+            cache.get_for_prewarm(&key).is_some(),
             "the TTL fast path is active — a normal get serves the entry without re-probing"
         );
 
@@ -1253,13 +1248,23 @@ mod tests {
             "the replacement must survive a verdict on the entry it replaced"
         );
         assert!(
-            cache.disk.get(key).is_some(),
+            cache
+                .disk
+                .get_with_freshness(key)
+                .map(|(cached, _)| cached)
+                .is_some(),
             "and so must its queued disk write"
         );
 
         cache.evict_if_current(key, &identity_of(&cache));
         assert!(cache.memory.pin().get(key).is_none());
-        assert!(cache.disk.get(key).is_none());
+        assert!(
+            cache
+                .disk
+                .get_with_freshness(key)
+                .map(|(cached, _)| cached)
+                .is_none()
+        );
 
         drop(cache);
         std::fs::remove_dir_all(&dir).ok();

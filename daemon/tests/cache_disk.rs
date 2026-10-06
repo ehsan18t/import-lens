@@ -206,7 +206,7 @@ fn disk_cache_preloads_entries_into_memory_on_startup() {
     assert_eq!(cache.memory_len(), 1);
     assert!(
         cache
-            .get("react@18.3.1::default")
+            .get_for_prewarm("react@18.3.1::default")
             .expect("cache entry should be preloaded")
             .cache_hit
     );
@@ -249,7 +249,7 @@ fn disk_cache_lazy_hit_populates_memory_cache() {
     assert_eq!(cache.memory_len(), 0);
     assert!(
         cache
-            .get("react@18.3.1::default")
+            .get_for_prewarm("react@18.3.1::default")
             .expect("lazy disk hit should return result")
             .cache_hit
     );
@@ -341,7 +341,7 @@ fn disk_cache_skips_corrupt_entries_without_poisoning_memory() {
     let cache = ImportCache::new_with_recent_preload_limit(Some(storage_path.clone()), true, 1);
 
     assert_eq!(cache.memory_len(), 0);
-    assert!(cache.get(key).is_none());
+    assert!(cache.get_for_prewarm(key).is_none());
     assert_eq!(cache.memory_len(), 0);
     drop(cache);
 
@@ -356,7 +356,7 @@ fn disk_cache_recreates_database_when_schema_mismatches() {
     let cache = ImportCache::new(Some(storage_path.clone()), true);
 
     assert_eq!(cache.memory_len(), 0);
-    assert!(cache.get("react@18.3.1::default").is_none());
+    assert!(cache.get_for_prewarm("react@18.3.1::default").is_none());
     drop(cache);
 
     assert_eq!(read_schema_version(&storage_path), CURRENT_SCHEMA_VERSION);
@@ -372,7 +372,7 @@ fn disk_cache_recreates_existing_database_when_schema_version_is_missing() {
     let cache = ImportCache::new(Some(storage_path.clone()), true);
 
     assert_eq!(cache.memory_len(), 0);
-    assert!(cache.get("react@18.3.1::default").is_none());
+    assert!(cache.get_for_prewarm("react@18.3.1::default").is_none());
     drop(cache);
 
     assert_eq!(read_schema_version(&storage_path), CURRENT_SCHEMA_VERSION);
@@ -411,7 +411,7 @@ fn disk_cache_clear_removes_disk_and_memory_entries() {
     let cache = ImportCache::new(Some(storage_path.clone()), true);
 
     assert_eq!(cache.memory_len(), 0);
-    assert!(cache.get("react@18.3.1::default").is_none());
+    assert!(cache.get_for_prewarm("react@18.3.1::default").is_none());
     drop(cache);
 
     fs::remove_dir_all(storage_path).expect("temp storage should be removed");
@@ -439,7 +439,7 @@ fn flush_to_disk_succeeds_with_nothing_dirty() {
     cache.insert("react@18.3.1::default".to_owned(), result("react"));
 
     cache.flush_to_disk().expect("flush should succeed");
-    assert!(cache.get("react@18.3.1::default").is_some());
+    assert!(cache.get_for_prewarm("react@18.3.1::default").is_some());
 
     // Disk-disabled cache: inserts never fail, so nothing is ever dirty.
     let memory_only = ImportCache::new(None, false);
@@ -462,7 +462,7 @@ fn flush_to_disk_persists_memory_entries_for_reload() {
 
     let reloaded = ImportCache::new(Some(storage_path.clone()), true);
 
-    assert!(reloaded.get(&key).is_some());
+    assert!(reloaded.get_for_prewarm(&key).is_some());
 
     fs::remove_dir_all(storage_path).expect("temp storage should be removed");
 }
@@ -476,13 +476,16 @@ fn insert_is_readable_before_flush_and_persists_after_flush() {
         let cache = ImportCache::new(Some(storage_path.clone()), true);
         cache.insert(key.clone(), result("react"));
         // Read-your-writes: visible immediately while still queued (unflushed).
-        assert!(cache.get(&key).is_some(), "read-your-writes before flush");
+        assert!(
+            cache.get_for_prewarm(&key).is_some(),
+            "read-your-writes before flush"
+        );
         // No explicit flush — rely on Drop to drain the queue on teardown.
     }
 
     let reloaded = ImportCache::new(Some(storage_path.clone()), true);
     assert!(
-        reloaded.get(&key).is_some(),
+        reloaded.get_for_prewarm(&key).is_some(),
         "Drop should flush queued inserts so they survive reload"
     );
 
@@ -653,21 +656,33 @@ fn a_second_open_of_a_live_shard_degrades_without_deleting_data() {
         !second.is_available(),
         "the racing open must degrade to a disabled cache"
     );
-    assert!(second.get(key).is_none(), "a disabled cache serves nothing");
+    assert!(
+        second
+            .get_with_freshness(key)
+            .map(|(cached, _)| cached)
+            .is_none(),
+        "a disabled cache serves nothing"
+    );
     second
         .insert(key, &cached("react"))
         .expect("a disabled cache accepts inserts as no-ops");
     drop(second);
 
     assert!(
-        first.get(key).is_some(),
+        first
+            .get_with_freshness(key)
+            .map(|(cached, _)| cached)
+            .is_some(),
         "the live handle must be unaffected by the degraded open"
     );
     drop(first);
 
     let reopened = DiskCache::new(Some(storage.clone()), true);
     assert!(
-        reopened.get(key).is_some(),
+        reopened
+            .get_with_freshness(key)
+            .map(|(cached, _)| cached)
+            .is_some(),
         "the data must survive the degraded open"
     );
     drop(reopened);
@@ -722,7 +737,11 @@ fn memory_promoted_entries_are_shielded_from_disk_eviction() {
     // persisted seq is untouched until the next flush). By persisted seq alone,
     // `a` (inserted first) is the older entry — the eviction filter must
     // recognize the promotion and refuse to offer `a` as a victim.
-    assert!(cache.get("a@1.0.0::default").is_some());
+    assert!(
+        cache
+            .get_with_result_freshness("a@1.0.0::default")
+            .is_some()
+    );
 
     let victims = cache.lowest_seq_disk_keys(10, 0);
     assert!(
@@ -760,13 +779,13 @@ fn eviction_pages_past_an_all_hot_lowest_batch_to_cold_entries_deeper() {
         .expect("flush should persist the seqs");
 
     // Promote the lowest EVICTION_BATCH persisted-seq entries in memory only: an
-    // interactive get bumps last_seq past the persisted seq the disk index sorted
+    // interactive read bumps last_seq past the persisted seq the disk index sorted
     // them by, with no flush, so all BATCH of them are memory-hot. These are
     // exactly the keys the disk index offers first.
     let hot: Vec<String> = (0..EVICTION_BATCH).map(key_of).collect();
     for key in &hot {
         assert!(
-            cache.get(key).is_some(),
+            cache.get_with_result_freshness(key).is_some(),
             "hot fixture entry should be resident"
         );
     }
@@ -816,7 +835,11 @@ fn flush_persists_promoted_recency_for_the_next_session() {
         // `b` was inserted later, so by insert seq it is the most recent. Promote
         // `a` interactively, then flush: the recency sweep must re-persist `a`
         // with its promoted seq so the NEXT session sees `a` as most recent.
-        assert!(cache.get("a@1.0.0::default").is_some());
+        assert!(
+            cache
+                .get_with_result_freshness("a@1.0.0::default")
+                .is_some()
+        );
         cache
             .flush_to_disk()
             .expect("second flush persists the promotion");

@@ -42,10 +42,10 @@ fn import_cache_returns_cache_hit_clone_without_mutating_stored_value() {
     cache.insert("react@18.3.1::default".to_owned(), result("react", false));
 
     let first = cache
-        .get("react@18.3.1::default")
+        .get_for_prewarm("react@18.3.1::default")
         .expect("cache entry should exist");
     let second = cache
-        .get("react@18.3.1::default")
+        .get_for_prewarm("react@18.3.1::default")
         .expect("cache entry should still exist");
 
     assert!(first.cache_hit);
@@ -61,7 +61,7 @@ fn import_cache_serves_memory_hits_when_disk_cache_is_disabled() {
     // disk byte budget or recents queue.
     assert!(
         cache
-            .get("react@18.3.1::default")
+            .get_for_prewarm("react@18.3.1::default")
             .expect("cache entry should exist")
             .cache_hit
     );
@@ -78,8 +78,12 @@ fn import_cache_invalidates_package_prefixes() {
 
     cache.invalidate_packages(&std::collections::HashSet::from(["react".to_owned()]));
 
-    assert!(cache.get("react@18.3.1::default").is_none());
-    assert!(cache.get("lodash-es@4.17.21::debounce").is_some());
+    assert!(cache.get_for_prewarm("react@18.3.1::default").is_none());
+    assert!(
+        cache
+            .get_for_prewarm("lodash-es@4.17.21::debounce")
+            .is_some()
+    );
 }
 
 #[test]
@@ -116,13 +120,13 @@ fn import_cache_purge_orphan_entries_removes_uninstalled_package_entries() {
 
     // Paths still exist -> not an orphan -> survives the purge.
     cache.purge_orphan_entries(ANALYZER_VERSION);
-    assert!(cache.get(&key).is_some());
+    assert!(cache.get_for_prewarm(&key).is_some());
 
     // Uninstall the package -> its resolved paths are gone -> orphan -> purged.
     fs::remove_dir_all(&package_root).expect("uninstall package");
     cache.purge_orphan_entries(ANALYZER_VERSION);
     assert!(
-        cache.get(&key).is_none(),
+        cache.get_for_prewarm(&key).is_none(),
         "orphan entry for an uninstalled package should be purged"
     );
 
@@ -165,12 +169,12 @@ fn import_cache_purge_orphan_entries_drops_disk_entries_on_version_mismatch() {
 
     // Live paths + current analyzer version -> survives the disk + memory scan.
     cache.purge_orphan_entries(ANALYZER_VERSION);
-    assert!(cache.get(&key).is_some());
+    assert!(cache.get_for_prewarm(&key).is_some());
 
     // A different analyzer version marks every current entry as release-stale.
     cache.purge_orphan_entries("some-other-analyzer-version");
     assert!(
-        cache.get(&key).is_none(),
+        cache.get_for_prewarm(&key).is_none(),
         "stale-analyzer-version entry should be purged from disk and memory"
     );
 
@@ -202,9 +206,13 @@ fn import_cache_invalidates_multiple_packages_in_one_pass() {
     let packages = std::collections::HashSet::from(["react".to_owned(), "vue".to_owned()]);
     cache.invalidate_packages(&packages);
 
-    assert!(cache.get("react@18.3.1::default").is_none());
-    assert!(cache.get("vue@3.4.0::ref").is_none());
-    assert!(cache.get("lodash-es@4.17.21::debounce").is_some());
+    assert!(cache.get_for_prewarm("react@18.3.1::default").is_none());
+    assert!(cache.get_for_prewarm("vue@3.4.0::ref").is_none());
+    assert!(
+        cache
+            .get_for_prewarm("lodash-es@4.17.21::debounce")
+            .is_some()
+    );
 }
 
 #[test]
@@ -226,10 +234,22 @@ fn import_cache_invalidates_subpath_entries() {
 
     cache.invalidate_packages(&std::collections::HashSet::from(["svelte".to_owned()]));
 
-    assert!(cache.get("svelte@5.0.0::*").is_none());
-    assert!(cache.get("svelte/transition@5.0.0::fade").is_none());
-    assert!(cache.get("svelte/store@5.0.0::writable").is_none());
-    assert!(cache.get("lodash-es@4.17.21::debounce").is_some());
+    assert!(cache.get_for_prewarm("svelte@5.0.0::*").is_none());
+    assert!(
+        cache
+            .get_for_prewarm("svelte/transition@5.0.0::fade")
+            .is_none()
+    );
+    assert!(
+        cache
+            .get_for_prewarm("svelte/store@5.0.0::writable")
+            .is_none()
+    );
+    assert!(
+        cache
+            .get_for_prewarm("lodash-es@4.17.21::debounce")
+            .is_some()
+    );
 }
 
 #[test]
@@ -255,14 +275,14 @@ fn cache_hit_skips_fingerprint_restat_until_generation_bumps() {
     // re-stat is skipped, so the (now stale) entry still serves.
     std::fs::remove_file(&dep).expect("delete dep");
     assert!(
-        cache.get("v3:aa").is_some(),
+        cache.get_for_prewarm("v3:aa").is_some(),
         "should serve without re-stat inside the same generation"
     );
 
     // A generation bump forces a re-verify, which observes the missing file.
     bump_cache_generation();
     assert!(
-        cache.get("v3:aa").is_none(),
+        cache.get_for_prewarm("v3:aa").is_none(),
         "generation bump should force re-verify and evict the stale entry"
     );
 
@@ -353,7 +373,7 @@ fn get_if_fresh_cold_daemon_serves_fresh_but_never_serves_unknown() {
     // still finds+serves it from disk (Unknown → keep), which both proves
     // get_if_fresh left the disk copy intact AND documents the exact laundering — a
     // `cache_hit` on an unverified value — that the force-fresh path must avoid.
-    let laundered = cold.get("v3:unknown");
+    let laundered = cold.get_for_prewarm("v3:unknown");
     assert!(
         laundered.as_ref().is_some_and(|hit| hit.cache_hit),
         "the normal get keeps+serves Unknown unchanged; get_if_fresh must not delete it: {laundered:?}"
@@ -364,9 +384,9 @@ fn get_if_fresh_cold_daemon_serves_fresh_but_never_serves_unknown() {
 }
 
 #[test]
-fn disk_hydration_interactive_get_promotes_recency() {
+fn disk_hydration_interactive_read_promotes_recency() {
     // Finding 10b / §3.2: a memory miss + disk hit must promote recency for an
-    // INTERACTIVE `get` (the disk-hydrated entry is about to be the working
+    // INTERACTIVE read (the disk-hydrated entry is about to be the working
     // set's most-recently-used one), but must leave the persisted `last_seq`
     // alone for non-promoting reads (prewarm / force-fresh) — otherwise a
     // just-accessed rehydrated entry stays a prime eviction victim.
@@ -412,7 +432,7 @@ fn disk_hydration_interactive_get_promotes_recency() {
     );
 
     // INTERACTIVE (promoting) disk-hydration hit.
-    assert!(cold.get(interactive_key).is_some());
+    assert!(cold.get_with_result_freshness(interactive_key).is_some());
     // Non-promoting disk-hydration hits — controls (must NOT regress C2/B4b).
     assert!(cold.get_for_prewarm(prewarm_key).is_some());
     assert!(cold.get_if_fresh(forcefresh_key).is_some());

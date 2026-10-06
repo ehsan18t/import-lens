@@ -220,13 +220,9 @@ impl DiskCache {
         self.db_read().is_some()
     }
 
-    pub fn get(&self, key: &str) -> Option<CachedImport> {
-        self.get_entry(key).map(|(cached, _)| cached)
-    }
-
-    /// Like `get`, but also reports the `Freshness` the entry was served under
-    /// (`Fresh` or `Unknown`; `Stale`/`Gone` evict), so a caller mirroring it into
-    /// memory does not stamp an `Unknown` entry as verified.
+    /// Reads an entry with the `Freshness` it was served under (`Fresh` or `Unknown`;
+    /// `Stale`/`Gone` evict), so a caller mirroring it into memory does not stamp an
+    /// `Unknown` entry as verified.
     pub fn get_with_freshness(
         &self,
         key: &str,
@@ -1712,7 +1708,9 @@ mod tests {
             .expect("enqueue stale-generation insert");
         disk.flush_pending_inserts();
         assert!(
-            disk.get("v4:react").is_none(),
+            disk.get_with_freshness("v4:react")
+                .map(|(cached, _)| cached)
+                .is_none(),
             "a pre-clear (stale-generation) insert must not resurrect a cleared shard (RB-3)"
         );
 
@@ -1722,7 +1720,9 @@ mod tests {
             .expect("enqueue current-generation insert");
         disk.flush_pending_inserts();
         assert!(
-            disk.get("v4:react").is_some(),
+            disk.get_with_freshness("v4:react")
+                .map(|(cached, _)| cached)
+                .is_some(),
             "a post-clear insert with the current generation persists as normal"
         );
 
@@ -1770,7 +1770,9 @@ mod tests {
             .expect("the write gate refuses it, and refusing is not an error");
         disk.flush_pending_inserts();
         assert!(
-            disk.get("v4:react:degraded").is_none(),
+            disk.get_with_freshness("v4:react:degraded")
+                .map(|(cached, _)| cached)
+                .is_none(),
             "premise: the write gate already holds"
         );
 
@@ -1779,11 +1781,15 @@ mod tests {
         disk.flush_pending_inserts();
 
         assert!(
-            disk.get("v4:react:legacy").is_none(),
+            disk.get_with_freshness("v4:react:legacy")
+                .map(|(cached, _)| cached)
+                .is_none(),
             "a non-durable row already on disk must be refused on READ, not served and re-promoted"
         );
         assert!(
-            disk.get("v4:react:legacy").is_none(),
+            disk.get_with_freshness("v4:react:legacy")
+                .map(|(cached, _)| cached)
+                .is_none(),
             "and evicted, so the next read does not pay to decode it again"
         );
 
@@ -1792,7 +1798,9 @@ mod tests {
             .expect("write a healthy row");
         disk.flush_pending_inserts();
         assert!(
-            disk.get("v4:react:healthy").is_some(),
+            disk.get_with_freshness("v4:react:healthy")
+                .map(|(cached, _)| cached)
+                .is_some(),
             "a durable row must still hydrate"
         );
 
@@ -1819,7 +1827,9 @@ mod tests {
             .expect("refusing an unverifiable write is not an error");
         disk.flush_pending_inserts();
         assert!(
-            disk.get("v4:asset:current").is_none(),
+            disk.get_with_freshness("v4:asset:current")
+                .map(|(cached, _)| cached)
+                .is_none(),
             "the L2 write boundary must keep no request-local observation"
         );
 
@@ -1827,7 +1837,9 @@ mod tests {
             .expect("simulate a pre-fix row");
         disk.flush_pending_inserts();
         assert!(
-            disk.get("v4:asset:legacy").is_none(),
+            disk.get_with_freshness("v4:asset:legacy")
+                .map(|(cached, _)| cached)
+                .is_none(),
             "the L2 read boundary must evict a pre-fix unverifiable observation"
         );
 
@@ -1864,11 +1876,15 @@ mod tests {
         );
         assert!(disk.pending_inserts.lock().unwrap().len() <= MAX_PENDING_INSERTS);
         assert!(
-            disk.get(&key(inserted - 1)).is_some(),
+            disk.get_with_freshness(&key(inserted - 1))
+                .map(|(cached, _)| cached)
+                .is_some(),
             "the newest entries stay queued"
         );
         assert!(
-            disk.get(&key(0)).is_none(),
+            disk.get_with_freshness(&key(0))
+                .map(|(cached, _)| cached)
+                .is_none(),
             "the least recently used are shed"
         );
 
@@ -1876,7 +1892,9 @@ mod tests {
         disk.flush_pending_inserts();
         assert!(disk.pending_inserts.lock().unwrap().is_empty());
         assert!(
-            disk.get(&key(inserted - 1)).is_some(),
+            disk.get_with_freshness(&key(inserted - 1))
+                .map(|(cached, _)| cached)
+                .is_some(),
             "a recovered disk persists the queue"
         );
 

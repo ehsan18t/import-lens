@@ -137,7 +137,11 @@ fn a_shard_without_its_disk_keeps_its_memory_and_retries_the_open() {
         Arc::ptr_eq(&degraded, &next_request),
         "every request must share the degraded shard's memory layer"
     );
-    assert!(next_request.get("react@18.3.1::default").is_some());
+    assert!(
+        next_request
+            .get_for_prewarm("react@18.3.1::default")
+            .is_some()
+    );
 
     drop(held);
     assert!(
@@ -159,7 +163,7 @@ fn a_shard_without_its_disk_keeps_its_memory_and_retries_the_open() {
         shard_dir.join(SHARD_METADATA_FILE_NAME).exists(),
         "a healed shard is listed again"
     );
-    assert!(healed.get("react@18.3.1::default").is_some());
+    assert!(healed.get_for_prewarm("react@18.3.1::default").is_some());
 
     // What the shard measured while its disk was missing is persisted once the disk is back.
     drop((degraded, next_request, healed, registry));

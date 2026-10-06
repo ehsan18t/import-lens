@@ -112,7 +112,9 @@ fn compaction_shrinks_the_file_after_heavy_eviction() {
     // non-evicted entry must still decode and serve.
     for key in &all_keys[950..] {
         assert!(
-            disk.get(key).is_some(),
+            disk.get_with_freshness(key)
+                .map(|(cached, _)| cached)
+                .is_some(),
             "entry {key} must survive compaction intact"
         );
     }
@@ -147,7 +149,11 @@ fn compaction_is_gated_on_shard_idleness() {
     // analyzing it. A fragmented BUT actively-used shard must NOT be compacted:
     // Database::compact holds the exclusive lock across the whole rewrite, which
     // would block the user's concurrent gets.
-    assert!(disk.get(&all_keys[950]).is_some());
+    assert!(
+        disk.get_with_freshness(&all_keys[950])
+            .map(|(cached, _)| cached)
+            .is_some()
+    );
     assert!(
         !disk.compact_if_fragmented(COMPACT_THRESHOLD),
         "a fragmented but recently-accessed shard must not be compacted"
@@ -174,7 +180,9 @@ fn compaction_is_gated_on_shard_idleness() {
     // Compaction must not drop surviving data.
     for key in &all_keys[950..] {
         assert!(
-            disk.get(key).is_some(),
+            disk.get_with_freshness(key)
+                .map(|(cached, _)| cached)
+                .is_some(),
             "entry {key} must survive compaction intact"
         );
     }

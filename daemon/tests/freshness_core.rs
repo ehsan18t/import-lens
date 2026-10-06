@@ -92,7 +92,7 @@ fn insert_at_captured_generation_does_not_serve_stale_after_bump() {
     // The entry was stamped with the OLD generation, so get() must re-verify and
     // (because the file changed) must NOT serve the stale v1 result.
     assert!(
-        cache.get("v3:d4").is_none(),
+        cache.get_for_prewarm("v3:d4").is_none(),
         "captured-generation insert must not launder a stale result as fresh"
     );
 
@@ -112,13 +112,19 @@ fn get_evicts_on_changed_or_missing_but_keeps_on_fresh() {
     bump_cache_generation(); // force the slow path (re-verify) on next get
 
     // Fresh → served.
-    assert!(cache.get("v3:ts").is_some(), "unchanged dep should serve");
+    assert!(
+        cache.get_for_prewarm("v3:ts").is_some(),
+        "unchanged dep should serve"
+    );
 
     // Changed → evicted. (Different LENGTH so detection is robust even if two
     // writes land within NTFS mtime resolution — these fingerprints carry no hash.)
     fs::write(&dep, "export const x = 222;").expect("change");
     bump_cache_generation();
-    assert!(cache.get("v3:ts").is_none(), "changed dep should evict");
+    assert!(
+        cache.get_for_prewarm("v3:ts").is_none(),
+        "changed dep should evict"
+    );
 
     fs::remove_dir_all(dir).ok();
 }
@@ -163,7 +169,7 @@ fn disk_hydrated_entry_evicts_when_dependency_content_changes() {
     let cache = ImportCache::new_with_recent_preload_limit(Some(storage_dir.clone()), true, 0);
     assert_eq!(cache.memory_len(), 0);
     assert!(
-        cache.get(&key).is_none(),
+        cache.get_for_prewarm(&key).is_none(),
         "disk-hydrated entry with a changed (Stale) dependency must evict, not serve"
     );
 
@@ -191,7 +197,7 @@ fn disk_hydrated_entry_evicts_when_dependency_is_deleted() {
     let cache = ImportCache::new_with_recent_preload_limit(Some(storage_dir.clone()), true, 0);
     assert_eq!(cache.memory_len(), 0);
     assert!(
-        cache.get(&key).is_none(),
+        cache.get_for_prewarm(&key).is_none(),
         "disk-hydrated entry whose dependency is Gone must evict, not serve"
     );
 
@@ -215,7 +221,7 @@ fn fresh_insert_serves_on_fast_path_within_ttl() {
     // dep out of band still serves (this is the intended TTL behavior).
     fs::remove_file(&dep).expect("rm");
     assert!(
-        cache.get("v3:ttl").is_some(),
+        cache.get_for_prewarm("v3:ttl").is_some(),
         "fast path within TTL serves without re-stat"
     );
 
@@ -273,7 +279,7 @@ fn first_party_entry_is_reverified_on_get_within_ttl() {
     fs::write(&dep, "export const v = 22222;").expect("dep v2");
 
     assert!(
-        cache.get(&key).is_none(),
+        cache.get_for_prewarm(&key).is_none(),
         "first-party dep change must be re-verified on get (fast-path bypass), not served stale"
     );
 
@@ -365,7 +371,9 @@ fn pending_unflushed_disk_insert_evicts_when_dependency_content_changes() {
 
     // Still queued (unflushed): read-your-writes resolves via pending_insert_entry.
     assert!(
-        disk.get(key).is_some(),
+        disk.get_with_freshness(key)
+            .map(|(cached, _)| cached)
+            .is_some(),
         "a fresh queued insert should resolve through the pending path"
     );
 
@@ -373,7 +381,9 @@ fn pending_unflushed_disk_insert_evicts_when_dependency_content_changes() {
     // next pending-path lookup must classify Stale and evict.
     fs::write(&dep, "export const x = 222;").expect("change dep");
     assert!(
-        disk.get(key).is_none(),
+        disk.get_with_freshness(key)
+            .map(|(cached, _)| cached)
+            .is_none(),
         "queued (unflushed) entry with a Stale dependency must evict, not serve"
     );
 
@@ -396,13 +406,17 @@ fn pending_unflushed_disk_insert_evicts_when_dependency_is_deleted() {
         .expect("queue insert");
 
     assert!(
-        disk.get(key).is_some(),
+        disk.get_with_freshness(key)
+            .map(|(cached, _)| cached)
+            .is_some(),
         "a fresh queued insert should resolve through the pending path"
     );
 
     fs::remove_file(&dep).expect("delete dep");
     assert!(
-        disk.get(key).is_none(),
+        disk.get_with_freshness(key)
+            .map(|(cached, _)| cached)
+            .is_none(),
         "queued (unflushed) entry whose dependency is Gone must evict, not serve"
     );
 

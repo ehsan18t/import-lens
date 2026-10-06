@@ -3038,7 +3038,7 @@ mod analyze_and_cache_single_flight_tests {
         assert_eq!(leader_result.result, cacheable_result("pkg-flight"));
         assert_eq!(follower_result, cacheable_result("pkg-flight"));
         assert!(
-            cache.get(&key).is_some(),
+            cache.get_for_prewarm(&key).is_some(),
             "a follower with should_store=true must keep its cache write even when the leader did not store",
         );
     }
@@ -3157,7 +3157,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
 
             cache.insert(key.clone(), result);
             assert!(
-                cache.get(&key).is_none(),
+                cache.get_for_prewarm(&key).is_none(),
                 "`{stage}` says nothing about the package's bytes; the L1 store must keep nothing"
             );
         }
@@ -3189,7 +3189,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
 
             cache.insert(key.clone(), result);
             assert!(
-                cache.get(&key).is_none(),
+                cache.get_for_prewarm(&key).is_none(),
                 "`{stage}`: real sizes, but a tree-shaking verdict that is a scheduling accident"
             );
         }
@@ -3219,7 +3219,9 @@ mod every_durable_store_rejects_a_non_durable_outcome {
             disk.flush_pending_inserts();
 
             assert!(
-                disk.get(&key).is_none(),
+                disk.get_with_freshness(&key)
+                    .map(|(cached, _)| cached)
+                    .is_none(),
                 "`{stage}`: L2 outlives the process; a scheduling accident must not"
             );
         }
@@ -3235,7 +3237,9 @@ mod every_durable_store_rejects_a_non_durable_outcome {
             .expect("enqueue a deterministic failure");
         disk.flush_pending_inserts();
         assert!(
-            disk.get("v4:broken-lib:parse").is_some(),
+            disk.get_with_freshness("v4:broken-lib:parse")
+                .map(|(cached, _)| cached)
+                .is_some(),
             "a deterministic failure is a fact about the package and IS persisted (invariant 3)"
         );
 
@@ -3345,7 +3349,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
 
             cache.insert_with_fingerprints(key.clone(), result, Vec::<FileFingerprint>::new());
             assert!(
-                cache.get(&key).is_some(),
+                cache.get_for_prewarm(&key).is_some(),
                 "`{stage}` will happen again next time; withholding it buys a rebuild and no \
                  correctness"
             );

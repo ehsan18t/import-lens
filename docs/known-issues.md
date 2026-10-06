@@ -372,14 +372,6 @@ resolve, and a generation bump on tsconfig edits.
 bundle. Answering this means building that union model. It is the highest-value idea absent from the design,
 and it must be a deliberate decision, not smuggled in as a bug fix.
 
-### T1: Three cache reads exist only for tests
-**Status: Deferred** · No user impact · Found in the 2026-10-06 regression review
-
-`ImportCache::get` (a serving read that promotes recency), `ImportCache::memory_len` and `DiskCache::get` have no production caller. Production reads go through `get_if_fresh_and_promote`, `get_if_fresh`, `get_with_result_freshness` and `get_for_prewarm`, so the `Serve { promote: true }` read policy that about 150 test call sites exercise is one the daemon never ships, which breaks the rule that tests use production entry points.
-
-**Why it is not fixed now:** removing them means rewriting those call sites across six test files onto the production reads, and choosing per test which production policy it meant to assert. That is test churn with no effect on the product, deferred until the cache tests are next reworked.
-**What would fix it:** delete the three methods and move each test to the production read whose policy it is asserting.
-
 ### C7: The engine-permit scheduling model is a repeat source of nondeterminism
 **Status: Watch** · Design-health watch. Becomes a redesign task if a THIRD genuine code-level race appears here.
 
