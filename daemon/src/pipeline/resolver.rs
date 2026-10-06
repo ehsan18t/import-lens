@@ -7,7 +7,6 @@ use oxc_resolver::{
 use serde_json::Value;
 use std::{
     cell::OnceCell,
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, RwLock},
@@ -828,31 +827,12 @@ fn resolve_file_candidate(candidate: &Path) -> Result<PathBuf, String> {
     Ok(found_path)
 }
 
-/// A cap on the alias-config-graph memo, keyed by every nearest-config path ever asked about
-/// (unbounded in a monorepo with a `tsconfig.json` per package). Overflow clears the map: it holds
-/// path lists, not measurements, so a miss costs one re-walk of the `references` graph.
-const MAX_MEMOIZED_ALIAS_CONFIG_GRAPHS: usize = 64;
-
 /// The runtime resolvers for installed packages, sharing one `oxc_resolver` FS cache across
 /// requests (Component and Client use identical options, so they share a resolver; Server has its
 /// own).
 pub struct ResolverSet {
     browser: Resolver,
     server: Resolver,
-    /// The `references` graph reachable from a nearest `tsconfig.json` / `jsconfig.json`: config
-    /// paths only, memoized per nearest-config path.
-    ///
-    /// **The walk is memoized, not the filesystem.** It holds only paths; the resolvers built from
-    /// them live for one request ([`ResolverSet::alias_resolvers`], [`FirstPartySourceProbe`]),
-    /// because a resolver that outlives a request memoizes a miss that nothing lifts.
-    ///
-    /// Each alias resolver must also hold its own oxc FS cache: oxc memoizes a manually configured
-    /// tsconfig in one slot (the cache entry for `/`) whatever the config path, so two configs
-    /// sharing a cache would answer with whichever loaded first.
-    ///
-    /// The map dies with the `ResolverSet` on [`invalidate_shared_resolvers`], which is what makes
-    /// a `tsconfig.json` edit take effect (FR-027a).
-    alias_config_graphs: RwLock<HashMap<PathBuf, Arc<Vec<PathBuf>>>>,
 }
 
 impl ResolverSet {
@@ -861,11 +841,7 @@ impl ResolverSet {
         // clone_with_options shares the same Arc<Cache>, so all runtimes reuse
         // one set of memoized (option-independent) filesystem facts.
         let server = browser.clone_with_options(resolve_options(ImportRuntime::Server));
-        Self {
-            browser,
-            server,
-            alias_config_graphs: RwLock::new(HashMap::new()),
-        }
+        Self { browser, server }
     }
 
     pub fn resolver(&self, runtime: ImportRuntime) -> &Resolver {
@@ -883,6 +859,15 @@ impl ResolverSet {
     ///
     /// Built fresh once per request ([`FirstPartySourceProbe`] owns them for one response): longer
     /// would cache a miss, per specifier would cost a resolver and a JSONC parse per config each.
+    ///
+    /// **The `references` walk is not memoized either.** A memo would go stale on an edit no
+    /// watcher reports (a referenced config outside the workspace folder, or one created after the
+    /// walk dropped it as missing), and the walk is cheap beside the resolvers built from it: about
+    /// 0.13 ms for three configs against about 2 ms for the probe (release build, Windows).
+    ///
+    /// Each alias resolver holds its own oxc FS cache: oxc memoizes a manually configured tsconfig
+    /// in one slot (the cache entry for `/`) whatever the config path, so two configs sharing a
+    /// cache would answer with whichever loaded first.
     fn alias_resolvers(
         &self,
         workspace_root: &Path,
@@ -891,32 +876,11 @@ impl ResolverSet {
         let config_file = find_workspace_config(workspace_root, active_document_path)?;
 
         Some(
-            self.alias_config_graph(&config_file)
+            reachable_alias_configs(&config_file)
                 .iter()
                 .map(|config| Resolver::new(alias_resolve_options(config)))
                 .collect(),
         )
-    }
-
-    /// The memoized `references` walk for one nearest-config path.
-    fn alias_config_graph(&self, config_file: &Path) -> Arc<Vec<PathBuf>> {
-        if let Ok(memo) = self.alias_config_graphs.read()
-            && let Some(configs) = memo.get(config_file)
-        {
-            return Arc::clone(configs);
-        }
-
-        let configs = Arc::new(reachable_alias_configs(config_file));
-        if let Ok(mut memo) = self.alias_config_graphs.write() {
-            if memo.len() >= MAX_MEMOIZED_ALIAS_CONFIG_GRAPHS {
-                memo.clear();
-            }
-            return Arc::clone(
-                memo.entry(config_file.to_path_buf())
-                    .or_insert_with(|| Arc::clone(&configs)),
-            );
-        }
-        configs
     }
 }
 
@@ -1477,7 +1441,7 @@ mod tests {
     /// **The floor is not sticky.** An import written before the file it points at is a floor, and
     /// creating that file must lift it on the next request with no restart and no invalidation
     /// message. `oxc_resolver` negative-caches a missing path, so the alias resolvers must not
-    /// outlive a request; only the `references` walk is memoized.
+    /// outlive a request.
     #[test]
     fn creating_the_alias_target_lifts_the_floor_without_an_invalidation() {
         let fixture = ConfigFixture::new("sticky-floor");
@@ -1503,6 +1467,39 @@ mod tests {
             "creating the alias target must lift the floor. It did not: the miss was cached in the \
              memoized resolver's filesystem cache, so the file stayed a floor for the daemon's life \
              - never cached, never persisted, and refused a verdict by `importlens check`"
+        );
+    }
+
+    /// **The `references` graph is not sticky either.** A referenced project that did not exist at
+    /// the first walk is dropped from it, and creating it fires no watcher event when it sits
+    /// outside the workspace folder, so the next request must walk again.
+    #[test]
+    fn creating_a_referenced_project_lifts_the_floor_without_an_invalidation() {
+        let fixture = ConfigFixture::new("sticky-references");
+        fixture.write(
+            "tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./tsconfig.app.json"}]}"#,
+        );
+        fixture.write(
+            "src/components.ts",
+            "export const Button = 1;
+",
+        );
+        let document = fixture.root.join("src").join("index.ts");
+
+        assert!(
+            !resolves_to_first_party_source(&fixture.root, &document, "@app/components"),
+            "test setup: the project declaring the alias does not exist yet"
+        );
+
+        fixture.write(
+            "tsconfig.app.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@app/*":["src/*"]}}}"#,
+        );
+
+        assert!(
+            resolves_to_first_party_source(&fixture.root, &document, "@app/components"),
+            "the referenced project now exists and maps the alias to first-party source"
         );
     }
 

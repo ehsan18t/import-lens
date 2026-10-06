@@ -507,8 +507,9 @@ invent a number) or bounded behaviours we chose. Revisit only if the blast radiu
 
 ## Path aliases
 
-All four degrade to a **floor** (the file's total is flagged incomplete, is not cached, and `importlens check`
-declines to judge it). A floor is conservative: it is never a wrong number. That is why none of them is fixed.
+A1, A2 and A4 degrade to a **floor** (the file's total is flagged incomplete, is not cached, and `importlens
+check` declines to judge it); A3 errs the other way and flags nothing. Neither direction invents a number. That
+is why none of them is fixed.
 
 ### A1: An alias declared only in a Vite, webpack, or Rollup config is not seen
 **Status: Accepted** · The only one with real-world reach
@@ -537,12 +538,10 @@ This is the price of making the answer document-independent, which is what fixed
 `.astro` breakage: asking "which project owns this document?" is exactly the question that kept producing
 regressions. It errs toward "flag nothing" and cannot invent a number.
 
-### A4: A tsconfig edited while the VS Code watcher is not running is not seen
+### A4: A file total can keep an old alias classification for up to 30 seconds
 **Status: Accepted**
 
-Alias-table invalidation rides the extension's file watcher. A tsconfig changed outside a running VS Code
-session is stale until the daemon restarts. `importlens check` is unaffected: the CLI spawns a fresh daemon per
-run.
+The alias tables and their `references` graph are re-read on every request, so a `tsconfig.json` or `jsconfig.json` edit is seen on the next analysis whether or not the VS Code watcher reported it. The L1 file-total cache keys on the import classification (`path_alias` versus `not_installed`) and lives for 30 seconds, so an edit the watcher did not report (a referenced config outside the workspace folder) can leave a file total classified the old way until that entry expires. `importlens check` is unaffected: the CLI spawns a fresh daemon per run.
 
 ## Engine and concurrency
 

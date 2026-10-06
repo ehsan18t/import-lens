@@ -871,7 +871,7 @@ impl ImportLensService {
         //
         // It must not outlive this response: a surviving `Resolver` memoizes the filesystem, and
         // a memoized miss would keep an import written before its target file a floor for the
-        // daemon's life (`ResolverSet::alias_config_graphs`). It is keyed on the workspace, not
+        // daemon's life. It is keyed on the workspace, not
         // the document, so the answer does not depend on the importing file's extension.
         let first_party =
             FirstPartySourceProbe::new(&context.workspace_root, &context.active_document_path);
