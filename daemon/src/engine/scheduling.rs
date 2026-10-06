@@ -29,7 +29,9 @@ where
     R: Send,
     F: Fn(usize, &T) -> (usize, R) + Sync,
 {
-    if items.len() <= 1 {
+    // Never inline on a rayon worker: a build's `rayon::join` there can steal a job that joins
+    // this item's single-flight as a follower, nested under its own leader, which deadlocks.
+    if items.len() <= 1 && rayon::current_thread_index().is_none() {
         return items
             .iter()
             .enumerate()
