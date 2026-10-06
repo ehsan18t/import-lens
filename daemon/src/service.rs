@@ -1806,7 +1806,7 @@ impl ImportLensService {
         }
 
         // An in-flight analysis that captured the pre-clear generation must not repopulate the
-        // store as fresh: its insert lands `verified_generation < current` and re-validates.
+        // store as fresh: its insert lands a verification generation behind the current one and re-validates.
         crate::cache::memory::bump_cache_generation();
 
         CacheRemoveResponse {
@@ -3117,8 +3117,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         CachedImport {
             result,
             dependency_fingerprints: Vec::new(),
-            verified_generation: 0,
-            verified_at: None,
+            verification: crate::cache::memory::Verification::never(),
             first_party: false,
             last_seq: Arc::new(AtomicU64::new(1)),
             persisted_seq: Arc::new(AtomicU64::new(1)),

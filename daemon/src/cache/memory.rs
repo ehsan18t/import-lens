@@ -75,16 +75,58 @@ pub fn cache_generation() -> u64 {
     current_cache_generation()
 }
 
+/// When an entry's fingerprints were last confirmed current: the cache generation and a monotonic
+/// timestamp. A fresh decode from disk is never-verified, so its next read re-verifies. Monotonic
+/// so a backward clock jump cannot extend the window.
+#[derive(Debug, Default)]
+pub struct Verification {
+    generation: AtomicU64,
+    /// Milliseconds since [`verification_epoch`], plus one; 0 means never verified.
+    at_millis: AtomicU64,
+}
+
+fn verification_epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+impl Verification {
+    pub fn never() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn verified_now(generation: u64) -> Arc<Self> {
+        let verification = Self::default();
+        verification.stamp(generation);
+        Arc::new(verification)
+    }
+
+    fn stamp(&self, generation: u64) {
+        let since_epoch = verification_epoch().elapsed().as_millis() as u64;
+        self.generation.store(generation, Ordering::Relaxed);
+        self.at_millis
+            .store(since_epoch.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// Verified under `generation` within [`REVERIFY_TTL`].
+    fn is_current(&self, generation: u64) -> bool {
+        let at_millis = self.at_millis.load(Ordering::Relaxed);
+        if at_millis == 0 || self.generation.load(Ordering::Relaxed) != generation {
+            return false;
+        }
+        let since_epoch = verification_epoch().elapsed().as_millis() as u64;
+        since_epoch.saturating_sub(at_millis - 1) < REVERIFY_TTL.as_millis() as u64
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedImport {
     pub result: ImportResult,
     pub dependency_fingerprints: Vec<FileFingerprint>,
-    // Runtime verification state (not persisted): the generation and monotonic
-    // instant at which this entry's fingerprints were last confirmed current.
-    pub verified_generation: u64,
-    // `None` = never verified this run (fresh decode from disk): the next read
-    // re-verifies. Monotonic so a backward clock jump cannot extend the window.
-    pub verified_at: Option<Instant>,
+    // Runtime verification state (not persisted). Shared via Arc like `last_seq`, so a hit
+    // restamps the entry in place: a copy-on-write restamp re-allocates the whole entry on the
+    // thread that served the hit, scattering the cache across every thread's heap.
+    pub verification: Arc<Verification>,
     // Recency sequence of the last interactive hit; drives LRU eviction for both
     // the memory working set and the disk byte budget. Shared via Arc so a hit
     // bumps it in place; persisted as a plain `u64` at flush time.
@@ -306,12 +348,8 @@ impl ImportCache {
             // with no generation bump (a watcher-excluded folder) would be served
             // unverified inside the window. First-party deps change without any
             // generation bump, so they always re-verify.
-            let fast_path = !require_fresh
-                && !cached.first_party
-                && cached.verified_generation == generation
-                && cached
-                    .verified_at
-                    .is_some_and(|at| at.elapsed() < REVERIFY_TTL);
+            let fast_path =
+                !require_fresh && !cached.first_party && cached.verification.is_current(generation);
             // Hash-verified per fingerprint, never per entry: a node_modules entry can
             // carry a workspace file that a stylesheet's `url()` reached outside the
             // package root (D18), and that file changes with no generation bump.
@@ -331,16 +369,10 @@ impl ImportCache {
                 Freshness::Fresh if fast_path => {}
                 Freshness::Fresh => {
                     self.clear_unknown(key);
-                    // `update` is a no-op when the key was concurrently removed, so a
-                    // racing invalidation or clear is never resurrected. First-party
-                    // entries never consult the stamps, so they skip the clone.
+                    // In place: a concurrently removed entry is stamped and dropped, never
+                    // resurrected. First-party entries never consult the stamps.
                     if !cached.first_party {
-                        memory.update(key.to_owned(), |entry| {
-                            let mut restamped = entry.clone();
-                            restamped.verified_generation = generation;
-                            restamped.verified_at = Some(Instant::now());
-                            restamped
-                        });
+                        cached.verification.stamp(generation);
                     }
                 }
             }
@@ -359,10 +391,9 @@ impl ImportCache {
         let hydration_generation = current_cache_generation();
         let clear_generation = self.disk.clear_generation();
         // The disk layer evicts Stale/Gone itself, so this is Fresh or Unknown.
-        let (mut cached, freshness) = self.disk.get_with_freshness(key)?;
+        let (cached, freshness) = self.disk.get_with_freshness(key)?;
         if freshness == Freshness::Fresh {
-            cached.verified_generation = hydration_generation;
-            cached.verified_at = Some(Instant::now());
+            cached.verification.stamp(hydration_generation);
             self.clear_unknown(key);
         } else if require_fresh {
             // Kept on disk, but neither served nor hydrated.
@@ -520,8 +551,7 @@ impl ImportCache {
         let cached = CachedImport {
             result,
             dependency_fingerprints,
-            verified_generation,
-            verified_at: Some(Instant::now()),
+            verification: Verification::verified_now(verified_generation),
             last_seq: Arc::new(AtomicU64::new(born_seq)),
             // The disk insert below persists this same seq.
             persisted_seq: Arc::new(AtomicU64::new(born_seq)),
@@ -1274,8 +1304,7 @@ mod tests {
         CachedImport {
             result: minimal_result(specifier),
             dependency_fingerprints: Vec::new(),
-            verified_generation: 0,
-            verified_at: None,
+            verification: crate::cache::memory::Verification::never(),
             last_seq: Arc::new(AtomicU64::new(1)),
             persisted_seq: Arc::new(AtomicU64::new(1)),
             first_party: false,

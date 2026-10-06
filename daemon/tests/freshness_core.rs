@@ -58,8 +58,7 @@ fn cached_import(
     CachedImport {
         result,
         dependency_fingerprints,
-        verified_generation: 0,
-        verified_at: None,
+        verification: import_lens_daemon::cache::memory::Verification::never(),
         first_party: false,
         last_seq: Arc::new(AtomicU64::new(0)),
         persisted_seq: Arc::new(AtomicU64::new(0)),
@@ -268,7 +267,7 @@ fn first_party_entry_is_reverified_on_get_within_ttl() {
     );
 
     let cache = ImportCache::new(None, false);
-    // Stamps the current generation + verified_at=now, so a NON-first-party key would
+    // Stamps the current generation and the current time, so a NON-first-party key would
     // serve on the fast path within TTL. The dep fingerprint is stat-only (no hash),
     // and the change below uses a different length for deterministic detection.
     cache.insert_with_fingerprints(

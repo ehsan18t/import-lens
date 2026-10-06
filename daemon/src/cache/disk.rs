@@ -1544,8 +1544,7 @@ fn decode_cached_result(bytes: &[u8]) -> Option<CachedImport> {
     Some(CachedImport {
         result,
         dependency_fingerprints: envelope.dependency_fingerprints,
-        verified_generation: 0,
-        verified_at: None,
+        verification: crate::cache::memory::Verification::never(),
         first_party: false,
         last_seq: Arc::new(AtomicU64::new(last_seq)),
         persisted_seq: Arc::new(AtomicU64::new(last_seq)),
@@ -1567,8 +1566,7 @@ mod tests {
         CachedImport {
             result,
             dependency_fingerprints: Vec::new(),
-            verified_generation: 0,
-            verified_at: None,
+            verification: crate::cache::memory::Verification::never(),
             first_party: false,
             last_seq: Arc::new(AtomicU64::new(last_seq)),
             persisted_seq: Arc::new(AtomicU64::new(last_seq)),

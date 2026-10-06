@@ -47,8 +47,7 @@ fn cached(specifier: &str) -> CachedImport {
     CachedImport {
         result: result(specifier),
         dependency_fingerprints: Vec::new(),
-        verified_generation: 0,
-        verified_at: None,
+        verification: import_lens_daemon::cache::memory::Verification::never(),
         first_party: false,
         last_seq: Arc::new(AtomicU64::new(1)),
         persisted_seq: Arc::new(AtomicU64::new(1)),
