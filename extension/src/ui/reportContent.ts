@@ -151,7 +151,7 @@ th{font-weight:600;white-space:nowrap}
 <p class="note">${escapeHtml(sharedModuleNote)}</p>
 <div class="table-scroll">
 <table>
-<thead><tr><th>Module</th><th>Imports</th><th>Module Bytes</th><th>${combinedImportCostLabel}</th><th>Specifiers</th><th>Vendored</th><th>Path</th></tr></thead>
+<thead><tr><th>Module</th><th>Imports</th><th>Module Bytes</th><th>${combinedImportCostLabel} (uncompressed)</th><th>Specifiers</th><th>Vendored</th><th>Path</th></tr></thead>
 <tbody>${sharedModules || `<tr><td class="empty" colspan="7">No shared top modules found.</td></tr>`}</tbody>
 </table>
 </div>

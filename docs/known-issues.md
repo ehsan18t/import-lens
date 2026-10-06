@@ -483,25 +483,6 @@ it fails the test.
 **Static analysis is the second line here, not the first.** The real enforcement is that a degraded result has
 no size to misuse: the size fields are `Option`, and the durability gate lives inside each store.
 
-### G3: The workspace report reuses the "Combined Import Cost" header for a compressed and an uncompressed column
-**Status: Accepted** · Each figure is correct; only the shared label spans two bases · Found in the 2026-07-16 module audit (E4)
-
-The exported workspace report (`extension/src/ui/reportContent.ts`) prints three figures under the "Combined
-Import Cost" label: the headline and the Duplicate Imports column render `combinedImportCostBrotliBytes`
-(compressed, brotli), while the Shared Modules column renders `combinedImportCostBytes`
-(`DuplicateModuleGroup.combinedImportCostBytes`, `ipc/protocol.ts:641-642`), which is rendered, uncompressed
-bytes. So one header names a compressed figure in two tables and an uncompressed one in the third.
-
-**What actually happens.** Every individual number is correct for the quantity it represents (the shared-module
-figure genuinely is the uncompressed per-site upper bound), and that basis is disclosed verbatim by the note
-printed directly above the table ("It is an upper bound, never a size. Rendered (uncompressed) bytes."). The
-only harm is a reader who ignores the note and cross-reads the identically-headed columns between tables, a
-label and presentation ambiguity, never a wrong number, wedge, or stale read.
-
-**Why it is not fixed:** presentation-only (a pure HTML render), and the basis is disclosed inline.
-**What would fix it:** give the Shared Modules column its own basis-explicit header (for example "Rendered
-(uncompressed)") instead of reusing the compressed "Combined Import Cost" label.
-
 ### G4: Changing the compression format does not re-render the status-bar size until the next edit
 **Status: Accepted** · Stale but correctly labelled, never a wrong number · Found in the 2026-07-16 module audit (E7)
 

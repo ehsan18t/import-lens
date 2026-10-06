@@ -118,7 +118,11 @@ test("the shared-modules table gives the module its own size and never calls the
     /<td>index\.js<\/td><td>3<\/td><td>100\.0 kB<\/td><td>300\.0 kB<\/td>/u,
     "the module is 100 kB, reached by 3 imports, and the 300 kB is the sum across those sites",
   );
-  assert.match(html, /<th>Module Bytes<\/th><th>Combined Import Cost<\/th>/u);
+  assert.match(
+    html,
+    /<th>Module Bytes<\/th><th>Combined Import Cost \(uncompressed\)<\/th>/u,
+    "the headline and duplicate-imports column are brotli; this column is rendered bytes, and its header must not read the same",
+  );
   assert.match(
     html,
     /reached by more than one import/u,
