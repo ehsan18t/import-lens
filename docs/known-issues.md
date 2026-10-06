@@ -163,8 +163,9 @@ A stylesheet's `@import` children are never graph modules, so none of the engine
 Lightning CSS recurses per `@import`, and a deep enough chain overflows the stack, which is NOT catchable: the
 process dies rather than the import failing. One attempt is therefore bounded to 256 files and 8 MB, inside the
 AC-03 build-wide 512-read/16 MiB ledger. A production union that consumes the per-attempt limit can exhaust that
-shared ledger during retry and end as the typed `module_graph_limit`; the unbounded processor helper still
-exercises raw/per-sheet fallback in isolation.
+shared ledger during retry, and a ledger breach ends as the disclosed floor: the JavaScript stands and every
+collected asset is disclosed at its raw size under `uncounted_assets`, none counted. Tests that want to observe
+the per-sheet degradation itself lift the ledger with `AssetBudgetLimits::unbounded_css_work`.
 
 The file count doubles as the depth bound, because a chain of N files costs N reads and nothing else can see
 depth from where the bound is applied. 256 stops the walk roughly three times short of where a release build's
@@ -232,8 +233,8 @@ offender is measured alone — was investigated and rejected on evidence.
 
 `charge_css_work` is monotonic with no per-path dedupe, and union-plus-retry already spends roughly
 2x the set's reads against a build-wide 512-read / 16 MiB ledger. A third pass makes it ~3x, and
-breaching that ledger is **terminal**: `process_stylesheets` turns a live context failure into a hard
-`AssetBudgetFailure` for the whole asset stage rather than a graceful degradation.
+breaching that ledger is **terminal for the asset stage**: every stylesheet that would have counted is
+disclosed at its raw size instead, so the whole asset contribution drops to a floor.
 
 Worse, the common reason the union fails IS the set breaching a budget together — that is exactly the
 shape the regression test at `assets.rs` pins (two sheets, each inside the 256-file per-attempt bound,
@@ -243,7 +244,7 @@ breaches again, having spent a third of the ledger to learn nothing. And
 signal distinguishing "one unparseable sheet" from "the set was too large".
 
 The trade would therefore be a **disclosed** over-count (already non-budgetable, already labelled as
-reading high) for a possible hard failure of the whole asset stage. The prerequisite is a typed
+reading high) for a possible breach that leaves no stylesheet counted at all. The prerequisite is a typed
 distinction between a per-sheet parse failure and a set-level budget breach; until that exists, this
 is not worth attempting.
 

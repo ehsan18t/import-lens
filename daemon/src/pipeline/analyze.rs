@@ -40,8 +40,6 @@ struct FailureFreshness {
     read_time_fingerprints: Vec<crate::cache::key::FileFingerprint>,
     /// Modules parsed before failure, used to find first-party manifests that shaped resolution.
     loaded_paths: Vec<PathBuf>,
-    /// Successful graph inputs that had no same-read hash.
-    stat_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,16 +225,11 @@ fn engine_failure_fingerprints(
     package_root: &Path,
     error: &AnalysisError,
 ) -> Option<FingerprintSource> {
-    if error.freshness.read_time_fingerprints.is_empty() && error.freshness.stat_paths.is_empty() {
+    if error.freshness.read_time_fingerprints.is_empty() {
         return None;
     }
 
-    let mut stat_paths = error.freshness.stat_paths.clone();
-    stat_paths.extend(manifest_stat_paths(
-        context,
-        package_root,
-        &error.freshness.loaded_paths,
-    ));
+    let stat_paths = manifest_stat_paths(context, package_root, &error.freshness.loaded_paths);
 
     Some(FingerprintSource::ReadTime {
         fingerprints: error.freshness.read_time_fingerprints.clone(),
@@ -418,9 +411,9 @@ pub(crate) fn analyze_with_rolldown_engine(
 
     // The package's non-JavaScript assets, processed the way they really ship, so their bytes JOIN
     // the Import Cost instead of being disclosed beside a number that excluded them (B2). Each
-    // artifact is compressed on its own and summed (ADR-0005). Ordinary parse/compression failures
-    // still disclose raw bytes, but a whole-build resource/deadline breach has no coherent partial
-    // measurement and therefore returns one typed Unmeasured result.
+    // artifact is compressed on its own and summed (ADR-0005). Parse/compression failures and a
+    // resource-ledger breach disclose raw bytes beside the measured JavaScript; only a request-local
+    // stage failure (deadline, panic, lost runtime) leaves the import Unmeasured.
     let assets = process_assets_bounded(
         artifact.assets.clone(),
         artifact.graph_source_bytes,
@@ -674,13 +667,26 @@ fn asset_processing_error(
         .freshness
         .read_time_fingerprints
         .extend(failure.read_time_fingerprints);
+    error
+        .freshness
+        .read_time_fingerprints
+        .extend(unhashed_fingerprints(&artifact.unhashed_paths));
     crate::cache::key::sort_and_dedup_fingerprints(&mut error.freshness.read_time_fingerprints);
     error.freshness.loaded_paths = artifact.loaded_paths.clone();
     error.freshness.loaded_paths.extend(failure.read_paths);
     error.freshness.loaded_paths.sort();
     error.freshness.loaded_paths.dedup();
-    error.freshness.stat_paths = artifact.unhashed_paths.clone();
     error
+}
+
+/// Modules whose bytes are in the build but whose read the plugin could not fingerprint, recorded
+/// as **unverifiable**: see [`import_freshness`] for why they are never `stat_paths`.
+fn unhashed_fingerprints(
+    unhashed_paths: &[PathBuf],
+) -> impl Iterator<Item = crate::cache::key::FileFingerprint> + '_ {
+    unhashed_paths
+        .iter()
+        .map(crate::cache::key::unverifiable_file_fingerprint)
 }
 
 /// §8.3: freshness comes from fingerprints captured by the same reads that supplied every measured
@@ -705,12 +711,7 @@ fn import_freshness(
     stat_paths: Vec<PathBuf>,
 ) -> FingerprintSource {
     let mut fingerprints = read_time_fingerprints;
-    fingerprints.extend(
-        unhashed_paths
-            .iter()
-            .cloned()
-            .map(crate::cache::key::unverifiable_file_fingerprint),
-    );
+    fingerprints.extend(unhashed_fingerprints(unhashed_paths));
     fingerprints.extend(asset_fingerprints);
     crate::cache::key::sort_and_dedup_fingerprints(&mut fingerprints);
     FingerprintSource::ReadTime {
@@ -872,6 +873,64 @@ mod tests {
         assert!(
             crate::cache::key::fingerprint_is_unverifiable(recorded),
             "it must be unverifiable so the result can never be served as fresh: {recorded:?}"
+        );
+    }
+
+    /// The asset-failure path records the same unfingerprinted modules the same way the success
+    /// path does: unverifiable, never deferred to a hash taken after the analysis.
+    #[test]
+    fn an_asset_stage_failure_records_unfingerprinted_modules_as_unverifiable() {
+        let unhashed = PathBuf::from("/pkg/native.node");
+        let artifact = crate::engine::BundleArtifact {
+            code: String::new(),
+            graph_source_bytes: 0,
+            loaded_paths: vec![unhashed.clone()],
+            read_time_fingerprints: Vec::new(),
+            unhashed_paths: vec![unhashed],
+            contributions: Vec::new(),
+            exported_names: Vec::new(),
+            diagnostics: Vec::new(),
+            assets: Vec::new(),
+            emitted_assets: Vec::new(),
+        };
+        let failure = AssetProcessingFailure {
+            stage: crate::engine::stage::TIMEOUT,
+            message: "asset processing did not complete within its deadline".to_owned(),
+            read_paths: Vec::new(),
+            read_time_fingerprints: Vec::new(),
+        };
+        let context = AnalysisContext {
+            workspace_root: PathBuf::from("/workspace"),
+            active_document_path: PathBuf::from("/workspace/src/index.ts"),
+        };
+        let request = ImportRequest {
+            specifier: "pkg".to_owned(),
+            package_name: "pkg".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: Vec::new(),
+            import_kind: ImportKind::Namespace,
+            runtime: crate::ipc::protocol::ImportRuntime::Component,
+        };
+
+        let error = asset_processing_error(&context, &request, &artifact, failure);
+
+        let Some(FingerprintSource::ReadTime {
+            fingerprints,
+            stat_paths,
+        }) = engine_failure_fingerprints(&context, Path::new("/pkg"), &error)
+        else {
+            panic!("an engine-built failure must carry freshness inputs");
+        };
+        assert!(
+            !stat_paths.iter().any(|path| path.ends_with("native.node")),
+            "a measured module must never be deferred to a post-analysis hash: {stat_paths:?}"
+        );
+        assert!(
+            fingerprints.iter().any(|fingerprint| {
+                fingerprint.path.contains("native.node")
+                    && crate::cache::key::fingerprint_is_unverifiable(fingerprint)
+            }),
+            "{fingerprints:?}"
         );
     }
 

@@ -164,7 +164,6 @@ pub struct BundleArtifact {
     /// allocation per build and take that check with it.
     pub exported_names: Vec<String>,
     pub diagnostics: Vec<ImportDiagnostic>,
-    pub matched_side_effect_paths: Vec<PathBuf>,
     /// The classified non-JavaScript modules the graph imported, intercepted at the load boundary
     /// (see [`CollectedAsset`]). The pipeline processes these and folds their shipped bytes into
     /// the size (B2); they are NOT in `code`, which is the JavaScript chunk alone.

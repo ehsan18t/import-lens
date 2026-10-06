@@ -209,6 +209,34 @@ async fn matrix_07_ambiguous_star_providers() {
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
 
+// A missing binding is `missing_export` whatever it is called: the stage comes from the event kind,
+// never from words in the message, so an internal edge named like this is still stubbed and sized.
+#[tokio::test]
+async fn a_missing_binding_named_ambiguous_is_still_a_missing_export() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "entry.js",
+        "import { isAmbiguous } from './parser.js';\nexport const present = () => isAmbiguous;",
+    );
+    write_source(&root, "parser.js", "export const parse = 1;");
+
+    let measured = run(&root, "entry.js", named(&["present"])).await;
+    let requested = run(&root, "entry.js", named(&["absentAmbiguous"])).await;
+    fs::remove_dir_all(&root).expect("temp workspace should be removed");
+
+    let artifact = measured.expect("an internal unbound edge must be stubbed and measured");
+    assert!(
+        artifact.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "missing_export" && diagnostic.message.contains("isAmbiguous")
+        }),
+        "{:?}",
+        artifact.diagnostics
+    );
+    let failure = requested.expect_err("a missing requested export must fail");
+    assert_eq!(failure.stage, "missing_export", "{failure:?}");
+}
+
 // Row 8: `export * as ns` produces a valid namespace object.
 #[tokio::test]
 async fn matrix_08_star_as_namespace_reexport() {
@@ -663,6 +691,40 @@ async fn matrix_27_cjs_export_shapes() {
     // augmented by guessing (§8.4).
     assert_eq!(exported.names, vec!["default".to_owned()]);
     fs::remove_dir_all(root).expect("temp workspace should be removed");
+}
+
+// Enumeration and sizing must agree on which graphs are buildable: an unbound import between
+// dependencies is stubbed and disclosed by both, and the entry's own surface is never stubbed.
+#[tokio::test]
+async fn enumeration_stubs_an_unbound_import_between_dependencies_but_not_at_the_entry() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "export { present } from './mid.js';");
+    write_source(
+        &root,
+        "mid.js",
+        "import { walk } from './parser.js';\nexport const present = () => walk;",
+    );
+    write_source(&root, "parser.js", "export const parse = 1;");
+    write_source(&root, "broken.js", "export { walk } from './parser.js';");
+
+    let exported = RolldownEngine
+        .enumerate_exports(root.join("entry.js"), ImportRuntime::default())
+        .await
+        .expect("a broken edge behind the entry must not fail enumeration");
+    let refused = RolldownEngine
+        .enumerate_exports(root.join("broken.js"), ImportRuntime::default())
+        .await;
+    fs::remove_dir_all(&root).expect("temp workspace should be removed");
+
+    assert_eq!(exported.names, vec!["present".to_owned()]);
+    assert!(
+        exported.diagnostics.iter().any(|diagnostic| {
+            diagnostic.stage == "missing_export" && diagnostic.message.contains("walk")
+        }),
+        "the stubbed edge must be disclosed: {exported:?}"
+    );
+    let failure = refused.expect_err("an entry re-exporting a missing binding must not be stubbed");
+    assert_eq!(failure.stage, "missing_export", "{failure:?}");
 }
 
 // Row 28: TS/TSX/JSX/JSON/.mts/.cts inputs transform natively into one

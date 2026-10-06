@@ -21,6 +21,21 @@ mod common;
 
 const CEILING_BYTES: usize = 64 * 1024;
 
+fn discloses_the_breach(
+    diagnostics: &[import_lens_daemon::ipc::protocol::ImportDiagnostic],
+) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        diagnostic.stage == "uncounted_assets"
+            && diagnostic
+                .details
+                .iter()
+                .any(|detail| detail.contains(&CEILING_BYTES.to_string()))
+    })
+}
+
+/// The breach is detected mid-run, while CSS dependency discovery admits the oversized font, and it
+/// must not cost the import its already-measured JavaScript: the result is the disclosed floor, it
+/// is cacheable, and it expires when the offending asset changes.
 #[test]
 fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
     // SAFETY: this is the only test in this binary, and the limit is initialized only when the
@@ -71,40 +86,35 @@ fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
         runtime: ImportRuntime::Component,
     };
     let result = analyze_import(&context, &request);
-    assert_eq!(
-        result.sizes(),
-        None,
-        "a breached graph has no size: {result:?}"
+    assert!(
+        result.sizes().is_some(),
+        "a ledger breach must not discard the measured JavaScript: {result:?}"
     );
-    assert_eq!(
-        result.unmeasured_stage(),
-        Some("module_graph_limit"),
-        "CSS resources must be admitted under the same typed graph limit: {result:?}"
+    assert_eq!(result.unmeasured_stage(), None, "{result:?}");
+    assert!(
+        result.asset_breakdown.is_empty(),
+        "a breached asset stage counts nothing: {result:?}"
     );
     assert!(
-        result
-            .error
-            .as_deref()
-            .is_some_and(|message| message.contains(&CEILING_BYTES.to_string())),
-        "the failure should name the aggregate byte ceiling: {result:?}"
+        discloses_the_breach(&result.diagnostics),
+        "the floor must name the aggregate byte ceiling it stopped at: {result:?}"
     );
 
     let resolved = resolve_package_entry(&context.active_document_path, &request)
         .expect("resource-limit package should resolve");
-    let (_, failure_source) =
-        analyze_resolved_import_with_dependencies(&context, &request, resolved);
-    let Some(FingerprintSource::ReadTime { fingerprints, .. }) = failure_source else {
-        panic!("a durable asset-limit failure must carry its exact freshness inputs");
+    let (_, source) = analyze_resolved_import_with_dependencies(&context, &request, resolved);
+    let Some(FingerprintSource::ReadTime { fingerprints, .. }) = source else {
+        panic!("a disclosed floor must carry its exact freshness inputs");
     };
     assert!(
         check_fingerprints_strict(&fingerprints) == Freshness::Fresh,
-        "the captured failure inputs should initially be current: {fingerprints:?}"
+        "the captured inputs should initially be current: {fingerprints:?}"
     );
     assert!(
         !fingerprints
             .iter()
             .any(|fingerprint| fingerprint.path.ends_with("must-not-read.wasm")),
-        "dependency discovery must stop reading after the fatal limit breach: {fingerprints:?}"
+        "dependency discovery must stop reading after the limit breach: {fingerprints:?}"
     );
 
     let prior_measurement = ImportResult::measured(
@@ -125,19 +135,16 @@ fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
         )],
     );
     assert!(
-        file_cost.degraded,
-        "a combined asset-limit failure must be an explicitly degraded fallback: {file_cost:?}"
+        file_cost.incomplete && !file_cost.degraded,
+        "a combined build whose asset stage breached is a measured floor: {file_cost:?}"
     );
     assert!(
         !file_cost.is_cacheable(),
-        "a per-import fallback is not a File Cost measurement: {file_cost:?}"
+        "a floor is not a complete File Cost: {file_cost:?}"
     );
     assert!(
-        file_cost
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.stage == "module_graph_limit"),
-        "File Cost must retain the typed asset-limit stage: {file_cost:?}"
+        discloses_the_breach(&file_cost.diagnostics),
+        "File Cost must disclose the breach: {file_cost:?}"
     );
 
     let service = ImportLensService::new(None, false);
@@ -150,36 +157,31 @@ fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
         streaming: false,
     };
     let first_service_result = service.handle_batch(batch(1)).imports.remove(0);
-    assert_eq!(
-        first_service_result.unmeasured_stage(),
-        Some("module_graph_limit")
+    assert!(
+        first_service_result.sizes().is_some(),
+        "{first_service_result:?}"
     );
     assert!(!first_service_result.cache_hit, "first analysis must miss");
-    let cached_failure = service.handle_batch(batch(2)).imports.remove(0);
+    let cached_floor = service.handle_batch(batch(2)).imports.remove(0);
     assert!(
-        cached_failure.cache_hit,
-        "a deterministic limit result should be reusable while its inputs are unchanged: \
-         {cached_failure:?}"
+        cached_floor.cache_hit,
+        "a deterministic breach is reusable while its inputs are unchanged: {cached_floor:?}"
     );
 
     fs::write(package_root.join("oversized.woff2"), [0x51; 32]).expect("shrink the offending font");
     assert!(
         check_fingerprints_strict(&fingerprints) != Freshness::Fresh,
-        "fixing only the offending asset must expire a cached deterministic rejection"
+        "fixing only the offending asset must expire the cached floor"
     );
     let recovered = analyze_import(&context, &request);
     assert!(
-        recovered.sizes().is_some(),
-        "the same import should become measurable after the asset is fixed: {recovered:?}"
+        !recovered.asset_breakdown.is_empty() && !discloses_the_breach(&recovered.diagnostics),
+        "the same import should count its assets once the font is fixed: {recovered:?}"
     );
     let refreshed = service.handle_batch(batch(3)).imports.remove(0);
     assert!(
-        refreshed.sizes().is_some(),
+        !refreshed.cache_hit && !discloses_the_breach(&refreshed.diagnostics),
         "the service cache must re-run after only the offending asset changes: {refreshed:?}"
-    );
-    assert!(
-        !refreshed.cache_hit,
-        "the stale deterministic failure must not be returned as a hit: {refreshed:?}"
     );
 
     fs::remove_dir_all(workspace).expect("workspace cleanup");

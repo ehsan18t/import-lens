@@ -41,32 +41,18 @@ impl RolldownEngine {
             });
         };
         let package_root = first_entry.package_root.clone();
-        let attempt = |shim_unbound_imports: bool| {
+        let (output, state, unbound_imports) = build_with_unbound_import_retry(|| {
             let input = InputItem {
                 name: None,
                 import: entry::VIRTUAL_ENTRY_ID.to_owned(),
             };
-            let mut options = build_options(input, package_root.clone(), request.runtime);
-            options.shim_missing_exports = Some(shim_unbound_imports);
-            let plugin = ImportLensPlugin::for_request(&request);
-            let state = plugin.state();
-            (options, plugin, state)
-        };
-
-        let (options, plugin, state) = attempt(false);
-        let failure = match run_build(options, plugin, &state).await {
-            Ok(output) => return translate(output, &state, Vec::new()),
-            Err(failure) => failure,
-        };
-        if !is_internal_unbound_import(&failure) {
-            return Err(failure);
-        }
-        // A fresh plugin and state, never the first attempt's: that one already recorded the paths
-        // and fingerprints of a graph that was thrown away, and freshness must describe the graph
-        // the returned size was actually taken from.
-        let (options, plugin, state) = attempt(true);
-        let output = run_build(options, plugin, &state).await?;
-        translate(output, &state, failure.diagnostics)
+            (
+                build_options(input, package_root.clone(), request.runtime),
+                ImportLensPlugin::for_request(&request),
+            )
+        })
+        .await?;
+        translate(output, &state, unbound_imports)
     }
 
     /// Export enumeration (§8.4): the resolved real entry becomes the strict
@@ -79,22 +65,25 @@ impl RolldownEngine {
         let cwd = entry_path
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let input = InputItem {
-            name: None,
-            import: rolldown_entry_path(&entry_path),
-        };
-        let options = build_options(input, cwd, runtime);
-        let plugin = ImportLensPlugin::passthrough();
-        let state = plugin.state();
-        let output = run_build(options, plugin, &state).await?;
+        let (output, state, unbound_imports) = build_with_unbound_import_retry(|| {
+            let input = InputItem {
+                name: None,
+                import: rolldown_entry_path(&entry_path),
+            };
+            (
+                build_options(input, cwd.clone(), runtime),
+                ImportLensPlugin::passthrough(),
+            )
+        })
+        .await?;
         let chunk = single_chunk(&output, &state)?;
         let (read_time_fingerprints, unhashed_paths) = build_observations(&state);
         let mut diagnostics = contract_diagnostics(&output.warnings);
+        diagnostics.extend(unbound_imports);
         diagnostics.extend(asset_io_diagnostic(&state));
 
         Ok(ExportEnumeration {
             names: chunk.exports.iter().map(|name| name.to_string()).collect(),
-            // A successful build's warnings used to be dropped on the floor.
             diagnostics,
             read_time_fingerprints,
             loaded_paths: state.sorted_loaded_paths(),
@@ -232,25 +221,66 @@ async fn run_build(
     result.map_err(|error| classify_failure(error.into_vec(), state))
 }
 
-/// Whether a failed build may be retried with the unmatched binding stubbed (`shim_missing_exports`).
+/// Run one build, and when [`is_internal_unbound_import`] admits its failure, run it once more with
+/// the unmatched bindings stubbed (`shim_missing_exports`). Returns the output, the state of the
+/// attempt that produced it, and the failed attempt's diagnostics: a stubbed build reports nothing
+/// of its own, so those are the whole disclosure.
+///
+/// Every attempt gets a fresh plugin and state: the failed one recorded the paths and fingerprints
+/// of a graph that was thrown away, and freshness must describe the graph the answer came from.
+async fn build_with_unbound_import_retry(
+    attempt: impl Fn() -> (BundlerOptions, ImportLensPlugin),
+) -> Result<
+    (
+        rolldown::BundleOutput,
+        Arc<BuildState>,
+        Vec<ImportDiagnostic>,
+    ),
+    BundleFailure,
+> {
+    let (options, plugin) = attempt();
+    let state = plugin.state();
+    let failure = match run_build(options, plugin, &state).await {
+        Ok(output) => return Ok((output, state, Vec::new())),
+        Err(failure) => failure,
+    };
+    if !is_internal_unbound_import(&failure, &state.entry_stable_ids()) {
+        return Err(failure);
+    }
+    let (mut options, plugin) = attempt();
+    options.shim_missing_exports = Some(true);
+    let state = plugin.state();
+    let output = run_build(options, plugin, &state).await?;
+    Ok((output, state, failure.diagnostics))
+}
+
+/// Whether a failed build may be retried with the unmatched binding stubbed.
 ///
 /// Rolldown raises an unmatched import at `Severity::Error`, so one broken edge **anywhere** in a
 /// package's graph leaves the whole package unmeasured — a package four levels away can drop an
 /// export in a patch release and every dependent becomes unmeasurable.
 ///
 /// Stubbing is sound for an edge BETWEEN dependencies: the user asked for the package, not for that
-/// binding, and every module still renders at its true bytes. It is refused for the export the user
-/// actually **requested**, which only the virtual entry imports — guessing that one is what the SRS
-/// forbids, and it would turn a typo into a confident size instead of a failure.
+/// binding, and every module still renders at its true bytes. It is refused when the build's ENTRY
+/// is the importer. For a size build that is the virtual entry, which imports exactly the export the
+/// user **requested**; guessing that one is what the SRS forbids, and it would turn a typo into a
+/// confident size. For export enumeration it is the real entry, whose own export surface is the
+/// answer, so a stub there would offer a name that does not exist.
 ///
 /// `ambiguous_export` is excluded on purpose: `shim_missing_exports` only rewrites a `NoMatch`
 /// binding, so a name lost to conflicting star providers fails the retry exactly as it failed the
 /// first attempt, and retrying it would only cost a second build.
-fn is_internal_unbound_import(failure: &BundleFailure) -> bool {
-    !failure.diagnostics.is_empty()
+fn is_internal_unbound_import(failure: &BundleFailure, entry_stable_ids: &[String]) -> bool {
+    // No recorded entry means nothing can be protected, so nothing may be stubbed.
+    !entry_stable_ids.is_empty()
+        && !failure.diagnostics.is_empty()
         && failure.diagnostics.iter().all(|diagnostic| {
             diagnostic.stage == stage::MISSING_EXPORT
-                && !diagnostic.message.contains(entry::VIRTUAL_ENTRY_ID)
+                && !entry_stable_ids.iter().any(|entry| {
+                    diagnostic
+                        .message
+                        .contains(&format!("imported by \"{entry}\""))
+                })
         })
 }
 
@@ -328,15 +358,6 @@ fn translate(
             ),
         });
     }
-    // There used to be a `side_effects` diagnostic here, pushed for EVERY glob declaration: "matched
-    // paths are unavailable from public bundler metadata, so side-effect confidence is
-    // conservative". Its premise was retracted (§10.7) and the daemon now matches the entry with
-    // `fast_glob` — Rolldown's own matcher — so the matched paths are not unavailable at all: the
-    // one that decides the badge is answered exactly. The diagnostic was the last thing holding
-    // every `["**/*.css"]` package below High confidence, and it also made `BundleEntry` carry a
-    // `reported_side_effects` nobody else read. Both are gone. Rolldown still owns retention
-    // (FR-021); the daemon only reports what the package declared about the entry it measured.
-
     let (read_time_fingerprints, unhashed_paths) = build_observations(state);
 
     Ok(BundleArtifact {
@@ -348,7 +369,6 @@ fn translate(
         contributions,
         exported_names: chunk.exports.iter().map(|name| name.to_string()).collect(),
         diagnostics,
-        matched_side_effect_paths: Vec::new(),
         assets: state.sorted_assets(),
         emitted_assets: emitted,
     })
@@ -522,19 +542,8 @@ fn classify_failure(diagnostics: Vec<BuildDiagnostic>, state: &BuildState) -> Bu
 
 fn stage_for(diagnostic: &BuildDiagnostic) -> &'static str {
     match diagnostic.kind() {
-        EventKind::MissingExportError => {
-            // 1.1.5 reports a name lost to conflicting star providers through
-            // the missing-export path; keep the contract's distinction (§12).
-            if diagnostic
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("ambiguous")
-            {
-                stage::AMBIGUOUS_EXPORT
-            } else {
-                stage::MISSING_EXPORT
-            }
-        }
+        EventKind::MissingExportError => stage::MISSING_EXPORT,
+        // The pinned Rolldown's only producer of a name claimed by conflicting star providers.
         EventKind::AmbiguousExternalNamespaceError => stage::AMBIGUOUS_EXPORT,
         EventKind::ParseError | EventKind::JsonParseError | EventKind::TransformError => {
             stage::PARSE
@@ -588,8 +597,8 @@ mod tests {
     /// It is the whole of what separates "a dependency's broken edge is measured and disclosed" from
     /// "a typo in the user's own import comes back as a confident size".
     ///
-    /// A Guard as much as a Logic test: loosening any arm — dropping the virtual-entry check,
-    /// admitting `ambiguous_export`, accepting a mixed diagnostic list — turns it red.
+    /// A Guard as much as a Logic test: loosening any arm — dropping the entry check, admitting
+    /// `ambiguous_export`, accepting a mixed diagnostic list — turns it red.
     #[test]
     fn only_an_internal_missing_export_may_be_retried_with_a_stub() {
         let failure = |diagnostics: Vec<ImportDiagnostic>| BundleFailure {
@@ -603,41 +612,62 @@ mod tests {
             stage: stage.to_owned(),
             message: message.to_owned(),
         };
-
-        assert!(
-            is_internal_unbound_import(&failure(vec![diagnostic(
+        let entries = [entry::VIRTUAL_ENTRY_ID.to_owned()];
+        let internal_edge = || {
+            failure(vec![diagnostic(
                 stage::MISSING_EXPORT,
                 r#""walk" is not exported by "yuku-parser/index.js", imported by "dts/index.mjs""#,
-            )])),
+            )])
+        };
+
+        assert!(
+            is_internal_unbound_import(&internal_edge(), &entries),
             "an edge between two dependencies is the case this exists for"
         );
         assert!(
-            !is_internal_unbound_import(&failure(vec![diagnostic(
-                stage::MISSING_EXPORT,
-                &format!(
-                    r#""nope" is not exported by "lib/index.js", imported by "{}""#,
-                    entry::VIRTUAL_ENTRY_ID
-                ),
-            )])),
+            !is_internal_unbound_import(
+                &failure(vec![diagnostic(
+                    stage::MISSING_EXPORT,
+                    &format!(
+                        r#""nope" is not exported by "lib/index.js", imported by "{}""#,
+                        entry::VIRTUAL_ENTRY_ID
+                    ),
+                )]),
+                &entries
+            ),
             "the export the USER requested is the one the virtual entry imports, and guessing that \
              binding is what the SRS forbids"
         );
         assert!(
-            !is_internal_unbound_import(&failure(vec![diagnostic(
-                stage::AMBIGUOUS_EXPORT,
-                "name is ambiguous",
-            )])),
+            !is_internal_unbound_import(&internal_edge(), &["dts/index.mjs".to_owned()]),
+            "an enumeration's own entry is protected the same way: a stub there invents an export"
+        );
+        assert!(
+            !is_internal_unbound_import(&internal_edge(), &[]),
+            "a build that recorded no entry has nothing it could protect"
+        );
+        assert!(
+            !is_internal_unbound_import(
+                &failure(vec![diagnostic(
+                    stage::AMBIGUOUS_EXPORT,
+                    "name is ambiguous"
+                )]),
+                &entries
+            ),
             "a stub only rewrites a NoMatch binding, so the retry would fail identically"
         );
         assert!(
-            !is_internal_unbound_import(&failure(vec![
-                diagnostic(stage::MISSING_EXPORT, "an internal edge"),
-                diagnostic(stage::PARSE, "a syntax error"),
-            ])),
+            !is_internal_unbound_import(
+                &failure(vec![
+                    diagnostic(stage::MISSING_EXPORT, "an internal edge"),
+                    diagnostic(stage::PARSE, "a syntax error"),
+                ]),
+                &entries
+            ),
             "a graph that also fails to parse is not made measurable by stubbing a binding"
         );
         assert!(
-            !is_internal_unbound_import(&failure(Vec::new())),
+            !is_internal_unbound_import(&failure(Vec::new()), &entries),
             "a failure with no diagnostics says nothing about what a retry would do"
         );
     }

@@ -78,6 +78,9 @@ pub(super) struct BuildState {
     /// Bare specifiers this build turned into an import boundary because the resolver refused them.
     /// Disclosed, never silent: the graph behind such an edge is not in the number.
     unresolved_externals: Mutex<BTreeSet<String>>,
+    /// Stable ids of the build's entry modules, spelled exactly as Rolldown's diagnostics name an
+    /// importer: the virtual entry for a size build, the real entry for export enumeration.
+    entry_stable_ids: Mutex<Vec<String>>,
 }
 
 impl BuildState {
@@ -180,6 +183,13 @@ impl BuildState {
             .collect()
     }
 
+    pub(super) fn entry_stable_ids(&self) -> Vec<String> {
+        self.entry_stable_ids
+            .lock()
+            .expect("entry stable-id list should not be poisoned")
+            .clone()
+    }
+
     /// Only the UNREADABLE ones. This drives the `asset_io` diagnostic and the `asset_io` failure
     /// stage, and an absent input belongs in neither — nothing about it is transient, and nothing
     /// about it needs the user to retry.
@@ -216,8 +226,7 @@ impl BuildState {
     }
 
     /// Canonicalize once per build. A path that no longer resolves (deleted
-    /// mid-build) falls back to the resolver's form, matching the previous
-    /// behavior.
+    /// mid-build) falls back to the resolver's form.
     fn canonical_path(&self, path: &Path) -> PathBuf {
         if let Some(canonical) = self
             .canonical
@@ -237,6 +246,16 @@ impl BuildState {
             .expect("canonical-path memo should not be poisoned")
             .insert(path.to_path_buf(), canonical.clone());
         canonical
+    }
+
+    /// Bind a module id carrying a loader suffix (`./font.woff2?url`) to the file `load` read for
+    /// it. `module_parsed` sees only the raw id, and canonicalizing that would key the module under
+    /// a path with no read-time fingerprint, which makes the whole result uncacheable.
+    fn alias_canonical(&self, id: &Path, canonical: &Path) {
+        self.canonical
+            .lock()
+            .expect("canonical-path memo should not be poisoned")
+            .insert(id.to_path_buf(), canonical.to_path_buf());
     }
 
     pub(super) fn take_breach(&self) -> Option<String> {
@@ -368,9 +387,8 @@ fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Opt
     }
     let is_package_relative = specifier.starts_with("./") || specifier.starts_with("../");
     if !is_package_relative {
-        // Bare/self-referential/aliased specifiers have no honest filesystem candidate until the
-        // configured resolver answers. The spelling is still useful in the disclosure, and the
-        // resulting unverifiable sentinel is rejected by identity rather than by probing this path.
+        // Bare/self-referential/aliased specifiers have no filesystem candidate until the
+        // configured resolver answers, so the spelling stands in; it is never probed or recorded.
         return Some(specifier_path.to_path_buf());
     }
     let importer = Path::new(importer);
@@ -422,16 +440,8 @@ fn failure_kind_of(error: &std::io::Error) -> AssetInputFailure {
     }
 }
 
-/// How to record a candidate the configured resolver could not answer for.
-///
-/// Only an ABSOLUTE path this hook can actually probe earns `Absent`. A bare, self-referential or
-/// aliased specifier has no honest filesystem location — `supported_asset_observation_candidate`
-/// hands back the spelling itself — so "it is not there" is not a claim this hook is entitled to
-/// make, and it stays `Unreadable`, which is the conservative answer that refuses the cache.
+/// How to record an absolute candidate the configured resolver could not answer for.
 async fn resolve_failure_kind(candidate: &Path) -> AssetInputFailure {
-    if !candidate.is_absolute() {
-        return AssetInputFailure::Unreadable;
-    }
     match tokio::fs::metadata(candidate).await {
         Err(error) => failure_kind_of(&error),
         // It exists but the resolver still refused it — an `exports` denial, a bad symlink target.
@@ -627,6 +637,20 @@ impl ImportLensPlugin {
         Arc::clone(&self.state)
     }
 
+    /// A bare specifier the resolver refused. A subpath of another package becomes a disclosed
+    /// import boundary (see [`is_bare_subpath_specifier`]); anything else is left to Rolldown,
+    /// which externalizes a `NotFound` root with a warning and fails the rest.
+    fn unresolved_boundary(&self, specifier: &str) -> Option<HookResolveIdOutput> {
+        if !is_bare_subpath_specifier(specifier) {
+            return None;
+        }
+        self.state.record_unresolved_external(specifier.to_owned());
+        Some(HookResolveIdOutput {
+            external: Some(true.into()),
+            ..HookResolveIdOutput::from_id(specifier.to_owned())
+        })
+    }
+
     fn breach(&self, message: String) -> std::io::Error {
         self.state.record_breach(&message);
         std::io::Error::other(message)
@@ -721,9 +745,8 @@ impl Plugin for ImportLensPlugin {
             // relative path ourselves. Client/Component builds apply package `browser` aliases
             // here, and a raw join would silently measure the server asset or ignore a `false`
             // mapping. Taking the successful result back through this hook still guarantees its
-            // final id reaches our observing `load`; retaining an asset-looking specifier on
-            // failure closes the resolve/load race for relative, absolute, bare, and aliased forms
-            // without changing resolver semantics.
+            // final id reaches our observing `load`; retaining a failed relative or absolute
+            // candidate closes the resolve/load race without changing resolver semantics.
             let resolved = ctx
                 .resolve(
                     args.specifier,
@@ -741,6 +764,13 @@ impl Plugin for ImportLensPlugin {
                     return Ok(Some(HookResolveIdOutput::from_resolved_id(resolved)));
                 }
                 Err(_) => {
+                    // A bare, self-referential or aliased spelling has no filesystem location to
+                    // probe, so its failure is the resolver's deterministic verdict about the
+                    // package graph, not an unreadable file. It takes the same boundary path as any
+                    // other bare specifier the resolver refuses.
+                    if !candidate.is_absolute() {
+                        return Ok(self.unresolved_boundary(args.specifier));
+                    }
                     // An alternative-specifier probe is the ordinary case here, not the exception:
                     // napi-rs writes one `require` per platform triple and ships one file, so most
                     // of these misses are a package fact, not a filesystem hiccup. Recording WHICH
@@ -777,14 +807,7 @@ impl Plugin for ImportLensPlugin {
                 // Hand back the id we already paid for rather than returning `None` and making
                 // Rolldown resolve the same specifier a second time.
                 Ok(resolved) => Ok(Some(HookResolveIdOutput::from_resolved_id(resolved))),
-                Err(_) => {
-                    self.state
-                        .record_unresolved_external(args.specifier.to_owned());
-                    Ok(Some(HookResolveIdOutput {
-                        external: Some(true.into()),
-                        ..HookResolveIdOutput::from_id(args.specifier.to_owned())
-                    }))
-                }
+                Err(_) => Ok(self.unresolved_boundary(args.specifier)),
             };
         }
         Ok(None)
@@ -818,11 +841,8 @@ impl Plugin for ImportLensPlugin {
         // ids are absolute paths; anything else is left to Rolldown.
         // A module id can carry a loader suffix that is not part of the file name —
         // `./font.woff2?url`, `./styles.css?inline`, `./data.json?raw`. oxc_resolver re-appends the
-        // query it parsed and Rolldown builds the id from that, so the suffix arrives here.
-        // Classifying the raw id reads the extension as `woff2?url`, which matches nothing: the
-        // asset is never stubbed, Rolldown reads the id verbatim, and the whole build dies on a path
-        // the filesystem rejects — `?` is an illegal Windows filename character. That failure is
-        // durable, so the package stayed unmeasurable until its bytes changed.
+        // query it parsed and Rolldown builds the id from that, so the suffix arrives here, and the
+        // raw id names no file (`?` is illegal in a Windows filename).
         let literal = Path::new(args.id);
         let stripped = Path::new(path_portion(args.id));
         if !stripped.is_absolute() {
@@ -839,7 +859,8 @@ impl Plugin for ImportLensPlugin {
         // Strip to rescue a loader suffix, never to lose a real file. `?` is illegal in a Windows
         // filename but legal on Linux, and `#` is legal on both, so a stripped path that is not on
         // disk means the suffix was part of the name — fall back to the literal id. The second stat
-        // runs only where the alternative was an outright build failure.
+        // runs only where the alternative was an outright build failure. Whichever file is chosen
+        // is the module's identity for `module_parsed` too.
         let mut path = stripped;
         let mut canonical = self.state.canonical_path(stripped);
         let mut stat = tokio::fs::metadata(&canonical).await;
@@ -850,6 +871,9 @@ impl Plugin for ImportLensPlugin {
                 canonical = literal_canonical;
                 stat = Ok(metadata);
             }
+        }
+        if stat.is_ok() && path != literal {
+            self.state.alias_canonical(literal, &canonical);
         }
 
         let asset_class = classify_asset_class(path);
@@ -1058,8 +1082,15 @@ impl Plugin for ImportLensPlugin {
         &self,
         _ctx: &PluginContext,
         module_info: Arc<ModuleInfo>,
-        _normal_module: &NormalModule,
+        normal_module: &NormalModule,
     ) -> HookNoopReturn {
+        if module_info.is_entry {
+            self.state
+                .entry_stable_ids
+                .lock()
+                .expect("entry stable-id list should not be poisoned")
+                .push(normal_module.stable_id.to_string());
+        }
         if module_info.id.as_str() == VIRTUAL_ENTRY_ID {
             return Ok(());
         }

@@ -28,14 +28,14 @@ use crate::ipc::protocol::{AssetContribution, ImportDiagnostic, MeasuredSizes};
 use crate::pipeline::asset_boundary::{self, AssetBoundaryError, AssetDeadline};
 #[cfg(test)]
 use crate::pipeline::asset_budget::AssetBudgetLimits;
-use crate::pipeline::asset_budget::{AssetBudgetFailure, AssetProcessingContext};
+use crate::pipeline::asset_budget::{AssetBudgetFailure, AssetBudgetStage, AssetProcessingContext};
 use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
-use crate::pipeline::css_dependencies::collect_referenced_assets;
+use crate::pipeline::css_dependencies::{collect_referenced_assets, is_remote_reference};
 use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider};
 use lightningcss::dependencies::DependencyOptions;
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions};
 use lightningcss::targets::Targets;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -134,9 +134,9 @@ impl Drop for RetainedSources {
     }
 }
 
-/// A `SourceProvider` that reads from disk like the built-in `FileProvider` but records every path
-/// it opens, bounds what one `@import` tree may pull in, and can serve one synthetic in-memory
-/// entry. The bundler drives the `@import` graph with `rayon`, so the provider must be
+/// A `SourceProvider` that reads from disk like the built-in `FileProvider`, records every read in
+/// the build's ledger, bounds what one `@import` tree may pull in, and can serve one synthetic
+/// in-memory entry. The bundler drives the `@import` graph with `rayon`, so the provider must be
 /// `Send + Sync`; its state is behind `Mutex`, never a `RefCell`.
 struct TrackingProvider {
     inner: FileProvider,
@@ -147,22 +147,16 @@ struct TrackingProvider {
     /// A virtual entry that `@import`s each reachable stylesheet by absolute path, so N stylesheets
     /// bundle into ONE artifact. `None` when there is a single real entry to bundle directly.
     synthetic: Option<(PathBuf, String)>,
-    read_paths: Mutex<HashSet<PathBuf>>,
-    read_time_fingerprints: Mutex<Vec<FileFingerprint>>,
-    failed_paths: Mutex<Vec<FailedRead>>,
     budget: Mutex<ReadBudget>,
-    /// One ledger for every union/per-sheet attempt in this build. Never optional: production
-    /// safety that a caller can omit is safety the tests will omit.
+    /// The ONE read ledger for every union/per-sheet attempt in this build: every path, snapshot
+    /// and failed read is recorded there and nowhere else. Never optional: production safety that
+    /// a caller can omit is safety the tests will omit.
     context: Arc<AssetProcessingContext>,
 }
 
 impl TrackingProvider {
-    /// The ONE way to build a provider.
-    ///
-    /// There were four: bounded and unbounded, each with and without a synthetic entry. The
-    /// unbounded pair existed only so processor tests could skip the ledger — which meant the
-    /// tests exercised a different code path from production, and the safety context was optional
-    /// exactly where it was load-bearing. Tests now pass a context with test limits instead.
+    /// The ONE way to build a provider. Tests pass a context with test limits rather than a
+    /// different constructor.
     ///
     /// `preloaded` holds only THIS attempt's entries. Everything an earlier attempt read is looked
     /// up on demand through the context, because copying the whole snapshot map per attempt made
@@ -181,9 +175,6 @@ impl TrackingProvider {
                 .map(|asset| (asset.path.clone(), asset))
                 .collect(),
             synthetic,
-            read_paths: Mutex::new(HashSet::new()),
-            read_time_fingerprints: Mutex::new(Vec::new()),
-            failed_paths: Mutex::new(Vec::new()),
             budget: Mutex::new(ReadBudget::default()),
             context,
         }
@@ -233,56 +224,9 @@ impl TrackingProvider {
         Ok(())
     }
 
-    /// The set of real files Lightning CSS read — the entries plus every resolved `@import` child.
-    /// Consumed after bundling is done (the provider must outlive the `StyleSheet`).
-    fn into_read_inputs(self) -> CssReadInputs {
-        let mut paths: Vec<PathBuf> = self
-            .read_paths
-            .into_inner()
-            .expect("css read-path set should not be poisoned")
-            .into_iter()
-            .collect();
-        paths.sort();
-        let mut fingerprints = self
-            .read_time_fingerprints
-            .into_inner()
-            .expect("CSS read-time fingerprint list should not be poisoned");
-        sort_and_dedup_fingerprints(&mut fingerprints);
-        let mut failed_paths = self
-            .failed_paths
-            .into_inner()
-            .expect("CSS failed-path set should not be poisoned")
-            .into_iter()
-            .collect::<Vec<_>>();
-        failed_paths.sort_by(|left, right| left.path.cmp(&right.path));
-        failed_paths.dedup();
-        CssReadInputs {
-            paths,
-            fingerprints,
-            failed_paths,
-        }
-    }
-
-    fn record_read(&self, path: PathBuf, fingerprint: Option<FileFingerprint>) {
-        self.read_paths
-            .lock()
-            .expect("CSS read-path set should not be poisoned")
-            .insert(path);
-        if let Some(fingerprint) = fingerprint {
-            self.read_time_fingerprints
-                .lock()
-                .expect("CSS read-time fingerprint list should not be poisoned")
-                .push(fingerprint);
-        }
-    }
-
-    fn record_failed_read(&self, path: PathBuf, kind: std::io::ErrorKind) {
-        self.failed_paths
-            .lock()
-            .expect("CSS failed-path set should not be poisoned")
-            .push(FailedRead::new(path.clone(), kind));
+    fn record_failed_read(&self, path: &Path, kind: std::io::ErrorKind) {
         self.context
-            .record_failed_path(&path, kind == std::io::ErrorKind::NotFound);
+            .record_failed_path(path, kind == std::io::ErrorKind::NotFound);
     }
 
     fn check_deadline(&self) -> Result<(), std::io::Error> {
@@ -317,10 +261,10 @@ impl SourceProvider for TrackingProvider {
 
         // Canonicalize so a cache key is stable across `..` / symlink spellings of the same file.
         let key = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-        // Record the ATTEMPT before any fallible operation. A missing/broken child is part of why
-        // processing fell back and must not disappear from freshness merely because it had no
-        // bytes to hash.
-        self.record_read(key.clone(), None);
+        // Every outcome below reaches the ledger: a snapshot charge, a metadata reservation, or a
+        // failed read. A missing/broken child is part of why processing fell back and must not
+        // disappear from freshness merely because it had no bytes to hash.
+        //
         // This attempt's own entry first, then anything an earlier attempt already read. Reusing the
         // ledger's snapshot is what keeps a retry measuring the SAME bytes the union measured, and
         // what stops it from charging the same file twice.
@@ -333,7 +277,6 @@ impl SourceProvider for TrackingProvider {
             Some(asset) => {
                 self.context.charge_css_snapshot(&asset)?;
                 self.reserve(asset.bytes().len())?;
-                self.record_read(key.clone(), Some(asset.fingerprint.clone()));
                 let bytes = self.retained_sources.retain_snapshot(asset.bytes_arc());
                 std::str::from_utf8(bytes).map_err(|error| {
                     std::io::Error::new(
@@ -349,7 +292,7 @@ impl SourceProvider for TrackingProvider {
                 let metadata = match std::fs::metadata(&key) {
                     Ok(metadata) => metadata,
                     Err(error) => {
-                        self.record_failed_read(key, error.kind());
+                        self.record_failed_read(&key, error.kind());
                         return Err(error);
                     }
                 };
@@ -364,16 +307,12 @@ impl SourceProvider for TrackingProvider {
                 let bytes = match std::fs::read(&key) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        self.record_failed_read(key, error.kind());
+                        self.record_failed_read(&key, error.kind());
                         return Err(error);
                     }
                 };
                 self.reconcile(reservation, bytes.len())?;
-                let fingerprint = self
-                    .context
-                    .finish_css_read(shared_reservation, &bytes)?
-                    .fingerprint;
-                self.record_read(key.clone(), Some(fingerprint));
+                self.context.finish_css_read(shared_reservation, &bytes)?;
                 let source = String::from_utf8(bytes).map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -392,12 +331,12 @@ impl SourceProvider for TrackingProvider {
         specifier: &str,
         originating_file: &Path,
     ) -> Result<ResolveResult, Self::Error> {
-        // A REMOTE `@import` (`@import url("https://fonts.googleapis.com/…")`) has no file behind it
-        // and is not ours to inline — a real bundler leaves it in the sheet as an import, and so do
-        // we. Reporting it as external keeps the rest of the stylesheet counted; treating it as a
-        // resolve failure would sink the whole set to raw disclosure over a shape ordinary packages
-        // ship.
-        if is_remote_specifier(specifier) {
+        // A REMOTE `@import` (`@import url("https://fonts.googleapis.com/…")`, or any other scheme
+        // such as `data:`) has no file behind it and is not ours to inline — a real bundler leaves
+        // it in the sheet as an import, and so do we. Reporting it as external keeps the rest of
+        // the stylesheet counted; treating it as a resolve failure would sink the whole set to raw
+        // disclosure over a shape ordinary packages ship.
+        if is_remote_reference(specifier) {
             return Ok(ResolveResult::External(specifier.to_owned()));
         }
 
@@ -427,12 +366,6 @@ impl SourceProvider for TrackingProvider {
     }
 }
 
-/// An `@import` that names a network resource rather than a file on disk.
-fn is_remote_specifier(specifier: &str) -> bool {
-    let lower = specifier.trim().to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("//")
-}
-
 /// A reachable stylesheet set processed as it ships: the bundled bytes before and after
 /// minification, plus every file that fed them (for freshness).
 #[derive(Debug)]
@@ -441,9 +374,6 @@ pub struct CssBundle {
     pub raw_bytes: Vec<u8>,
     /// The `@import`-inlined, minified stylesheet: what actually ships, and what gets compressed.
     pub minified_bytes: Vec<u8>,
-    pub read_paths: Vec<PathBuf>,
-    pub read_time_fingerprints: Vec<FileFingerprint>,
-    failed_paths: Vec<FailedRead>,
     /// Supported local artifacts referenced by the CSS that survives minification. They are
     /// separate emitted files, so the caller processes and compresses them independently.
     pub referenced_assets: Vec<CollectedAsset>,
@@ -465,85 +395,36 @@ pub struct CssBundle {
     pub dependency_external: Vec<String>,
 }
 
-/// A read that failed, and WHY — because the two reasons must not be treated alike.
-///
-/// A file that simply is not there is a deterministic fact about the package: it will keep not being
-/// there until someone creates it, and creating it invalidates the result through the never-fresh
-/// sentinel below. A permission error, a lock, or a file deleted mid-build is a fact about this
-/// machine at this moment.
-///
-/// Both must stay never-fresh. Only the second may contribute the request-local `asset_io` stage —
-/// conflating them meant one missing `@import` target refused the WHOLE asset result from every
-/// durable store, so the package was re-measured on every keystroke over a file nobody was going to
-/// create. One collection rather than two parallel ones: two vectors that must agree is the shape
-/// that drifts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FailedRead {
-    path: PathBuf,
-    missing: bool,
-}
-
-impl FailedRead {
-    fn new(path: PathBuf, kind: std::io::ErrorKind) -> Self {
-        Self {
-            missing: kind == std::io::ErrorKind::NotFound,
-            path,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct CssReadInputs {
-    paths: Vec<PathBuf>,
-    fingerprints: Vec<FileFingerprint>,
-    failed_paths: Vec<FailedRead>,
-}
-
-impl CssReadInputs {
-    fn extend(&mut self, other: Self) {
-        self.paths.extend(other.paths);
-        self.fingerprints.extend(other.fingerprints);
-        self.failed_paths.extend(other.failed_paths);
-    }
-}
-
+/// Why a stylesheet attempt failed. What it read is in the build's ledger, not here: a read failure
+/// that makes the result request-local is derived from the ledger's sentinels (see
+/// [`asset_io_diagnostic`]).
 #[derive(Debug)]
 struct CssProcessingError {
     message: String,
-    inputs: CssReadInputs,
     non_durable_stages: BTreeSet<&'static str>,
 }
 
 impl CssProcessingError {
-    fn from_transform(message: String, inputs: CssReadInputs) -> Self {
-        let mut non_durable_stages = BTreeSet::new();
-        if inputs.failed_paths.iter().any(|failed| !failed.missing) {
-            non_durable_stages.insert(crate::engine::stage::ASSET_IO);
-        }
+    fn from_transform(message: String) -> Self {
         Self {
             message,
-            inputs,
-            non_durable_stages,
+            non_durable_stages: BTreeSet::new(),
         }
     }
 
-    fn from_compression(message: String, inputs: CssReadInputs) -> Self {
-        let mut error = Self::from_transform(message, inputs);
-        error
-            .non_durable_stages
-            .insert(crate::pipeline::stage::COMPRESSION);
-        error
+    fn from_compression(message: String) -> Self {
+        Self {
+            message,
+            non_durable_stages: BTreeSet::from([crate::pipeline::stage::COMPRESSION]),
+        }
     }
 }
 
 /// Bundle one stylesheet the way it ships: resolve its `@import` tree from disk into one
-/// stylesheet, minify with deterministic (target-free) output, and print. Returns the bytes and the
-/// set of files read. Any failure is an `Err`; the caller falls back to raw-byte disclosure so the
-/// result never drops below today's behavior.
+/// stylesheet, minify with deterministic (target-free) output, and print. Any failure is an `Err`;
+/// the caller falls back to raw-byte disclosure.
 ///
-/// Test-only, and it builds a REAL ledger rather than skipping one. There used to be an unbounded
-/// path here so processor tests could avoid constructing a context, which meant the tests measured
-/// through code production never runs — the one place where "it passed in tests" is worth least.
+/// Test-only, and it builds a REAL ledger rather than skipping one.
 #[cfg(test)]
 pub fn bundle_css(entry: &Path) -> Result<CssBundle, String> {
     let asset = read_collected_asset(entry, AssetKind::Css)
@@ -589,17 +470,7 @@ fn bundle_collected_css(
     context: Arc<AssetProcessingContext>,
 ) -> Result<CssBundle, CssProcessingError> {
     let provider = TrackingProvider::new(std::slice::from_ref(entry), None, context);
-    let result = bundle_with(&provider, &entry.path);
-    let inputs = provider.into_read_inputs();
-    match result {
-        Ok(mut bundle) => {
-            bundle.read_paths = inputs.paths;
-            bundle.read_time_fingerprints = inputs.fingerprints;
-            bundle.failed_paths = inputs.failed_paths;
-            Ok(bundle)
-        }
-        Err(message) => Err(CssProcessingError::from_transform(message, inputs)),
-    }
+    bundle_with(&provider, &entry.path).map_err(CssProcessingError::from_transform)
 }
 
 /// Bundle EVERY reachable stylesheet into one artifact, which is how CSS ships and how the esbuild
@@ -624,11 +495,9 @@ fn bundle_collected_css_set(
     context: Arc<AssetProcessingContext>,
 ) -> Result<CssBundle, CssProcessingError> {
     match entries {
-        [] => Err(CssProcessingError {
-            message: "no stylesheets to bundle".to_owned(),
-            inputs: CssReadInputs::default(),
-            non_durable_stages: BTreeSet::new(),
-        }),
+        [] => Err(CssProcessingError::from_transform(
+            "no stylesheets to bundle".to_owned(),
+        )),
         [single] => bundle_collected_css(single, context),
         many => {
             let paths = many
@@ -637,17 +506,7 @@ fn bundle_collected_css_set(
                 .collect::<Vec<_>>();
             let (path, content) = synthetic_entry(&paths);
             let provider = TrackingProvider::new(many, Some((path.clone(), content)), context);
-            let result = bundle_with(&provider, &path);
-            let inputs = provider.into_read_inputs();
-            match result {
-                Ok(mut bundle) => {
-                    bundle.read_paths = inputs.paths;
-                    bundle.read_time_fingerprints = inputs.fingerprints;
-                    bundle.failed_paths = inputs.failed_paths;
-                    Ok(bundle)
-                }
-                Err(message) => Err(CssProcessingError::from_transform(message, inputs)),
-            }
+            bundle_with(&provider, &path).map_err(CssProcessingError::from_transform)
         }
     }
 }
@@ -763,6 +622,7 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
         .map(|result| {
             let dependencies = collect_referenced_assets(
                 result.dependencies.unwrap_or_default(),
+                &|path| provider.context.observe_metadata(path),
                 &|path, kind| provider.read_referenced_asset(path, kind),
                 &|| provider.should_continue_dependency_reads(),
             );
@@ -815,9 +675,6 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
     Ok(CssBundle {
         raw_bytes,
         minified_bytes,
-        read_paths: Vec::new(),
-        read_time_fingerprints: Vec::new(),
-        failed_paths: Vec::new(),
         referenced_assets,
         referenced_failures,
         referenced_uncounted,
@@ -835,11 +692,10 @@ pub struct ProcessedAssets {
     /// children and supported local `url()` artifacts. Without these in freshness, editing one
     /// would not invalidate the size it fed.
     pub read_paths: Vec<PathBuf>,
-    /// Fingerprints captured by the same reads that supplied every measured asset byte.
+    /// The build ledger's observations: fingerprints captured by the same reads that supplied every
+    /// measured asset byte, plus a sentinel for every failed read. A later success in the same
+    /// union/retry flow does not erase a failure: that mixed observation cannot be reused.
     pub read_time_fingerprints: Vec<FileFingerprint>,
-    /// Paths whose read failed during any attempt. A later success in the same union/retry flow
-    /// does not erase the failure: that mixed observation cannot produce a reusable cache entry.
-    failed_paths: Vec<FailedRead>,
     /// Assets that could NOT be processed, disclosed with their raw bytes exactly as before.
     pub uncounted: Vec<UncountedAsset>,
     /// Why each of those fell back, for the diagnostic.
@@ -895,60 +751,27 @@ impl ProcessedAssets {
         !self.uncounted.is_empty() || !self.css_dependency_omissions.is_empty()
     }
 
-    /// Exact asset fingerprints plus never-fresh sentinels for attempted paths that supplied no
-    /// bytes. Both Import Cost and File Cost consume this one normalization so neither can silently
-    /// drop an unreadable CSS child or resource from freshness.
+    /// Every observation the build's ledger made: exact snapshots, stat-only observations, and a
+    /// sentinel for each failed read (absent while a missing file stays missing, unverifiable for
+    /// any other failure). Both Import Cost and File Cost consume this one set.
     pub fn freshness_fingerprints(&self) -> Vec<FileFingerprint> {
         let mut fingerprints = self.read_time_fingerprints.clone();
-        let fingerprinted = fingerprints
-            .iter()
-            .map(|fingerprint| fingerprint.path.clone())
-            .collect::<HashSet<_>>();
-        // A path that was MISSING gets the absent sentinel: fresh while it stays missing, stale
-        // the moment it appears. A path that failed for any other reason stays unverifiable, which
-        // is never fresh, because we cannot say what state it was in.
-        let mut absent_paths = self
-            .failed_paths
-            .iter()
-            .filter(|failed| failed.missing)
-            .map(|failed| failed.path.clone())
-            .collect::<Vec<_>>();
-        absent_paths.sort();
-        absent_paths.dedup();
-        let missing = absent_paths.iter().cloned().collect::<HashSet<_>>();
-        fingerprints.extend(
-            absent_paths
-                .into_iter()
-                .map(crate::cache::key::absent_file_fingerprint),
-        );
-        let mut failed_paths = self
-            .failed_paths
-            .iter()
-            .filter(|failed| !failed.missing)
-            .map(|failed| failed.path.clone())
-            .collect::<Vec<_>>();
-        // Defensive inference for any future processor that records an attempted path but forgets
-        // to classify the failed read explicitly. Explicit failures remain even if another attempt
-        // later fingerprinted the same path.
-        // A path already recorded as absent is excluded: giving it the unverifiable sentinel too
-        // would put two different sentinels on one path, which reads as a conflicting observation
-        // and refuses the whole result — the exact reuse this fix exists to restore.
-        failed_paths.extend(
-            self.read_paths
-                .iter()
-                .filter(|path| !fingerprinted.contains(&path.to_string_lossy().replace('\\', "/")))
-                .filter(|path| !missing.contains(*path))
-                .cloned(),
-        );
-        failed_paths.sort();
-        failed_paths.dedup();
-        fingerprints.extend(
-            failed_paths
-                .into_iter()
-                .map(crate::cache::key::unverifiable_file_fingerprint),
-        );
         sort_and_dedup_fingerprints(&mut fingerprints);
         fingerprints
+    }
+
+    /// Inputs whose read failed for a reason other than absence: a moment on this machine, which
+    /// makes the result request-local.
+    fn unreadable_inputs(&self) -> Vec<String> {
+        let mut paths = self
+            .read_time_fingerprints
+            .iter()
+            .filter(|fingerprint| crate::cache::key::fingerprint_is_unverifiable(fingerprint))
+            .map(|fingerprint| fingerprint.path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
     }
 }
 
@@ -1041,17 +864,10 @@ fn external_css_resources_diagnostic(processed: &ProcessedAssets) -> Option<Impo
 }
 
 fn asset_io_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
-    let mut paths = processed
-        .failed_paths
-        .iter()
-        .filter(|failed| !failed.missing)
-        .map(|failed| failed.path.clone())
-        .collect::<Vec<_>>();
+    let paths = processed.unreadable_inputs();
     if paths.is_empty() {
         return None;
     }
-    paths.sort();
-    paths.dedup();
     Some(ImportDiagnostic {
         stage: crate::engine::stage::ASSET_IO.to_owned(),
         message: "one or more asset inputs could not be read during this analysis; the result \
@@ -1059,7 +875,7 @@ fn asset_io_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> 
             .to_owned(),
         details: paths
             .iter()
-            .map(|path| format!("unreadable asset input: {}", path.display()))
+            .map(|path| format!("unreadable asset input: {path}"))
             .collect(),
     })
 }
@@ -1155,38 +971,29 @@ pub fn process_assets_bounded(
     .map_err(boundary_failure)?
 }
 
-/// Process every reachable asset the build collected, the way each really ships.
-///
-/// Never fails on an asset it cannot process: that falls back to the raw-byte disclosure that was
-/// the whole behaviour before B2, so the result is a strict improvement or a tie. It DOES fail when
-/// the shared build ledger is exhausted, which is a fact about the build rather than about any one
-/// asset.
-/// Fold a resource-ledger breach into the result as a DISCLOSURE rather than an error.
+/// A resource-ledger breach as a DISCLOSURE rather than an error: every collected asset at its raw
+/// size, none counted, with the observations that expire it.
 ///
 /// The import's JavaScript is measured before this stage runs, so failing the stage throws away a
-/// complete measurement and reports the whole import Unmeasured — below the pre-B2 floor FR-018a
-/// promises never to go under. A breach is exactly what a disclosure is for: the number stands, and
-/// it says what it could not reach. Freshness travels with it, so the result still invalidates when
-/// the files it did observe change.
+/// complete measurement and reports the whole import Unmeasured, below the pre-B2 floor FR-018a
+/// promises never to go under. The number stands and says what it could not reach.
 fn disclose_budget_breach(
-    processed: &mut ProcessedAssets,
     assets: &[CollectedAsset],
     failure: AssetBudgetFailure,
-) {
-    processed.read_paths.extend(failure.read_paths);
-    processed
-        .read_time_fingerprints
-        .extend(failure.read_time_fingerprints);
-    processed.failures.push(failure.message);
-    processed.uncounted.extend(
-        assets
+) -> ProcessedAssets {
+    let mut processed = ProcessedAssets {
+        read_paths: failure.read_paths,
+        read_time_fingerprints: failure.read_time_fingerprints,
+        failures: vec![failure.message],
+        uncounted: assets
             .iter()
-            .filter(|asset| asset.kind == AssetKind::Css)
             .map(|asset| UncountedAsset {
                 path: asset.path.clone(),
                 bytes: asset.raw_bytes(),
-            }),
-    );
+            })
+            .collect(),
+        ..ProcessedAssets::default()
+    };
     if processed.uncounted.is_empty() {
         // Nothing sizeable to disclose, but bytes were still left unread. Without this the result
         // would read complete, which is the one thing a breach must never let it do.
@@ -1196,70 +1003,66 @@ fn disclose_budget_breach(
                 .to_owned(),
         );
     }
+    processed
 }
 
+/// Process every reachable asset the build collected, the way each really ships.
+///
+/// Never fails on an asset it cannot process: that falls back to the raw-byte disclosure that was
+/// the whole behaviour before B2. A breach of the shared ledger, whenever it is detected, is a
+/// deterministic fact about the build and becomes [`disclose_budget_breach`]'s floor. Only the
+/// deadline fails the stage, because a timeout is request-local and must never be cached.
 fn process_assets(
     assets: &[CollectedAsset],
     context: Arc<AssetProcessingContext>,
 ) -> Result<ProcessedAssets, AssetBudgetFailure> {
     let mut processed = ProcessedAssets::default();
-    if let Some(failure) = context.failure() {
-        disclose_budget_breach(&mut processed, assets, failure);
-        return Ok(processed);
+    if context.failure().is_none() {
+        count_assets(assets, &mut processed, &context);
     }
-    if assets.is_empty() {
-        return Ok(processed);
+    match context.failure() {
+        None => {}
+        Some(failure) if failure.stage == AssetBudgetStage::Timeout => return Err(failure),
+        Some(failure) => return Ok(disclose_budget_breach(assets, failure)),
     }
 
-    let referenced_assets = process_stylesheets(assets, &mut processed, context.clone())?;
+    // Freshness is the ledger's whole history, so a later successful retry cannot erase an earlier
+    // conflicting or failed observation of the same path.
+    processed.read_paths = context.read_paths();
+    processed.read_time_fingerprints = context.freshness_fingerprints();
+    processed
+        .contributions
+        .sort_by_key(|contribution| contribution.kind);
+    Ok(processed)
+}
+
+/// Count every asset into `processed`, stopping as soon as the shared ledger records a failure.
+/// Partial work is left for [`process_assets`] to discard.
+fn count_assets(
+    assets: &[CollectedAsset],
+    processed: &mut ProcessedAssets,
+    context: &Arc<AssetProcessingContext>,
+) {
+    let referenced_assets = process_stylesheets(assets, processed, context.clone());
+    if context.failure().is_some() {
+        return;
+    }
     let mut assets_by_path: BTreeMap<PathBuf, CollectedAsset> = assets
         .iter()
         .cloned()
         .map(|asset| (asset.path.clone(), asset))
         .collect();
+    // One emitted file per path. Every observation of it is already in the ledger, so a resource
+    // that changed between a direct graph load and CSS dependency analysis still leaves two
+    // conflicting fingerprints behind and the run is not reused.
     for asset in referenced_assets {
-        processed.read_paths.push(asset.path.clone());
-        // Count one emitted file per path, but retain every observation. If the same resource
-        // changed between a direct graph load and CSS dependency analysis (or between per-sheet
-        // retries), the conflicting fingerprints make this run non-reusable instead of silently
-        // blessing whichever snapshot won the byte deduplication.
-        processed
-            .read_time_fingerprints
-            .push(asset.fingerprint.clone());
         assets_by_path.entry(asset.path.clone()).or_insert(asset);
     }
     let all_assets: Vec<CollectedAsset> = assets_by_path.into_values().collect();
 
-    processed
-        .read_paths
-        .extend(all_assets.iter().map(|asset| asset.path.clone()));
-    processed
-        .read_time_fingerprints
-        .extend(all_assets.iter().map(|asset| asset.fingerprint.clone()));
-
     for kind in [AssetKind::Wasm, AssetKind::Font] {
-        process_binary_kind(&all_assets, kind, &mut processed, &context)?;
+        process_binary_kind(&all_assets, kind, processed, context);
     }
-
-    // The shared ledger also observes metadata reservations that fail before a provider read and
-    // exact snapshots served across retry providers. Merge that whole history on success so a
-    // later successful retry cannot erase an earlier conflicting/failed observation from cache
-    // freshness merely because both used the same path.
-    processed.read_paths.extend(context.read_paths());
-    processed
-        .read_time_fingerprints
-        .extend(context.freshness_fingerprints());
-
-    processed
-        .contributions
-        .sort_by_key(|contribution| contribution.kind);
-    processed.read_paths.sort();
-    processed.read_paths.dedup();
-    sort_and_dedup_fingerprints(&mut processed.read_time_fingerprints);
-    if let Some(failure) = context.failure() {
-        return Err(failure);
-    }
-    Ok(processed)
 }
 
 /// The settled result of bundling the stylesheet set, named rather than a bare tuple so that the
@@ -1269,10 +1072,8 @@ struct StylesheetOutcome {
     /// Why individual sheets fell back, one per entry in `uncounted`.
     failures: Vec<String>,
     uncounted: Vec<UncountedAsset>,
-    /// Inputs observed by failed union/per-sheet attempts. Successful bundles carry their own.
-    observed_inputs: CssReadInputs,
     /// A request-local cause stays sticky across the union/per-sheet retry. A later success must
-    /// not turn an earlier filesystem/compressor failure into a reusable package fact.
+    /// not turn an earlier compressor failure into a reusable package fact.
     non_durable_stages: BTreeSet<&'static str>,
     /// `Some(union error)` when the set was measured one sheet at a time.
     degraded: Option<String>,
@@ -1288,14 +1089,14 @@ fn process_stylesheets(
     assets: &[CollectedAsset],
     processed: &mut ProcessedAssets,
     context: Arc<AssetProcessingContext>,
-) -> Result<Vec<CollectedAsset>, AssetBudgetFailure> {
+) -> Vec<CollectedAsset> {
     let entries: Vec<CollectedAsset> = assets
         .iter()
         .filter(|asset| asset.kind == AssetKind::Css)
         .cloned()
         .collect();
     if entries.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     // One artifact for the whole set is the right answer (it is how CSS ships, and it dedupes what
@@ -1322,7 +1123,6 @@ fn process_stylesheets(
             counted: vec![counted],
             failures: Vec::new(),
             uncounted: Vec::new(),
-            observed_inputs: CssReadInputs::default(),
             non_durable_stages: BTreeSet::new(),
             degraded: None,
         })
@@ -1344,7 +1144,6 @@ fn process_stylesheets(
 
             let CssProcessingError {
                 message: union_message,
-                inputs: mut observed_inputs,
                 mut non_durable_stages,
             } = union_error;
             let mut counted = Vec::new();
@@ -1361,7 +1160,6 @@ fn process_stylesheets(
                     Ok(bundled) => counted.push(bundled),
                     Err(error) => {
                         failures.push(error.message);
-                        observed_inputs.extend(error.inputs);
                         non_durable_stages.extend(error.non_durable_stages);
                         uncounted.push(UncountedAsset {
                             path: entry.path.clone(),
@@ -1376,7 +1174,6 @@ fn process_stylesheets(
             if counted.is_empty() {
                 return Err(CssProcessingError {
                     message: union_message,
-                    inputs: observed_inputs,
                     non_durable_stages,
                 });
             }
@@ -1384,7 +1181,6 @@ fn process_stylesheets(
                 counted,
                 failures,
                 uncounted,
-                observed_inputs,
                 non_durable_stages,
                 // Sheets DID count here, so `uncounted` may well be empty and the uncounted
                 // disclosure silent. This is what makes the over-count speakable.
@@ -1392,9 +1188,9 @@ fn process_stylesheets(
             })
         });
 
-    if let Some(failure) = context.failure() {
-        disclose_budget_breach(processed, assets, failure);
-        return Ok(Vec::new());
+    // A ledger failure settles the whole stage; `process_assets` owns its one disclosure.
+    if context.failure().is_some() {
+        return Vec::new();
     }
 
     let mut referenced_assets = Vec::new();
@@ -1403,15 +1199,9 @@ fn process_stylesheets(
             counted,
             failures,
             uncounted,
-            observed_inputs,
             non_durable_stages,
             degraded,
         }) => {
-            processed.read_paths.extend(observed_inputs.paths);
-            processed
-                .read_time_fingerprints
-                .extend(observed_inputs.fingerprints);
-            processed.failed_paths.extend(observed_inputs.failed_paths);
             processed.non_durable_stages.extend(non_durable_stages);
             processed.failures.extend(failures);
             processed.uncounted.extend(uncounted);
@@ -1427,41 +1217,15 @@ fn process_stylesheets(
                 zstd_bytes: 0,
             };
             for (bundle, compressed) in counted {
-                // Only a TRANSIENT failure makes the result request-local. A missing file is a
-                // deterministic fact about the package and stays cacheable.
-                let had_asset_io = bundle.failed_paths.iter().any(|failed| !failed.missing)
-                    || bundle
-                        .referenced_failures
-                        .iter()
-                        .any(|failure| failure.kind != std::io::ErrorKind::NotFound);
                 css.raw_bytes += bundle.raw_bytes.len() as u64;
                 css.minified_bytes += bundle.minified_bytes.len() as u64;
                 css.gzip_bytes += compressed.gzip_bytes;
                 css.brotli_bytes += compressed.brotli_bytes;
                 css.zstd_bytes += compressed.zstd_bytes;
-                processed.read_paths.extend(bundle.read_paths);
-                processed
-                    .read_time_fingerprints
-                    .extend(bundle.read_time_fingerprints);
-                processed.failed_paths.extend(bundle.failed_paths);
-                if had_asset_io {
-                    processed
-                        .non_durable_stages
-                        .insert(crate::engine::stage::ASSET_IO);
-                }
                 referenced_assets.extend(bundle.referenced_assets);
+                // The failed read itself is already in the ledger, under the sentinel its reason
+                // earns; only the disclosure is added here.
                 for failure in bundle.referenced_failures {
-                    processed.read_paths.push(failure.path.clone());
-                    // Classify by the REAL reason. A `url()` target that is simply absent is a
-                    // deterministic fact about the package: it takes the absent-state sentinel and
-                    // stays cacheable, so supplying the file is what invalidates the result.
-                    // Hardcoding "not missing" here would make such a package permanently
-                    // unverifiable — rebuilt on every keystroke over a file nobody is going to
-                    // create — and put a second, conflicting sentinel on any path the snapshot half
-                    // records correctly.
-                    processed
-                        .failed_paths
-                        .push(FailedRead::new(failure.path.clone(), failure.kind));
                     processed.failures.push(failure.message);
                     processed.uncounted.push(UncountedAsset {
                         path: failure.path,
@@ -1488,11 +1252,6 @@ fn process_stylesheets(
             processed.contributions.push(css);
         }
         Err(error) => {
-            processed.read_paths.extend(error.inputs.paths);
-            processed
-                .read_time_fingerprints
-                .extend(error.inputs.fingerprints);
-            processed.failed_paths.extend(error.inputs.failed_paths);
             processed
                 .non_durable_stages
                 .extend(error.non_durable_stages);
@@ -1509,7 +1268,7 @@ fn process_stylesheets(
         }
     }
 
-    Ok(referenced_assets)
+    referenced_assets
 }
 
 /// Compress a bundled stylesheet as its own artifact — never concatenated with anything else first,
@@ -1530,38 +1289,17 @@ fn compress_bundle_with(
     context: &AssetProcessingContext,
     compress: &dyn Fn(&[u8]) -> Result<CompressionSizes, String>,
 ) -> Result<(CssBundle, CompressionSizes), CssProcessingError> {
-    context.check_deadline().map_err(|error| {
-        CssProcessingError::from_transform(error.to_string(), CssReadInputs::default())
-    })?;
+    let deadline_error =
+        |error: std::io::Error| CssProcessingError::from_transform(error.to_string());
+    context.check_deadline().map_err(deadline_error)?;
     match compress(&bundle.minified_bytes) {
         Ok(compressed) => {
-            context.check_deadline().map_err(|error| {
-                CssProcessingError::from_transform(error.to_string(), CssReadInputs::default())
-            })?;
+            context.check_deadline().map_err(deadline_error)?;
             Ok((bundle, compressed))
         }
-        Err(error) => {
-            let mut inputs = CssReadInputs {
-                paths: bundle.read_paths,
-                fingerprints: bundle.read_time_fingerprints,
-                failed_paths: bundle.failed_paths,
-            };
-            for asset in bundle.referenced_assets {
-                inputs.paths.push(asset.path.clone());
-                inputs.fingerprints.push(asset.fingerprint);
-            }
-            for failure in bundle.referenced_failures {
-                inputs.paths.push(failure.path.clone());
-                inputs.failed_paths.push(FailedRead {
-                    path: failure.path,
-                    missing: false,
-                });
-            }
-            Err(CssProcessingError::from_compression(
-                format!("failed to compress the bundled stylesheet: {error}"),
-                inputs,
-            ))
-        }
+        Err(error) => Err(CssProcessingError::from_compression(format!(
+            "failed to compress the bundled stylesheet: {error}"
+        ))),
     }
 }
 
@@ -1570,25 +1308,25 @@ fn process_binary_kind(
     kind: AssetKind,
     processed: &mut ProcessedAssets,
     context: &AssetProcessingContext,
-) -> Result<(), AssetBudgetFailure> {
-    process_binary_kind_with(assets, kind, processed, context, &compress_asset_bytes)
+) {
+    process_binary_kind_with(assets, kind, processed, context, &compress_asset_bytes);
 }
 
+/// An expired deadline stops the loop; the context retains the typed failure for
+/// [`process_assets`] to settle.
 fn process_binary_kind_with(
     assets: &[CollectedAsset],
     kind: AssetKind,
     processed: &mut ProcessedAssets,
     context: &AssetProcessingContext,
     compress: &dyn Fn(&[u8]) -> Result<CompressionSizes, String>,
-) -> Result<(), AssetBudgetFailure> {
+) {
     let mut sizes = MeasuredSizes::ZERO;
     let mut counted = false;
 
     for asset in assets.iter().filter(|asset| asset.kind == kind) {
         if context.check_deadline().is_err() {
-            return Err(context
-                .failure()
-                .expect("an expired asset deadline must retain a typed failure"));
+            return;
         }
         let measured = compress(asset.bytes())
             .map_err(|error| format!("failed to compress {}: {error}", asset.path.display()))
@@ -1616,9 +1354,7 @@ fn process_binary_kind_with(
             }
         }
         if context.check_deadline().is_err() {
-            return Err(context
-                .failure()
-                .expect("an expired asset deadline must retain a typed failure"));
+            return;
         }
     }
 
@@ -1632,7 +1368,6 @@ fn process_binary_kind_with(
             zstd_bytes: sizes.zstd_bytes,
         });
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1722,22 +1457,14 @@ mod tests {
             "the unminified print must be larger than the minified one",
         );
         // Both the entry and the @import child are captured for cache freshness.
-        assert!(
-            bundle
-                .read_paths
-                .iter()
-                .any(|path| path.ends_with("index.css")),
-            "the entry must be captured: {:?}",
-            bundle.read_paths,
-        );
-        assert!(
-            bundle
-                .read_paths
-                .iter()
-                .any(|path| path.ends_with("child.css")),
-            "the @import child must be captured: {:?}",
-            bundle.read_paths,
-        );
+        let processed = process_assets_for_test(&[css_asset(&fixture.path("index.css"))]);
+        for name in ["index.css", "child.css"] {
+            assert!(
+                processed.read_paths.iter().any(|path| path.ends_with(name)),
+                "{name} must be captured: {:?}",
+                processed.read_paths,
+            );
+        }
     }
 
     #[test]
@@ -2023,26 +1750,52 @@ mod tests {
             1,
             "the unreadable target must be recorded: {bundle:?}"
         );
-        assert_eq!(
-            bundle.referenced_failures[0].kind,
-            std::io::ErrorKind::NotFound,
-            "the reason must survive to the caller, which is what selects the sentinel: {bundle:?}"
-        );
 
-        // The sentinel the caller derives from that reason: absent, not unverifiable. Absent is
-        // fresh only while the file stays missing and goes stale the moment it appears.
-        let mut processed = ProcessedAssets::default();
-        for failure in &bundle.referenced_failures {
-            processed
-                .failed_paths
-                .push(FailedRead::new(failure.path.clone(), failure.kind));
-        }
+        // Absent, not unverifiable: fresh only while the file stays missing, stale the moment it
+        // appears, and never the request-local `asset_io`.
+        let processed = process_assets_for_test(&[css_asset(&fixture.path("index.css"))]);
         let fingerprints = processed.freshness_fingerprints();
-        assert_eq!(fingerprints.len(), 1, "{fingerprints:?}");
-        assert_eq!(
-            fingerprints[0],
-            crate::cache::key::absent_file_fingerprint(bundle.referenced_failures[0].path.clone()),
+        assert!(
+            fingerprints.contains(&crate::cache::key::absent_file_fingerprint(
+                bundle.referenced_failures[0].path.clone()
+            )),
             "a missing target takes the absent-state sentinel: {fingerprints:?}"
+        );
+        assert!(
+            crate::cache::key::fingerprints_are_reusable(&fingerprints),
+            "an absence must not refuse the cache: {fingerprints:?}"
+        );
+        assert!(
+            asset_io_diagnostic(&processed).is_none(),
+            "an absence is not a filesystem incident: {processed:?}"
+        );
+    }
+
+    /// `@import` and `url()` share one remote predicate, so an `@import` with any URL scheme is left
+    /// in the sheet rather than joined onto the sheet's directory as a file that cannot be read.
+    #[test]
+    fn a_data_import_is_external_and_does_not_sink_the_stylesheet() {
+        let fixture = Fixture::new(
+            "data-import",
+            &[(
+                "index.css",
+                "@import url(\"data:text/css,.inline{color:red}\");\n.a { color: blue }\n",
+            )],
+        );
+        let assets = vec![css_asset(&fixture.path("index.css"))];
+
+        let processed = process_assets_for_test(&assets);
+
+        assert!(
+            processed.uncounted.is_empty() && asset_diagnostics(&processed).is_empty(),
+            "a data: @import names no file: {processed:?}"
+        );
+        assert!(
+            processed
+                .contributions
+                .iter()
+                .any(|contribution| contribution.kind == AssetKind::Css),
+            "the stylesheet must be counted: {processed:?}"
         );
     }
 
@@ -2235,17 +1988,12 @@ mod tests {
         );
     }
 
-    /// When the union AND every per-sheet retry fail, each stylesheet must be disclosed ONCE. The
-    /// retry used to report each failure as it went and then hand back an error, so the outer arm
-    /// disclosed them all a second time and the diagnostic doubled its own count and byte total — a
-    /// wrong number in the one place that exists to be honest about what is missing.
     /// A resource-ledger breach must not cost the import its JavaScript.
     ///
     /// That measurement is already complete when this stage runs, so failing the stage reports the
     /// whole import Unmeasured for a package whose code measured perfectly — and the verdict is
     /// durable, so it is cached rather than retried. Disclosing the bytes the breach could not reach
     /// IS the pre-B2 floor: the number stands and says what is missing from it.
-
     #[test]
     fn a_ledger_breach_discloses_the_stylesheet_rather_than_failing_the_import() {
         let fixture = Fixture::new("breach", &[("index.css", ".a { color: red }\n")]);
@@ -2274,6 +2022,65 @@ mod tests {
         );
     }
 
+    /// The same floor when the breach is detected MID-RUN rather than when the ledger is built: the
+    /// union reads its way past the build-wide CSS work limit. Every collected asset is disclosed
+    /// exactly once, a direct font included, and nothing is counted.
+    #[test]
+    fn a_ledger_breach_during_processing_discloses_every_asset_once() {
+        let fixture = Fixture::new(
+            "midrun-breach",
+            &[
+                ("a-child.css", ".a-child { color: red }\n"),
+                ("b-child.css", ".b-child { color: blue }\n"),
+                ("a.css", "@import \"./a-child.css\";\n.a { color: red }\n"),
+                ("b.css", "@import \"./b-child.css\";\n.b { color: blue }\n"),
+            ],
+        );
+        let font_path = fixture.write_bytes("probe.woff2", &[0x51; 64]);
+        let assets = vec![
+            css_asset(&fixture.path("a.css")),
+            css_asset(&fixture.path("b.css")),
+            read_collected_asset(&font_path, AssetKind::Font).expect("font snapshot"),
+        ];
+        let context = test_context_with(&assets, AssetBudgetLimits::css_work_reads(3));
+        assert!(
+            context.failure().is_none(),
+            "the premise is a ledger that breaches during processing, not at construction"
+        );
+
+        let processed = process_assets(&assets, context)
+            .expect("a ledger breach must not fail the asset stage");
+
+        assert!(
+            processed.contributions.is_empty(),
+            "a breached stage counts nothing: {processed:?}"
+        );
+        let mut disclosed = processed
+            .uncounted
+            .iter()
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>();
+        disclosed.sort();
+        let mut expected = assets
+            .iter()
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            disclosed, expected,
+            "each asset exactly once: {processed:?}"
+        );
+        assert!(
+            processed
+                .failures
+                .iter()
+                .any(|failure| failure.contains("CSS read")),
+            "the breach is named: {processed:?}"
+        );
+    }
+
+    /// When the union AND every per-sheet retry fail, each stylesheet is disclosed exactly once, so
+    /// the disclosure cannot double its own count and byte total.
     #[test]
     fn a_set_where_every_stylesheet_fails_discloses_each_of_them_exactly_once() {
         let fixture = Fixture::new(
@@ -2411,20 +2218,14 @@ mod tests {
     fn a_failed_css_read_remains_unverifiable_after_a_later_success() {
         let fixture = Fixture::new("failed-then-readable", &[]);
         let child = fixture.path("created.css");
-        let provider = TrackingProvider::new(&[], None, test_context(&[]));
+        let context = test_context(&[]);
+        let provider = TrackingProvider::new(&[], None, context.clone());
 
         assert!(provider.read(&child).is_err(), "the first read is missing");
         fixture.write("created.css", ".created { color: red }");
         assert!(provider.read(&child).is_ok(), "the retry can read it");
 
-        let inputs = provider.into_read_inputs();
-        let processed = ProcessedAssets {
-            read_paths: inputs.paths,
-            read_time_fingerprints: inputs.fingerprints,
-            failed_paths: inputs.failed_paths,
-            ..ProcessedAssets::default()
-        };
-        let freshness = processed.freshness_fingerprints();
+        let freshness = context.freshness_fingerprints();
 
         // Asserts the INVARIANT rather than which sentinel carries it. This run saw one path in two
         // states — absent, then present with bytes — and a run that disagrees with itself cannot be
@@ -2446,9 +2247,6 @@ mod tests {
         let bundle = CssBundle {
             raw_bytes: b".a { color: red }".to_vec(),
             minified_bytes: b".a{color:red}".to_vec(),
-            read_paths: Vec::new(),
-            read_time_fingerprints: Vec::new(),
-            failed_paths: Vec::new(),
             referenced_assets: Vec::new(),
             referenced_failures: Vec::new(),
             referenced_uncounted: Vec::new(),
@@ -2485,8 +2283,7 @@ mod tests {
             &mut processed,
             &test_context(&[]),
             &|_| Err("injected failure".to_owned()),
-        )
-        .expect("a per-asset compressor failure falls back instead of aborting the stage");
+        );
 
         assert_eq!(processed.uncounted.len(), 1);
         assert!(processed.contributions.is_empty());
@@ -2525,11 +2322,15 @@ mod tests {
             1,
             "a stylesheet both sheets @import must be inlined ONCE, not counted twice: {css}",
         );
+        let processed = process_assets_for_test(&[
+            css_asset(&fixture.path("a.css")),
+            css_asset(&fixture.path("b.css")),
+        ]);
         for name in ["shared.css", "a.css", "b.css"] {
             assert!(
-                bundle.read_paths.iter().any(|path| path.ends_with(name)),
+                processed.read_paths.iter().any(|path| path.ends_with(name)),
                 "{name} must be captured for freshness: {:?}",
-                bundle.read_paths,
+                processed.read_paths,
             );
         }
     }

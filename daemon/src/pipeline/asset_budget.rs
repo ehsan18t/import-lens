@@ -52,6 +52,16 @@ impl AssetBudgetLimits {
         }
     }
 
+    /// Production limits with a build-wide CSS work ledger of `reads`, so a test can breach it
+    /// part-way through processing instead of at construction.
+    #[cfg(test)]
+    pub(crate) fn css_work_reads(reads: usize) -> Self {
+        Self {
+            max_css_work_reads: reads,
+            ..Self::production()
+        }
+    }
+
     pub(crate) fn production() -> Self {
         Self {
             max_unique_files: MAX_GRAPH_MODULES,
@@ -289,6 +299,24 @@ impl AssetProcessingContext {
             }
         };
         self.finish_read(reservation, kind, &bytes)
+    }
+
+    /// Stat a CSS-referenced resource and record what was seen: its metadata, or the absence or
+    /// failure. A resource disclosed by size rather than read still needs this, or the cached
+    /// disclosure would not expire when the file changes or disappears.
+    pub(crate) fn observe_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                let mut state = self.lock_state();
+                state.read_paths.insert(path.to_path_buf());
+                state.fingerprints.push(stat_fingerprint(path, &metadata));
+                Ok(metadata)
+            }
+            Err(error) => {
+                self.record_failed_path(path, error.kind() == std::io::ErrorKind::NotFound);
+                Err(error)
+            }
+        }
     }
 
     fn snapshot_if_present(&self, path: &Path) -> Option<CollectedAsset> {
@@ -577,8 +605,20 @@ impl AssetProcessingContext {
     }
 }
 
+/// A missing file cannot be canonicalized, but its directory usually can. Spelling it through the
+/// canonical directory keeps an absent observation and a later read of the same file under one
+/// identity, so the two are seen as conflicting rather than as two unrelated paths.
 fn canonical_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .zip(path.file_name())
+            .and_then(|(parent, name)| {
+                std::fs::canonicalize(parent)
+                    .ok()
+                    .map(|parent| parent.join(name))
+            })
+            .unwrap_or_else(|| path.to_path_buf())
+    })
 }
 
 fn metadata_bytes(metadata: &std::fs::Metadata, path: &Path) -> std::io::Result<usize> {
