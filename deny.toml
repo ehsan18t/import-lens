@@ -8,7 +8,13 @@
 # whole transitive tree; matches are still denied. Vulnerabilities, yanked crates,
 # and notices are denied by default in cargo-deny 0.19+.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+  # rkyv 0.7 (archive validation with Rc/Arc). Reached only through lightningcss ->
+  # parcel_sourcemap, whose SourceMap::from_buffer is the sole rkyv deserializer and is
+  # never called: the daemon builds no source maps. The fix exists only in rkyv 0.8,
+  # which needs a lightningcss release that moves parcel_sourcemap off 0.7.
+  { id = "RUSTSEC-2026-0235", reason = "unreachable: no source map is ever deserialized" },
+]
 
 [licenses]
 # Only allow these licenses - anything unlisted is denied by default.
