@@ -1,9 +1,50 @@
 use import_lens_daemon::{ipc::server::run_server, reclaim};
+use libmimalloc_sys::{mi_heap_malloc_aligned, mi_heap_realloc_aligned, mi_heap_zalloc_aligned};
 use rayon::ThreadPoolBuilder;
+use std::alloc::{GlobalAlloc, Layout};
 use std::{env, error::Error, path::PathBuf};
 
+/// mimalloc, with every allocation made inside `reclaim::long_lived` sent to the long-lived heap.
+/// mimalloc frees a block into whichever heap owns it, so `dealloc` needs no routing.
+struct DaemonAllocator;
+
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: DaemonAllocator = DaemonAllocator;
+
+// SAFETY: every path hands `layout`'s size and alignment to mimalloc, which honours both; blocks
+// from either heap are freed by `mi_free`, which finds the owning heap itself.
+unsafe impl GlobalAlloc for DaemonAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        match reclaim::long_lived_heap_in_scope() {
+            Some(heap) => unsafe {
+                mi_heap_malloc_aligned(heap, layout.size(), layout.align()).cast()
+            },
+            None => unsafe { mimalloc::MiMalloc.alloc(layout) },
+        }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        match reclaim::long_lived_heap_in_scope() {
+            Some(heap) => unsafe {
+                mi_heap_zalloc_aligned(heap, layout.size(), layout.align()).cast()
+            },
+            None => unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) },
+        }
+    }
+
+    unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
+        unsafe { mimalloc::MiMalloc.dealloc(block, layout) }
+    }
+
+    unsafe fn realloc(&self, block: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        match reclaim::long_lived_heap_in_scope() {
+            Some(heap) => unsafe {
+                mi_heap_realloc_aligned(heap, block.cast(), new_size, layout.align()).cast()
+            },
+            None => unsafe { mimalloc::MiMalloc.realloc(block, layout, new_size) },
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct Args {

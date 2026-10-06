@@ -713,7 +713,9 @@ impl ImportCache {
         // a post-clear insert of the same key that replaced it.
         let our_last_seq = Arc::clone(&cached.last_seq);
         let memory = self.memory.pin();
-        memory.insert(key.clone(), cached);
+        // The entry outlives the build that computed it, so it is copied into the long-lived heap
+        // (see `reclaim::long_lived`). `clone` keeps the seq `Arc`s shared, so identity holds.
+        crate::reclaim::long_lived(|| memory.insert(key.clone(), cached.clone()));
         // A clear() whose wipe preceded our insert still rolls us back.
         if self.disk.clear_generation() != captured_generation {
             self.remove_from_memory_if_current(key, &our_last_seq);
