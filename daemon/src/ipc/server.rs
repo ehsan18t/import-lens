@@ -529,6 +529,7 @@ where
                         &prefetcher,
                         &lifecycles,
                         &mut active_tasks,
+                        &mut invalidation,
                         &mut _maintenance_task,
                     )
                     .await;
@@ -544,6 +545,7 @@ where
                         &prefetcher,
                         &lifecycles,
                         &mut active_tasks,
+                        &mut invalidation,
                         &mut _maintenance_task,
                     )
                     .await;
@@ -578,6 +580,7 @@ where
                 &prefetcher,
                 &lifecycles,
                 &mut active_tasks,
+                &mut invalidation,
                 &mut _maintenance_task,
             )
             .await;
@@ -1149,6 +1152,7 @@ where
                     &prefetcher,
                     &lifecycles,
                     &mut active_tasks,
+                    &mut invalidation,
                     &mut _maintenance_task,
                 )
                 .await;
@@ -1268,12 +1272,17 @@ async fn close_connection(
     prefetcher: &Prefetcher,
     lifecycles: &ConnectionLifecycles,
     active_tasks: &mut Vec<JoinHandle<()>>,
+    invalidation: &mut Option<oneshot::Receiver<()>>,
     maintenance_task: &mut Option<AbortOnDrop>,
 ) {
     // Abort the pending maintenance pass first: it is scheduled, not started, and a pass that
     // begins while we are flushing is compacting the shards the flush is writing to.
     *maintenance_task = None;
     lifecycles.cancel_all(prefetcher);
+    // Unbounded, unlike the join below: an invalidation is pure redb I/O that cannot park inside
+    // Rolldown, and one cut off part-way leaves later shards serving entries the client was told
+    // are gone, with nothing to send the invalidation again.
+    invalidation_settled(invalidation).await;
     // Bounded: a build already inside Rolldown cannot be cancelled and runs to `BUILD_TIMEOUT`,
     // which is LONGER than the extension's force-kill grace — so joining it without a bound is how
     // a graceful shutdown loses its flush entirely.

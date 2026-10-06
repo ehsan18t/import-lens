@@ -107,6 +107,7 @@ async fn closing_a_connection_flushes_what_the_session_measured() {
         &ConnectionLifecycles::new(),
         &mut Vec::new(),
         &mut None,
+        &mut None,
     )
     .await;
 
@@ -122,4 +123,34 @@ async fn closing_a_connection_flushes_what_the_session_measured() {
     fs::remove_dir_all(&key_probe_storage).ok();
     fs::remove_dir_all(&storage).ok();
     fs::remove_dir_all(&workspace).ok();
+}
+
+/// An invalidation still running at teardown is finished, never abandoned: a purge cut off part-way
+/// leaves shards serving entries the client was told are gone.
+#[tokio::test]
+async fn closing_the_connection_waits_for_a_running_invalidation() {
+    let service = ImportLensService::new(None, false);
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let flag = std::sync::Arc::clone(&finished);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        flag.store(true, Ordering::SeqCst);
+        let _ = done_tx.send(());
+    });
+
+    close_connection(
+        &service,
+        &Prefetcher::new(),
+        &ConnectionLifecycles::new(),
+        &mut Vec::new(),
+        &mut Some(done_rx),
+        &mut None,
+    )
+    .await;
+
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "teardown returned before the invalidation finished"
+    );
 }
