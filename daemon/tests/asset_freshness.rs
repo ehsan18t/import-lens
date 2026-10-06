@@ -315,3 +315,67 @@ fn an_asset_imported_with_a_loader_suffix_is_fingerprinted_under_its_file() {
         "no module may be keyed under its loader suffix: {fingerprints:?}"
     );
 }
+
+/// A bare asset subpath the resolver refuses is a fact about the package graph: an uninstalled
+/// optional peer, or a file another package's `exports` map declines to expose. Neither is a
+/// filesystem moment, so neither may surface as `asset_io` or make the result uncacheable; both are
+/// the disclosed import boundary every other refused bare subpath gets.
+#[test]
+fn a_refused_bare_asset_subpath_is_a_disclosed_boundary_not_an_io_failure() {
+    let root = common::temp_workspace("import-lens-asset-bare-refused");
+    write_file(
+        &root.join("node_modules").join("closed-pkg"),
+        "package.json",
+        r#"{"name":"closed-pkg","version":"1.0.0","exports":{".":"./index.js"}}"#,
+    );
+    write_file(
+        &root.join("node_modules").join("closed-pkg"),
+        "index.js",
+        "export const closed = 1;\n",
+    );
+    write_file(
+        &root.join("node_modules").join("closed-pkg"),
+        "dist/x.css",
+        ".closed { color: red; }\n",
+    );
+    for (package_name, specifier) in [
+        ("missing-peer-lib", "not-installed-peer/dist/peer.min.css"),
+        ("denied-subpath-lib", "closed-pkg/dist/x.css"),
+    ] {
+        let package_root = root.join("node_modules").join(package_name);
+        write_file(
+            &package_root,
+            "package.json",
+            format!(r#"{{"name":"{package_name}","version":"1.0.0","module":"index.js"}}"#),
+        );
+        write_file(
+            &package_root,
+            "index.js",
+            format!("import '{specifier}';\nexport const used = 1;\n"),
+        );
+
+        let (result, fingerprints) = analyze_fixture(&root, package_name);
+
+        assert_eq!(result.error, None, "{specifier}: {result:?}");
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == "asset_io"),
+            "{specifier}: a refused bare specifier is not a filesystem incident: {result:?}"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == "external"
+                    && diagnostic.message.contains(specifier)),
+            "{specifier}: the boundary must be disclosed: {result:?}"
+        );
+        assert!(
+            fingerprints_are_reusable(&fingerprints),
+            "{specifier}: a deterministic boundary must stay cacheable: {fingerprints:?}"
+        );
+    }
+    fs::remove_dir_all(&root).ok();
+}

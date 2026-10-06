@@ -387,9 +387,8 @@ fn supported_asset_observation_candidate(specifier: &str, importer: &str) -> Opt
     }
     let is_package_relative = specifier.starts_with("./") || specifier.starts_with("../");
     if !is_package_relative {
-        // Bare/self-referential/aliased specifiers have no honest filesystem candidate until the
-        // configured resolver answers. The spelling is still useful in the disclosure, and the
-        // resulting unverifiable sentinel is rejected by identity rather than by probing this path.
+        // Bare/self-referential/aliased specifiers have no filesystem candidate until the
+        // configured resolver answers, so the spelling stands in; it is never probed or recorded.
         return Some(specifier_path.to_path_buf());
     }
     let importer = Path::new(importer);
@@ -441,16 +440,8 @@ fn failure_kind_of(error: &std::io::Error) -> AssetInputFailure {
     }
 }
 
-/// How to record a candidate the configured resolver could not answer for.
-///
-/// Only an ABSOLUTE path this hook can actually probe earns `Absent`. A bare, self-referential or
-/// aliased specifier has no honest filesystem location — `supported_asset_observation_candidate`
-/// hands back the spelling itself — so "it is not there" is not a claim this hook is entitled to
-/// make, and it stays `Unreadable`, which is the conservative answer that refuses the cache.
+/// How to record an absolute candidate the configured resolver could not answer for.
 async fn resolve_failure_kind(candidate: &Path) -> AssetInputFailure {
-    if !candidate.is_absolute() {
-        return AssetInputFailure::Unreadable;
-    }
     match tokio::fs::metadata(candidate).await {
         Err(error) => failure_kind_of(&error),
         // It exists but the resolver still refused it — an `exports` denial, a bad symlink target.
@@ -646,6 +637,20 @@ impl ImportLensPlugin {
         Arc::clone(&self.state)
     }
 
+    /// A bare specifier the resolver refused. A subpath of another package becomes a disclosed
+    /// import boundary (see [`is_bare_subpath_specifier`]); anything else is left to Rolldown,
+    /// which externalizes a `NotFound` root with a warning and fails the rest.
+    fn unresolved_boundary(&self, specifier: &str) -> Option<HookResolveIdOutput> {
+        if !is_bare_subpath_specifier(specifier) {
+            return None;
+        }
+        self.state.record_unresolved_external(specifier.to_owned());
+        Some(HookResolveIdOutput {
+            external: Some(true.into()),
+            ..HookResolveIdOutput::from_id(specifier.to_owned())
+        })
+    }
+
     fn breach(&self, message: String) -> std::io::Error {
         self.state.record_breach(&message);
         std::io::Error::other(message)
@@ -740,9 +745,8 @@ impl Plugin for ImportLensPlugin {
             // relative path ourselves. Client/Component builds apply package `browser` aliases
             // here, and a raw join would silently measure the server asset or ignore a `false`
             // mapping. Taking the successful result back through this hook still guarantees its
-            // final id reaches our observing `load`; retaining an asset-looking specifier on
-            // failure closes the resolve/load race for relative, absolute, bare, and aliased forms
-            // without changing resolver semantics.
+            // final id reaches our observing `load`; retaining a failed relative or absolute
+            // candidate closes the resolve/load race without changing resolver semantics.
             let resolved = ctx
                 .resolve(
                     args.specifier,
@@ -760,6 +764,13 @@ impl Plugin for ImportLensPlugin {
                     return Ok(Some(HookResolveIdOutput::from_resolved_id(resolved)));
                 }
                 Err(_) => {
+                    // A bare, self-referential or aliased spelling has no filesystem location to
+                    // probe, so its failure is the resolver's deterministic verdict about the
+                    // package graph, not an unreadable file. It takes the same boundary path as any
+                    // other bare specifier the resolver refuses.
+                    if !candidate.is_absolute() {
+                        return Ok(self.unresolved_boundary(args.specifier));
+                    }
                     // An alternative-specifier probe is the ordinary case here, not the exception:
                     // napi-rs writes one `require` per platform triple and ships one file, so most
                     // of these misses are a package fact, not a filesystem hiccup. Recording WHICH
@@ -796,14 +807,7 @@ impl Plugin for ImportLensPlugin {
                 // Hand back the id we already paid for rather than returning `None` and making
                 // Rolldown resolve the same specifier a second time.
                 Ok(resolved) => Ok(Some(HookResolveIdOutput::from_resolved_id(resolved))),
-                Err(_) => {
-                    self.state
-                        .record_unresolved_external(args.specifier.to_owned());
-                    Ok(Some(HookResolveIdOutput {
-                        external: Some(true.into()),
-                        ..HookResolveIdOutput::from_id(args.specifier.to_owned())
-                    }))
-                }
+                Err(_) => Ok(self.unresolved_boundary(args.specifier)),
             };
         }
         Ok(None)
