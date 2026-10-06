@@ -317,6 +317,24 @@ Today an unbuildable import reports no size. A graph-limit breach means much of 
 stopped, so a real floor exists: "at least 4 MB; graph limit exceeded" is strictly better than a blank. The
 engine currently discards the partial graph on failure, so this needs plumbing through the engine boundary.
 
+### D31: A shard directory is removed without checking whether another process holds it
+**Status: Deferred** · Data-loss class on unix; benign on Windows, which is the supported platform
+
+`remove_shard_by_id` (`project.rs`) calls `fs::remove_dir_all(&cache_path)` unconditionally, reached from
+the Manage Cache commands and from the automatic orphan sweep. There is no check
+for another process holding the shard's `.redb`.
+
+On **Windows** `redb` opens through `std::fs::File`, which does not request `FILE_SHARE_DELETE`, so the
+delete fails with a sharing violation and is reported as `removed: false`: annoying, not destructive.
+On **unix** the unlink succeeds while the holder keeps writing to an unlinked inode, and that data
+vanishes on close. A related ordering hazard exists on both: `remove_dir_all` deletes in readdir order,
+so a failed `.redb` delete can still leave the JSON sidecar gone, producing a metadata-less shard
+directory that is invisible to every listing yet still counted by the maintenance gate.
+
+**Why it is not fixed:** unreachable in practice on the supported platform, and reaching it at all
+requires two windows on one workspace (both resolve the same `storageUri`, so they share a cache base). Both the unix unlink and the sidecar ordering become
+routine under a shared cache base, so the fix is sequenced with that work rather than ahead of it.
+
 ### D4: A file with one unmeasurable import can never cache its total
 **Status: Deferred** · A performance cost of an invariant we want
 

@@ -767,7 +767,7 @@ This is one trade, not two independent losses. The same synthetic namespace that
 | `importLens.showWarnings`           | boolean | `true`      | Show warning indicator for non-tree-shakeable imports                                                          |
 | `importLens.useCodeLens`            | boolean | `false`     | Use code lens above the line instead of end-of-line decorations                                                |
 | `importLens.enableDiskCache`        | boolean | `true`      | Persist computed sizes to disk via redb across editor restarts                                                 |
-| `importLens.cacheMaxSizeMB`         | number  | `512`       | Global disk-byte budget across all project cache shards; least-recently-used entries are evicted when exceeded |
+| `importLens.cacheMaxSizeMB`         | number  | `512`       | Disk-byte budget across the project cache shards of **one cache base**; least-recently-used entries are evicted when exceeded. FR-026 puts one base per workspace, so this is per window, not a machine-wide total |
 | `importLens.registryCacheMaxSizeMB` | number  | `32`        | Byte budget for the shared npm registry metadata cache; oldest entries are evicted when exceeded               |
 | `importLens.budgets`                | object  | `{}`        | Optional per-import and per-file Brotli thresholds for diagnostics and CLI checks                              |
 | `importLens.enableRegistryHints`    | boolean | `true`      | Enable short-timeout npm metadata hints cached in the daemon's centralized package metadata cache              |

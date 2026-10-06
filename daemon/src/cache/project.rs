@@ -35,7 +35,9 @@ pub struct ProjectCacheRegistry {
     // write. Lock order is always load-lock, then `loaded` (briefly), never the
     // reverse. This map's own mutex is a leaf, held only for the get-or-insert.
     load_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    // Global disk-byte budget and cross-shard LRU eviction; a 0 budget disables it.
+    // Disk-byte budget and cross-shard LRU eviction over every shard under this
+    // registry's `base_path`; a 0 budget disables it. FR-026 puts one base per
+    // workspace, so the budget is per window, not machine-wide.
     coordinator: BudgetCoordinator,
     // Throttles the automatic orphan sweep to `ORPHAN_SWEEP_INTERVAL`.
     last_orphan_sweep: Mutex<Option<Instant>>,
