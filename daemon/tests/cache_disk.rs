@@ -282,6 +282,34 @@ fn recent_keys_returns_highest_last_seq_first() {
     fs::remove_dir_all(storage_path).expect("temp storage should be removed");
 }
 
+/// Entries that share a seq at the cut-off are chosen by key ascending, the same `limit` a full
+/// sort of every entry would pick, whichever order the recency index stores the ties in.
+#[test]
+fn recent_keys_breaks_seq_ties_at_the_limit_by_key() {
+    let storage = temp_storage();
+    fs::create_dir_all(&storage).expect("storage dir");
+    let disk = DiskCache::new(Some(storage.clone()), true);
+    for (key, seq) in [("d", 30_u64), ("b", 10), ("a", 30), ("c", 30)] {
+        let mut entry = cached(key);
+        entry.last_seq = Arc::new(AtomicU64::new(seq));
+        disk.insert(key, &entry).expect("insert should queue");
+    }
+
+    assert_eq!(disk.recent_keys(2), vec!["a".to_owned(), "c".to_owned()]);
+    assert_eq!(
+        disk.recent_keys(10),
+        vec![
+            "a".to_owned(),
+            "c".to_owned(),
+            "d".to_owned(),
+            "b".to_owned()
+        ]
+    );
+
+    drop(disk);
+    fs::remove_dir_all(storage).expect("cleanup");
+}
+
 #[test]
 fn removing_an_entry_leaves_no_orphan_recency() {
     let storage_path = temp_storage();

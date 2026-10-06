@@ -69,12 +69,11 @@ pub const COMPACT_THRESHOLD: f64 = 0.5;
 const COMPACT_IDLE: Duration = Duration::from_secs(5);
 
 // Every CACHE_TABLE value is `[last_seq: u64 LE, 8 bytes][msgpack CacheEnvelope]`.
-// The recency readers that still scan CACHE_TABLE (`recent_keys`, and the
-// summary rebuild/heal) only need `last_seq` + the value length; the fixed prefix
-// lets them read it without deserializing the full envelope (ImportResult +
-// contributions + fingerprints — KBs and dozens of allocations per entry).
-// `shard_rollup`/`lowest_seq_keys` no longer scan at all — they read the summary
-// and the `(last_seq, key)` index directly.
+// Index and summary maintenance, and the heal-on-open rebuild, need only
+// `last_seq` + the value length; the fixed prefix gives them that without
+// deserializing the full envelope (ImportResult + contributions + fingerprints).
+// Recency readers (`recent_keys`, `lowest_seq_keys`, `shard_rollup`) read the
+// `(last_seq, key)` index and the summary, never CACHE_TABLE.
 const SEQ_PREFIX_LEN: usize = 8;
 
 #[cfg(test)]
@@ -514,11 +513,9 @@ impl DiskCache {
         }
     }
 
-    /// Returns the `limit` most-recently-used keys, highest `last_seq` first.
-    /// Recency now lives in each entry's envelope (there is no separate recents
-    /// table), so this scans CACHE_TABLE and decodes each value's `last_seq`. Used
-    /// only at startup preload and prewarm, so the full scan is off the hot path
-    /// (it shares the same cost model as the byte-budget rollup scan).
+    /// Returns the `limit` most-recently-used keys, highest `last_seq` first, ties
+    /// by key ascending. A reverse range read of the `(last_seq, key)` index, so a
+    /// cold open's preload costs O(limit) rows, not a scan of the shard.
     pub fn recent_keys(&self, limit: usize) -> Vec<String> {
         if limit == 0 {
             return Vec::new();
@@ -538,33 +535,35 @@ impl DiskCache {
                 return Vec::new();
             }
         };
-        let table = match read_txn.open_table(CACHE_TABLE) {
-            Ok(table) => table,
+        let seq_index = match read_txn.open_table(SEQ_INDEX_TABLE) {
+            Ok(seq_index) => seq_index,
             Err(error) => {
-                cache_warn(format!("failed to open cache table: {error}"));
+                cache_warn(format!("failed to open seq index for recent keys: {error}"));
                 return Vec::new();
             }
         };
-        let iter = match table.iter() {
+        let iter = match seq_index.iter() {
             Ok(iter) => iter,
             Err(error) => {
-                cache_warn(format!("failed to iterate cache table: {error}"));
+                cache_warn(format!("failed to iterate seq index: {error}"));
                 return Vec::new();
             }
         };
-        let mut keys = iter
-            .filter_map(|entry| {
-                let (key, value) = entry.ok()?;
-                let last_seq = decode_last_seq(value.value());
-                Some((key.value().to_owned(), last_seq))
-            })
-            .collect::<Vec<_>>();
-
-        if keys.len() > limit {
-            keys.select_nth_unstable_by(limit, compare_recent_keys);
-            keys.truncate(limit);
+        // Walk the index from the highest seq down. It orders equal seqs by key
+        // ascending, so reversed they come key-descending: keep every row tied with
+        // the last one taken, then let the sort pick the same `limit` keys a full
+        // sort would.
+        let mut keys: Vec<(String, u64)> = Vec::with_capacity(limit);
+        for entry in iter.rev() {
+            let Ok((row, _)) = entry else { continue };
+            let (seq, key) = row.value();
+            if keys.len() >= limit && keys.last().is_some_and(|(_, last)| *last != seq) {
+                break;
+            }
+            keys.push((key.to_owned(), seq));
         }
         keys.sort_by(compare_recent_keys);
+        keys.truncate(limit);
         keys.into_iter().map(|(key, _)| key).collect()
     }
 
