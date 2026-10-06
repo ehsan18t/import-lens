@@ -1,7 +1,7 @@
 export const compilerStackConfig = {
-  currentRolldownVersion: "1.2.0",
-  currentOxcVersion: "0.140.0",
-  currentResolverVersion: "11.24.2",
+  currentRolldownVersion: "1.2.12",
+  currentOxcVersion: "0.152.0",
+  currentResolverVersion: "11.24.3",
   // The glob matcher Rolldown itself reads `sideEffects` with
   // (`rolldown_common`, `rolldown_utils`, and oxc_resolver). The daemon matches
   // the entry against the declared patterns to decide the Side-Effectful badge,
@@ -9,7 +9,7 @@ export const compilerStackConfig = {
   // bundler that owns retention -- so the two must be the SAME matcher at the
   // SAME version, or the agreement breaks silently. It is not chosen: the
   // updater reads it out of the version Cargo resolves for rolldown's own graph.
-  currentGlobMatcherVersion: "1.0.1",
+  currentGlobMatcherVersion: "1.1.2",
   globMatcherCrate: "fast-glob",
   // The CSS processor. It bundles and minifies a package's stylesheets so their
   // shipped bytes can be folded into the Import Cost, which means a version

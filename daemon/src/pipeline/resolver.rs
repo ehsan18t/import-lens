@@ -1145,11 +1145,16 @@ fn normalized_side_effect_path(package_root: &Path, entry_path: &Path) -> Option
 /// `path` is the package-relative path, forward-slashed by [`normalized_side_effect_path`].
 fn side_effects_pattern_matches(pattern: &str, path: &str) -> bool {
     let trimmed = pattern.trim_start_matches("./");
-    let normalized = if trimmed.len() != pattern.len() || !trimmed.contains('/') {
+    let mut normalized = if trimmed.len() != pattern.len() || !trimmed.contains('/') {
         format!("**/{trimmed}")
     } else {
         trimmed.to_owned()
     };
+    // `sideEffects` is a positive allowlist, so `!lib/fx.js` names a file; unescaped, fast_glob
+    // would read the `!` as a negation and match every other path.
+    if normalized.starts_with('!') {
+        normalized.insert(0, '\\');
+    }
 
     fast_glob::glob_match(
         normalized.as_bytes(),

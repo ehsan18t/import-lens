@@ -10,7 +10,7 @@ pub fn minify_source(source: &str) -> Result<String, String> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
 
-    if parsed.panicked || parsed.diagnostics.has_errors() {
+    if parsed.fatal_error || parsed.diagnostics.has_errors() {
         return Err(format!(
             "failed to parse linked source before minification: {}",
             parsed

@@ -249,7 +249,7 @@ async fn run_build(
     plugin: ImportLensPlugin,
     state: &BuildState,
 ) -> Result<rolldown::BundleOutput, BundleFailure> {
-    let mut bundler = Bundler::with_plugins(options, vec![Arc::new(plugin) as Arc<dyn Pluginable>])
+    let mut bundler = Bundler::with_plugins(options, vec![Pluginable::new_shared(plugin)])
         .map_err(|error| classify_failure(error.into_vec(), state))?;
     let result = bundler.generate().await;
     // Release plugin-driver resources even when the build failed.

@@ -2394,6 +2394,13 @@ fn every_side_effects_form_answers_with_what_rolldown_retained() {
             entry_is_effectful: true,
             why: "an anchored wildcard, and `*` does not cross a separator: it still names the entry",
         },
+        Form {
+            declaration: Some(r#"["!lib/fx.js"]"#),
+            entry: "dist/index.js",
+            entry_is_effectful: false,
+            why: "`sideEffects` is an allowlist, so a leading `!` is part of a file name, not a \
+                  negation: read as one, it would match every other path, the entry included",
+        },
     ];
 
     let workspace = temp_workspace();

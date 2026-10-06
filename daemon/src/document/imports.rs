@@ -44,7 +44,7 @@ fn imports_from_region(
     let source_type = super::script_regions::source_type_for_region(&region.filename);
     let parsed = Parser::new(&allocator, region.source, source_type).parse();
 
-    if parsed.panicked || parsed.diagnostics.has_errors() {
+    if parsed.fatal_error || parsed.diagnostics.has_errors() {
         return Err(format!(
             "failed to parse document region {}; errors: {}",
             region.filename,

@@ -213,7 +213,7 @@ pub fn assert_parseable(source: &str) {
     let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
 
     assert!(
-        !parsed.panicked && !parsed.diagnostics.has_errors(),
+        !parsed.fatal_error && !parsed.diagnostics.has_errors(),
         "generated source should parse cleanly: {source}"
     );
 }
@@ -229,7 +229,7 @@ pub fn assert_semantic_valid(source: &str) {
     let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
 
     assert!(
-        !parsed.panicked && !parsed.diagnostics.has_errors(),
+        !parsed.fatal_error && !parsed.diagnostics.has_errors(),
         "generated source should parse cleanly: {source}"
     );
 

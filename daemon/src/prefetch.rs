@@ -253,7 +253,7 @@ pub fn entry_exposes_default_export(entry_path: &Path) -> bool {
 fn source_exposes_default(source: &str, source_type: SourceType) -> bool {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
-    if parsed.panicked {
+    if parsed.fatal_error {
         return true;
     }
 
