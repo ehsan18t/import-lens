@@ -27,14 +27,13 @@ our usage, then apply both the bump and the code changes it implies.**
 
 ## What we depend on (the surface to check against)
 
-Three independently-versioned lines, moved as ONE coordinated stack:
+Four lines moved as ONE coordinated stack, plus one standalone pin:
 
 - **`rolldown`** — exact-pinned (`=x.y.z`) unconditional production dependency
   (with its `rolldown_common`/`rolldown_error` siblings at the same monorepo
-  version). Since the bundler-redesign Phase 3 cutover it is THE semantic
-  bundler: every size number flows through its linking and tree-shaking. Its
-  Rust API has NO semver guarantee, and its caret requirements decide which
-  OXC/resolver versions are even reachable.
+  version). It is THE semantic bundler: every size number flows through its
+  linking and tree-shaking. Its Rust API has NO semver guarantee, and its caret
+  requirements decide which OXC/resolver versions are even reachable.
 - **OXC monorepo crates** (all pinned to one coordinated `=x.y.z`):
   `oxc_allocator, oxc_codegen, oxc_minifier, oxc_parser, oxc_semantic,
   oxc_span, oxc_syntax` — the canonical list lives in
@@ -43,21 +42,32 @@ Three independently-versioned lines, moved as ONE coordinated stack:
   custom bundler); they remain transitive via rolldown.
 - **`oxc_resolver`** — separate repo, separate version (its range is declared by
   the `rolldown_resolver` workspace crate, not by `rolldown` itself).
+- **`fast-glob`** — the `sideEffects` glob matcher. It is NOT chosen: the
+  updater reads the version Cargo resolves for rolldown's own graph and pins
+  ours to it (`currentGlobMatcherVersion`), because the Side-Effectful badge is
+  right only while `pipeline/resolver.rs` matches with the SAME matcher at the
+  SAME version as the bundler that decides retention. Its changelog is in
+  scope: a matching change moves which files rolldown keeps.
+- **`lightningcss`** (standalone) — the CSS processor that bundles and minifies a
+  package's stylesheets into the Import Cost (`pipeline/{assets,css_dependencies}.rs`).
+  Exact-pinned and version-tested like the stack, but NOT derived from
+  rolldown's graph and NOT handled by the updater. See "Standalone pin:
+  lightningcss" below.
 
-Our direct OXC-using code (grep `use oxc_` under `daemon/src` to refresh this):
-`daemon/src/document/{imports,completion,script_regions}.rs` and
-`daemon/src/pipeline/{minify,resolver}.rs`. Rolldown types are confined to
-`daemon/src/engine/{adapter,plugin}.rs` (the engine contract in
-`engine/mod.rs` must never leak them).
+Our direct OXC-using code (grep `oxc_` under `daemon/src` to refresh this):
+`daemon/src/document/{imports,completion,script_regions}.rs`,
+`daemon/src/pipeline/{minify,resolver}.rs`, and `daemon/src/prefetch.rs`
+(parses a package entry file to see whether it exposes a default export). Rolldown types live in
+`daemon/src/engine/{adapter,plugin}.rs`, plus `rolldown_common::ModuleId` and the
+copied `sideEffects` pattern normalisation in `pipeline/resolver.rs` (the engine
+contract in `engine/mod.rs` must never leak them).
 
 Five facts about that surface decide most impact calls. Get them wrong and you will
 mis-scope the delta in both directions:
 
 - **Rolldown transforms real TypeScript/JSX/JSON during its build; our direct
   OXC crates never see package source.** `minify.rs` parses only the one linked
-  ESM chunk rolldown emits (literal path `import-lens-bundle.js`,
-  `SourceType::mjs()`; the `cjs()` arm exists for conservative fallback
-  sizing). So `transformer:` changelog entries reach our output only through
+  ESM chunk rolldown emits (`SourceType::mjs()`). So `transformer:` changelog entries reach our output only through
   rolldown's bundled transformer, not through any direct call.
 - **`document/` parses only the user's open document** (imports, completion
   context, script regions) — parser/module-record changes hit it, but
@@ -72,13 +82,22 @@ mis-scope the delta in both directions:
   `RenderedModule::rendered_length()`, or the one-chunk/no-code-splitting
   shape breaks the adapter's output translation — check those APIs on every
   bump.
-- **Known Windows defect we track**: rolldown 1.1.5 never matches string/array
-  `sideEffects` globs on Windows (backslash paths vs `/`-globs). Matrix rows
-  42/43 are `#[ignore]`d for it and MUST be re-attempted on every rolldown
-  bump — if they pass, remove the ignores and update FR-021's limitation note.
+- **The `sideEffects` copy must track rolldown.** `pipeline/resolver.rs` copies
+  `rolldown_common::side_effects::glob_match_with_normalized_pattern`. Diff that
+  function across the range on every bump; if rolldown changed it, change ours.
+  (There is no Windows glob defect: an old "rolldown never matches on Windows"
+  note was refuted, see the comment on matrix rows 42/43 in
+  `daemon/tests/candidate_matrix.rs`.)
+- **Rolldown's I/O runs on our engine runtime.** It reads every module with
+  `spawn_blocking` on the runtime `engine/boundary.rs` owns, so that runtime's
+  blocking-pool limits decide how many reader threads (each holding its own
+  allocator heap) a build spawns. If a release changes how rolldown loads
+  sources (a new `spawn_blocking`, `block_in_place`, or its own runtime), recheck
+  those limits; `block_in_place` against a capped blocking pool can deadlock.
 
-Current versions: read `currentRolldownVersion`, `currentOxcVersion`, and
-`currentResolverVersion` from `scripts/compiler-stack.config.mjs`.
+Current versions: read `currentRolldownVersion`, `currentOxcVersion`,
+`currentResolverVersion`, `currentGlobMatcherVersion`, and
+`currentCssProcessorVersion` from `scripts/compiler-stack.config.mjs`.
 
 See `references/sources-and-surface.md` for the exact changelog URLs, the GitHub
 API calls, the release-note categorization, and per-crate/per-API gotchas.
@@ -114,9 +133,9 @@ each release in `(current, target]`, for all three lines. See
   no auth, no rate limit, and it is what the updater itself uses. Confirm the same
   version exists for every configured OXC crate while you are there.
 - Read the notes from the GitHub release bodies: monorepo tag `crates_vX.Y.Z` at
-  `oxc-project/oxc`, resolver tag `vX.Y.Z` at `oxc-project/oxc-resolver`. Send
-  `Authorization: Bearer $GH_TOKEN` on the FIRST call — unauthenticated requests hit
-  the rate limit almost immediately.
+  `oxc-project/oxc`, resolver tag `vX.Y.Z` at `oxc-project/oxc-resolver`. Use
+  `gh api` (installed and authenticated); unauthenticated requests hit the rate
+  limit almost immediately.
 - **Do NOT fall back to the per-crate `crates/<crate>/CHANGELOG.md`.** Those files are
   generated when the release PR opens, so changes merged later the same day are in the
   tagged source and in the aggregate release body but missing from the per-crate
@@ -197,8 +216,8 @@ Produce a short impact table: change → PR → our file(s) → required/optiona
   updater merely re-asserts its `deps:update:*` scripts, so normally it comes
   out byte-identical and is skipped. It then runs `pnpm install
   --lockfile-only` and `cargo update -p <crate> --precise` for the `rolldown`
-  family, `oxc_resolver`, and each configured OXC crate, which moves
-  `Cargo.lock`, and finally regenerates
+  family, `oxc_resolver`, each configured OXC crate, and `fast-glob` (at the
+  version rolldown's graph resolved), which moves `Cargo.lock`, and finally regenerates
   `scripts/compiler-stack.fingerprint.json` from the locked graph. It touches
   **no test file** and does **not** rebuild the daemon.
 - Make the code changes for every breaking item, and adopt the worthwhile features.
@@ -231,6 +250,21 @@ Produce a short impact table: change → PR → our file(s) → required/optiona
   prose describing changed APIs/behavior — §9.2/§9.3 and any affected component
   spec — in the same task.
 
+### Standalone pin: lightningcss
+Not touched by the updater; move it on its own, in its own commit, after the stack:
+- Read every release in range at `github.com/parcel-bundler/lightningcss/releases`
+  (tags are the npm version `vX.Y.Z`; the crate is versioned `1.0.0-alpha.N` and
+  published the same day, so map crate to tag by publish date from
+  `https://crates.io/api/v1/crates/lightningcss`: alpha.71 = v1.32.0, alpha.72 = v1.33.0).
+  Filter for bundler, minifier, printer, and `@import`/`url()` handling: those move
+  our CSS bytes.
+- Change the `=` pin in `daemon/Cargo.toml`, `currentCssProcessorVersion` in
+  `scripts/compiler-stack.config.mjs`, and the SRS dependency table together, then
+  `cargo update -p lightningcss --precise <ver>`. `compiler-stack-coordination.test.mjs`
+  fails if they disagree.
+- Gate it with the asset and CSS tests (`cargo test --workspace` covers them) and
+  bump `ANALYZER_REVISION` when CSS bytes can change.
+
 ### 8. Report
 Summarize: versions moved (both lines), breaking changes and how we adapted each,
 features adopted vs deferred (with reasons), perf/accuracy impact observed in the
@@ -242,9 +276,15 @@ accuracy suite, and any follow-ups.
   the construct matrix (`--test candidate_matrix`), the real-package suite
   (`--test candidate_packages -- --ignored`), the performance gates
   (`--release --test candidate_performance -- --ignored`), and the accuracy
-  suite — and bump `ANALYZER_REVISION` (`daemon/src/cache/key.rs`) when
-  measured output can change. Re-attempt the ignored Windows sideEffects-glob
-  matrix rows on every bump.
+  suite — and update `ANALYZER_REVISION` (`daemon/src/cache/key.rs`) when
+  measured output can change. Its format is `<engine>-<minor line>.x+<revision>`:
+  a patch bump that moves numbers increments `+<revision>`, a minor or major bump
+  rewrites the line itself (`rolldown-1.3.x+1`). The doc comment on the macro is
+  the authority.
+- **Check memory, not only speed.** A release that changes how rolldown or OXC
+  allocates (arena reuse, thread-local caches, new parallelism, I/O model) moves
+  the daemon's resident set. The performance gates assert NFR-004 (idle and
+  20-import batch RSS); run them, and on Linux compare idle RSS before and after.
 - `oxc_mangler` is banned as a **direct** dependency of `daemon/Cargo.toml` — that is
   all the ban means, and all `compiler-stack-coordination.test.mjs` enforces. It is already a
   non-optional transitive dependency of `oxc_minifier` and sits in `Cargo.lock`;

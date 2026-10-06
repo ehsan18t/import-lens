@@ -37,11 +37,11 @@
 
 ## Enumerating releases in a range via the GitHub REST API
 
-**Authenticate from the first call.** `GH_TOKEN` is already in the environment; send
-`Authorization: Bearer $GH_TOKEN`. Unauthenticated access is ~60 req/hr shared per IP
-and in practice returns HTTP 403 on the very first release-list page. `gh` is **not
-installed** — do not plan around it. Use `node -e 'fetch(...)'` or the context-mode
-execute tool.
+**Authenticate from the first call.** Unauthenticated access is ~60 req/hr shared per
+IP and in practice returns HTTP 403 on the very first release-list page. `gh` is
+installed and logged in, so call these endpoints as `gh api '<path>' --paginate --jq …`
+(no `GH_TOKEN` is exported; do not build raw `fetch` calls around one). Filter with
+`--jq` or pipe into code; never read raw pages into context.
 
 ```
 # All monorepo releases (paginate page=1,2,… until empty):
@@ -73,27 +73,32 @@ Each release `body` is grouped by emoji headers. Extract each section:
 - `🐛 Bug Fixes`
 
 Every entry links a PR. For breaking changes on crates we use, and for promising
-features, open the PR for the real detail. `gh` is usually NOT on PATH in this
-sandbox, so prefer a direct fetch:
-- Page (no API-limit cost): `https://github.com/oxc-project/oxc/pull/<N>`
-- Diff (no API-limit cost): `https://github.com/oxc-project/oxc/pull/<N>.diff`
-- API description: `GET https://api.github.com/repos/oxc-project/oxc/pulls/<N>`
-  (body only — for the actual patch use `GET .../pulls/<N>/files` or the `.diff` above).
-- `gh pr view <N> --repo oxc-project/oxc` only if `gh` happens to be available.
+features, open the PR for the real detail:
+- `gh pr view <N> --repo oxc-project/oxc` (description) and
+  `gh pr diff <N> --repo oxc-project/oxc` (the patch); same for `rolldown/rolldown`.
+- The diff also downloads without the API: `https://github.com/oxc-project/oxc/pull/<N>.diff`.
+
+Rolldown release bodies are grouped differently: `### 💥 BREAKING CHANGES`,
+`### 🚀 Features`, `### 🐛 Bug Fixes`, `### ⚡ Performance`, `### 🚜 Refactor`, and
+often a bare list. Entries carry a scope (`rust:`, `node:`, `binding:`, `cli:`,
+`dev:`/`hmr:`, `plugin_*`). `node:`/`binding:`/`cli:`/`hmr:`/`dev:` and
+`browser` scopes never reach the Rust crate we embed; keep everything else.
 
 ## Our OXC surface (starter map — refresh with `grep -rl 'use oxc_' daemon/src`)
 
 | Crate | Where we use it (verify with grep) | What we call |
 |---|---|---|
-| `oxc_parser` | `document/{completion,imports}`, `pipeline/minify.rs` | `Parser::new(...).parse()`, `ParserReturn`, error recovery |
-| `oxc_allocator` | `document/{completion,imports}`, `pipeline/minify.rs` | arena `Allocator`, lifetimes bound to it |
+| `oxc_parser` | `document/{completion,imports}`, `pipeline/minify.rs`, `prefetch.rs` | `Parser::new(...).parse()`, `ParserReturn`, error recovery |
+| `oxc_allocator` | `document/{completion,imports}`, `pipeline/minify.rs`, `prefetch.rs` | arena `Allocator`, lifetimes bound to it |
 | `oxc_semantic` | `pipeline/minify.rs` | linked-chunk validation before minification |
 | `oxc_minifier` | `pipeline/minify.rs` | `Minifier`, `MinifierOptions`, mangling metadata |
 | `oxc_codegen` | `pipeline/minify.rs` | `Codegen::new().with_options(CodegenOptions::minify()).with_scoping(..).with_private_member_mappings(..).build()` |
 | `oxc_span` | `document/{completion,imports,script_regions}`, `pipeline/minify.rs` | `Span`, source ranges, `SourceType` |
 | `oxc_syntax` | `document/{completion,imports}` | syntax metadata |
 | `oxc_resolver` | `pipeline/resolver.rs` | `Resolver`, `ResolveOptions`, root resolution from active doc path |
-| `rolldown` (+`rolldown_common`, `rolldown_error`) | `engine/{adapter,plugin}.rs` ONLY | `BundlerBuilder`/`BundlerOptions`/`generate()`, plugin hooks (`resolve_id`/`load`/`module_parsed`), `OutputChunk.exports`, `RenderedModule::rendered_length()`, `treeshake`, `preserve_entry_signatures`, `code_splitting`, `resolve.{condition_names,main_fields}` |
+| `fast-glob` | `pipeline/resolver.rs` | `glob_match` for `sideEffects`, behind a copy of `rolldown_common::side_effects::glob_match_with_normalized_pattern` |
+| `lightningcss` (standalone pin) | `pipeline/{assets,css_dependencies}.rs` | stylesheet bundling and minification for asset bytes |
+| `rolldown` (+`rolldown_common`, `rolldown_error`) | `engine/{adapter,plugin}.rs`, and `ModuleId` in `pipeline/resolver.rs` | `BundlerBuilder`/`BundlerOptions`/`generate()`, plugin hooks (`resolve_id`/`load`/`module_parsed`), `OutputChunk.exports`, `RenderedModule::rendered_length()`, `treeshake`, `preserve_entry_signatures`, `code_splitting`, `resolve.{condition_names,main_fields}` |
 
 `oxc_ast`, `oxc_ast_visit`, and `oxc_transformer` are no longer direct
 dependencies — they reach us only transitively through rolldown's build.
