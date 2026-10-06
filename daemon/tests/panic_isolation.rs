@@ -22,8 +22,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use import_lens_daemon::engine::boundary::{
-    ENGINE_PERMITS, builds_started, bundle_sync_for_test_hang, bundle_sync_for_test_panic,
-    peak_in_flight,
+    ENGINE_PERMITS, builds_started, builds_waiting, bundle_sync_for_test_hang,
+    bundle_sync_for_test_panic, peak_in_flight, run_as_background,
 };
 
 /// The `[profile.release]` section of the workspace manifest, as raw lines.
@@ -261,6 +261,94 @@ fn a_parked_build_does_not_delay_the_build_beside_it() {
         "timeout",
         "the parked build ends on its own clock, not on anybody else's"
     );
+}
+
+/// Long enough that an interactive build queued behind it is unmistakable.
+const PREWARM_PARK_LIMIT: Duration = Duration::from_millis(1_500);
+
+/// Block until `expected` builds started since `before` are each either admitted or waiting at
+/// the boundary, so the test measures admission and not thread start-up.
+fn wait_until_submitted(before: usize, expected: usize) {
+    let since = Instant::now();
+    while builds_started() - before + builds_waiting() < expected {
+        assert!(
+            since.elapsed() < Duration::from_secs(5),
+            "the builds never reached the boundary"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// Prewarm saturating the engine must not make the user wait (P1).
+///
+/// One prewarm build per permit, each parked for `PREWARM_PARK_LIMIT`. If prewarm could take
+/// every permit, an interactive build would queue until one of them timed out; it is admitted at
+/// once instead, because background builds are capped one short of the permit count.
+#[test]
+fn an_interactive_build_is_admitted_while_prewarm_saturates_the_engine() {
+    let _guard = serialized();
+    let before = builds_started();
+
+    let prewarms = (0..ENGINE_PERMITS)
+        .map(|_| {
+            std::thread::spawn(|| {
+                run_as_background(|| bundle_sync_for_test_hang(PREWARM_PARK_LIMIT))
+            })
+        })
+        .collect::<Vec<_>>();
+    wait_until_submitted(before, ENGINE_PERMITS);
+
+    let started_at = Instant::now();
+    let interactive = within_deadline(bundle_sync_for_test_panic)
+        .expect_err("the synthetic interactive build panics");
+    let waited = started_at.elapsed();
+
+    assert_eq!(interactive.stage, "panic");
+    assert!(
+        waited < PREWARM_PARK_LIMIT / 3,
+        "an interactive build waited {waited:?} behind prewarm builds"
+    );
+    for prewarm in prewarms {
+        assert_eq!(
+            prewarm
+                .join()
+                .expect("a boundary caller must not panic")
+                .expect_err("a parked build cannot produce an artifact")
+                .stage,
+            "timeout",
+            "every queued prewarm build still runs: background work waits, it is not dropped"
+        );
+    }
+}
+
+/// The cap reserves a permit for interactive work; it must not starve background work of the
+/// permits interactive work is not using.
+#[test]
+fn a_prewarm_build_is_admitted_on_a_permit_interactive_work_leaves_free() {
+    let _guard = serialized();
+    let before = builds_started();
+
+    let interactive = std::thread::spawn(|| bundle_sync_for_test_hang(PARK_LIMIT));
+    wait_until_submitted(before, 1);
+    while builds_started() == before {
+        std::thread::yield_now();
+    }
+
+    let started_at = Instant::now();
+    let prewarm = within_deadline(|| run_as_background(bundle_sync_for_test_panic))
+        .expect_err("the synthetic prewarm build panics");
+    let waited = started_at.elapsed();
+
+    assert_eq!(prewarm.stage, "panic");
+    assert!(
+        waited < PARK_LIMIT,
+        "a prewarm build waited {waited:?} with a permit free"
+    );
+    assert!(
+        !interactive.is_finished(),
+        "the interactive build must still be parked, or this proved nothing"
+    );
+    let _ = interactive.join();
 }
 
 /// The stage vocabulary lives in `engine::stage`/`engine::diagnostic_stage` precisely so a new

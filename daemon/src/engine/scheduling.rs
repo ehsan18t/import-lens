@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use super::boundary::ENGINE_PERMITS;
+use super::boundary::{ENGINE_PERMITS, is_background, run_as_background};
 
 /// Two permits, but a worker keeps running after it releases one: minify, compress,
 /// fingerprint, insert. At exactly `ENGINE_PERMITS` workers that post-build tail
@@ -21,20 +21,31 @@ const MISS_DRAIN_WORKERS: usize = ENGINE_PERMITS + 2;
 
 /// Run `run` over every item with a fixed number of scoped worker threads, returning
 /// `(index, result)` in completion order.
+///
+/// A lone item runs on the caller: the caller blocks on the result either way, and an OS
+/// thread spawn costs more than many a classified miss.
 fn drain_bounded<T, R, F>(items: &[T], workers: usize, run: F) -> Vec<(usize, R)>
 where
     T: Sync,
     R: Send,
     F: Fn(usize, &T) -> (usize, R) + Sync,
 {
-    let workers = workers.min(items.len()).max(1);
+    if items.len() <= 1 {
+        return items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| run(index, item))
+            .collect();
+    }
+    let workers = workers.min(items.len());
     let cursor = AtomicUsize::new(0);
     let completed = Mutex::new(Vec::with_capacity(items.len()));
+    let background = is_background();
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
-                loop {
+                let drain = || loop {
                     let index = cursor.fetch_add(1, Ordering::Relaxed);
                     let Some(item) = items.get(index) else {
                         break;
@@ -44,6 +55,12 @@ where
                         .lock()
                         .expect("drain results should not be poisoned")
                         .push(result);
+                };
+                // A worker's builds keep the priority of the caller that queued them.
+                if background {
+                    run_as_background(drain);
+                } else {
+                    drain();
                 }
             });
         }
@@ -60,7 +77,7 @@ where
     R: Send,
     F: Fn(usize, &T) -> R + Sync,
 {
-    let mut pairs = drain_bounded(items, ENGINE_PERMITS, |index, item| {
+    let mut pairs = drain_bounded(items, MISS_DRAIN_WORKERS, |index, item| {
         (index, run(index, item))
     });
     pairs.sort_by_key(|(index, _)| *index);
@@ -69,11 +86,10 @@ where
 
 /// Classify every item at pool width, then drain only the ones that need the engine.
 ///
-/// The engine permits (§9) bound *builds* to two. They say nothing about cache hits,
-/// yet running the whole of `analyze_with_cache` inside `drain_ordered` throttled hit
-/// and miss alike to two at a time — so a batch of ninety cached imports, none of
-/// which touches the engine, was served two-wide. `classify` runs on the Rayon pool
-/// (`Ok` = answered, `Err` = pending work); only the `Err`s reach the bounded drain.
+/// The engine permits (§9) bound *builds* to two. They say nothing about cache hits or
+/// imports that never resolve, and running those inside the bounded drain would serve
+/// them at drain width. `classify` runs on the Rayon pool (`Ok` = answered, `Err` =
+/// pending work); only the `Err`s reach the bounded drain.
 ///
 /// The miss drain runs slightly wider than the permit count on purpose: a worker
 /// that finished its build still has to minify, compress, fingerprint and insert,
@@ -190,8 +206,24 @@ mod tests {
     };
 
     use super::{
-        ENGINE_PERMITS, drain_classified, drain_misses_owned, drain_ordered, drain_ordered_owned,
+        MISS_DRAIN_WORKERS, drain_classified, drain_misses_owned, drain_ordered,
+        drain_ordered_owned, is_background, run_as_background,
     };
+
+    /// A prewarm drain's builds run on worker threads; each must still be admitted as
+    /// background work, and an interactive drain's must not be.
+    #[test]
+    fn drain_workers_keep_the_callers_build_priority() {
+        let items: Vec<usize> = (0..MISS_DRAIN_WORKERS * 2).collect();
+        let marks = |items: &[usize]| drain_ordered(items, |_, _| is_background());
+
+        assert!(run_as_background(|| marks(&items)).iter().all(|mark| *mark));
+        assert!(marks(&items).iter().all(|mark| !*mark));
+        assert!(
+            !is_background(),
+            "the mark is restored when the work returns"
+        );
+    }
 
     /// The classified drain reorders by construction: hits settle on the Rayon pool
     /// while misses queue for the engine, so the two halves finish interleaved and
@@ -277,10 +309,11 @@ mod tests {
     }
 
     #[test]
-    fn caps_work_at_the_engine_permit_count() {
+    fn caps_work_at_the_miss_drain_width() {
+        let items: Vec<usize> = (0..MISS_DRAIN_WORKERS * 2).collect();
         let in_flight = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        let output = drain_ordered(&[0, 1, 2, 3], |_, item| {
+        let output = drain_ordered(&items, |_, item| {
             let current = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
             peak.fetch_max(current, Ordering::AcqRel);
             thread::sleep(Duration::from_millis(10));
@@ -288,8 +321,33 @@ mod tests {
             *item
         });
 
-        assert_eq!(output, vec![0, 1, 2, 3]);
-        assert_eq!(peak.load(Ordering::Acquire), ENGINE_PERMITS);
+        assert_eq!(output, items);
+        assert_eq!(peak.load(Ordering::Acquire), MISS_DRAIN_WORKERS);
+    }
+
+    /// A lone miss must not pay for a thread spawn: every drain blocks its caller anyway.
+    #[test]
+    fn a_lone_item_runs_on_the_calling_thread() {
+        let caller = thread::current().id();
+        let ran_on = Mutex::new(Vec::new());
+        let record = |_: usize| {
+            ran_on
+                .lock()
+                .expect("thread ids")
+                .push(thread::current().id())
+        };
+
+        drain_misses_owned(vec![0], record);
+        drain_ordered(&[0], |index, _: &i32| record(index));
+        drain_classified(
+            &[0],
+            |_, item: &i32| Err::<(), i32>(*item),
+            |index, _, _| {
+                record(index);
+            },
+        );
+
+        assert_eq!(*ran_on.lock().expect("thread ids"), vec![caller; 3]);
     }
 
     #[test]

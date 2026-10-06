@@ -1,6 +1,6 @@
 use crate::{
     cache::key::{CacheIdentity, decode_cache_identity},
-    engine::scheduling::drain_ordered,
+    engine::{boundary::run_as_background, scheduling::drain_ordered},
     ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
     pipeline::{
         analyze::AnalysisContext,
@@ -121,15 +121,14 @@ impl Prefetcher {
 }
 
 /// Dispatch the outer prewarm coordination (dependency enumeration + fan-out)
-/// onto the bounded `PREWARM_POOL` instead of an unbounded per-call OS thread.
-/// The heavy per-import work already runs on this pool via `pool.install`; this
-/// bounds the OUTER dispatch too and, crucially, LOGS a pool-build failure at
-/// debug rather than silently swallowing it as the old raw
-/// `thread::Builder…spawn` (`let _ = …`) did. Cancellation is still checked inside
-/// the job, so a superseded dispatch bails via the generation guard.
+/// onto the bounded `PREWARM_POOL` instead of an unbounded per-call OS thread,
+/// logging a pool-build failure at debug. Every engine build the job starts is
+/// background work, so prewarm never holds the permit interactive builds rely on.
+/// Cancellation is still checked inside the job, so a superseded dispatch bails
+/// via the generation guard.
 fn dispatch_prewarm(job: impl FnOnce() + Send + 'static) {
     match prewarm_pool() {
-        Ok(pool) => pool.spawn(job),
+        Ok(pool) => pool.spawn(|| run_as_background(job)),
         Err(error) => {
             crate::logging::log_debug("prefetch", format!("prewarm dispatch skipped: {error}"));
         }
