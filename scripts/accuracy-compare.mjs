@@ -49,7 +49,7 @@ import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 import { decode, encode } from "@msgpack/msgpack";
 import * as esbuild from "esbuild";
 
-const protocolVersion = 6;
+const protocolVersion = 7;
 const packageName = "importlens-accuracy-fixture";
 const typedPackageName = "importlens-accuracy-ts-fixture";
 const assetPackageName = "importlens-accuracy-asset-fixture";
@@ -778,23 +778,18 @@ const writeTypedFixture = async (workspace, sourceRoot) => {
 };
 
 const importLensNamedSize = async (daemon, workspace, benchmark, requestId) => {
+  // The same document esbuild bundles, sized the way the CI budget gate sizes a file: a fresh
+  // synchronous recompute, never a stale-while-revalidate value.
   const response = await daemon.request({
+    type: "file_size_document",
     version: protocolVersion,
     request_id: requestId,
     workspace_root: workspace,
     active_document_path: benchmark.activeDocumentPath,
-    imports: [
-      {
-        specifier: benchmark.package,
-        package: benchmark.package,
-        version: benchmark.version,
-        named: [benchmark.named],
-        import_kind: "named",
-        runtime: "component",
-      },
-    ],
+    source: await readFile(benchmark.activeDocumentPath, "utf8"),
+    force_fresh: true,
   });
-  const result = response.imports?.[0];
+  const result = response.imports?.find((item) => item.specifier === benchmark.package);
 
   if (!result || result.error) {
     throw new Error(

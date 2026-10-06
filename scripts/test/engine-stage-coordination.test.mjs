@@ -168,15 +168,14 @@ test("budget verdicts reject the same deterministic upper-bound stages everywher
   assert.deepEqual(cliNonBudgetableStages(), daemon);
 });
 
-// Drift check. The protocol version is declared THREE times — the daemon, the extension, and the
-// standalone CLI — because none of the three can import the others at runtime. The daemon accepts a
-// RANGE of versions for backward compatibility, so a stale copy in one client does not fail loudly:
-// it silently negotiates an older protocol and simply never receives whatever the newer version
-// added. The CLI sat a version behind exactly this way.
+// Drift check. The protocol version is declared four times (the daemon, the extension, the
+// standalone CLI, and the accuracy harness) because none of them can import the others at runtime.
+// The daemon accepts a RANGE of versions for backward compatibility, so a stale copy in one client
+// does not fail loudly: it silently negotiates an older protocol and simply never receives whatever
+// the newer version added.
 //
-// This is the check that makes the third copy visible. It is a Drift test, not an Echo: the expected
-// value is derived from the daemon's own declaration, so bumping PROTOCOL_VERSION and forgetting a
-// client turns it red.
+// It is a Drift test, not an Echo: the expected value is derived from the daemon's own declaration,
+// so bumping PROTOCOL_VERSION and forgetting a client turns it red.
 const daemonProtocolVersion = () => {
   const declaration = /pub const PROTOCOL_VERSION: u32 = (\d+)/u.exec(
     repoFile("daemon/src/ipc/protocol.rs"),
@@ -204,5 +203,15 @@ test("every client speaks the protocol version the daemon declares", () => {
     Number(cliVersion[1]),
     daemon,
     "the CLI negotiates an older protocol and silently loses newer response fields",
+  );
+
+  const accuracyVersion = /^const protocolVersion = (\d+);$/mu.exec(
+    repoFile("scripts/accuracy-compare.mjs"),
+  );
+  assert.ok(accuracyVersion, "the accuracy harness must still declare protocolVersion");
+  assert.equal(
+    Number(accuracyVersion[1]),
+    daemon,
+    "the accuracy harness negotiates an older protocol and measures against a stale wire shape",
   );
 });
