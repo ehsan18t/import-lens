@@ -47,8 +47,7 @@ pub const ENTRY_RESOLUTION: &str = "entry_resolution";
 ///
 /// **Not durable, and not deterministic.** This is an IO condition — a lock, a permission blip, a
 /// drive that went away — and the next attempt may well succeed. It is the one stage the old
-/// denylist got wrong, because it is transient in fact while being absent from
-/// [`engine_stage::is_transient`], whose names describe failures observed inside the *engine*.
+/// denylist got wrong, because it is transient in fact while not being an engine stage.
 pub const ENTRY_METADATA: &str = "entry_metadata";
 /// The entry file is larger than the module source limit. A property of its bytes.
 pub const OVERSIZED_ENTRY: &str = "oversized_entry";
@@ -105,8 +104,11 @@ pub const ALL: &[&str] = &[
 ];
 
 /// Every analysis stage that describes this request's machine/filesystem state rather than a fact
-/// about the package bytes. This is the product-wide list mirrored by the extension and CLI; unlike
-/// [`engine_stage::is_transient`], it also includes transient pipeline work around the engine.
+/// about the package bytes: a build cancelled at the deadline, unwound, cut off from its runtime, or
+/// unable to observe an asset input, and transient pipeline work around the engine. This is the
+/// only such list; the extension and CLI mirror it under a drift check
+/// (`scripts/test/engine-stage-coordination.test.mjs`). It is not the cache gate by itself: that is
+/// [`may_enter_a_durable_store`], which refuses any stage it has not classified.
 pub const TRANSIENT_ANALYSIS_STAGES: &[&str] = &[
     engine_stage::PANIC,
     engine_stage::TIMEOUT,

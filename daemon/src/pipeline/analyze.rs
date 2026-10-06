@@ -68,14 +68,6 @@ pub fn analyze_import(context: &AnalysisContext, request: &ImportRequest) -> Imp
     }
 }
 
-pub fn analyze_resolved_import(
-    context: &AnalysisContext,
-    request: &ImportRequest,
-    resolved: ResolvedPackage,
-) -> ImportResult {
-    analyze_resolved_import_with_dependencies(context, request, resolved).0
-}
-
 /// Manifests of the first-party packages whose sources this build loaded (§8.3).
 ///
 /// The plugin records graph *modules*, and a `package.json` is never one — but it
@@ -393,7 +385,7 @@ pub(crate) fn analyze_with_rolldown_engine(
     })
     .map_err(|failure| engine_error(context, request, failure))?;
 
-    let minified = minify_source(&artifact.code, false).map_err(|error| {
+    let minified = minify_source(&artifact.code).map_err(|error| {
         error_with_context(
             crate::pipeline::stage::MINIFY,
             format!("failed to minify engine chunk: {error}"),
@@ -495,7 +487,7 @@ pub(crate) fn analyze_with_rolldown_engine(
                 }
             };
 
-            let full_len = minify_source(&full.code, false).ok()?.len() as u64;
+            let full_len = minify_source(&full.code).ok()?.len() as u64;
             // A graph carrying a module the plugin could not fingerprint as it read it
             // (a binary module) has no complete read-time record, so there is nothing to
             // expire a memo against: measure it, use it, and store nothing.

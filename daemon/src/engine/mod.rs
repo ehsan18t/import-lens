@@ -330,29 +330,6 @@ pub mod stage {
             .position(|known| *known == stage)
             .unwrap_or(ALL.len())
     }
-
-    /// Whether a stage describes a failure of **this run of the daemon** rather than of the
-    /// package.
-    ///
-    /// A `parse`/`link`/`resolve`/`output_shape`/`module_graph_limit` failure is a property of
-    /// the code being measured: it will fail the same way next time, so the degraded result it
-    /// produces is worth caching. These four are not. A build that was cancelled at the deadline,
-    /// unwound, lost its runtime, or could not observe an asset input tells us nothing reusable
-    /// about the package, so storing what it produced makes a machine/filesystem accident durable.
-    ///
-    /// This is the ENGINE's list, and it is not by itself the cache gate: a stage can be transient
-    /// in fact without being an engine stage at all (`pipeline::stage::ENTRY_METADATA` is
-    /// `fs::metadata` failing). The gate is the allowlist in
-    /// `crate::pipeline::stage::may_enter_a_durable_store`, which every store applies through
-    /// [`crate::ipc::protocol::ImportResult::is_durable`]; the L1 aggregate additionally refuses a
-    /// total that summed an import nobody had measured
-    /// ([`crate::pipeline::file_size::FileSizeComputation::is_cacheable`]).
-    ///
-    /// The list is mirrored in the extension and the CLI, which cannot import it, under a drift
-    /// check (`scripts/test/engine-stage-coordination.test.mjs`).
-    pub fn is_transient(stage: &str) -> bool {
-        matches!(stage, TIMEOUT | PANIC | ENGINE_GONE | ASSET_IO)
-    }
 }
 
 /// Stage names for the [`ImportDiagnostic`]s the engine emits on the *success* path.

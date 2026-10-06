@@ -517,8 +517,8 @@ warning (`report/model.rs:95`: `is_cjs || side_effects || !truly_treeshakeable`)
 
 **What actually happens.** For an extensionless CommonJS entry, the same package can show the warning when
 first measured on the interactive path and hide it when the row was populated by prefetch (or the reverse). The
-measured bytes are identical either way: `is_cjs` reaches no build input (both `minify_source` calls hard-code
-`false` at `analyze.rs:367,453`, and it is not a `BundleRequest` field). Only the warning flips.
+measured bytes are identical either way: `is_cjs` reaches no build input (`minify_source` always parses the
+Rolldown output as an ES module, and it is not a `BundleRequest` field). Only the warning flips.
 
 **Why it is not fixed:** a badge-consistency issue with no size impact (the S1/K1 class).
 **What would fix it:** resolve the entry's format on the prefetch path instead of passing `false`, or fold
