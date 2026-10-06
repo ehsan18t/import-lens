@@ -56,8 +56,11 @@ enum SupportedAsset {
     External(String),
 }
 
+/// `stat` must record what it observes in the build's read ledger: it is the only freshness input a
+/// disclosed-by-size resource has.
 pub(super) fn collect_referenced_assets(
     dependencies: impl IntoIterator<Item = Dependency>,
+    stat: &impl Fn(&Path) -> std::io::Result<fs::Metadata>,
     read_asset: &impl Fn(&Path, AssetKind) -> std::io::Result<CollectedAsset>,
     should_continue: &impl Fn() -> bool,
 ) -> CssDependencyAssets {
@@ -73,26 +76,28 @@ pub(super) fn collect_referenced_assets(
             break;
         };
         match dependency {
-            Dependency::Url(dependency) => match collect_supported_asset(dependency, read_asset) {
-                Some(SupportedAsset::Collected(asset)) => {
-                    assets.entry(asset.path.clone()).or_insert(asset);
+            Dependency::Url(dependency) => {
+                match collect_supported_asset(dependency, stat, read_asset) {
+                    Some(SupportedAsset::Collected(asset)) => {
+                        assets.entry(asset.path.clone()).or_insert(asset);
+                    }
+                    Some(SupportedAsset::Unreadable(failure)) => {
+                        failures.insert(failure.path.clone(), failure);
+                    }
+                    Some(SupportedAsset::Uncounted(asset)) => {
+                        uncounted.entry(asset.path.clone()).or_insert(asset);
+                    }
+                    Some(SupportedAsset::Omitted(message)) => {
+                        omissions.insert(message);
+                    }
+                    Some(SupportedAsset::External(message)) => {
+                        external.insert(message);
+                    }
+                    // Nothing at all: a `data:` payload already inside the counted CSS text, or a bare
+                    // fragment pointing at the current document.
+                    None => {}
                 }
-                Some(SupportedAsset::Unreadable(failure)) => {
-                    failures.insert(failure.path.clone(), failure);
-                }
-                Some(SupportedAsset::Uncounted(asset)) => {
-                    uncounted.entry(asset.path.clone()).or_insert(asset);
-                }
-                Some(SupportedAsset::Omitted(message)) => {
-                    omissions.insert(message);
-                }
-                Some(SupportedAsset::External(message)) => {
-                    external.insert(message);
-                }
-                // Nothing at all: a `data:` payload already inside the counted CSS text, or a bare
-                // fragment pointing at the current document.
-                None => {}
-            },
+            }
             // Local `@import`s were already inlined by the bundler, so anything surviving this print
             // is an external stylesheet whose bytes are fetched at runtime, or a `data:` one already
             // counted inside the CSS text.
@@ -146,6 +151,7 @@ fn external_import(dependency: ImportDependency) -> Option<String> {
 
 fn collect_supported_asset(
     dependency: UrlDependency,
+    stat: &impl Fn(&Path) -> std::io::Result<fs::Metadata>,
     read_asset: &impl Fn(&Path, AssetKind) -> std::io::Result<CollectedAsset>,
 ) -> Option<SupportedAsset> {
     let specifier = dependency.url.trim();
@@ -198,7 +204,7 @@ fn collect_supported_asset(
 
     let path = source_file.parent()?.join(resource);
     let path = fs::canonicalize(&path).unwrap_or(path);
-    let metadata = fs::metadata(&path);
+    let metadata = stat(&path);
     let raw_bytes = metadata.as_ref().map_or(0, |metadata| metadata.len());
 
     // A resolvable path that cannot be stat'd is `Unreadable`, NOT `Omitted`, and the distinction is
@@ -224,9 +230,8 @@ fn collect_supported_asset(
     }
 
     // Outside the counted taxonomy — an image, an SVG, anything the processors do not handle. The
-    // bytes ship regardless, so they are disclosed at full size rather than dropped. This arm used
-    // to be a bare `None`, which took them out of the headline in silence and left the result at
-    // High confidence claiming to be the import's full cost.
+    // bytes ship regardless, so they are disclosed at full size rather than dropped, and `stat`
+    // above is what expires that disclosure when the file changes.
     // Only a binary is a separate artifact here. A `url()` naming a stylesheet is not: Lightning CSS
     // inlines `@import` children into the one bundled sheet, so counting it again would double it.
     let counted_kind = classify_asset_class(&path).and_then(|class| match class {

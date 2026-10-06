@@ -301,6 +301,24 @@ impl AssetProcessingContext {
         self.finish_read(reservation, kind, &bytes)
     }
 
+    /// Stat a CSS-referenced resource and record what was seen: its metadata, or the absence or
+    /// failure. A resource disclosed by size rather than read still needs this, or the cached
+    /// disclosure would not expire when the file changes or disappears.
+    pub(crate) fn observe_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                let mut state = self.lock_state();
+                state.read_paths.insert(path.to_path_buf());
+                state.fingerprints.push(stat_fingerprint(path, &metadata));
+                Ok(metadata)
+            }
+            Err(error) => {
+                self.record_failed_path(path, error.kind() == std::io::ErrorKind::NotFound);
+                Err(error)
+            }
+        }
+    }
+
     fn snapshot_if_present(&self, path: &Path) -> Option<CollectedAsset> {
         {
             let state = self.lock_state();

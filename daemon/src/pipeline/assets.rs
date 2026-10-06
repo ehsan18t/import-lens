@@ -763,6 +763,7 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
         .map(|result| {
             let dependencies = collect_referenced_assets(
                 result.dependencies.unwrap_or_default(),
+                &|path| provider.context.observe_metadata(path),
                 &|path, kind| provider.read_referenced_asset(path, kind),
                 &|| provider.should_continue_dependency_reads(),
             );

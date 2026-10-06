@@ -379,3 +379,57 @@ fn a_refused_bare_asset_subpath_is_a_disclosed_boundary_not_an_io_failure() {
     }
     fs::remove_dir_all(&root).ok();
 }
+
+/// An image a counted stylesheet references is disclosed with its byte count, so that count is a
+/// cached fact about the file and must expire when the file is resized or removed.
+#[test]
+fn a_css_referenced_image_disclosure_expires_when_the_image_changes() {
+    let root = common::temp_workspace("import-lens-asset-css-image");
+    let package_root = root.join("node_modules").join("sprite-lib");
+    write_file(
+        &package_root,
+        "package.json",
+        r#"{"name":"sprite-lib","version":"1.0.0","module":"index.js"}"#,
+    );
+    write_file(
+        &package_root,
+        "index.js",
+        "import './styles.css';\nexport const used = 1;\n",
+    );
+    write_file(
+        &package_root,
+        "styles.css",
+        ".icon { background: url('./sprite.png'); }\n",
+    );
+    write_file(&package_root, "sprite.png", vec![0x89; 4000]);
+
+    let (result, fingerprints) = analyze_fixture(&root, "sprite-lib");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "uncounted_assets"
+                && diagnostic.message.contains("4000")),
+        "the image is disclosed with its size: {result:?}"
+    );
+    let sprite = fs::canonicalize(package_root.join("sprite.png"))
+        .expect("sprite should canonicalize")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let fingerprint = fingerprints
+        .iter()
+        .find(|fingerprint| fingerprint.path == sprite)
+        .unwrap_or_else(|| {
+            panic!("the disclosed image must be a freshness input: {fingerprints:?}")
+        })
+        .clone();
+    assert_eq!(check_fingerprint(&fingerprint), Freshness::Fresh);
+
+    write_file(&package_root, "sprite.png", vec![0x89; 40_000]);
+    assert_eq!(
+        check_fingerprint(&fingerprint),
+        Freshness::Stale,
+        "resizing the image must expire its cached disclosure"
+    );
+    fs::remove_dir_all(&root).ok();
+}
