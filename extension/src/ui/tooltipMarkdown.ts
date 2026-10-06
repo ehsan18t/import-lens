@@ -80,7 +80,7 @@ export const importResultSizeMarkdown = (
 };
 
 /**
- * How the size above is composed, when part of it is not JavaScript (B2).
+ * How the size above is composed, when part of it is not JavaScript.
  *
  * These bytes are already inside the number — a UI kit's cost is part JS and part stylesheet — so
  * this names the parts rather than adding to the total. Nothing is rendered for the common case of

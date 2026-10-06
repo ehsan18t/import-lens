@@ -293,7 +293,7 @@ fn get_if_fresh_cold_daemon_serves_fresh_but_never_serves_unknown() {
 
     // Two dependencies: one stays valid (the Fresh control); one is swapped for a
     // directory after seeding so its verification hits a non-`NotFound` read error
-    // (`Unknown` — the deterministic B3/B4 directory technique, no mocking).
+    // (`Unknown`, via a directory in place of the file: deterministic, no mocking).
     let fresh_dep = root.join("fresh_dep.js");
     fs::write(&fresh_dep, "export const a = 1;").expect("fresh dep");
     let unknown_dep = root.join("unknown_dep.js");

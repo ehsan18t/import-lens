@@ -60,7 +60,7 @@ export interface ImportRequest {
 export type AssetKind = "css" | "wasm" | "font";
 
 /**
- * One asset kind's contribution to an import's size (B2): every artifact of that kind, each
+ * One asset kind's contribution to an import's size: every artifact of that kind, each
  * compressed on its own and summed. Mirrors the daemon's `AssetContribution`.
  */
 export interface AssetContribution {
@@ -93,7 +93,7 @@ export interface ImportResult {
   diagnostics: ImportDiagnostic[];
   module_breakdown?: ModuleContribution[];
   shared_bytes?: number;
-  // What each kind of non-JavaScript asset contributed to the five sizes above (B2). Empty for an
+  // What each kind of non-JavaScript asset contributed to the five sizes above. Empty for an
   // import that ships none, which is the common case. These bytes are already IN the sizes: this
   // says how the number is composed, it does not add to it.
   asset_breakdown?: AssetContribution[];

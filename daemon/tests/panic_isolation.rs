@@ -279,7 +279,7 @@ fn wait_until_submitted(before: usize, expected: usize) {
     }
 }
 
-/// Prewarm saturating the engine must not make the user wait (P1).
+/// Prewarm saturating the engine must not make the user wait.
 ///
 /// One prewarm build per permit, each parked for `PREWARM_PARK_LIMIT`. If prewarm could take
 /// every permit, an interactive build would queue until one of them timed out; it is admitted at

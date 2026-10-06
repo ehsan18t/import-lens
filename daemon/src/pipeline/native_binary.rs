@@ -4,7 +4,7 @@
 //! esbuild). The binary is spawned by the package's `bin` and never enters the import graph, so
 //! counting it would be wrong, and the JS shim alone is a misleadingly tiny number.
 //!
-//! The rule is detect and label, do not count (known issue B3):
+//! The rule is detect and label, do not count:
 //! - No importable JS entry: a `native_binary_only` badge (a Measured zero, the same shape as
 //!   `types_only`), instead of an "unavailable" that reads like a build failure.
 //! - A JS entry that resolves: its measured JS size stands, with a `native_binary` flag beside it,

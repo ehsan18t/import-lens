@@ -139,7 +139,7 @@ export const packageJsonDependencyHintParts = (
   }
 
   // No importable JS entry — the tool is a native binary. A badge, not a byte size, the same shape
-  // as "types only" (B3).
+  // as "types only".
   if (isNativeBinaryOnlyResult(state.result)) {
     return {
       primary: "native binary only",
@@ -150,7 +150,7 @@ export const packageJsonDependencyHintParts = (
 
   const confidencePrefix = state.result.confidence === "low" ? "~" : "";
   // The JS entry resolved but the tool is backed by a native binary: keep the measured size and
-  // flag it, so a thin shim's number is not read as the whole cost (B3).
+  // flag it, so a thin shim's number is not read as the whole cost.
   const nativeBinarySuffix = isNativeBinaryResult(state.result) ? " · native binary" : "";
   const primary = `${confidencePrefix}${formatBytes(bytesForCompression(sizes, config.compression))} ${labelForCompression(config.compression)}${nativeBinarySuffix}`;
 

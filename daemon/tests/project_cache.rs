@@ -55,7 +55,7 @@ fn cached(specifier: &str) -> CachedImport {
     }
 }
 
-/// C5 / Finding 10d (§3.3): the startup recency seed must lift the process-global
+/// The startup recency seed must lift the process-global
 /// recency clock above the GLOBAL maximum persisted seq before the server serves
 /// any request. A shard left on disk by a prior session with a large `max_seq` must
 /// be observed even though it is never loaded this session — otherwise a fresh

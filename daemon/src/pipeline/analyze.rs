@@ -268,7 +268,7 @@ fn unresolved_import_result(
 
         // A native-binary-only package (a `bin` plus a platform-specific native binary as
         // `optionalDependencies`, no importable JS entry) is likewise Measured at zero and
-        // labelled (B3).
+        // labelled.
         if let Some(result) =
             native_binary_only_package_result(&context.active_document_path, request)
         {
@@ -340,7 +340,7 @@ fn analyze_import_inner_resolved(
     )?;
     // A package whose JS entry resolved but which is backed by a platform-specific native binary
     // keeps its measured JS size and carries a `native_binary` flag beside it, so a thin shim (the
-    // TypeScript 7 version stub) is not read as the whole cost (B3).
+    // TypeScript 7 version stub) is not read as the whole cost.
     annotate_native_binary(&mut result, &package_json);
     record_loaded_paths(entry_path, request.runtime, loaded_paths);
     Ok((result, Some(freshness)))
@@ -390,7 +390,7 @@ pub(crate) fn analyze_with_rolldown_engine(
         )
     })?;
 
-    // The package's non-JavaScript assets, processed the way they ship, join the Import Cost (B2).
+    // The package's non-JavaScript assets, processed the way they ship, join the Import Cost.
     // Each artifact is compressed on its own and summed (ADR-0005). Parse/compression failures and
     // a resource-ledger breach disclose raw bytes beside the measured JavaScript; only a
     // request-local stage failure (deadline, panic, lost runtime) leaves the import Unmeasured.
@@ -541,7 +541,7 @@ pub(crate) fn analyze_with_rolldown_engine(
     result.diagnostics = diagnostics;
     result.module_breakdown = Some(top_module_contributions(&contributions));
     // Composition only: these bytes are already in the five sizes; this says which are
-    // stylesheet, wasm, or font (B2).
+    // stylesheet, wasm, or font.
     result.asset_breakdown = assets.contributions;
     result.internal_contributions = contributions;
 

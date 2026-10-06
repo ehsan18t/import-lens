@@ -2351,7 +2351,7 @@ mod tests {
                 path: expected_path,
                 bytes: expected_bytes
             }],
-            "it must be disclosed with its raw bytes, exactly as before B2: {processed:?}",
+            "it must be disclosed with its raw bytes: {processed:?}",
         );
         assert!(!processed.failures.is_empty(), "{processed:?}");
     }

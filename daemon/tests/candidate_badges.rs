@@ -143,7 +143,7 @@ const EXPECTATIONS: &[BadgeExpectation] = &[
                      does `import \"./index.css\"`, which is why it is in the set at all (see \
                      `a_css_shipping_real_package_counts_its_stylesheet_into_its_size`). It stays \
                      Medium because it declares side effects, NOT because of its stylesheet: those \
-                     bytes are counted now (B2), so the asset disclosure no longer holds anything \
+                     bytes are counted, so the asset disclosure no longer holds anything \
                      below High",
     },
     BadgeExpectation {
@@ -277,7 +277,7 @@ fn real_package_badges_hold() {
 /// deleted size-fabricator hid it behind a plausible number.
 ///
 /// `@uiw/react-md-editor` is the set's first package whose published ESM entry really does
-/// `import "./index.css"`. Its stylesheet's bytes are now COUNTED into the Import Cost (B2), so it
+/// `import "./index.css"`. Its stylesheet's bytes are COUNTED into the Import Cost, so it
 /// must produce a size that includes them and report what the CSS contributed — never an Unmeasured
 /// row, and no longer a disclosure of bytes the number left out.
 ///

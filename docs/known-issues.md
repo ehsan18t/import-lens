@@ -14,9 +14,9 @@ with no failure scenario is a rumour, and a rumour in a tracker is worse than no
 **Delete an entry when it is fixed.** This file answers one question — what is wrong with the product right
 now, and what did we decide about it — and every resolved entry left in place makes that question harder to
 answer. Fixing something and writing a paragraph about the fix here grows the file forever and buries the
-things that are still true. When an issue is resolved, cut the entry and add one row to
-[Resolved](#resolved); the behaviour belongs in the SRS, the reasoning in the commit, and the guarantee in
-the test.
+things that are still true. When an issue is resolved, delete its entry: the behaviour belongs in the SRS,
+the reasoning in the commit, and the guarantee in the test. Do not cite a tracker ID from code or other
+documents; state the behaviour instead, so nothing points at an entry that has been deleted.
 
 A decision **not** to fix is not a resolution. An Accepted or Deferred entry stays, in full, because it is
 still true of the product — and so does a documented decline, which exists to stop the same dangerous change
@@ -39,15 +39,12 @@ while eleven plan tasks sat untouched. "Real" was never the right bar.
 | **Accepted** | We know, we are not fixing it, and we are content. Revisit only if the blast radius changes. |
 | **Watch** | Not a defect today. Becomes one if some condition changes. |
 | **Unverified** | Shipped without the review we normally require. Not known to be wrong. |
-| **Resolved** | Fixed. The entry is **deleted** and collapses to one row in [Resolved](#resolved). |
 
 ---
 
 # Priority 0: release blockers
 
-Nothing is open. B1 (the all-inline-`type` over-count), B3 (native-binary mislabeling) and B2 (non-JS asset
-counting) have all landed and moved to [Resolved](#resolved). The revision each shipped under is in git;
-`ANALYZER_REVISION` in `daemon/src/cache/key.rs` holds the current value.
+Nothing is open.
 
 ---
 
@@ -97,7 +94,7 @@ project's whole dependency set and buckets each "unavailable" by its actual stag
 graph-limit, timeout, parse) sizes the fix and surfaces any genuine bug. Build that first.
 
 ### D7: A stylesheet its own package declares droppable is counted anyway
-**Status: Accepted** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the B2 adversarial review
+**Status: Accepted** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the asset-counting adversarial review
 
 A bundler DROPS a bare `import "./styles.css"` from a package declaring `"sideEffects": false`, so that CSS
 never ships. Import Lens counts it anyway: the plugin banks an asset in the `load` hook, and rolldown only
@@ -114,7 +111,7 @@ rollup, and vite, which is exactly why maintainers do not ship it.
 **Do NOT fix it by filtering the collected assets against what the build retained.** That inverts into a far
 worse under-count: the `Empty` stub gives a stylesheet no statements, so rolldown treats it as side-effect-free
 and drops it even when the package declares nothing, which is the common and correct case. Filtering by
-retention would zero out the CSS for `@uiw/react-md-editor` and undo B2 entirely. The honest fix asks the DECLARATION rather than the build — and that is exactly what this product forbids.
+retention would zero out the CSS for `@uiw/react-md-editor` and undo asset counting entirely. The honest fix asks the DECLARATION rather than the build, and that is exactly what this product forbids.
 FR-021 (Critical) and the engine boundary contract both state that the daemon's own reading of `sideEffects` is
 reporting metadata that "decides a badge, never a byte", and both name rolldown as the only authority on
 retention. Dropping an asset on our reading makes it decide bytes. Closing D7 therefore requires amending a
@@ -133,11 +130,11 @@ a measured non-shape in the ecosystem whose fix conflicts with a Critical requir
 ecosystem survey changes.
 
 ### D8: One stylesheet Lightning CSS cannot parse falls back alone, but a cyclic one undercounts
-**Status: Accepted** · Never below the pre-B2 floor · Found by the B2 adversarial review
+**Status: Accepted** · Never below raw-byte disclosure · Found by the asset-counting adversarial review
 
 Lightning CSS parses plain CSS. A published package that imports a preprocessor source (`.scss`, `.less`) or a
 stylesheet with a bare `@import "pkg/base.css"` cannot be bundled, so that sheet falls back to raw-byte
-disclosure. That is the ADR-0006 fallback working: it lands exactly on the pre-B2 behaviour, never below it.
+disclosure. That is the ADR-0006 fallback working: it lands exactly on raw-byte disclosure, never below it.
 A failed set retries per sheet, so only the offender falls back and the rest stay counted. In that degraded
 mode two sheets sharing an `@import` are no longer deduped against each other, which over-counts the shared
 part, a smaller and rarer error than dropping them all.
@@ -145,7 +142,7 @@ part, a smaller and rarer error than dropping them all.
 A stylesheet caught in an `@import` cycle keeps its `@import`ed rules but loses its own, which undercounts that
 one sheet. Cycles are silent in browsers and in every real bundler, so a package can ship one unknowingly. It no
 longer threatens the daemon (that wedge is fixed and pinned by a regression test); it is now only an accuracy
-edge on broken input, and still strictly better than before B2, when the package contributed zero CSS either
+edge on broken input, and still strictly better than not counting CSS at all, when the package contributed zero CSS either
 way.
 
 Do not resolve a bare `@import` with the JavaScript resolver: that profile has no `style` main field, no
@@ -153,7 +150,7 @@ Do not resolve a bare `@import` with the JavaScript resolver: that profile has n
 wrong file. Doing it properly needs a purpose-built CSS resolver profile.
 
 ### D9: A stylesheet's own `@import` tree is bounded at 256 files
-**Status: Accepted** · A bound where there was none · Found by the B2 adversarial review
+**Status: Accepted** · A bound where there was none · Found by the asset-counting adversarial review
 
 A stylesheet's `@import` children are never graph modules, so none of the engine's limits ever applied to them.
 Lightning CSS recurses per `@import`, and a deep enough chain overflows the stack, which is NOT catchable: the
@@ -344,8 +341,8 @@ whatever implements it, so the measured graph is the one *as installed*.
 
 **Why it is not fixed here.** No number is undisclosed — both carry a named diagnostic and cap the import at
 Medium confidence — and the gap is at the aggregate surface, which is a different fix from the one this change
-was making. It is the same family as D12 and D17 (both resolved), which made per-import and per-asset floors
-structural rather than prose; this is the third member, and it wants that same treatment: a floor that a
+was making. Per-import and per-asset floors are already structural rather than prose; this is the third member of
+that family, and it wants that same treatment: a floor that a
 consumer can see without reading diagnostic text. Doing it means deciding whether `incomplete` should key on
 "a contributor is a floor" rather than "a contributor is missing", which changes what every durable store and
 budget check does with an `external` boundary — far past the blast radius of the change that found it.
@@ -466,7 +463,7 @@ first measured on the interactive path and hide it when the row was populated by
 measured bytes are identical either way: `is_cjs` reaches no build input (`minify_source` always parses the
 Rolldown output as an ES module, and it is not a `BundleRequest` field). Only the warning flips.
 
-**Why it is not fixed:** a badge-consistency issue with no size impact (the S1/K1 class).
+**Why it is not fixed:** a badge-consistency issue with no size impact (the S1 class).
 **What would fix it:** resolve the entry's format on the prefetch path instead of passing `false`, or fold
 `is_cjs` into `CacheIdentity` so the two paths cannot share a row.
 
@@ -768,46 +765,3 @@ materialise only where the runtime width does not already saturate cores (much h
 builds); revisit only if the runtime-width versus permit split is reworked. The change was clean (const to
 `LazyLock` semaphore plus `miss_drain_workers()`, all sites converted, tests green): the code is not the
 problem, the tuning simply did not pay off here.
-
----
-
-# Resolved
-
-One line each, and deliberately no more. A fixed issue is not a known issue, and a tracker that keeps
-every fix forever stops being read. The detail lives where it belongs: the behaviour in the SRS, the
-reasoning in the commit that made the change, the guarantee in the test that holds it. What survives here is
-only the identifier, because code comments and older entries refer to these by name and a reference that
-resolves to nothing is worse than the bloat.
-
-| ID | What it was | Fixed |
-| --- | --- | --- |
-| P1 | A user's interactive build could queue behind prewarm builds holding every engine permit | 2026-10-06 |
-| P5 | The 32-entry dependency-path index evicted an arbitrary set, so a first-party set in use could lose its deep-module freshness signal | 2026-10-06 |
-| P7 | Every build rebuilt the fixed builtin-external list (about 180 `String`s) and the resolve options | 2026-10-06 |
-| P4 | The linked chunk was copied purely to move it into the artifact | 2026-10-06 |
-| P2 | Types-only and unresolvable imports, which never build, queued in the engine miss drain and re-resolved there | 2026-10-06 |
-| P6 | `drain_ordered` ran 2 workers where the other miss drains ran 4, idling a permit during the post-build tail | 2026-10-06 |
-| P8 | The miss drain spawned an OS thread even for a single miss the caller could run itself (still spawned on a rayon worker, where running inline can deadlock a single-flight) | 2026-10-06 |
-| R2 | The legacy entry-field fallback searched `module`, `browser`, `main`, against the resolver's own per-runtime order | 2026-10-06 |
-| G2 | A failed (unmeasured) import was counted and badged as a "Conservative estimate" in the workspace report | 2026-10-06 |
-| K2 | The project-cache metadata and the recycle timestamp were written in place, so a crash mid-write could tear them | 2026-10-06 |
-| C5 | The process outlived its connection for as long as an uncancellable blocking drain ran, holding its cache shards open | 2026-10-06 |
-| P3 | The load hook copied every module's source per build purely to keep the bytes alive for hashing | 2026-07-19 |
-| D25 | The always-on-screen file total could not say what share of it was not JavaScript | 2026-07-19 |
-| D27 | A first-party dependency manifest edit left the File Cost stale while per-import numbers updated | 2026-07-19 |
-| D26 | A waiter that could not use an admission wake swallowed it, so a freed permit sat idle | 2026-07-19 |
-| D23 | A resource-ledger breach discarded an import's complete JavaScript measurement | 2026-07-19 |
-| D22 | An asset input that was never there was recorded as an unreadable one, costing a correct build its cache | 2026-07-19 |
-| D11 | An asset the daemon could not read is disclosed, and that disclosure is cached | 2026-07-18 |
-| D12 | A file total that omits an asset is not structurally flagged as a floor | 2026-07-18 |
-| D20 | Nested rayon inside the asset pool does not widen its admission | 2026-07-18 |
-| D21 | A missing @import target made the whole asset result permanently non-durable | 2026-07-18 |
-| D10 | Every reported brotli size was high, because the daemon compressed at quality 4 | 2026-07-18 |
-| D15 | `shared_bytes` explains JavaScript sharing only | 2026-07-18 |
-| D16 | Asset composition reaches only the hover | 2026-07-18 |
-| D17 | A per-import floor can still be compared against a budget | 2026-07-18 |
-| B2 | The Import Cost ignored shipped non-JS asset bytes (CSS, wasm, fonts) | 2026-07-17 |
-| B1 | An all-inline-`type` named import was measured as the whole package | 2026-07-16 |
-| B3 | Native-binary-backed packages were mismeasured instead of labelled | 2026-07-16 |
-| K1 | The `sideEffects` badge fix is invisible on a warm cache until `ANALYZER_REVISION` moves | 2026-07-15 |
-| U1 | `a6cae06` did not get an adversarial review | 2026-07-16 |

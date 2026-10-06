@@ -976,7 +976,7 @@ fn analyze_declaration_only_detection_requires_declaration_files() {
 fn analyze_native_binary_only_package_is_measured_at_zero_and_labelled() {
     // A `bin`-only package whose real tool ships as a platform-specific native binary in
     // `optionalDependencies` (the Biome shape). It has no importable JS entry, so it is MEASURED at
-    // zero and labelled `native_binary_only`, not shown as a bare "unavailable" (B3).
+    // zero and labelled `native_binary_only`, not shown as a bare "unavailable".
     let workspace = temp_workspace();
     write_package_file(
         &workspace,
@@ -1020,7 +1020,7 @@ fn analyze_native_binary_only_package_is_measured_at_zero_and_labelled() {
 fn analyze_native_binary_backed_package_with_a_js_entry_keeps_its_size_and_is_flagged() {
     // A native-binary-backed package whose JS entry DOES resolve — a thin shim (the TypeScript 7
     // version stub shape). Its measured JS size stands, with a `native_binary` flag beside it, so
-    // the number is not read as the whole cost (B3).
+    // the number is not read as the whole cost.
     let workspace = temp_workspace();
     write_package_file(
         &workspace,
@@ -1067,7 +1067,7 @@ fn analyze_native_backed_package_with_a_broken_declared_entry_stays_unavailable(
     // The package DECLARES a JS entry (`main`) that does not exist — a broken or partial install —
     // and also lists a platform native optional dep. It must NOT be flattened to a confident zero;
     // it stays Unmeasured at `entry_resolution`, the honest answer for something we could not
-    // measure (B3 review finding: the native-binary-only zero requires no DECLARED entry).
+    // measure (the native-binary-only zero requires no DECLARED entry).
     let workspace = temp_workspace();
     write_package_file(
         &workspace,
@@ -2664,8 +2664,8 @@ fn a_workspace_linked_package_answers_with_what_rolldown_retained() {
 /// Nobody noticed, because the pipeline caught the failure and fabricated a size for it; delete the
 /// fabricator without `plugin.rs` linking the stylesheet as an empty module and they all go BLANK.
 ///
-/// The JS chunk is measured exactly, and the stylesheet's bytes are folded into the same number
-/// (B2): they really do ship, so a size that omitted them was an undercount of every CSS-shipping
+/// The JS chunk is measured exactly, and the stylesheet's bytes are folded into the same number.
+/// They really do ship, so a size that omitted them was an undercount of every CSS-shipping
 /// package. Proven against an identical package with no stylesheet, so the delta can only be the
 /// CSS. The disclosure this test used to assert is now only the FALLBACK, for a stylesheet that
 /// cannot be processed.
@@ -2676,7 +2676,7 @@ fn analyze_a_css_shipping_package_counts_its_stylesheet_in_the_import_cost() {
     // here rather than decoration: it is the declaration that makes a bundler RETAIN the stylesheet,
     // so counting those bytes is correct. A fixture declaring `sideEffects: false` would be the one
     // shape where a bundler DROPS the CSS and this number would be wrong (see known-issues D7), so
-    // pinning B2 on that shape would pin the defect. The JS entry still matches no glob, so it stays
+    // pinning asset counting on that shape would pin the defect. The JS entry still matches no glob, so it stays
     // non-effectful and the confidence assertion below means what it says.
     write_package(
         &workspace,
@@ -2734,8 +2734,8 @@ fn analyze_a_css_shipping_package_counts_its_stylesheet_in_the_import_cost() {
     let plain_sizes = common::measured_sizes(&plain);
     assert!(sizes.brotli_bytes > 0, "{result:?}");
 
-    // THE POINT OF B2. Before it, both packages measured the same and the stylesheet's bytes were
-    // merely disclosed beside a number that excluded them — a systematic undercount of every
+    // Without asset counting both packages would measure the same and the stylesheet's bytes would
+    // only be disclosed beside a number that excluded them, a systematic undercount of every
     // CSS-shipping package. The stylesheet really ships, so it is in the number.
     assert!(
         sizes.brotli_bytes > plain_sizes.brotli_bytes,

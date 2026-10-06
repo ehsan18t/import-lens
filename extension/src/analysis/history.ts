@@ -12,8 +12,8 @@ import { isDurableFileSize, isDurableImportResult } from "./transience.js";
 
 // Each version left the previous rows behind for one recurring reason: they carry no metadata with
 // which to reject only the bad ones. v1 rows have no stage, so a request-local asset floor recorded
-// before D11 is indistinguishable from a real baseline; v2 rows can hold deterministic
-// `uncounted_assets` totals from before D12 made that missing weight structural.
+// before such floors were refused is indistinguishable from a real baseline; v2 rows can hold
+// deterministic `uncounted_assets` totals recorded before an omitted asset marked a total as a floor.
 //
 // Both advance again now. An `imprecise_assets` total is a disclosed UPPER BOUND, which FR-032a says
 // MAY enter history — and must, since it is deterministic and reusable — but v3 rows record no sign

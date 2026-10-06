@@ -25,7 +25,7 @@
 //     - refractor: a sideEffects glob anchored at the package root.
 //     - @uiw/react-md-editor: the only real package whose published ESM entry actually
 //                 does `import "./index.css"`, so it is the one benchmark that compares
-//                 ASSET COUNTING (B2) against the oracle -- both sides must fold in the
+//                 ASSET COUNTING against the oracle -- both sides must fold in the
 //                 same stylesheet exactly once, which `minifiedTolerance` is what checks.
 //
 // NOT covered: the `.js`-containing-JSX retry path (`graph.rs`), which is a
@@ -125,9 +125,9 @@ const realFixtures = [
   // The ONLY real package in the set whose published ESM entry actually does `import "./index.css"`
   // — react-toastify, react-datepicker, swiper and react-loading-skeleton all *ship* a stylesheet
   // but none imports one from published JavaScript, so none would exercise this at all. It is what
-  // gates asset counting (B2) against the oracle: both sides must fold in the same stylesheet
+  // gates asset counting against the oracle: both sides must fold in the same stylesheet
   // exactly once, so a double count or a dropped stylesheet shows up here as a delta rather than as
-  // a wrong number in the product. Its own stylesheets contain no `@import`, so that part of B2 is
+  // a wrong number in the product. Its own stylesheets contain no `@import`, so that part of asset counting is
   // the unit tests' job, not this benchmark's.
   {
     package: "@uiw/react-md-editor",
@@ -154,7 +154,7 @@ const realFixtures = [
     //
     // 1.5% sits between those, deliberately: it is nearly 2x the honest reading and a third below a
     // double count, so both failure directions are caught with room, and it is what makes this
-    // fixture gate B2 at all. (2% would also catch a double count, but by under 10% — thin enough
+    // fixture gate asset counting at all. (2% would also catch a double count, but by under 10%: thin enough
     // that a small real drift could hide one.) Our JS reads 0.8% LOW against esbuild minifier,
     // which is why the band is not centred on zero. Both minifiers are exact-pinned and
     // upgrade-gated, so this only moves on a deliberate re-baseline. If it goes red, a stylesheet
@@ -447,7 +447,7 @@ const assertRealFixturePreconditions = async (workspace) => {
 
   // @uiw/react-md-editor is here for ONE property: its published ESM entry really does
   // `import "./index.css"`. That is the whole reason it is the only real package in this suite that
-  // exercises asset counting (B2) against an independent bundler — react-toastify, react-datepicker,
+  // exercises asset counting against an independent bundler: react-toastify, react-datepicker,
   // swiper and react-loading-skeleton all SHIP a stylesheet but none imports one from published
   // JavaScript, so none would exercise it at all.
   //
@@ -589,7 +589,7 @@ const writeFixture = async (workspace) => {
 // straight from JavaScript is compared against an oracle.
 //
 // `writeAssetFixture` reaches its font INDIRECTLY, through a surviving CSS `url()`. That never
-// exercises the other half of B2: the daemon intercepts a directly imported wasm/font at Rolldown's
+// exercises the other half of asset counting: the daemon intercepts a directly imported wasm/font at Rolldown's
 // `load` hook, stubs the module to `ModuleType::Empty`, and counts the file's raw bytes as a
 // separate artifact. Stubbing DELETES the reference code a real file-loader build emits, so the two
 // models are not obviously the same thing, and until this fixture existed nobody had measured
@@ -842,7 +842,7 @@ const esbuildNamedSize = async (
 
   // When the bundled graph imports CSS, esbuild gathers it into that sibling `.css`, so
   // `outputFiles` holds more than one entry and the JS is not guaranteed to be at index 0. The
-  // daemon counts those stylesheet bytes now (B2), so the oracle must too, or the two would be
+  // daemon counts those stylesheet bytes, so the oracle must too, or the two would be
   // measuring different things and the comparison would be meaningless.
   //
   // Classify by extension and compress each artifact ON ITS OWN before summing — never concatenate

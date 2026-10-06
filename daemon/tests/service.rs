@@ -1806,7 +1806,7 @@ fn file_size_document_force_fresh_recomputes_on_unknown_dependency() {
     // time) for a directory at the same path. The mtime+len pre-filter never matches a
     // directory, so `check_fingerprint` falls to its content-hash `fs::read`, which
     // fails on a directory with a non-`NotFound` error → `Freshness::Unknown`
-    // (deterministic, no mocking — the B3 technique from
+    // (deterministic, no mocking: the directory-in-place-of-a-file technique from
     // freshness_core.rs/result_freshness.rs). Bump the generation so the lookup takes
     // the slow re-verify path instead of the TTL fast path (mirrors
     // `file_size_document_force_fresh_bypasses_serve_stale` above).

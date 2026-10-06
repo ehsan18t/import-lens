@@ -499,7 +499,7 @@ fn compute_file_size_with(
             }
         };
 
-        // This group's non-JavaScript assets, processed the way they ship (B2). The combined build
+        // This group's non-JavaScript assets, processed the way they ship. The combined build
         // saw every import in this runtime, so its stylesheets bundle into one artifact, deduping
         // what two imports both `@import`. Each artifact is compressed on its own and summed
         // (ADR-0005); an asset that cannot be processed is disclosed.
