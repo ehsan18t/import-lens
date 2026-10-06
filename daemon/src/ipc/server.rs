@@ -36,7 +36,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -505,9 +505,16 @@ where
     // revalidations. Shutdown and idle-recycle join them, so nothing is still writing to the cache
     // after the flush.
     let mut active_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Set while a cache invalidation runs. No frame is read until it settles, so every request
+    // that follows an invalidation still sees its effect; frames already queued keep going out.
+    let mut invalidation: Option<oneshot::Receiver<()>> = None;
 
     loop {
         let payload = tokio::select! {
+            () = invalidation_settled(&mut invalidation), if invalidation.is_some() => {
+                invalidation = None;
+                continue;
+            }
             outbound = outbound_rx.recv() => {
                 // The loop itself holds a sender, so `recv` cannot return None here.
                 if let Some(frame) = outbound
@@ -527,7 +534,7 @@ where
                 }
                 continue;
             }
-            payload = framed.next() => match payload.transpose() {
+            payload = framed.next(), if invalidation.is_none() => match payload.transpose() {
                 Ok(payload) => payload,
                 Err(error) => {
                     close_connection(
@@ -790,11 +797,19 @@ where
             }
             ClientMessage::CacheInvalidate(message) if hello_received => {
                 prefetcher.cancel();
-                service.invalidate_package(&message.package_name);
+                invalidation = Some(spawn_invalidation(
+                    &mut active_tasks,
+                    &service,
+                    move |service| service.invalidate_package(&message.package_name),
+                ));
             }
             ClientMessage::CacheInvalidateAll(_) if hello_received => {
                 prefetcher.cancel();
-                service.invalidate_all();
+                invalidation = Some(spawn_invalidation(
+                    &mut active_tasks,
+                    &service,
+                    ImportLensService::invalidate_all,
+                ));
             }
             ClientMessage::CacheStatus(request) if hello_received => {
                 let svc = std::sync::Arc::clone(&service);
@@ -1031,14 +1046,20 @@ where
                 );
             }
             ClientMessage::NodeModulesChanged(message) if hello_received => {
-                // Both halves always run: `|` and not `||`, because a batch can carry an install AND
-                // a tsconfig edit, and short-circuiting would drop the second.
-                let invalidated = service
-                    .invalidate_package_json_paths(&message.package_json_paths)
-                    | service.invalidate_workspace_config_paths(&message.tsconfig_paths);
-                if invalidated {
-                    prefetcher.cancel();
+                // An empty batch invalidates nothing.
+                if message.package_json_paths.is_empty() && message.tsconfig_paths.is_empty() {
+                    continue;
                 }
+                prefetcher.cancel();
+                // Both halves always run: a batch can carry an install AND a tsconfig edit.
+                invalidation = Some(spawn_invalidation(
+                    &mut active_tasks,
+                    &service,
+                    move |service| {
+                        service.invalidate_package_json_paths(&message.package_json_paths);
+                        service.invalidate_workspace_config_paths(&message.tsconfig_paths);
+                    },
+                ));
             }
             ClientMessage::EnumerateExports(request) if hello_received => {
                 prefetcher.cancel();
@@ -1141,6 +1162,33 @@ where
     }
 
     Ok(())
+}
+
+/// Run a cache invalidation off the connection loop. It rewrites every shard on disk, blocking redb
+/// I/O that grows with the number of projects ever opened, and the loop must keep writing frames
+/// meanwhile. The returned receiver settles when the invalidation has finished.
+fn spawn_invalidation(
+    active_tasks: &mut Vec<JoinHandle<()>>,
+    service: &std::sync::Arc<ImportLensService>,
+    invalidate: impl FnOnce(&ImportLensService) + Send + 'static,
+) -> oneshot::Receiver<()> {
+    let service = std::sync::Arc::clone(service);
+    let (done_tx, done_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        if let Err(error) = tokio::task::spawn_blocking(move || invalidate(&service)).await {
+            logging::log_warn("cache", format!("cache invalidation failed: {error}"));
+        }
+        let _ = done_tx.send(());
+    });
+    track_active_task(active_tasks, handle);
+    done_rx
+}
+
+/// Resolves once the pending invalidation has finished, or its task is gone.
+async fn invalidation_settled(pending: &mut Option<oneshot::Receiver<()>>) {
+    if let Some(done) = pending {
+        let _ = done.await;
+    }
 }
 
 /// Registers a task the connection owns. Finished handles are pruned on each push, so a long-lived
