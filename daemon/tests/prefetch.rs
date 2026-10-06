@@ -1,15 +1,14 @@
 use import_lens_daemon::{
-    cache::key::cache_key_for_resolved_import,
-    ipc::protocol::{ImportKind, ImportRequest, ImportRuntime},
-    pipeline::resolver::resolve_package_entry,
-    prefetch::{
-        CancellationToken, Prefetcher, cached_import_request_from_key,
-        package_json_dependency_names, package_json_prewarm_requests, prewarm_pool,
-    },
+    cache::key::{CacheIdentity, decode_cache_identity},
+    ipc::protocol::ImportKind,
+    prefetch::{CancellationToken, Prefetcher, package_json_dependency_names, prewarm_pool},
+    service::ImportLensService,
 };
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 mod common;
@@ -46,6 +45,49 @@ fn write_installed_named_only_package(workspace: &Path, package_name: &str, vers
         "export const value = 1; export const other = 2;",
     )
     .expect("package entry should be written");
+}
+
+/// Prewarm the workspace's `package.json` through the production entry point and return the
+/// identities the project cache holds once at least `expected` entries have landed.
+fn prewarmed_identities(workspace: &Path, expected: usize) -> Vec<CacheIdentity> {
+    let storage = temp_workspace();
+    let service = Arc::new(ImportLensService::new_with_cache_policy(
+        Some(storage.clone()),
+        true,
+        512,
+        32,
+    ));
+    let prefetcher = Prefetcher::new();
+    let package_json_path = workspace.join("package.json");
+    prefetcher.prewarm_package_json(
+        Arc::clone(&service),
+        package_json_path.clone(),
+        package_json_path,
+    );
+
+    let cached_keys = || {
+        service.flush_cache().expect("flush should succeed");
+        service.recent_cache_keys(workspace, 8)
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while cached_keys().len() < expected {
+        assert!(
+            Instant::now() < deadline,
+            "the prewarm should cache {expected} entries"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Give a job that should NOT have been queued the time to land, so its absence means something.
+    std::thread::sleep(Duration::from_millis(500));
+    let identities = cached_keys()
+        .iter()
+        .map(|key| decode_cache_identity(key).expect("a cache key should decode"))
+        .collect();
+
+    drop(prefetcher);
+    drop(service);
+    let _ = fs::remove_dir_all(&storage);
+    identities
 }
 
 #[test]
@@ -95,69 +137,46 @@ fn package_json_dependency_names_ignore_non_string_dependency_versions() {
 }
 
 #[test]
-fn package_json_prewarm_requests_use_installed_package_versions() {
+fn package_json_prewarm_caches_the_installed_version_as_default_and_namespace_imports() {
     let workspace = temp_workspace();
-    let package_json_path = workspace.join("package.json");
-    let active_document_path = workspace.join("package.json");
     write_installed_package(&workspace, "react", "19.2.3");
     fs::write(
-        &package_json_path,
+        workspace.join("package.json"),
         r#"{"dependencies":{"react":"^19.0.0"}}"#,
     )
     .expect("workspace package json should be written");
 
-    let requests = package_json_prewarm_requests(&package_json_path, &active_document_path)
-        .expect("prewarm requests should be created");
+    let mut identities = prewarmed_identities(&workspace, 2);
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].specifier, "react");
-    assert_eq!(requests[0].version, "19.2.3");
-    assert_eq!(requests[0].import_kind, ImportKind::Default);
-    assert_eq!(requests[1].specifier, "react");
-    assert_eq!(requests[1].version, "19.2.3");
-    assert_eq!(requests[1].import_kind, ImportKind::Namespace);
+    identities.sort_by_key(|identity| format!("{:?}", identity.import_kind));
+    assert_eq!(identities.len(), 2, "{identities:?}");
+    assert!(
+        identities
+            .iter()
+            .all(|identity| identity.specifier == "react" && identity.package_version == "19.2.3"),
+        "{identities:?}"
+    );
+    assert_eq!(identities[0].import_kind, ImportKind::Default);
+    assert_eq!(identities[1].import_kind, ImportKind::Namespace);
 }
 
 #[test]
-fn package_json_prewarm_requests_skip_default_for_packages_without_default_export() {
+fn package_json_prewarm_skips_the_default_import_of_a_package_without_one() {
     let workspace = temp_workspace();
-    let package_json_path = workspace.join("package.json");
-    let active_document_path = workspace.join("package.json");
     write_installed_named_only_package(&workspace, "named-lib", "1.0.0");
     fs::write(
-        &package_json_path,
+        workspace.join("package.json"),
         r#"{"dependencies":{"named-lib":"^1.0.0"}}"#,
     )
     .expect("workspace package json should be written");
 
-    let resolved = resolve_package_entry(
-        &active_document_path,
-        &ImportRequest {
-            specifier: "named-lib".to_owned(),
-            package_name: "named-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: Vec::new(),
-            import_kind: ImportKind::Namespace,
-            runtime: ImportRuntime::Component,
-        },
-    )
-    .expect("named package should resolve");
-    let exports = import_lens_daemon::engine::boundary::enumerate_exports_sync(
-        resolved.entry_path,
-        ImportRuntime::Component,
-    )
-    .expect("resolved entry export enumeration should succeed");
-    assert!(!exports.names.iter().any(|name| name == "default"));
-
-    let requests = package_json_prewarm_requests(&package_json_path, &active_document_path)
-        .expect("prewarm requests should be created");
+    let identities = prewarmed_identities(&workspace, 1);
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    // No default export -> only the (cacheable) Namespace variant is prewarmed.
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].specifier, "named-lib");
-    assert_eq!(requests[0].import_kind, ImportKind::Namespace);
+    assert_eq!(identities.len(), 1, "{identities:?}");
+    assert_eq!(identities[0].specifier, "named-lib");
+    assert_eq!(identities[0].import_kind, ImportKind::Namespace);
 }
 
 #[test]
@@ -170,38 +189,6 @@ fn cancellation_token_invalidates_existing_jobs() {
     token.cancel();
 
     assert!(!token.is_current(generation));
-}
-
-#[test]
-fn cached_import_request_from_key_parses_recent_cache_keys() {
-    let workspace = temp_workspace();
-    write_installed_package(&workspace, "lodash-es", "4.17.21");
-    let active_document_path = workspace.join("src").join("index.ts");
-    let request = ImportRequest {
-        specifier: "lodash-es".to_owned(),
-        package_name: "lodash-es".to_owned(),
-        version: "4.17.21".to_owned(),
-        named: vec!["throttle".to_owned(), "debounce".to_owned()],
-        import_kind: ImportKind::Named,
-        runtime: ImportRuntime::Component,
-    };
-    let resolved =
-        resolve_package_entry(&active_document_path, &request).expect("package should resolve");
-    let key = cache_key_for_resolved_import(&request, &resolved);
-
-    let named = cached_import_request_from_key(&key).expect("v3 cache key should parse");
-
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-    assert_eq!(named.specifier, "lodash-es");
-    assert_eq!(named.version, "4.17.21");
-    assert_eq!(named.import_kind, ImportKind::Named);
-    assert_eq!(named.runtime, ImportRuntime::Component);
-    assert_eq!(
-        named.named,
-        vec!["debounce".to_owned(), "throttle".to_owned()]
-    );
-    assert!(cached_import_request_from_key("react@19.2.3::default").is_none());
-    assert!(cached_import_request_from_key("bad-key").is_none());
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use import_lens_daemon::{
-    ipc::protocol::{BatchRequest, ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION},
+    ipc::protocol::{AnalyzeDocumentRequest, PROTOCOL_VERSION},
     service::ImportLensService,
 };
 use std::{
@@ -9,6 +9,8 @@ use std::{
 };
 
 mod common;
+
+use common::documents::analyze_document;
 
 fn fixture_workspace(name: &str) -> PathBuf {
     common::fixture_workspace(name)
@@ -24,8 +26,9 @@ fn threshold_ms(base_ms: u128) -> u128 {
     base_ms * multiplier
 }
 
-fn uuid_batch(workspace: &Path, request_id: u64) -> BatchRequest {
-    BatchRequest {
+fn document(workspace: &Path, request_id: u64, source: String) -> AnalyzeDocumentRequest {
+    AnalyzeDocumentRequest {
+        message_type: "analyze_document".to_owned(),
         version: PROTOCOL_VERSION,
         request_id,
         workspace_root: workspace.to_string_lossy().to_string(),
@@ -34,16 +37,16 @@ fn uuid_batch(workspace: &Path, request_id: u64) -> BatchRequest {
             .join("app.ts")
             .to_string_lossy()
             .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "uuid".to_owned(),
-            package_name: "uuid".to_owned(),
-            version: "13.0.0".to_owned(),
-            named: vec!["v4".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
+        source,
     }
+}
+
+fn uuid_document(workspace: &Path, request_id: u64) -> AnalyzeDocumentRequest {
+    document(
+        workspace,
+        request_id,
+        "import { v4 } from 'uuid';".to_owned(),
+    )
 }
 
 #[test]
@@ -53,11 +56,11 @@ fn fixture_miss_and_cache_hit_stay_under_release_thresholds() {
     let service = ImportLensService::new(None, false);
 
     let miss_start = Instant::now();
-    let miss = service.handle_batch(uuid_batch(&workspace, 1));
+    let miss = analyze_document(&service, uuid_document(&workspace, 1));
     let miss_ms = miss_start.elapsed().as_millis();
 
     let hit_start = Instant::now();
-    let hit = service.handle_batch(uuid_batch(&workspace, 2));
+    let hit = analyze_document(&service, uuid_document(&workspace, 2));
     let hit_ms = hit_start.elapsed().as_millis();
 
     assert_eq!(miss.imports[0].error, None);
@@ -100,25 +103,16 @@ fn multi_module_rebundle_stays_under_release_threshold() {
     fs::write(pkg.join("index.js"), index).expect("index");
 
     let service = ImportLensService::new(None, false);
-    let document = workspace.join("src").join("app.ts");
     let start = Instant::now();
     for i in 0..40 {
-        let request = BatchRequest {
-            version: PROTOCOL_VERSION,
-            request_id: i,
-            workspace_root: workspace.to_string_lossy().to_string(),
-            active_document_path: document.to_string_lossy().to_string(),
-            imports: vec![ImportRequest {
-                specifier: "multi-lib".to_owned(),
-                package_name: "multi-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec![format!("fn{i}")],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            }],
-            streaming: false,
-        };
-        let response = service.handle_batch(request);
+        let response = analyze_document(
+            &service,
+            document(
+                &workspace,
+                i,
+                format!("import {{ fn{i} }} from 'multi-lib';"),
+            ),
+        );
         assert_eq!(response.imports[0].error, None, "{:?}", response.imports[0]);
     }
     let elapsed_ms = start.elapsed().as_millis();
@@ -156,27 +150,18 @@ fn warm_reanalysis_of_multi_module_dependency_stays_under_threshold() {
     fs::write(pkg.join("index.js"), index).expect("index");
 
     let service = ImportLensService::new(None, false);
-    let document = workspace.join("src").join("app.ts");
-    let batch = |request_id: u64| BatchRequest {
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: document.to_string_lossy().to_string(),
-        imports: vec![ImportRequest {
-            specifier: "wide-lib".to_owned(),
-            package_name: "wide-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["fn0".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
+    let wide = |request_id: u64| {
+        document(
+            &workspace,
+            request_id,
+            "import { fn0 } from 'wide-lib';".to_owned(),
+        )
     };
 
-    assert_eq!(service.handle_batch(batch(0)).imports[0].error, None);
+    assert_eq!(analyze_document(&service, wide(0)).imports[0].error, None);
     let start = Instant::now();
     for i in 1..=50 {
-        let response = service.handle_batch(batch(i));
+        let response = analyze_document(&service, wide(i));
         assert!(response.imports[0].cache_hit, "expected warm hit");
     }
     let elapsed_ms = start.elapsed().as_millis();

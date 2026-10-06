@@ -1,5 +1,5 @@
 use crate::document::{PackageJsonDependencyEntry, PackageJsonDependencySection};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 7;
 
@@ -106,17 +106,6 @@ pub struct ImportRequest {
     pub import_kind: ImportKind,
     #[serde(default)]
     pub runtime: ImportRuntime,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatchRequest {
-    pub version: u32,
-    pub request_id: u64,
-    pub workspace_root: String,
-    pub active_document_path: String,
-    pub imports: Vec<ImportRequest>,
-    #[serde(default)]
-    pub streaming: bool,
 }
 
 /// Which freshness state a served size result is in.
@@ -553,15 +542,6 @@ impl ImportDiagnostic {
 pub struct ModuleContribution {
     pub path: String,
     pub bytes: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatchResponse {
-    pub version: u32,
-    pub request_id: u64,
-    pub imports: Vec<ImportResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub indexes: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1146,46 +1126,6 @@ pub struct EnumerateExportsResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileSizeRequest {
-    #[serde(rename = "type")]
-    #[serde(default = "file_size_message_type")]
-    pub message_type: String,
-    pub version: u32,
-    pub request_id: u64,
-    pub workspace_root: String,
-    pub active_document_path: String,
-    pub imports: Vec<ImportRequest>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileSizeResponse {
-    pub version: u32,
-    pub request_id: u64,
-    pub raw_bytes: u64,
-    pub minified_bytes: u64,
-    pub gzip_bytes: u64,
-    pub brotli_bytes: u64,
-    pub zstd_bytes: u64,
-    pub imports: Vec<ImportResult>,
-    /// These totals are a **floor**, not the file's size — the same flag, and the same meaning, as
-    /// [`FileSizeDocumentResponse::incomplete`].
-    ///
-    /// It was missing here, which made this the one surface where a floor and a measurement are
-    /// indistinguishable: the legacy `file_size` request answers with the same
-    /// [`crate::pipeline::file_size::FileSizeComputation`] and simply dropped the one field that
-    /// says the number is short. Additive and `#[serde(default)]`, so an older client that ignores
-    /// it is no worse off than it was.
-    #[serde(default)]
-    pub incomplete: bool,
-    /// The file's own combined build failed — the same flag, and the same meaning, as
-    /// [`FileSizeDocumentResponse::degraded`]. Missing here for the same reason `incomplete` was.
-    #[serde(default)]
-    pub degraded: bool,
-    pub error: Option<String>,
-    pub diagnostics: Vec<ImportDiagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheShardInfo {
     pub shard_id: String,
     pub project_root: String,
@@ -1330,19 +1270,19 @@ pub struct ShutdownMessage {
     pub message_type: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Every frame a client sends, told apart by its `type` field.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello(HelloMessage),
     AnalyzeDocument(AnalyzeDocumentRequest),
     AnalyzePackageJson(AnalyzePackageJsonRequest),
     AnalyzeSpecifiers(AnalyzeSpecifiersRequest),
-    Batch(BatchRequest),
     CacheInvalidate(CacheInvalidateMessage),
     CacheInvalidateAll(CacheInvalidateAllMessage),
     PrewarmPackageJson(PrewarmPackageJsonMessage),
     NodeModulesChanged(NodeModulesChangedMessage),
     EnumerateExports(EnumerateExportsRequest),
-    FileSize(FileSizeRequest),
     FileSizeDocument(FileSizeDocumentRequest),
     CompleteImportMembers(CompleteImportMembersRequest),
     CacheStatus(CacheStatusRequest),
@@ -1351,108 +1291,6 @@ pub enum ClientMessage {
     RefreshRegistryHints(RefreshRegistryHintsRequest),
     WorkspaceReport(WorkspaceReportRequest),
     Shutdown(ShutdownMessage),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
-enum ClientMessageWire {
-    Typed(TypedClientMessage),
-    Batch(BatchRequestWire),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum TypedClientMessage {
-    Hello(HelloMessage),
-    AnalyzeDocument(AnalyzeDocumentRequest),
-    AnalyzePackageJson(AnalyzePackageJsonRequest),
-    AnalyzeSpecifiers(AnalyzeSpecifiersRequest),
-    CacheInvalidate(CacheInvalidateMessage),
-    CacheInvalidateAll(CacheInvalidateAllMessage),
-    PrewarmPackageJson(PrewarmPackageJsonMessage),
-    NodeModulesChanged(NodeModulesChangedMessage),
-    EnumerateExports(EnumerateExportsRequest),
-    FileSize(FileSizeRequest),
-    FileSizeDocument(FileSizeDocumentRequest),
-    CompleteImportMembers(CompleteImportMembersRequest),
-    CacheStatus(CacheStatusRequest),
-    CacheList(CacheListRequest),
-    CacheRemove(CacheRemoveRequest),
-    RefreshRegistryHints(RefreshRegistryHintsRequest),
-    WorkspaceReport(WorkspaceReportRequest),
-    Shutdown(ShutdownMessage),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BatchRequestWire {
-    version: u32,
-    request_id: u64,
-    workspace_root: String,
-    active_document_path: String,
-    imports: Vec<ImportRequest>,
-    #[serde(default)]
-    streaming: bool,
-}
-
-impl<'de> Deserialize<'de> for ClientMessage {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        ClientMessageWire::deserialize(deserializer).map(Into::into)
-    }
-}
-
-impl From<ClientMessageWire> for ClientMessage {
-    fn from(message: ClientMessageWire) -> Self {
-        match message {
-            ClientMessageWire::Typed(message) => message.into(),
-            ClientMessageWire::Batch(request) => Self::Batch(request.into()),
-        }
-    }
-}
-
-impl From<TypedClientMessage> for ClientMessage {
-    fn from(message: TypedClientMessage) -> Self {
-        match message {
-            TypedClientMessage::Hello(message) => Self::Hello(message),
-            TypedClientMessage::AnalyzeDocument(message) => Self::AnalyzeDocument(message),
-            TypedClientMessage::AnalyzePackageJson(message) => Self::AnalyzePackageJson(message),
-            TypedClientMessage::AnalyzeSpecifiers(message) => Self::AnalyzeSpecifiers(message),
-            TypedClientMessage::CacheInvalidate(message) => Self::CacheInvalidate(message),
-            TypedClientMessage::CacheInvalidateAll(message) => Self::CacheInvalidateAll(message),
-            TypedClientMessage::PrewarmPackageJson(message) => Self::PrewarmPackageJson(message),
-            TypedClientMessage::NodeModulesChanged(message) => Self::NodeModulesChanged(message),
-            TypedClientMessage::EnumerateExports(message) => Self::EnumerateExports(message),
-            TypedClientMessage::FileSize(message) => Self::FileSize(message),
-            TypedClientMessage::FileSizeDocument(message) => Self::FileSizeDocument(message),
-            TypedClientMessage::CompleteImportMembers(message) => {
-                Self::CompleteImportMembers(message)
-            }
-            TypedClientMessage::CacheStatus(message) => Self::CacheStatus(message),
-            TypedClientMessage::CacheList(message) => Self::CacheList(message),
-            TypedClientMessage::CacheRemove(message) => Self::CacheRemove(message),
-            TypedClientMessage::RefreshRegistryHints(message) => {
-                Self::RefreshRegistryHints(message)
-            }
-            TypedClientMessage::WorkspaceReport(message) => Self::WorkspaceReport(message),
-            TypedClientMessage::Shutdown(message) => Self::Shutdown(message),
-        }
-    }
-}
-
-impl From<BatchRequestWire> for BatchRequest {
-    fn from(request: BatchRequestWire) -> Self {
-        Self {
-            version: request.version,
-            request_id: request.request_id,
-            workspace_root: request.workspace_root,
-            active_document_path: request.active_document_path,
-            imports: request.imports,
-            streaming: request.streaming,
-        }
-    }
 }
 
 fn hello_message_type() -> String {
@@ -1499,10 +1337,6 @@ fn node_modules_changed_message_type() -> String {
 
 fn enumerate_exports_message_type() -> String {
     "enumerate_exports".to_owned()
-}
-
-fn file_size_message_type() -> String {
-    "file_size".to_owned()
 }
 
 fn file_size_document_message_type() -> String {

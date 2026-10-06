@@ -10,7 +10,6 @@ pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub enum IpcCodecError {
     MessagePackEncode(String),
     MessagePackDecode(String),
-    FrameTooLarge(usize),
 }
 
 impl fmt::Display for IpcCodecError {
@@ -22,30 +21,11 @@ impl fmt::Display for IpcCodecError {
             Self::MessagePackDecode(message) => {
                 write!(formatter, "MessagePack decode failed: {message}")
             }
-            Self::FrameTooLarge(size) => write!(formatter, "IPC frame is too large: {size} bytes"),
         }
     }
 }
 
 impl Error for IpcCodecError {}
-
-#[derive(Debug, Default)]
-pub struct FrameDecoder {
-    buffer: Vec<u8>,
-}
-
-pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, IpcCodecError> {
-    let payload = encode_payload(message)?;
-    if payload.len() > MAX_FRAME_BYTES {
-        return Err(IpcCodecError::FrameTooLarge(payload.len()));
-    }
-    let payload_len =
-        u32::try_from(payload.len()).map_err(|_| IpcCodecError::FrameTooLarge(payload.len()))?;
-    let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
-    frame.extend_from_slice(&payload_len.to_be_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
 
 pub fn encode_payload<T: Serialize>(message: &T) -> Result<Vec<u8>, IpcCodecError> {
     rmp_serde::to_vec_named(message)
@@ -67,40 +47,4 @@ pub fn message_frame_codec() -> LengthDelimitedCodec {
 
 pub fn payload_bytes<T: Serialize>(message: &T) -> Result<Bytes, IpcCodecError> {
     Ok(Bytes::from(encode_payload(message)?))
-}
-
-impl FrameDecoder {
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, IpcCodecError> {
-        self.buffer.extend_from_slice(chunk);
-        let mut frames = Vec::new();
-
-        loop {
-            if self.buffer.len() < FRAME_HEADER_BYTES {
-                break;
-            }
-
-            let payload_len = u32::from_be_bytes(
-                self.buffer[0..FRAME_HEADER_BYTES]
-                    .try_into()
-                    .expect("frame header slice is exactly 4 bytes"),
-            ) as usize;
-            if payload_len > MAX_FRAME_BYTES {
-                self.buffer.clear();
-                return Err(IpcCodecError::FrameTooLarge(payload_len));
-            }
-
-            let frame_len = FRAME_HEADER_BYTES
-                .checked_add(payload_len)
-                .ok_or(IpcCodecError::FrameTooLarge(payload_len))?;
-
-            if self.buffer.len() < frame_len {
-                break;
-            }
-
-            frames.push(self.buffer[FRAME_HEADER_BYTES..frame_len].to_vec());
-            self.buffer.drain(0..frame_len);
-        }
-
-        Ok(frames)
-    }
 }

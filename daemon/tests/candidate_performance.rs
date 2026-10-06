@@ -54,19 +54,20 @@
 //! run at 8, making it 400 ms — turns a hard requirement into a number no one chose. If it ever
 //! does go red on CI, that is a fact about NFR-002 worth hearing, not a number to inflate.
 
+use futures_util::{SinkExt, StreamExt};
 use import_lens_daemon::engine::{
     AssetKind, BundleEntry, BundlePurpose, BundleRequest, ImportRuntime, RolldownEngine,
 };
-use import_lens_daemon::ipc::codec::{FrameDecoder, decode_payload, encode_frame};
+use import_lens_daemon::ipc::codec::{decode_payload, message_frame_codec, payload_bytes};
 use import_lens_daemon::ipc::protocol::{
-    BatchRequest, BatchResponse, HelloMessage, ImportKind, ImportRequest, ImportResult,
-    PROTOCOL_VERSION,
+    AnalyzeDocumentRequest, AnalyzeDocumentResponse, HelloMessage, ImportAnalysisItem,
+    ImportResult, PROTOCOL_VERSION, RefreshedResultsResponse,
 };
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 mod common;
 
@@ -186,8 +187,7 @@ type DaemonStream = tokio::net::UnixStream;
 /// run — must not leave 35 redb databases behind either.
 struct DaemonSession {
     child: std::process::Child,
-    stream: DaemonStream,
-    decoder: FrameDecoder,
+    framed: Framed<DaemonStream, LengthDelimitedCodec>,
     storage: PathBuf,
     /// Spawn → the moment the daemon accepted an IPC connection. NFR-005 word for word.
     startup: Duration,
@@ -264,21 +264,14 @@ async fn start_daemon(workspace: &Path) -> DaemonSession {
 
     let launched = Instant::now();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_import-lens-daemon"))
-        .args([
-            "--pipe",
-            &endpoint,
-            "--workspace",
-            &workspace.to_string_lossy(),
-            "--storage",
-            &storage.to_string_lossy(),
-        ])
+        .args(["--pipe", &endpoint, "--storage", &storage.to_string_lossy()])
         .spawn()
         .expect("the shipped daemon binary should start");
-    let mut stream = connect(&endpoint).await;
+    let mut framed = Framed::new(connect(&endpoint).await, message_frame_codec());
     let startup = launched.elapsed();
 
     send(
-        &mut stream,
+        &mut framed,
         &HelloMessage {
             message_type: "hello".to_owned(),
             version: PROTOCOL_VERSION,
@@ -294,78 +287,107 @@ async fn start_daemon(workspace: &Path) -> DaemonSession {
 
     DaemonSession {
         child,
-        stream,
-        decoder: FrameDecoder::default(),
+        framed,
         storage,
         startup,
     }
 }
 
-async fn send<S, T>(stream: &mut S, message: &T)
-where
-    S: AsyncWrite + Unpin,
-    T: serde::Serialize,
-{
-    let frame = encode_frame(message).expect("client frame should encode");
-    stream
-        .write_all(&frame)
+async fn send<T: serde::Serialize>(
+    framed: &mut Framed<DaemonStream, LengthDelimitedCodec>,
+    message: &T,
+) {
+    framed
+        .send(payload_bytes(message).expect("client frame should encode"))
         .await
         .expect("client frame should be writable");
-    stream.flush().await.expect("client frame should flush");
 }
 
-async fn read_batch_response<S>(stream: &mut S, decoder: &mut FrameDecoder) -> BatchResponse
-where
-    S: AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
+/// Every import of one analyzed document, each with the result it finally settled on.
+#[derive(Debug)]
+struct AnalyzedDocument {
+    imports: Vec<ImportResult>,
+}
 
-    let mut buffer = [0_u8; 64 * 1024];
+/// Read until every import of the document `request_id` names has a result: the cache hits ride on
+/// the response, and each miss arrives as its own `refreshed_results` push. Frames left over from an
+/// earlier request (a late shared-bytes correction) are skipped.
+async fn read_analyzed_document(
+    framed: &mut Framed<DaemonStream, LengthDelimitedCodec>,
+    request_id: u64,
+) -> AnalyzedDocument {
+    let mut items: Option<Vec<ImportAnalysisItem>> = None;
     loop {
-        let read = tokio::time::timeout(Duration::from_secs(60), stream.read(&mut buffer))
+        if let Some(items) = &items
+            && items.iter().all(|item| item.result.is_some())
+        {
+            break;
+        }
+
+        let payload = tokio::time::timeout(Duration::from_secs(60), framed.next())
             .await
             .expect("daemon should answer within 60s")
-            .expect("daemon response should be readable");
-        assert!(read > 0, "daemon closed the connection before responding");
-
-        for payload in decoder
-            .push(&buffer[..read])
-            .expect("daemon frame should decode")
+            .expect("daemon closed the connection before answering")
+            .expect("daemon frame should be readable");
+        if let Ok(response) = decode_payload::<AnalyzeDocumentResponse>(&payload) {
+            if response.request_id == request_id {
+                assert_eq!(response.error, None, "{response:?}");
+                items = Some(response.imports);
+            }
+        } else if let Ok(push) = decode_payload::<RefreshedResultsResponse>(&payload)
+            && push.generation == Some(request_id)
+            && let Some(items) = items.as_mut()
         {
-            if let Ok(response) = decode_payload::<BatchResponse>(&payload) {
-                return response;
+            for (result, identity) in push.results.into_iter().zip(push.identities) {
+                if let Some(item) = items.iter_mut().find(|item| {
+                    item.detected.specifier == identity.specifier
+                        && item.detected.import_kind == identity.import_kind
+                        && item.detected.named == identity.named
+                        && item.detected.runtime == identity.runtime
+                }) {
+                    item.result = Some(result);
+                }
             }
         }
     }
-}
 
-/// One request/response round trip, timed the way the user experiences it: from the moment the
-/// request leaves to the moment the answer is decoded.
-async fn timed_batch(
-    session: &mut DaemonSession,
-    request: &BatchRequest,
-) -> (BatchResponse, Duration) {
-    let start = Instant::now();
-    send(&mut session.stream, request).await;
-    let response = read_batch_response(&mut session.stream, &mut session.decoder).await;
-    (response, start.elapsed())
-}
-
-fn named_import(workspace: &Path, package: &str, export: &str) -> ImportRequest {
-    ImportRequest {
-        specifier: package.to_owned(),
-        package_name: package.to_owned(),
-        // Read from the installed manifest, never typed here: a pinned version is a fact about
-        // scripts/accuracy-fixtures/package.json, and repeating it would add a place to forget.
-        version: common::pipeline_fixtures::installed_version(workspace, package),
-        named: vec![export.to_owned()],
-        import_kind: ImportKind::Named,
-        runtime: ImportRuntime::default(),
+    AnalyzedDocument {
+        imports: items
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| item.result)
+            .collect(),
     }
 }
 
-fn batch_of(workspace: &Path, request_id: u64, imports: Vec<ImportRequest>) -> BatchRequest {
-    BatchRequest {
+/// One document analysis, timed the way the user experiences it: from the moment the request
+/// leaves to the moment every import in it has its number.
+async fn timed_document(
+    session: &mut DaemonSession,
+    request: &AnalyzeDocumentRequest,
+) -> (AnalyzedDocument, Duration) {
+    let start = Instant::now();
+    send(&mut session.framed, request).await;
+    let analyzed = read_analyzed_document(&mut session.framed, request.request_id).await;
+    (analyzed, start.elapsed())
+}
+
+/// A document importing each `(package, export)` pair with its own named import statement. Each
+/// binding is aliased, so two packages exporting the same name do not collide.
+fn document_of(
+    workspace: &Path,
+    request_id: u64,
+    imports: &[(&str, &str)],
+) -> AnalyzeDocumentRequest {
+    let source = imports
+        .iter()
+        .enumerate()
+        .map(|(index, (package, export))| {
+            format!("import {{ {export} as binding{index} }} from '{package}';\n")
+        })
+        .collect::<String>();
+    AnalyzeDocumentRequest {
+        message_type: "analyze_document".to_owned(),
         version: PROTOCOL_VERSION,
         request_id,
         workspace_root: workspace.to_string_lossy().into_owned(),
@@ -374,28 +396,24 @@ fn batch_of(workspace: &Path, request_id: u64, imports: Vec<ImportRequest>) -> B
             .join("app.ts")
             .to_string_lossy()
             .into_owned(),
-        imports,
-        streaming: false,
+        source,
     }
 }
 
-fn latency_batch(workspace: &Path, request_id: u64) -> BatchRequest {
-    batch_of(
-        workspace,
-        request_id,
-        vec![named_import(workspace, LATENCY_PACKAGE, LATENCY_EXPORT)],
-    )
+fn latency_document(workspace: &Path, request_id: u64) -> AnalyzeDocumentRequest {
+    document_of(workspace, request_id, &[(LATENCY_PACKAGE, LATENCY_EXPORT)])
 }
 
-fn asset_import(package: &str) -> ImportRequest {
-    ImportRequest {
-        specifier: package.to_owned(),
-        package_name: package.to_owned(),
-        version: "1.0.0".to_owned(),
-        named: vec!["value".to_owned()],
-        import_kind: ImportKind::Named,
-        runtime: ImportRuntime::default(),
-    }
+fn asset_document(
+    workspace: &Path,
+    request_id: u64,
+    packages: &[String],
+) -> AnalyzeDocumentRequest {
+    let imports = packages
+        .iter()
+        .map(|package| (package.as_str(), "value"))
+        .collect::<Vec<_>>();
+    document_of(workspace, request_id, &imports)
 }
 
 fn write_css_heavy_package(workspace: &Path, package: &str) {
@@ -479,7 +497,7 @@ fn write_binary_heavy_package(workspace: &Path, package: &str) {
 
 /// A gate that timed a FAILED analysis would be timing the error path, and an Unmeasured result
 /// never enters the engine at all — it would make every gate here trivially green.
-fn assert_measured(response: &BatchResponse, expected: usize) {
+fn assert_measured(response: &AnalyzedDocument, expected: usize) {
     assert_eq!(
         response.imports.len(),
         expected,
@@ -554,7 +572,7 @@ async fn shipped_daemon_cold_import_p95_and_startup_stay_under_release_threshold
     let mut startup = Vec::with_capacity(RECORDED_RUNS);
     for run in 0..(WARMUP_RUNS + RECORDED_RUNS) {
         let mut session = start_daemon(&workspace).await;
-        let (miss, elapsed) = timed_batch(&mut session, &latency_batch(&workspace, 1)).await;
+        let (miss, elapsed) = timed_document(&mut session, &latency_document(&workspace, 1)).await;
 
         assert_measured(&miss, 1);
         assert!(
@@ -603,7 +621,7 @@ async fn shipped_daemon_cache_hit_p95_and_idle_rss_stay_under_release_thresholds
     let workspace = common::engine_fixtures::fixtures_workspace();
     let mut session = start_daemon(&workspace).await;
 
-    let (miss, _) = timed_batch(&mut session, &latency_batch(&workspace, 1)).await;
+    let (miss, _) = timed_document(&mut session, &latency_document(&workspace, 1)).await;
     assert_measured(&miss, 1);
     assert!(!miss.imports[0].cache_hit, "{:?}", miss.imports[0]);
 
@@ -611,7 +629,7 @@ async fn shipped_daemon_cache_hit_p95_and_idle_rss_stay_under_release_thresholds
     for run in 0..(WARMUP_RUNS + RECORDED_RUNS) {
         let request_id = 2 + run as u64;
         let (hit, elapsed) =
-            timed_batch(&mut session, &latency_batch(&workspace, request_id)).await;
+            timed_document(&mut session, &latency_document(&workspace, request_id)).await;
 
         assert_measured(&hit, 1);
         assert!(
@@ -652,8 +670,8 @@ async fn shipped_daemon_cache_hit_p95_and_idle_rss_stay_under_release_thresholds
 
 // NFR-004 (High, §10.6): a 20-import active batch stays below 400 MB peak RSS — in the DAEMON.
 //
-// The batch is sent as one `BatchRequest` to the shipped binary, so the concurrency, the engine
-// permits and the allocator are the shipped ones. It matches the spec's comparison set:
+// The imports are sent as one document analysis to the shipped binary, so the concurrency, the
+// engine permits and the allocator are the shipped ones. It matches the spec's comparison set:
 // independent packages, shared transitive dependencies, a CJS package, and repeated different
 // exports from single packages.
 #[tokio::test(flavor = "multi_thread")]
@@ -685,11 +703,8 @@ async fn shipped_daemon_twenty_import_batch_peak_rss_stays_under_release_thresho
     let workspace = common::engine_fixtures::fixtures_workspace();
     let mut session = start_daemon(&workspace).await;
 
-    let imports = BATCH
-        .iter()
-        .map(|(package, export)| named_import(&workspace, package, export))
-        .collect::<Vec<_>>();
-    let (response, elapsed) = timed_batch(&mut session, &batch_of(&workspace, 1, imports)).await;
+    let (response, elapsed) =
+        timed_document(&mut session, &document_of(&workspace, 1, BATCH)).await;
 
     assert_measured(&response, BATCH.len());
     // Read before the `Drop` kills the daemon: a dead process has no working set to report.
@@ -744,8 +759,8 @@ async fn shipped_daemon_asset_heavy_p95_and_peak_rss_stay_bounded() {
     let mut session = start_daemon(&workspace).await;
     let mut css_durations = Vec::with_capacity(RECORDED_RUNS);
     for (run, package) in css_packages.iter().enumerate() {
-        let request = batch_of(&workspace, run as u64 + 1, vec![asset_import(package)]);
-        let (response, elapsed) = timed_batch(&mut session, &request).await;
+        let request = asset_document(&workspace, run as u64 + 1, std::slice::from_ref(package));
+        let (response, elapsed) = timed_document(&mut session, &request).await;
         assert_measured(&response, 1);
         assert!(!response.imports[0].cache_hit, "{response:?}");
         assert_asset_breakdown(&response.imports[0], &[(AssetKind::Css, None)]);
@@ -756,12 +771,12 @@ async fn shipped_daemon_asset_heavy_p95_and_peak_rss_stay_bounded() {
 
     let mut binary_durations = Vec::with_capacity(RECORDED_RUNS);
     for (run, package) in binary_packages.iter().enumerate() {
-        let request = batch_of(
+        let request = asset_document(
             &workspace,
             (runs + run) as u64 + 1,
-            vec![asset_import(package)],
+            std::slice::from_ref(package),
         );
-        let (response, elapsed) = timed_batch(&mut session, &request).await;
+        let (response, elapsed) = timed_document(&mut session, &request).await;
         assert_measured(&response, 1);
         assert!(!response.imports[0].cache_hit, "{response:?}");
         assert_asset_breakdown(
@@ -779,14 +794,14 @@ async fn shipped_daemon_asset_heavy_p95_and_peak_rss_stay_bounded() {
     // A fresh multi-import request makes several post-build tails contend for the dedicated
     // two-wide boundary. Sequential single-import samples above establish latency, but cannot
     // expose widened admission or concurrent retention in the daemon's high-water RSS.
-    let batch_imports = batch_css_packages
+    let batch_packages = batch_css_packages
         .iter()
         .chain(&batch_binary_packages)
-        .map(|package| asset_import(package))
+        .cloned()
         .collect::<Vec<_>>();
-    let (batch_response, batch_elapsed) = timed_batch(
+    let (batch_response, batch_elapsed) = timed_document(
         &mut session,
-        &batch_of(&workspace, (runs * 2) as u64 + 1, batch_imports),
+        &asset_document(&workspace, (runs * 2) as u64 + 1, &batch_packages),
     )
     .await;
     assert_measured(&batch_response, ASSET_BATCH_PER_KIND * 2);

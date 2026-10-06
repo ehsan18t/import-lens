@@ -1,14 +1,15 @@
+use bytes::BytesMut;
+use futures_util::{SinkExt, StreamExt};
 use import_lens_daemon::{
     ipc::{
-        codec::{FrameDecoder, decode_payload, encode_frame},
+        codec::{decode_payload, message_frame_codec, payload_bytes},
         protocol::{
             AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
-            AnalyzePackageJsonResponse, BatchRequest, BatchResponse, CacheStatusRequest,
-            CacheStatusResponse, FileSizeDocumentRequest, FileSizeDocumentResponse,
-            FileSizeRequest, FileSizeResponse, FreshnessKind, HelloMessage, ImportAnalysisStatus,
-            ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION,
-            RefreshRegistryHintsRequest, RefreshRegistryHintsResponse, RefreshedResultsResponse,
-            RegistryHintMode, RegistryHintTarget, ShutdownMessage,
+            AnalyzePackageJsonResponse, CacheStatusRequest, CacheStatusResponse,
+            EnumerateExportsRequest, EnumerateExportsResponse, FileSizeDocumentRequest,
+            FileSizeDocumentResponse, FreshnessKind, HelloMessage, ImportAnalysisStatus,
+            PROTOCOL_VERSION, RefreshRegistryHintsRequest, RefreshRegistryHintsResponse,
+            RefreshedResultsResponse, RegistryHintMode, RegistryHintTarget, ShutdownMessage,
         },
         server::{handle_connection, response_from_join},
     },
@@ -18,11 +19,12 @@ use import_lens_daemon::{
         service::RegistryHintService,
         types::{HttpRegistryResponse, RegistryHttpClient},
     },
-    service::{ImportLensService, protocol_error_batch_response},
+    service::{ImportLensService, protocol_error_exports_response},
 };
+use serde::de::DeserializeOwned;
 use std::{
-    collections::VecDeque,
     fs,
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -30,137 +32,61 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+use tokio::io::{DuplexStream, duplex};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 static NEXT_TEMP_WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
-struct ResponseReader {
-    decoder: FrameDecoder,
-    pending: VecDeque<BatchResponse>,
+/// The client end of a test connection, framed by the codec the daemon ships.
+type Client = Framed<DuplexStream, LengthDelimitedCodec>;
+
+async fn next_payload(stream: &mut Client) -> BytesMut {
+    stream
+        .next()
+        .await
+        .expect("server closed before writing a frame")
+        .expect("server frame should decode")
 }
 
-struct CacheStatusResponseReader {
-    decoder: FrameDecoder,
-    pending: VecDeque<CacheStatusResponse>,
-}
+/// Reads every frame as one response type.
+struct TypedReader<T>(PhantomData<T>);
 
-struct FileSizeResponseReader {
-    decoder: FrameDecoder,
-    pending: VecDeque<FileSizeResponse>,
-}
-
-impl FileSizeResponseReader {
+impl<T: DeserializeOwned> TypedReader<T> {
     fn new() -> Self {
-        Self {
-            decoder: FrameDecoder::default(),
-            pending: VecDeque::new(),
-        }
+        Self(PhantomData)
     }
 
-    async fn read_response(&mut self, stream: &mut DuplexStream) -> FileSizeResponse {
-        if let Some(response) = self.pending.pop_front() {
-            return response;
-        }
-
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let read = stream
-                .read(&mut buffer)
-                .await
-                .expect("server response should be readable");
-            assert!(read > 0, "server closed before writing response");
-            for payload in self
-                .decoder
-                .push(&buffer[..read])
-                .expect("server frame should decode")
-            {
-                self.pending.push_back(
-                    decode_payload::<FileSizeResponse>(&payload)
-                        .expect("file-size response should decode"),
-                );
-            }
-            if let Some(response) = self.pending.pop_front() {
-                return response;
-            }
-        }
+    async fn read_response(&mut self, stream: &mut Client) -> T {
+        decode_payload(&next_payload(stream).await).expect("server response should decode")
     }
 }
 
-impl CacheStatusResponseReader {
+type CacheStatusResponseReader = TypedReader<CacheStatusResponse>;
+type FileSizeDocumentResponseReader = TypedReader<FileSizeDocumentResponse>;
+type RegistryRefreshResponseReader = TypedReader<RefreshRegistryHintsResponse>;
+type PackageJsonResponseReader = TypedReader<AnalyzePackageJsonResponse>;
+
+enum MixedResponse {
+    CacheStatus(CacheStatusResponse),
+    PackageJson(AnalyzePackageJsonResponse),
+}
+
+/// Reads a stream that interleaves cache-status responses with package.json frames.
+struct MixedResponseReader;
+
+impl MixedResponseReader {
     fn new() -> Self {
-        Self {
-            decoder: FrameDecoder::default(),
-            pending: VecDeque::new(),
-        }
+        Self
     }
 
-    async fn read_response(&mut self, stream: &mut DuplexStream) -> CacheStatusResponse {
-        if let Some(response) = self.pending.pop_front() {
-            return response;
-        }
-
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let read = stream
-                .read(&mut buffer)
-                .await
-                .expect("server response should be readable");
-            assert!(read > 0, "server closed before writing response");
-            for payload in self
-                .decoder
-                .push(&buffer[..read])
-                .expect("server frame should decode")
-            {
-                self.pending.push_back(
-                    decode_payload::<CacheStatusResponse>(&payload)
-                        .expect("cache status response should decode"),
-                );
-            }
-            if let Some(response) = self.pending.pop_front() {
-                return response;
-            }
-        }
-    }
-}
-
-struct RegistryRefreshResponseReader {
-    decoder: FrameDecoder,
-    pending: VecDeque<RefreshRegistryHintsResponse>,
-}
-
-impl RegistryRefreshResponseReader {
-    fn new() -> Self {
-        Self {
-            decoder: FrameDecoder::default(),
-            pending: VecDeque::new(),
-        }
-    }
-
-    async fn read_response(&mut self, stream: &mut DuplexStream) -> RefreshRegistryHintsResponse {
-        if let Some(response) = self.pending.pop_front() {
-            return response;
-        }
-
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let read = stream
-                .read(&mut buffer)
-                .await
-                .expect("server response should be readable");
-            assert!(read > 0, "server closed before writing response");
-            for payload in self
-                .decoder
-                .push(&buffer[..read])
-                .expect("server frame should decode")
-            {
-                self.pending.push_back(
-                    decode_payload::<RefreshRegistryHintsResponse>(&payload)
-                        .expect("registry refresh response should decode"),
-                );
-            }
-            if let Some(response) = self.pending.pop_front() {
-                return response;
-            }
+    async fn read_response(&mut self, stream: &mut Client) -> MixedResponse {
+        let payload = next_payload(stream).await;
+        if let Ok(response) = decode_payload::<CacheStatusResponse>(&payload) {
+            MixedResponse::CacheStatus(response)
+        } else if let Ok(response) = decode_payload::<AnalyzePackageJsonResponse>(&payload) {
+            MixedResponse::PackageJson(response)
+        } else {
+            panic!("server frame should match an expected response shape");
         }
     }
 }
@@ -180,139 +106,6 @@ impl RegistryHttpClient for DelayedRegistryClient {
             retry_after_ms: None,
             body: r#"{"dist-tags":{"latest":"2.0.0"},"versions":{"1.0.0":{}},"time":{"2.0.0":"2026-01-01T00:00:00.000Z"}}"#.to_owned(),
         })
-    }
-}
-
-impl ResponseReader {
-    fn new() -> Self {
-        Self {
-            decoder: FrameDecoder::default(),
-            pending: VecDeque::new(),
-        }
-    }
-
-    async fn read_response(&mut self, stream: &mut DuplexStream) -> BatchResponse {
-        if let Some(response) = self.pending.pop_front() {
-            return response;
-        }
-
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let read = stream
-                .read(&mut buffer)
-                .await
-                .expect("server response should be readable");
-            assert!(read > 0, "server closed before writing response");
-            for payload in self
-                .decoder
-                .push(&buffer[..read])
-                .expect("server frame should decode")
-            {
-                self.pending.push_back(
-                    decode_payload::<BatchResponse>(&payload)
-                        .expect("batch response should decode"),
-                );
-            }
-            if let Some(response) = self.pending.pop_front() {
-                return response;
-            }
-        }
-    }
-}
-
-struct PackageJsonResponseReader {
-    decoder: FrameDecoder,
-    pending: VecDeque<AnalyzePackageJsonResponse>,
-}
-
-enum MixedResponse {
-    Batch(BatchResponse),
-    CacheStatus(CacheStatusResponse),
-    PackageJson(AnalyzePackageJsonResponse),
-}
-
-struct MixedResponseReader {
-    decoder: FrameDecoder,
-    pending: VecDeque<MixedResponse>,
-}
-
-impl PackageJsonResponseReader {
-    fn new() -> Self {
-        Self {
-            decoder: FrameDecoder::default(),
-            pending: VecDeque::new(),
-        }
-    }
-
-    async fn read_response(&mut self, stream: &mut DuplexStream) -> AnalyzePackageJsonResponse {
-        if let Some(response) = self.pending.pop_front() {
-            return response;
-        }
-
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let read = stream
-                .read(&mut buffer)
-                .await
-                .expect("server response should be readable");
-            assert!(read > 0, "server closed before writing response");
-            for payload in self
-                .decoder
-                .push(&buffer[..read])
-                .expect("server frame should decode")
-            {
-                self.pending.push_back(
-                    decode_payload::<AnalyzePackageJsonResponse>(&payload)
-                        .expect("package.json response should decode"),
-                );
-            }
-            if let Some(response) = self.pending.pop_front() {
-                return response;
-            }
-        }
-    }
-}
-
-impl MixedResponseReader {
-    fn new() -> Self {
-        Self {
-            decoder: FrameDecoder::default(),
-            pending: VecDeque::new(),
-        }
-    }
-
-    async fn read_response(&mut self, stream: &mut DuplexStream) -> MixedResponse {
-        if let Some(response) = self.pending.pop_front() {
-            return response;
-        }
-
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let read = stream
-                .read(&mut buffer)
-                .await
-                .expect("server response should be readable");
-            assert!(read > 0, "server closed before writing response");
-            for payload in self
-                .decoder
-                .push(&buffer[..read])
-                .expect("server frame should decode")
-            {
-                if let Ok(response) = decode_payload::<CacheStatusResponse>(&payload) {
-                    self.pending.push_back(MixedResponse::CacheStatus(response));
-                } else if let Ok(response) = decode_payload::<AnalyzePackageJsonResponse>(&payload)
-                {
-                    self.pending.push_back(MixedResponse::PackageJson(response));
-                } else if let Ok(response) = decode_payload::<BatchResponse>(&payload) {
-                    self.pending.push_back(MixedResponse::Batch(response));
-                } else {
-                    panic!("server frame should match an expected response shape");
-                }
-            }
-            if let Some(response) = self.pending.pop_front() {
-                return response;
-            }
-        }
     }
 }
 
@@ -378,47 +171,6 @@ fn hello(workspace: &Path) -> HelloMessage {
     }
 }
 
-fn streaming_batch(workspace: &Path, request_id: u64) -> BatchRequest {
-    let active_document_path = workspace
-        .join("src")
-        .join("index.ts")
-        .to_string_lossy()
-        .to_string();
-
-    BatchRequest {
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path,
-        imports: vec![
-            ImportRequest {
-                specifier: "tiny-stream-lib".to_owned(),
-                package_name: "tiny-stream-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec!["value".to_owned()],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            },
-            ImportRequest {
-                specifier: "heavy-stream-lib".to_owned(),
-                package_name: "heavy-stream-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec!["value".to_owned()],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            },
-        ],
-        streaming: true,
-    }
-}
-
-fn cache_warmup_batch(workspace: &Path, request_id: u64) -> BatchRequest {
-    let mut batch = streaming_batch(workspace, request_id);
-    batch.imports.truncate(1);
-    batch.streaming = false;
-    batch
-}
-
 fn streaming_package_json(workspace: &Path, request_id: u64) -> AnalyzePackageJsonRequest {
     AnalyzePackageJsonRequest {
         message_type: "analyze_package_json".to_owned(),
@@ -460,28 +212,6 @@ fn cache_status(workspace: &Path, request_id: u64) -> CacheStatusRequest {
     }
 }
 
-fn file_size(workspace: &Path, request_id: u64) -> FileSizeRequest {
-    FileSizeRequest {
-        message_type: "file_size".to_owned(),
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "tiny-stream-lib".to_owned(),
-            package_name: "tiny-stream-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["value".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-    }
-}
-
 async fn wait_for_generation_above(cancellation: &Arc<CancellationToken>, baseline: u64) {
     for _ in 0..20 {
         if cancellation.generation() > baseline {
@@ -494,13 +224,13 @@ async fn wait_for_generation_above(cancellation: &Arc<CancellationToken>, baseli
 }
 
 async fn shutdown_server(
-    client_stream: &mut DuplexStream,
+    client_stream: &mut Client,
     server: tokio::task::JoinHandle<Result<(), String>>,
     workspace: PathBuf,
 ) {
     client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
+        .send(
+            payload_bytes(&ShutdownMessage {
                 message_type: "shutdown".to_owned(),
             })
             .expect("shutdown should encode"),
@@ -517,7 +247,8 @@ async fn shutdown_server(
 #[tokio::test]
 async fn server_batches_cached_registry_hint_partials() {
     let workspace = temp_workspace();
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let registry_hints = RegistryHintService::new(
         RegistryMetadataCache::empty(),
         Box::new(DelayedRegistryClient),
@@ -546,12 +277,12 @@ async fn server_batches_cached_registry_hint_partials() {
     let mut reader = RegistryRefreshResponseReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
     client_stream
-        .write_all(
-            &encode_frame(&RefreshRegistryHintsRequest {
+        .send(
+            payload_bytes(&RefreshRegistryHintsRequest {
                 message_type: "refresh_registry_hints".to_owned(),
                 version: PROTOCOL_VERSION,
                 request_id: 23,
@@ -606,8 +337,8 @@ async fn server_batches_cached_registry_hint_partials() {
     assert_eq!(final_response.results.len(), 3);
 
     client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
+        .send(
+            payload_bytes(&ShutdownMessage {
                 message_type: "shutdown".to_owned(),
             })
             .expect("shutdown should encode"),
@@ -624,7 +355,8 @@ async fn server_batches_cached_registry_hint_partials() {
 #[tokio::test]
 async fn server_responds_to_cache_status_request() {
     let workspace = temp_workspace();
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let server = tokio::spawn(async move {
         handle_connection(
             server_stream,
@@ -638,11 +370,11 @@ async fn server_responds_to_cache_status_request() {
     let mut reader = CacheStatusResponseReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
     client_stream
-        .write_all(&encode_frame(&cache_status(&workspace, 11)).expect("status should encode"))
+        .send(payload_bytes(&cache_status(&workspace, 11)).expect("status should encode"))
         .await
         .expect("status should be written");
 
@@ -657,7 +389,8 @@ async fn server_responds_to_cache_status_request() {
 #[tokio::test]
 async fn server_ignores_an_undecodable_frame_and_keeps_serving() {
     let workspace = temp_workspace();
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let server = tokio::spawn(async move {
         handle_connection(
             server_stream,
@@ -671,18 +404,18 @@ async fn server_ignores_an_undecodable_frame_and_keeps_serving() {
     let mut reader = CacheStatusResponseReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
     // A well-framed but undecodable payload (a corrupt frame, or an unknown
     // message type from a newer client) must be skipped, not tear down the
     // connection and discard warm cache + in-flight work.
     client_stream
-        .write_all(&encode_frame(&0xDEAD_BEEF_u64).expect("garbage frame should encode"))
+        .send(payload_bytes(&0xDEAD_BEEF_u64).expect("garbage frame should encode"))
         .await
         .expect("garbage frame should be written");
     client_stream
-        .write_all(&encode_frame(&cache_status(&workspace, 12)).expect("status should encode"))
+        .send(payload_bytes(&cache_status(&workspace, 12)).expect("status should encode"))
         .await
         .expect("status should be written");
 
@@ -691,8 +424,8 @@ async fn server_ignores_an_undecodable_frame_and_keeps_serving() {
     assert_eq!(response.error, None);
 
     client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
+        .send(
+            payload_bytes(&ShutdownMessage {
                 message_type: "shutdown".to_owned(),
             })
             .expect("shutdown should encode"),
@@ -710,7 +443,8 @@ async fn server_ignores_an_undecodable_frame_and_keeps_serving() {
 async fn server_cancels_prewarm_before_file_size_requests() {
     let workspace = temp_workspace();
     write_tiny_package(&workspace);
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let prefetcher = Prefetcher::new();
     let cancellation = Arc::clone(prefetcher.cancellation());
     let initial_generation = cancellation.generation();
@@ -724,17 +458,25 @@ async fn server_cancels_prewarm_before_file_size_requests() {
         .await
         .map_err(|error| error.to_string())
     });
-    let mut reader = FileSizeResponseReader::new();
+    let mut reader = FileSizeDocumentResponseReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
     wait_for_generation_above(&cancellation, initial_generation).await;
     let prewarm_generation = cancellation.generation();
 
     client_stream
-        .write_all(&encode_frame(&file_size(&workspace, 12)).expect("file size should encode"))
+        .send(
+            payload_bytes(&file_size_document(
+                &workspace,
+                &workspace.join("src").join("index.ts"),
+                "import { value } from 'tiny-stream-lib';",
+                12,
+            ))
+            .expect("file size should encode"),
+        )
         .await
         .expect("file size should be written");
 
@@ -743,8 +485,8 @@ async fn server_cancels_prewarm_before_file_size_requests() {
     assert!(cancellation.generation() > prewarm_generation);
 
     client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
+        .send(
+            payload_bytes(&ShutdownMessage {
                 message_type: "shutdown".to_owned(),
             })
             .expect("shutdown should encode"),
@@ -760,41 +502,15 @@ async fn server_cancels_prewarm_before_file_size_requests() {
 
 /// Reads raw framed payloads so one stream can carry two different response types in
 /// sequence — the FileSizeDocument reply, then the unsolicited RefreshedResults push.
-struct RawFrameReader {
-    decoder: FrameDecoder,
-    pending: VecDeque<Vec<u8>>,
-}
+struct RawFrameReader;
 
 impl RawFrameReader {
     fn new() -> Self {
-        Self {
-            decoder: FrameDecoder::default(),
-            pending: VecDeque::new(),
-        }
+        Self
     }
 
-    async fn next_payload(&mut self, stream: &mut DuplexStream) -> Vec<u8> {
-        if let Some(payload) = self.pending.pop_front() {
-            return payload;
-        }
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let read = stream
-                .read(&mut buffer)
-                .await
-                .expect("server response should be readable");
-            assert!(read > 0, "server closed before writing a frame");
-            for payload in self
-                .decoder
-                .push(&buffer[..read])
-                .expect("server frame should decode")
-            {
-                self.pending.push_back(payload);
-            }
-            if let Some(payload) = self.pending.pop_front() {
-                return payload;
-            }
-        }
+    async fn next_payload(&mut self, stream: &mut Client) -> BytesMut {
+        next_payload(stream).await
     }
 }
 
@@ -818,7 +534,7 @@ fn analyze_document(
 /// back with `loading` placeholders and each import arrives afterwards on its own push.
 async fn collect_streamed_imports(
     reader: &mut RawFrameReader,
-    stream: &mut DuplexStream,
+    stream: &mut Client,
     count: usize,
 ) -> Vec<RefreshedResultsResponse> {
     let mut pushes = Vec::new();
@@ -875,7 +591,8 @@ async fn a_cold_document_answers_at_once_and_streams_each_import_as_it_lands() {
                   export const total = [value, heavy];\n";
     fs::write(&document, source).expect("document should be written");
 
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let server = tokio::spawn(async move {
         handle_connection(
             server_stream,
@@ -889,12 +606,12 @@ async fn a_cold_document_answers_at_once_and_streams_each_import_as_it_lands() {
     let mut reader = RawFrameReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
     client_stream
-        .write_all(
-            &encode_frame(&analyze_document(&workspace, &document, source, 7))
+        .send(
+            payload_bytes(&analyze_document(&workspace, &document, source, 7))
                 .expect("request should encode"),
         )
         .await
@@ -950,8 +667,8 @@ async fn a_cold_document_answers_at_once_and_streams_each_import_as_it_lands() {
     assert_eq!(delivered, vec!["heavy-stream-lib", "tiny-stream-lib"]);
 
     client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
+        .send(
+            payload_bytes(&ShutdownMessage {
                 message_type: "shutdown".to_owned(),
             })
             .expect("shutdown should encode"),
@@ -973,7 +690,8 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
     let source = "import { value } from 'tiny-stream-lib';\nexport const total = value;\n";
     fs::write(&document, source).expect("document should be written");
 
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let server = tokio::spawn(async move {
         handle_connection(
             server_stream,
@@ -987,15 +705,15 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
     let mut reader = RawFrameReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
 
     // Seed the cache the way the editor does: the document analysis is what builds a document's
     // imports (the file-size read only sizes the file), and its results land on the push channel.
     client_stream
-        .write_all(
-            &encode_frame(&analyze_document(&workspace, &document, source, 0))
+        .send(
+            payload_bytes(&analyze_document(&workspace, &document, source, 0))
                 .expect("request should encode"),
         )
         .await
@@ -1006,8 +724,8 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
 
     // The first size read now hits that warm cache with a Fresh entry.
     client_stream
-        .write_all(
-            &encode_frame(&file_size_document(&workspace, &document, source, 1))
+        .send(
+            payload_bytes(&file_size_document(&workspace, &document, source, 1))
                 .expect("request should encode"),
         )
         .await
@@ -1034,8 +752,8 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
 
     // Second request serves the STALE value immediately, then pushes RefreshedResults.
     client_stream
-        .write_all(
-            &encode_frame(&file_size_document(&workspace, &document, source, 2))
+        .send(
+            payload_bytes(&file_size_document(&workspace, &document, source, 2))
                 .expect("request should encode"),
         )
         .await
@@ -1097,8 +815,8 @@ async fn server_pushes_refreshed_results_after_serving_stale_size() {
     );
 
     client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
+        .send(
+            payload_bytes(&ShutdownMessage {
                 message_type: "shutdown".to_owned(),
             })
             .expect("shutdown should encode"),
@@ -1148,7 +866,8 @@ async fn a_streamed_import_is_delivered_while_a_file_size_build_is_in_flight() {
                   export const total = [value, heavy];\n";
     fs::write(&document, source).expect("document should be written");
 
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let server = tokio::spawn(async move {
         handle_connection(
             server_stream,
@@ -1162,18 +881,27 @@ async fn a_streamed_import_is_delivered_while_a_file_size_build_is_in_flight() {
     let mut reader = RawFrameReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
 
-    let mut pipelined = encode_frame(&analyze_document(&workspace, &document, source, 21))
-        .expect("analysis request should encode");
-    pipelined.extend_from_slice(
-        &encode_frame(&file_size_document(&workspace, &document, source, 22))
-            .expect("file-size request should encode"),
-    );
+    // Both frames are queued, then written in one flush: one chunk on the wire.
     client_stream
-        .write_all(&pipelined)
+        .feed(
+            payload_bytes(&analyze_document(&workspace, &document, source, 21))
+                .expect("analysis request should encode"),
+        )
+        .await
+        .expect("analysis request should be queued");
+    client_stream
+        .feed(
+            payload_bytes(&file_size_document(&workspace, &document, source, 22))
+                .expect("file-size request should encode"),
+        )
+        .await
+        .expect("file-size request should be queued");
+    client_stream
+        .flush()
         .await
         .expect("both requests should be written in one chunk");
 
@@ -1192,9 +920,7 @@ async fn a_streamed_import_is_delivered_while_a_file_size_build_is_in_flight() {
     // different core counts). Assert instead the property the loop actually owes and the old
     // inline-`.await` broke: it stays live while the build runs. Ask a fresh, trivial question now.
     client_stream
-        .write_all(
-            &encode_frame(&cache_status(&workspace, 23)).expect("cache status should encode"),
-        )
+        .send(payload_bytes(&cache_status(&workspace, 23)).expect("cache status should encode"))
         .await
         .expect("cache status should be written");
 
@@ -1251,105 +977,12 @@ async fn a_streamed_import_is_delivered_while_a_file_size_build_is_in_flight() {
 }
 
 #[tokio::test]
-async fn server_writes_streaming_partial_frame_before_final_response() {
-    let workspace = temp_workspace();
-    write_tiny_package(&workspace);
-    write_heavy_package(&workspace);
-
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
-    let server = tokio::spawn(async move {
-        handle_connection(
-            server_stream,
-            None,
-            Arc::new(ImportLensService::new(None, false)),
-            Prefetcher::new(),
-        )
-        .await
-        .map_err(|error| error.to_string())
-    });
-    let mut reader = ResponseReader::new();
-
-    client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
-        .await
-        .expect("hello should be written");
-    client_stream
-        .write_all(
-            &encode_frame(&cache_warmup_batch(&workspace, 1))
-                .expect("warmup request should encode"),
-        )
-        .await
-        .expect("warmup should be written");
-    let warmup = reader.read_response(&mut client_stream).await;
-    assert_eq!(warmup.request_id, 1);
-    assert_eq!(warmup.indexes, None);
-
-    client_stream
-        .write_all(
-            &encode_frame(&streaming_batch(&workspace, 2))
-                .expect("streaming request should encode"),
-        )
-        .await
-        .expect("streaming request should be written");
-    let first_partial = tokio::time::timeout(
-        Duration::from_millis(200),
-        reader.read_response(&mut client_stream),
-    )
-    .await
-    .expect("cached import partial should arrive before the heavy import finishes");
-    assert_eq!(first_partial.request_id, 2);
-    assert_eq!(first_partial.indexes, Some(vec![0]));
-    assert_eq!(first_partial.imports.len(), 1);
-
-    let early_final = tokio::time::timeout(
-        Duration::from_millis(20),
-        reader.read_response(&mut client_stream),
-    )
-    .await;
-    assert!(
-        early_final.is_err(),
-        "final response should not be buffered with the first partial",
-    );
-
-    let second_partial = tokio::time::timeout(
-        Duration::from_secs(10),
-        reader.read_response(&mut client_stream),
-    )
-    .await
-    .expect("heavy import partial should arrive");
-    assert_eq!(second_partial.indexes, Some(vec![1]));
-
-    let final_response = tokio::time::timeout(
-        Duration::from_secs(10),
-        reader.read_response(&mut client_stream),
-    )
-    .await
-    .expect("final response should arrive");
-    assert_eq!(final_response.indexes, None);
-    assert_eq!(final_response.imports.len(), 2);
-
-    client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
-                message_type: "shutdown".to_owned(),
-            })
-            .expect("shutdown should encode"),
-        )
-        .await
-        .expect("shutdown should be written");
-    server
-        .await
-        .expect("server task should join")
-        .expect("server should exit cleanly");
-    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
-}
-
-#[tokio::test]
 async fn server_writes_package_json_partial_frame_before_final_response() {
     let workspace = temp_workspace();
     write_tiny_package(&workspace);
 
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let server = tokio::spawn(async move {
         handle_connection(
             server_stream,
@@ -1363,12 +996,12 @@ async fn server_writes_package_json_partial_frame_before_final_response() {
     let mut reader = PackageJsonResponseReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
     client_stream
-        .write_all(
-            &encode_frame(&streaming_package_json(&workspace, 6))
+        .send(
+            payload_bytes(&streaming_package_json(&workspace, 6))
                 .expect("package.json request should encode"),
         )
         .await
@@ -1403,8 +1036,8 @@ async fn server_writes_package_json_partial_frame_before_final_response() {
     assert_eq!(final_response.states.len(), 2);
 
     client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
+        .send(
+            payload_bytes(&ShutdownMessage {
                 message_type: "shutdown".to_owned(),
             })
             .expect("shutdown should encode"),
@@ -1424,7 +1057,8 @@ async fn server_keeps_connection_responsive_during_package_json_stream() {
     write_tiny_package(&workspace);
     write_heavy_package(&workspace);
 
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let server = tokio::spawn(async move {
         handle_connection(
             server_stream,
@@ -1438,12 +1072,12 @@ async fn server_keeps_connection_responsive_during_package_json_stream() {
     let mut reader = MixedResponseReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
     client_stream
-        .write_all(
-            &encode_frame(&streaming_large_package_json(&workspace, 20))
+        .send(
+            payload_bytes(&streaming_large_package_json(&workspace, 20))
                 .expect("package.json request should encode"),
         )
         .await
@@ -1471,9 +1105,7 @@ async fn server_keeps_connection_responsive_during_package_json_stream() {
     );
 
     client_stream
-        .write_all(
-            &encode_frame(&cache_status(&workspace, 21)).expect("cache status should encode"),
-        )
+        .send(payload_bytes(&cache_status(&workspace, 21)).expect("cache status should encode"))
         .await
         .expect("cache status should be written");
 
@@ -1512,116 +1144,10 @@ async fn server_keeps_connection_responsive_during_package_json_stream() {
 }
 
 #[tokio::test]
-async fn server_keeps_connection_responsive_during_streaming_batch() {
-    let workspace = temp_workspace();
-    write_tiny_package(&workspace);
-    write_heavy_package(&workspace);
-
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
-    let server = tokio::spawn(async move {
-        handle_connection(
-            server_stream,
-            None,
-            Arc::new(ImportLensService::new(None, false)),
-            Prefetcher::new(),
-        )
-        .await
-        .map_err(|error| error.to_string())
-    });
-    let mut reader = MixedResponseReader::new();
-
-    client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
-        .await
-        .expect("hello should be written");
-    client_stream
-        .write_all(
-            &encode_frame(&cache_warmup_batch(&workspace, 19)).expect("warmup batch should encode"),
-        )
-        .await
-        .expect("warmup batch should be written");
-    let warmup = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let response = reader.read_response(&mut client_stream).await;
-            if let MixedResponse::Batch(response) = response
-                && response.request_id == 19
-                && response.indexes.is_none()
-            {
-                return response;
-            }
-        }
-    })
-    .await
-    .expect("warmup batch should complete");
-    assert_eq!(warmup.imports.len(), 1);
-
-    client_stream
-        .write_all(
-            &encode_frame(&streaming_batch(&workspace, 22)).expect("streaming batch should encode"),
-        )
-        .await
-        .expect("streaming batch should be written");
-
-    let first_partial = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let response = reader.read_response(&mut client_stream).await;
-            if let MixedResponse::Batch(response) = response
-                && response.request_id == 22
-                && response.indexes.is_some()
-            {
-                return response;
-            }
-        }
-    })
-    .await
-    .expect("streaming batch should emit a partial before the final frame");
-    assert_eq!(first_partial.imports.len(), 1);
-
-    client_stream
-        .write_all(
-            &encode_frame(&cache_status(&workspace, 23)).expect("cache status should encode"),
-        )
-        .await
-        .expect("cache status should be written");
-
-    let (cache_status_at, batch_final_at) = tokio::time::timeout(Duration::from_secs(20), async {
-        let mut cache_status_at: Option<usize> = None;
-        let mut batch_final_at: Option<usize> = None;
-        let mut seq = 0_usize;
-
-        while cache_status_at.is_none() || batch_final_at.is_none() {
-            let response = reader.read_response(&mut client_stream).await;
-            match response {
-                MixedResponse::CacheStatus(response) if response.request_id == 23 => {
-                    cache_status_at.get_or_insert(seq);
-                }
-                MixedResponse::Batch(response)
-                    if response.request_id == 22 && response.indexes.is_none() =>
-                {
-                    batch_final_at.get_or_insert(seq);
-                }
-                _ => {}
-            }
-            seq += 1;
-        }
-
-        (cache_status_at.unwrap(), batch_final_at.unwrap())
-    })
-    .await
-    .expect("cache_status and batch final should arrive");
-
-    assert!(
-        cache_status_at < batch_final_at,
-        "cache_status must be served before the streaming batch final frame"
-    );
-
-    shutdown_server(&mut client_stream, server, workspace).await;
-}
-
-#[tokio::test]
 async fn unsupported_hello_version_closes_connection_without_accepting_requests() {
     let workspace = temp_workspace();
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let server = tokio::spawn(async move {
         handle_connection(
             server_stream,
@@ -1634,20 +1160,27 @@ async fn unsupported_hello_version_closes_connection_without_accepting_requests(
     });
     let mut unsupported_hello = hello(&workspace);
     unsupported_hello.version = PROTOCOL_VERSION + 1;
-    let mut frames = encode_frame(&unsupported_hello).expect("hello should encode");
-    frames.extend(encode_frame(&cache_warmup_batch(&workspace, 3)).expect("batch should encode"));
 
     client_stream
-        .write_all(&frames)
+        .feed(payload_bytes(&unsupported_hello).expect("hello should encode"))
+        .await
+        .expect("hello should be queued");
+    client_stream
+        .feed(payload_bytes(&cache_status(&workspace, 3)).expect("status should encode"))
+        .await
+        .expect("status should be queued");
+    client_stream
+        .flush()
         .await
         .expect("client frames should be written");
-    let mut buffer = [0_u8; 256];
-    let read = tokio::time::timeout(Duration::from_secs(1), client_stream.read(&mut buffer))
+    let next = tokio::time::timeout(Duration::from_secs(1), client_stream.next())
         .await
-        .expect("connection should close")
-        .expect("client read should complete");
+        .expect("connection should close");
 
-    assert_eq!(read, 0);
+    assert!(
+        next.is_none(),
+        "the server must close without answering a request after an unsupported hello"
+    );
     server
         .await
         .expect("server task should join")
@@ -1656,24 +1189,37 @@ async fn unsupported_hello_version_closes_connection_without_accepting_requests(
 }
 
 #[tokio::test]
-async fn spawn_blocking_join_error_returns_protocol_batch_error() {
+async fn spawn_blocking_join_error_returns_a_request_scoped_protocol_error() {
     let workspace = temp_workspace();
-    let request = cache_warmup_batch(&workspace, 4);
+    let request = EnumerateExportsRequest {
+        message_type: "enumerate_exports".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 4,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: workspace
+            .join("src")
+            .join("index.ts")
+            .to_string_lossy()
+            .to_string(),
+        specifier: "tiny-stream-lib".to_owned(),
+        package_name: "tiny-stream-lib".to_owned(),
+        package_version: "1.0.0".to_owned(),
+        cursor_offset: None,
+    };
     let response = response_from_join(
-        tokio::task::spawn_blocking(|| -> BatchResponse {
+        tokio::task::spawn_blocking(|| -> EnumerateExportsResponse {
             panic!("analysis worker panic");
         }),
         &request,
-        protocol_error_batch_response,
+        protocol_error_exports_response,
     )
     .await;
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert_eq!(response.request_id, 4);
-    assert_eq!(response.indexes, None);
-    assert_eq!(response.imports.len(), 1);
+    assert!(response.exports.is_empty());
     assert!(
-        response.imports[0]
+        response
             .error
             .as_deref()
             .is_some_and(|message| message.contains("analysis worker failed")),
@@ -1684,7 +1230,8 @@ async fn spawn_blocking_join_error_returns_protocol_batch_error() {
 #[tokio::test]
 async fn server_streams_registry_hint_partials_before_final_response() {
     let workspace = temp_workspace();
-    let (mut client_stream, server_stream) = duplex(64 * 1024);
+    let (client_stream, server_stream) = duplex(64 * 1024);
+    let mut client_stream = Framed::new(client_stream, message_frame_codec());
     let registry_hints = RegistryHintService::new(
         RegistryMetadataCache::empty(),
         Box::new(DelayedRegistryClient),
@@ -1704,12 +1251,12 @@ async fn server_streams_registry_hint_partials_before_final_response() {
     let mut reader = RegistryRefreshResponseReader::new();
 
     client_stream
-        .write_all(&encode_frame(&hello(&workspace)).expect("hello should encode"))
+        .send(payload_bytes(&hello(&workspace)).expect("hello should encode"))
         .await
         .expect("hello should be written");
     client_stream
-        .write_all(
-            &encode_frame(&RefreshRegistryHintsRequest {
+        .send(
+            payload_bytes(&RefreshRegistryHintsRequest {
                 message_type: "refresh_registry_hints".to_owned(),
                 version: PROTOCOL_VERSION,
                 request_id: 8,
@@ -1789,8 +1336,8 @@ async fn server_streams_registry_hint_partials_before_final_response() {
     );
 
     client_stream
-        .write_all(
-            &encode_frame(&ShutdownMessage {
+        .send(
+            payload_bytes(&ShutdownMessage {
                 message_type: "shutdown".to_owned(),
             })
             .expect("shutdown should encode"),

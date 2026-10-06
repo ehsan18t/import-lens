@@ -163,18 +163,6 @@ pub fn package_json_dependency_names(contents: &str) -> Result<Vec<String>, Stri
     Ok(names)
 }
 
-pub fn package_json_prewarm_requests(
-    package_json_path: &Path,
-    active_document_path: &Path,
-) -> Result<Vec<ImportRequest>, String> {
-    Ok(
-        package_json_prewarm_jobs(package_json_path, active_document_path, &|| true)?
-            .into_iter()
-            .map(|job| job.request)
-            .collect(),
-    )
-}
-
 fn package_json_prewarm_jobs(
     package_json_path: &Path,
     active_document_path: &Path,
@@ -389,10 +377,6 @@ fn run_recent_prewarm_job(
 fn installed_package(active_document_path: &Path, package_name: &str) -> Option<ResolvedPackage> {
     let request = prewarm_request(package_name, "", ImportKind::Namespace);
     resolve_package_entry(active_document_path, &request).ok()
-}
-
-pub fn cached_import_request_from_key(key: &str) -> Option<ImportRequest> {
-    decode_cache_identity(key).map(import_request_from_identity)
 }
 
 fn import_request_from_identity(identity: CacheIdentity) -> ImportRequest {

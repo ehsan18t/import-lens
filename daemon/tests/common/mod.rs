@@ -303,6 +303,80 @@ pub(crate) fn normalized_zip_entry_path(name: &str) -> Option<(PathBuf, bool)> {
     Some((path, is_dir))
 }
 
+/// A document analysis run to completion through the production entry points, the way the server
+/// serves the editor: the streamed `AnalyzeDocument` response, then every build it left pending,
+/// with each pushed result merged into the import it names.
+#[allow(dead_code)]
+pub mod documents {
+    use import_lens_daemon::{
+        document::IgnoreRuleResolver,
+        ipc::protocol::{
+            AnalyzeDocumentRequest, ImportAnalysisItem, ImportAnalysisStatus, ImportResult,
+        },
+        pipeline::analyze::AnalysisContext,
+        service::ImportLensService,
+    };
+    use std::{path::PathBuf, sync::Mutex};
+
+    #[derive(Debug)]
+    pub struct AnalyzedDocument {
+        pub request_id: u64,
+        pub error: Option<String>,
+        pub items: Vec<ImportAnalysisItem>,
+        /// The settled result of every import that has one, in document order.
+        pub imports: Vec<ImportResult>,
+    }
+
+    pub fn analyze_document(
+        service: &ImportLensService,
+        request: AnalyzeDocumentRequest,
+    ) -> AnalyzedDocument {
+        let context = AnalysisContext {
+            workspace_root: PathBuf::from(&request.workspace_root),
+            active_document_path: PathBuf::from(&request.active_document_path),
+        };
+        let streamed =
+            service.handle_analyze_document_streaming(request, &IgnoreRuleResolver::default());
+        let request_id = streamed.response.request_id;
+        let error = streamed.response.error.clone();
+        let items = Mutex::new(streamed.response.imports);
+        service.complete_pending_imports(
+            &context,
+            streamed.measured,
+            streamed.pending,
+            || true,
+            |results, identities| {
+                let mut items = items.lock().expect("items lock");
+                for (result, identity) in results.into_iter().zip(identities) {
+                    let item = items
+                        .iter_mut()
+                        .find(|item| {
+                            item.detected.specifier == identity.specifier
+                                && item.detected.import_kind == identity.import_kind
+                                && item.detected.named == identity.named
+                                && item.detected.runtime == identity.runtime
+                        })
+                        .expect("a pushed result must name an import of the document");
+                    item.status = ImportAnalysisStatus::Ready;
+                    item.result = Some(result);
+                }
+            },
+        );
+        let items = items.into_inner().expect("items lock");
+        let imports = items
+            .iter()
+            .filter_map(|item| item.result.clone())
+            .collect();
+
+        AnalyzedDocument {
+            request_id,
+            error,
+            items,
+            imports,
+        }
+    }
+}
+
 /// The five sizes of a result the test expects to have been MEASURED.
 ///
 /// Panics with the result's own failure stage when there is none, which is the whole point: a test

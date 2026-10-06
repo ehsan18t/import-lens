@@ -1,9 +1,6 @@
 use super::{ConnectionLifecycles, close_connection};
 use crate::{
-    ipc::protocol::{
-        BatchRequest, CacheStatusRequest, ImportKind, ImportRequest, ImportRuntime,
-        PROTOCOL_VERSION,
-    },
+    ipc::protocol::{AnalyzeSpecifiersRequest, CacheStatusRequest, PROTOCOL_VERSION},
     prefetch::Prefetcher,
     service::ImportLensService,
 };
@@ -37,8 +34,9 @@ fn write_tiny_package(workspace: &Path) {
         .expect("entry should be written");
 }
 
-fn batch(workspace: &Path) -> BatchRequest {
-    BatchRequest {
+fn analyze(service: &ImportLensService, workspace: &Path) {
+    service.handle_analyze_specifiers(AnalyzeSpecifiersRequest {
+        message_type: "analyze_specifiers".to_owned(),
         version: PROTOCOL_VERSION,
         request_id: 1,
         workspace_root: workspace.to_string_lossy().to_string(),
@@ -47,16 +45,8 @@ fn batch(workspace: &Path) -> BatchRequest {
             .join("index.ts")
             .to_string_lossy()
             .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "tiny-teardown-lib".to_owned(),
-            package_name: "tiny-teardown-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["value".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
-    }
+        specifiers: vec!["tiny-teardown-lib".to_owned()],
+    });
 }
 
 /// Entries the project's shard holds ON DISK. Read through the same rollup the cache manager uses.
@@ -92,7 +82,7 @@ async fn closing_a_connection_flushes_what_the_session_measured() {
     // against a throwaway shard to learn the key this workspace's import will be cached under.
     let probe =
         ImportLensService::new_with_cache_policy(Some(key_probe_storage.clone()), true, 512, 32);
-    probe.handle_batch(batch(&workspace));
+    analyze(&probe, &workspace);
     let keys = probe.recent_cache_keys(&workspace, 8);
     let key = keys
         .first()
@@ -104,7 +94,7 @@ async fn closing_a_connection_flushes_what_the_session_measured() {
     // dirty set — measured, and not yet durable.
     let service = ImportLensService::new_with_cache_policy(Some(storage.clone()), true, 512, 32);
     crate::cache::disk::test_support::fail_inserts_for_keys([key.clone()]);
-    service.handle_batch(batch(&workspace));
+    analyze(&service, &workspace);
     assert_eq!(
         persisted_entries(&service, &workspace),
         0,

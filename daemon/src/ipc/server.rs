@@ -19,8 +19,7 @@ use crate::{
     prefetch::Prefetcher,
     service::{
         ImportLensService, StreamedDocumentAnalysis, protocol_error_analyze_document_response,
-        protocol_error_batch_response, protocol_error_exports_response,
-        protocol_error_file_size_document_response, protocol_error_file_size_response,
+        protocol_error_exports_response, protocol_error_file_size_document_response,
     },
 };
 use bytes::Bytes;
@@ -698,61 +697,6 @@ where
                     return Ok(());
                 }
             }
-            ClientMessage::Batch(request) if hello_received => {
-                prefetcher.cancel();
-                lifecycle.record_batch();
-                let svc = std::sync::Arc::clone(&service);
-                if request.version >= 2 && request.streaming {
-                    let request_for_error = request.clone();
-                    let (partial_tx, partial_rx) = mpsc::unbounded_channel();
-                    let response_handle = tokio::task::spawn_blocking(move || {
-                        svc.handle_batch_streaming(request, move |partial| {
-                            let _ = partial_tx.send(partial);
-                        })
-                    });
-                    track_active_task(
-                        &mut active_tasks,
-                        spawn_streaming_forwarder(
-                            &outbound_tx,
-                            partial_rx,
-                            response_handle,
-                            request_for_error,
-                            protocol_error_batch_response,
-                        ),
-                    );
-                } else {
-                    spawn_request(
-                        &mut active_tasks,
-                        &outbound_tx,
-                        request.clone(),
-                        protocol_error_batch_response,
-                        move || svc.handle_batch(request),
-                    );
-                }
-
-                if recycle_if_needed(
-                    &lifecycle,
-                    lifecycle_storage_path.as_deref(),
-                    &prefetcher,
-                    &service,
-                    &mut active_tasks,
-                    &mut _maintenance_task,
-                )
-                .await
-                {
-                    drain_outbound(&mut framed, &mut outbound_rx).await;
-                    return Ok(());
-                }
-            }
-            ClientMessage::Batch(request) => {
-                queue_outbound(
-                    &outbound_tx,
-                    &protocol_error_batch_response(
-                        &request,
-                        "hello message not received".to_owned(),
-                    ),
-                );
-            }
             ClientMessage::AnalyzeDocument(request) if hello_received => {
                 prefetcher.cancel();
                 lifecycle.record_batch();
@@ -1112,27 +1056,6 @@ where
                 queue_outbound(
                     &outbound_tx,
                     &protocol_error_exports_response(
-                        &request,
-                        "hello message not received".to_owned(),
-                    ),
-                );
-            }
-            ClientMessage::FileSize(request) if hello_received => {
-                prefetcher.cancel();
-                lifecycle.record_batch();
-                let svc = std::sync::Arc::clone(&service);
-                spawn_request(
-                    &mut active_tasks,
-                    &outbound_tx,
-                    request.clone(),
-                    protocol_error_file_size_response,
-                    move || svc.handle_file_size(request),
-                );
-            }
-            ClientMessage::FileSize(request) => {
-                queue_outbound(
-                    &outbound_tx,
-                    &protocol_error_file_size_response(
                         &request,
                         "hello message not received".to_owned(),
                     ),
