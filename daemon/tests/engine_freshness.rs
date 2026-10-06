@@ -173,3 +173,60 @@ fn a_production_chunk_carries_no_bundler_debug_metadata() {
         artifact.code
     );
 }
+
+/// A cached engine failure must expire when the package manifest that chose its entry changes,
+/// exactly as a success does. The manifest comes from the pre-resolved package the engine ran
+/// against, so it is recorded even when the specifier no longer resolves from the active document
+/// (the prefetch-refill path hands the analysis a package found by cache identity).
+#[test]
+fn a_failed_build_records_the_manifest_of_the_package_it_ran_against() {
+    use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest};
+    use import_lens_daemon::pipeline::analyze::{
+        AnalysisContext, FingerprintSource, analyze_resolved_import_with_dependencies,
+    };
+    use import_lens_daemon::pipeline::resolver::{ResolvedPackage, SideEffectsMode};
+
+    let root = common::temp_workspace("import-lens-failure-manifest");
+    write_source(
+        &root,
+        "node_modules/broken/package.json",
+        r#"{"name":"broken","version":"1.0.0","module":"./index.js"}"#,
+    );
+    write_source(
+        &root,
+        "node_modules/broken/index.js",
+        "export const used = ;\n",
+    );
+    let package_root = root.join("node_modules/broken");
+    let elsewhere = common::temp_workspace("import-lens-failure-manifest-doc");
+
+    let context = AnalysisContext {
+        workspace_root: elsewhere.clone(),
+        active_document_path: elsewhere.join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: "broken".to_owned(),
+        package_name: "broken".to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["used".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+    let resolved = ResolvedPackage {
+        package_root: package_root.clone(),
+        package_json: serde_json::json!({ "name": "broken", "version": "1.0.0" }),
+        entry_path: package_root.join("index.js"),
+        is_cjs: false,
+        side_effects: SideEffectsMode::Missing,
+    };
+
+    let (result, source) = analyze_resolved_import_with_dependencies(&context, &request, resolved);
+    assert!(result.sizes().is_none(), "the build must fail: {result:?}");
+    let Some(FingerprintSource::ReadTime { stat_paths, .. }) = source else {
+        panic!("a failed build that read its entry carries freshness inputs: {result:?}");
+    };
+    assert!(
+        stat_paths.contains(&package_root.join("package.json")),
+        "the failure must expire with its package manifest: {stat_paths:?}"
+    );
+}

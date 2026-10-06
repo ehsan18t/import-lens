@@ -125,6 +125,19 @@ pub(super) fn first_party_manifests(
     manifests
 }
 
+/// The manifests that decided what a build resolved: the measured package's own, plus the
+/// first-party manifests its loaded sources sit under. One helper for the success and failure
+/// paths, so a cached failure expires on exactly the manifest edits a cached size does.
+fn manifest_stat_paths(
+    context: &AnalysisContext,
+    package_root: &Path,
+    loaded_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut paths = vec![package_root.join("package.json")];
+    paths.extend(first_party_manifests(context, loaded_paths));
+    paths
+}
+
 /// Everything the full-package memo must expire against: the read-time fingerprints
 /// of every module the comparison build measured, plus the manifests that decide what
 /// it resolved. Mirrors the freshness set the import cache stores for the entry build
@@ -159,8 +172,8 @@ pub(crate) fn manifest_augmented_fingerprints(
 
     let mut fingerprints = read_time_fingerprints.to_vec();
     fingerprints.extend(
-        std::iter::once(package_root.join("package.json"))
-            .chain(first_party_manifests(context, loaded_paths))
+        manifest_stat_paths(context, package_root, loaded_paths)
+            .into_iter()
             .filter_map(file_fingerprint_reading_hash),
     );
     fingerprints
@@ -186,6 +199,7 @@ pub fn analyze_resolved_import_with_dependencies(
     request: &ImportRequest,
     resolved: ResolvedPackage,
 ) -> (ImportResult, Option<FingerprintSource>) {
+    let package_root = resolved.package_root.clone();
     match analyze_import_inner_resolved(context, request, resolved) {
         Ok((result, source)) => (result, source),
         Err(error) => {
@@ -193,7 +207,7 @@ pub fn analyze_resolved_import_with_dependencies(
             // change — which means fingerprinting the bytes the failure was derived from, not just
             // the entry the caller happened to name. The engine reports what it had loaded when it
             // gave up; those are those bytes.
-            let source = engine_failure_fingerprints(context, request, &error);
+            let source = engine_failure_fingerprints(context, &package_root, &error);
             (error_result(request, error), source)
         }
     }
@@ -210,7 +224,7 @@ pub fn analyze_resolved_import_with_dependencies(
 /// for the answer to change.
 fn engine_failure_fingerprints(
     context: &AnalysisContext,
-    request: &ImportRequest,
+    package_root: &Path,
     error: &AnalysisError,
 ) -> Option<FingerprintSource> {
     if error.freshness.read_time_fingerprints.is_empty() && error.freshness.stat_paths.is_empty() {
@@ -218,11 +232,9 @@ fn engine_failure_fingerprints(
     }
 
     let mut stat_paths = error.freshness.stat_paths.clone();
-    if let Ok(resolved) = resolve_package_entry(&context.active_document_path, request) {
-        stat_paths.push(resolved.package_root.join("package.json"));
-    }
-    stat_paths.extend(first_party_manifests(
+    stat_paths.extend(manifest_stat_paths(
         context,
+        package_root,
         &error.freshness.loaded_paths,
     ));
 
@@ -556,13 +568,11 @@ pub(crate) fn analyze_with_rolldown_engine(
     // §8.3: freshness comes from fingerprints captured by the same reads that supplied every
     // measured byte. The plugin owns JavaScript and directly imported asset snapshots; the asset
     // processor owns CSS `@import` children and local resources discovered through `url()`.
-    let mut stat_paths = vec![package_root.join("package.json")];
-    stat_paths.extend(first_party_manifests(context, &artifact.loaded_paths));
     let freshness = import_freshness(
         artifact.read_time_fingerprints.clone(),
         &artifact.unhashed_paths,
         assets.freshness_fingerprints(),
-        stat_paths,
+        manifest_stat_paths(context, package_root, &artifact.loaded_paths),
     );
     let mut loaded_paths = artifact.loaded_paths;
     loaded_paths.extend(assets.read_paths.iter().cloned());
