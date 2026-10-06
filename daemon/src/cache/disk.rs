@@ -242,22 +242,44 @@ impl DiskCache {
     }
 
     fn get_entry(&self, key: &str) -> Option<(CachedImport, crate::cache::key::Freshness)> {
-        // Read-your-writes: a queued insert not yet flushed is not in the table.
-        if let Some(entry) = self.pending_insert_entry(key) {
-            // A pending hit is a real access on an enabled shard — stamp it.
+        // Read-your-writes: a queued insert not yet flushed is not in the table. Its
+        // bytes passed the durability gate on the way in.
+        let mut cached = if let Some(pending) = self.pending_insert(key) {
             self.stamp_access();
-            return Some(entry);
+            pending
+        } else {
+            self.read_committed(key)?
+        };
+        // First-party-ness is key-derived; stamp it once at hydration so the
+        // per-hit gate never has to re-decode the identity.
+        cached.first_party = crate::cache::key::cache_key_is_first_party(key);
+        // Hash-verified per FINGERPRINT on this cold path too, exactly as the memory
+        // read does, so a restart cannot re-arm the X-7 / D18 blind spot.
+        let freshness =
+            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
+        match freshness {
+            crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
+                self.remove(key);
+                None
+            }
+            // Unknown is transient: keep the entry.
+            crate::cache::key::Freshness::Fresh | crate::cache::key::Freshness::Unknown => {
+                Some((cached, freshness))
+            }
         }
+    }
 
+    /// Decodes the committed row for `key`, evicting one that is undecodable or not
+    /// durable.
+    fn read_committed(&self, key: &str) -> Option<CachedImport> {
         // Scope the read guard: `remove` re-acquires the db lock, and a re-entrant
         // read while a compaction writer is queued deadlocks (std `RwLock` blocks
         // new readers behind a queued writer, and its docs say a re-entrant `read`
         // may deadlock). Decide inside the scope, drop the guard, THEN remove.
         let decoded = {
             let db_guard = self.db_read()?;
-            // Stamp only once the DB is confirmed open (after the disabled
-            // short-circuit), so a no-op cache skips the clock syscall. Before the
-            // table read, so a get MISS still counts as shard activity.
+            // Stamp only once the DB is confirmed open, and before the table read so a
+            // miss still counts as shard activity.
             self.stamp_access();
             let db = db_guard.as_ref().expect("db present under read guard");
             let read_txn = db.begin_read().ok()?;
@@ -266,18 +288,14 @@ impl DiskCache {
             decode_cached_result(value.value())
         };
 
-        let Some(mut cached) = decoded else {
+        let Some(cached) = decoded else {
             // Undecodable row (corrupt or written by an incompatible build).
             self.remove(key);
             return None;
         };
-        // **The durability gate is on the READ too, not only on `insert_at_generation`**
-        // (ADR-0006, invariant 3). A write-side gate protects a store from what it is handed
-        // today; it does nothing about what is already on disk. L2 outlives the process, so a row
-        // written by a build that predates the gate — or by any future path that reaches redb some
-        // other way — would be decoded, served, and re-promoted into L1 forever, and every read
-        // path (`get_with_freshness`, and the prewarm's `load_recent`) goes through here. Refusing
-        // and removing it costs one rebuild.
+        // The durability gate is on the READ too (ADR-0006, invariant 3): L2 outlives
+        // the process, so a row written before the write gate existed would otherwise
+        // be served and re-promoted into L1 forever. Refusing it costs one rebuild.
         if !cached.result.is_durable()
             || !crate::cache::key::fingerprints_are_reusable(&cached.dependency_fingerprints)
         {
@@ -291,30 +309,7 @@ impl DiskCache {
             self.remove(key);
             return None;
         }
-        // First-party-ness is key-derived; stamp it once at hydration so the
-        // per-hit gate never has to re-decode the identity.
-        cached.first_party = crate::cache::key::cache_key_is_first_party(key);
-        // First-party (workspace / npm-link / file:) source files can be rewritten
-        // equal-length with a preserved mtime, which the cheap pre-filter would miss
-        // (X-7). Hash-verify them strictly on the cold disk-hydration path too, so the
-        // blind spot isn't served even on the first hit before memory hydration.
-        // node_modules files stay on the cheap pre-filter inside the strict variant.
-        // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
-        // stylesheet's `url()` reached outside the package root (D18). Routing by entry meant that
-        // file's stored content hash was never consulted, and a rehydrate from disk re-armed the
-        // same blind spot, so a restart did not clear it either.
-        let freshness =
-            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
-        match freshness {
-            crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
-                self.remove(key);
-                None
-            }
-            // Fresh OR Unknown → keep and return the entry (Unknown must not delete).
-            crate::cache::key::Freshness::Fresh | crate::cache::key::Freshness::Unknown => {
-                Some((cached, freshness))
-            }
-        }
+        Some(cached)
     }
 
     /// The current clear generation. A writer captures this BEFORE deriving the bytes
@@ -481,44 +476,19 @@ impl DiskCache {
         }
     }
 
-    fn pending_insert_entry(
-        &self,
-        key: &str,
-    ) -> Option<(CachedImport, crate::cache::key::Freshness)> {
+    /// The queued-but-unflushed entry for `key`, served only while its generation
+    /// still matches: a `clear()` that superseded it must not be undone by a read,
+    /// exactly as `flush_pending_inserts` drops it before the disk (RB-3).
+    fn pending_insert(&self, key: &str) -> Option<CachedImport> {
         let bytes = {
             let pending = self.pending_inserts.lock().ok()?;
-            // Value is `(clear_generation, bytes)`. Serve a queued-but-unflushed entry on
-            // a get ONLY while its generation still matches: a clear() that superseded it
-            // (bumping the generation) must not be undone by a get reading stale pending
-            // bytes, exactly as `flush_pending_inserts` drops it before the disk (RB-3).
             let (entry_generation, bytes) = pending.get(key)?;
             if *entry_generation != self.clear_generation() {
                 return None;
             }
             bytes.clone()
         };
-        let mut cached = decode_cached_result(&bytes)?;
-        cached.first_party = crate::cache::key::cache_key_is_first_party(key);
-        // First-party (workspace / npm-link / file:) source files can be rewritten
-        // equal-length with a preserved mtime, which the cheap pre-filter would miss
-        // (X-7). Hash-verify them strictly on the cold disk-hydration path too, so the
-        // blind spot isn't served even on the first hit before memory hydration.
-        // node_modules files stay on the cheap pre-filter inside the strict variant.
-        // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
-        // stylesheet's `url()` reached outside the package root (D18). Routing by entry meant that
-        // file's stored content hash was never consulted, and a rehydrate from disk re-armed the
-        // same blind spot, so a restart did not clear it either.
-        let freshness =
-            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
-        match freshness {
-            crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
-                self.remove(key);
-                return None;
-            }
-            // Fresh OR Unknown → keep and return the entry (Unknown must not delete).
-            crate::cache::key::Freshness::Fresh | crate::cache::key::Freshness::Unknown => {}
-        }
-        Some((cached, freshness))
+        decode_cached_result(&bytes)
     }
 
     pub fn remove(&self, key: &str) {

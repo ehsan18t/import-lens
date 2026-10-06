@@ -375,13 +375,9 @@ pub fn check_fingerprint(stored: &FileFingerprint) -> Freshness {
 
     // mtime/len differ. With a content hash we can tell a real change from a
     // no-op touch; without one we can only assume Stale.
-    let Some(expected) = stored.content_hash else {
-        return Freshness::Stale;
-    };
-    match fs::read(&stored.path) {
-        Ok(bytes) if content_hash(&bytes) == expected => Freshness::Fresh,
-        Ok(_) => Freshness::Stale,
-        Err(error) => classify_stat_error(error.kind()),
+    match stored.content_hash {
+        Some(expected) => verify_content_hash(&stored.path, expected),
+        None => Freshness::Stale,
     }
 }
 
@@ -390,10 +386,16 @@ pub fn check_fingerprint(stored: &FileFingerprint) -> Freshness {
 /// first-party/linked source files (probed every get), where a mtime-preserving,
 /// equal-length rewrite would otherwise be served stale (X-7).
 pub fn check_fingerprint_strict(stored: &FileFingerprint) -> Freshness {
-    let Some(expected) = stored.content_hash else {
-        return check_fingerprint(stored); // no hash to verify — mtime+len is all we have
-    };
-    match fs::read(&stored.path) {
+    match stored.content_hash {
+        Some(expected) => verify_content_hash(&stored.path, expected),
+        // No hash to verify: mtime+len is all there is.
+        None => check_fingerprint(stored),
+    }
+}
+
+/// Re-reads `path` and compares its content hash with the stored one.
+fn verify_content_hash(path: &str, expected: u64) -> Freshness {
+    match fs::read(path) {
         Ok(bytes) if content_hash(&bytes) == expected => Freshness::Fresh,
         Ok(_) => Freshness::Stale,
         Err(error) => classify_stat_error(error.kind()),

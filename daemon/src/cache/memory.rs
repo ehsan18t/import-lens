@@ -2,8 +2,8 @@ use crate::{
     cache::{
         disk::DiskCache,
         key::{
-            FileFingerprint, cache_key_is_orphan, cache_key_matches_any_package,
-            fingerprints_are_reusable,
+            FileFingerprint, Freshness, cache_key_is_orphan, cache_key_matches_any_package,
+            check_fingerprints_strict, fingerprints_are_reusable,
         },
         recency::RecencyClock,
     },
@@ -180,6 +180,15 @@ enum ReadIntent {
     RequireFresh,
 }
 
+/// What a read does with an entry whose dependencies changed but still exist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StalePolicy {
+    /// Drop it from both layers so the caller recomputes.
+    Evict,
+    /// Keep serving it, flagged stale, while a background recompute replaces it.
+    Serve,
+}
+
 impl ImportCache {
     pub fn new(storage_path: Option<PathBuf>, enable_disk_cache: bool) -> Self {
         Self::new_with_recent_preload_limit(storage_path, enable_disk_cache, RECENT_PRELOAD_LIMIT)
@@ -232,179 +241,19 @@ impl ImportCache {
     /// This is the cold-daemon completion of the force-fresh gate: a fresh daemon
     /// hydrating a prior run's DISK cache must not serve a disk-classified `Unknown`
     /// (which the evicting `get` would launder into a `cache_hit`). Freshness is
-    /// classified by the SAME plumbing the normal read uses
-    /// (`check_fingerprints[_strict]`, `disk.get_with_freshness`) — only the
+    /// classified by the SAME plumbing the normal read uses (`lookup`) — only the
     /// serve-on-`Unknown` decision differs.
     pub fn get_if_fresh(&self, key: &str) -> Option<ImportResult> {
         self.read(key, ReadIntent::RequireFresh)
     }
 
-    /// Shared read path for `get`/`get_for_prewarm` (serve semantics) and
-    /// `get_if_fresh` (force-fresh semantics). Classifies the memory working set,
-    /// then the disk cache; `intent` selects only recency promotion and what a
-    /// transient `Unknown` does — serve the last-known value, or return `None` so a
-    /// force-fresh caller recomputes. Stale/Gone always evict; a verified `Fresh`
-    /// always serves (and a disk hit hydrates into memory).
+    /// Read for `get`/`get_for_prewarm` (serve) and `get_if_fresh` (force-fresh): a
+    /// stale entry is evicted, and a force-fresh read refuses an unverified one.
     fn read(&self, key: &str, intent: ReadIntent) -> Option<ImportResult> {
-        let memory = self.memory.pin();
-        if let Some(cached) = memory.get(key) {
-            let generation = current_cache_generation();
-            // Bump LRU recency on every interactive hit. The Arc is shared with the
-            // restamp clone below, so this stays current across both return paths.
-            if let ReadIntent::Serve { promote: true } = intent {
-                cached
-                    .last_seq
-                    .store(RecencyClock::next_seq(), Ordering::Relaxed);
-            }
-            // A force-fresh read (§4.5 — CI / `importlens check`) must ALWAYS re-verify
-            // against disk: it may never ride the TTL fast path (RB-4). Otherwise a
-            // node_modules change with no generation bump (a watcher-excluded folder —
-            // the very case REVERIFY_TTL exists to cover, memory.rs:31-33) would be
-            // served unverified inside the 30 s window, and the budget gate would judge
-            // against a stale size. The fast path is a normal-read optimization only;
-            // the disk-hydration path below already honors `RequireFresh`.
-            //
-            // First-party deps (workspace / npm link / file:) change without a
-            // NodeModulesChanged generation bump, so they too must never take the TTL
-            // fast path — always fall through to the tri-state re-validation below (D3).
-            // `first_party` is memoized on the entry: deriving it from the key means a
-            // hex+msgpack decode, far too expensive per hit.
-            let fresh_without_restat = !matches!(intent, ReadIntent::RequireFresh)
-                && !cached.first_party
-                && cached.verified_generation == generation
-                && cached
-                    .verified_at
-                    .is_some_and(|at| at.elapsed() < REVERIFY_TTL);
-
-            if !fresh_without_restat {
-                // D3/X-7: the cheap mtime+len pre-filter has a blind spot — an equal-length,
-                // mtime-preserving rewrite reads Fresh without the hash ever being consulted — so
-                // any file that can change without a NodeModulesChanged generation bump must be
-                // hash-verified. `check_fingerprints_strict` decides that PER FINGERPRINT, keeping
-                // the cheap check for node_modules paths, where re-reading bytes on every hit would
-                // be pure waste.
-                //
-                // Per FINGERPRINT, never per entry. A node_modules entry is not made of
-                // node_modules files only: a stylesheet's `url()` may resolve outside the package
-                // root (D18), so a WORKSPACE font can sit in a node_modules entry's fingerprint
-                // set, and it changes with no generation bump behind it. Routing by entry leaves
-                // that file's stored content hash unconsulted, and the staleness does not expire —
-                // after the TTL the cheap check returns Fresh and restamps, so neither a generation
-                // bump nor a daemon restart clears it.
-                let freshness =
-                    crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
-                match freshness {
-                    crate::cache::key::Freshness::Stale | crate::cache::key::Freshness::Gone => {
-                        // Non-`Unknown` outcome → reset any graduation window for a key
-                        // shared with the serve-stale path (§4.3.1).
-                        self.clear_unknown(key);
-                        memory.remove(key);
-                        self.disk.remove(key);
-                        return None;
-                    }
-                    crate::cache::key::Freshness::Unknown => {
-                        // Could not verify (transient fs error). Keep the entry and do
-                        // NOT restamp, so the next hit re-checks once the transient
-                        // condition clears. A force-fresh read (§4.5) must NOT serve
-                        // this unverified value — return `None` so the caller
-                        // recomputes; a normal read serves the last-known value.
-                        // (Graduation of the `Unknown` surfaced to the client is owned
-                        // by `get_with_result_freshness`; this evicting read only keeps.)
-                        return match intent {
-                            ReadIntent::RequireFresh => None,
-                            ReadIntent::Serve { .. } => {
-                                let mut result = cached.result.clone();
-                                result.cache_hit = true;
-                                Some(result)
-                            }
-                        };
-                    }
-                    crate::cache::key::Freshness::Fresh => {
-                        // Non-`Unknown` outcome → reset any graduation window for a key
-                        // shared with the serve-stale path (§4.3.1).
-                        self.clear_unknown(key);
-                        let mut result = cached.result.clone();
-                        // Restamp via `update`, which is a no-op when the key was
-                        // concurrently removed (invalidation / clear / eviction) —
-                        // a plain `insert` here would resurrect the removed entry.
-                        // First-party entries skip it entirely: their gate above never
-                        // consults the stamps, so restamping is a wasted clone.
-                        if !cached.first_party {
-                            memory.update(key.to_owned(), |entry| {
-                                let mut restamped = entry.clone();
-                                restamped.verified_generation = generation;
-                                restamped.verified_at = Some(Instant::now());
-                                restamped
-                            });
-                        }
-                        result.cache_hit = true;
-                        return Some(result);
-                    }
-                }
-            }
-
-            let mut result = cached.result.clone();
-            result.cache_hit = true;
-            return Some(result);
-        }
-        // Release the map pin before the disk probe: `get_with_freshness` stats
-        // (and may read/remove) files, and holding an epoch guard across that I/O
-        // delays reclamation of concurrently removed entries.
-        drop(memory);
-
-        // Capture the generation BEFORE probing disk freshness, mirroring the
-        // insert and slow-path stamps. If an invalidation bumps the generation
-        // during get_with_freshness, stamping the post-check (newer) generation
-        // would launder a just-invalidated entry into "verified fresh" and serve
-        // it on the fast path for up to REVERIFY_TTL.
-        let hydration_generation = current_cache_generation();
-        // Also capture the clear generation: a `clear()` racing between this disk read
-        // and the memory hydration below could otherwise leave a memory-only survivor of
-        // the just-cleared entry (the read twin of the insert disk-then-memory race,
-        // RB-3). The guarded insert rolls it back if the generation moved.
-        let clear_generation = self.disk.clear_generation();
-        if let Some((mut cached, freshness)) = self.disk.get_with_freshness(key) {
-            // Only stamp "verified now" when the disk layer actually confirmed
-            // freshness against the file on disk. If it came back `Unknown` (a
-            // transient stat/read error kept the entry instead of evicting it),
-            // stamping it here would launder that transient failure into
-            // "verified fresh": the next get() would take the
-            // fresh_without_restat fast path and skip re-checking for up to
-            // REVERIFY_TTL. Leaving the decoded defaults (generation 0 / verified_at
-            // None, set by decode_cached_result) makes the very next get()
-            // re-verify instead.
-            if freshness == crate::cache::key::Freshness::Fresh {
-                cached.verified_generation = hydration_generation;
-                cached.verified_at = Some(Instant::now());
-                self.clear_unknown(key);
-            } else if let ReadIntent::RequireFresh = intent {
-                // Disk hydration yields only Fresh or Unknown (the disk layer already
-                // evicts Stale/Gone). A force-fresh read (§4.5) must not serve — or
-                // even hydrate — an `Unknown`: return `None` (the disk entry is kept)
-                // so the caller recomputes. A normal read falls through below and
-                // hydrates+serves the last-known value.
-                return None;
-            }
-            // §3.2: an interactive hit must promote recency even on a disk-hydration
-            // hit — otherwise a just-accessed rehydrated entry keeps its old/ancient
-            // persisted `last_seq` and stays a prime eviction victim on the very next
-            // maintenance pass. Mirrors the memory-hit promotion above; non-promoting
-            // intents (prewarm/force-fresh) keep the persisted seq unchanged.
-            if let ReadIntent::Serve { promote: true } = intent {
-                cached
-                    .last_seq
-                    .store(RecencyClock::next_seq(), Ordering::Relaxed);
-            }
-            let mut result = cached.result.clone();
-            self.insert_into_memory_guarded(key.to_owned(), cached, clear_generation);
-            result.cache_hit = true;
-            // Re-hydrating from disk grows the map too, so enforce the cap here as
-            // well as on fresh inserts.
-            self.enforce_memory_cap();
-            return Some(result);
-        }
-
-        None
+        let require_fresh = matches!(intent, ReadIntent::RequireFresh);
+        let promote = matches!(intent, ReadIntent::Serve { promote: true });
+        let (result, freshness) = self.lookup(key, promote, require_fresh, StalePolicy::Evict)?;
+        (!require_fresh || freshness == Freshness::Fresh).then_some(result)
     }
 
     /// Stale-while-revalidate read: like `get`, but NON-evicting on `Stale` — it
@@ -419,151 +268,130 @@ impl ImportCache {
         self.read_with_result_freshness(key, true)
     }
 
-    /// Shared stale-while-revalidate read path for `get_with_result_freshness`
+    /// Shared stale-while-revalidate read for `get_with_result_freshness`
     /// (interactive) and `get_with_result_freshness_for_bulk` (bulk). `promote`
-    /// selects ONLY recency promotion: an interactive read bumps `last_seq`; a
-    /// bulk/background read (WorkspaceReport, Compare) does not, so a full-workspace
-    /// scan can't flood the recency signal and evict the user's warm working set
-    /// (scan resistance, §5.1). Freshness handling (Fresh/Stale/Unknown, disk
-    /// hydration, graduation) is otherwise identical on both paths.
+    /// selects only recency promotion, so a full-workspace scan can't flood the
+    /// recency signal and evict the user's warm working set (scan resistance, §5.1).
     fn read_with_result_freshness(
         &self,
         key: &str,
         promote: bool,
     ) -> Option<(ImportResult, ResultFreshness)> {
+        let (mut result, freshness) = self.lookup(key, promote, false, StalePolicy::Serve)?;
+        let served = match freshness {
+            Freshness::Fresh => ResultFreshness::fresh(),
+            Freshness::Stale => ResultFreshness::stale(true),
+            Freshness::Unknown | Freshness::Gone => self.record_unknown(key),
+        };
+        result.freshness = served.clone();
+        Some((result, served))
+    }
+
+    /// The one classify-and-serve mechanism behind every read: the memory working
+    /// set first, then the disk shard. Returns the result (`cache_hit` set) with the
+    /// freshness it was served under: `Fresh`, `Unknown` (a transient error; the
+    /// entry is kept and not restamped, so the next read re-checks), or `Stale`
+    /// (only under `StalePolicy::Serve`). `Gone` always evicts, as does `Stale`
+    /// under `StalePolicy::Evict`. `require_fresh` skips the TTL fast path and never
+    /// hydrates an `Unknown` disk entry; `promote` bumps LRU recency on a hit.
+    fn lookup(
+        &self,
+        key: &str,
+        promote: bool,
+        require_fresh: bool,
+        stale: StalePolicy,
+    ) -> Option<(ImportResult, Freshness)> {
         let memory = self.memory.pin();
         if let Some(cached) = memory.get(key) {
-            let generation = current_cache_generation();
-            // Interactive serve → promote recency; a bulk read skips the bump.
+            // The Arc is shared with the restamp clone below, so the bump survives it.
             if promote {
                 cached
                     .last_seq
                     .store(RecencyClock::next_seq(), Ordering::Relaxed);
             }
-            let fresh_without_restat = !cached.first_party
+            let generation = current_cache_generation();
+            // A force-fresh read (§4.5) never rides the TTL fast path: a node_modules
+            // change with no generation bump (a watcher-excluded folder) would be served
+            // unverified inside the window. First-party deps change without a generation
+            // bump at all, so they always re-verify (D3).
+            let fast_path = !require_fresh
+                && !cached.first_party
                 && cached.verified_generation == generation
                 && cached
                     .verified_at
                     .is_some_and(|at| at.elapsed() < REVERIFY_TTL);
-
-            if !fresh_without_restat {
-                // D3/X-7: the cheap mtime+len pre-filter has a blind spot — an equal-length,
-                // mtime-preserving rewrite reads Fresh without the hash ever being consulted — so
-                // any file that can change without a NodeModulesChanged generation bump must be
-                // hash-verified. `check_fingerprints_strict` decides that PER FINGERPRINT, keeping
-                // the cheap check for node_modules paths, where re-reading bytes on every hit would
-                // be pure waste.
-                //
-                // Per FINGERPRINT, never per entry. A node_modules entry is not made of
-                // node_modules files only: a stylesheet's `url()` may resolve outside the package
-                // root (D18), so a WORKSPACE font can sit in a node_modules entry's fingerprint
-                // set, and it changes with no generation bump behind it. Routing by entry leaves
-                // that file's stored content hash unconsulted, and the staleness does not expire —
-                // after the TTL the cheap check returns Fresh and restamps, so neither a generation
-                // bump nor a daemon restart clears it.
-                let freshness =
-                    crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
-                match freshness {
-                    crate::cache::key::Freshness::Gone => {
-                        // Non-`Unknown` outcome → reset the graduation window (§4.3.1).
-                        self.clear_unknown(key);
-                        memory.remove(key);
-                        self.disk.remove(key);
-                        return None;
-                    }
-                    crate::cache::key::Freshness::Stale => {
-                        // Non-`Unknown` outcome → reset the graduation window (§4.3.1).
-                        self.clear_unknown(key);
-                        // Serve-stale: keep the entry (do NOT restamp — it must stay on
-                        // the slow path so later gets keep re-checking until a
-                        // background recompute replaces it) and flag it stale.
-                        let mut result = cached.result.clone();
-                        result.cache_hit = true;
-                        result.freshness = ResultFreshness::stale(true);
-                        return Some((result, ResultFreshness::stale(true)));
-                    }
-                    crate::cache::key::Freshness::Unknown => {
-                        // Graduate the transient error (§4.3.1): quietly
-                        // `Stale{revalidating}` while it is fresh, `Unverified` only once
-                        // it persists past the window. Do NOT restamp (stay on the slow
-                        // path so later gets keep re-checking) and do NOT delete — keep
-                        // serving the last-known value throughout.
-                        let mut result = cached.result.clone();
-                        result.cache_hit = true;
-                        let freshness = self.record_unknown(key);
-                        result.freshness = freshness.clone();
-                        return Some((result, freshness));
-                    }
-                    crate::cache::key::Freshness::Fresh => {
-                        // Non-`Unknown` outcome → reset the graduation window (§4.3.1).
-                        self.clear_unknown(key);
-                        let mut result = cached.result.clone();
-                        // Restamp via `update` — a no-op when the key was concurrently
-                        // removed, so a racing invalidation/clear is never resurrected.
-                        // First-party entries skip it: their gate never reads the stamps.
-                        if !cached.first_party {
-                            memory.update(key.to_owned(), |entry| {
-                                let mut restamped = entry.clone();
-                                restamped.verified_generation = generation;
-                                restamped.verified_at = Some(Instant::now());
-                                restamped
-                            });
-                        }
-                        result.cache_hit = true;
-                        result.freshness = ResultFreshness::fresh();
-                        return Some((result, ResultFreshness::fresh()));
+            // Hash-verified per FINGERPRINT, never per entry: a node_modules entry can
+            // carry a workspace file that a stylesheet's `url()` reached outside the
+            // package root (D18), and that file changes with no generation bump behind
+            // it (X-7: an equal-length, mtime-preserving rewrite passes mtime+len).
+            let freshness = if fast_path {
+                Freshness::Fresh
+            } else {
+                check_fingerprints_strict(&cached.dependency_fingerprints)
+            };
+            match freshness {
+                Freshness::Unknown => {}
+                Freshness::Stale if stale == StalePolicy::Serve => self.clear_unknown(key),
+                Freshness::Stale | Freshness::Gone => {
+                    self.clear_unknown(key);
+                    memory.remove(key);
+                    self.disk.remove(key);
+                    return None;
+                }
+                Freshness::Fresh if fast_path => {}
+                Freshness::Fresh => {
+                    self.clear_unknown(key);
+                    // `update` is a no-op when the key was concurrently removed, so a
+                    // racing invalidation or clear is never resurrected. First-party
+                    // entries never consult the stamps, so they skip the clone.
+                    if !cached.first_party {
+                        memory.update(key.to_owned(), |entry| {
+                            let mut restamped = entry.clone();
+                            restamped.verified_generation = generation;
+                            restamped.verified_at = Some(Instant::now());
+                            restamped
+                        });
                     }
                 }
             }
-
             let mut result = cached.result.clone();
             result.cache_hit = true;
-            result.freshness = ResultFreshness::fresh();
-            return Some((result, ResultFreshness::fresh()));
+            return Some((result, freshness));
         }
+        // Release the pin before the disk probe: it stats and may read files, and an
+        // epoch guard held across that I/O delays reclamation of removed entries.
         drop(memory);
 
-        // Disk-hydration path: `disk.get_with_freshness` already evicts Stale/Gone, so
-        // it only yields Fresh (served Fresh) or Unknown (kept, graduated per §4.3.1).
-        // A disk-only stale entry is therefore not served stale here — it falls through
-        // to recompute, which is acceptable (the common serve-stale case is the memory
-        // working set above).
+        // Both generations are captured BEFORE the disk probe. Stamping a generation
+        // read after it would launder an entry invalidated mid-probe into "verified"
+        // for the whole TTL, and a `clear()` racing the hydration below must roll the
+        // memory copy back (RB-3).
         let hydration_generation = current_cache_generation();
-        // Capture the clear generation before the disk read so a racing `clear()` can't
-        // leave a memory-only survivor of the hydrated entry (RB-3, as in `read`).
         let clear_generation = self.disk.clear_generation();
-        if let Some((mut cached, freshness)) = self.disk.get_with_freshness(key) {
-            let result_freshness = if freshness == crate::cache::key::Freshness::Fresh {
-                cached.verified_generation = hydration_generation;
-                cached.verified_at = Some(Instant::now());
-                self.clear_unknown(key);
-                ResultFreshness::fresh()
-            } else {
-                // Disk hydration yields only Fresh or Unknown (the disk layer already
-                // evicts Stale/Gone), so this branch is an `Unknown` — graduate it too
-                // (§4.3.1) rather than flashing Unverified on a cold, transiently-locked
-                // hydrate. The entry is inserted below, so subsequent gets continue the
-                // window through the memory path above.
-                self.record_unknown(key)
-            };
-            // §3.2: promote recency on an interactive disk-hydration hit, mirroring
-            // the memory-hit promotion above — otherwise a just-accessed rehydrated
-            // entry keeps its persisted `last_seq` and stays a prime eviction victim
-            // on the next maintenance pass. A bulk read keeps the persisted seq.
-            if promote {
-                cached
-                    .last_seq
-                    .store(RecencyClock::next_seq(), Ordering::Relaxed);
-            }
-            let mut result = cached.result.clone();
-            result.freshness = result_freshness.clone();
-            self.insert_into_memory_guarded(key.to_owned(), cached, clear_generation);
-            result.cache_hit = true;
-            self.enforce_memory_cap();
-            return Some((result, result_freshness));
+        // The disk layer evicts Stale/Gone itself, so this is Fresh or Unknown.
+        let (mut cached, freshness) = self.disk.get_with_freshness(key)?;
+        if freshness == Freshness::Fresh {
+            cached.verified_generation = hydration_generation;
+            cached.verified_at = Some(Instant::now());
+            self.clear_unknown(key);
+        } else if require_fresh {
+            // Kept on disk, but neither served nor hydrated.
+            return None;
         }
-
-        None
+        // An `Unknown` keeps the decoded "never verified" stamps, so the next read
+        // re-checks instead of riding the fast path. An interactive hit promotes even
+        // here, or a just-used rehydrated entry keeps its old persisted seq and is a
+        // prime victim on the next maintenance pass (§3.2).
+        if promote {
+            cached
+                .last_seq
+                .store(RecencyClock::next_seq(), Ordering::Relaxed);
+        }
+        let mut result = cached.result.clone();
+        result.cache_hit = true;
+        self.insert_into_memory_guarded(key.to_owned(), cached, clear_generation);
+        self.enforce_memory_cap();
+        Some((result, freshness))
     }
 
     /// Bulk/background stale-while-revalidate read (WorkspaceReport, Compare): serves
@@ -652,14 +480,13 @@ impl ImportCache {
     /// overwrite the good cached value with an error result. Re-stats every dependency
     /// (bypassing the TTL fast path), so the call itself is the active re-check for a
     /// graduated key. Returns `None` when the key is not in the memory working set.
-    pub fn probe_freshness(&self, key: &str) -> Option<crate::cache::key::Freshness> {
+    pub fn probe_freshness(&self, key: &str) -> Option<Freshness> {
         let memory = self.memory.pin();
         let cached = memory.get(key)?;
         // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
         // stylesheet's `url()` reached outside the package root (D18), and that file changes with
         // no generation bump behind it.
-        let freshness =
-            crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
+        let freshness = check_fingerprints_strict(&cached.dependency_fingerprints);
         Some(freshness)
     }
 
