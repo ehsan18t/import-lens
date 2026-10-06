@@ -649,11 +649,7 @@ fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|&[high, low]| {
-            let high = hex_value(high)?;
-            let low = hex_value(low)?;
-            Some((high << 4) | low)
-        })
+        .map(|&[high, low]| Some((hex_value(high)? << 4) | hex_value(low)?))
         .collect()
 }
 
