@@ -5,20 +5,23 @@ use std::{env, error::Error, path::PathBuf};
 #[derive(Debug, Default)]
 struct Args {
     pipe: Option<String>,
-    workspace: Option<PathBuf>,
     storage: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     configure_rayon_pool();
     let args = parse_args(env::args().skip(1))?;
     let pipe = args.pipe.ok_or("missing required --pipe argument")?;
-    let workspace = args
-        .workspace
-        .ok_or("missing required --workspace argument")?;
 
-    run_server(&pipe, workspace, args.storage).await
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_server(&pipe, args.storage));
+    // The connection has already flushed the cache. A blocking handler still draining engine
+    // builds has no cancellation point, and dropping the runtime would wait for it without limit.
+    runtime.shutdown_background();
+
+    result
 }
 
 fn configure_rayon_pool() {
@@ -39,7 +42,11 @@ where
     while let Some(arg) = iterator.next() {
         match arg.as_str() {
             "--pipe" => parsed.pipe = iterator.next(),
-            "--workspace" => parsed.workspace = iterator.next().map(PathBuf::from),
+            // Accepted and ignored: the extension and the CLI still pass it, but the workspace
+            // root of every request comes from the client's `hello`.
+            "--workspace" => {
+                iterator.next();
+            }
             "--storage" => parsed.storage = iterator.next().map(PathBuf::from),
             unknown => return Err(format!("unknown argument: {unknown}").into()),
         }

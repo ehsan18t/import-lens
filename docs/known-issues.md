@@ -733,14 +733,6 @@ A fabricated comparison would be worse than "comparison failed."
 Two pipelined requests may now be answered out of order. Nothing in the extension depends on it (every response
 is routed by `request_id`), but it is a protocol-level behaviour change.
 
-### C5: Shutdown can take up to `BUILD_TIMEOUT`
-**Status: Accepted**
-
-Shutdown joins in-flight handlers under a bounded deadline, then flushes the cache unconditionally. A build
-already inside Rolldown cannot be cancelled, so a parked one can hold shutdown to its 8s limit. A task still
-running at the deadline is abandoned and its result is not persisted, stated in the SRS rather than papered
-over.
-
 ### C6: A nested `"type"` does not reach the pre-resolved entry (dual-package layouts)
 **Status: Accepted** · One field, two lookups, no fix exists at the current upstream API
 
@@ -842,6 +834,7 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| C5 | The process outlived its connection for as long as an uncancellable blocking drain ran, holding its cache shards open | 2026-10-06 |
 | D25 | The always-on-screen file total could not say what share of it was not JavaScript | 2026-07-19 |
 | D27 | A first-party dependency manifest edit left the File Cost stale while per-import numbers updated | 2026-07-19 |
 | D26 | A waiter that could not use an admission wake swallowed it, so a freed permit sat idle | 2026-07-19 |

@@ -417,7 +417,6 @@ use tokio::net::windows::named_pipe::ServerOptions;
 #[cfg(windows)]
 pub async fn run_server(
     pipe_name: &str,
-    _workspace_root: PathBuf,
     storage_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let pipe = ServerOptions::new()
@@ -434,35 +433,41 @@ pub async fn run_server(
 #[cfg(not(windows))]
 pub async fn run_server(
     pipe_name: &str,
-    _workspace_root: PathBuf,
     storage_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     use tokio::net::UnixListener;
 
-    if std::fs::metadata(pipe_name).is_ok() {
+    // `symlink_metadata`, so a dangling link at the path is removed instead of failing the bind.
+    if std::fs::symlink_metadata(pipe_name).is_ok() {
         std::fs::remove_file(pipe_name)?;
     }
 
-    let listener = UnixListener::bind(pipe_name)?;
+    // The client chooses the path. One past the platform's `sun_path` limit (104 bytes on macOS,
+    // 108 on Linux, NUL included) fails here, and its length is what diagnoses that.
+    let listener = UnixListener::bind(pipe_name).map_err(|error| {
+        format!(
+            "cannot bind IPC socket {pipe_name} ({} bytes): {error}",
+            pipe_name.len()
+        )
+    })?;
     restrict_unix_socket_permissions(pipe_name)?;
 
     let service = std::sync::Arc::new(ImportLensService::new(None, false));
     let prefetcher = Prefetcher::new();
 
-    let result = async {
-        let (stream, _) = listener.accept().await?;
-        handle_connection(stream, storage_path, service, prefetcher).await
-    }
-    .await;
-
+    let accepted = listener.accept().await;
+    // One client per daemon, so the path is needed only until it connects. Unlinking it here
+    // rather than on exit means no way out of the process, SIGKILL included, leaves it behind.
+    drop(listener);
     if let Err(error) = std::fs::remove_file(pipe_name) {
         logging::log_warn(
             "ipc",
             format!("failed to remove IPC socket {pipe_name}: {error}"),
         );
     }
+    let (stream, _) = accepted?;
 
-    result
+    handle_connection(stream, storage_path, service, prefetcher).await
 }
 
 pub async fn handle_connection<S>(
