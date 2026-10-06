@@ -116,7 +116,7 @@ export const bundleImpactHistoryItemForResponse = (
  * exact shape of this defect — something the next caller can forget, with nothing failing when they
  * do. Handing it the response instead makes forgetting impossible: the gate is the store's own.
  *
- * The daemon fixed this same shape on its side (`FileSizeCache::insert` asks `is_cacheable` itself);
+ * The daemon fixed this same shape on its side (`FileSizeCache::insert` asks its own gate itself);
  * this is the other half of it (FR-026c).
  */
 export const recordBundleImpactHistory = async (

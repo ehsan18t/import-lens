@@ -49,7 +49,7 @@ const fieldsRead = (body, receiver) =>
 
 const daemonGate = bodyBetween(
   read("daemon/src/pipeline/file_size.rs"),
-  "pub fn is_cacheable(&self) -> bool {",
+  "pub fn is_file_cost(&self) -> bool {",
   "\n    }",
 );
 const extensionGate = bodyBetween(
@@ -84,7 +84,7 @@ test("the daemon, extension and CLI read the same base File Cost quality fields"
     [...extensionFields].sort(),
     [...daemonWireFields].sort(),
     "extension/src/analysis/transience.ts::isDurableFileSize consults different wire-visible \
-quality fields than daemon FileSizeComputation::is_cacheable",
+quality fields than daemon FileSizeComputation::is_file_cost",
   );
   assert.deepEqual(
     [...cliFields].sort(),

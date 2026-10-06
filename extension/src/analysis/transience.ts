@@ -83,7 +83,7 @@ export const isDurableImportResult = (result: ImportResult | undefined): result 
  * Whether a document's totals are a measurement of **this file**, and so may be written to a durable
  * store or judged against a budget.
  *
- * **This is the one predicate.** The daemon's `FileSizeComputation::is_cacheable` is its Rust twin,
+ * **This is the one predicate.** The daemon's `FileSizeComputation::is_file_cost` is its Rust twin,
  * and `cli/importlens.mjs` reads the same three fields off the same wire response — because the
  * defect this exists to end was three consumers each asking a slightly different question of the
  * same number, and the CLI asking the weakest one and issuing a CI verdict from it.

@@ -74,19 +74,21 @@ impl FileSizeCache {
         Some(entry.computation.clone())
     }
 
-    /// Store a file's totals, but only if they are the file's totals.
+    /// Store a file's totals, or a floor that would read the same until an input changes.
     ///
-    /// The gate lives in the store (ADR-0006, invariants 3 and 4) so no caller can bypass it. A
-    /// floor (a total missing a Loading or Unmeasured import) is not this file's number, and 30
-    /// seconds is long enough for it to become the reported size, the baseline, and the CI verdict.
+    /// The gate lives in the store (ADR-0006, invariants 3 and 4) so no caller can bypass it: see
+    /// [`FileSizeComputation::may_enter_aggregate_cache`]. A floor is served back with its
+    /// `incomplete` flag, so it never becomes a baseline or a verdict.
     pub fn insert(&self, path: PathBuf, signature: u64, computation: FileSizeComputation) {
-        if !computation.is_cacheable() {
+        if !computation.may_enter_aggregate_cache() {
             crate::logging::log_debug(
                 "file_size_cache",
                 format!(
-                    "refusing to cache a non-measurement for {} (incomplete: {})",
+                    "refusing to cache a total that changes by itself for {} (incomplete: {}, \
+                     degraded: {})",
                     path.display(),
-                    computation.incomplete
+                    computation.incomplete,
+                    computation.degraded
                 ),
             );
             return;

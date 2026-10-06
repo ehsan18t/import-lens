@@ -141,7 +141,7 @@ fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
         "a combined build whose asset stage breached is a measured floor: {file_cost:?}"
     );
     assert!(
-        !file_cost.is_cacheable(),
+        !file_cost.is_file_cost(),
         "a floor is not a complete File Cost: {file_cost:?}"
     );
     assert!(

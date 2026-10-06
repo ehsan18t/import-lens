@@ -55,7 +55,7 @@ pub const COMPRESSION: &str = "compression";
 pub const PROTOCOL: &str = "protocol";
 /// The aggregate could not sum an import. Only ever an aggregate diagnostic, never an
 /// `ImportResult`'s stage; the aggregate has its own gate
-/// ([`crate::pipeline::file_size::FileSizeComputation::is_cacheable`]).
+/// ([`crate::pipeline::file_size::FileSizeComputation::is_file_cost`]).
 pub const FILE_SIZE_FALLBACK: &str = "file_size_fallback";
 /// A declarations-only package: a measurement of zero runtime bytes, not a failure. Carried on a
 /// Measured result, so it must be durable or every `@types`-shaped package is re-analyzed forever.

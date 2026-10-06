@@ -110,7 +110,8 @@ pub struct FileSizeComputation {
     /// Bytes that belong in these totals are absent: an import contributed no measurement, or a
     /// successful build disclosed a floor ([`crate::pipeline::stage::marks_a_floor`]). The totals are then a lower bound:
     /// safe to show beside the diagnostics that say so (FR-024a: a floor beats a zero), never safe
-    /// to cache, persist, or compare against a baseline (ADR-0006, invariant 4).
+    /// to persist or compare against a baseline (ADR-0006, invariant 4). Only a deterministic floor
+    /// may sit in the L1 aggregate cache, flagged ([`Self::may_enter_aggregate_cache`]).
     ///
     /// **Any** missing-byte shape sets it:
     ///
@@ -125,7 +126,7 @@ pub struct FileSizeComputation {
     ///   `missing_export` (a stubbed binding) on a build that succeeded.
     ///
     /// No other signal sees this: `error` is `None` (the sum succeeded), and the stage scan in
-    /// [`Self::is_cacheable`] sees only request-local stages (a still-building import has no stage,
+    /// [`Self::is_file_cost`] sees only request-local stages (a still-building import has no stage,
     /// and a floor disclosure is deliberately reusable at the import level).
     pub incomplete: bool,
     /// The file's own combined build failed, so these totals fell back to a sum of per-import costs
@@ -148,9 +149,8 @@ pub struct FileSizeComputation {
 }
 
 impl FileSizeComputation {
-    /// Whether this aggregate is a measurement of the file, and so may be written to the L1
-    /// file-size cache (SRS FR-026c). [`crate::pipeline::file_size_cache::FileSizeCache::insert`]
-    /// asks this itself; a caller cannot forget it.
+    /// Whether this aggregate is a measurement of the file: the rule every durable record and
+    /// verdict applies (SRS FR-026c), stated again by the extension and the CLI.
     ///
     /// It is not when it failed (`error`), is [`Self::incomplete`] (an under-count), is
     /// [`Self::degraded`] (an un-deduplicated over-count), carries unverifiable fingerprints, or
@@ -159,7 +159,7 @@ impl FileSizeComputation {
     /// `degraded` is redundant with neither `incomplete` (a combined build can park while every
     /// import is measured) nor the transient scan (a deterministic combined-build failure carries
     /// a durable stage such as `link` or `parse`).
-    pub fn is_cacheable(&self) -> bool {
+    pub fn is_file_cost(&self) -> bool {
         self.error.is_none()
             && !self.incomplete
             && !self.degraded
@@ -168,6 +168,28 @@ impl FileSizeComputation {
                 .diagnostics
                 .iter()
                 .any(|item| crate::pipeline::stage::is_transient(&item.stage))
+    }
+
+    /// Whether this aggregate may be written to the L1 file-size cache (SRS FR-026c), which
+    /// [`crate::pipeline::file_size_cache::FileSizeCache::insert`] asks itself: a File Cost, or a
+    /// floor whose missing bytes are deterministic (an import not installed, unresolvable, or
+    /// failing on its own bytes). Such a floor is the same floor on every read until an input
+    /// changes, and the cache's signature, fingerprints and 30-second window expire it; it keeps
+    /// its `incomplete` flag, so no record or verdict ever takes it for a measurement.
+    ///
+    /// A floor qualifies only when every stage it carries is on the durable allowlist (FR-026c).
+    /// That refuses a degraded sum, a total missing a still-Loading import (`file_size_fallback` is
+    /// not on the list), and any transient or unclassified stage: those change on the next read by
+    /// themselves.
+    pub fn may_enter_aggregate_cache(&self) -> bool {
+        self.is_file_cost()
+            || (self.error.is_none()
+                && !self.degraded
+                && fingerprints_are_reusable(&self.dependency_fingerprints)
+                && self
+                    .diagnostics
+                    .iter()
+                    .all(|item| crate::pipeline::stage::may_enter_a_durable_store(&item.stage)))
     }
 
     /// Fold one runtime group's conservative per-import sum into the file's totals, and report
@@ -878,13 +900,13 @@ mod tests {
     }
 
     #[test]
-    fn a_sum_of_real_measurements_is_the_file_and_is_cacheable() {
+    fn a_sum_of_real_measurements_is_the_file_and_is_file_cost() {
         let totals = absorb(&[measured("alpha", 100), measured("beta", 20)]);
 
         assert_eq!(totals.raw_bytes, 120);
         assert!(!totals.incomplete);
         assert!(
-            totals.is_cacheable(),
+            totals.is_file_cost(),
             "every import was really measured, so the sum IS this file's size"
         );
     }
@@ -907,7 +929,7 @@ mod tests {
         ];
 
         assert!(
-            !totals.is_cacheable(),
+            !totals.is_file_cost(),
             "no on-disk file can validate two different known snapshots of one path"
         );
     }
@@ -924,7 +946,7 @@ mod tests {
         assert_eq!(totals.raw_bytes, 100, "the missing import contributes zero");
         assert!(totals.incomplete);
         assert!(
-            !totals.is_cacheable(),
+            !totals.is_file_cost(),
             "a total that is missing an input is a lower bound, not a measurement"
         );
         assert!(
@@ -961,7 +983,7 @@ mod tests {
                 totals.diagnostics
             );
             assert!(
-                !totals.is_cacheable(),
+                !totals.is_file_cost(),
                 "`{transient}`: caching a floor serves it as the file's size for the whole TTL"
             );
         }
@@ -984,7 +1006,7 @@ mod tests {
                 "`{deterministic}`: beta's bytes are unknown, and unknown-forever is still unknown"
             );
             assert!(
-                !totals.is_cacheable(),
+                !totals.is_file_cost(),
                 "`{deterministic}`: caching a floor serves it as the file's size for the whole TTL"
             );
             assert!(
@@ -1018,7 +1040,7 @@ mod tests {
             "a successful JavaScript build does not make omitted asset bytes part of the sum"
         );
         assert!(
-            !totals.is_cacheable(),
+            !totals.is_file_cost(),
             "a deterministic floor may be cached per import, but not as this file's complete cost"
         );
         assert!(
@@ -1057,7 +1079,7 @@ mod tests {
 
             assert_eq!(totals.raw_bytes, 100, "{stage}");
             assert_eq!(totals.incomplete, is_floor, "{stage}");
-            assert_eq!(totals.is_cacheable(), !is_floor, "{stage}");
+            assert_eq!(totals.is_file_cost(), !is_floor, "{stage}");
         }
     }
 
@@ -1090,7 +1112,7 @@ mod tests {
 
         assert_eq!(totals.raw_bytes, 123);
         assert!(!totals.incomplete);
-        assert!(totals.is_cacheable());
+        assert!(totals.is_file_cost());
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1248,7 +1270,7 @@ mod tests {
         );
         assert!(!totals.degraded, "the combined build succeeded");
         assert!(
-            totals.is_cacheable(),
+            totals.is_file_cost(),
             "a file whose only unresolvable import is types-only is fully measured, and must be \
              cached — otherwise every `@types`-importing file rebuilds on every size request"
         );
@@ -1304,7 +1326,7 @@ mod tests {
             "the bytes behind the boundary are absent from the total: {:?}",
             totals.diagnostics
         );
-        assert!(!totals.is_cacheable());
+        assert!(!totals.is_file_cost());
     }
 
     /// The native-binary-only twin of the check above: a `bin`-only package (Biome) is answered
@@ -1339,7 +1361,7 @@ mod tests {
         );
         assert!(!totals.degraded, "the combined build succeeded");
         assert!(
-            totals.is_cacheable(),
+            totals.is_file_cost(),
             "a file whose only unresolvable import is native-binary-only is fully measured, and \
              must be cached"
         );
@@ -1401,7 +1423,7 @@ mod tests {
             totals.diagnostics
         );
         assert!(
-            totals.is_cacheable(),
+            totals.is_file_cost(),
             "and a cold document's total must be CACHED, or the combined build re-runs on every \
              keystroke and `importlens check` can never judge a file it measured first: {:?}",
             totals.diagnostics
@@ -1511,7 +1533,7 @@ mod tests {
             "the JavaScript-only number is a floor when a shipped stylesheet is absent"
         );
         assert!(
-            !totals.is_cacheable(),
+            !totals.is_file_cost(),
             "the floor must not become File Cost history or a budget verdict"
         );
     }
@@ -1557,7 +1579,7 @@ mod tests {
             "test setup: the number IS there — the un-deduplicated sum of the per-import costs"
         );
         assert!(
-            !totals.is_cacheable(),
+            !totals.is_file_cost(),
             "an un-deduplicated per-import sum is a different QUANTITY from a File Cost; caching \
              it serves a number the file never had for the whole TTL, and a budget judged against \
              it is neither passed nor failed (ADR-0006, invariants 4 and 5)"
@@ -1607,7 +1629,7 @@ mod tests {
             "test setup: the number IS there — the un-deduplicated sum of the per-import costs"
         );
         assert!(
-            !totals.is_cacheable(),
+            !totals.is_file_cost(),
             "a per-import sum is a different QUANTITY from a File Cost (ADR-0004); caching it \
              serves a number the file never had for the whole TTL, and judging a budget against it \
              is neither a pass nor a fail (ADR-0006, invariants 4 and 5)"
@@ -1641,7 +1663,7 @@ mod tests {
 
         assert!(!totals.degraded, "{:?}", totals.diagnostics);
         assert!(!totals.incomplete, "{:?}", totals.diagnostics);
-        assert!(totals.is_cacheable(), "{:?}", totals.diagnostics);
+        assert!(totals.is_file_cost(), "{:?}", totals.diagnostics);
         assert!(totals.minified_bytes > 0);
     }
 
@@ -1714,7 +1736,7 @@ mod tests {
             clean.brotli_bytes,
         );
         assert!(
-            !totals.is_cacheable(),
+            !totals.is_file_cost(),
             "a part-bundle, part-per-import-sum total is not this file's size (ADR-0006, \
              invariant 4)"
         );
@@ -1749,7 +1771,7 @@ mod tests {
             totals.diagnostics
         );
         assert!(
-            totals.is_cacheable(),
+            totals.is_file_cost(),
             "aliased files must still be cached and persisted, or the combined build re-runs on \
              every keystroke and `importlens check` exits 3 forever: {:?}",
             totals.diagnostics
@@ -1789,7 +1811,7 @@ mod tests {
             "an import whose package is not installed leaves the total short by its whole weight"
         );
         assert!(
-            !totals.is_cacheable(),
+            !totals.is_file_cost(),
             "a floor is never cached or persisted"
         );
         assert!(

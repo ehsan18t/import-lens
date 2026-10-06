@@ -514,7 +514,7 @@ test("analyzeFileWithDaemon reports a failed aggregate instead of aborting the r
 });
 
 // The gate the CLI applies to the raw wire response, in isolation. The daemon's
-// `FileSizeComputation::is_cacheable` and the extension's `isDurableFileSize` are the same rule, and
+// `FileSizeComputation::is_file_cost` and the extension's `isDurableFileSize` are the same rule, and
 // a drift check holds all three together (file-size-usability-coordination.test.mjs).
 test("isUsableFileSize refuses every shape that is not this file's size", () => {
   const response = (overrides = {}) => ({

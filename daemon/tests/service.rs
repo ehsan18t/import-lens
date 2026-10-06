@@ -530,7 +530,7 @@ fn service_computes_file_size_from_document_source() {
 }
 
 #[test]
-fn file_size_document_marks_uncounted_asset_bytes_as_a_floor_and_does_not_cache_it() {
+fn file_size_document_caches_an_uncounted_asset_floor_until_the_asset_changes() {
     let _shared_index_guard = SHARED_INDEX_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -587,8 +587,8 @@ fn file_size_document_marks_uncounted_asset_bytes_as_a_floor_and_does_not_cache_
         "the floor must retain its asset disclosure: {response:?}"
     );
     assert!(
-        !shared_file_size_cache().contains_path(&document_path),
-        "a deterministic import fallback may be reusable, but the partial File Cost may not"
+        shared_file_size_cache().contains_path(&document_path),
+        "the floor is deterministic, so it is cached, still flagged, for its window"
     );
 
     fs::write(

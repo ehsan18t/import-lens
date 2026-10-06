@@ -339,7 +339,7 @@ fn mixed_runtime_compression_sums_the_groups_not_their_concatenation() {
     );
 
     assert!(
-        mixed.is_cacheable(),
+        mixed.is_file_cost(),
         "nothing failed here: two clean per-runtime builds are a real File Cost: {:?}",
         mixed.diagnostics
     );

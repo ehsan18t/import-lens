@@ -280,7 +280,7 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
 - **Decision (cache):** every cache and memo gates on the failure STAGE, not merely on
   `error`. `pipeline::stage::is_transient` (`TRANSIENT_ANALYSIS_STAGES`: `panic` | `timeout` |
   `engine_gone` | `asset_io` | `entry_metadata` | `compression`) names the request-local
-  stages, and `FileSizeComputation::is_cacheable` refuses any of them. `should_cache_result`
+  stages, and `FileSizeComputation::is_file_cost` refuses any of them. `should_cache_result`
   goes through `ImportResult::is_durable`, an allowlist
   (`pipeline::stage::may_enter_a_durable_store`) that refuses every stage it has not
   classified as durable. Together they cover L1 memory, L2 disk, and the L1 aggregate
@@ -347,6 +347,11 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   guarantee is downgraded to what is actually true and stated as such in FR-004c. Worst case, a
   late build writes to `papaya` after the flush and the process exits before it is persisted:
   one rebuild lost, against the whole session's cache saved.
+
+### D16 — A deterministic floor may enter the L1 file-size cache, flagged · 2026-10-07
+- **Context:** a file with one permanently unmeasurable import (not installed, unresolvable, failing on its own bytes) or a measured floor (a stubbed binding, uncounted assets) was refused by the L1 aggregate cache, so every size read re-ran its combined build and asset tail: on every edit and every focus, for as long as the import stayed broken.
+- **Decision:** the L1 aggregate cache has its own gate, `FileSizeComputation::may_enter_aggregate_cache`: a File Cost, or a floor whose combined build succeeded and whose every diagnostic stage is on the durable allowlist. The floor keeps its `incomplete` flag, so the shared rule every record and verdict applies (`is_file_cost`, mirrored by the extension and the CLI under the drift check) is unchanged and still refuses it. A degraded sum, a total missing a still-Loading import (`file_size_fallback`) and any transient or unclassified stage stay out.
+- **Consequences / status:** the floor is expired by the signature (installs, resolution, alias classification, the `node_modules` generation), the combined build's fingerprints and the 30-second window, the same bounds a complete total has. A cause nothing watches or fingerprints (creating a missing module file a package imports) can keep the floor showing for up to 30 seconds. A memo of the failed *combined* build is still not safe (D4's prerequisites: absent-file fingerprints for every module a build failed to read, a generation bump on tsconfig edits), so degraded totals are not covered.
 
 ---
 

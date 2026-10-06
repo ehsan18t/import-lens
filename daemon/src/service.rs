@@ -3269,7 +3269,8 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         }
 
         // A deterministic failure is cached per import (invariant 3) and still makes the file's
-        // total a floor (invariant 4).
+        // total a floor (invariant 4). In the per-import sum it also failed the combined build, so
+        // that sum is degraded, as production marks every fallback sum, and stays out.
         for stage in durable_failure_stages() {
             let cache = FileSizeCache::new();
             let result = ImportResult::unmeasured("beta", stage, "no matching export", vec![]);
@@ -3278,7 +3279,8 @@ mod every_durable_store_rejects_a_non_durable_outcome {
                 "`{stage}`: the per-import failure IS cached — it is a fact about the bytes"
             );
 
-            let total = file_total(vec![("alpha", measured("alpha", 100)), ("beta", result)]);
+            let mut total = file_total(vec![("alpha", measured("alpha", 100)), ("beta", result)]);
+            total.degraded = true;
             assert!(
                 total.incomplete,
                 "`{stage}`: beta contributed no bytes, so the file's total is a FLOOR"
@@ -3286,9 +3288,28 @@ mod every_durable_store_rejects_a_non_durable_outcome {
             cache.insert(path.clone(), 1, total);
             assert!(
                 cache.get(&path, 1).is_none(),
-                "`{stage}`: deterministically unknown is still unknown, and a floor is never cached"
+                "`{stage}`: a degraded per-import sum is not this file's total, floor or not"
             );
         }
+
+        // The floor D4 is about: the combined build succeeded, and an import that is not installed
+        // is missing from it. It reads the same on every request until an input changes, so it is
+        // cached, and it comes back still flagged as the floor it is.
+        let cache = FileSizeCache::new();
+        let deterministic_floor = FileSizeComputation {
+            raw_bytes: 100,
+            incomplete: true,
+            diagnostics: vec![ImportDiagnostic::for_stage(
+                pipeline_stage::PACKAGE_RESOLUTION,
+                "package is not installed",
+            )],
+            ..FileSizeComputation::default()
+        };
+        cache.insert(path.clone(), 1, deterministic_floor);
+        let served = cache
+            .get(&path, 1)
+            .expect("a deterministic floor is cached for its window");
+        assert!(served.incomplete, "and is served as the floor it is");
 
         // An import whose own build has not landed yet.
         let cache = FileSizeCache::new();

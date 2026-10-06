@@ -265,24 +265,6 @@ Today an unbuildable import reports no size. A graph-limit breach means much of 
 stopped, so a real floor exists: "at least 4 MB; graph limit exceeded" is strictly better than a blank. The
 engine currently discards the partial graph on failure, so this needs plumbing through the engine boundary.
 
-### D4: A file with one unmeasurable import can never cache its total
-**Status: Deferred** · A performance cost of an invariant we want
-
-An aggregate missing a contributor's bytes is a **floor**, and a floor is never cached. So a file containing
-one permanently-broken import, one deterministically unprocessable supported asset, or one import measured as
-a floor (an unresolvable specifier kept as a boundary, a stubbed binding) re-runs its combined build and asset
-tail on every size request, and `importlens check` declines to judge it (exit 3, D5). The per-import deterministic outcome is still cached; the file
-aggregate cannot be, because it is not a complete File Cost.
-
-A memo of the deterministic build failure was implemented and reverted (2026-10-06): it is not safe with the
-inputs a failed build records. A relative JavaScript module that is missing when the build runs fails it at
-`resolve`, a durable stage, but the plugin records an absent-file fingerprint only for asset candidates, so the
-memo never expires when the module appears; a module deleted and recreated mid-build (`rimraf dist && tsc`, a
-checkout) is memoized the same way; and a workspace tsconfig error is durable `link` while a tsconfig edit
-bumps no generation. Each served a stale floor indefinitely where the uncached path recovers on the next
-request. **Prerequisite for a retry:** absent-file fingerprints for every module the build failed to read or
-resolve, and a generation bump on tsconfig edits.
-
 ### D3: Marginal cost, a project-level bundle model
 **Status: Deferred** · A different product, decided on its own merits
 

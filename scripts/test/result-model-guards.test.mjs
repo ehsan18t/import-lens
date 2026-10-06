@@ -38,7 +38,7 @@ import { lineAt, sourceFiles, stripComments } from "../source-scan.mjs";
 // **So the runtime gate is what ENFORCES the rule; this only catches the spellings it can see.** A
 // size is `Option`/`null`-typed, so a consumer who asks about `error` still cannot GET a size without
 // asking for it separately — and every durable store applies its own gate at the insert
-// (`ImportResult::is_durable`, `FileSizeComputation::is_cacheable`, `isDurableFileSize`,
+// (`ImportResult::is_durable`, `FileSizeComputation::is_file_cost`, `isDurableFileSize`,
 // `isUsableFileSize`), where no static check has to reach. Those gates are quantified over by
 // property tests that derive the whole non-durable stage vocabulary FROM the allowlist and feed each
 // store a real non-durable outcome, asserting it kept nothing
@@ -168,7 +168,7 @@ const resultHandlingFiles = allFiles.filter(
  * and no `degraded`, so it cannot be asked for them and it cannot be passed to any of these three
  * predicates without a type error.
  */
-const aggregateGates = "fileCostQuality|isDurableFileSize|isUsableFileSize|is_cacheable";
+const aggregateGates = "fileCostQuality|isDurableFileSize|isUsableFileSize|is_file_cost";
 
 const consultsTheAggregateFlags = (code, receiver) => {
   const chain = receiver
