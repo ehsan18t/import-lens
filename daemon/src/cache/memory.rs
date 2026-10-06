@@ -810,8 +810,43 @@ impl ImportCache {
     /// Retries a failed disk open (see `DiskCache::reopen_if_unavailable`). The
     /// memory layer is kept; entries measured while the disk was away stay
     /// memory-only.
+    /// Attaches the shard's disk if it is missing. On the transition, entries computed while it
+    /// was missing are written (they were never queued), and the recent-entry preload a cold open
+    /// does runs for every key memory does not already hold a newer value for.
     pub fn reopen_disk(&self) -> bool {
-        self.disk.reopen_if_unavailable()
+        if self.disk.is_available() {
+            return true;
+        }
+        if !self.disk.reopen_if_unavailable() {
+            return false;
+        }
+
+        let clear_generation = self.disk.clear_generation();
+        let failed = {
+            let memory = self.memory.pin();
+            memory
+                .iter()
+                .filter(|(key, cached)| {
+                    self.disk
+                        .insert_at_generation(key, cached, clear_generation)
+                        .is_err()
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>()
+        };
+        if !failed.is_empty()
+            && let Ok(mut dirty) = self.dirty.lock()
+        {
+            dirty.extend(failed);
+        }
+
+        for (key, cached) in self.disk.load_recent(RECENT_PRELOAD_LIMIT) {
+            if !self.memory.pin().contains_key(&key) {
+                self.insert_into_memory_guarded(key, cached, clear_generation);
+            }
+        }
+        self.enforce_memory_cap();
+        true
     }
 
     /// One-pass byte/recency summary of this cache's disk shard for the capacity

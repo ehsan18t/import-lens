@@ -161,6 +161,17 @@ fn a_shard_without_its_disk_keeps_its_memory_and_retries_the_open() {
     );
     assert!(healed.get("react@18.3.1::default").is_some());
 
+    // What the shard measured while its disk was missing is persisted once the disk is back.
     drop((degraded, next_request, healed, registry));
+    let next_session = ProjectCacheRegistry::new(Some(storage.clone()), true, 512);
+    assert!(
+        next_session
+            .cache_for_root(&root)
+            .get_for_prewarm("react@18.3.1::default")
+            .is_some(),
+        "an entry computed without the disk is written when the disk reattaches"
+    );
+
+    drop(next_session);
     std::fs::remove_dir_all(storage).ok();
 }

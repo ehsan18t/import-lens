@@ -124,8 +124,10 @@ struct DiskRetry {
 }
 
 impl DiskRetry {
-    const FIRST_INTERVAL_MILLIS: u64 = 5_000;
-    const MAX_INTERVAL_MILLIS: u64 = 300_000;
+    // Short, because the common failure is this daemon's own maintenance or status pass holding
+    // the file for a moment; a permanently unavailable disk still logs at most twice a minute.
+    const FIRST_INTERVAL_MILLIS: u64 = 2_000;
+    const MAX_INTERVAL_MILLIS: u64 = 30_000;
 
     fn starting_at(now: u64) -> Self {
         Self {
