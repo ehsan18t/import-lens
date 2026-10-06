@@ -559,6 +559,7 @@ where
             }
         };
 
+        crate::reclaim::note_activity();
         match message {
             ClientMessage::Hello(hello) => {
                 if !is_supported_protocol_version(hello.version) {

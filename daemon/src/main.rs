@@ -1,4 +1,4 @@
-use import_lens_daemon::ipc::server::run_server;
+use import_lens_daemon::{ipc::server::run_server, reclaim};
 use rayon::ThreadPoolBuilder;
 use std::{env, error::Error, path::PathBuf};
 
@@ -22,8 +22,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // add idle threads, each holding its own allocator heap.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .on_thread_park(reclaim::collect_this_thread)
         .enable_all()
         .build()?;
+    runtime.spawn(reclaim::sweep_when_settled());
     let result = runtime.block_on(run_server(&pipe, args.storage));
     // The connection has already flushed the cache. A blocking handler still draining engine
     // builds has no cancellation point, and dropping the runtime would wait for it without limit.

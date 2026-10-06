@@ -9,6 +9,7 @@ pub mod lifecycle;
 pub mod logging;
 pub mod pipeline;
 pub mod prefetch;
+pub mod reclaim;
 pub mod registry;
 pub mod report;
 pub mod service;

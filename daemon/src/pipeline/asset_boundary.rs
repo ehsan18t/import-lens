@@ -201,13 +201,22 @@ impl AssetExecutor {
     }
 }
 
+static EXECUTOR: OnceLock<AssetExecutor> = OnceLock::new();
+
+/// Runs `job` once on every asset worker, if the executor has been built. Waits for each worker to
+/// finish the job it holds.
+pub(crate) fn broadcast_to_workers(job: fn()) {
+    if let Some(executor) = EXECUTOR.get() {
+        executor.pool.broadcast(|_| job());
+    }
+}
+
 /// The process-wide asset executor, built once and shared by every request.
 ///
 /// Only SUCCESS is cached, and the cell's type enforces it. A failed `ThreadPoolBuilder::build`
 /// reflects thread or handle exhaustion, which clears on its own; caching it would report
 /// Unmeasured for every asset-bearing package until a restart.
 fn executor() -> Result<&'static AssetExecutor, AssetBoundaryError> {
-    static EXECUTOR: OnceLock<AssetExecutor> = OnceLock::new();
     if let Some(executor) = EXECUTOR.get() {
         return Ok(executor);
     }

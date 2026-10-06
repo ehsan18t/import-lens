@@ -86,6 +86,7 @@ fn engine_runtime() -> &'static Runtime {
             // its keep-alive expires; the reads are short, so queueing them costs nothing. Never
             // `block_in_place` on this runtime: against a capped pool it can deadlock.
             .max_blocking_threads(engine_runtime_workers())
+            .on_thread_park(crate::reclaim::collect_this_thread)
             .thread_name("il-engine")
             .enable_all()
             .build()
@@ -109,6 +110,7 @@ impl InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        crate::reclaim::note_activity();
     }
 }
 
