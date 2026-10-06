@@ -16,11 +16,10 @@ use crate::{
     lifecycle::{LifecycleState, record_recycle_timestamp},
     logging::{self, parse_log_level, set_log_level},
     pipeline::analyze::AnalysisContext,
-    prefetch::Prefetcher,
+    prefetch::{Prefetcher, prewarm_root},
     service::{
         ImportLensService, StreamedDocumentAnalysis, protocol_error_analyze_document_response,
-        protocol_error_batch_response, protocol_error_exports_response,
-        protocol_error_file_size_document_response, protocol_error_file_size_response,
+        protocol_error_exports_response, protocol_error_file_size_document_response,
     },
 };
 use bytes::Bytes;
@@ -37,7 +36,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -417,7 +416,6 @@ use tokio::net::windows::named_pipe::ServerOptions;
 #[cfg(windows)]
 pub async fn run_server(
     pipe_name: &str,
-    _workspace_root: PathBuf,
     storage_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let pipe = ServerOptions::new()
@@ -434,35 +432,41 @@ pub async fn run_server(
 #[cfg(not(windows))]
 pub async fn run_server(
     pipe_name: &str,
-    _workspace_root: PathBuf,
     storage_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     use tokio::net::UnixListener;
 
-    if std::fs::metadata(pipe_name).is_ok() {
+    // `symlink_metadata`, so a dangling link at the path is removed instead of failing the bind.
+    if std::fs::symlink_metadata(pipe_name).is_ok() {
         std::fs::remove_file(pipe_name)?;
     }
 
-    let listener = UnixListener::bind(pipe_name)?;
+    // The client chooses the path. One past the platform's `sun_path` limit (104 bytes on macOS,
+    // 108 on Linux, NUL included) fails here, and its length is what diagnoses that.
+    let listener = UnixListener::bind(pipe_name).map_err(|error| {
+        format!(
+            "cannot bind IPC socket {pipe_name} ({} bytes): {error}",
+            pipe_name.len()
+        )
+    })?;
     restrict_unix_socket_permissions(pipe_name)?;
 
     let service = std::sync::Arc::new(ImportLensService::new(None, false));
     let prefetcher = Prefetcher::new();
 
-    let result = async {
-        let (stream, _) = listener.accept().await?;
-        handle_connection(stream, storage_path, service, prefetcher).await
-    }
-    .await;
-
+    let accepted = listener.accept().await;
+    // One client per daemon, so the path is needed only until it connects. Unlinking it here
+    // rather than on exit means no way out of the process, SIGKILL included, leaves it behind.
+    drop(listener);
     if let Err(error) = std::fs::remove_file(pipe_name) {
         logging::log_warn(
             "ipc",
             format!("failed to remove IPC socket {pipe_name}: {error}"),
         );
     }
+    let (stream, _) = accepted?;
 
-    result
+    handle_connection(stream, storage_path, service, prefetcher).await
 }
 
 pub async fn handle_connection<S>(
@@ -501,9 +505,18 @@ where
     // revalidations. Shutdown and idle-recycle join them, so nothing is still writing to the cache
     // after the flush.
     let mut active_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Set while a cache invalidation runs. No frame is read until it settles, so every request
+    // that follows an invalidation still sees its effect; frames already queued keep going out.
+    let mut invalidation: Option<oneshot::Receiver<()>> = None;
+    // The workspace root the client opened this connection for.
+    let mut connection_workspace_root: Option<PathBuf> = None;
 
     loop {
         let payload = tokio::select! {
+            () = invalidation_settled(&mut invalidation), if invalidation.is_some() => {
+                invalidation = None;
+                continue;
+            }
             outbound = outbound_rx.recv() => {
                 // The loop itself holds a sender, so `recv` cannot return None here.
                 if let Some(frame) = outbound
@@ -523,7 +536,7 @@ where
                 }
                 continue;
             }
-            payload = framed.next() => match payload.transpose() {
+            payload = framed.next(), if invalidation.is_none() => match payload.transpose() {
                 Ok(payload) => payload,
                 Err(error) => {
                     close_connection(
@@ -674,6 +687,7 @@ where
                 // full shard scans). Replacing the handle aborts the previous
                 // task if a client re-handshakes.
                 _maintenance_task = Some(spawn_cache_maintenance(std::sync::Arc::clone(&service)));
+                connection_workspace_root = Some(hello_workspace_root.clone());
                 prefetcher.prewarm_recent_cache_entries(
                     std::sync::Arc::clone(&service),
                     hello_workspace_root,
@@ -692,61 +706,6 @@ where
                     drain_outbound(&mut framed, &mut outbound_rx).await;
                     return Ok(());
                 }
-            }
-            ClientMessage::Batch(request) if hello_received => {
-                prefetcher.cancel();
-                lifecycle.record_batch();
-                let svc = std::sync::Arc::clone(&service);
-                if request.version >= 2 && request.streaming {
-                    let request_for_error = request.clone();
-                    let (partial_tx, partial_rx) = mpsc::unbounded_channel();
-                    let response_handle = tokio::task::spawn_blocking(move || {
-                        svc.handle_batch_streaming(request, move |partial| {
-                            let _ = partial_tx.send(partial);
-                        })
-                    });
-                    track_active_task(
-                        &mut active_tasks,
-                        spawn_streaming_forwarder(
-                            &outbound_tx,
-                            partial_rx,
-                            response_handle,
-                            request_for_error,
-                            protocol_error_batch_response,
-                        ),
-                    );
-                } else {
-                    spawn_request(
-                        &mut active_tasks,
-                        &outbound_tx,
-                        request.clone(),
-                        protocol_error_batch_response,
-                        move || svc.handle_batch(request),
-                    );
-                }
-
-                if recycle_if_needed(
-                    &lifecycle,
-                    lifecycle_storage_path.as_deref(),
-                    &prefetcher,
-                    &service,
-                    &mut active_tasks,
-                    &mut _maintenance_task,
-                )
-                .await
-                {
-                    drain_outbound(&mut framed, &mut outbound_rx).await;
-                    return Ok(());
-                }
-            }
-            ClientMessage::Batch(request) => {
-                queue_outbound(
-                    &outbound_tx,
-                    &protocol_error_batch_response(
-                        &request,
-                        "hello message not received".to_owned(),
-                    ),
-                );
             }
             ClientMessage::AnalyzeDocument(request) if hello_received => {
                 prefetcher.cancel();
@@ -841,11 +800,19 @@ where
             }
             ClientMessage::CacheInvalidate(message) if hello_received => {
                 prefetcher.cancel();
-                service.invalidate_package(&message.package_name);
+                invalidation = Some(spawn_invalidation(
+                    &mut active_tasks,
+                    &service,
+                    move |service| service.invalidate_package(&message.package_name),
+                ));
             }
             ClientMessage::CacheInvalidateAll(_) if hello_received => {
                 prefetcher.cancel();
-                service.invalidate_all();
+                invalidation = Some(spawn_invalidation(
+                    &mut active_tasks,
+                    &service,
+                    ImportLensService::invalidate_all,
+                ));
             }
             ClientMessage::CacheStatus(request) if hello_received => {
                 let svc = std::sync::Arc::clone(&service);
@@ -1075,21 +1042,29 @@ where
                 );
             }
             ClientMessage::PrewarmPackageJson(message) if hello_received => {
+                let package_json_path = PathBuf::from(message.package_json_path);
                 prefetcher.prewarm_package_json(
                     std::sync::Arc::clone(&service),
-                    PathBuf::from(message.package_json_path),
+                    prewarm_root(connection_workspace_root.as_deref(), &package_json_path),
+                    package_json_path,
                     PathBuf::from(message.active_document_path),
                 );
             }
             ClientMessage::NodeModulesChanged(message) if hello_received => {
-                // Both halves always run: `|` and not `||`, because a batch can carry an install AND
-                // a tsconfig edit, and short-circuiting would drop the second.
-                let invalidated = service
-                    .invalidate_package_json_paths(&message.package_json_paths)
-                    | service.invalidate_workspace_config_paths(&message.tsconfig_paths);
-                if invalidated {
-                    prefetcher.cancel();
+                // An empty batch invalidates nothing.
+                if message.package_json_paths.is_empty() && message.tsconfig_paths.is_empty() {
+                    continue;
                 }
+                prefetcher.cancel();
+                // Both halves always run: a batch can carry an install AND a tsconfig edit.
+                invalidation = Some(spawn_invalidation(
+                    &mut active_tasks,
+                    &service,
+                    move |service| {
+                        service.invalidate_package_json_paths(&message.package_json_paths);
+                        service.invalidate_workspace_config_paths(&message.tsconfig_paths);
+                    },
+                ));
             }
             ClientMessage::EnumerateExports(request) if hello_received => {
                 prefetcher.cancel();
@@ -1107,27 +1082,6 @@ where
                 queue_outbound(
                     &outbound_tx,
                     &protocol_error_exports_response(
-                        &request,
-                        "hello message not received".to_owned(),
-                    ),
-                );
-            }
-            ClientMessage::FileSize(request) if hello_received => {
-                prefetcher.cancel();
-                lifecycle.record_batch();
-                let svc = std::sync::Arc::clone(&service);
-                spawn_request(
-                    &mut active_tasks,
-                    &outbound_tx,
-                    request.clone(),
-                    protocol_error_file_size_response,
-                    move || svc.handle_file_size(request),
-                );
-            }
-            ClientMessage::FileSize(request) => {
-                queue_outbound(
-                    &outbound_tx,
-                    &protocol_error_file_size_response(
                         &request,
                         "hello message not received".to_owned(),
                     ),
@@ -1213,6 +1167,33 @@ where
     }
 
     Ok(())
+}
+
+/// Run a cache invalidation off the connection loop. It rewrites every shard on disk, blocking redb
+/// I/O that grows with the number of projects ever opened, and the loop must keep writing frames
+/// meanwhile. The returned receiver settles when the invalidation has finished.
+fn spawn_invalidation(
+    active_tasks: &mut Vec<JoinHandle<()>>,
+    service: &std::sync::Arc<ImportLensService>,
+    invalidate: impl FnOnce(&ImportLensService) + Send + 'static,
+) -> oneshot::Receiver<()> {
+    let service = std::sync::Arc::clone(service);
+    let (done_tx, done_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        if let Err(error) = tokio::task::spawn_blocking(move || invalidate(&service)).await {
+            logging::log_warn("cache", format!("cache invalidation failed: {error}"));
+        }
+        let _ = done_tx.send(());
+    });
+    track_active_task(active_tasks, handle);
+    done_rx
+}
+
+/// Resolves once the pending invalidation has finished, or its task is gone.
+async fn invalidation_settled(pending: &mut Option<oneshot::Receiver<()>>) {
+    if let Some(done) = pending {
+        let _ = done.await;
+    }
 }
 
 /// Registers a task the connection owns. Finished handles are pruned on each push, so a long-lived

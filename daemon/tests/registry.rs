@@ -5,8 +5,8 @@ use import_lens_daemon::{
     registry::{
         cache::RegistryMetadataCache,
         constants::{
-            FRESH_HINT_TTL_MS, REGISTRY_MANUAL_RATE_LIMIT_REQUESTS, REGISTRY_RATE_LIMIT_REQUESTS,
-            REGISTRY_REFRESH_CONCURRENCY, REGISTRY_RETENTION_MS,
+            FRESH_HINT_TTL_MS, REGISTRY_MANUAL_RATE_LIMIT_REQUESTS, REGISTRY_MAX_BACKOFF_MS,
+            REGISTRY_RATE_LIMIT_REQUESTS, REGISTRY_REFRESH_CONCURRENCY, REGISTRY_RETENTION_MS,
         },
         service::{RegistryHintMode, RegistryHintService},
         types::{HttpRegistryResponse, RegistryHttpClient, RegistryPackageMetadata},
@@ -341,6 +341,74 @@ fn registry_service_persists_retry_window_for_rate_limits() {
     assert_eq!(second.error.as_deref(), Some("npm registry rate limit"));
 }
 
+/// A proxy's Retry-After is capped like the global backoff it also feeds: a month-long value may
+/// not hold one package's retry window past `REGISTRY_MAX_BACKOFF_MS`, and an extreme one (which
+/// saturates to `u64::MAX`) may not overflow the window arithmetic.
+#[test]
+fn a_rate_limit_retry_window_is_capped_at_the_maximum_backoff() {
+    for (name, retry_after_ms) in [("month", 30 * 24 * 60 * 60 * 1000), ("saturated", u64::MAX)] {
+        let cache_path = temp_cache_path(&format!("retry-after-cap-{name}"));
+        let client = FakeRegistryHttpClient::with_response(HttpRegistryResponse {
+            status: 429,
+            retry_after_ms: Some(retry_after_ms),
+            body: r#"{"error":"rate limited"}"#.to_owned(),
+        });
+        let service = RegistryHintService::new(
+            RegistryMetadataCache::new(cache_path.clone()),
+            Box::new(client),
+        );
+
+        let lookup = service.hint_for("react", Some("18.2.0"), RegistryHintMode::RefreshStale, 100);
+        service.flush();
+        let entry = RegistryMetadataCache::new(cache_path.clone()).get("react");
+
+        fs::remove_dir_all(&cache_path).expect("cache cleanup");
+        assert_eq!(lookup.error.as_deref(), Some("npm registry rate limit"));
+        assert!(
+            entry
+                .as_ref()
+                .and_then(|entry| entry.retry_after)
+                .is_some_and(|retry_at| retry_at <= 100 + REGISTRY_MAX_BACKOFF_MS),
+            "{name}: the retry window must be capped: {entry:?}"
+        );
+    }
+}
+
+/// A failure recorded for a package that was never fetched successfully still carries a retry
+/// window. Maintenance must not prune it before that window closes, or the next lookup goes back
+/// to the network at once.
+#[test]
+fn maintenance_keeps_the_retry_window_of_a_never_fetched_package() {
+    let cache_path = temp_cache_path("retry-window-retention");
+    let client = FakeRegistryHttpClient::with_response(HttpRegistryResponse {
+        status: 429,
+        retry_after_ms: Some(1_000),
+        body: r#"{"error":"rate limited"}"#.to_owned(),
+    });
+    let now = REGISTRY_RETENTION_MS + 1_000_000;
+    let service = RegistryHintService::new(
+        RegistryMetadataCache::new(cache_path.clone()),
+        Box::new(client.clone()),
+    );
+
+    service.hint_for("react", Some("18.2.0"), RegistryHintMode::RefreshStale, now);
+    service.run_maintenance(now + 1, u64::MAX);
+    let second = service.hint_for(
+        "react",
+        Some("18.2.0"),
+        RegistryHintMode::RefreshStale,
+        now + 500,
+    );
+
+    fs::remove_dir_all(cache_path).expect("cache cleanup");
+    assert_eq!(
+        client.calls(),
+        vec!["react"],
+        "the retry window must survive maintenance"
+    );
+    assert_eq!(second.error.as_deref(), Some("npm registry rate limit"));
+}
+
 #[test]
 fn registry_service_retries_transient_failures_and_returns_stale_hint_with_error() {
     let cache_path = temp_cache_path("transient");
@@ -495,11 +563,13 @@ fn registry_service_releases_waiters_and_recovers_after_owner_panic() {
     let recovered = service.hint_for("react", Some("18.2.0"), RegistryHintMode::ForceRefresh, 200);
 
     fs::remove_dir_all(cache_path).expect("cache cleanup");
+    // The waiter takes over the abandoned fetch rather than inheriting the owner's panic, and the
+    // follow-up request reuses what it fetched.
     assert_eq!(client.calls(), vec!["react", "react"]);
-    assert_eq!(waiter_lookup.hint, None);
+    assert_eq!(waiter_lookup.error, None);
     assert_eq!(
-        waiter_lookup.error.as_deref(),
-        Some("registry fetch panicked")
+        waiter_lookup.hint.and_then(|item| item.latest_version),
+        Some("19.0.0".to_owned()),
     );
     assert_eq!(recovered.error, None);
     assert_eq!(

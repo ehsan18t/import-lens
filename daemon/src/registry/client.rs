@@ -74,7 +74,10 @@ fn registry_url(package_name: &str) -> String {
 
 fn retry_after_delay_ms(header: &str, now: SystemTime) -> Option<u64> {
     if let Ok(seconds) = header.parse::<f64>() {
-        return Some((seconds.max(0.0) * 1000.0).round() as u64);
+        // `inf` and `NaN` parse as f64 but are not delta-seconds.
+        return seconds
+            .is_finite()
+            .then(|| (seconds.max(0.0) * 1000.0).round() as u64);
     }
 
     // RFC 7231 allows Retry-After to carry an HTTP-date instead of
@@ -127,5 +130,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         assert_eq!(retry_after_delay_ms("soon", now), None);
         assert_eq!(retry_after_delay_ms("", now), None);
+        assert_eq!(retry_after_delay_ms("inf", now), None);
+        assert_eq!(retry_after_delay_ms("NaN", now), None);
     }
 }

@@ -1,11 +1,11 @@
 use bytes::BytesMut;
 use import_lens_daemon::ipc::codec::{
-    FrameDecoder, MAX_FRAME_BYTES, decode_payload, encode_frame, message_frame_codec,
+    MAX_FRAME_BYTES, decode_payload, message_frame_codec, payload_bytes,
 };
 use import_lens_daemon::ipc::protocol::{
     CacheRemoveScope, ClientMessage, ImportKind, ImportRequest, PROTOCOL_VERSION, ShutdownMessage,
 };
-use tokio_util::codec::Decoder;
+use tokio_util::codec::{Decoder, Encoder};
 
 const OVERSIZED_FRAME_BYTES: usize = MAX_FRAME_BYTES + 1;
 
@@ -54,62 +54,61 @@ fn msgpack(value: &serde_json::Value) -> Vec<u8> {
     rmp_serde::to_vec(&WireValue::from(value)).expect("test payload should encode")
 }
 
+fn shutdown_frame() -> BytesMut {
+    let mut frame = BytesMut::new();
+    message_frame_codec()
+        .encode(
+            payload_bytes(&ShutdownMessage {
+                message_type: "shutdown".to_owned(),
+            })
+            .expect("message should encode"),
+            &mut frame,
+        )
+        .expect("frame should encode");
+    frame
+}
+
+/// The extension's codec reads a 4-byte big-endian length header; the daemon's must write one.
 #[test]
-fn encode_frame_writes_big_endian_payload_length() {
-    let frame = encode_frame(&ShutdownMessage {
-        message_type: "shutdown".to_owned(),
-    })
-    .expect("message should encode");
+fn the_frame_codec_writes_a_big_endian_payload_length() {
+    let frame = shutdown_frame();
     let payload_len = u32::from_be_bytes(frame[0..4].try_into().expect("header length")) as usize;
 
     assert_eq!(payload_len, frame.len() - 4);
 }
 
 #[test]
-fn frame_decoder_buffers_partial_frames() {
-    let first = encode_frame(&ShutdownMessage {
-        message_type: "shutdown".to_owned(),
-    })
-    .expect("first message should encode");
-    let second = encode_frame(&ShutdownMessage {
-        message_type: "shutdown".to_owned(),
-    })
-    .expect("second message should encode");
-    let mut decoder = FrameDecoder::default();
+fn the_frame_codec_buffers_partial_frames() {
+    let first = shutdown_frame();
+    let second = shutdown_frame();
+    let mut codec = message_frame_codec();
+    let mut input = BytesMut::from(&first[..3]);
 
     assert!(
-        decoder
-            .push(&first[..3])
+        codec
+            .decode(&mut input)
             .expect("partial frame should be accepted")
-            .is_empty()
+            .is_none()
     );
 
-    let frames = decoder
-        .push(&[&first[3..], second.as_slice()].concat())
-        .expect("complete frames should decode");
+    input.extend_from_slice(&first[3..]);
+    input.extend_from_slice(&second);
+    let frame = codec
+        .decode(&mut input)
+        .expect("a complete frame should decode")
+        .expect("the first frame is complete");
 
-    assert_eq!(frames.len(), 2);
     assert_eq!(
-        decode_payload::<ClientMessage>(&frames[0]).expect("first payload should decode"),
+        decode_payload::<ClientMessage>(&frame).expect("first payload should decode"),
         ClientMessage::Shutdown(ShutdownMessage {
             message_type: "shutdown".to_owned()
         })
     );
-}
-
-#[test]
-fn frame_decoder_rejects_oversized_frames_before_buffering_payload() {
-    let mut decoder = FrameDecoder::default();
-    let mut header = Vec::new();
-    header.extend_from_slice(&(OVERSIZED_FRAME_BYTES as u32).to_be_bytes());
-
-    let error = decoder
-        .push(&header)
-        .expect_err("oversized frame should be rejected");
-
     assert!(
-        error.to_string().contains("too large"),
-        "unexpected error: {error}"
+        codec
+            .decode(&mut input)
+            .expect("the second frame should decode")
+            .is_some()
     );
 }
 

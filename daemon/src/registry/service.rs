@@ -11,11 +11,11 @@ use super::{
         RegistryPackageMetadata, RegistryPackageMetadataEntry,
     },
 };
-use crate::{ipc::protocol::RegistryHint, logging};
+use crate::{analysis_flight::AnalysisFlightRegistry, ipc::protocol::RegistryHint, logging};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    sync::{Arc, Condvar, Mutex},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -31,7 +31,8 @@ pub enum RegistryHintMode {
 pub struct RegistryHintService {
     cache: RegistryMetadataCache,
     client: Box<dyn RegistryHttpClient>,
-    in_flight: Mutex<HashMap<String, Arc<InflightRegistryPackageFetch>>>,
+    /// One fetch per package at a time; a concurrent request for it joins the fetch in flight.
+    fetches: AnalysisFlightRegistry<RegistryPackageMetadataEntry>,
     rate_limiter: Mutex<RegistryRateLimiter>,
     /// Monotonic instant of the last SUCCESSFUL manual (`ForceRefresh`) fetch per
     /// package. A re-click whose entry is younger than `MANUAL_REFRESH_COOLDOWN_MS`
@@ -39,54 +40,6 @@ pub struct RegistryHintService {
     /// in memory only (never serialized) because `Instant` is monotonic and
     /// process-local.
     manual_cooldowns: Mutex<HashMap<String, Instant>>,
-}
-
-struct InflightRegistryPackageFetch {
-    result: Mutex<Option<RegistryPackageMetadataEntry>>,
-    ready: Condvar,
-}
-
-impl InflightRegistryPackageFetch {
-    fn new() -> Self {
-        Self {
-            result: Mutex::new(None),
-            ready: Condvar::new(),
-        }
-    }
-}
-
-/// Cleans up after the owning fetch on both success and unwind. If the owner
-/// panics before publishing a result, waiters would otherwise block on the
-/// condvar forever and the stale in-flight entry would wedge every future
-/// fetch for the same package.
-struct InflightFetchGuard<'a> {
-    service: &'a RegistryHintService,
-    key: String,
-    flight: Arc<InflightRegistryPackageFetch>,
-}
-
-impl Drop for InflightFetchGuard<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut result) = self.flight.result.lock()
-            && result.is_none()
-        {
-            *result = Some(RegistryPackageMetadataEntry {
-                metadata: None,
-                updated_at: 0,
-                retry_after: None,
-                error: Some("registry fetch panicked".to_owned()),
-                not_found: false,
-            });
-        }
-        self.flight.ready.notify_all();
-        if let Ok(mut in_flight) = self.service.in_flight.lock()
-            && in_flight
-                .get(&self.key)
-                .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
-        {
-            in_flight.remove(&self.key);
-        }
-    }
 }
 
 struct RegistryRateLimiter {
@@ -177,7 +130,7 @@ impl RegistryHintService {
         Self {
             cache,
             client,
-            in_flight: Mutex::new(HashMap::new()),
+            fetches: AnalysisFlightRegistry::new(),
             rate_limiter: Mutex::new(RegistryRateLimiter::new()),
             manual_cooldowns: Mutex::new(HashMap::new()),
         }
@@ -187,7 +140,7 @@ impl RegistryHintService {
         Self {
             cache: RegistryMetadataCache::empty(),
             client: Box::new(NoopRegistryHttpClient),
-            in_flight: Mutex::new(HashMap::new()),
+            fetches: AnalysisFlightRegistry::new(),
             rate_limiter: Mutex::new(RegistryRateLimiter::new()),
             manual_cooldowns: Mutex::new(HashMap::new()),
         }
@@ -410,52 +363,12 @@ impl RegistryHintService {
         now_ms: u64,
         manual: bool,
     ) -> RegistryPackageMetadataEntry {
-        let key = cache::cache_key(package_name);
-        let (flight, is_owner) = match self.in_flight.lock() {
-            Ok(mut in_flight) => {
-                if let Some(flight) = in_flight.get(&key) {
-                    (Arc::clone(flight), false)
-                } else {
-                    let flight = Arc::new(InflightRegistryPackageFetch::new());
-                    in_flight.insert(key.clone(), Arc::clone(&flight));
-                    (flight, true)
-                }
-            }
-            // Poisoned in-flight map: skip de-duplication and fetch directly.
-            Err(_) => return self.fetch_package_with_retries(package_name, now_ms, manual),
-        };
-
-        if is_owner {
-            // Registered as guard before fetching so an unwinding fetch still
-            // publishes a failure result, wakes waiters, and clears the map
-            // entry on drop.
-            let _cleanup = InflightFetchGuard {
-                service: self,
-                key,
-                flight: Arc::clone(&flight),
-            };
-            let result = self.fetch_package_with_retries(package_name, now_ms, manual);
-            if let Ok(mut guard) = flight.result.lock() {
-                *guard = Some(result.clone());
-            }
-            return result;
-        }
-
-        let Ok(mut guard) = flight.result.lock() else {
-            // Poisoned in-flight result: fall back to fetching directly.
-            return self.fetch_package_with_retries(package_name, now_ms, manual);
-        };
-        while guard.is_none() {
-            match flight.ready.wait(guard) {
-                Ok(next) => guard = next,
-                // Poisoned while waiting: fall back to fetching directly.
-                Err(_) => return self.fetch_package_with_retries(package_name, now_ms, manual),
-            }
-        }
-        // The loop above only exits once the owner (or its drop guard)
-        // published a result, so this is a logic invariant rather than a
-        // recoverable lock failure.
-        guard.clone().expect("registry in-flight result")
+        // Registry metadata has no cache generation, so every fetch of a package shares one.
+        // A leader that panics leaves its followers to elect a replacement and fetch again.
+        self.fetches
+            .run_or_join(cache::cache_key(package_name), 0, || {
+                self.fetch_package_with_retries(package_name, now_ms, manual)
+            })
     }
 
     fn fetch_package_with_retries(
@@ -526,14 +439,17 @@ impl RegistryHintService {
                     return entry;
                 }
                 Ok(response) if response.status == 429 => {
+                    // Capped once, for both the global floor and this package's window: a
+                    // hostile or broken proxy's Retry-After must not outlast the cap either way.
                     let delay_ms = response
                         .retry_after_ms
-                        .unwrap_or_else(|| transient_backoff_ms(attempt));
+                        .unwrap_or_else(|| transient_backoff_ms(attempt))
+                        .min(REGISTRY_MAX_BACKOFF_MS);
                     // D6: honor Retry-After GLOBALLY — back off every subsequent
                     // fetch (manual and background) through the shared limiter,
                     // not just this package's per-entry retry window below.
                     self.apply_global_backoff(delay_ms);
-                    let retry_after = now_ms + delay_ms;
+                    let retry_after = now_ms.saturating_add(delay_ms);
                     logging::log_warn(
                         "registry",
                         format!(
@@ -836,7 +752,8 @@ fn failed_entry_from_cache(
 }
 
 fn is_transient_status(status: u16) -> bool {
-    status == 408 || status == 425 || status == 429 || status >= 500
+    // 429 never reaches here: it has its own arm, which honors Retry-After.
+    status == 408 || status == 425 || status >= 500
 }
 
 /// A permanent fetch failure will not succeed on retry within a short window, so
@@ -859,7 +776,10 @@ fn sleep_before_retry(attempt: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn rate_limiter_throttles_every_caller_once_the_window_limit_is_hit() {

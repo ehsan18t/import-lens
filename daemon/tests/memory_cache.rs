@@ -444,10 +444,11 @@ fn disk_hydration_interactive_get_promotes_recency() {
 }
 
 #[test]
-fn disk_hydration_interactive_swr_read_promotes_recency() {
-    // Same bug (Finding 10b / §3.2), for the C2 stale-while-revalidate read
-    // path: `get_with_result_freshness` (interactive) must promote a disk
-    // hydration hit; `get_with_result_freshness_for_bulk` must not.
+fn disk_hydration_interactive_swr_and_force_fresh_reads_promote_recency() {
+    // Same rule (§3.2) for the two other interactive reads: the stale-while-
+    // revalidate read (`get_with_result_freshness`) and the interactive force-fresh
+    // read (`get_if_fresh_and_promote`) must both promote a disk hydration hit.
+    // The non-promoting force-fresh read is the control in the test above.
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -460,22 +461,22 @@ fn disk_hydration_interactive_swr_read_promotes_recency() {
     let shard = root.join("shard");
     fs::create_dir_all(&root).expect("temp root");
 
-    let interactive_key = "v4:diskhydrate-swr-interactive";
-    let bulk_key = "v4:diskhydrate-swr-bulk";
+    let swr_key = "v4:diskhydrate-swr-interactive";
+    let forcefresh_key = "v4:diskhydrate-forcefresh-interactive";
 
     {
         let seed = ImportCache::new(Some(shard.clone()), true);
-        seed.insert(interactive_key.to_owned(), result("interactive-pkg", false));
-        seed.insert(bulk_key.to_owned(), result("bulk-pkg", false));
+        seed.insert(swr_key.to_owned(), result("swr-pkg", false));
+        seed.insert(forcefresh_key.to_owned(), result("forcefresh-pkg", false));
         seed.flush_to_disk().expect("seed flush");
     }
 
-    let interactive_before = disk_persisted_last_seq(&shard, interactive_key);
-    let bulk_before = disk_persisted_last_seq(&shard, bulk_key);
+    let swr_before = disk_persisted_last_seq(&shard, swr_key);
+    let forcefresh_before = disk_persisted_last_seq(&shard, forcefresh_key);
 
     // Cold reopen with preload DISABLED: neither key is memory-resident, so
-    // both reads below go through `read_with_result_freshness`'s disk-hydration
-    // branch, never its memory-hit branch.
+    // both reads below go through the disk-hydration branch, never the
+    // memory-hit branch.
     let cold = ImportCache::new_with_recent_preload_limit(Some(shard.clone()), true, 0);
     assert_eq!(
         cold.memory_len(),
@@ -483,25 +484,24 @@ fn disk_hydration_interactive_swr_read_promotes_recency() {
         "cold reopen must start with an empty working set"
     );
 
-    // Interactive (promoting) SWR disk-hydration hit.
-    assert!(cold.get_with_result_freshness(interactive_key).is_some());
-    // Bulk (non-promoting) SWR disk-hydration hit — control.
-    assert!(cold.get_with_result_freshness_for_bulk(bulk_key).is_some());
+    assert!(cold.get_with_result_freshness(swr_key).is_some());
+    assert!(cold.get_if_fresh_and_promote(forcefresh_key).is_some());
 
     cold.flush_to_disk().expect("flush after reads");
     drop(cold);
 
-    let interactive_after = disk_persisted_last_seq(&shard, interactive_key);
-    let bulk_after = disk_persisted_last_seq(&shard, bulk_key);
+    let swr_after = disk_persisted_last_seq(&shard, swr_key);
+    let forcefresh_after = disk_persisted_last_seq(&shard, forcefresh_key);
 
     assert!(
-        interactive_after > interactive_before,
+        swr_after > swr_before,
         "an interactive SWR disk-hydration hit must promote last_seq to a fresh value: \
-         {interactive_before} -> {interactive_after}"
+         {swr_before} -> {swr_after}"
     );
-    assert_eq!(
-        bulk_after, bulk_before,
-        "a bulk SWR disk-hydration hit must NOT promote last_seq"
+    assert!(
+        forcefresh_after > forcefresh_before,
+        "an interactive force-fresh disk-hydration hit must promote last_seq to a fresh value: \
+         {forcefresh_before} -> {forcefresh_after}"
     );
 
     fs::remove_dir_all(&root).ok();

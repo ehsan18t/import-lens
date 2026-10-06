@@ -19,10 +19,6 @@ impl WorkspaceReportExecutor {
     pub fn spawn(&self, job: impl FnOnce() + Send + 'static) {
         self.pool.spawn(job);
     }
-
-    pub fn install<R: Send>(&self, job: impl FnOnce() -> R + Send) -> R {
-        self.pool.install(job)
-    }
 }
 
 impl Default for WorkspaceReportExecutor {

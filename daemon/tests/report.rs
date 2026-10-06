@@ -1,13 +1,23 @@
 use import_lens_daemon::{
-    ipc::protocol::{PROTOCOL_VERSION, WorkspaceReportBudgets, WorkspaceReportRequest},
+    ipc::protocol::{
+        PROTOCOL_VERSION, WorkspaceReportBudgets, WorkspaceReportRequest, WorkspaceReportResponse,
+    },
     service::ImportLensService,
 };
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
 mod common;
 
 fn temp_workspace() -> PathBuf {
     common::temp_workspace("import-lens-report")
+}
+
+/// Run a report the way the server does: on the report worker, answered through a oneshot.
+fn workspace_report(request: WorkspaceReportRequest) -> WorkspaceReportResponse {
+    let service = Arc::new(ImportLensService::new(None, false));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    service.spawn_workspace_report(request, tx);
+    rx.blocking_recv().expect("the report worker should answer")
 }
 
 fn write_report_package(workspace: &std::path::Path) {
@@ -75,9 +85,7 @@ fn report_rows_carry_the_shared_bytes_of_their_own_file() {
         "import { left } from 'left-lib';\nimport { right } from 'right-lib';\nconsole.log(left, right);",
     )
     .expect("source file");
-    let service = ImportLensService::new(None, false);
-
-    let response = service.build_workspace_report(WorkspaceReportRequest {
+    let response = workspace_report(WorkspaceReportRequest {
         message_type: "workspace_report".to_owned(),
         version: PROTOCOL_VERSION,
         request_id: 91,
@@ -128,9 +136,7 @@ fn workspace_report_scans_supported_sources_and_skips_node_modules() {
         "import { value } from 'tiny-lib';",
     )
     .expect("ignored source");
-    let service = ImportLensService::new(None, false);
-
-    let response = service.build_workspace_report(WorkspaceReportRequest {
+    let response = workspace_report(WorkspaceReportRequest {
         message_type: "workspace_report".to_owned(),
         version: PROTOCOL_VERSION,
         request_id: 90,

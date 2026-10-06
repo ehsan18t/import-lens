@@ -7,8 +7,8 @@ use std::fs;
 
 use import_lens_daemon::cache::key::{Freshness, check_fingerprints_strict};
 use import_lens_daemon::ipc::protocol::{
-    BatchRequest, ImportKind, ImportRequest, ImportResult, ImportRuntime, MeasuredSizes,
-    PROTOCOL_VERSION,
+    AnalyzeSpecifiersRequest, ImportKind, ImportRequest, ImportResult, ImportRuntime,
+    MeasuredSizes, PROTOCOL_VERSION,
 };
 use import_lens_daemon::pipeline::analyze::{
     AnalysisContext, FingerprintSource, analyze_import, analyze_resolved_import_with_dependencies,
@@ -148,21 +148,28 @@ fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
     );
 
     let service = ImportLensService::new(None, false);
-    let batch = |request_id| BatchRequest {
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().into_owned(),
-        active_document_path: context.active_document_path.to_string_lossy().into_owned(),
-        imports: vec![request.clone()],
-        streaming: false,
+    let analyze = |request_id| {
+        service
+            .handle_analyze_specifiers(AnalyzeSpecifiersRequest {
+                message_type: "analyze_specifiers".to_owned(),
+                version: PROTOCOL_VERSION,
+                request_id,
+                workspace_root: workspace.to_string_lossy().into_owned(),
+                active_document_path: context.active_document_path.to_string_lossy().into_owned(),
+                specifiers: vec![request.specifier.clone()],
+            })
+            .imports
+            .remove(0)
+            .result
+            .expect("the namespace import should settle with a result")
     };
-    let first_service_result = service.handle_batch(batch(1)).imports.remove(0);
+    let first_service_result = analyze(1);
     assert!(
         first_service_result.sizes().is_some(),
         "{first_service_result:?}"
     );
     assert!(!first_service_result.cache_hit, "first analysis must miss");
-    let cached_floor = service.handle_batch(batch(2)).imports.remove(0);
+    let cached_floor = analyze(2);
     assert!(
         cached_floor.cache_hit,
         "a deterministic breach is reusable while its inputs are unchanged: {cached_floor:?}"
@@ -178,7 +185,7 @@ fn a_css_referenced_asset_cannot_escape_the_graph_source_ceiling() {
         !recovered.asset_breakdown.is_empty() && !discloses_the_breach(&recovered.diagnostics),
         "the same import should count its assets once the font is fixed: {recovered:?}"
     );
-    let refreshed = service.handle_batch(batch(3)).imports.remove(0);
+    let refreshed = analyze(3);
     assert!(
         !refreshed.cache_hit && !discloses_the_breach(&refreshed.diagnostics),
         "the service cache must re-run after only the offending asset changes: {refreshed:?}"

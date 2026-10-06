@@ -156,6 +156,54 @@ fn clear_sticks_bypassing_union() {
     );
 }
 
+/// Two daemons share the file. A clear in one must stick even though the other still holds the
+/// cleared entries in memory: neither its next flush nor its maintenance pass may write them back.
+#[test]
+fn a_clear_in_one_daemon_sticks_against_another_daemons_flush_and_maintenance() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_millis() as u64;
+
+    for compaction in [false, true] {
+        let dir = common::temp_workspace("import-lens-registry-cross-clear");
+        let seed = RegistryMetadataCache::new(dir.clone());
+        // Recent, so the maintenance pass's retention prune cannot be what removes it.
+        seed.write_metadata("react", metadata("18.0.0"), now - 1_000)
+            .expect("write react");
+        seed.flush().expect("flush seed");
+        drop(seed);
+
+        let window_a = RegistryMetadataCache::new(dir.clone());
+        let window_b = RegistryMetadataCache::new(dir.clone());
+        assert!(window_b.get("react").is_some(), "both windows load react");
+
+        window_a.clear().expect("clear persists the empty snapshot");
+        window_b
+            .write_metadata("vue", metadata("3.4.0"), now + 60_000)
+            .expect("write vue");
+        if compaction {
+            window_b.run_maintenance(now + 60_000, 0);
+        } else {
+            window_b.flush().expect("flush B");
+        }
+
+        let reloaded = RegistryMetadataCache::new(dir);
+        assert!(
+            reloaded.get("react").is_none(),
+            "the cleared entry must not come back (compaction: {compaction})"
+        );
+        assert!(
+            reloaded.get("vue").is_some(),
+            "a write made after the clear survives (compaction: {compaction})"
+        );
+        assert!(
+            window_b.get("react").is_none(),
+            "the other window drops the cleared entry from memory too (compaction: {compaction})"
+        );
+    }
+}
+
 #[test]
 fn auto_retention_drops_expired_and_sticks() {
     let dir = common::temp_workspace("import-lens-registry-retention");

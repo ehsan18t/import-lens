@@ -14,11 +14,10 @@ use crate::{
     ipc::protocol::{
         AnalyzeDocumentRequest, AnalyzeDocumentResponse, AnalyzePackageJsonRequest,
         AnalyzePackageJsonResponse, AnalyzeSpecifiersRequest, AnalyzeSpecifiersResponse,
-        BatchRequest, BatchResponse, CacheListRequest, CacheListResponse, CacheRemoveRequest,
-        CacheRemoveResponse, CacheRemoveScope, CacheStatusRequest, CacheStatusResponse,
-        CompleteImportMembersRequest, CompleteImportMembersResponse, DetectedImport,
-        EnumerateExportsRequest, EnumerateExportsResponse, FileSizeDocumentRequest,
-        FileSizeDocumentResponse, FileSizeRequest, FileSizeResponse, FreshnessKind,
+        CacheListRequest, CacheListResponse, CacheRemoveRequest, CacheRemoveResponse,
+        CacheRemoveScope, CacheStatusRequest, CacheStatusResponse, CompleteImportMembersRequest,
+        CompleteImportMembersResponse, DetectedImport, EnumerateExportsRequest,
+        EnumerateExportsResponse, FileSizeDocumentRequest, FileSizeDocumentResponse, FreshnessKind,
         ImportAnalysisItem, ImportAnalysisStatus, ImportDiagnostic, ImportKind, ImportRequest,
         ImportResult, ImportRuntime, ImportSyntax, PROTOCOL_VERSION,
         PackageJsonDependencyAnalysisItem, RefreshedImportIdentity,
@@ -43,12 +42,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Whether a cached-analyze read promotes the entry's LRU recency (scan
-/// resistance, §5.1). An interactive read whose result the user is looking at now
-/// promotes; a bulk/background scan (`WorkspaceReport`, `Compare`) does not, so a
-/// full-workspace pass can't flood the recency signal and evict the user's warm
-/// working set. When a caller's intent is ambiguous, prefer `Interactive` —
-/// over-promoting is safe; the finding targets full-workspace report/Compare scans.
+/// Whether a cached-analyze read promotes the entry's LRU recency (FR-026b, scan
+/// resistance §5.1). An interactive read whose result the user is looking at now
+/// promotes; the workspace report does not, so a full-workspace pass can't flood
+/// the recency signal and evict the user's warm working set. When a caller's
+/// intent is ambiguous, prefer `Interactive`: over-promoting is safe.
 #[derive(Clone, Copy)]
 enum ReadIntent {
     Interactive,
@@ -518,14 +516,6 @@ impl ImportLensService {
         self.registry_hints.flush();
     }
 
-    pub fn build_workspace_report(
-        &self,
-        request: WorkspaceReportRequest,
-    ) -> WorkspaceReportResponse {
-        self.report_executor
-            .install(|| self.build_workspace_report_on_worker(request))
-    }
-
     fn build_workspace_report_on_worker(
         &self,
         request: WorkspaceReportRequest,
@@ -722,153 +712,6 @@ impl ImportLensService {
         self.report_executor.spawn(move || {
             let _ = tx.send(service.build_workspace_report_on_worker(request));
         });
-    }
-
-    pub fn handle_batch(&self, request: BatchRequest) -> BatchResponse {
-        if !is_supported_protocol_version(request.version) {
-            return protocol_error_batch_response(
-                &request,
-                format!("unsupported protocol version {}", request.version),
-            );
-        }
-
-        let context = AnalysisContext {
-            workspace_root: PathBuf::from(&request.workspace_root),
-            active_document_path: PathBuf::from(&request.active_document_path),
-        };
-        let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
-        annotate_shared_bytes(runtimes_of(&request.imports).zip(imports.iter_mut()));
-
-        BatchResponse {
-            version: request.version,
-            request_id: request.request_id,
-            imports,
-            indexes: None,
-        }
-    }
-
-    /// Cache hits are classified across the Rayon pool; only misses queue for the
-    /// two-permit engine drain. `emit` fires once per import as it settles, in
-    /// completion order, and carries the import's original index.
-    fn analyze_batch(
-        &self,
-        context: &AnalysisContext,
-        imports: &[ImportRequest],
-        emit: impl Fn(usize, &ImportResult) + Sync,
-    ) -> Vec<ImportResult> {
-        drain_classified(
-            imports,
-            |index, item| match self.probe_cache(context, item, false, ReadIntent::Interactive) {
-                CacheProbe::Hit(result) => {
-                    emit(index, &result);
-                    Ok(*result)
-                }
-                pending => Err(pending),
-            },
-            |index, item, pending| {
-                let result = self.complete_probe(context, item, pending);
-                emit(index, &result);
-                result
-            },
-        )
-    }
-
-    pub fn handle_batch_streaming<F>(&self, request: BatchRequest, emit_partial: F) -> BatchResponse
-    where
-        F: Fn(BatchResponse) + Sync,
-    {
-        if !is_supported_protocol_version(request.version) {
-            return protocol_error_batch_response(
-                &request,
-                format!("unsupported protocol version {}", request.version),
-            );
-        }
-
-        if request.version < 2 || !request.streaming {
-            return self.handle_batch(request);
-        }
-
-        let context = AnalysisContext {
-            workspace_root: PathBuf::from(&request.workspace_root),
-            active_document_path: PathBuf::from(&request.active_document_path),
-        };
-        let mut imports = self.analyze_batch(&context, &request.imports, |index, result| {
-            emit_partial(BatchResponse {
-                version: request.version,
-                request_id: request.request_id,
-                imports: vec![result.clone()],
-                indexes: Some(vec![index]),
-            });
-        });
-        annotate_shared_bytes(runtimes_of(&request.imports).zip(imports.iter_mut()));
-
-        BatchResponse {
-            version: request.version,
-            request_id: request.request_id,
-            imports,
-            indexes: None,
-        }
-    }
-
-    pub fn handle_file_size(&self, request: FileSizeRequest) -> FileSizeResponse {
-        if !(2..=PROTOCOL_VERSION).contains(&request.version) {
-            return protocol_error_file_size_response(
-                &request,
-                format!("unsupported protocol version {}", request.version),
-            );
-        }
-
-        let context = AnalysisContext {
-            workspace_root: PathBuf::from(&request.workspace_root),
-            active_document_path: PathBuf::from(&request.active_document_path),
-        };
-        let mut imports = self.analyze_batch(&context, &request.imports, |_, _| {});
-        annotate_shared_bytes(runtimes_of(&request.imports).zip(imports.iter_mut()));
-        // Hand the per-import measurements to the aggregate: if its combined build fails, the
-        // conservative fallback sums THESE instead of re-analyzing every import through the
-        // engine a second time.
-        let sized = request
-            .imports
-            .iter()
-            .cloned()
-            .zip(imports.iter().cloned())
-            .map(|(request, result)| SizedImport::installed(request, Some(result)))
-            .collect::<Vec<_>>();
-        let file_size = self.file_size_with_cache(&context, &request.active_document_path, &sized);
-
-        FileSizeResponse {
-            version: request.version,
-            request_id: request.request_id,
-            raw_bytes: file_size.raw_bytes,
-            minified_bytes: file_size.minified_bytes,
-            gzip_bytes: file_size.gzip_bytes,
-            brotli_bytes: file_size.brotli_bytes,
-            zstd_bytes: file_size.zstd_bytes,
-            imports,
-            incomplete: file_size.incomplete,
-            degraded: file_size.degraded,
-            error: file_size.error,
-            diagnostics: file_size.diagnostics,
-        }
-    }
-
-    /// Analyze a document and WAIT for every miss to build.
-    ///
-    /// The complete answer, at the price of the client waiting for the slowest build in the
-    /// document. Only two callers want that trade: the workspace report (a table row cannot say
-    /// "still measuring") and `importlens check` through the force-fresh file-size path (CI must
-    /// judge the real number or fail loudly). The editor takes
-    /// [`Self::handle_analyze_document_streaming`] instead.
-    pub fn handle_analyze_document(
-        &self,
-        request: AnalyzeDocumentRequest,
-        ignore_resolver: &IgnoreRuleResolver,
-    ) -> AnalyzeDocumentResponse {
-        // Interactive analyze (an editor request for the active document the user is
-        // looking at) promotes recency. The bulk WorkspaceReport scan reuses this same
-        // per-file analysis via `_with_intent(.., ReadIntent::Bulk)` so it does NOT
-        // promote — a full-workspace pass can't flood the recency signal (§5.1).
-        self.handle_analyze_document_with_intent(request, ignore_resolver, ReadIntent::Interactive)
     }
 
     /// Analyze a document WITHOUT waiting for any engine build.
@@ -1277,10 +1120,8 @@ impl ImportLensService {
             // the same transient error, and could overwrite the good cached value with an
             // error result. The re-probe itself re-stats the dependency, so for a
             // graduated key it doubles as the active re-check that heals it on a later get.
-            if matches!(
-                cache.probe_freshness(&key),
-                Some(crate::cache::key::Freshness::Unknown)
-            ) {
+            let freshness = cache.probe_freshness(&key);
+            if matches!(freshness, Some(crate::cache::key::Freshness::Unknown)) {
                 continue;
             }
             // Dedupe only within one document generation. The real cache key remains
@@ -1295,14 +1136,22 @@ impl ImportLensService {
             let Some(_guard) = cache.begin_revalidation(&claim_key) else {
                 continue;
             };
-            let mut result = self.analyze_and_cache(
-                cache.as_ref(),
-                &context,
-                &import_request,
-                key.clone(),
-                resolved.clone(),
-                || true,
-            );
+            // `Fresh` again: another request rebuilt the entry after this one was served
+            // stale, so the client is owed that value, not a second build of it.
+            let healed = matches!(freshness, Some(crate::cache::key::Freshness::Fresh))
+                .then(|| cache.get_if_fresh_and_promote(&key))
+                .flatten();
+            let mut result = match healed {
+                Some(result) => result,
+                None => self.analyze_and_cache(
+                    cache.as_ref(),
+                    &context,
+                    &import_request,
+                    key.clone(),
+                    resolved.clone(),
+                    || true,
+                ),
+            };
             // F1 trailing re-check: if a dependency changed AGAIN while this recompute
             // ran, the value just inserted already reflects the older state and
             // `probe_freshness` re-stats it to `Stale`. A concurrent stale serve during
@@ -2247,20 +2096,6 @@ impl ImportLensService {
         self.cache_registry.flush_to_disk()
     }
 
-    pub fn prewarm_import<F>(
-        &self,
-        context: &AnalysisContext,
-        request: &ImportRequest,
-        should_continue: F,
-    ) where
-        F: Fn() -> bool,
-    {
-        let Ok(resolved) = resolve_package_entry(&context.active_document_path, request) else {
-            return;
-        };
-        self.prewarm_resolved_import(context, request, resolved, should_continue);
-    }
-
     pub fn prewarm_resolved_import<F>(
         &self,
         context: &AnalysisContext,
@@ -2666,14 +2501,9 @@ impl ImportLensService {
             let lookup_started_at = Instant::now();
             // SWR: serve the last-known value (flagged Stale/Unverified) instead of
             // evicting-and-recomputing. The FileSizeDocument handler spawns a background
-            // recompute + push when a served result is Stale. A bulk read
-            // (WorkspaceReport, Compare) uses the non-promoting variant so a
-            // full-workspace scan can't flood the recency signal (scan resistance, §5.1).
-            let served = match intent {
-                ReadIntent::Interactive => cache.get_with_result_freshness(&key),
-                ReadIntent::Bulk => cache.get_with_result_freshness_for_bulk(&key),
-            };
-            if let Some((result, _freshness)) = served {
+            // recompute + push when a served result is Stale. Only that interactive size
+            // read serves stale, and the read promotes recency.
+            if let Some((result, _freshness)) = cache.get_with_result_freshness(&key) {
                 log_cache_lookup_timing(
                     request,
                     cache_read_mode_label(serve_stale, intent),
@@ -2822,14 +2652,6 @@ fn effective_registry_hint_mode(
         }
         None => crate::registry::service::RegistryHintMode::Off,
     }
-}
-
-/// The runtime each request resolves under, in request order — the partition
-/// [`annotate_shared_bytes`] counts sharing within (ADR-0005). The batch handlers' results are
-/// index-aligned with their requests, which is the same alignment `SizedImport::installed` already
-/// relies on in `handle_file_size`.
-fn runtimes_of(requests: &[ImportRequest]) -> impl Iterator<Item = ImportRuntime> + '_ {
-    requests.iter().map(|request| request.runtime)
 }
 
 /// Re-derive `shared_bytes` across a document's COMPLETE set of measurements and return only the
@@ -2981,7 +2803,10 @@ fn fresh_cached_result_for_key(
     intent: ReadIntent,
 ) -> Option<ImportResult> {
     let lookup_started_at = Instant::now();
-    let result = cache.get_if_fresh(key);
+    let result = match intent {
+        ReadIntent::Interactive => cache.get_if_fresh_and_promote(key),
+        ReadIntent::Bulk => cache.get_if_fresh(key),
+    };
     log_cache_lookup_timing(
         request,
         cache_read_mode_label(false, intent),
@@ -3207,19 +3032,6 @@ pub fn protocol_error_file_size_document_response(
     }
 }
 
-pub fn protocol_error_batch_response(request: &BatchRequest, message: String) -> BatchResponse {
-    BatchResponse {
-        version: request.version.min(PROTOCOL_VERSION),
-        request_id: request.request_id,
-        imports: request
-            .imports
-            .iter()
-            .map(|item| protocol_error(item, message.clone()))
-            .collect(),
-        indexes: None,
-    }
-}
-
 /// The runtime a direct `enumerate_exports` request resolves under, from the ONE document
 /// classifier (`document::runtime_at_offset`) so it cannot disagree with the size path.
 ///
@@ -3254,47 +3066,6 @@ pub fn protocol_error_exports_response(
             details: vec![format!("specifier: {}", request.specifier)],
         }],
     }
-}
-
-pub fn protocol_error_file_size_response(
-    request: &FileSizeRequest,
-    message: String,
-) -> FileSizeResponse {
-    FileSizeResponse {
-        version: request.version.min(PROTOCOL_VERSION),
-        request_id: request.request_id,
-        raw_bytes: 0,
-        minified_bytes: 0,
-        gzip_bytes: 0,
-        brotli_bytes: 0,
-        zstd_bytes: 0,
-        imports: request
-            .imports
-            .iter()
-            .map(|item| protocol_error(item, message.clone()))
-            .collect(),
-        // Nothing was summed at all; `error` is the answer.
-        incomplete: false,
-        degraded: false,
-        error: Some(message.clone()),
-        diagnostics: vec![ImportDiagnostic {
-            stage: crate::pipeline::stage::PROTOCOL.to_owned(),
-            message,
-            details: Vec::new(),
-        }],
-    }
-}
-
-fn protocol_error(request: &ImportRequest, message: String) -> ImportResult {
-    let mut result = ImportResult::unmeasured(
-        request.specifier.clone(),
-        crate::pipeline::stage::PROTOCOL,
-        message,
-        vec![format!("specifier: {}", request.specifier)],
-    );
-    result.confidence_reasons =
-        vec!["Protocol validation failed before a bundle size could be measured.".to_owned()];
-    result
 }
 
 #[cfg(test)]

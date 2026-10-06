@@ -1,16 +1,16 @@
 use import_lens_daemon::{
     ipc::protocol::{
-        AnalyzeDocumentRequest, AnalyzePackageJsonRequest, AnalyzeSpecifiersRequest, BatchRequest,
+        AnalyzeDocumentRequest, AnalyzePackageJsonRequest, AnalyzeSpecifiersRequest,
         CacheRemoveRequest, CacheRemoveScope, CacheStatusRequest, CompleteImportMembersRequest,
-        EnumerateExportsRequest, FileSizeDocumentRequest, FileSizeRequest, ImportAnalysisStatus,
-        ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION, RegistryHintMode,
-        RegistryHintTarget,
+        EnumerateExportsRequest, FileSizeDocumentRequest, ImportAnalysisStatus, ImportKind,
+        ImportRuntime, PROTOCOL_VERSION, RegistryHintMode, RegistryHintTarget,
+        WorkspaceReportRequest,
     },
     pipeline::file_size::FileSizeComputation,
     pipeline::file_size_cache::shared_file_size_cache,
     pipeline::resolver::shared_resolvers,
     registry::service::RegistryHintService,
-    service::{ImportLensService, protocol_error_batch_response, protocol_error_exports_response},
+    service::{ImportLensService, protocol_error_exports_response},
 };
 use std::{
     fs,
@@ -19,6 +19,8 @@ use std::{
 };
 
 mod common;
+
+use common::documents::{AnalyzedDocument, analyze_document};
 
 // Serializes tests that touch process-global freshness state (the engine's
 // dependency-path index and the L1 file-size cache).
@@ -264,180 +266,124 @@ fn write_cjs_file_size_package(workspace: &Path) {
     .expect("helper should be written");
 }
 
-fn batch(workspace: &Path, request_id: u64) -> BatchRequest {
-    BatchRequest {
-        version: 1,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "tiny-lib".to_owned(),
-            package_name: "tiny-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["value".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
-    }
+/// The editor's document analysis, run to completion through the production entry points.
+fn analyze(service: &ImportLensService, request: AnalyzeDocumentRequest) -> AnalyzedDocument {
+    analyze_document(service, request)
 }
 
-fn effectful_batch(workspace: &Path, request_id: u64, import_kind: ImportKind) -> BatchRequest {
-    BatchRequest {
-        version: 1,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "effectful-lib".to_owned(),
-            package_name: "effectful-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: if matches!(import_kind, ImportKind::Named) {
-                vec!["value".to_owned()]
-            } else {
-                Vec::new()
-            },
-            import_kind,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
+fn document_request_for(
+    workspace: &Path,
+    document_relative_path: &str,
+    request_id: u64,
+    source: &str,
+) -> AnalyzeDocumentRequest {
+    let mut document = workspace.to_path_buf();
+    for segment in document_relative_path.split('/') {
+        document.push(segment);
     }
-}
 
-fn runtime_batch(workspace: &Path, request_id: u64, runtime: ImportRuntime) -> BatchRequest {
-    BatchRequest {
+    AnalyzeDocumentRequest {
+        message_type: "analyze_document".to_owned(),
         version: PROTOCOL_VERSION,
         request_id,
         workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "runtime-lib".to_owned(),
-            package_name: "runtime-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["value".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime,
-        }],
-        streaming: false,
+        active_document_path: document.to_string_lossy().to_string(),
+        source: source.to_owned(),
     }
 }
 
-fn missing_effectful_batch(
+fn document_request(workspace: &Path, request_id: u64, source: &str) -> AnalyzeDocumentRequest {
+    document_request_for(workspace, "src/index.ts", request_id, source)
+}
+
+/// The import statement of each kind, for a package bound as `binding`.
+fn import_statement(package_name: &str, import_kind: ImportKind, named: &str) -> String {
+    match import_kind {
+        ImportKind::Named => format!("import {{ {named} }} from '{package_name}';"),
+        ImportKind::Default => format!("import binding from '{package_name}';"),
+        ImportKind::Namespace => format!("import * as binding from '{package_name}';"),
+        ImportKind::Dynamic => format!("const binding = import('{package_name}');"),
+    }
+}
+
+fn tiny_document(workspace: &Path, request_id: u64) -> AnalyzeDocumentRequest {
+    package_document(workspace, request_id, "tiny-lib", "value")
+}
+
+fn effectful_document(
     workspace: &Path,
     request_id: u64,
     import_kind: ImportKind,
-) -> BatchRequest {
-    BatchRequest {
-        version: PROTOCOL_VERSION,
+) -> AnalyzeDocumentRequest {
+    document_request(
+        workspace,
         request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "missing-effectful-lib".to_owned(),
-            package_name: "missing-effectful-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: if matches!(import_kind, ImportKind::Named) {
-                vec!["missing".to_owned()]
-            } else {
-                Vec::new()
-            },
-            import_kind,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
+        &import_statement("effectful-lib", import_kind, "value"),
+    )
+}
+
+/// The runtime comes from where the import sits: a `.ts` module is a component, an Astro
+/// frontmatter runs on the server, and an Astro `<script>` runs on the client.
+fn runtime_document(
+    workspace: &Path,
+    request_id: u64,
+    runtime: ImportRuntime,
+) -> AnalyzeDocumentRequest {
+    let statement = "import { value } from 'runtime-lib';";
+    match runtime {
+        ImportRuntime::Component => document_request(workspace, request_id, statement),
+        ImportRuntime::Server => document_request_for(
+            workspace,
+            "src/index.astro",
+            request_id,
+            &format!("---\n{statement}\nconsole.log(value);\n---\n<div />\n"),
+        ),
+        ImportRuntime::Client => document_request_for(
+            workspace,
+            "src/index.astro",
+            request_id,
+            &format!("<div />\n<script>\n{statement}\nconsole.log(value);\n</script>\n"),
+        ),
     }
 }
 
-fn package_batch(
+fn missing_effectful_document(
+    workspace: &Path,
+    request_id: u64,
+    import_kind: ImportKind,
+) -> AnalyzeDocumentRequest {
+    document_request(
+        workspace,
+        request_id,
+        &import_statement("missing-effectful-lib", import_kind, "missing"),
+    )
+}
+
+fn package_document(
     workspace: &Path,
     request_id: u64,
     package_name: &str,
     named: &str,
-) -> BatchRequest {
-    BatchRequest {
-        version: PROTOCOL_VERSION,
+) -> AnalyzeDocumentRequest {
+    document_request(
+        workspace,
         request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: package_name.to_owned(),
-            package_name: package_name.to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec![named.to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-        streaming: false,
-    }
+        &import_statement(package_name, ImportKind::Named, named),
+    )
 }
 
-fn shared_batch(workspace: &Path, request_id: u64) -> BatchRequest {
-    BatchRequest {
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![
-            ImportRequest {
-                specifier: "left-lib".to_owned(),
-                package_name: "left-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec!["left".to_owned()],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            },
-            ImportRequest {
-                specifier: "right-lib".to_owned(),
-                package_name: "right-lib".to_owned(),
-                version: "1.0.0".to_owned(),
-                named: vec!["right".to_owned()],
-                import_kind: ImportKind::Named,
-                runtime: ImportRuntime::Component,
-            },
-        ],
-        streaming: false,
-    }
+const SHARED_SOURCE: &str = "import { left } from 'left-lib';\nimport { right } from 'right-lib';";
+
+fn shared_document(workspace: &Path, request_id: u64) -> AnalyzeDocumentRequest {
+    document_request(workspace, request_id, SHARED_SOURCE)
 }
 
-fn file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
-    let batch = shared_batch(workspace, request_id);
-
-    FileSizeRequest {
-        message_type: "file_size".to_owned(),
-        version: PROTOCOL_VERSION,
-        request_id,
-        workspace_root: batch.workspace_root,
-        active_document_path: batch.active_document_path,
-        imports: batch.imports,
-    }
+fn file_size_request(workspace: &Path, request_id: u64) -> FileSizeDocumentRequest {
+    file_size_document_request(workspace, request_id, SHARED_SOURCE)
 }
 
 #[test]
-fn handle_file_size_populates_and_reuses_aggregate_cache() {
+fn file_size_document_populates_and_reuses_aggregate_cache() {
     // It asserts on the process-wide L1 cache, and other tests in this binary CLEAR it (a cache
     // remove, a workspace-config invalidation). Serialize against them.
     let _shared_index_guard = SHARED_INDEX_TEST_LOCK
@@ -450,8 +396,8 @@ fn handle_file_size_populates_and_reuses_aggregate_cache() {
 
     let request = file_size_request(&workspace, 1);
     let path = PathBuf::from(&request.active_document_path);
-    let first = service.handle_file_size(request);
-    let second = service.handle_file_size(file_size_request(&workspace, 2));
+    let first = service.handle_file_size_document(request);
+    let second = service.handle_file_size_document(file_size_request(&workspace, 2));
 
     // Same import set -> identical aggregate numbers on the repeat request.
     assert_eq!(first.minified_bytes, second.minified_bytes);
@@ -465,26 +411,12 @@ fn handle_file_size_populates_and_reuses_aggregate_cache() {
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
 }
 
-fn cjs_file_size_request(workspace: &Path, request_id: u64) -> FileSizeRequest {
-    FileSizeRequest {
-        message_type: "file_size".to_owned(),
-        version: PROTOCOL_VERSION,
+fn cjs_file_size_request(workspace: &Path, request_id: u64) -> FileSizeDocumentRequest {
+    file_size_document_request(
+        workspace,
         request_id,
-        workspace_root: workspace.to_string_lossy().to_string(),
-        active_document_path: workspace
-            .join("src")
-            .join("index.ts")
-            .to_string_lossy()
-            .to_string(),
-        imports: vec![ImportRequest {
-            specifier: "cjs-file-lib".to_owned(),
-            package_name: "cjs-file-lib".to_owned(),
-            version: "1.0.0".to_owned(),
-            named: vec!["value".to_owned()],
-            import_kind: ImportKind::Named,
-            runtime: ImportRuntime::Component,
-        }],
-    }
+        "import { value } from 'cjs-file-lib';",
+    )
 }
 
 fn enumerate_exports_request(workspace: &Path, request_id: u64) -> EnumerateExportsRequest {
@@ -511,33 +443,29 @@ fn service_analyzes_document_source_in_daemon() {
     write_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let response = service.handle_analyze_document(
-        AnalyzeDocumentRequest {
-            message_type: "analyze_document".to_owned(),
-            version: PROTOCOL_VERSION,
-            request_id: 31,
-            workspace_root: workspace.to_string_lossy().to_string(),
-            active_document_path: active_document_path(&workspace),
-            source: "import { value } from 'tiny-lib';\nimport type { Type } from 'tiny-lib';"
-                .to_owned(),
-        },
-        &import_lens_daemon::document::IgnoreRuleResolver::default(),
+    let response = analyze(
+        &service,
+        document_request(
+            &workspace,
+            31,
+            "import { value } from 'tiny-lib';\nimport type { Type } from 'tiny-lib';",
+        ),
     );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert_eq!(response.request_id, 31);
     assert_eq!(response.error, None);
-    assert_eq!(response.imports.len(), 1);
-    assert_eq!(response.imports[0].status, ImportAnalysisStatus::Ready);
-    assert_eq!(response.imports[0].detected.package_name, "tiny-lib");
+    assert_eq!(response.items.len(), 1);
+    assert_eq!(response.items[0].status, ImportAnalysisStatus::Ready);
+    assert_eq!(response.items[0].detected.package_name, "tiny-lib");
     assert_eq!(
-        response.imports[0]
+        response.items[0]
             .request
             .as_ref()
             .map(|request| request.version.as_str()),
         Some("1.0.0"),
     );
-    assert!(response.imports[0].result.is_some());
+    assert!(response.items[0].result.is_some());
 }
 
 #[test]
@@ -2031,6 +1959,45 @@ fn revalidate_document_sizes_recomputes_only_stale_specifiers() {
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
+/// A served-stale import whose entry is Fresh again when its revalidation runs (another request
+/// already rebuilt it) is pushed from the cache. Rebuilding it would spend an engine permit on a
+/// value the cache already holds.
+#[test]
+fn revalidation_pushes_an_entry_that_is_fresh_again_without_rebuilding_it() {
+    use std::collections::HashSet;
+
+    let workspace = temp_workspace();
+    write_tiny_package_with_source(&workspace, "export const value = 'tiny';");
+    let service = ImportLensService::new(None, false);
+    let request = FileSizeDocumentRequest {
+        message_type: "file_size_document".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        source: "import { value } from 'tiny-lib';".to_owned(),
+        force_fresh: false,
+        analysis_generation: None,
+    };
+    let built = service.handle_file_size_document(request.clone());
+    assert!(
+        !built.imports[0].cache_hit,
+        "precondition: the first read builds the entry: {built:?}"
+    );
+
+    let stale = HashSet::from(["tiny-lib".to_owned()]);
+    let (_, _, results, _) = service
+        .revalidate_document_sizes(&request, &stale, || true)
+        .expect("the served-stale import should still be pushed");
+
+    fs::remove_dir_all(&workspace).ok();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].cache_hit,
+        "a Fresh entry must be pushed from the cache, not rebuilt: {results:?}"
+    );
+}
+
 #[test]
 fn revalidate_document_sizes_bails_when_superseded() {
     use std::collections::HashSet;
@@ -2445,14 +2412,14 @@ fn service_invalidates_packages_from_node_modules_package_json_paths() {
     write_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let _ = service.handle_batch(batch(&workspace, 1));
+    let _ = analyze(&service, tiny_document(&workspace, 1));
     let invalidated = service.invalidate_package_json_paths(&[workspace
         .join("node_modules")
         .join("tiny-lib")
         .join("package.json")
         .to_string_lossy()
         .to_string()]);
-    let after_invalidate = service.handle_batch(batch(&workspace, 2));
+    let after_invalidate = analyze(&service, tiny_document(&workspace, 2));
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(invalidated);
@@ -2468,7 +2435,7 @@ fn service_bulk_invalidation_is_scoped_to_changed_packages() {
     write_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let _ = service.handle_batch(batch(&workspace, 1));
+    let _ = analyze(&service, tiny_document(&workspace, 1));
 
     // A large burst of UNRELATED package.json changes must not evict tiny-lib:
     // bulk invalidation is scoped to the named packages, never a workspace nuke.
@@ -2483,7 +2450,7 @@ fn service_bulk_invalidation_is_scoped_to_changed_packages() {
         })
         .collect::<Vec<_>>();
     let invalidated_unrelated = service.invalidate_package_json_paths(&unrelated_paths);
-    let after_unrelated = service.handle_batch(batch(&workspace, 2));
+    let after_unrelated = analyze(&service, tiny_document(&workspace, 2));
 
     // Invalidating tiny-lib itself does evict it.
     let tiny_lib_path = workspace
@@ -2493,7 +2460,7 @@ fn service_bulk_invalidation_is_scoped_to_changed_packages() {
         .to_string_lossy()
         .to_string();
     let invalidated_tiny = service.invalidate_package_json_paths(&[tiny_lib_path]);
-    let after_tiny = service.handle_batch(batch(&workspace, 3));
+    let after_tiny = analyze(&service, tiny_document(&workspace, 3));
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(invalidated_unrelated);
@@ -2518,8 +2485,11 @@ fn service_skips_unmappable_package_json_paths_and_targets_only_mappable_ones() 
     write_named_package(&workspace, "other-lib");
     let service = ImportLensService::new(None, false);
 
-    let _ = service.handle_batch(batch(&workspace, 1));
-    let _ = service.handle_batch(package_batch(&workspace, 2, "other-lib", "value"));
+    let _ = analyze(&service, tiny_document(&workspace, 1));
+    let _ = analyze(
+        &service,
+        package_document(&workspace, 2, "other-lib", "value"),
+    );
 
     let tiny_lib_path = workspace
         .join("node_modules")
@@ -2536,8 +2506,11 @@ fn service_skips_unmappable_package_json_paths_and_targets_only_mappable_ones() 
 
     let invalidated = service.invalidate_package_json_paths(&[tiny_lib_path, unmappable_path]);
 
-    let after_tiny = service.handle_batch(batch(&workspace, 3));
-    let after_other = service.handle_batch(package_batch(&workspace, 4, "other-lib", "value"));
+    let after_tiny = analyze(&service, tiny_document(&workspace, 3));
+    let after_other = analyze(
+        &service,
+        package_document(&workspace, 4, "other-lib", "value"),
+    );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(invalidated);
@@ -2561,15 +2534,21 @@ fn service_invalidates_all_when_every_package_json_path_is_unmappable() {
     write_named_package(&workspace, "other-lib");
     let service = ImportLensService::new(None, false);
 
-    let _ = service.handle_batch(batch(&workspace, 1));
-    let _ = service.handle_batch(package_batch(&workspace, 2, "other-lib", "value"));
+    let _ = analyze(&service, tiny_document(&workspace, 1));
+    let _ = analyze(
+        &service,
+        package_document(&workspace, 2, "other-lib", "value"),
+    );
 
     let unmappable_path = workspace.join("package.json").to_string_lossy().to_string();
 
     let invalidated = service.invalidate_package_json_paths(&[unmappable_path]);
 
-    let after_tiny = service.handle_batch(batch(&workspace, 3));
-    let after_other = service.handle_batch(package_batch(&workspace, 4, "other-lib", "value"));
+    let after_tiny = analyze(&service, tiny_document(&workspace, 3));
+    let after_other = analyze(
+        &service,
+        package_document(&workspace, 4, "other-lib", "value"),
+    );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(invalidated);
@@ -2600,8 +2579,11 @@ fn node_modules_change_reclaims_uninstalled_package_entries() {
     let service = ImportLensService::new(None, false);
 
     // Cache both packages.
-    let _ = service.handle_batch(batch(&workspace, 1));
-    let _ = service.handle_batch(package_batch(&workspace, 2, "other-lib", "value"));
+    let _ = analyze(&service, tiny_document(&workspace, 1));
+    let _ = analyze(
+        &service,
+        package_document(&workspace, 2, "other-lib", "value"),
+    );
 
     // Uninstall tiny-lib entirely (manifest + entry gone); other-lib stays installed.
     fs::remove_dir_all(workspace.join("node_modules").join("tiny-lib"))
@@ -2617,8 +2599,11 @@ fn node_modules_change_reclaims_uninstalled_package_entries() {
         .to_string();
     let invalidated = service.invalidate_package_json_paths(&[manifest_path]);
 
-    let after_tiny = service.handle_batch(batch(&workspace, 3));
-    let after_other = service.handle_batch(package_batch(&workspace, 4, "other-lib", "value"));
+    let after_tiny = analyze(&service, tiny_document(&workspace, 3));
+    let after_other = analyze(
+        &service,
+        package_document(&workspace, 4, "other-lib", "value"),
+    );
 
     fs::remove_dir_all(&workspace).ok();
     assert!(
@@ -2627,7 +2612,10 @@ fn node_modules_change_reclaims_uninstalled_package_entries() {
          uninstalled -- the name comes from the path string, never a stat of the file"
     );
     assert!(
-        !after_tiny.imports[0].cache_hit,
+        after_tiny.items[0]
+            .result
+            .as_ref()
+            .is_none_or(|result| !result.cache_hit),
         "the uninstalled package's entries must be reclaimed automatically (no orphan scan)"
     );
     assert!(
@@ -2642,8 +2630,8 @@ fn service_processes_batch_and_serves_second_request_from_cache() {
     write_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let first = service.handle_batch(batch(&workspace, 7));
-    let second = service.handle_batch(batch(&workspace, 8));
+    let first = analyze(&service, tiny_document(&workspace, 7));
+    let second = analyze(&service, tiny_document(&workspace, 8));
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(first.request_id, 7);
@@ -2663,8 +2651,8 @@ fn service_does_not_reuse_same_package_version_across_workspaces() {
     );
     let service = ImportLensService::new(None, false);
 
-    let left = service.handle_batch(batch(&left_workspace, 1));
-    let right = service.handle_batch(batch(&right_workspace, 2));
+    let left = analyze(&service, tiny_document(&left_workspace, 1));
+    let right = analyze(&service, tiny_document(&right_workspace, 2));
 
     fs::remove_dir_all(left_workspace).expect("left workspace should be removed");
     fs::remove_dir_all(right_workspace).expect("right workspace should be removed");
@@ -2679,8 +2667,14 @@ fn service_does_not_reuse_cache_across_runtime_profiles() {
     write_runtime_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let component = service.handle_batch(runtime_batch(&workspace, 1, ImportRuntime::Component));
-    let server = service.handle_batch(runtime_batch(&workspace, 2, ImportRuntime::Server));
+    let component = analyze(
+        &service,
+        runtime_document(&workspace, 1, ImportRuntime::Component),
+    );
+    let server = analyze(
+        &service,
+        runtime_document(&workspace, 2, ImportRuntime::Server),
+    );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!component.imports[0].cache_hit);
@@ -2697,9 +2691,9 @@ fn service_cache_invalidation_removes_matching_package_entries() {
     write_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let _ = service.handle_batch(batch(&workspace, 1));
+    let _ = analyze(&service, tiny_document(&workspace, 1));
     service.invalidate_package("tiny-lib");
-    let after_invalidate = service.handle_batch(batch(&workspace, 2));
+    let after_invalidate = analyze(&service, tiny_document(&workspace, 2));
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!after_invalidate.imports[0].cache_hit);
@@ -2720,8 +2714,8 @@ fn service_reports_and_removes_per_project_cache_shards() {
     );
     let service = ImportLensService::new_with_cache_policy(Some(storage.clone()), true, 512, 32);
 
-    let _ = service.handle_batch(batch(&left_workspace, 1));
-    let _ = service.handle_batch(batch(&right_workspace, 2));
+    let _ = analyze(&service, tiny_document(&left_workspace, 1));
+    let _ = analyze(&service, tiny_document(&right_workspace, 2));
 
     let status = service.cache_status(CacheStatusRequest {
         message_type: "cache_status".to_owned(),
@@ -2781,8 +2775,8 @@ fn cache_status_reports_total_budget_registry_and_per_project_counts() {
         ImportLensService::new_with_cache_policy(Some(storage.clone()), true, max_size_mb, 32);
 
     // Two analyses seed two disk shards, each holding at least one entry.
-    let _ = service.handle_batch(batch(&left_workspace, 1));
-    let _ = service.handle_batch(batch(&right_workspace, 2));
+    let _ = analyze(&service, tiny_document(&left_workspace, 1));
+    let _ = analyze(&service, tiny_document(&right_workspace, 2));
 
     // Baseline registry size BEFORE seeding a hint: the empty snapshot still
     // serializes to a small non-zero envelope, so seeding must grow it.
@@ -2896,7 +2890,7 @@ fn remove_registry_scope_clears_only_registry() {
     let service = ImportLensService::new_with_cache_policy(Some(storage.clone()), true, 512, 32);
 
     // Seed BOTH a bundle shard (a real analysis) and a registry hint.
-    let _ = service.handle_batch(batch(&workspace, 1));
+    let _ = analyze(&service, tiny_document(&workspace, 1));
     service
         .registry_hints_for_tests()
         .write_metadata_for_tests("registry-scope-pkg", "1.0.0", 100);
@@ -3061,7 +3055,10 @@ fn service_revalidates_cache_when_relative_dependency_changes() {
     write_dependent_package(&workspace, "export const helper = 1;");
     let service = ImportLensService::new(None, false);
 
-    let first = service.handle_batch(package_batch(&workspace, 1, "dependent-lib", "value"));
+    let first = analyze(
+        &service,
+        package_document(&workspace, 1, "dependent-lib", "value"),
+    );
     fs::write(
         workspace
             .join("node_modules")
@@ -3074,7 +3071,10 @@ fn service_revalidates_cache_when_relative_dependency_changes() {
     // extension sends node_modules_changed); that forces the fingerprint
     // re-verification which detects the changed dependency.
     import_lens_daemon::cache::memory::bump_cache_generation();
-    let second = service.handle_batch(package_batch(&workspace, 2, "dependent-lib", "value"));
+    let second = analyze(
+        &service,
+        package_document(&workspace, 2, "dependent-lib", "value"),
+    );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
@@ -3088,7 +3088,10 @@ fn service_revalidates_cache_when_transitive_package_dependency_changes() {
     write_parent_and_transitive_package(&workspace, "export const dep = 1;");
     let service = ImportLensService::new(None, false);
 
-    let first = service.handle_batch(package_batch(&workspace, 1, "parent-lib", "value"));
+    let first = analyze(
+        &service,
+        package_document(&workspace, 1, "parent-lib", "value"),
+    );
     fs::write(
         workspace
             .join("node_modules")
@@ -3101,7 +3104,10 @@ fn service_revalidates_cache_when_transitive_package_dependency_changes() {
     // extension sends node_modules_changed); that forces the fingerprint
     // re-verification which detects the changed transitive dependency.
     import_lens_daemon::cache::memory::bump_cache_generation();
-    let second = service.handle_batch(package_batch(&workspace, 2, "parent-lib", "value"));
+    let second = analyze(
+        &service,
+        package_document(&workspace, 2, "parent-lib", "value"),
+    );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
@@ -3118,12 +3124,12 @@ fn service_reports_an_unusable_manifest_as_unmeasured_and_caches_nothing() {
     let workspace = temp_workspace();
     write_versionless_package(&workspace);
     let service = ImportLensService::new(None, false);
-    let request = package_batch(&workspace, 1, "versionless-lib", "value");
+    let request = package_document(&workspace, 1, "versionless-lib", "value");
     let mut second_request = request.clone();
     second_request.request_id = 2;
 
-    let first = service.handle_batch(request);
-    let second = service.handle_batch(second_request);
+    let first = analyze(&service, request);
+    let second = analyze(&service, second_request);
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
@@ -3146,10 +3152,18 @@ fn service_does_not_alias_named_results_to_namespace_cache() {
     write_effectful_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let named = service.handle_batch(effectful_batch(&workspace, 1, ImportKind::Named));
-    let namespace = service.handle_batch(effectful_batch(&workspace, 2, ImportKind::Namespace));
-    let namespace_again =
-        service.handle_batch(effectful_batch(&workspace, 3, ImportKind::Namespace));
+    let named = analyze(
+        &service,
+        effectful_document(&workspace, 1, ImportKind::Named),
+    );
+    let namespace = analyze(
+        &service,
+        effectful_document(&workspace, 2, ImportKind::Namespace),
+    );
+    let namespace_again = analyze(
+        &service,
+        effectful_document(&workspace, 3, ImportKind::Namespace),
+    );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!named.imports[0].cache_hit);
@@ -3164,11 +3178,17 @@ fn service_caches_a_deterministic_missing_export_failure() {
     write_missing_export_effectful_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let first = service.handle_batch(missing_effectful_batch(&workspace, 1, ImportKind::Named));
+    let first = analyze(
+        &service,
+        missing_effectful_document(&workspace, 1, ImportKind::Named),
+    );
     // The SAME request again. A `missing_export` failure is a property of the package's bytes: it
     // will fail identically every time, so it is cached (ADR-0006, invariant 3) and this second
     // request must be answered without re-entering the engine.
-    let second = service.handle_batch(missing_effectful_batch(&workspace, 2, ImportKind::Named));
+    let second = analyze(
+        &service,
+        missing_effectful_document(&workspace, 2, ImportKind::Named),
+    );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert!(!first.imports[0].cache_hit);
@@ -3184,34 +3204,6 @@ fn service_caches_a_deterministic_missing_export_failure() {
          package on every analysis, forever, on one of only two permits: {second:?}",
     );
     assert_eq!(second.imports[0].sizes(), None, "{second:?}");
-}
-
-#[test]
-fn service_streams_indexed_partials_before_final_response() {
-    let workspace = temp_workspace();
-    write_package(&workspace);
-    let service = ImportLensService::new(None, false);
-    let mut request = batch(&workspace, 9);
-    request.version = 2;
-    request.streaming = true;
-
-    let partials = Mutex::new(Vec::new());
-    let final_response = service.handle_batch_streaming(request, |partial| {
-        partials
-            .lock()
-            .expect("partials lock should not be poisoned")
-            .push(partial);
-    });
-    let responses = partials
-        .into_inner()
-        .expect("partials lock should not be poisoned");
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0].indexes, Some(vec![0]));
-    assert_eq!(responses[0].imports.len(), 1);
-    assert_eq!(final_response.indexes, None);
-    assert_eq!(final_response.imports.len(), 1);
 }
 
 #[test]
@@ -3234,7 +3226,7 @@ fn service_marks_shared_transitive_modules_in_batch_results() {
     write_shared_packages(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let response = service.handle_batch(shared_batch(&workspace, 21));
+    let response = analyze(&service, shared_document(&workspace, 21));
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(response.imports.len(), 2);
@@ -3328,8 +3320,8 @@ fn service_computes_file_size_with_shared_module_deduplication() {
     write_shared_packages(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let batch = service.handle_batch(shared_batch(&workspace, 22));
-    let file_size = service.handle_file_size(file_size_request(&workspace, 23));
+    let batch = analyze(&service, shared_document(&workspace, 22));
+    let file_size = service.handle_file_size_document(file_size_request(&workspace, 23));
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     let summed_raw = batch
@@ -3360,7 +3352,7 @@ fn service_computes_file_size_for_commonjs_imports() {
     write_cjs_file_size_package(&workspace);
     let service = ImportLensService::new(None, false);
 
-    let file_size = service.handle_file_size(cjs_file_size_request(&workspace, 25));
+    let file_size = service.handle_file_size_document(cjs_file_size_request(&workspace, 25));
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
     assert_eq!(file_size.request_id, 25);
@@ -3385,29 +3377,6 @@ fn service_rejects_v1_export_enumeration_requests() {
     assert_eq!(response.request_id, 12);
     assert!(response.error.is_some());
     assert!(response.exports.is_empty());
-}
-
-#[test]
-fn protocol_error_batch_response_rejects_all_imports_without_analysis() {
-    let workspace = temp_workspace();
-    let response = protocol_error_batch_response(
-        &batch(&workspace, 42),
-        "hello message not received".to_owned(),
-    );
-
-    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
-    assert_eq!(response.request_id, 42);
-    assert_eq!(response.imports.len(), 1);
-    assert_eq!(
-        response.imports[0].error.as_deref(),
-        Some("hello message not received")
-    );
-    assert_eq!(response.imports[0].diagnostics[0].stage, "protocol");
-    assert_eq!(
-        response.imports[0].sizes(),
-        None,
-        "a request rejected before any build ran has no size — not a zero"
-    );
 }
 
 #[test]
@@ -3493,7 +3462,10 @@ fn a_cached_deterministic_failure_expires_when_the_module_that_caused_it_is_fixe
         .expect("broken module should be written");
 
     let service = ImportLensService::new(None, false);
-    let broken = service.handle_batch(package_batch(&workspace, 1, "broken-lib", "value"));
+    let broken = analyze(
+        &service,
+        package_document(&workspace, 1, "broken-lib", "value"),
+    );
 
     assert_eq!(
         broken.imports[0].sizes(),
@@ -3506,7 +3478,10 @@ fn a_cached_deterministic_failure_expires_when_the_module_that_caused_it_is_fixe
     fs::write(package_root.join("broken.js"), "export const value = 1;\n")
         .expect("fixed module should be written");
 
-    let fixed = service.handle_batch(package_batch(&workspace, 2, "broken-lib", "value"));
+    let fixed = analyze(
+        &service,
+        package_document(&workspace, 2, "broken-lib", "value"),
+    );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(
@@ -3546,7 +3521,10 @@ fn fixing_only_a_broken_css_import_child_invalidates_the_cached_fallback() {
     .expect("broken child should be written");
 
     let service = ImportLensService::new(None, false);
-    let broken = service.handle_batch(package_batch(&workspace, 1, "broken-css-lib", "value"));
+    let broken = analyze(
+        &service,
+        package_document(&workspace, 1, "broken-css-lib", "value"),
+    );
     assert!(
         broken.imports[0].asset_breakdown.is_empty(),
         "the premise: the broken stylesheet cannot be counted: {broken:?}"
@@ -3565,7 +3543,10 @@ fn fixing_only_a_broken_css_import_child_invalidates_the_cached_fallback() {
         ".fixed { color: rebeccapurple; padding: 12345px; }\n",
     )
     .expect("child should be fixed");
-    let fixed = service.handle_batch(package_batch(&workspace, 2, "broken-css-lib", "value"));
+    let fixed = analyze(
+        &service,
+        package_document(&workspace, 2, "broken-css-lib", "value"),
+    );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(
@@ -3606,7 +3587,10 @@ fn creating_a_missing_css_import_child_invalidates_the_cached_fallback() {
     .expect("stylesheet should be written");
 
     let service = ImportLensService::new(None, false);
-    let missing = service.handle_batch(package_batch(&workspace, 1, "missing-css-lib", "value"));
+    let missing = analyze(
+        &service,
+        package_document(&workspace, 1, "missing-css-lib", "value"),
+    );
     assert!(
         missing.imports[0]
             .diagnostics
@@ -3632,7 +3616,10 @@ fn creating_a_missing_css_import_child_invalidates_the_cached_fallback() {
     // The point of treating it as deterministic: measuring the same unchanged package again is a
     // cache hit. Under `asset_io` this was refused by every durable store, so a package with one
     // missing `@import` target rebuilt its whole graph on every keystroke, forever.
-    let repeated = service.handle_batch(package_batch(&workspace, 2, "missing-css-lib", "value"));
+    let repeated = analyze(
+        &service,
+        package_document(&workspace, 2, "missing-css-lib", "value"),
+    );
     assert!(
         repeated.imports[0].cache_hit,
         "a deterministic missing child must not force a rebuild on every request: {repeated:?}"
@@ -3643,7 +3630,10 @@ fn creating_a_missing_css_import_child_invalidates_the_cached_fallback() {
         ".created { color: green; padding: 9876px; }\n",
     )
     .expect("missing child should be created");
-    let created = service.handle_batch(package_batch(&workspace, 3, "missing-css-lib", "value"));
+    let created = analyze(
+        &service,
+        package_document(&workspace, 3, "missing-css-lib", "value"),
+    );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(
@@ -3688,18 +3678,14 @@ fn a_direct_asset_read_failure_does_not_enter_the_import_cache() {
     fs::create_dir(&font).expect("unreadable-as-a-file asset should be created");
 
     let service = ImportLensService::new(None, false);
-    let first = service.handle_batch(package_batch(
-        &workspace,
-        1,
-        "temporarily-unreadable-asset-lib",
-        "value",
-    ));
-    let repeated = service.handle_batch(package_batch(
-        &workspace,
-        2,
-        "temporarily-unreadable-asset-lib",
-        "value",
-    ));
+    let first = analyze(
+        &service,
+        package_document(&workspace, 1, "temporarily-unreadable-asset-lib", "value"),
+    );
+    let repeated = analyze(
+        &service,
+        package_document(&workspace, 2, "temporarily-unreadable-asset-lib", "value"),
+    );
     assert!(!first.imports[0].cache_hit, "{first:?}");
     assert!(
         !repeated.imports[0].cache_hit,
@@ -3716,18 +3702,14 @@ fn a_direct_asset_read_failure_does_not_enter_the_import_cache() {
 
     fs::remove_dir(&font).expect("temporary directory asset should be removed");
     fs::write(&font, [0x51; 64]).expect("readable font should replace it");
-    let recovered = service.handle_batch(package_batch(
-        &workspace,
-        3,
-        "temporarily-unreadable-asset-lib",
-        "value",
-    ));
-    let healthy_repeat = service.handle_batch(package_batch(
-        &workspace,
-        4,
-        "temporarily-unreadable-asset-lib",
-        "value",
-    ));
+    let recovered = analyze(
+        &service,
+        package_document(&workspace, 3, "temporarily-unreadable-asset-lib", "value"),
+    );
+    let healthy_repeat = analyze(
+        &service,
+        package_document(&workspace, 4, "temporarily-unreadable-asset-lib", "value"),
+    );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert!(!recovered.imports[0].cache_hit, "{recovered:?}");
@@ -3767,18 +3749,14 @@ fn a_healthy_asset_does_not_make_an_unrelated_resolve_failure_non_cacheable() {
     fs::write(package_root.join("font.woff2"), [0x51; 64]).expect("healthy font should be written");
 
     let service = ImportLensService::new(None, false);
-    let first = service.handle_batch(package_batch(
-        &workspace,
-        1,
-        "healthy-asset-broken-js-lib",
-        "value",
-    ));
-    let repeated = service.handle_batch(package_batch(
-        &workspace,
-        2,
-        "healthy-asset-broken-js-lib",
-        "value",
-    ));
+    let first = analyze(
+        &service,
+        package_document(&workspace, 1, "healthy-asset-broken-js-lib", "value"),
+    );
+    let repeated = analyze(
+        &service,
+        package_document(&workspace, 2, "healthy-asset-broken-js-lib", "value"),
+    );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     assert_eq!(first.imports[0].unmeasured_stage(), Some("resolve"));
@@ -3818,12 +3796,10 @@ fn direct_asset_observation_preserves_the_client_browser_alias() {
         .expect("browser font should be written");
 
     let service = ImportLensService::new(None, false);
-    let response = service.handle_batch(package_batch(
-        &workspace,
-        1,
-        "browser-aliased-asset-lib",
-        "value",
-    ));
+    let response = analyze(
+        &service,
+        package_document(&workspace, 1, "browser-aliased-asset-lib", "value"),
+    );
 
     fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
     let font = response.imports[0]
@@ -3835,4 +3811,83 @@ fn direct_asset_observation_preserves_the_client_browser_alias() {
         font.raw_bytes, 4096,
         "the observing hook must delegate to the configured browser-aware resolver: {response:?}"
     );
+}
+
+/// FR-026b: an interactive cache hit promotes the entry's recency and a bulk scan does not, so
+/// the byte-budget evictor and the startup preload rank what the user keeps reading above what a
+/// workspace report touched once.
+#[test]
+fn an_interactive_cache_hit_promotes_recency_and_a_workspace_report_does_not() {
+    let workspace = temp_workspace();
+    let storage = temp_workspace();
+    write_named_package(&workspace, "first-lib");
+    write_named_package(&workspace, "second-lib");
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+    fs::write(
+        workspace.join("src").join("index.ts"),
+        // A namespace import: the same cache key `AnalyzeSpecifiers` reads.
+        "import * as first from 'first-lib';\nconsole.log(first);\n",
+    )
+    .expect("source should be written");
+    let service = Arc::new(ImportLensService::new_with_cache_policy(
+        Some(storage.clone()),
+        true,
+        512,
+        32,
+    ));
+    let analyze = |specifier: &str| {
+        service.handle_analyze_specifiers(AnalyzeSpecifiersRequest {
+            message_type: "analyze_specifiers".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 1,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            active_document_path: active_document_path(&workspace),
+            specifiers: vec![specifier.to_owned()],
+        })
+    };
+    let recency_order = || {
+        service.flush_cache().expect("flush should succeed");
+        service.recent_cache_keys(&workspace, 2)
+    };
+
+    analyze("first-lib");
+    analyze("second-lib");
+    let built = recency_order();
+    assert_eq!(built.len(), 2, "both imports should be cached: {built:?}");
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    service.spawn_workspace_report(
+        WorkspaceReportRequest {
+            message_type: "workspace_report".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 2,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            budgets: Default::default(),
+        },
+        tx,
+    );
+    let report = rx.blocking_recv().expect("the report should answer");
+    assert_eq!(report.rows.len(), 1, "{report:?}");
+    assert_eq!(
+        recency_order(),
+        built,
+        "a workspace report must not promote what it reads"
+    );
+
+    let hit = analyze("first-lib");
+    assert!(
+        hit.imports[0]
+            .result
+            .as_ref()
+            .is_some_and(|result| result.cache_hit),
+        "the second analysis should be a cache hit: {hit:?}"
+    );
+    assert_eq!(
+        recency_order(),
+        vec![built[1].clone(), built[0].clone()],
+        "an interactive hit must make its entry the most recent"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&storage);
 }

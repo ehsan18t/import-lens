@@ -182,12 +182,20 @@ enum ReadIntent {
     /// LRU recency when `promote` is set (an interactive hit does; a prewarm scan
     /// does not — scan resistance, §5.1).
     Serve { promote: bool },
-    /// Force-fresh read (§4.5 — CI / `importlens check`): serves ONLY a value
-    /// verified `Fresh` against disk, across both the memory working set and the
-    /// disk cache. Every non-`Fresh` state (Unknown/Stale/Gone/miss) yields `None`
-    /// so the caller recomputes synchronously; an `Unknown` entry is KEPT (never
-    /// deleted, never served, never hydrated). Never promotes recency.
-    RequireFresh,
+    /// Force-fresh read (§4.5): serves ONLY a value verified `Fresh` against disk,
+    /// across both the memory working set and the disk cache. Every non-`Fresh`
+    /// state (Unknown/Stale/Gone/miss) yields `None` so the caller recomputes
+    /// synchronously; an `Unknown` entry is KEPT (never deleted, never served, never
+    /// hydrated). Promotes recency when `promote` is set, as `Serve` does.
+    RequireFresh { promote: bool },
+}
+
+impl ReadIntent {
+    fn promotes(self) -> bool {
+        match self {
+            Self::Serve { promote } | Self::RequireFresh { promote } => promote,
+        }
+    }
 }
 
 /// What a read does with an entry whose dependencies changed but still exist.
@@ -260,7 +268,8 @@ impl ImportCache {
     /// synchronously (§4.5 — CI never serves a stale/unverified value):
     ///   Fresh → Some(value);  Stale/Gone → evict (as the normal read does), None;
     ///   Unknown → keep (never delete), but None (do NOT serve unverified);  miss → None.
-    /// Does not promote recency.
+    /// Does not promote recency: this is the bulk read (a workspace report must not
+    /// flood the recency signal, §5.1).
     ///
     /// This is the cold-daemon completion of the force-fresh gate: a fresh daemon
     /// hydrating a prior run's DISK cache must not serve a disk-classified `Unknown`
@@ -268,15 +277,21 @@ impl ImportCache {
     /// classified by the SAME plumbing the normal read uses (`lookup`) — only the
     /// serve-on-`Unknown` decision differs.
     pub fn get_if_fresh(&self, key: &str) -> Option<ImportResult> {
-        self.read(key, ReadIntent::RequireFresh)
+        self.read(key, ReadIntent::RequireFresh { promote: false })
+    }
+
+    /// `get_if_fresh` for an interactive read: the same freshness gate, and a hit
+    /// promotes the entry's recency (FR-026b).
+    pub fn get_if_fresh_and_promote(&self, key: &str) -> Option<ImportResult> {
+        self.read(key, ReadIntent::RequireFresh { promote: true })
     }
 
     /// Read for `get`/`get_for_prewarm` (serve) and `get_if_fresh` (force-fresh): a
     /// stale entry is evicted, and a force-fresh read refuses an unverified one.
     fn read(&self, key: &str, intent: ReadIntent) -> Option<ImportResult> {
-        let require_fresh = matches!(intent, ReadIntent::RequireFresh);
-        let promote = matches!(intent, ReadIntent::Serve { promote: true });
-        let (result, freshness) = self.lookup(key, promote, require_fresh, StalePolicy::Evict)?;
+        let require_fresh = matches!(intent, ReadIntent::RequireFresh { .. });
+        let (result, freshness) =
+            self.lookup(key, intent.promotes(), require_fresh, StalePolicy::Evict)?;
         (!require_fresh || freshness == Freshness::Fresh).then_some(result)
     }
 
@@ -288,20 +303,9 @@ impl ImportCache {
     /// `Stale { revalidating: true }` while the error is fresh and surfaced as
     /// `Unverified` only once it persists past the window; `Fresh` serves `Fresh`. Does
     /// not touch the in-flight set — dedupe is the caller's via `begin_revalidation`.
+    /// Only the interactive size read serves stale, so a hit always promotes recency.
     pub fn get_with_result_freshness(&self, key: &str) -> Option<(ImportResult, ResultFreshness)> {
-        self.read_with_result_freshness(key, true)
-    }
-
-    /// Shared stale-while-revalidate read for `get_with_result_freshness`
-    /// (interactive) and `get_with_result_freshness_for_bulk` (bulk). `promote`
-    /// selects only recency promotion, so a full-workspace scan can't flood the
-    /// recency signal and evict the user's warm working set (scan resistance, §5.1).
-    fn read_with_result_freshness(
-        &self,
-        key: &str,
-        promote: bool,
-    ) -> Option<(ImportResult, ResultFreshness)> {
-        let (mut result, freshness) = self.lookup(key, promote, false, StalePolicy::Serve)?;
+        let (mut result, freshness) = self.lookup(key, true, false, StalePolicy::Serve)?;
         let served = match freshness {
             Freshness::Fresh => ResultFreshness::fresh(),
             Freshness::Stale => ResultFreshness::stale(true),
@@ -415,17 +419,6 @@ impl ImportCache {
         self.insert_into_memory_guarded(key.to_owned(), cached, clear_generation);
         self.enforce_memory_cap();
         Some((result, freshness))
-    }
-
-    /// Bulk/background stale-while-revalidate read (WorkspaceReport, Compare): serves
-    /// the SAME freshness info as `get_with_result_freshness` but does NOT promote
-    /// recency (scan resistance, §5.1), so a full-workspace scan can't flood the
-    /// recency signal and evict the user's warm working set.
-    pub fn get_with_result_freshness_for_bulk(
-        &self,
-        key: &str,
-    ) -> Option<(ImportResult, ResultFreshness)> {
-        self.read_with_result_freshness(key, false)
     }
 
     /// Claim ownership of a background revalidation. Returns `Some(guard)` for the
@@ -1118,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn swr_result_freshness_read_promotes_only_when_interactive() {
+    fn swr_and_force_fresh_reads_promote_only_when_interactive() {
         let cache = ImportCache::new(None, false);
         cache.insert("v4:react".to_owned(), minimal_result("react"));
 
@@ -1132,16 +1125,19 @@ mod tests {
             "interactive SWR read must promote recency: {seq0} -> {seq1}"
         );
 
-        // Bulk SWR read (WorkspaceReport / Compare) must NOT promote recency
-        // (scan resistance, §5.1) — a full-workspace scan can't flood the recency
-        // signal and evict the user's warm working set.
-        assert!(
-            cache
-                .get_with_result_freshness_for_bulk("v4:react")
-                .is_some()
-        );
+        // Interactive force-fresh read (hover, document analysis) promotes too.
+        assert!(cache.get_if_fresh_and_promote("v4:react").is_some());
         let seq2 = last_seq_of(&cache, "v4:react");
-        assert_eq!(seq2, seq1, "bulk SWR read must not promote recency");
+        assert!(
+            seq2 > seq1,
+            "interactive force-fresh read must promote recency: {seq1} -> {seq2}"
+        );
+
+        // Bulk force-fresh read (WorkspaceReport) must NOT promote recency (scan
+        // resistance, §5.1).
+        assert!(cache.get_if_fresh("v4:react").is_some());
+        let seq3 = last_seq_of(&cache, "v4:react");
+        assert_eq!(seq3, seq2, "bulk force-fresh read must not promote recency");
     }
 
     #[test]
