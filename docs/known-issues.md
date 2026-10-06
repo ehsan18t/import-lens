@@ -242,21 +242,6 @@ reading high) for a possible breach that leaves no stylesheet counted at all. Th
 distinction between a per-sheet parse failure and a set-level budget breach; until that exists, this
 is not worth attempting.
 
-### D7 follow-up: per-asset `sideEffects` attribution is further away than recorded
-**Status: Still deferred, with a corrected blocker** · Re-examined 2026-07-18
-
-D7's recorded blocker is "needs per-asset package attribution first". That was read as meaning the
-attribution was the only missing piece. Re-examination found three separate blockers:
-
-- Rolldown's `load` hook has **no importer parameter**. `args.id` is the asset's own id; the importer
-  exists only in `resolve_id`, which discards it. Nothing in the daemon maps an asset path back to the
-  module that imported it (Rolldown's `ModuleInfo::importers` is empty at `module_parsed`).
-- `sideEffects` patterns are **collapsed to a bool at parse time** (`SideEffectsMode::Array { entry_matches }`).
-  The patterns are deliberately not retained, so the value cannot be re-asked about a different path.
-- The engine boundary contract states the daemon's own reading of `sideEffects` is "reporting
-  metadata — it decides a badge, never a byte". Dropping an asset on that reading makes it decide
-  bytes, which is the thing the contract exists to prevent.
-
 ### D18: A CSS `url()` may resolve outside the package root
 **Status: Accepted** · Decided 2026-07-18
 
@@ -272,16 +257,6 @@ narrow place while every other read ignores it, which buys no safety property.
 It would also cost accuracy. A monorepo package legitimately referencing a shared font through `../`
 is a real shape, and a containment check would stop counting bytes that genuinely ship — turning a
 correct number into a floor to prevent something that is not a defect.
-
-### D19: The per-sheet retry is bounded, not free
-**Status: Accepted bound** · Measured 2026-07-18
-
-A stylesheet's `url()` dependencies are stat'd one at a time, and the loop checks the deadline before
-each one, so the work is bounded by the same eight-second budget as everything else in the stage. The
-stats are not charged to the byte ledger because a stat moves no bytes.
-
-Recorded rather than fixed because the bound already exists and adding a second accounting mechanism
-for zero-byte operations would be more machinery than the risk justifies.
 
 ### D28: A counted CSS resource is canonicalized more than once per build
 **Status: Accepted** · Measured 2026-07-19, narrowed 2026-10-06
@@ -374,7 +349,7 @@ has produced three distinct nondeterminism issues on this branch:
 - A test over-assertion (`33411bc`): the streaming test asserted a per-import push reaches the socket before
   the file-size response. `AnalyzeDocument` and `FileSizeDocument` spawn independent tasks that race for the
   two permits, so the trivial per-import build can be starved and the combined build can answer first. No user
-  impact (like C4, push and response ordering is not a guarantee), but it flaked CI on a runner with a
+  impact (push and response ordering is not a guarantee, FR-004c), but it flaked CI on a runner with a
   different core count.
 
 **Current assessment: no redesign.** The first two were real defects and were hardened, not patched around.
@@ -388,18 +363,6 @@ wrong or dropped, not merely reordered. At that point the two builds should be c
 reusing the per-import module builds, which also makes ordering deterministic) rather than left to race. Per
 the "redesign at third recurrence" rule, that redesign is the first priority after release blockers and major
 fixes.
-
-### E1: `cargo test` fails at full parallelism on the primary dev machine
-**Status: Deferred** · Blocks: `pnpm test`, and therefore the pre-push hook
-
-`cargo test` reproducibly fails with `can't find crate for import_lens_daemon` /
-`required to be available in rlib format`. It survives `cargo clean` and a fresh target directory. `-j 2`
-builds and passes cleanly.
-
-Almost certainly something else touching `target/` concurrently: rust-analyzer running its own `cargo check`,
-or antivirus. Not a code defect, but it will bite anyone trying to push.
-
-**Workaround:** `cargo test -j 2`.
 
 ### M1: With the cache populated, a heavy session holds about 70 to 100 MB more than its live data
 **Status: Deferred**
@@ -557,12 +520,6 @@ a streamed push to merge into, so streaming them would hand the UI an empty list
 to land. They block, and with `EngineBudget` deleted they carry no total time bound.
 
 A fabricated comparison would be worse than "comparison failed."
-
-### C4: Cross-request response ordering is no longer guaranteed
-**Status: Accepted** · A consequence of the multiplexing connection loop
-
-Two pipelined requests may now be answered out of order. Nothing in the extension depends on it (every response
-is routed by `request_id`), but it is a protocol-level behaviour change.
 
 ### C6: A nested `"type"` does not reach the pre-resolved entry (dual-package layouts)
 **Status: Accepted** · One field, two lookups, no fix exists at the current upstream API
