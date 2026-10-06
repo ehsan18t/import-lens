@@ -575,6 +575,43 @@ fn project_cache_registry_removes_current_project_without_removing_other_shards(
     fs::remove_dir_all(storage).expect("temp storage should be removed");
 }
 
+/// A shard another holder still has open is left exactly as it was: its database is not unlinked
+/// from under the holder, and its metadata sidecar survives, so it stays listed. The second
+/// registry stands in for a second Import Lens window sharing the cache base.
+#[test]
+fn removing_a_shard_another_holder_has_open_removes_nothing() {
+    let storage = common::temp_workspace("import-lens-project-cache-held");
+    let root = storage.join("held-app");
+    let holder = ProjectCacheRegistry::new(Some(storage.clone()), true, 512);
+    let held = holder.cache_for_root(&root);
+    held.insert("react@18.3.1::default".to_owned(), result("react"));
+    held.flush_to_disk()
+        .expect("the holder's shard should flush");
+    let shard_dir = holder
+        .list_shards()
+        .into_iter()
+        .find(|shard| shard.project_root == root.to_string_lossy())
+        .map(|shard| PathBuf::from(shard.cache_path))
+        .expect("the holder's shard should be listed");
+
+    let other = ProjectCacheRegistry::new(Some(storage.clone()), true, 512);
+    let removed = other.remove_current_project(&root);
+
+    assert_eq!(removed.len(), 1);
+    assert!(!removed[0].removed, "{removed:?}");
+    assert!(removed[0].error.is_some(), "{removed:?}");
+    assert!(shard_dir.join(CACHE_DB_FILE_NAME).is_file());
+    assert!(shard_dir.join(SHARD_METADATA_FILE_NAME).is_file());
+
+    drop(held);
+    drop(holder);
+    let removed = other.remove_current_project(&root);
+    assert!(removed[0].removed, "{removed:?}");
+    assert!(!shard_dir.exists());
+
+    fs::remove_dir_all(storage).expect("temp storage should be removed");
+}
+
 fn metadata_last_used_millis(path: &Path) -> u64 {
     let contents = fs::read_to_string(path).expect("project cache metadata should exist");
     let metadata: serde_json::Value =

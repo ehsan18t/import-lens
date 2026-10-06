@@ -790,6 +790,16 @@ impl ProjectCacheRegistry {
             };
         }
 
+        if let Err(error) = remove_shard_database(&cache_path.join(SHARD_DB_FILE_NAME)) {
+            return CacheOperationResult {
+                shard_id: shard_id.to_owned(),
+                project_root,
+                cache_path: cache_path_text,
+                removed: false,
+                error: Some(error),
+            };
+        }
+
         match fs::remove_dir_all(&cache_path) {
             Ok(()) => CacheOperationResult {
                 shard_id: shard_id.to_owned(),
@@ -979,6 +989,43 @@ pub fn project_cache_shard_id(project_root: &Path) -> String {
     }
 
     format!("v1-{hash:016x}")
+}
+
+/// Deletes a shard's database, before anything else in its directory and only when nothing holds
+/// it open: redb refuses an open while this process or another one holds the file. On unix an
+/// unlink would otherwise succeed under a live holder, whose writes then vanish with the inode.
+/// Deleting the database first means a refused or failed delete leaves the metadata sidecar in
+/// place, so the shard stays listed instead of turning into a directory no listing shows.
+fn remove_shard_database(db_path: &Path) -> Result<(), String> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let removed = match redb::Database::open(db_path) {
+        Ok(database) => {
+            // Unix: unlink while still holding it, so no other opener fits between the check and
+            // the delete. Windows cannot delete an open file, and an opener there fails the delete.
+            #[cfg(unix)]
+            let removed = fs::remove_file(db_path);
+            drop(database);
+            #[cfg(not(unix))]
+            let removed = fs::remove_file(db_path);
+            removed
+        }
+        Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+            return Err(
+                "the cache shard is still open (another Import Lens window, or a request still \
+                 using it); nothing was removed"
+                    .to_owned(),
+            );
+        }
+        // Unreadable as a database, so nothing can hold it as one: remove the file itself.
+        Err(_) => fs::remove_file(db_path),
+    };
+    match removed {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub fn remove_legacy_central_cache(storage_path: &Path) -> Option<CacheOperationResult> {
