@@ -93,7 +93,7 @@ impl RolldownEngine {
 }
 
 fn rolldown_entry_path(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = crate::cache::key::identity_path_string(path);
     if let Some(unc) = normalized.strip_prefix("//?/UNC/") {
         return format!("//{unc}");
     }

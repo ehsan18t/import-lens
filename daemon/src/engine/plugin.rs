@@ -308,7 +308,7 @@ impl BuildState {
         self.record_fingerprint(
             canonical.to_path_buf(),
             FileFingerprint {
-                path: canonical.to_string_lossy().replace('\\', "/"),
+                path: crate::cache::key::identity_path_string(canonical),
                 len,
                 modified_millis,
                 content_hash: None,

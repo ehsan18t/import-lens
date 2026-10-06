@@ -633,7 +633,7 @@ fn metadata_bytes(metadata: &std::fs::Metadata, path: &Path) -> std::io::Result<
 fn stat_fingerprint(path: &Path, metadata: &std::fs::Metadata) -> FileFingerprint {
     let (len, modified_millis) = read_time_len_mtime_of(metadata);
     FileFingerprint {
-        path: path.to_string_lossy().replace('\\', "/"),
+        path: crate::cache::key::identity_path_string(path),
         len,
         modified_millis,
         content_hash: None,
