@@ -20,21 +20,18 @@ fast-glob = "=1.1.2"
 flate2 = "^1.1"
 futures-util = { version = "^0.3", default-features = false, features = ["sink", "std"] }
 httpdate = "^1"
-# Coordinated compiler stack, exact-pinned: it processes a package's CSS the way it
-# ships (resolve `@import`s, minify) so the reported size is right, which means a
-# version bump can silently move CSS numbers. Pinned and upgrade-gated like rolldown /
-# oxc. `bundler` gives parse + `@import` + minify; `browserslist` stays OFF so output
-# is deterministic and target-free. It has only ever shipped `1.0.0-alpha.*`, and the
-# API breaks between alphas, so the exact pin is load-bearing. `serde` is enabled
-# because `bundler`'s `ResolveResult` carries an ungated `#[serde(untagged)]` (a
-# feature-gating hole in this alpha); serde is already in our tree, so it costs
-# nothing. `browserslist` stays off to keep output deterministic.
 # Allocator. glibc malloc keeps each worker thread's peak resident after the build that
-# grew it, which measured 1.3 GB idle on Linux. mimalloc only beats that with transparent
-# huge pages off (`no_thp`) and purging on free (set in main.rs): 245 MB idle, same speed.
+# grew it. mimalloc only beats that with transparent huge pages off (`no_thp`) and
+# purging on free (set in main.rs); idle threads also collect their heaps (`reclaim`).
 libmimalloc-sys = { version = "^0.1", default-features = false, features = ["extended", "no_thp"] }
 mimalloc = { version = "^0.1", default-features = false }
-lightningcss = { version = "=1.0.0-alpha.71", default-features = false, features = ["bundler", "serde"] }
+# CSS processor, a standalone exact pin (not derived from rolldown's graph): it processes
+# a package's CSS the way it ships (resolve `@import`s, minify) so the reported size is
+# right, which means a version bump can silently move CSS numbers. `bundler` gives
+# parse + `@import` + minify; `browserslist` stays OFF so output is deterministic and
+# target-free. It has only ever shipped `1.0.0-alpha.*`, and the API breaks between
+# alphas, so the exact pin is load-bearing.
+lightningcss = { version = "=1.0.0-alpha.72", default-features = false, features = ["bundler"] }
 oxc_allocator = "=0.152.0"
 oxc_codegen = "=0.152.0"
 oxc_minifier = "=0.152.0"

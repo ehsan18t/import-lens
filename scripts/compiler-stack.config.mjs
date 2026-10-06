@@ -18,7 +18,7 @@ export const compilerStackConfig = {
   // independently, not derived from rolldown's graph) and it is not reachable from
   // rolldown/oxc, so it stays out of the fingerprint closure. It is a STANDALONE
   // exact-pin: version-tested here, upgraded deliberately, never floated.
-  currentCssProcessorVersion: "1.0.0-alpha.71",
+  currentCssProcessorVersion: "1.0.0-alpha.72",
   cssProcessorCrate: "lightningcss",
   rolldownCrate: "rolldown",
   // Rolldown monorepo siblings the adapter depends on directly (they carry
