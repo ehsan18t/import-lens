@@ -255,18 +255,13 @@ fn resolve_legacy_fallback(
             .map(|path| classify_resolved_entry(manifest, path, false));
     }
 
-    if let Some(module) = manifest.json.get("module").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(module))
-            .map(|path| classify_resolved_entry(manifest, path, false));
-    }
-
-    if let Some(browser) = manifest.json.get("browser").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(browser))
-            .map(|path| classify_resolved_entry(manifest, path, false));
-    }
-
-    if let Some(main) = manifest.json.get("main").and_then(Value::as_str) {
-        return resolve_file_candidate(&manifest.root.join(main))
+    // The resolver's own main-field order for this runtime, so the fallback cannot pick an entry
+    // the resolver would have ranked lower.
+    if let Some(target) = profile_entry_fields(request.runtime)
+        .iter()
+        .find_map(|field| manifest.json.get(*field).and_then(Value::as_str))
+    {
+        return resolve_file_candidate(&manifest.root.join(target))
             .map(|path| classify_resolved_entry(manifest, path, false));
     }
 
@@ -354,6 +349,8 @@ fn validate_declared_entry_resolution(
     resolve_file_candidate(&manifest.root.join(first_target)).map(|_| ())
 }
 
+/// The top-level entry fields, in preference order, for a runtime. The single source of the
+/// resolver's `main_fields` and of the legacy fallback's search order.
 fn profile_entry_fields(runtime: ImportRuntime) -> &'static [&'static str] {
     match runtime {
         ImportRuntime::Component | ImportRuntime::Client => &["browser", "module", "main"],
@@ -1125,7 +1122,7 @@ pub(crate) fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
             ],
             extensions: module_extensions(),
             extension_alias: extension_aliases(),
-            main_fields: vec!["browser".to_owned(), "module".to_owned(), "main".to_owned()],
+            main_fields: main_fields(runtime),
             module_type: true,
             node_path: false,
             ..ResolveOptions::default()
@@ -1141,12 +1138,19 @@ pub(crate) fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
             ],
             extensions: module_extensions(),
             extension_alias: extension_aliases(),
-            main_fields: vec!["module".to_owned(), "main".to_owned()],
+            main_fields: main_fields(runtime),
             module_type: true,
             node_path: false,
             ..ResolveOptions::default()
         },
     }
+}
+
+fn main_fields(runtime: ImportRuntime) -> Vec<String> {
+    profile_entry_fields(runtime)
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect()
 }
 
 fn module_extensions() -> Vec<String> {
@@ -1408,6 +1412,64 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).ok();
         }
+    }
+
+    /// The fallback reached when oxc cannot resolve a package with no `exports` map searches the
+    /// entry fields in the resolver's own order for the runtime: a browser runtime prefers
+    /// `browser`, a server runtime never reads it.
+    #[test]
+    fn the_legacy_fallback_searches_entry_fields_in_the_resolvers_order() {
+        let fixture = ConfigFixture::new("legacy-fallback-order");
+        fixture.write("browser.js", "export const side = 'browser';\n");
+        fixture.write("module.js", "export const side = 'module';\n");
+        fixture.write("main.js", "exports.side = 'main';\n");
+        let manifest = |json: Value| PackageManifest {
+            root: fixture.root.clone(),
+            json,
+        };
+        let request = |runtime| ImportRequest {
+            specifier: "pkg".to_owned(),
+            package_name: "pkg".to_owned(),
+            version: "1.0.0".to_owned(),
+            named: Vec::new(),
+            import_kind: crate::ipc::protocol::ImportKind::Namespace,
+            runtime,
+        };
+        let entry_name = |manifest: &PackageManifest, runtime| {
+            let (entry, _) = resolve_legacy_fallback(manifest, &request(runtime), "oxc failed")
+                .expect("the fallback resolves a declared entry");
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .expect("entry file name")
+        };
+
+        let all_three = manifest(serde_json::json!({
+            "name": "pkg",
+            "version": "1.0.0",
+            "browser": "./browser.js",
+            "module": "./module.js",
+            "main": "./main.js",
+        }));
+        assert_eq!(entry_name(&all_three, ImportRuntime::Client), "browser.js");
+        assert_eq!(
+            entry_name(&all_three, ImportRuntime::Component),
+            "browser.js"
+        );
+        assert_eq!(entry_name(&all_three, ImportRuntime::Server), "module.js");
+
+        let browser_and_main = manifest(serde_json::json!({
+            "name": "pkg",
+            "version": "1.0.0",
+            "browser": "./browser.js",
+            "main": "./main.js",
+        }));
+        assert_eq!(
+            entry_name(&browser_and_main, ImportRuntime::Server),
+            "main.js",
+            "a server import never reads `browser`"
+        );
     }
 
     /// One probe, one specifier — the shape a *single* request has when it asks about *one* import.

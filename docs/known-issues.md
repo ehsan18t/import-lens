@@ -370,25 +370,6 @@ re-doing the build is waste.
 bundle. Answering this means building that union model. It is the highest-value idea absent from the design,
 and it must be a deliberate decision, not smuggled in as a bug fix.
 
-### R2: The legacy entry-field fallback orders `module`, `browser`, `main`, against the resolver's own preference
-**Status: Deferred** · Not reproduced as a wrong number · Found in the 2026-07-16 module audit (D2)
-
-`resolve_legacy_fallback` searches the pre-resolved entry in the order `module`, `browser`, `main`
-(`resolver.rs:258-271`). For a Client or Component import the resolver itself prefers `browser`, `module`,
-`main` (`profile_entry_fields`, `resolver.rs:357`; `main_fields`, `resolver.rs:1128`), so the fallback
-contradicts that order.
-
-**What actually happens.** The fallback fires only when oxc's full resolution fails AND the package has no
-`exports` map AND no subpath. To pick a different entry than the resolver would, the package must also carry
-distinct top-level `browser` and `module` string fields, but when both point at real files, oxc (which also
-tries `browser` first) succeeds and the fallback never runs. No concrete package shape was found where oxc
-fails yet a usable distinct `browser` string remains, so no served wrong number is demonstrated; the worst
-theoretical case is a browser-versus-module entry delta on an exotic malformed package.
-
-**Why it is not fixed now:** not reproducible, so not a wrong number today.
-**What would fix it:** reorder the fallback to `browser`, `module`, `main` for parity with the resolver, a
-one-line change.
-
 ### G0: The legacy `performance.rs` smoke suite still claims to gate the NFR numbers, at 8x loose
 **Status: Deferred** · Not an active hole, but a second suite that appears to gate what it does not
 
@@ -793,6 +774,7 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| R2 | The legacy entry-field fallback searched `module`, `browser`, `main`, against the resolver's own per-runtime order | 2026-10-06 |
 | G2 | A failed (unmeasured) import was counted and badged as a "Conservative estimate" in the workspace report | 2026-10-06 |
 | K2 | The project-cache metadata and the recycle timestamp were written in place, so a crash mid-write could tear them | 2026-10-06 |
 | C5 | The process outlived its connection for as long as an uncancellable blocking drain ran, holding its cache shards open | 2026-10-06 |
