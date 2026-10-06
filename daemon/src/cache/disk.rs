@@ -24,38 +24,26 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cac
 const METADATA_TABLE: TableDefinition<&str, u64> = TableDefinition::new("metadata");
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
-// O(1) per-shard rollup — the incrementally-maintained byte/count/recency
-// totals, so `shard_rollup` reads three scalars instead of scanning CACHE_TABLE.
+// O(1) per-shard rollup: incrementally maintained byte/count/recency totals, so
+// `shard_rollup` reads scalars instead of scanning CACHE_TABLE.
 const SUMMARY_TABLE: TableDefinition<&str, u64> = TableDefinition::new("summary");
 const SUMMARY_TOTAL_BYTES: &str = "total_bytes";
 const SUMMARY_ENTRY_COUNT: &str = "entry_count";
 // Recency high-water: the largest `last_seq` ever inserted. Advances on insert,
-// is left untouched by removals (a high-water mark), and is recomputed by the
-// heal-on-open scan. Used to keep the recency clock ahead of
-// persisted seqs in O(1) (and by C5's startup seed).
+// is untouched by removals, and is recomputed by the heal-on-open scan. Keeps the
+// recency clock ahead of persisted seqs in O(1).
 const SUMMARY_MAX_SEQ: &str = "max_seq";
-// Secondary index: ascending `(last_seq, key)` → the evictor's lowest-N is a
-// bounded range read instead of a full sort-scan, and `oldest_seq` is the first
-// key. redb 4.1 supports the tuple key `(u64, &str)` with a `()` value natively,
-// and its `Key` impl compares `u64` numerically (then the key lexicographically),
-// so ascending iteration is exactly ascending-by-seq order.
+// Secondary index, ascending `(last_seq, key)`: the evictor's lowest-N is a bounded
+// range read and `oldest_seq` is the first key. redb compares the `u64` numerically,
+// then the key lexicographically, so iteration is ascending by seq.
 const SEQ_INDEX_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("seq_index");
 
-// v8: `ImportResult`'s five size fields became `Option<u64>` (ADR-0006). A v7 row does NOT fail
-// to decode into the new struct — msgpack is happy to read the old `17550` as `Some(17550)` — and
-// that is exactly the danger: every fabricated size a v7 daemon wrote (a manifest fallback's
-// on-disk directory bytes, a timed-out build's entry file measured alone) would come back as a
-// GENUINE measurement, indistinguishable from one, with nothing left in the record to say it was
-// invented. The wipe is total, so it is sufficient: no fabricated size survives the upgrade.
-// v7: adds SUMMARY_TABLE (O(1) rollup) and SEQ_INDEX_TABLE (by-`last_seq`
-// secondary index), both maintained in the SAME write transaction as every
-// CACHE_TABLE mutation so a crash can't tear accounting from data.
-// v6: the stored value gained the fixed 8-byte `last_seq` prefix (see
-// `SEQ_PREFIX_LEN`), which shifts the msgpack envelope — older rows would
-// misparse, so bumping the schema wipes them on the first upgraded open via the
-// existing recreate-on-mismatch path (v5 did the same for the identity-v4 key
-// change). The retired `cache_recents` table from pre-v5 builds is never
-// opened; it is harmless dead space reclaimed by the compactor.
+// A mismatch recreates the database on open. Bump on any change to a row's layout
+// or meaning, including one that still decodes: msgpack reads a plain `17550` into an
+// `Option<u64>` size as `Some(17550)`, so a row whose sizes may be fabricated would
+// come back as a genuine measurement. SUMMARY_TABLE and SEQ_INDEX_TABLE are written
+// in the SAME transaction as every CACHE_TABLE mutation, so a crash cannot tear
+// accounting from data.
 const CURRENT_SCHEMA_VERSION: u64 = 8;
 const INSERT_FLUSH_BATCH: usize = 64;
 /// Queue ceiling, reachable only while flushes keep failing: past it the least
@@ -68,25 +56,21 @@ const FLUSH_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// Compact a shard when more than this fraction of its `.redb` file is
 /// reclaimable free space (redb reuses freed pages rather than shrinking).
 pub const COMPACT_THRESHOLD: f64 = 0.5;
-/// A shard is compaction-eligible only after it has stayed idle — no get or
-/// insert — for at least this long (§5.5 / Finding 12). `Database::compact`
-/// holds the exclusive lock across the whole rewrite, so compacting a shard the
-/// user is actively analyzing would stall their concurrent gets. Measured
-/// against the coarse `last_access` millis clock stamped on the hot paths.
+/// A shard is compaction-eligible only after no get or insert for this long.
+/// `Database::compact` holds the exclusive lock across the whole rewrite, so
+/// compacting an actively analyzed shard would stall its gets. Measured against
+/// the coarse `last_access` clock.
 const COMPACT_IDLE: Duration = Duration::from_secs(5);
 
 // Every CACHE_TABLE value is `[last_seq: u64 LE, 8 bytes][msgpack CacheEnvelope]`.
-// Index and summary maintenance, and the heal-on-open rebuild, need only
-// `last_seq` + the value length; the fixed prefix gives them that without
-// deserializing the full envelope (ImportResult + contributions + fingerprints).
-// Recency readers (`recent_keys`, `lowest_seq_keys`, `shard_rollup`) read the
-// `(last_seq, key)` index and the summary, never CACHE_TABLE.
+// Index and summary maintenance and the heal-on-open rebuild need only `last_seq`
+// and the value length, which the fixed prefix gives without deserializing the
+// envelope. Recency readers use the `(last_seq, key)` index and the summary.
 const SEQ_PREFIX_LEN: usize = 8;
 
-/// redb's page cache defaults to 1 GiB per database and fills with every page read or
-/// written, so a full scan (`recent_keys`, eviction, compaction) would leave the whole
-/// shard resident. The in-memory `ImportCache` is the hot tier; redb only needs enough
-/// to keep the B-tree interior pages warm.
+/// redb's page cache defaults to 1 GiB per database and fills with every page touched,
+/// so a full scan would leave the whole shard resident. The in-memory `ImportCache` is
+/// the hot tier; redb only needs its B-tree interior pages warm.
 const REDB_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 fn create_database(path: &Path) -> Result<Database, redb::DatabaseError> {
@@ -113,10 +97,8 @@ struct CacheEnvelope {
 
 /// A shard's contribution to the global byte budget: its total on-disk bytes, the
 /// oldest recency sequence it holds (the victim-selection key), and its entry
-/// count. Read O(1) by `DiskCache::shard_rollup` from the incrementally-maintained
-/// SUMMARY table plus the first key of the `(last_seq, key)` index — no full scan.
-/// The evictor still re-reads its victim after each round, but that read is now
-/// three scalars and an index descent rather than a table scan.
+/// count. Read in O(1) from the SUMMARY table plus the first key of the
+/// `(last_seq, key)` index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardRollup {
     pub total_bytes: u64,
@@ -139,34 +121,25 @@ impl ShardRollup {
 
 #[derive(Debug, Default)]
 pub struct DiskCache {
-    // Behind an RwLock so the compactor can take exclusive `&mut Database`
-    // (`Database::compact` requires it) while every normal read/write shares the
-    // read lock — redb already serializes its own writers, so shared access is
-    // enough for them and preserves concurrent readers. The exclusive write lock
-    // additionally guarantees no live read transaction during compaction.
+    // Behind an RwLock so the compactor can take the exclusive `&mut Database`
+    // `Database::compact` requires (which also guarantees no live read transaction),
+    // while normal reads and writes share the read lock; redb serializes its own
+    // writers.
     db: RwLock<Option<Database>>,
-    // Serialized envelopes awaiting a batched commit; drained at a size
-    // threshold, on recent_keys, on recycle (flush_to_disk), and on Drop. The
-    // value is `(clear_generation at enqueue, the exact bytes written to
-    // CACHE_TABLE)`. The generation tag lets a flush drop an entry that a `clear()`
-    // superseded after it was queued (RB-3): `clear()` bumps `clear_generation`, so
-    // any entry still carrying the pre-bump generation is stale and never written.
+    // Serialized envelopes awaiting a batched commit, as `(clear_generation at
+    // enqueue, exact CACHE_TABLE bytes)`. Drained at a size threshold, on
+    // recent_keys, on recycle, and on Drop. A flush writes only entries whose tag
+    // equals the current generation, so a `clear()` after enqueue drops them.
     pending_inserts: Mutex<HashMap<String, (u64, Vec<u8>)>>,
     // Bumped by `clear()`. A writer captures it before deriving its bytes and tags the
-    // queued entry with it; `flush_pending_inserts` writes only entries whose tag still
-    // equals the current value, so a wipe that lands mid-flush can't resurrect a
-    // pre-clear entry (RB-3). Paired with `clear_lock` so the bump+wipe and the
-    // read+write are mutually exclusive — no interleave can slip a stale entry through.
+    // queued entry with it.
     clear_generation: AtomicU64,
-    // Serializes `clear()`'s (bump generation + wipe tables + drop pending) against
-    // `flush_pending_inserts`'s (read generation + write kept entries), so the two
-    // never interleave. Off the per-insert hot path: only the batched flush and the
-    // rare clear take it.
+    // Serializes `clear()` (bump generation, wipe tables, drop pending) against
+    // `flush_pending_inserts` (read generation, write kept entries). Off the
+    // per-insert hot path.
     clear_lock: Mutex<()>,
-    // Coarse wall-clock millis of the last get/insert on this shard, stamped
-    // (relaxed) on those hot paths. The compaction idle gate reads it so a shard
-    // the user is actively analyzing is never compacted (§5.5 / Finding 12). A
-    // heuristic, not a correctness gate — a relaxed store/load is enough.
+    // Coarse wall-clock millis of the last get/insert, read by the compaction idle
+    // gate. A heuristic, not a correctness gate, so relaxed ordering is enough.
     last_access: AtomicU64,
     // Unix millis before which an insert must not trigger a flush, set by a failed
     // flush (`FLUSH_RETRY_BACKOFF`); 0 when the last flush succeeded.
@@ -207,13 +180,9 @@ impl DiskCache {
             pending_inserts: Mutex::new(HashMap::new()),
             clear_generation: AtomicU64::new(0),
             clear_lock: Mutex::new(()),
-            // Seed to the epoch (idle), NOT `now`: a maintenance pass temp-opens
-            // every unloaded shard fresh (`collect_shard_targets`) and compacts it
-            // a few ms later in the SAME pass, so a `now` seed would make every
-            // cold, heavily-evicted shard read as "recently accessed" and never
-            // compact — the exact case compaction exists for. A real get/insert
-            // stamps `now` and protects an actively-analyzed shard; the brief
-            // open->first-access window reading as idle is benign.
+            // Seeded idle, NOT `now`: a maintenance pass temp-opens unloaded shards
+            // and compacts them in the same pass, so a `now` seed would keep every
+            // cold shard from ever compacting. A real get/insert stamps `now`.
             last_access: AtomicU64::new(0),
             flush_retry_after: AtomicU64::new(0),
         }
@@ -227,10 +196,8 @@ impl DiskCache {
         guard.is_some().then_some(guard)
     }
 
-    /// Stamps the shard's last-access clock so the compaction idle gate can tell
-    /// a shard the user is actively analyzing from one that has gone quiet.
-    /// Called on the `get`/`insert` hot paths — a single relaxed store of coarse
-    /// wall-clock millis, off the critical path (§5.5 / Finding 12).
+    /// Stamps the shard's last-access clock for the compaction idle gate. Called on
+    /// the `get`/`insert` hot paths.
     fn stamp_access(&self) {
         self.last_access.store(
             crate::time::unix_millis_now(),
@@ -247,9 +214,8 @@ impl DiskCache {
     }
 
     /// Whether a database is actually open. False when disk caching is disabled
-    /// OR the open failed (e.g. `DatabaseAlreadyOpen` while a maintenance pass
-    /// temporarily holds the file) — callers that intended persistence can use
-    /// this to avoid committing to a silently disabled cache.
+    /// or the open failed (e.g. `DatabaseAlreadyOpen` while a maintenance pass
+    /// holds the file).
     pub fn is_available(&self) -> bool {
         self.db_read().is_some()
     }
@@ -258,11 +224,9 @@ impl DiskCache {
         self.get_entry(key).map(|(cached, _)| cached)
     }
 
-    /// Like `get`, but also reports the `Freshness` classification the entry was
-    /// served under (`Fresh` or `Unknown` — `Stale`/`Gone` evict inside
-    /// `get_entry` and never reach a caller). Callers that mirror the entry into
-    /// another layer (the in-memory cache re-hydrating from a disk hit) need
-    /// this so they don't stamp an `Unknown`-survived entry as freshly verified.
+    /// Like `get`, but also reports the `Freshness` the entry was served under
+    /// (`Fresh` or `Unknown`; `Stale`/`Gone` evict), so a caller mirroring it into
+    /// memory does not stamp an `Unknown` entry as verified.
     pub fn get_with_freshness(
         &self,
         key: &str,
@@ -290,11 +254,9 @@ impl DiskCache {
         } else {
             self.read_committed(key)?
         };
-        // First-party-ness is key-derived; stamp it once at hydration so the
-        // per-hit gate never has to re-decode the identity.
+        // Stamped once at hydration so the per-hit gate never re-decodes the key.
         cached.first_party = crate::cache::key::cache_key_is_first_party(key);
-        // Hash-verified per FINGERPRINT on this cold path too, exactly as the memory
-        // read does, so a restart cannot re-arm the X-7 / D18 blind spot.
+        // Hash-verified per fingerprint, exactly as the memory read does (D18).
         let freshness =
             crate::cache::key::check_fingerprints_strict(&cached.dependency_fingerprints);
         match freshness {
@@ -314,8 +276,7 @@ impl DiskCache {
     fn read_committed(&self, key: &str) -> Option<CachedImport> {
         // Scope the read guard: `remove` re-acquires the db lock, and a re-entrant
         // read while a compaction writer is queued deadlocks (std `RwLock` blocks
-        // new readers behind a queued writer, and its docs say a re-entrant `read`
-        // may deadlock). Decide inside the scope, drop the guard, THEN remove.
+        // new readers behind a queued writer). Decide inside, drop the guard, THEN remove.
         let decoded = {
             let db_guard = self.db_read()?;
             // Stamp only once the DB is confirmed open, and before the table read so a
@@ -334,8 +295,8 @@ impl DiskCache {
             return None;
         };
         // The durability gate is on the READ too (ADR-0006, invariant 3): L2 outlives
-        // the process, so a row written before the write gate existed would otherwise
-        // be served and re-promoted into L1 forever. Refusing it costs one rebuild.
+        // the process, so a non-durable row on disk would otherwise be served and
+        // re-promoted into L1 forever. Refusing it costs one rebuild.
         if !cached.result.is_durable()
             || !crate::cache::key::fingerprints_are_reusable(&cached.dependency_fingerprints)
         {
@@ -354,7 +315,7 @@ impl DiskCache {
 
     /// The current clear generation. A writer captures this BEFORE deriving the bytes
     /// it will queue; if a `clear()` bumps it in between, `flush_pending_inserts` drops
-    /// those now-stale bytes so a wipe cannot be undone by an in-flight writer (RB-3).
+    /// those now-stale bytes so a wipe cannot be undone by an in-flight writer.
     pub fn clear_generation(&self) -> u64 {
         self.clear_generation
             .load(std::sync::atomic::Ordering::Acquire)
@@ -370,18 +331,14 @@ impl DiskCache {
     }
 
     /// Like [`Self::insert`], but tags the queued entry with a caller-captured clear
-    /// `generation` rather than the current one. The `flush_to_disk` dirty replay +
-    /// recency sweep and `enforce_memory_cap`'s re-persist derive their bytes from a
-    /// memory snapshot taken earlier, so they capture the generation BEFORE that
-    /// snapshot and pass it here: a `clear()` landing between the snapshot and the
-    /// enqueue then bumps the generation, and this entry — still carrying the old one —
-    /// is dropped by `flush_pending_inserts` instead of resurrecting the wiped shard.
+    /// `generation`. Writers that derive bytes from an earlier memory snapshot capture
+    /// the generation before it, so a `clear()` in between drops this entry at flush
+    /// instead of resurrecting the wiped shard.
     ///
-    /// **The transience gate is applied here too**, and not merely upstream in `ImportCache`
-    /// (ADR-0006, invariant 3). L2 is a store in its own right — it outlives the process, which is
-    /// the worst place for a scheduling accident to land — and "the caller already checked" is the
-    /// assumption that produced this defect six times. A refused insert is a no-op, not an error:
-    /// `Err` here marks the key dirty for a flush replay, which would defeat the refusal.
+    /// **The transience gate is applied here too**, not only in `ImportCache` (ADR-0006,
+    /// invariant 3): L2 is a store in its own right and outlives the process. A refused insert
+    /// is a no-op, not an error: `Err` marks the key dirty for a flush replay, which would
+    /// defeat the refusal.
     pub fn insert_at_generation(
         &self,
         key: &str,
@@ -407,11 +364,8 @@ impl DiskCache {
         self.write_at_generation(key, cached, generation)
     }
 
-    /// The write, with the durability gate already applied — or, in a test, deliberately not.
-    ///
-    /// The gate protects L2 from what it is handed *today*. It says nothing about a row a build
-    /// that predates it already wrote, and that row is on real users' disks right now. This is the
-    /// only way to put one there, and it is `#[cfg(test)]` so it stays the only way.
+    /// The write with the durability gate skipped, so a test can plant a non-durable row (as an
+    /// older build may have left on disk) and exercise the read-side gate. Test-only.
     #[cfg(test)]
     pub(crate) fn write_ungated_for_test(
         &self,
@@ -438,8 +392,6 @@ impl DiskCache {
                 return Err(format!("forced cache insert failure for {key}"));
             }
         }
-        // An insert is shard activity; stamp the idle gate's last-access clock
-        // (after the disabled short-circuit, so a no-op cache skips the syscall).
         self.stamp_access();
 
         let mut persisted = cached.clone();
@@ -447,9 +399,8 @@ impl DiskCache {
 
         let bytes = encode_cache_value(persisted)?;
 
-        // Queue for a batched commit instead of one durable transaction per
-        // entry; a cold parallel batch otherwise serialized N fsyncs on redb's
-        // single writer.
+        // Queued for a batched commit: one durable transaction per entry would
+        // serialize N fsyncs on redb's single writer.
         let should_flush = match self.pending_inserts.lock() {
             Ok(mut pending) => {
                 pending.insert(key.to_owned(), (generation, bytes));
@@ -469,11 +420,10 @@ impl DiskCache {
     }
 
     pub fn flush_pending_inserts(&self) {
-        // Serialize against `clear()` so its (bump generation + wipe) and this
-        // (read generation + write) can never interleave: this flush runs entirely
-        // before a clear (its writes are then wiped) or entirely after it (it observes
-        // the bumped generation and drops every pre-clear entry). A poisoned lock is
-        // recovered — a prior panic here must not wedge all future flushes (RB-3).
+        // Serialized against `clear()`: this flush runs entirely before a clear (its
+        // writes are then wiped) or entirely after (it sees the bumped generation and
+        // drops every pre-clear entry). A poisoned lock is recovered so a prior panic
+        // cannot wedge all future flushes.
         let _clear_guard = self
             .clear_lock
             .lock()
@@ -494,10 +444,8 @@ impl DiskCache {
             Err(_) => return,
         };
 
-        // Drop every entry a `clear()` superseded after it was queued: only bytes
-        // still carrying the current generation are written (RB-3). Read under
-        // `clear_lock`, so the generation cannot change between here and the write.
-        // Moves the kept bytes (no clone) to keep the batched flush cheap.
+        // Only bytes carrying the current generation are written. Read under
+        // `clear_lock`, so the generation cannot change before the write.
         let generation = self.clear_generation();
         let mut kept: HashMap<String, Vec<u8>> = HashMap::with_capacity(pending.len());
         for (key, (entry_generation, bytes)) in pending {
@@ -520,8 +468,7 @@ impl DiskCache {
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 if let Ok(mut current) = self.pending_inserts.lock() {
-                    // Re-queue only the entries we tried to write, preserving their
-                    // (still-current) generation tag so a later flush retries them.
+                    // Re-queue the entries we tried to write with their generation tag.
                     for (key, bytes) in kept {
                         current.entry(key).or_insert((generation, bytes));
                     }
@@ -533,8 +480,7 @@ impl DiskCache {
     }
 
     /// The queued-but-unflushed entry for `key`, served only while its generation
-    /// still matches: a `clear()` that superseded it must not be undone by a read,
-    /// exactly as `flush_pending_inserts` drops it before the disk (RB-3).
+    /// still matches, so a read cannot undo a `clear()` that superseded it.
     fn pending_insert(&self, key: &str) -> Option<CachedImport> {
         let bytes = {
             let pending = self.pending_inserts.lock().ok()?;
@@ -606,10 +552,9 @@ impl DiskCache {
                 return Vec::new();
             }
         };
-        // Walk the index from the highest seq down. It orders equal seqs by key
-        // ascending, so reversed they come key-descending: keep every row tied with
-        // the last one taken, then let the sort pick the same `limit` keys a full
-        // sort would.
+        // Walk the index from the highest seq down. Equal seqs come key-descending
+        // in reverse, so keep every row tied with the last one taken and let the sort
+        // pick the same `limit` keys a full sort would.
         let mut keys: Vec<(String, u64)> = Vec::with_capacity(limit);
         for entry in iter.rev() {
             let Ok((row, _)) = entry else { continue };
@@ -624,13 +569,11 @@ impl DiskCache {
         keys.into_iter().map(|(key, _)| key).collect()
     }
 
-    /// One-pass summary of this shard for the byte-budget coordinator: total
-    /// on-disk bytes, the oldest recency sequence held, and the entry count. Built
-    /// once when the shard is loaded (the coordinator then maintains it
-    /// incrementally on insert/evict rather than rescanning per operation). Size is
-    /// the exact CACHE_TABLE value length; recency is each envelope's `last_seq`.
-    /// Also advances the recency clock past every persisted seq so a post-restart
-    /// access sorts newer than durable entries.
+    /// Summary of this shard for the byte-budget coordinator: total on-disk bytes
+    /// (summed CACHE_TABLE value lengths), the oldest recency sequence held, and the
+    /// entry count, read from the SUMMARY table and the seq index. Also advances the
+    /// recency clock past every persisted seq so a post-restart access sorts newer
+    /// than durable entries.
     pub fn shard_rollup(&self) -> ShardRollup {
         self.flush_pending_inserts();
 
@@ -656,16 +599,14 @@ impl DiskCache {
 
         let total_bytes = read_summary_field(&summary, SUMMARY_TOTAL_BYTES);
         let entry_count = read_summary_field(&summary, SUMMARY_ENTRY_COUNT);
-        // Keep the live recency clock ahead of every persisted seq. The scan used
-        // to observe each entry's seq; the summary's high-water does it in O(1).
+        // Keep the live recency clock ahead of every persisted seq.
         crate::cache::recency::RecencyClock::observe(read_summary_field(&summary, SUMMARY_MAX_SEQ));
 
         if entry_count == 0 {
             return ShardRollup::empty();
         }
 
-        // `oldest_seq` is the first key of the ascending `(last_seq, key)` index —
-        // an O(log N) descent rather than a full min-scan.
+        // `oldest_seq` is the first key of the ascending `(last_seq, key)` index.
         let oldest_seq = match read_txn.open_table(SEQ_INDEX_TABLE) {
             Ok(seq_index) => match seq_index.first() {
                 Ok(Some((key, _))) => key.value().0,
@@ -688,13 +629,11 @@ impl DiskCache {
         }
     }
 
-    /// The largest `last_seq` persisted in this shard — a single-key read of the
-    /// SUMMARY `max_seq` high-water, NOT a CACHE_TABLE scan. Used by the startup
-    /// recency seed (C5 / Finding 10d, §3.3) to lift the process-global clock above
-    /// every persisted seq BEFORE serving, without paying for a full `shard_rollup`
-    /// (which also descends the seq index for `oldest_seq`). Returns `0` for a
-    /// fresh/empty shard or an unavailable database. Flushes queued inserts first so
-    /// a not-yet-committed high seq is included, mirroring `shard_rollup`.
+    /// The largest `last_seq` persisted in this shard, a single-key read of the
+    /// SUMMARY `max_seq` high-water. The startup recency seed uses it to lift the
+    /// process-global clock above every persisted seq before serving. Returns `0` for
+    /// an empty shard or an unavailable database. Flushes queued inserts first so a
+    /// not-yet-committed high seq is included.
     pub fn summary_max_seq(&self) -> u64 {
         self.flush_pending_inserts();
 
@@ -712,13 +651,10 @@ impl DiskCache {
         read_summary_field(&summary, SUMMARY_MAX_SEQ)
     }
 
-    /// Returns up to `n` of the shard's lowest-`last_seq` (least-recently-used)
-    /// keys with their PERSISTED seq, EXCLUDING the shard's `floor` highest-seq
-    /// entries (the per-project floor, so a small project keeps its newest
-    /// working set even when a larger project drives global eviction). Empty when
-    /// every entry is within the floor. The persisted seq lets a caller with a
-    /// memory layer detect entries promoted since their last persist and shield
-    /// them from eviction.
+    /// Returns up to `n` of the shard's lowest-`last_seq` keys with their persisted
+    /// seq, excluding the shard's `floor` highest-seq entries (the per-project floor).
+    /// Empty when every entry is within the floor. The persisted seq lets a caller
+    /// with a memory layer shield entries promoted since their last persist.
     pub fn lowest_seq_keys(&self, n: usize, floor: u64) -> Vec<(String, u64)> {
         if n == 0 {
             return Vec::new();
@@ -737,9 +673,7 @@ impl DiskCache {
             return Vec::new();
         };
 
-        // The `floor` highest-seq entries are protected; the eligible set is
-        // everything past the floor. `take` bounds the range read so a huge shard
-        // never materializes more than the evictor asked for.
+        // `take` bounds the range read to what the evictor asked for, past the floor.
         let entry_count = read_summary_field(&summary, SUMMARY_ENTRY_COUNT);
         let take = n.min(entry_count.saturating_sub(floor) as usize);
         if take == 0 {
@@ -753,9 +687,8 @@ impl DiskCache {
             return Vec::new();
         };
 
-        // The index is ascending by `(last_seq, key)`, so the first `take` rows
-        // are exactly the lowest-seq keys beyond the floor (seq, then key, as the
-        // old sort-scan tiebreak did) — O(take · log N), no full materialization.
+        // The index is ascending by `(last_seq, key)`, so the first `take` rows are
+        // the lowest-seq keys beyond the floor.
         let mut lowest = Vec::with_capacity(take);
         for entry in iter {
             let Ok((key_guard, _)) = entry else { continue };
@@ -788,9 +721,8 @@ impl DiskCache {
         let Ok(write_txn) = db.begin_write() else {
             return 0;
         };
-        // The freed byte count is the summed removed value lengths (see
-        // `maintain_removals`), so it matches the rollup accounting exactly. Only
-        // report bytes the commit actually durably freed.
+        // Freed bytes are the summed removed value lengths, matching the rollup
+        // accounting; only bytes the commit durably freed are reported.
         match maintain_removals(&write_txn, keys.iter().map(String::as_str)) {
             Ok(freed) => match write_txn.commit() {
                 Ok(()) => freed,
@@ -808,8 +740,7 @@ impl DiskCache {
     }
 
     /// Evicts every entry belonging to any package in `package_names` in a single
-    /// table scan that decodes each key once, rather than one full scan (with a
-    /// per-key decode) per package.
+    /// table scan that decodes each key once.
     pub fn invalidate_packages(&self, package_names: &HashSet<String>) {
         if package_names.is_empty() {
             return;
@@ -825,9 +756,8 @@ impl DiskCache {
         };
 
         if let Ok(write_txn) = db.begin_write() {
-            // Collect the matching keys under this txn, dropping the read-only
-            // table handle before `maintain_removals` re-opens CACHE_TABLE (redb
-            // forbids opening the same table twice in one write transaction).
+            // Drop the table handle before `maintain_removals` re-opens CACHE_TABLE:
+            // redb forbids opening the same table twice in one write transaction.
             let keys_to_remove = {
                 let mut keys = Vec::new();
                 if let Ok(table) = write_txn.open_table(CACHE_TABLE)
@@ -844,8 +774,6 @@ impl DiskCache {
                 keys
             };
 
-            // A CACHE_TABLE mutator like any other: maintain SUMMARY + SEQ_INDEX
-            // in the same txn so invalidation never drifts the accounting.
             match maintain_removals(&write_txn, keys_to_remove.iter().map(String::as_str)) {
                 Ok(_) => {
                     let _ = write_txn.commit();
@@ -858,31 +786,16 @@ impl DiskCache {
         }
     }
 
-    /// Reclaims redb free pages when the shard is IDLE and its free-space ratio
-    /// exceeds `threshold` (e.g. 0.5 = over half the file is reclaimable). `redb`
-    /// reuses freed pages rather than shrinking the file, so after heavy eviction
-    /// the `.redb` file can far exceed the logical byte budget until compacted.
+    /// Reclaims redb free pages when the shard is idle and its free-space ratio
+    /// exceeds `threshold`. redb reuses freed pages rather than shrinking the file, so
+    /// after heavy eviction the file can far exceed the logical byte budget.
     ///
-    /// Two-stage gating keeps the common path cheap and the user's gets unblocked
-    /// (§5.5 / Finding 12):
-    ///  1. Idle gate — a single relaxed load. A shard touched by a get/insert
-    ///     within `COMPACT_IDLE` is skipped outright, because `Database::compact`
-    ///     holds the exclusive lock across the whole rewrite and would stall the
-    ///     user's concurrent gets on a shard they are actively analyzing.
-    ///  2. Lock-free probe — the fragmentation ratio is read under the SHARED
-    ///     `db_read()` guard (`fragmentation_ratio` needs only `&Database`), so a
-    ///     non-fragmented shard never pays the exclusive lock merely to be
-    ///     checked. The shared guard is dropped before escalating (std `RwLock`
-    ///     cannot upgrade a read guard to a write guard on the same thread).
-    ///
-    /// Only when both gates pass does it escalate to the exclusive `db.write()`
-    /// for the compact itself: `Database::compact` needs `&mut Database` and fails
-    /// if any read transaction is live, and the write lock guarantees neither (all
-    /// normal ops share the read lock). Runs off the hot path on the idle
-    /// maintenance tick. Returns whether it compacted.
+    /// Gated in two stages: a shard touched within `COMPACT_IDLE` is skipped, then the
+    /// fragmentation ratio is probed under the shared read guard so a non-fragmented
+    /// shard never takes the exclusive lock. Only then does it take `db.write()`:
+    /// `Database::compact` needs `&mut Database` and fails if any read transaction is
+    /// live. Returns whether it compacted.
     pub fn compact_if_fragmented(&self, threshold: f64) -> bool {
-        // Stage 1 — idle gate (cheapest possible check, one relaxed load): never
-        // compact a shard the user is actively analyzing.
         let idle_for = Duration::from_millis(
             crate::time::unix_millis_now()
                 .saturating_sub(self.last_access.load(std::sync::atomic::Ordering::Relaxed)),
@@ -891,9 +804,7 @@ impl DiskCache {
             return false;
         }
 
-        // Stage 2 — lock-free fragmentation probe under the SHARED read guard, so
-        // a non-fragmented shard is never charged the exclusive lock just to be
-        // checked. Drop the guard before escalating: std `RwLock` cannot upgrade a
+        // Drop the shared guard before escalating: std `RwLock` cannot upgrade a
         // held read guard to the write guard on the same thread.
         let free_ratio = {
             let db_guard = self.db_read();
@@ -907,23 +818,19 @@ impl DiskCache {
             return false;
         }
 
-        // Both gates passed — escalate to the exclusive guard for the compact.
         let mut guard = self.db.write().unwrap_or_else(|poison| poison.into_inner());
         let Some(database) = guard.as_mut() else {
             return false;
         };
 
-        // Recompute under the exclusive guard: the shared-guard ratio was a
-        // pre-lock estimate (a concurrent insert/evict could have moved it since),
-        // and recomputing avoids compacting on a now-stale decision.
+        // Recompute under the exclusive guard: a concurrent insert or evict may have
+        // moved the ratio since the probe.
         let free_ratio = fragmentation_ratio(database);
         if free_ratio <= threshold {
             return false;
         }
 
-        // Compaction rewrites the live dataset; log its duration so the
-        // "acceptably brief while holding the exclusive lock" assumption stays
-        // observable in the field.
+        // Logged so the time spent holding the exclusive lock stays observable.
         let started = std::time::Instant::now();
         match database.compact() {
             Ok(compacted) => {
@@ -974,8 +881,6 @@ impl DiskCache {
             return 0;
         }
 
-        // The scan ran under a read txn; the removal opens its own write txn (no
-        // same-table double-open), and maintains SUMMARY + SEQ_INDEX in it.
         let mut removed = 0;
         if let Ok(write_txn) = db.begin_write() {
             match maintain_removals(&write_txn, orphan_keys.iter().map(String::as_str)) {
@@ -1001,14 +906,11 @@ impl DiskCache {
     }
 
     pub fn clear(&self) {
-        // Serialize against `flush_pending_inserts` (see `clear_lock`) and bump the
-        // clear generation FIRST — before the wipe and before dropping pending — so any
-        // writer that already captured the old generation is superseded: its queued
-        // bytes fail the flush's generation filter, and the ImportCache memory-rollback
-        // guard (which reads this generation) sees the change (RB-3). Bump even when the
-        // disk is disabled: memory-only mode has no `db` to wipe but still relies on the
-        // generation for that rollback. Recover a poisoned lock so a prior panic cannot
-        // wedge every future clear.
+        // Bump the clear generation FIRST, under `clear_lock`, so any writer that
+        // captured the old one is superseded: its queued bytes fail the flush filter and
+        // the ImportCache memory-rollback guard sees the change. Bumped even with disk
+        // disabled, since memory-only mode still relies on it. A poisoned lock is
+        // recovered so a prior panic cannot wedge every future clear.
         let _clear_guard = self
             .clear_lock
             .lock()
@@ -1020,8 +922,7 @@ impl DiskCache {
         if let Some(db) = db_guard.as_ref().and_then(|guard| guard.as_ref())
             && let Ok(write_txn) = db.begin_write()
         {
-            // Drop every row from all three tables and zero the summary, so a
-            // cleared shard rolls up as empty with no orphaned index entries.
+            // Empty the cache and index tables and zero the summary.
             if let Ok(mut cache) = write_txn.open_table(CACHE_TABLE) {
                 let _ = cache.retain(|_, _| false);
             }
@@ -1040,10 +941,9 @@ impl DiskCache {
         }
     }
 
-    /// Rebuilds the summary/index when the persisted `entry_count` disagrees with
-    /// the actual CACHE_TABLE row count. The len check is O(1) (redb tracks both),
-    /// so a correctly-maintained shard pays only that; the O(N) scan runs once,
-    /// only when there is genuine drift or an absent summary to heal.
+    /// Rebuilds the summary and index when the persisted `entry_count` disagrees with
+    /// the CACHE_TABLE row count. The check is O(1); the O(N) rebuild runs only on
+    /// drift or an absent summary.
     fn heal_summary_if_inconsistent(db: &Database) {
         let needs_rebuild = match db.begin_read() {
             Ok(read_txn) => {
@@ -1085,9 +985,6 @@ impl DiskCache {
             pending_inserts: Mutex::new(HashMap::new()),
             clear_generation: AtomicU64::new(0),
             clear_lock: Mutex::new(()),
-            // A disabled cache never compacts (no database), so the value is
-            // immaterial; 0 (the `Default` for the enabled-but-never-opened case
-            // too) simply reads as idle.
             last_access: AtomicU64::new(0),
             flush_retry_after: AtomicU64::new(0),
             storage_path: None,
@@ -1131,12 +1028,9 @@ impl DiskCache {
         let db_existed = db_path.exists();
         let db = match create_database(&db_path) {
             Ok(db) => db,
-            // The file is already open elsewhere in this process (redb allows one
-            // Database per file). This happens when a temp open for a maintenance
-            // pass — eviction, invalidation, orphan purge — races the same shard
-            // being loaded. NEVER recreate here: `recreate_database` unlinks the
-            // file, which would destroy the live shard's data. Degrade to a
-            // disabled cache for this transient open instead.
+            // Already open elsewhere in this process (redb allows one Database per
+            // file), e.g. a maintenance temp open racing the shard being loaded.
+            // NEVER recreate here: `recreate_database` unlinks the live shard's file.
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
                 cache_warn(format!(
                     "cache database {} is already open; skipping this open",
@@ -1149,10 +1043,9 @@ impl DiskCache {
                     "failed to open cache database {}: {error}",
                     db_path.display()
                 ));
-                // Only a genuine corruption / unrecoverable-format signal justifies
-                // unlinking the shard. A transient open failure (Windows sharing
-                // violation, AV lock, permission blip, flaky/offline drive) keeps
-                // the possibly-valid file so a later open retries (§12 / X-5).
+                // Only genuine corruption justifies unlinking the shard. A transient
+                // failure (sharing violation, AV lock, permission, offline drive) keeps
+                // the possibly-valid file so a later open retries.
                 if Self::is_corruption_error(&error) {
                     return Self::recreate_database(&db_path);
                 }
@@ -1162,11 +1055,7 @@ impl DiskCache {
 
         match Self::ensure_schema(&db, !db_existed) {
             Ok(()) => {
-                // Cheap O(1) drift check on open: if the persisted entry_count
-                // disagrees with the CACHE_TABLE row count (a drifted shard, or a
-                // v7 shard whose summary rows are absent), rebuild once from a
-                // scan. A correctly-maintained shard matches and never scans; a
-                // v6→v7 wipe recreates empty and also matches at zero.
+                // O(1) drift check on open; rebuilds from a scan only on mismatch.
                 Self::heal_summary_if_inconsistent(&db);
                 Some(db)
             }
@@ -1180,8 +1069,8 @@ impl DiskCache {
                 drop(db);
                 Self::recreate_database(&db_path)
             }
-            // A transient schema-read failure keeps the (possibly valid) DB so a
-            // later open retries rather than wiping good data (§12 / X-5).
+            // A transient schema-read failure keeps the possibly-valid DB so a later
+            // open retries.
             Err(SchemaError::Transient(message)) => {
                 cache_warn(format!(
                     "cache database {} schema check failed transiently, keeping it: {message}",
@@ -1192,14 +1081,12 @@ impl DiskCache {
         }
     }
 
-    /// True only for a genuine on-disk corruption / unrecoverable-format signal
-    /// that justifies wiping+recreating the shard. A transient open failure
-    /// (lock, AV, permission, IO on a flaky/offline drive) is NOT corruption — it
-    /// must keep the (possibly valid) DB and retry later. See §12 / X-5.
+    /// True only for genuine on-disk corruption or an unrecoverable format, which
+    /// justifies wiping and recreating the shard. A transient open failure (lock, AV,
+    /// permission, IO on an offline drive) keeps the possibly-valid DB.
     ///
-    /// redb 4.1's `DatabaseError` / `StorageError` are `#[non_exhaustive]`, so the
-    /// catch-all keeps every unclassified error (including any future variant) on
-    /// the safe "keep" side — never `_ => true`, which would resurrect the bug.
+    /// redb's `DatabaseError` / `StorageError` are `#[non_exhaustive]`; the catch-all
+    /// keeps every unclassified error, including future variants. Never `_ => true`.
     pub(crate) fn is_corruption_error(error: &redb::DatabaseError) -> bool {
         use redb::{DatabaseError, StorageError};
         match error {
@@ -1209,22 +1096,17 @@ impl DiskCache {
             // no automatic migration. For a rebuildable cache the sanctioned
             // recovery is the same wipe-and-recreate as a schema-version mismatch.
             DatabaseError::UpgradeRequired(_) => true,
-            // The database needed repair and repair did not complete (reachable
-            // only via an aborting repair callback or a read-only open, neither of
-            // which `Database::create` installs — so this is defensive). The shard
-            // is unusable as-is and this is never a transient lock/permission/IO
-            // fault, so recreate.
+            // Repair did not complete (defensive: reachable only via an aborting
+            // repair callback or a read-only open, neither of which
+            // `Database::create` installs). Never a transient fault, so recreate.
             DatabaseError::RepairAborted => true,
-            // A bad/absent magic number ("not a redb database") is surfaced as an
-            // IO error of kind `InvalidData`, and that is the ONLY `InvalidData`
-            // redb produces while opening. It is a format-corruption signal: a
-            // transient fault (sharing violation, AV lock, permission blip,
-            // flaky/offline drive) surfaces under a DIFFERENT `ErrorKind`, so every
-            // other IO kind is kept.
+            // A bad or absent magic number surfaces as IO `InvalidData`, the only
+            // `InvalidData` redb produces while opening. Transient faults surface
+            // under other kinds, which are kept.
             DatabaseError::Storage(StorageError::Io(source)) => {
                 source.kind() == std::io::ErrorKind::InvalidData
             }
-            // Not positively corruption → KEEP the possibly-valid database:
+            // Not positively corruption, so KEEP the possibly-valid database:
             //   DatabaseAlreadyOpen     - concurrent open; handled before this call
             //   TransactionInProgress   - transient lifecycle state
             //   Storage(ValueTooLarge)  - cannot occur while opening
@@ -1297,9 +1179,8 @@ impl DiskCache {
                         })?;
                     CURRENT_SCHEMA_VERSION
                 }
-                // An existing database with the metadata table but no version key
-                // is a recognized-incompatible schema (pre-versioning or a wiped
-                // row), not a transient fault → the migration wipe recreates it.
+                // An existing database with no version key is incompatible, not a
+                // transient fault: the migration wipe recreates it.
                 None => {
                     return Err(SchemaError::Incompatible(
                         "schema version is missing".to_owned(),
@@ -1318,8 +1199,8 @@ impl DiskCache {
             write_txn.open_table(CACHE_TABLE).map_err(|error| {
                 SchemaError::Transient(format!("failed to open cache table: {error}"))
             })?;
-            // Create the v7 accounting tables so a fresh shard has them and the
-            // maintenance paths never race a missing-table open.
+            // Create the accounting tables so maintenance paths never race a
+            // missing-table open.
             write_txn.open_table(SUMMARY_TABLE).map_err(|error| {
                 SchemaError::Transient(format!("failed to open summary table: {error}"))
             })?;
@@ -1335,19 +1216,13 @@ impl DiskCache {
 }
 
 /// Why `ensure_schema` could not certify a database at the current schema
-/// version. The two dispositions differ sharply — recreate vs. keep — so before
-/// X-5 collapsing them to one error string wiped valid caches on a transient
-/// schema-read blip.
+/// version. The dispositions differ: recreate vs. keep.
 enum SchemaError {
-    /// A recognized but incompatible on-disk schema: the stored version differs
-    /// from `CURRENT_SCHEMA_VERSION`, or an existing database carries no version
-    /// key at all. Both are the sanctioned migration wipe — the shard is recreated
-    /// empty. The schema was read successfully; this is NOT a transient fault.
+    /// The stored version differs from `CURRENT_SCHEMA_VERSION`, or an existing
+    /// database has no version key. The shard is recreated empty.
     Incompatible(String),
-    /// A transient failure while reading or writing the schema (begin/commit a
-    /// transaction, open a table, read the version key). The database may be
-    /// entirely valid, so it is kept and a later open retries rather than wiping
-    /// possibly-good data.
+    /// A failure while reading or writing the schema. The database may be valid, so
+    /// it is kept and a later open retries.
     Transient(String),
 }
 
@@ -1367,13 +1242,11 @@ impl Drop for DiskCache {
     }
 }
 
-/// The shard's reclaimable-free-space ratio (fragmented bytes / allocated bytes)
-/// from redb's stats. redb exposes fragmentation only via `WriteTransaction::
-/// stats()` — there is no `ReadTransaction::stats` — but `Database::begin_write`
-/// needs just `&Database`, so this reads it under the caller's SHARED `db_read()`
-/// guard, never the exclusive RwLock. The throwaway transaction is immediately
-/// aborted and mutates nothing. Returns `0.0` (never fragmented) on any
-/// transaction/stats error so a probe failure never provokes a compact.
+/// The shard's reclaimable-free-space ratio (fragmented / allocated bytes). redb
+/// exposes it only via `WriteTransaction::stats()`, but `begin_write` needs just
+/// `&Database`, so this runs under the caller's shared guard; the throwaway
+/// transaction is aborted. Returns `0.0` on any error so a probe failure never
+/// provokes a compact.
 fn fragmentation_ratio(db: &Database) -> f64 {
     let Ok(txn) = db.begin_write() else {
         return 0.0;
@@ -1413,9 +1286,8 @@ fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> R
             .open_table(SEQ_INDEX_TABLE)
             .map_err(|error| format!("failed to open seq index table: {error}"))?;
 
-        // Fold every entry's delta into locals, then write the summary once.
-        // `total_bytes` is accumulated as i128 so a replace with a smaller value
-        // never underflows before the final clamp back to u64.
+        // Deltas fold into locals and the summary is written once; i128 so a
+        // replace with a smaller value never underflows before the final clamp.
         let mut total_bytes = read_summary_field(&summary, SUMMARY_TOTAL_BYTES) as i128;
         let mut entry_count = read_summary_field(&summary, SUMMARY_ENTRY_COUNT) as i128;
         let mut max_seq = read_summary_field(&summary, SUMMARY_MAX_SEQ);
@@ -1424,8 +1296,8 @@ fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> R
             let new_len = bytes.len() as u64;
             let new_seq = decode_last_seq(bytes);
 
-            // `insert` returns the prior value; read its length + seq before it
-            // drops so the index/byte maintenance sees the exact replaced row.
+            // `insert` returns the prior value: its seq and length drive the index
+            // and byte maintenance.
             let prior = cache
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|error| format!("failed to insert cache entry: {error}"))?;
@@ -1477,7 +1349,7 @@ fn shed_oldest_pending_inserts(pending: &mut HashMap<String, (u64, Vec<u8>)>) {
 }
 
 /// Reads a `u64` summary field, defaulting to `0` when the key is absent (a fresh
-/// v7 shard has no summary rows until its first insert).
+/// shard has no summary rows until its first insert).
 fn read_summary_field<T: ReadableTable<&'static str, u64>>(table: &T, field: &str) -> u64 {
     table
         .get(field)
@@ -1488,8 +1360,8 @@ fn read_summary_field<T: ReadableTable<&'static str, u64>>(table: &T, field: &st
 }
 
 /// Writes `total_bytes`/`entry_count` (clamped non-negative) back to SUMMARY, and
-/// `max_seq` when supplied. Removals pass `None` for `max_seq` — the high-water
-/// mark only advances on insert, so a removal must not lower it.
+/// `max_seq` when supplied. Removals pass `None`: the high-water mark only advances
+/// on insert.
 fn write_summary(
     summary: &mut redb::Table<'_, &'static str, u64>,
     total_bytes: i128,
@@ -1513,8 +1385,7 @@ fn write_summary(
 /// Removes `keys` from CACHE_TABLE inside `write_txn`, maintaining SUMMARY and
 /// SEQ_INDEX in the SAME transaction, and returns the total on-disk bytes freed.
 /// The caller owns the commit, so an aborted txn leaves data and accounting
-/// consistent (all-or-nothing). `max_seq` is deliberately left untouched — it is
-/// a high-water mark, and rescanning to lower it would defeat the O(1) intent.
+/// consistent. `max_seq` is a high-water mark and is left untouched.
 fn maintain_removals<'a>(
     write_txn: &WriteTransaction,
     keys: impl IntoIterator<Item = &'a str>,
@@ -1569,7 +1440,6 @@ fn rebuild_summary_in_txn(write_txn: &WriteTransaction) -> Result<(), String> {
         .open_table(SEQ_INDEX_TABLE)
         .map_err(|error| format!("failed to open seq index table: {error}"))?;
 
-    // Repopulate the index from scratch so a stale/partial index self-heals.
     seq_index
         .retain(|_, _| false)
         .map_err(|error| format!("failed to clear seq index table: {error}"))?;
@@ -1711,17 +1581,11 @@ mod tests {
         super::encode_cache_value(sample_cached(last_seq)).expect("value should serialize")
     }
 
-    /// **Guard.** The L2 envelope is encoded with `rmp_serde::to_vec` — *positional* msgpack, an
-    /// array with no field names. `ImportResult`'s size fields sit in the middle of that array, so
-    /// the crate's dominant `Option` idiom, `#[serde(default, skip_serializing_if =
-    /// "Option::is_none")]`, would omit them on an Unmeasured result, shorten the array, and every
-    /// field after them would decode off by one — measured, not theorised: it fails with
-    /// `invalid type: boolean \`false\`, expected u64`. A plain `Option` writes a `nil`
-    /// placeholder and keeps the array length.
-    ///
-    /// This test is the only thing standing between a future contributor "tidying up" those five
-    /// attributes and a silently unreadable disk cache for every user who has ever seen a package
-    /// the engine could not build.
+    /// **Guard.** The L2 envelope is *positional* msgpack (`rmp_serde::to_vec`, an array with no
+    /// field names). `ImportResult`'s size fields sit mid-array, so
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` on them would shorten the array on an
+    /// Unmeasured result and every later field would decode off by one. A plain `Option` writes a
+    /// `nil` placeholder.
     #[test]
     fn an_unmeasured_result_round_trips_through_the_positional_disk_encoding() {
         let unmeasured = crate::ipc::protocol::ImportResult::unmeasured(
@@ -1744,17 +1608,10 @@ mod tests {
         assert_eq!(decoded.result, unmeasured);
     }
 
-    /// **Guard**, and the shape the test above does NOT catch. The five sizes were the *only* fields
-    /// protected from the `skip_serializing_if` idiom, but `module_breakdown` and `shared_bytes` sit
-    /// mid-struct too — and the daemon really does build this exact pair: an Unmeasured result has
-    /// `module_breakdown: None` (skipped, under the old attributes) beside the `shared_bytes:
-    /// Some(0)` that `annotate_shared_bytes` stamps on **every** result, measured or not. The
-    /// skipped `None` shortened the array, `shared_bytes`'s `0` slid into its slot, and the decode
-    /// failed with `invalid type: integer, expected a sequence` — an unreadable disk entry for every
-    /// package the engine could not build.
-    ///
-    /// It was latent only because the annotation runs on the response, one call site away from the
-    /// value that is cached. Latent is not fixed.
+    /// **Guard**, for the same positional-encoding rule on other mid-struct `Option`s. An
+    /// Unmeasured result has `module_breakdown: None` beside the `shared_bytes: Some(0)` that
+    /// `annotate_shared_bytes` stamps on every result; skipping the `None` would slide the `0`
+    /// into its slot and make the row undecodable.
     #[test]
     fn a_result_with_no_breakdown_but_a_shared_byte_count_round_trips() {
         let mut result = crate::ipc::protocol::ImportResult::unmeasured(
@@ -1777,17 +1634,10 @@ mod tests {
         assert_eq!(decoded.result.shared_bytes, Some(0));
     }
 
-    /// **Guard.** `internal_contributions` is `#[serde(skip)]` on `ImportResult` — it is the FULL
-    /// module set, far too large for the wire, and only the top 10 go out as `module_breakdown`. The
-    /// L2 envelope therefore carries it explicitly as `full_contributions` and restores it on
-    /// decode. Nothing pinned that, and the field it protects is now load-bearing twice over:
-    /// `annotate_shared_bytes` prefers `internal_contributions` over `module_breakdown`, so if a
-    /// cache hit came back without it, every shared-byte figure in the system would silently be
-    /// computed from the truncated top-10 list instead of the real graph — a smaller, wrong number,
-    /// on exactly the results that hit cache (i.e. almost all of them).
-    ///
-    /// Delete `full_contributions` from the envelope, or trust `#[serde(skip)]` to round-trip it,
-    /// and this goes red.
+    /// **Guard.** `internal_contributions` is `#[serde(skip)]` on `ImportResult` (the full module
+    /// set; only the top 10 go out as `module_breakdown`), so the L2 envelope carries it as
+    /// `full_contributions`. `annotate_shared_bytes` prefers it, so a cache hit without it would
+    /// compute every shared-byte figure from the truncated top 10: a smaller, wrong number.
     #[test]
     fn the_full_module_set_survives_the_l2_round_trip_even_though_the_wire_drops_it() {
         use crate::ipc::protocol::ModuleContribution;
@@ -1802,8 +1652,7 @@ mod tests {
                 zstd_bytes: 35,
             },
         );
-        // The wire carries the top 10; the graph had more, and the extras are what a shared-byte
-        // count needs.
+        // The wire carries the top 10; a shared-byte count needs the rest.
         result.internal_contributions = (0..14)
             .map(|index| ModuleContribution {
                 path: format!("/workspace/node_modules/react/module-{index:02}.js"),
@@ -1828,11 +1677,9 @@ mod tests {
     fn superseded_generation_insert_is_dropped_after_clear() {
         use super::DiskCache;
 
-        // RB-3: the disk resurrection guard. A writer captures the clear generation,
-        // then a `clear()` races in and wipes + bumps it. When the pre-clear writer
-        // (e.g. `flush_to_disk` replaying a snapshot taken before the clear) finally
-        // enqueues its bytes, they carry the STALE generation and must be dropped by the
-        // flush — never written back into the cleared shard.
+        // A writer captures the clear generation, then a `clear()` wipes and bumps it.
+        // The writer's later enqueue carries the stale generation and is dropped by the
+        // flush, never written back into the cleared shard.
         let dir = std::env::temp_dir().join(format!(
             "il-rb3-gen-{}-{:?}",
             std::process::id(),
@@ -1866,14 +1713,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// **The gate is on the READ too** (ADR-0006, invariant 3).
-    ///
-    /// The write-side gate protects L2 from what it is handed today. It does nothing about a row a
-    /// build that predates it already wrote — and L2 outlives the process, so those rows are on real
-    /// users' disks right now. Left alone, a `timeout` result would be decoded, served as a cache
-    /// hit, and re-promoted into L1 on every access, for as long as the package's bytes did not
-    /// change: a transient condition producing a durable wrong answer, which is the one disease this
-    /// model exists to end.
+    /// **The gate is on the READ too** (ADR-0006, invariant 3). L2 outlives the process, so a
+    /// non-durable row already on disk would otherwise be served and re-promoted into L1 on every
+    /// access: a transient condition producing a durable wrong answer.
     #[test]
     fn a_non_durable_row_already_on_disk_is_refused_on_read_and_evicted() {
         use super::DiskCache;
@@ -1885,9 +1727,8 @@ mod tests {
         ));
         let disk = DiskCache::new(Some(dir.clone()), true);
 
-        // A MEASURED result whose full-package comparison build timed out: real sizes, a transient
-        // diagnostic, and `error: None`. The shape every negative-`error` check waves through, and
-        // the one a store must refuse.
+        // A measured result whose comparison build timed out: real sizes, a transient diagnostic,
+        // and `error: None`. A store must refuse it.
         let mut degraded = crate::ipc::protocol::ImportResult::measured(
             "react",
             crate::ipc::protocol::MeasuredSizes {
@@ -1907,7 +1748,7 @@ mod tests {
             "test setup: this is precisely a result no store may hold"
         );
 
-        // The gate refuses it on the way in, which is why writing it needs the test-only door.
+        // The write gate refuses it, so planting it needs the test-only write.
         disk.insert("v4:react:degraded", &cached_with(degraded, 7))
             .expect("the write gate refuses it, and refusing is not an error");
         disk.flush_pending_inserts();
@@ -1929,8 +1770,7 @@ mod tests {
             "and evicted, so the next read does not pay to decode it again"
         );
 
-        // Control: a healthy row written the same way is still served. Without this the fix could be
-        // "made to pass" by refusing everything.
+        // Control: a healthy row written the same way is still served.
         disk.write_ungated_for_test("v4:react:healthy", &sample_cached(8))
             .expect("write a healthy row");
         disk.flush_pending_inserts();
@@ -1978,9 +1818,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// On a full disk or a read-only remount every flush fails. Retrying the whole backlog on each
-    /// insert past the batch size made the cost O(N) per insert, and re-queueing every failed entry
-    /// let the queue hold one serialized envelope per distinct key for the rest of the process.
+    /// On a full disk or a read-only remount every flush fails. Inserts must back off rather than
+    /// retry the whole backlog each time, and the queue must stay bounded.
     #[test]
     fn a_failing_disk_neither_retries_every_insert_nor_grows_the_queue_without_bound() {
         use super::{DiskCache, MAX_PENDING_INSERTS, test_support};
@@ -2050,7 +1889,7 @@ mod tests {
     fn decode_last_seq_reads_the_prefix_without_full_decode() {
         let value = value_bytes(4242);
         assert_eq!(decode_last_seq(&value), 4242);
-        // The prefix IS the first 8 bytes — no envelope parse involved.
+        // The prefix is the first 8 bytes; no envelope parse involved.
         assert_eq!(&value[..SEQ_PREFIX_LEN], 4242_u64.to_le_bytes().as_slice());
     }
 
@@ -2076,15 +1915,14 @@ mod tests {
         use redb::{DatabaseError, StorageError};
         use std::io::{Error as IoError, ErrorKind};
 
-        // Genuine corruption / unrecoverable on-disk format → wipe + recreate.
+        // Genuine corruption or unrecoverable on-disk format: wipe and recreate.
         assert!(
             DiskCache::is_corruption_error(&DatabaseError::Storage(StorageError::Corrupted(
                 "mangled b-tree".to_owned()
             ))),
             "an explicit Corrupted signal is corruption"
         );
-        // redb reports a bad/absent magic number ("not a redb database") as an IO
-        // error of kind InvalidData — a format-corruption signal, not a fault.
+        // redb reports a bad or absent magic number as IO InvalidData.
         assert!(
             DiskCache::is_corruption_error(&DatabaseError::Storage(StorageError::Io(
                 IoError::from(ErrorKind::InvalidData)
@@ -2096,15 +1934,13 @@ mod tests {
             DiskCache::is_corruption_error(&DatabaseError::UpgradeRequired(2)),
             "an un-upgradable old file format is corruption"
         );
-        // Needed repair, repair prevented → the shard is unusable as-is.
+        // Repair needed but prevented: the shard is unusable as-is.
         assert!(
             DiskCache::is_corruption_error(&DatabaseError::RepairAborted),
             "an aborted repair leaves an unusable shard"
         );
 
-        // Transient / non-corruption → KEEP the (possibly valid) DB. This is the
-        // exact X-5 data-loss bug: a lock / AV / permission / flaky-drive IO fault
-        // must never be mistaken for corruption.
+        // Transient faults (lock, AV, permission, flaky drive) keep the possibly-valid DB.
         for kind in [
             ErrorKind::PermissionDenied,
             ErrorKind::WouldBlock,

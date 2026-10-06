@@ -93,11 +93,10 @@ impl Admission {
         loop {
             let remaining = deadline.remaining();
             if remaining.is_zero() {
-                // Pass on a wake this waiter cannot use. `release` notifies ONE waiter, so if the
-                // one it picks has already expired and leaves silently, the freed permit sits idle
-                // while a waiter that could still use it sleeps to its own deadline and also fails.
-                // Deadlines are absolute per call, so waiters routinely expire in a different order
-                // than they arrived.
+                // Pass on a wake this waiter cannot use. `release` notifies ONE waiter; if it
+                // picks an expired one that leaves silently, the freed permit idles while a live
+                // waiter sleeps to its own deadline. Deadlines are per call, so waiters expire out
+                // of order.
                 if *available > 0 {
                     self.changed.notify_one();
                 }
@@ -204,19 +203,16 @@ impl AssetExecutor {
 
 /// The process-wide asset executor, built once and shared by every request.
 ///
-/// Only SUCCESS is cached, and the cell's type is what enforces it. A failed
-/// `ThreadPoolBuilder::build` reflects thread or handle exhaustion — a machine state that clears on
-/// its own — so caching it would report Unmeasured for every asset-bearing package until a restart.
-/// A `OnceLock<AssetExecutor>` cannot hold a failure, which makes the retry structural rather than
-/// something a future edit has to remember.
+/// Only SUCCESS is cached, and the cell's type enforces it. A failed `ThreadPoolBuilder::build`
+/// reflects thread or handle exhaustion, which clears on its own; caching it would report
+/// Unmeasured for every asset-bearing package until a restart.
 fn executor() -> Result<&'static AssetExecutor, AssetBoundaryError> {
     static EXECUTOR: OnceLock<AssetExecutor> = OnceLock::new();
     if let Some(executor) = EXECUTOR.get() {
         return Ok(executor);
     }
-    // A racing caller may win the cell; its executor is the one everybody uses and ours is dropped.
-    // That costs one short-lived pool on cold start and keeps a single shared admission gate, which
-    // is the property that actually matters.
+    // A racing caller may win the cell; ours is then dropped. That costs one short-lived pool on
+    // cold start and keeps a single shared admission gate.
     let executor = AssetExecutor::new()?;
     Ok(EXECUTOR.get_or_init(|| executor))
 }
@@ -284,15 +280,10 @@ mod tests {
         }
     }
 
-    /// The two-permit bound is only real if every request shares ONE executor, and no other test can
-    /// observe that: the concurrency test below builds its own, so that a sibling test holding a
-    /// production permit cannot make it flake. Without this, de-globalizing `executor()` — a
-    /// refactor that reads as harmless cleanup — stays green while asset concurrency becomes
-    /// unbounded, since the engine releases its own permit before asset processing runs and this
-    /// gate is the only one left.
-    ///
-    /// It also pins the other half: only a SUCCESS is cached, so a transient build failure is
-    /// retried rather than kept for the daemon's lifetime.
+    /// The two-permit bound is only real if every request shares ONE executor. The concurrency test
+    /// below builds its own executor (so a sibling test's production permit cannot flake it), so
+    /// only this test catches a de-globalized `executor()`. The engine releases its permit before
+    /// asset processing runs, so this gate is the only bound left.
     #[test]
     fn every_caller_shares_one_process_wide_asset_executor() {
         let first = super::executor().expect("the production asset executor should build");

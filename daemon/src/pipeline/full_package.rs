@@ -1,10 +1,9 @@
 //! Memo for the full-package comparison build (§8.4/§6.3).
 //!
-//! `truly_treeshakeable` asks one question — is the named import materially smaller
-//! than the whole package? — and answers it with a second complete Rolldown build
-//! plus a second complete minify, of which only the minified *length* is ever used.
-//! That answer does not depend on which names were imported, but the import cache key
-//! does, so for N named variants of one entry the daemon paid 2N full builds.
+//! `truly_treeshakeable` asks whether the named import is materially smaller than the whole
+//! package, and answers with a second complete Rolldown build and minify, of which only the
+//! minified length is used. That length does not depend on which names were imported, but the
+//! import cache key does, so it is memoized per entry and runtime rather than per import.
 //!
 //! See [`crate::pipeline::build_memo`] for what makes this safe to cache.
 

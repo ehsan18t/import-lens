@@ -13,8 +13,8 @@ use super::AssetKind;
 /// An immutable non-JavaScript input captured at the engine load boundary.
 ///
 /// The bytes and fingerprint are deliberately one value: post-build processing must never reopen
-/// `path` and accidentally bind a size from new bytes to the fingerprint of the old bytes. `Arc`
-/// keeps clones cheap while the build state and translated artifact briefly share ownership.
+/// `path` and bind a size from new bytes to the fingerprint of old bytes. `Arc` keeps clones cheap
+/// while the build state and translated artifact briefly share ownership.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CollectedAsset {
     pub path: PathBuf,
@@ -49,9 +49,8 @@ impl CollectedAsset {
         &self.bytes
     }
 
-    /// A second handle on the SAME bytes, for a consumer that must outlive this value without
-    /// copying it. The snapshot is immutable by construction, so sharing it cannot change what was
-    /// measured.
+    /// A second handle on the SAME immutable bytes, for a consumer that must outlive this value
+    /// without copying it.
     pub fn bytes_arc(&self) -> Arc<[u8]> {
         Arc::clone(&self.bytes)
     }

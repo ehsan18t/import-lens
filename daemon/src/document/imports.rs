@@ -57,11 +57,9 @@ fn imports_from_region(
         ));
     }
 
-    // TypeScript erases a binding used only in type positions, so it costs nothing at
-    // runtime and must not be sized as a runtime import (see `type_only_binding_spans`).
-    // Only build a `Semantic` when there is something it could possibly elide: this
-    // runs per script region on every document analysis, including the workspace
-    // report's sweep over every file.
+    // TypeScript erases a binding used only in type positions (see `type_only_binding_spans`).
+    // A `Semantic` is built only when there is something to elide: this runs per script region
+    // on every document analysis, including the workspace report's sweep over every file.
     let type_only_spans = if source_type.is_typescript()
         && parsed
             .module_record
@@ -117,18 +115,16 @@ struct ImportGroup {
 /// ordinary valid TypeScript:
 ///
 /// ```ts
-/// import { ParseOptions } from "commander";   // erased — costs nothing at runtime
+/// import { ParseOptions } from "commander";   // erased: costs nothing at runtime
 /// const options: ParseOptions = {};
 /// ```
 ///
-/// Sending that to the bundler as a runtime named import makes it correctly report a
-/// missing runtime export, which the analyzer turns into a hard zero-size error on
-/// code that compiles and runs.
+/// Sent to the bundler as a runtime named import, that is a missing runtime export and a
+/// hard error on code that compiles and runs.
 ///
-/// A binding with NO references is deliberately NOT elided: under
-/// `verbatimModuleSyntax` / `isolatedModules` TypeScript preserves an unused value
-/// import, and it has real runtime cost. Eliding it would silently under-count, which
-/// is a worse failure than the one being fixed.
+/// A binding with no references is not elided: under `verbatimModuleSyntax` /
+/// `isolatedModules` TypeScript preserves an unused value import, and it has real runtime
+/// cost. Eliding it would silently under-count.
 ///
 /// Nor is a binding the component markup uses (`markup_uses`): the Vue, Svelte and Astro
 /// compilers keep an import the template renders, whatever the script does with it.
@@ -163,11 +159,10 @@ fn imports_from_static_imports(
 ) -> Vec<DetectedImport> {
     let mut groups = Vec::<ImportGroup>::new();
     let mut binding_imports = HashMap::<(String, u32, u32), usize>::new();
-    // Statements whose every binding was type-erased. The `requested_modules` loop
-    // below adds a NAMESPACE group for any statement it has not seen a binding for —
-    // that is how a bare `import "pkg"` is detected — so without this an elided
-    // statement would come back as a namespace import of the whole package, turning a
-    // zero-cost type import into the package's entire weight.
+    // Statements whose every binding was type-erased. The `requested_modules` loop below
+    // adds a namespace group for any statement it has not seen a binding for (that is how a
+    // bare `import "pkg"` is detected), so without this an elided statement comes back as a
+    // namespace import of the whole package.
     let mut elided_statements = HashSet::<(String, u32, u32)>::new();
 
     for entry in module_record.import_entries.iter() {
@@ -182,15 +177,11 @@ fn imports_from_static_imports(
             entry.statement_span.end,
         );
 
-        // Two spellings erase to nothing at runtime and must not be sized. A specifier
-        // carrying the inline `type` modifier (`{ type X }`), or a whole `import type`,
-        // is marked `is_type` by oxc. The legacy elision form — a value binding
-        // referenced only in type positions, with no `type` keyword — is caught by
-        // `type_only_spans`. Either way, register the statement as elided so the
-        // `requested_modules` fallback below cannot resurrect an all-type statement as a
-        // namespace import of the whole package. A mixed statement keeps its surviving
-        // value binding in `binding_imports` (added below) and is emitted normally; the
-        // elided key is then redundant with that entry and changes nothing.
+        // `{ type X }` and `import type` are marked `is_type` by oxc; the legacy elision form
+        // (a value binding referenced only in type positions) is in `type_only_spans`. Either
+        // way the statement is registered as elided so the `requested_modules` fallback cannot
+        // resurrect it as a namespace import. A mixed statement keeps its surviving value
+        // binding in `binding_imports` and is emitted normally.
         if entry.is_type || type_only_spans.contains(&entry.local_name.span) {
             elided_statements.insert(key);
             continue;

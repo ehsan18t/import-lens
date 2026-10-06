@@ -58,10 +58,10 @@ pub const NODE_BUILTIN_MODULES: &[&str] = &[
 
 /// Builtins Node exposes ONLY under the `node:` prefix.
 ///
-/// These are deliberately not reachable bare, so that `import x from "test"` keeps
-/// meaning the npm package named `test` — treating the bare form as a builtin would
-/// externalize a real dependency and report its size as zero. Sorted for binary
-/// search, and stored with the prefix because the bare spelling must never match.
+/// Not reachable bare, so `import x from "test"` keeps meaning the npm package named
+/// `test`; treating the bare form as a builtin would externalize a real dependency and
+/// report its size as zero. Sorted for binary search, and stored with the prefix because
+/// the bare spelling must never match.
 pub const NODE_PREFIX_ONLY_MODULES: &[&str] = &[
     "node:sea",
     "node:sqlite",
@@ -81,8 +81,8 @@ pub fn is_node_builtin_specifier(specifier: &str) -> bool {
 mod tests {
     use super::{NODE_BUILTIN_MODULES, NODE_PREFIX_ONLY_MODULES, is_node_builtin_specifier};
 
-    /// Both lists are binary-searched, so an unsorted entry is not a style problem —
-    /// it is a builtin that stops being recognized.
+    /// Both lists are binary-searched, so an unsorted entry is a builtin that stops
+    /// being recognized.
     #[test]
     fn builtin_list_stays_sorted_and_matches_node_prefixes() {
         assert!(

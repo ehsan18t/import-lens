@@ -9,25 +9,24 @@ use crate::engine::{AssetClass, AssetKind, CollectedAsset, UncountedAsset, class
 /// Resolve the local files referenced by `url()` in a bundled stylesheet.
 ///
 /// Lightning CSS reports the source file for every reference, including rules originating in an
-/// `@import` child. That source—not the synthetic union entry—is the base a browser/bundler uses.
+/// `@import` child. That source, not the synthetic union entry, is the base a bundler resolves
+/// from.
 ///
-/// Every reference lands in exactly one of these, and the split is the point: a resource this
-/// package ships is either counted, or disclosed with its bytes, or named as an omission — never
-/// dropped. Only a resource fetched from elsewhere at runtime leaves no trace, because it is not
-/// this import's cost to begin with (ADR-0004).
+/// Every reference lands in exactly one field: a resource this package ships is counted, disclosed
+/// with its bytes, or named as an omission, never dropped. A runtime-fetched resource is not this
+/// import's cost (ADR-0004) and is disclosed as `external`.
 pub(super) struct CssDependencyAssets {
     pub assets: Vec<CollectedAsset>,
     pub failures: Vec<CssDependencyFailure>,
-    /// Resolvable local files outside the counted CSS/wasm/font taxonomy — an image, an SVG. Their
+    /// Resolvable local files outside the counted CSS/wasm/font taxonomy (an image, an SVG). Their
     /// bytes ship, so they are disclosed at their real size and left out of the total.
     pub uncounted: Vec<UncountedAsset>,
     /// Local resources that ship but could not be located, read, or inspected, so not even their
     /// size is known. These make the result a floor: bytes are missing and the magnitude is not.
     pub omissions: Vec<String>,
-    /// Resources fetched over the network at runtime. Real weight the user pays, but not bytes this
-    /// package ships, so the measured size stays EXACT and keeps its budget verdict. Disclosed on
-    /// the `external` stage, which is durable and budgetable, rather than on a precision stage that
-    /// would refuse to judge an exact number.
+    /// Resources fetched over the network at runtime: not bytes this package ships, so the measured
+    /// size stays EXACT and keeps its budget verdict. Disclosed on the durable, budgetable
+    /// `external` stage, never on a precision stage that would refuse to judge an exact number.
     pub external: Vec<String>,
 }
 
@@ -44,8 +43,7 @@ enum SupportedAsset {
     Uncounted(UncountedAsset),
     Omitted(String),
     /// Fetched over the network at runtime, so not bytes this package ships. The measured size
-    /// stays exact and keeps its budget verdict; treating one of these as unmeasurable is what
-    /// silently disabled budgeting for every package that `@import`s a web font.
+    /// stays exact and keeps its budget verdict.
     External(String),
 }
 
@@ -102,10 +100,8 @@ pub(super) fn collect_referenced_assets(
         }
     }
 
-    // Stopping early is abandoned work, not an absence of references. Anything still queued when the
-    // deadline or the budget cut the walk short ships without being examined, so it is named as an
-    // omission: silently returning the references we happened to reach makes a short total look
-    // complete, which is the one outcome this module exists to prevent.
+    // Stopping early is abandoned work, not an absence of references: anything still queued is
+    // named as an omission, so a short total never looks complete.
     let abandoned = dependencies.count();
     if abandoned > 0 {
         omissions.insert(format!(
@@ -123,8 +119,8 @@ pub(super) fn collect_referenced_assets(
     }
 }
 
-/// A remote stylesheet is real weight the user's page pays, but it is fetched rather than shipped by
-/// this package, so it does not change what the measured bytes are — only what they leave out.
+/// A remote stylesheet is fetched rather than shipped by this package, so it is disclosed, never
+/// counted.
 fn external_import(dependency: ImportDependency) -> Option<String> {
     if dependency
         .url
@@ -150,9 +146,9 @@ fn collect_supported_asset(
     let specifier = dependency.url.trim();
     let source_file = Path::new(&dependency.loc.file_path);
 
-    // No separate artifact at all: a `data:` payload is already bytes inside the counted CSS text and
-    // a bare fragment points at the current document. These are the ONLY two reasons a reference may
-    // leave no trace, which is why they are decided here rather than falling out of a failed parse.
+    // No separate artifact: a `data:` payload is already inside the counted CSS text and a bare
+    // fragment points at the current document. These are the ONLY references that may leave no
+    // trace, so they are decided here explicitly rather than falling out of a failed parse.
     if specifier.is_empty()
         || specifier.starts_with('#')
         || specifier.to_ascii_lowercase().starts_with("data:")
@@ -160,9 +156,8 @@ fn collect_supported_asset(
         return None;
     }
 
-    // Externality is decided BEFORE the kind, and the order is load-bearing. Classifying first sent
-    // every unsupported extension out through one `None` arm, so a remote image and a shipped local
-    // image were indistinguishable — and both vanished.
+    // Externality is decided BEFORE the kind: a remote image and a shipped local image classify the
+    // same, and only this check tells them apart.
     if is_remote_reference(specifier) {
         return Some(SupportedAsset::External(format!(
             "CSS resource `{}` in {} is fetched at runtime and is not in this size",
@@ -172,10 +167,9 @@ fn collect_supported_asset(
     }
 
     // A reference we cannot turn into a path still names bytes that ship, so it is an OMISSION and
-    // never a silent `None`. Percent-escapes that do not decode to UTF-8 reach here — a CP-1252
-    // export naming `Ubuntu-R%E9gular.woff2` — and dropping one costs a whole font face from the
-    // total while leaving the result Measured at High confidence: cached, budgeted, and not
-    // invalidated by supplying the file, because a dropped reference enters no freshness either.
+    // never a silent `None`. Percent-escapes that do not decode to UTF-8 reach here (a CP-1252
+    // export naming `Ubuntu-R%E9gular.woff2`); dropping one would lose a font face from a total
+    // still reported Measured at High confidence.
     let Some(resource_path) = resource_path(specifier) else {
         return Some(SupportedAsset::Omitted(format!(
             "CSS resource `{}` in {} could not be interpreted as a file name, so its shipped bytes \
@@ -217,11 +211,10 @@ fn collect_supported_asset(
         ));
     }
 
-    // Outside the counted taxonomy — an image, an SVG, anything the processors do not handle. The
-    // bytes ship regardless, so they are disclosed at full size rather than dropped, and `stat`
-    // above is what expires that disclosure when the file changes.
-    // Only a binary is a separate artifact here. A `url()` naming a stylesheet is not: Lightning CSS
-    // inlines `@import` children into the one bundled sheet, so counting it again would double it.
+    // Outside the counted taxonomy (an image, an SVG): the bytes ship, so they are disclosed at
+    // full size, and `stat` above expires that disclosure when the file changes. Only a wasm or
+    // font is counted here; a `url()` naming a stylesheet is not, because Lightning CSS inlines
+    // `@import` children into the one bundled sheet and counting it again would double it.
     let counted_kind = classify_asset_class(&path).and_then(|class| match class {
         AssetClass::Counted(kind @ (AssetKind::Wasm | AssetKind::Font)) => Some(kind),
         _ => None,
@@ -243,10 +236,8 @@ fn collect_supported_asset(
 }
 
 /// Extract the filesystem-looking portion of a CSS resource URL. Query strings and fragments name
-/// the same emitted file. Returns `None` when the reference cannot be turned into a file name at
-/// all; the caller discloses that as an omission rather than dropping it. The `data:` and
-/// fragment-only cases are decided by the caller, because those are the only two references that
-/// legitimately name no artifact.
+/// the same emitted file. Returns `None` when the reference cannot be turned into a file name; the
+/// caller discloses that as an omission. The caller handles the `data:` and fragment-only cases.
 fn resource_path(specifier: &str) -> Option<PathBuf> {
     let path_end = specifier.find(['?', '#']).unwrap_or(specifier.len());
     let path = decode_percent_encoded(&specifier[..path_end])?;
@@ -259,10 +250,9 @@ fn resource_path(specifier: &str) -> Option<PathBuf> {
 
 /// A reference the browser fetches from elsewhere rather than one this package ships.
 ///
-/// Protocol-relative (`//cdn/x.woff2`) counts. Omitting that form makes a CDN font read as an
-/// unlocatable LOCAL file, which keeps the number correct but labels it a floor and drops its budget
-/// verdict. The one predicate for both discovery boundaries: `url()` here, and `@import` through
-/// the stylesheet bundler's resolve.
+/// Protocol-relative (`//cdn/x.woff2`) counts; otherwise a CDN font would read as an unlocatable
+/// local file and mark the size a floor. The one predicate for both discovery boundaries: `url()`
+/// here, and `@import` through the stylesheet bundler's resolve.
 pub(super) fn is_remote_reference(value: &str) -> bool {
     let value = value.trim();
     value.starts_with("//") || has_url_scheme(value)

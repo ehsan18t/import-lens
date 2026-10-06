@@ -14,8 +14,8 @@ pub fn compress_all(source: &str) -> Result<CompressionSizes, Box<dyn Error + Se
 }
 
 /// The same three compressors over raw bytes, for an artifact that is not text: a wasm module or a
-/// font, whose shipped size is simply its bytes (B2). A woff2 is already brotli-internally, so it
-/// barely shrinks again here — which is correct, and exactly what it costs on the wire.
+/// font, whose shipped size is its bytes. A woff2 is already brotli internally, so it barely
+/// shrinks again here, which is what it costs on the wire.
 pub fn compress_all_bytes(bytes: &[u8]) -> Result<CompressionSizes, Box<dyn Error + Send + Sync>> {
     let (gzip, (brotli, zstd)) = join(
         || gzip_compress(bytes),
@@ -38,11 +38,9 @@ fn gzip_compress(bytes: &[u8]) -> Result<usize, Box<dyn Error + Send + Sync>> {
 fn brotli_compress(bytes: &[u8]) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let mut output = Vec::new();
     {
-        // Quality 9, not 4, and not 11. Measured on a real 139 kB minified bundle: q4 reads 16.0%
-        // high against what a CDN actually serves, q9 reads 7.5% high, and q11 is exact. The cost
-        // is what decides it — q9 is +33 ms over q4, while q11 is +928 ms, on a compressor that runs
-        // per keystroke and often more than once per document. Half the overstatement for a third of
-        // a frame is the trade; a full second of lag is not.
+        // Quality 9. Measured on a real 139 kB minified bundle against what a CDN serves: q4
+        // reads 16.0% high, q9 7.5% high, q11 exact. q9 costs +33 ms over q4 and q11 +928 ms, on a
+        // compressor that runs per keystroke, often more than once per document.
         let mut writer = brotli::CompressorWriter::new(&mut output, 4096, 9, 22);
         writer.write_all(bytes)?;
     }

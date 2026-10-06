@@ -13,23 +13,17 @@ use std::{
     },
 };
 
-// Persist the full snapshot at most every N writes rather than on every write,
-// so refreshing M packages does not rewrite the whole file M times (O(M^2)
-// bytes). A trailing flush (per request / on Drop) persists the remainder.
+// Persist the full snapshot at most every N writes, so refreshing M packages does not rewrite
+// the whole file M times. A trailing flush (per request / on Drop) persists the remainder.
 const REGISTRY_PERSIST_BATCH: usize = 16;
 
-/// On-disk schema version for the registry metadata file. Bumping this (any
-/// format change to the persisted entries) makes `load_snapshot` wipe a file
-/// written under a different version instead of misparsing it. Scoped to the
-/// registry file only: a bundle-cache bump never touches this and vice-versa
-/// (§11).
+/// On-disk schema version for the registry metadata file. Bump it on any format change:
+/// `load_snapshot` wipes a file written under another version instead of misparsing it. Independent
+/// of the bundle-cache version (§11).
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 
-/// Versioned envelope wrapping the persisted entry map. Storing the bare
-/// `HashMap` gave the loader no way to tell a schema change from valid data;
-/// wrapping it lets the loader detect a wrong `schema_version` (or a
-/// pre-envelope bare-map file, which simply fails to parse as this struct) and
-/// wipe rather than misinterpret stale bytes.
+/// Versioned envelope wrapping the persisted entry map, so the loader can detect a wrong
+/// `schema_version` (or a bare-map file, which fails to parse) and wipe instead of misreading.
 #[derive(Default, Serialize, Deserialize)]
 struct RegistrySnapshot {
     schema_version: u32,
@@ -40,10 +34,8 @@ struct RegistrySnapshot {
     cleared_at: u64,
 }
 
-/// Borrowing twin of `RegistrySnapshot` used only to MEASURE the serialized
-/// snapshot size (the size cap) without cloning the whole map on every check.
-/// Its field order matches `RegistrySnapshot`, so the measured length equals the
-/// bytes `persist_snapshot` will actually write.
+/// Borrowing twin of `RegistrySnapshot`, so serializing (and measuring) never clones the map. Its
+/// field order must match `RegistrySnapshot`, so it writes the same bytes.
 #[derive(Serialize)]
 struct RegistrySnapshotRef<'a> {
     schema_version: u32,
@@ -132,8 +124,7 @@ impl RegistryMetadataCache {
             };
             entries.insert(cache_key(package_name), entry);
         }
-        // The in-memory map is the source of truth (get reads it), so defer the
-        // full-file persist; flush at a write threshold, per request, and on Drop.
+        // The in-memory map is the source of truth, so the full-file persist is deferred.
         if self.unpersisted_writes.fetch_add(1, Ordering::AcqRel) + 1 >= REGISTRY_PERSIST_BATCH {
             return self.flush();
         }
@@ -154,11 +145,8 @@ impl RegistryMetadataCache {
         Ok(())
     }
 
-    /// Serialized size in bytes of the current in-memory snapshot, measured
-    /// exactly as [`Self::persist_snapshot`] writes it (the versioned envelope).
-    /// One O(entries) serialization for cache-status observability (§8/X-24),
-    /// reusing the same [`snapshot_bytes`] measurement the size cap uses — never
-    /// on a write hot path. A poisoned lock degrades to 0.
+    /// Serialized size in bytes of the in-memory snapshot (the versioned envelope), for cache
+    /// status. One O(entries) serialization, never on a write hot path. A poisoned lock gives 0.
     pub fn serialized_size_bytes(&self) -> u64 {
         self.entries
             .lock()
@@ -166,11 +154,8 @@ impl RegistryMetadataCache {
             .unwrap_or(0)
     }
 
-    /// Empties the store and writes an authoritative empty snapshot that bypasses
-    /// the persist-time union, so the cleared entries do not resurrect from disk
-    /// on the next save (X-14). A normal `flush` keeps the union for cross-process
-    /// safety; only this authoritative path may deliberately shrink the shared
-    /// file to nothing.
+    /// Empties the store and writes an authoritative empty snapshot that bypasses the
+    /// persist-time union, so the cleared entries do not resurrect from disk on the next save.
     pub fn clear(&self) -> Result<(), String> {
         // No backing file (disabled / `empty()` cache): just empty the in-memory map.
         if self.path.as_os_str().is_empty() {
@@ -185,14 +170,10 @@ impl RegistryMetadataCache {
         let Ok(_persist_guard) = self.persist_lock.lock() else {
             return Err("registry cache persist lock poisoned".to_owned());
         };
-        // Empty the map, CAPTURE the authoritative (empty) snapshot, AND reset the
-        // pending-write count under ONE entries-lock hold. This closes the D-a race: a
-        // concurrent write_entry can no longer land between the clear and the snapshot
-        // capture. It is serialized either before the clear (its entry is dropped, and
-        // resetting the count here is correct — nothing of it remains) or after it (a
-        // fresh post-clear write whose own fetch_add re-counts it, so a later flush
-        // persists it). Doing the reset WITH the clear — not after the write below — is
-        // what stops it from clobbering a post-clear write's dirty flag.
+        // Clear, capture the snapshot, and reset the pending-write count under one entries-lock
+        // hold. A concurrent `write_entry` then lands either before the clear (dropped with it)
+        // or after (its own `fetch_add` re-counts it). Resetting after the write below instead
+        // would clobber a post-clear write's dirty flag.
         let snapshot = {
             let Ok(mut entries) = self.entries.lock() else {
                 return Err("registry cache lock poisoned".to_owned());
@@ -208,37 +189,25 @@ impl RegistryMetadataCache {
         self.write_snapshot(&snapshot)
     }
 
-    /// Retention prune: drops entries whose `updated_at` is older than
-    /// `retention_ms`, written AUTHORITATIVELY so the deletions stick. Invoked by
-    /// the user-triggered orphan purge; the automatic startup/periodic pass goes
-    /// through [`run_maintenance`], which layers the size cap on top. Returns the
-    /// number of entries removed.
+    /// Retention prune for the user-triggered orphan purge: drops entries older than
+    /// `retention_ms`, written authoritatively so the deletions stick. Returns the number removed.
+    /// The maintenance pass uses [`Self::run_maintenance`], which adds the size cap.
     pub fn purge_expired(&self, now_ms: u64, retention_ms: u64) -> usize {
         self.compact_authoritatively(now_ms, retention_ms, None)
     }
 
-    /// Periodic registry-store maintenance (D3 + D4 / §6.1): the 30-day retention
-    /// prune followed by a byte-budget size cap (evict oldest-`updated_at`
-    /// entries until the serialized snapshot fits `max_bytes`), then ONE
-    /// authoritative write. Runs on the maintenance pass — daemon startup and the
-    /// periodic tick — never on the write hot path, where serializing to measure
-    /// the size would be too costly. Returns the total entries removed (retention
-    /// + eviction).
+    /// Registry-store maintenance: the retention prune, then a byte-budget cap (evict
+    /// oldest-`updated_at` entries until the snapshot fits `max_bytes`), then one authoritative
+    /// write. Runs on the per-open maintenance pass (decision-log D3), never on the write hot path,
+    /// where measuring the size is too costly. Returns the total entries removed.
     pub fn run_maintenance(&self, now_ms: u64, max_bytes: u64) -> usize {
         self.compact_authoritatively(now_ms, REGISTRY_RETENTION_MS, Some(max_bytes))
     }
 
-    /// Shared body for the orphan purge and the maintenance pass. Merges the
-    /// on-disk view into memory FIRST (newest `updated_at` per key) so a sibling
-    /// process's fresh writes survive this authoritative rewrite, and so entries
-    /// only another (now-closed) window ever held are still subject to retention
-    /// and the size cap instead of lingering on disk forever; then prunes
-    /// past-retention entries, optionally evicts oldest entries down to
-    /// `max_bytes`, and writes the result with `union = false`.
-    ///
-    /// The authoritative write is what makes both the retention and the eviction
-    /// deletions stick: a union write would re-read disk and merge every
-    /// just-dropped entry straight back in, resurrecting it.
+    /// Shared body for the orphan purge and the maintenance pass. Merges the on-disk view in first
+    /// (newest `updated_at` per key), so a sibling process's writes survive and entries only a
+    /// closed window held are still pruned; then prunes, optionally evicts down to `max_bytes`,
+    /// and writes authoritatively. A union write would merge the dropped entries straight back.
     fn compact_authoritatively(
         &self,
         now_ms: u64,
@@ -264,19 +233,12 @@ impl RegistryMetadataCache {
         let Ok(_persist_guard) = self.persist_lock.lock() else {
             return 0;
         };
-        // Merge the on-disk view in, prune, evict, reset the pending-write count, AND
-        // capture the authoritative snapshot under ONE entries-lock hold — the same
-        // discipline as `clear()`. Doing the `store(0)` HERE (not after the write
-        // below) is what stops a concurrent `write_entry` landing between the snapshot
-        // capture and the reset from having its dirty flag clobbered: the D-a race,
-        // closed for `clear()` in F-b and now for the maintenance path too.
+        // Merge, prune, evict, reset the pending-write count, and capture the snapshot under one
+        // entries-lock hold, for the same reason as in `clear()`.
         let (removed, snapshot) = {
             let Ok(mut entries) = self.entries.lock() else {
                 return 0;
             };
-            // Merge before pruning so the prune/evict operate on the union of every
-            // process's writes and the authoritative write below cannot silently
-            // clobber a sibling window's fresh disjoint entries.
             let on_disk = load_snapshot(&self.path);
             self.adopt_clear(&mut entries, on_disk.cleared_at);
             merge_newest(&mut entries, on_disk.entries);
@@ -287,8 +249,7 @@ impl RegistryMetadataCache {
             self.unpersisted_writes.store(0, Ordering::Release);
             (removed, entries.clone())
         };
-        // union = false: the captured, merged-then-pruned-then-evicted snapshot becomes
-        // the file verbatim, so the deletions are not resurrected off disk on the next save.
+        // Written verbatim, never unioned with the file, so the deletions stick.
         let _ = self.write_snapshot(&snapshot);
         removed
     }
@@ -337,10 +298,8 @@ impl RegistryMetadataCache {
         self.write_snapshot(&snapshot)
     }
 
-    /// Serializes `snapshot` into the versioned envelope and writes it atomically
-    /// (temp file + rename). Touches NO locks, so it is shared by `persist_snapshot`
-    /// (after its clone/union/prune, under `persist_lock`) and `clear` (which captures
-    /// its own empty snapshot under the entries lock). Callers hold `persist_lock`.
+    /// Serializes `snapshot` into the versioned envelope and writes it atomically (temp file +
+    /// rename). Takes no locks; callers hold `persist_lock`.
     fn write_snapshot(
         &self,
         snapshot: &HashMap<String, RegistryPackageMetadataEntry>,
@@ -348,23 +307,15 @@ impl RegistryMetadataCache {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        // Measured byte-identically by `snapshot_bytes`/the size cap: `RegistrySnapshotRef`
-        // mirrors `RegistrySnapshot`'s field order, so the borrow serializes to the same
-        // bytes an owned `RegistrySnapshot` would — without cloning the map.
         let bytes = serde_json::to_vec(&RegistrySnapshotRef {
             schema_version: REGISTRY_SCHEMA_VERSION,
             entries: snapshot,
             cleared_at: self.cleared_at.load(Ordering::Acquire),
         })
         .map_err(|error| error.to_string())?;
-        // Persist atomically: a direct `fs::write` to the live path can truncate the
-        // cache if the process crashes mid-write. Write the full last-writer-wins
-        // snapshot to a temp file, then rename it over the target.
-        // Per-process temp name: the cache lives in shared global storage, so a
-        // fixed temp path would let two windows' writes interleave into one file
-        // and rename corrupt JSON into place (which load_snapshot then silently
-        // resets to empty). Each process writes its own complete, merged file;
-        // renames are atomic and the last one wins with a superset snapshot.
+        // Temp file + rename, so a crash mid-write cannot truncate the live file. The temp name is
+        // per process: the file is shared global storage, and a fixed temp path would let two
+        // windows interleave writes and rename corrupt JSON into place.
         let temp_path = self
             .path
             .with_extension(format!("json.{}.tmp", std::process::id()));
@@ -387,11 +338,8 @@ fn load_snapshot(path: &Path) -> RegistrySnapshot {
     let Ok(contents) = fs::read_to_string(path) else {
         return RegistrySnapshot::default();
     };
-    // Wipe on schema mismatch: a parse failure (e.g. a pre-envelope bare-map
-    // file, or a truncated/corrupt write) or a `schema_version` this build does
-    // not recognize yields an EMPTY map rather than a misparse. This is the
-    // sanctioned one-time cold-cache moment (§11), scoped to the registry file —
-    // it never touches the bundle shards.
+    // A parse failure or an unrecognized `schema_version` yields an empty map rather than a
+    // misparse (§11). Scoped to the registry file; it never touches the bundle shards.
     match serde_json::from_str::<RegistrySnapshot>(&contents) {
         Ok(snapshot) if snapshot.schema_version == REGISTRY_SCHEMA_VERSION => snapshot,
         _ => RegistrySnapshot::default(),
@@ -428,11 +376,8 @@ fn prune_expired_entries(
     before - entries.len()
 }
 
-/// Serialized length of the versioned envelope for `entries`, measured the way
-/// `write_snapshot` writes it, so a size-cap check matches the eventual on-disk
-/// file size. `cleared_at` is measured at its widest, so the estimate never falls
-/// short. Borrows the map (via `RegistrySnapshotRef`) to avoid cloning it on
-/// every measurement.
+/// Serialized length of the versioned envelope for `entries`, measured the way `write_snapshot`
+/// writes it. `cleared_at` is measured at its widest, so the estimate never falls short.
 fn snapshot_bytes(entries: &HashMap<String, RegistryPackageMetadataEntry>) -> u64 {
     serde_json::to_vec(&RegistrySnapshotRef {
         schema_version: REGISTRY_SCHEMA_VERSION,
@@ -443,11 +388,8 @@ fn snapshot_bytes(entries: &HashMap<String, RegistryPackageMetadataEntry>) -> u6
     .unwrap_or(0)
 }
 
-/// Approximate serialized footprint of one `"key":value` pair inside the entries
-/// object: the value's own JSON length, the quoted key, the colon, and one comma
-/// separator. Lets `evict_oldest_over_budget` bulk-evict without re-serializing
-/// the whole envelope per removal; the exact reconciliation there covers the
-/// small JSON-framing drift.
+/// Approximate serialized footprint of one `"key":value` pair in the entries object (value JSON,
+/// quoted key, colon, comma), so `evict_oldest_over_budget` need not re-serialize per removal.
 fn entry_footprint(key: &str, entry: &RegistryPackageMetadataEntry) -> u64 {
     let value_len = serde_json::to_vec(entry)
         .map(|bytes| bytes.len())
@@ -460,20 +402,15 @@ fn entry_footprint(key: &str, entry: &RegistryPackageMetadataEntry) -> u64 {
 /// so eviction is deterministic) until the serialized snapshot fits within
 /// `max_bytes`. Returns the number evicted.
 ///
-/// Two phases keep this O(n) rather than O(n^2). Phase one subtracts each
-/// victim's own [`entry_footprint`] from a running total instead of
-/// re-serializing the full envelope per removal. Phase two re-measures exactly
-/// once and drops a few more oldest entries if the per-entry estimate stopped a
-/// hair over budget (the comma framing makes it drift by ~1 byte per entry).
+/// Two phases keep this O(n): subtract each victim's [`entry_footprint`] from a running total,
+/// then re-measure exactly and drop a few more if the estimate (which drifts ~1 byte per entry
+/// from comma framing) stopped just over budget.
 fn evict_oldest_over_budget(
     entries: &mut HashMap<String, RegistryPackageMetadataEntry>,
     max_bytes: u64,
 ) -> usize {
-    // A zero budget means "no size cap" (disabled), matching the main byte budget
-    // (`budget.rs` returns early on `budget_bytes == 0`) — NOT "evict everything".
-    // Without this, a hand-edited `registryCacheMaxSizeMB: 0` would wipe the entire
-    // hint store on every maintenance pass; RB-16 made this value live end-to-end,
-    // where the old hardcoded 32 MiB constant could never reach zero.
+    // A zero budget means "no size cap", matching the main byte budget, never "evict everything"
+    // (decision-log D10).
     if max_bytes == 0 {
         return 0;
     }
@@ -499,8 +436,7 @@ fn evict_oldest_over_budget(
         entries.remove(&key);
         evicted += 1;
     }
-    // Exact reconciliation against the real envelope size: drop a few more oldest
-    // entries if the per-entry estimate left us fractionally over budget.
+    // Exact reconciliation against the real envelope size.
     while snapshot_bytes(entries) > max_bytes {
         let Some(key) = ordered.next() else { break };
         entries.remove(&key);
@@ -542,10 +478,7 @@ mod tests {
 
     #[test]
     fn zero_budget_disables_size_eviction_instead_of_wiping_everything() {
-        // RB-16 hazard guard: a hand-edited `registryCacheMaxSizeMB: 0` (out of the
-        // package.json schema) must mean "no size cap" — NOT "evict every hint".
-        // Without the `max_bytes == 0` guard, `evict_oldest_over_budget` drains the
-        // whole store on every maintenance pass.
+        // A hand-edited `registryCacheMaxSizeMB: 0` means "no size cap", not "evict every hint".
         let mut entries = HashMap::new();
         entries.insert("react".to_owned(), entry(1_000));
         entries.insert("lodash".to_owned(), entry(2_000));
@@ -575,8 +508,7 @@ mod tests {
         cache.flush().expect("persist the seeded entry");
         assert!(cache.get("react").is_some());
 
-        // clear() empties the in-memory store AND writes an authoritative empty
-        // snapshot (union-bypassing), returning the write's Result (D-a).
+        // clear() empties the in-memory store and writes an authoritative empty snapshot.
         cache
             .clear()
             .expect("clear should persist the empty snapshot");
@@ -585,8 +517,7 @@ mod tests {
             "clear empties the in-memory store"
         );
 
-        // A fresh load from the same file sees the cleared state — the empty snapshot
-        // is durable, not resurrected off disk by a union write.
+        // A fresh load sees the cleared state, not entries resurrected by a union write.
         let reloaded = RegistryMetadataCache::new(dir.clone());
         assert!(
             reloaded.get("react").is_none(),

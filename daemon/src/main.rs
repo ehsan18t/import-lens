@@ -61,8 +61,8 @@ where
     while let Some(arg) = iterator.next() {
         match arg.as_str() {
             "--pipe" => parsed.pipe = iterator.next(),
-            // Accepted and ignored: the extension and the CLI still pass it, but the workspace
-            // root of every request comes from the client's `hello`.
+            // Accepted and ignored: the extension and the CLI pass it, but the workspace root of
+            // every request comes from the client's `hello`.
             "--workspace" => {
                 iterator.next();
             }

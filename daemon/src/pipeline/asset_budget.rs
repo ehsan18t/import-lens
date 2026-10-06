@@ -29,9 +29,8 @@ impl AssetBudgetLimits {
     ///
     /// The two cannot both be production in one test: a union that breaches the 256-file attempt
     /// bound needs N > 256 reads, and its per-sheet retry reads all N again, so the pair costs 2N
-    /// against a build-wide ledger of 512. Any N that triggers the degradation also exhausts the
-    /// ledger. That is real production behaviour and is recorded in known-issues; a test that wants
-    /// to observe the degradation itself has to hold the other limit out of the way.
+    /// against a build-wide ledger of 512. That is real production behaviour (known-issues D9); a
+    /// test that observes the degradation itself must hold the other limit out of the way.
     #[cfg(test)]
     pub(crate) fn unbounded_css_work() -> Self {
         Self {
@@ -42,8 +41,7 @@ impl AssetBudgetLimits {
     }
 
     /// A ledger with no room at all, for a test that exercises what a BREACH does rather than what
-    /// triggers one. In production the same state needs a graph near the 2,000-file cap; the
-    /// behaviour under breach is identical and is what matters.
+    /// triggers one. In production the same state needs a graph near the 2,000-file cap.
     #[cfg(test)]
     pub(crate) fn exhausted() -> Self {
         Self {
@@ -302,8 +300,8 @@ impl AssetProcessingContext {
     }
 
     /// Stat a CSS-referenced resource and record what was seen: its metadata, or the absence or
-    /// failure. A resource disclosed by size rather than read still needs this, or the cached
-    /// disclosure would not expire when the file changes or disappears.
+    /// failure. A resource disclosed by size needs this so its cached disclosure expires when the
+    /// file changes or disappears.
     pub(crate) fn observe_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
         match std::fs::metadata(path) {
             Ok(metadata) => {
@@ -333,10 +331,8 @@ impl AssetProcessingContext {
 
     /// One snapshot by canonical path, for a retry that needs the bytes an earlier attempt read.
     ///
-    /// Deliberately not a bulk `snapshots()` accessor. Handing out the whole map made every
-    /// per-sheet retry clone every read before it — quadratic in exactly the degraded case the
-    /// retries exist to serve — and no caller ever needed more than the one path it was about to
-    /// open.
+    /// Deliberately not a bulk accessor: cloning the whole map per retry is quadratic in exactly
+    /// the degraded case the retries serve.
     pub(crate) fn snapshot_for(&self, path: &Path) -> Option<CollectedAsset> {
         self.lock_state().snapshots.get(path).cloned()
     }
@@ -351,11 +347,10 @@ impl AssetProcessingContext {
 
     /// Record a read that failed, keeping WHY.
     ///
-    /// A missing file gets the absent sentinel — fresh while it stays missing, stale the moment it
-    /// appears — so a package that imports something which is not there stays cacheable instead of
-    /// rebuilding on every keystroke. Anything else stays unverifiable, which is never fresh,
-    /// because we cannot say what state the file was in. One path carrying two different
-    /// observations is a conflict and refuses the whole result.
+    /// A missing file gets the absent sentinel (fresh while it stays missing, stale once it
+    /// appears), so a package importing a missing file stays cacheable. Any other failure is
+    /// unverifiable, which is never fresh. One path carrying two different observations is a
+    /// conflict and refuses the whole result.
     pub(crate) fn record_failed_path(&self, path: &Path, missing: bool) {
         let path = canonical_path(path);
         let mut state = self.lock_state();
@@ -469,12 +464,11 @@ impl AssetProcessingContext {
             return Err(limit_io_error(&state));
         }
 
-        // Every successful observation reconciles against the path ledger, not only the read that
-        // first inserted it. A union attempt may reserve metadata and fail locally before reading;
-        // a later per-sheet retry then sees an existing path. If that file grew, skipping the
-        // second reconciliation would let the growth escape the aggregate cap. Keep the maximum
+        // Every successful observation reconciles against the path ledger, not only the first read:
+        // a union attempt may reserve metadata and fail before reading, and a later retry then sees
+        // an existing path whose file may have grown past the aggregate cap. Keep the maximum
         // observed size: overlapping reads can briefly retain both snapshots, so shrinking the
-        // reservation here would understate peak memory.
+        // reservation would understate peak memory.
         if !state.graph_files.contains(&reservation.path) {
             let charged_bytes = *state
                 .unique_files
@@ -670,12 +664,8 @@ fn normalized_observations(observations: &[FileFingerprint]) -> Vec<FileFingerpr
     fingerprints
 }
 
-/// Keep the FIRST breach, which is the one that actually stopped the work.
-///
-/// This used to keep the lexicographically smallest message, so the reported limit could name a
-/// later breach that only happened because the first one had already been hit — telling the user
-/// about a symptom while the cause sat behind it. Ordering by content also made the answer depend on
-/// how the messages happened to be spelled.
+/// Keep the FIRST breach, which is the one that actually stopped the work; a later breach is its
+/// symptom.
 fn record_limit(state: &mut BudgetState, message: String) {
     state.module_limit_message.get_or_insert(message);
 }

@@ -1,6 +1,5 @@
-//! Non-JS asset processing (B2): a package's real cost is not only its JavaScript. A UI kit ships
-//! CSS; some packages ship wasm or fonts. The engine measures the JS chunk exactly and hands the
-//! reachable assets here to be processed the way they actually ship, so their bytes can be folded
+//! Non-JS asset processing. The engine measures the JS chunk exactly and hands the reachable assets
+//! (CSS, wasm, fonts) here to be processed the way they actually ship, so their bytes are folded
 //! into the Import Cost rather than merely disclosed.
 //!
 //! - **CSS** goes through Lightning CSS: resolve the `@import` tree from disk into one stylesheet,
@@ -14,11 +13,10 @@
 //! ([ADR-0005](../../../docs/adr/0005-a-runtime-is-an-artifact-boundary.md)): they are separate
 //! files that ship separately, so concatenating them before compressing would invent a number.
 //!
-//! Every path Lightning CSS opens — the entry and each resolved `@import` child — plus supported
+//! Every path Lightning CSS opens (the entry and each resolved `@import` child) plus supported
 //! local artifacts referenced by `url()` are captured for cache freshness, so an edit to any of
 //! them invalidates the measured size. Any processing failure falls back to disclosing the raw
-//! bytes, which is exactly today's behaviour: never below it
-//! ([ADR-0006](../../../docs/adr/0006-the-result-model.md)).
+//! bytes, never below that floor ([ADR-0006](../../../docs/adr/0006-the-result-model.md)).
 
 use crate::cache::key::{FileFingerprint, sort_and_dedup_fingerprints};
 #[cfg(test)]
@@ -42,26 +40,21 @@ use std::time::Duration;
 
 /// How many files one `@import` tree may pull in, and how many bytes of them.
 ///
-/// The JavaScript graph has [`crate::engine::limits`]; a stylesheet's `@import` children are never
-/// graph modules, so nothing bounded them at all.
+/// A stylesheet's `@import` children are not graph modules, so [`crate::engine::limits`] does not
+/// bound them; this does.
 ///
-/// The file count doubles as the DEPTH bound, which is what makes it load-bearing rather than tidy.
-/// Lightning CSS recurses per `@import`, and a chain deep enough overflows the stack — around 800
-/// frames in a release build. That is not catchable: `catch_unwind` never runs, the process
-/// `__fastfail`s, and the daemon dies with every in-flight request. The canonicalizing `resolve`
-/// below removes the cycle that made depth unbounded; this bounds the honest-but-absurd chain that
-/// remains. A chain of N files costs N reads, so refusing at 256 stops the walk roughly three times
-/// short of where the stack gives out in the build that actually ships.
+/// The file count doubles as the DEPTH bound. Lightning CSS recurses per `@import`, and a deep
+/// enough chain overflows the stack (around 800 frames in a release build). That is not catchable:
+/// the process `__fastfail`s and the daemon dies with every in-flight request. The canonicalizing
+/// `resolve` below breaks cycles; this bounds the honest-but-absurd chain. Refusing at 256 stops
+/// the walk roughly three times short of where the release build's stack gives out.
 ///
-/// Breaching either is not a wrong number: the set falls back to the per-sheet path, and failing that
-/// to raw-byte disclosure, which is the pre-B2 behaviour and the floor this feature promised never to
-/// go below.
+/// Breaching either is not a wrong number: the set falls back to the per-sheet path, and failing
+/// that to raw-byte disclosure.
 ///
-/// It cannot be raised on the grounds that a flat set of many sheets is harmless: the budget cannot
-/// tell breadth from depth, and giving the walk its own big stack does not help, because Lightning CSS
-/// drives the `@import` graph on `rayon` workers, whose stacks it does not own. 256 stylesheets in one
-/// runtime group is already far more than real packages ship; a set past it degrades to the per-sheet
-/// path, which is disclosed, rather than being dropped.
+/// Do not raise it because a flat set of many sheets is harmless: the budget cannot tell breadth
+/// from depth, and a bigger stack does not help, because Lightning CSS drives the `@import` graph
+/// on `rayon` workers whose stacks it does not own.
 const MAX_STYLESHEET_FILES: usize = 256;
 const MAX_STYLESHEET_BYTES: usize = 8 * 1024 * 1024;
 
@@ -158,9 +151,9 @@ impl TrackingProvider {
     /// The ONE way to build a provider. Tests pass a context with test limits rather than a
     /// different constructor.
     ///
-    /// `preloaded` holds only THIS attempt's entries. Everything an earlier attempt read is looked
-    /// up on demand through the context, because copying the whole snapshot map per attempt made
-    /// each per-sheet retry pay for every read before it.
+    /// `preloaded` holds only THIS attempt's entries. Anything an earlier attempt read is looked up
+    /// on demand through the context; copying the whole snapshot map per attempt would make each
+    /// per-sheet retry pay for every earlier read.
     fn new(
         entries: &[CollectedAsset],
         synthetic: Option<(PathBuf, String)>,
@@ -252,7 +245,7 @@ impl SourceProvider for TrackingProvider {
     fn read<'a>(&'a self, file: &Path) -> Result<&'a str, Self::Error> {
         self.check_deadline()?;
         // The synthetic entry has no file behind it, so it is served from memory and never recorded
-        // as a freshness input — there is nothing on disk that could change.
+        // as a freshness input.
         if let Some((path, content)) = &self.synthetic
             && file == path
         {
@@ -262,12 +255,11 @@ impl SourceProvider for TrackingProvider {
         // Canonicalize so a cache key is stable across `..` / symlink spellings of the same file.
         let key = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
         // Every outcome below reaches the ledger: a snapshot charge, a metadata reservation, or a
-        // failed read. A missing/broken child is part of why processing fell back and must not
-        // disappear from freshness merely because it had no bytes to hash.
+        // failed read. A missing or broken child must stay in freshness even with no bytes to hash.
         //
         // This attempt's own entry first, then anything an earlier attempt already read. Reusing the
-        // ledger's snapshot is what keeps a retry measuring the SAME bytes the union measured, and
-        // what stops it from charging the same file twice.
+        // ledger's snapshot keeps a retry measuring the SAME bytes the union measured, and stops it
+        // charging the same file twice.
         let snapshot = self
             .preloaded
             .get(&key)
@@ -332,10 +324,8 @@ impl SourceProvider for TrackingProvider {
         originating_file: &Path,
     ) -> Result<ResolveResult, Self::Error> {
         // A REMOTE `@import` (`@import url("https://fonts.googleapis.com/…")`, or any other scheme
-        // such as `data:`) has no file behind it and is not ours to inline — a real bundler leaves
-        // it in the sheet as an import, and so do we. Reporting it as external keeps the rest of
-        // the stylesheet counted; treating it as a resolve failure would sink the whole set to raw
-        // disclosure over a shape ordinary packages ship.
+        // such as `data:`) has no file behind it; a real bundler leaves it in the sheet, and so do
+        // we. Treating it as a resolve failure would sink the whole set to raw disclosure.
         if is_remote_reference(specifier) {
             return Ok(ResolveResult::External(specifier.to_owned()));
         }
@@ -352,14 +342,11 @@ impl SourceProvider for TrackingProvider {
             }
         };
 
-        // CANONICALIZE, and not for tidiness: Lightning CSS cycle-detects on the very PathBuf
-        // spelling this returns, and `FileProvider::resolve` is a naive `with_file_name` join that
-        // never normalizes `..`. A cycle that crosses a `../` therefore hands back a LONGER, DISTINCT
-        // key for the SAME file on every hop, the dedup never fires, and the recursion overflows the
-        // stack — which `catch_unwind` cannot catch, so the daemon dies outright rather than failing
-        // one import. `node_modules` is untrusted input and an `@import` cycle is silent in browsers
-        // and in every real bundler (they dedupe on a resolved URL), so a package can ship one and
-        // never know. Canonicalizing makes the key an identity, and the cycle terminates.
+        // CANONICALIZE: Lightning CSS cycle-detects on the PathBuf spelling this returns, and
+        // `FileProvider::resolve` never normalizes `..`. A cycle crossing `../` would hand back
+        // a longer, distinct key for the same file on every hop and overflow the stack, which
+        // `catch_unwind` cannot catch, killing the daemon. Browsers and real bundlers tolerate
+        // `@import` cycles, so packages can ship one unknowingly. A canonical key terminates it.
         Ok(ResolveResult::File(
             std::fs::canonicalize(&resolved).unwrap_or(resolved),
         ))
@@ -386,9 +373,8 @@ pub struct CssBundle {
     /// dependency analysis could not inspect a sheet's URLs at all (an ambiguous relative URL in a
     /// custom property fails the metadata-only print while both measuring prints succeed).
     ///
-    /// Dependency analysis is metadata-only and must never discard an otherwise valid CSS size, so
-    /// the CSS contribution is kept and the omission is disclosed. It is an OMISSION, not an
-    /// over-count: these bytes are missing from the total, so they make the result a floor.
+    /// Dependency analysis must never discard an otherwise valid CSS size, so the CSS is kept and
+    /// the omission disclosed. These bytes are missing from the total, so the result is a floor.
     pub dependency_omissions: Vec<String>,
     /// Runtime-fetched resources: real weight, but not bytes this package ships, so the measured
     /// size is exact and stays budgetable.
@@ -435,9 +421,8 @@ pub fn bundle_css(entry: &Path) -> Result<CssBundle, String> {
 
 /// A production-shaped ledger for a test that only wants to bundle something.
 ///
-/// Production limits deliberately: a test that quietly ran under looser bounds than the daemon
-/// would be measuring a different system. The per-attempt stylesheet-tree bound lives on the
-/// provider and still applies, which is what the budget tests exercise.
+/// Production limits deliberately: a test under looser bounds would measure a different system.
+/// The per-attempt stylesheet-tree bound lives on the provider and still applies.
 #[cfg(test)]
 fn process_assets_for_test(assets: &[CollectedAsset]) -> ProcessedAssets {
     process_assets(assets, test_context(assets))
@@ -535,16 +520,13 @@ fn synthetic_entry(entries: &[PathBuf]) -> (PathBuf, String) {
 
 /// Escape a path for use inside a CSS string.
 ///
-/// Backslash and double-quote are the only characters that can end the string or start an escape, so
-/// escaping them is the whole job — and it is not theoretical: a package is free to ship a file whose
-/// name contains a quote (POSIX allows it), which would otherwise close the string and inject rules
-/// into the sheet we are about to measure. `node_modules` is untrusted input.
+/// Backslash and double-quote are the only characters that can end the string or start an escape,
+/// so escaping them is the whole job. A package may ship a file whose name contains a quote (POSIX
+/// allows it), which would otherwise inject rules into the sheet being measured.
 ///
-/// This replaces a blanket `\` -> `/` rewrite, which was wrong twice over: it corrupted a legitimate
-/// POSIX path containing a literal backslash, and on Windows it turned a verbatim `\\?\C:\…` prefix
-/// into `//?/C:/…`, which is NOT verbatim — silently switching off the `..` normalization that
-/// `PathBuf` applies to verbatim paths, and with it the only thing keeping an `@import` cycle from
-/// recursing forever. Backslashes are kept and escaped instead.
+/// Never rewrite `\` to `/`: that corrupts a POSIX path containing a literal backslash, and turns a
+/// Windows verbatim `\\?\C:\…` prefix into a non-verbatim `//?/C:/…`, switching off the `..`
+/// normalization that keeps an `@import` cycle from recursing forever.
 fn css_string_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -696,26 +678,22 @@ pub struct ProcessedAssets {
     /// measured asset byte, plus a sentinel for every failed read. A later success in the same
     /// union/retry flow does not erase a failure: that mixed observation cannot be reused.
     pub read_time_fingerprints: Vec<FileFingerprint>,
-    /// Assets that could NOT be processed, disclosed with their raw bytes exactly as before.
+    /// Assets that could NOT be processed, disclosed with their raw bytes.
     pub uncounted: Vec<UncountedAsset>,
     /// Why each of those fell back, for the diagnostic.
     pub failures: Vec<String>,
     /// Why the stylesheet set could not be bundled as ONE artifact, when it could not.
     ///
-    /// Every sheet is still counted, so this leaves `uncounted` EMPTY — which is exactly why it is
-    /// its own field instead of a line in `failures`. `failures` is read only as the detail of the
-    /// `uncounted` disclosure, so a degradation with no uncounted asset had nothing to hang from
-    /// and was dropped on the floor, taking a silent, High-confidence, cacheable over-count with
-    /// it. Every channel here now has one consumer and its own trigger.
+    /// Every sheet is still counted, so this leaves `uncounted` EMPTY. That is why it is its own
+    /// field: `failures` is read only as the detail of the `uncounted` disclosure, which is silent
+    /// when nothing is uncounted. Every channel here has one consumer and its own trigger.
     pub stylesheets_measured_separately: Option<String>,
     /// Local resources a counted stylesheet references that are missing from the total and whose
-    /// size is not even known — an unlocatable path, an unreadable file, or a sheet whose URLs
-    /// could not be inspected at all.
+    /// size is not even known: an unlocatable path, an unreadable file, or a sheet whose URLs could
+    /// not be inspected at all.
     ///
-    /// This is an OMISSION channel. It used to be disclosed as `imprecise_assets`, the stage that
-    /// means the number reads HIGH, which pointed the disclosure in the opposite direction from the
-    /// error: `incomplete` never fired, so a total missing real shipped bytes was cached and
-    /// recorded as a file's permanent baseline.
+    /// This is an OMISSION channel (the number is a floor), never `imprecise_assets` (which means
+    /// the number reads HIGH).
     pub css_dependency_omissions: Vec<String>,
     /// The `uncounted` rows are a lower bound on what is missing: a resource limit stopped the
     /// walk, so the `@import` children and `url()` resources those rows reach are missing too.
@@ -748,9 +726,8 @@ impl ProcessedAssets {
     /// lower bound rather than a complete File Cost.
     pub fn has_uncounted_assets(&self) -> bool {
         // A CSS-referenced omission counts here even though it has no `UncountedAsset` row: the
-        // bytes are missing from the total just the same, and the fact that their size is unknown
-        // makes the result MORE of a floor, not less. Reading only `uncounted` is what let an
-        // omission through as a complete measurement.
+        // bytes are missing from the total just the same, and an unknown size makes the result MORE
+        // of a floor, not less.
         !self.uncounted.is_empty() || !self.css_dependency_omissions.is_empty()
     }
 
@@ -778,10 +755,9 @@ impl ProcessedAssets {
     }
 }
 
-/// The disclosure for assets that could NOT be processed. This is the pre-B2 behaviour kept as the
-/// fallback: their bytes are real, they ship, and they are not in the number — which is exactly
-/// what this stage has always meant. `None` when everything was counted, which is the normal case,
-/// and that absence is what lets a CSS-shipping package leave Medium confidence.
+/// The disclosure for assets that could NOT be processed: their bytes are real, they ship, and they
+/// are not in the number. `None` when everything was counted (the normal case), and that absence is
+/// what lets a CSS-shipping package leave Medium confidence.
 pub fn uncounted_assets_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
     if processed.uncounted.is_empty() {
         return None;
@@ -799,20 +775,17 @@ pub fn uncounted_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
 
 /// The disclosure for assets that ARE counted but whose bytes are counted more than once.
 ///
-/// The union buys TWO things, and losing it costs both: it dedupes an `@import` two sheets share,
-/// AND it puts the whole set through ONE compression stream. When it fails, each sheet is measured
-/// and compressed alone, so shared bytes are inlined into each and no sheet's compressor can reach
-/// what the others contain. The second term dominates, by a lot: 300 tiny sheets sharing no
-/// `@import` at all — the shape that actually breaches the file budget — sum to ~40x the union's
-/// gzip and ~57x its brotli, because every stream restarts its window and pays its own header.
+/// The union buys TWO things: it dedupes an `@import` two sheets share, AND it puts the whole set
+/// through ONE compression stream. When it fails, each sheet is measured and compressed alone. The
+/// second term dominates: 300 tiny sheets sharing no `@import` at all (the shape that actually
+/// breaches the file budget) sum to ~40x the union's gzip and ~57x its brotli, because every stream
+/// restarts its window and pays its own header.
 ///
-/// That is why this fires on the union having failed, not on the sheets provably sharing bytes.
-/// Sheets that share nothing are not the safe case to stay quiet about; they are the worst one.
-/// `None` in the normal case, where the union held.
+/// So this fires on the union having failed, not on the sheets provably sharing bytes: sheets that
+/// share nothing are the worst case, not the safe one. `None` when the union held.
 ///
-/// This is separate from [`uncounted_assets_diagnostic`] because it reports a different fact: bytes
-/// present but over-counted, not bytes missing. Folding it into that one is what hid it — that
-/// function returns early when nothing is uncounted, which is exactly the degraded case.
+/// Separate from [`uncounted_assets_diagnostic`], which reports bytes missing (and returns early
+/// when nothing is uncounted, exactly the degraded case); this reports bytes over-counted.
 pub fn imprecise_assets_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
     let reason = processed.stylesheets_measured_separately.as_ref()?;
 
@@ -828,11 +801,8 @@ pub fn imprecise_assets_diagnostic(processed: &ProcessedAssets) -> Option<Import
 
 /// The disclosure for local resources a counted stylesheet references but the size does not include.
 ///
-/// `UNCOUNTED_ASSETS`, not `IMPRECISE_ASSETS`. Those two stages point in opposite directions:
-/// imprecise means bytes are counted more than once and the number reads HIGH, uncounted means
-/// bytes are missing and the number is a floor. This channel is the second one, and reporting it as
-/// the first is what stopped `incomplete` from firing — so a File Cost short by real shipped bytes
-/// passed every durability gate and was written to the no-TTL history as that file's baseline.
+/// `UNCOUNTED_ASSETS`, not `IMPRECISE_ASSETS`: imprecise means the number reads HIGH, uncounted
+/// means bytes are missing and the number is a floor, which is what makes `incomplete` fire.
 fn omitted_css_resources_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
     if processed.css_dependency_omissions.is_empty() {
         return None;
@@ -850,10 +820,9 @@ fn omitted_css_resources_diagnostic(processed: &ProcessedAssets) -> Option<Impor
 /// The disclosure for resources a counted stylesheet fetches at runtime rather than ships.
 ///
 /// `EXTERNAL`, which is durable AND budgetable, because the measured bytes are exact without them:
-/// a CDN font is weight the page pays but not weight this package carries, so refusing to judge the
-/// number would be wrong. Routing these through a precision stage is what silently disabled budget
-/// verdicts for every package that `@import`s a web font. The disclosure still costs High
-/// confidence, which is the honest reading — there is runtime weight this number does not model.
+/// a CDN font is weight the page pays but not weight this package carries. Never route these
+/// through a precision stage, which would refuse a budget verdict. The disclosure still costs High
+/// confidence: there is runtime weight this number does not model.
 fn external_css_resources_diagnostic(processed: &ProcessedAssets) -> Option<ImportDiagnostic> {
     if processed.css_dependency_external.is_empty() {
         return None;
@@ -955,8 +924,7 @@ fn boundary_failure(error: AssetBoundaryError) -> AssetProcessingFailure {
 
 /// Production entry: asset work has its own two-wide admission gate and one absolute deadline.
 ///
-/// Public because the freshness integration test measures through it. There used to be an unbounded
-/// entry point for that, which meant the test measured code production never runs.
+/// Public because the freshness integration test measures through it; there is no unbounded entry.
 pub fn process_assets_bounded(
     assets: Vec<CollectedAsset>,
     graph_source_bytes: usize,
@@ -980,9 +948,9 @@ pub fn process_assets_bounded(
 /// A resource-ledger breach as a DISCLOSURE rather than an error: every collected asset at its raw
 /// size, none counted, with the observations that expire it.
 ///
-/// The import's JavaScript is measured before this stage runs, so failing the stage throws away a
-/// complete measurement and reports the whole import Unmeasured, below the pre-B2 floor FR-018a
-/// promises never to go under. The number stands and says what it could not reach.
+/// The import's JavaScript is measured before this stage runs, so failing the stage would discard a
+/// complete measurement and report the import Unmeasured, below the floor FR-018a promises. The
+/// number stands and says what it could not reach.
 fn disclose_budget_breach(
     assets: &[CollectedAsset],
     failure: AssetBudgetFailure,
@@ -1015,10 +983,10 @@ fn disclose_budget_breach(
 
 /// Process every reachable asset the build collected, the way each really ships.
 ///
-/// Never fails on an asset it cannot process: that falls back to the raw-byte disclosure that was
-/// the whole behaviour before B2. A breach of the shared ledger, whenever it is detected, is a
-/// deterministic fact about the build and becomes [`disclose_budget_breach`]'s floor. Only the
-/// deadline fails the stage, because a timeout is request-local and must never be cached.
+/// Never fails on an asset it cannot process: that falls back to raw-byte disclosure. A breach of
+/// the shared ledger, whenever it is detected, is a deterministic fact about the build and becomes
+/// [`disclose_budget_breach`]'s floor. Only the deadline fails the stage, because a timeout is
+/// request-local and must never be cached.
 fn process_assets(
     assets: &[CollectedAsset],
     context: Arc<AssetProcessingContext>,
@@ -1106,24 +1074,17 @@ fn process_stylesheets(
         return Vec::new();
     }
 
-    // One artifact for the whole set is the right answer (it is how CSS ships, and it dedupes what
-    // two sheets share) — but it is all-or-nothing, and a set fails as a unit. A package that ships
-    // one `.scss`, or one sheet with a bare `@import` Lightning CSS cannot resolve, would take every
-    // other stylesheet down with it, and in the File Cost's combined build that set spans every
-    // import in the runtime group. So if the union fails, retry per sheet: the ones that parse are
-    // still counted and only the offender falls back. Sheets that share an `@import` are no longer
-    // deduped in that degraded mode, which is a smaller and rarer error than dropping them all.
-    // NOTHING is written to `processed` until the outcome is settled. The retry used to report each
-    // sheet's failure as it went and then hand back an `Err` when none survived, so the all-fail path
-    // disclosed every stylesheet TWICE and the diagnostic doubled its own count and byte total. The
-    // per-sheet results are gathered locally and committed once, which removes that shape rather than
-    // patching it.
+    // One artifact for the whole set is right (it is how CSS ships, and it dedupes what two sheets
+    // share), but a union fails as a unit: one `.scss`, or one unresolvable `@import`, would take
+    // down every stylesheet in the runtime group. So if the union fails, retry per sheet: the ones
+    // that parse are still counted and only the offender falls back, at the cost of no dedup.
     //
-    // The degradation is recorded as its own state, NOT as a line in `failures`. `failures` is read
-    // only as the detail of the uncounted disclosure, which goes silent when every sheet counts —
-    // the common outcome here, since the union's usual reason to fail is the whole set breaching a
-    // budget that each sheet is well inside. That silence made this path report an over-count at
-    // High confidence and cache it.
+    // NOTHING is written to `processed` until the outcome is settled, so the all-fail path
+    // discloses each stylesheet exactly once.
+    //
+    // The degradation is its own state, NOT a line in `failures`: `failures` only details the
+    // uncounted disclosure, which is silent when every sheet counts (the common outcome, since the
+    // union usually fails on a budget each sheet is well inside).
     let bundled = bundle_collected_css_set(&entries, context.clone())
         .and_then(|bundle| compress_bundle(bundle, &context))
         .map(|counted| StylesheetOutcome {
@@ -1176,8 +1137,8 @@ fn process_stylesheets(
                 }
             }
 
-            // Every sheet failed, so this is simply the pre-B2 fallback: hand back the union's error
-            // and let the one disclosure below cover them, exactly once each.
+            // Every sheet failed: hand back the union's error and let the one disclosure below
+            // cover each sheet exactly once.
             if counted.is_empty() {
                 return Err(CssProcessingError {
                     message: union_message,
@@ -1189,8 +1150,8 @@ fn process_stylesheets(
                 failures,
                 uncounted,
                 non_durable_stages,
-                // Sheets DID count here, so `uncounted` may well be empty and the uncounted
-                // disclosure silent. This is what makes the over-count speakable.
+                // Sheets DID count here, so `uncounted` may be empty and its disclosure silent;
+                // this is what discloses the over-count.
                 degraded: Some(union_message),
             })
         });
@@ -1386,7 +1347,7 @@ mod tests {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     /// A temp workspace that writes its files up front and deletes itself on drop, so an assertion
-    /// failing mid-test cannot leak the directory the way a trailing `remove_dir_all` did.
+    /// failing mid-test cannot leak the directory.
     struct Fixture {
         dir: PathBuf,
     }
@@ -1538,9 +1499,9 @@ mod tests {
         assert!(bundle.dependency_omissions.is_empty());
     }
 
-    /// `@import "theme.css"` — no `./` — is a RELATIVE url in CSS, and one of the most common shapes
-    /// real stylesheets ship. Deciding by spelling alone would have dropped every such sheet to
-    /// raw-byte disclosure; the file's existence beside the sheet is what decides.
+    /// `@import "theme.css"` (no `./`) is a RELATIVE url in CSS, and one of the most common shapes
+    /// real stylesheets ship. Deciding by spelling alone would drop every such sheet to raw-byte
+    /// disclosure; the file's existence beside the sheet is what decides.
     #[test]
     fn an_unprefixed_import_is_relative_to_the_sheet_and_is_counted() {
         let fixture = Fixture::new(
@@ -1565,10 +1526,8 @@ mod tests {
     }
 
     /// **The daemon-killer.** Lightning CSS cycle-detects on the path spelling `resolve` hands back,
-    /// and the built-in resolver's naive `with_file_name` join never normalizes `..`, so a cycle
-    /// crossing a `../` yielded a distinct key for the same file on every hop, the dedup never
-    /// fired, and the recursion overflowed the stack — uncatchable, `__fastfail`, every in-flight
-    /// request dead with it.
+    /// so a non-canonical key for a cycle crossing `../` would differ on every hop and overflow the
+    /// stack (uncatchable `__fastfail`, killing every in-flight request).
     ///
     /// If this test ever hangs or aborts the runner rather than failing, THAT is the regression.
     #[test]
@@ -1598,8 +1557,8 @@ mod tests {
         let bundle = result.expect("a cyclic @import must terminate, not overflow the stack");
         let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
         // Sheets outside the cycle are still counted, so one package's broken CSS cannot sink the
-        // set. Lightning CSS drops the cyclic sheet's own rules, undercounting that one stylesheet —
-        // recorded in known-issues.
+        // set. Lightning CSS drops the cyclic sheet's own rules, undercounting that one stylesheet
+        // (known-issues D8).
         assert!(
             css.contains(".other"),
             "a stylesheet outside the cycle must still be counted: {css}"
@@ -1625,10 +1584,9 @@ mod tests {
 
         let error = bundle_css(&fixture.path("index.css"))
             .expect_err("a tree past the file budget must be refused");
-        // Name the bound. This guard exists for an UNCATCHABLE stack overflow that takes the daemon
-        // down, and the build-wide CSS work ledger can refuse the same tree with a message that also
-        // contains "limit" — so asserting on that word alone cannot tell which mechanism actually
-        // stopped the walk, and the guard would read green while doing nothing.
+        // Name the bound: the build-wide CSS work ledger can refuse the same tree with a message
+        // that also contains "limit", so asserting on that word alone cannot tell which mechanism
+        // stopped the walk.
         assert!(
             error.contains("stylesheet @import tree exceeds"),
             "the per-attempt file bound must be what refused this tree: {error}"
@@ -1636,8 +1594,8 @@ mod tests {
     }
 
     /// The other half of the bound: it must refuse the absurd without refusing the real. It stays
-    /// shallow deliberately — a test that recursed near the budget would overflow a DEBUG build's
-    /// stack, whose frames run an order of magnitude larger than the release build it is sized for.
+    /// shallow deliberately: recursing near the budget would overflow a DEBUG build's stack, whose
+    /// frames run an order of magnitude larger than the release build it is sized for.
     #[test]
     fn an_ordinary_import_chain_inside_the_budget_still_bundles() {
         let fixture = Fixture::new("chain", &[]);
@@ -1660,9 +1618,8 @@ mod tests {
         assert!(css.contains(".rule0") && css.contains(".rule23"), "{css}");
     }
 
-    /// A protocol-relative `url()` names a CDN, exactly like the `https://` form. Classifying it as
-    /// an unlocatable LOCAL file kept the number correct but labelled it a floor and dropped its
-    /// budget verdict — the `@import` half already knew this shape, the `url()` half did not.
+    /// A protocol-relative `url()` names a CDN, exactly like the `https://` form, not an
+    /// unlocatable local file that would mark the size a floor.
     #[test]
     fn a_protocol_relative_url_is_external_rather_than_an_unlocatable_local_file() {
         let fixture = Fixture::new(
@@ -1697,10 +1654,8 @@ mod tests {
         );
     }
 
-    /// Percent-escapes that do not decode to UTF-8 (a CP-1252 export) once left through the same
-    /// silent arm as a `data:` payload, so a whole font face vanished from the total while the
-    /// result stayed Measured at High confidence — cached, budgeted, and never invalidated by
-    /// supplying the file. Nothing may leave without a trace.
+    /// Percent-escapes that do not decode to UTF-8 (a CP-1252 export) still name a shipped file, so
+    /// the reference is disclosed as an omission. Nothing may leave without a trace.
     #[test]
     fn a_url_whose_escapes_are_not_utf8_is_named_rather_than_dropped() {
         let fixture = Fixture::new(
@@ -1738,9 +1693,7 @@ mod tests {
     }
 
     /// A `url()` target that is simply absent is a deterministic fact about the package, not a fact
-    /// about this machine. Recording it as a transient failure made the package permanently
-    /// unverifiable — rebuilt on every keystroke over a file nobody was going to create — and told
-    /// the user the result reflected "a changing or unavailable filesystem".
+    /// about this machine, so it must not be recorded as a transient (`asset_io`) failure.
     #[test]
     fn a_missing_url_target_is_recorded_as_absent_not_as_transient_io() {
         let fixture = Fixture::new(
@@ -1827,8 +1780,7 @@ mod tests {
             "the local rules must still be counted: {css}"
         );
         // A CDN stylesheet is fetched at runtime and is not a byte this package ships, so the
-        // measured size is EXACT and must keep its budget verdict. Disclosing it on a precision
-        // stage instead silently disabled budgeting for every package that `@import`s a web font.
+        // measured size is EXACT and must keep its budget verdict.
         assert_eq!(
             bundle.dependency_external.len(),
             1,
@@ -1865,8 +1817,7 @@ mod tests {
     }
 
     /// The headline claims to be the import's full cost, so a shipped file it does not include has
-    /// to say so. An image is outside the counted taxonomy, which used to mean it left through a
-    /// bare `None` — out of the number, out of every disclosure, still High confidence.
+    /// to say so: an image outside the counted taxonomy is disclosed, never silently dropped.
     #[test]
     fn an_image_referenced_by_css_is_disclosed_with_its_real_size() {
         let fixture = Fixture::new(
@@ -1946,9 +1897,8 @@ mod tests {
         );
     }
 
-    /// One unprocessable sheet must not take the others down with it. The set spans every import in
-    /// the runtime group, so all-or-nothing meant one package's `.scss` silently reverted CSS
-    /// counting for all of them.
+    /// One unprocessable sheet must not take the others down with it: the set spans every import in
+    /// the runtime group.
     #[test]
     fn one_unparseable_stylesheet_does_not_sink_the_rest_of_the_set() {
         let fixture = Fixture::new(
@@ -1997,10 +1947,9 @@ mod tests {
 
     /// A resource-ledger breach must not cost the import its JavaScript.
     ///
-    /// That measurement is already complete when this stage runs, so failing the stage reports the
-    /// whole import Unmeasured for a package whose code measured perfectly — and the verdict is
-    /// durable, so it is cached rather than retried. Disclosing the bytes the breach could not reach
-    /// IS the pre-B2 floor: the number stands and says what is missing from it.
+    /// That measurement is already complete when this stage runs, and a breach is durable, so
+    /// failing the stage would cache Unmeasured for a package whose code measured perfectly. The
+    /// number stands and says what is missing from it.
     #[test]
     fn a_ledger_breach_discloses_the_stylesheet_rather_than_failing_the_import() {
         let fixture = Fixture::new("breach", &[("index.css", ".a { color: red }\n")]);
@@ -2137,9 +2086,8 @@ mod tests {
     }
 
     /// The union can fail for a reason NO individual sheet fails for, and then every sheet counts and
-    /// `uncounted` is empty. That combination used to produce an over-counted size (a shared
-    /// `@import` inlined into each sheet) carrying NO diagnostic, so it read as High confidence and
-    /// was written to disk. The over-count is the accepted cost of degrading; the silence was not.
+    /// `uncounted` is empty. The over-count (a shared `@import` inlined into each sheet) is the
+    /// accepted cost of degrading, but it must be disclosed.
     #[test]
     fn a_set_that_degrades_to_per_sheet_still_discloses_that_it_may_read_high() {
         let fixture = Fixture::new("degraded", &[("shared.css", ".shared { color: red }\n")]);
@@ -2376,9 +2324,8 @@ mod tests {
         assert_eq!(processed.total().brotli_bytes, contribution.brotli_bytes);
     }
 
-    /// The fallback that keeps B2 from ever being worse than what it replaced. A dangling `@import`
-    /// cannot be resolved from disk, so bundling must error rather than panic and the caller reverts
-    /// to raw-byte disclosure.
+    /// The raw-byte fallback. A dangling `@import` cannot be resolved from disk, so bundling must
+    /// error rather than panic and the caller reverts to raw-byte disclosure.
     #[test]
     fn process_assets_falls_back_to_raw_disclosure_when_a_stylesheet_cannot_be_processed() {
         let fixture = Fixture::new(

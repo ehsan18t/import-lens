@@ -38,12 +38,10 @@ fn memory_weight(cached: &CachedImport) -> usize {
         .saturating_mul(GRAPH_ROW_WEIGHT_BYTES)
 }
 
-// Dependency fingerprints only change when node_modules changes, which the
-// extension signals via cache invalidation. Between invalidations, re-stat'ing
-// every dependency file on each cache hit is pure waste, so a cached entry
-// verified at the current generation skips the re-stat. The TTL backstops the
-// case where node_modules changes with no invalidation event (e.g. a
-// watcher-excluded folder): after it elapses, the entry re-verifies anyway.
+// node_modules dependencies change only with node_modules, which the extension
+// signals via cache invalidation, so an entry verified at the current generation
+// skips the re-stat. The TTL backstops a node_modules change with no invalidation
+// event (a watcher-excluded folder).
 static CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 const REVERIFY_TTL: Duration = Duration::from_secs(30);
 
@@ -54,12 +52,10 @@ pub fn bump_cache_generation() {
 /// Serializes the lib tests that touch [`CACHE_GENERATION`] against the ones that assume it holds
 /// still while they run.
 ///
-/// The generation is process-global and the test binary is multi-threaded, so a test that bumps it
-/// can slip between any other test's two reads of it — turning a single-flight follower into its
-/// own leader (`service::analyze_and_cache`, which re-reads the generation per call) or making two
-/// L1 signatures taken moments apart disagree. Neither is a product defect, and both are a coin
-/// flip that comes up tails only when the schedule happens to interleave them, which is the worst
-/// kind of red.
+/// The generation is process-global and the test binary is multi-threaded, so a bump can land
+/// between another test's two reads of it, turning a single-flight follower into its own leader
+/// (`service::analyze_and_cache` re-reads the generation per call) or making two L1 signatures
+/// disagree.
 #[cfg(test)]
 pub(crate) fn hold_cache_generation_steady() -> std::sync::MutexGuard<'static, ()> {
     static GENERATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -86,36 +82,26 @@ pub struct CachedImport {
     // Runtime verification state (not persisted): the generation and monotonic
     // instant at which this entry's fingerprints were last confirmed current.
     pub verified_generation: u64,
-    // `None` = never verified this run (fresh decode from disk) → the fast path
-    // is skipped and the next `get` re-verifies. Monotonic so a backward
-    // wall-clock jump (NTP, VM resume) cannot extend the re-verify window.
+    // `None` = never verified this run (fresh decode from disk): the next `get`
+    // re-verifies. Monotonic so a backward clock jump cannot extend the window.
     pub verified_at: Option<Instant>,
-    // Monotonic recency sequence of the last interactive hit; drives LRU
-    // eviction (smallest = least-recently-used) for both the memory working set
-    // and the disk byte budget. A process-global counter, not wall-clock: no
-    // ties, and immune to backward clock jumps. Shared via Arc so an interactive
-    // hit can bump it in place without re-inserting the entry; persisted to the
-    // disk envelope as a plain `u64` at flush time.
+    // Recency sequence of the last interactive hit; drives LRU eviction for both
+    // the memory working set and the disk byte budget. Shared via Arc so a hit
+    // bumps it in place; persisted as a plain `u64` at flush time.
     pub last_seq: Arc<AtomicU64>,
-    // The `last_seq` value the disk layer currently knows for this entry (stamped
-    // at insert/hydration, refreshed when `flush_to_disk` persists a promotion).
-    // `last_seq > persisted_seq` means the entry was used since it was last
-    // persisted — the eviction filter treats such entries as hot, and the flush
-    // sweep re-persists them so recency survives a restart.
+    // The `last_seq` the disk layer currently holds for this entry.
+    // `last_seq > persisted_seq` means used since last persisted: the eviction
+    // filter treats it as hot and the flush sweep re-persists it.
     pub persisted_seq: Arc<AtomicU64>,
-    // Whether the cache key resolves to a first-party dependency (workspace /
-    // npm link / `file:`). Key-derived and immutable for the entry's lifetime;
-    // memoized here because deriving it means hex+msgpack-decoding the key, which
-    // is far too expensive to repeat on every cache hit (the D3 gate consults it
-    // before the TTL fast path).
+    // Whether the key resolves to a first-party dependency (workspace, npm link,
+    // `file:`). Memoized because deriving it decodes the key, too costly per hit.
     pub first_party: bool,
 }
 
-// A transient stat/read error on a dependency (`Freshness::Unknown` — a file locked
-// for milliseconds by a save or an AV scan) must not immediately flash an alarming
-// "couldn't verify". `get_with_result_freshness` graduates it (§4.3.1): the first few
-// Unknown sightings keep serving the last value QUIETLY flagged `Stale{revalidating}`,
-// and it is surfaced as `Unverified` only once the error persists past either bound.
+// A transient stat/read error on a dependency (`Freshness::Unknown`, e.g. a file
+// locked briefly by a save or an AV scan) is graduated: the first sightings serve the
+// last value quietly flagged `Stale{revalidating}`, and it surfaces as `Unverified`
+// only once the error persists past either bound.
 const UNKNOWN_MAX_ATTEMPTS: u32 = 3;
 const UNKNOWN_PERSIST_AFTER: Duration = Duration::from_secs(2);
 
@@ -124,8 +110,8 @@ const UNKNOWN_PERSIST_AFTER: Duration = Duration::from_secs(2);
 /// outcome and on re-insert, so a later blip starts a fresh window.
 #[derive(Debug, Clone, Copy)]
 struct UnknownRetry {
-    // Monotonic — never `SystemTime` — so a backward wall-clock jump (NTP, VM resume)
-    // cannot stretch or collapse the persistence window.
+    // Monotonic, never `SystemTime`, so a backward clock jump cannot stretch or
+    // collapse the persistence window.
     first_seen: Instant,
     attempts: u32,
 }
@@ -140,10 +126,8 @@ pub struct ImportCache {
     // same-document work can coalesce, while independent documents may use distinct
     // claims even when they refresh the same cache key.
     revalidating: Mutex<HashSet<String>>,
-    // Per-key `Unknown` graduation windows (§4.3.1). Only keys currently on the slow
-    // re-check path with an unresolved transient error appear here; entries are removed
-    // on any non-`Unknown` outcome and on re-insert. Independent of the papaya `memory`
-    // map — never locked while a `memory` epoch guard is held in a conflicting order.
+    // Per-key `Unknown` graduation windows, removed on any non-`Unknown` outcome and
+    // on re-insert. Independent of the papaya `memory` map.
     unknown_retry: Mutex<std::collections::HashMap<String, UnknownRetry>>,
 }
 
@@ -159,9 +143,8 @@ impl Default for ImportCache {
     }
 }
 
-/// RAII claim on an in-flight revalidation. Releasing on drop (rather than an explicit
-/// `finish` call) keeps the in-flight set correct even if the recompute panics and
-/// unwinds — a leaked key would otherwise block that key's revalidation until restart.
+/// RAII claim on an in-flight revalidation. Released on drop, so a recompute that
+/// panics cannot leak the claim and block that key's revalidation until restart.
 #[must_use = "dropping the guard immediately releases the revalidation claim"]
 pub struct RevalidationGuard<'cache> {
     cache: &'cache ImportCache,
@@ -177,16 +160,13 @@ impl Drop for RevalidationGuard<'_> {
 /// Read semantics for the shared cache-read path (`ImportCache::read`).
 #[derive(Clone, Copy)]
 enum ReadIntent {
-    /// Interactive / bulk read: serves the last-known value even on a transient
-    /// `Unknown` (§4.3.1 keeps serving while the error is transient), and promotes
-    /// LRU recency when `promote` is set (an interactive hit does; a prewarm scan
-    /// does not — scan resistance, §5.1).
+    /// Interactive or bulk read: serves the last-known value even on a transient
+    /// `Unknown`, and promotes LRU recency when `promote` is set (an interactive hit
+    /// does; a prewarm scan does not, for scan resistance).
     Serve { promote: bool },
-    /// Force-fresh read (§4.5): serves ONLY a value verified `Fresh` against disk,
-    /// across both the memory working set and the disk cache. Every non-`Fresh`
-    /// state (Unknown/Stale/Gone/miss) yields `None` so the caller recomputes
-    /// synchronously; an `Unknown` entry is KEPT (never deleted, never served, never
-    /// hydrated). Promotes recency when `promote` is set, as `Serve` does.
+    /// Force-fresh read: serves only a value verified `Fresh` against disk. Every
+    /// other state yields `None` so the caller recomputes; an `Unknown` entry is kept
+    /// (never deleted, served, or hydrated). Promotes recency when `promote` is set.
     RequireFresh { promote: bool },
 }
 
@@ -255,27 +235,19 @@ impl ImportCache {
         self.read(key, ReadIntent::Serve { promote: true })
     }
 
-    /// Bulk/prewarm read: does NOT promote recency (scan resistance). A
-    /// full-workspace scan or a prefetcher dedup check must not flood the
-    /// recency signal and evict a user's warm working set (design §5.1).
+    /// Bulk/prewarm read: does not promote recency, so a workspace scan or a
+    /// prefetcher dedup check cannot evict the user's warm working set.
     pub fn get_for_prewarm(&self, key: &str) -> Option<ImportResult> {
         self.read(key, ReadIntent::Serve { promote: false })
     }
 
-    /// Force-fresh read (CI / `importlens check`): returns the cached value ONLY when
-    /// it is verified `Fresh` against disk, across BOTH the in-memory working set and
-    /// the disk cache. Every non-Fresh state returns `None` so the caller recomputes
-    /// synchronously (§4.5 — CI never serves a stale/unverified value):
-    ///   Fresh → Some(value);  Stale/Gone → evict (as the normal read does), None;
-    ///   Unknown → keep (never delete), but None (do NOT serve unverified);  miss → None.
-    /// Does not promote recency: this is the bulk read (a workspace report must not
-    /// flood the recency signal, §5.1).
-    ///
-    /// This is the cold-daemon completion of the force-fresh gate: a fresh daemon
-    /// hydrating a prior run's DISK cache must not serve a disk-classified `Unknown`
-    /// (which the evicting `get` would launder into a `cache_hit`). Freshness is
-    /// classified by the SAME plumbing the normal read uses (`lookup`) — only the
-    /// serve-on-`Unknown` decision differs.
+    /// Force-fresh read (CI / `importlens check`): returns the cached value only when
+    /// it is verified `Fresh` against disk, in memory or on disk, so CI never serves
+    /// a stale or unverified value:
+    ///   Fresh: Some(value). Stale/Gone: evict, None.
+    ///   Unknown: keep, but None. Miss: None.
+    /// Does not promote recency (a workspace report is a bulk read). Classified by the
+    /// same `lookup` as the normal read; only the serve-on-`Unknown` decision differs.
     pub fn get_if_fresh(&self, key: &str) -> Option<ImportResult> {
         self.read(key, ReadIntent::RequireFresh { promote: false })
     }
@@ -295,15 +267,12 @@ impl ImportCache {
         (!require_fresh || freshness == Freshness::Fresh).then_some(result)
     }
 
-    /// Stale-while-revalidate read: like `get`, but NON-evicting on `Stale` — it
-    /// serves the last-known value flagged `Stale { revalidating: true }` instead of
-    /// dropping it, so the caller can show an instant answer and recompute in the
-    /// background. `Gone` still evicts and returns `None` (recompute can't reuse a
-    /// removed dep); a transient `Unknown` is GRADUATED (§4.3.1) — served quietly as
-    /// `Stale { revalidating: true }` while the error is fresh and surfaced as
-    /// `Unverified` only once it persists past the window; `Fresh` serves `Fresh`. Does
-    /// not touch the in-flight set — dedupe is the caller's via `begin_revalidation`.
-    /// Only the interactive size read serves stale, so a hit always promotes recency.
+    /// Stale-while-revalidate read: like `get`, but on `Stale` it serves the last-known
+    /// value flagged `Stale { revalidating: true }` so the caller can answer instantly
+    /// and recompute in the background. `Gone` evicts and returns `None`; a transient
+    /// `Unknown` is served as `Stale { revalidating: true }` and surfaces as
+    /// `Unverified` once it persists past the window. Dedupe is the caller's, via
+    /// `begin_revalidation`. A hit always promotes recency.
     pub fn get_with_result_freshness(&self, key: &str) -> Option<(ImportResult, ResultFreshness)> {
         let (mut result, freshness) = self.lookup(key, true, false, StalePolicy::Serve)?;
         let served = match freshness {
@@ -338,20 +307,19 @@ impl ImportCache {
                     .store(RecencyClock::next_seq(), Ordering::Relaxed);
             }
             let generation = current_cache_generation();
-            // A force-fresh read (§4.5) never rides the TTL fast path: a node_modules
-            // change with no generation bump (a watcher-excluded folder) would be served
-            // unverified inside the window. First-party deps change without a generation
-            // bump at all, so they always re-verify (D3).
+            // A force-fresh read never rides the TTL fast path: a node_modules change
+            // with no generation bump (a watcher-excluded folder) would be served
+            // unverified inside the window. First-party deps change without any
+            // generation bump, so they always re-verify.
             let fast_path = !require_fresh
                 && !cached.first_party
                 && cached.verified_generation == generation
                 && cached
                     .verified_at
                     .is_some_and(|at| at.elapsed() < REVERIFY_TTL);
-            // Hash-verified per FINGERPRINT, never per entry: a node_modules entry can
+            // Hash-verified per fingerprint, never per entry: a node_modules entry can
             // carry a workspace file that a stylesheet's `url()` reached outside the
-            // package root (D18), and that file changes with no generation bump behind
-            // it (X-7: an equal-length, mtime-preserving rewrite passes mtime+len).
+            // package root (D18), and that file changes with no generation bump.
             let freshness = if fast_path {
                 Freshness::Fresh
             } else {
@@ -392,7 +360,7 @@ impl ImportCache {
         // Both generations are captured BEFORE the disk probe. Stamping a generation
         // read after it would launder an entry invalidated mid-probe into "verified"
         // for the whole TTL, and a `clear()` racing the hydration below must roll the
-        // memory copy back (RB-3).
+        // memory copy back.
         let hydration_generation = current_cache_generation();
         let clear_generation = self.disk.clear_generation();
         // The disk layer evicts Stale/Gone itself, so this is Fresh or Unknown.
@@ -406,9 +374,8 @@ impl ImportCache {
             return None;
         }
         // An `Unknown` keeps the decoded "never verified" stamps, so the next read
-        // re-checks instead of riding the fast path. An interactive hit promotes even
-        // here, or a just-used rehydrated entry keeps its old persisted seq and is a
-        // prime victim on the next maintenance pass (§3.2).
+        // re-checks. An interactive hit promotes even here, or a just-used rehydrated
+        // entry keeps its old persisted seq and is a prime eviction victim.
         if promote {
             cached
                 .last_seq
@@ -423,8 +390,7 @@ impl ImportCache {
 
     /// Claim ownership of a background revalidation. Returns `Some(guard)` for the
     /// first caller (which should spawn the recompute) and `None` while that claim is
-    /// already in flight. The guard releases the claim on drop — including on
-    /// panic/unwind — so a recompute that panics cannot leak the claim forever.
+    /// already in flight. The guard releases the claim on drop, including on unwind.
     pub fn begin_revalidation(&self, claim_key: &str) -> Option<RevalidationGuard<'_>> {
         let mut inflight = self
             .revalidating
@@ -440,9 +406,7 @@ impl ImportCache {
         }
     }
 
-    /// Release an in-flight claim. Prefer the `RevalidationGuard` returned by
-    /// `begin_revalidation`, which calls this on drop (panic-safe); this is the
-    /// guard's release primitive.
+    /// Release an in-flight claim; called by `RevalidationGuard` on drop.
     fn finish_revalidation(&self, claim_key: &str) {
         let mut inflight = self
             .revalidating
@@ -452,11 +416,9 @@ impl ImportCache {
     }
 
     /// Records another transient `Unknown` sighting for `key` and returns the serve-time
-    /// freshness it graduates to (§4.3.1). While the error is fresh — within
-    /// `UNKNOWN_MAX_ATTEMPTS` sightings AND `UNKNOWN_PERSIST_AFTER` of monotonic time —
-    /// the last value is served QUIETLY as `Stale { revalidating: true }` (a quiet
-    /// recheck); once it persists past either bound it is surfaced as
-    /// `Unverified { reason }`. Never deletes and never claims `Fresh`.
+    /// freshness: `Stale { revalidating: true }` within `UNKNOWN_MAX_ATTEMPTS` sightings
+    /// and `UNKNOWN_PERSIST_AFTER`, then `Unverified { reason }`. Never deletes and never
+    /// claims `Fresh`.
     fn record_unknown(&self, key: &str) -> ResultFreshness {
         let mut retries = self
             .unknown_retry
@@ -477,9 +439,8 @@ impl ImportCache {
     }
 
     /// Clears any `Unknown` graduation window for `key`. Called on every non-`Unknown`
-    /// outcome (Fresh/Stale/Gone) and on re-insert, so a later transient error starts a
-    /// fresh window rather than inheriting a stale `first_seen`/`attempts` that would
-    /// immediately surface `Unverified`.
+    /// outcome and on re-insert, so a later transient error starts a fresh window
+    /// instead of surfacing `Unverified` at once.
     fn clear_unknown(&self, key: &str) {
         let mut retries = self
             .unknown_retry
@@ -488,20 +449,16 @@ impl ImportCache {
         retries.remove(key);
     }
 
-    /// Re-probe the raw dependency freshness of a *memory-resident* `key` WITHOUT
-    /// serving or restamping it. The background SWR revalidation uses this to tell a
-    /// genuine content-`Stale` entry (which should recompute) from one graduated to
-    /// `Stale` by a transient `Unknown` (§4.3.1): the latter must NEVER be routed into
-    /// recompute — re-analyzing would re-hit the same stat/read error and could
-    /// overwrite the good cached value with an error result. Re-stats every dependency
-    /// (bypassing the TTL fast path), so the call itself is the active re-check for a
-    /// graduated key. Returns `None` when the key is not in the memory working set.
+    /// Re-probe the raw dependency freshness of a memory-resident `key` without
+    /// serving or restamping it. Background SWR uses this to tell a genuinely `Stale`
+    /// entry (recompute) from one served as `Stale` because of a transient `Unknown`,
+    /// which must never recompute: re-analyzing would re-hit the same error and could
+    /// overwrite the good value with an error result. Bypasses the TTL fast path.
+    /// Returns `None` when the key is not in the memory working set.
     pub fn probe_freshness(&self, key: &str) -> Option<Freshness> {
         let memory = self.memory.pin();
         let cached = memory.get(key)?;
-        // Per FINGERPRINT, not per entry: a node_modules entry can carry a workspace file that a
-        // stylesheet's `url()` reached outside the package root (D18), and that file changes with
-        // no generation bump behind it.
+        // Per fingerprint, not per entry (see `lookup`, D18).
         let freshness = check_fingerprints_strict(&cached.dependency_fingerprints);
         Some(freshness)
     }
@@ -530,10 +487,7 @@ impl ImportCache {
     /// "must re-verify" and cannot be served on the fast path.
     ///
     /// **The transience gate lives here**, in the store, not at the call sites (ADR-0006,
-    /// invariant 3). It used to be a predicate — `should_cache_result` — that every caller had to
-    /// remember, while this method took any `ImportResult` at all; the next caller who forgot it
-    /// would write a timed-out build straight into L1 and L2, and nothing would have failed. A
-    /// store that cannot be misused does not depend on anyone remembering.
+    /// invariant 3), so no caller can write a timed-out build into L1 or L2 by forgetting it.
     pub fn insert_with_fingerprints_at_generation(
         &self,
         key: String,
@@ -542,12 +496,9 @@ impl ImportCache {
         verified_generation: u64,
     ) {
         if !result.is_durable() || !fingerprints_are_reusable(&dependency_fingerprints) {
-            // Logged, never silent. A refused *failure* is routine (a timeout, a locked file), so
-            // it is debug. A refused **measurement** is not: the sizes are real, and the only thing
-            // keeping them out is a stage `pipeline::stage` has not classified — a misclassification
-            // costs this package its cache forever, so it must be visible. Refusing loudly is the
-            // price of an allowlist, and it is the right way round: the alternative failure mode is
-            // a wrong number nobody ever sees.
+            // A refused failure (timeout, locked file) is routine: debug. A refused
+            // measurement means `pipeline::stage` has not classified a stage, which costs this
+            // package its cache forever, so it warns.
             let stage = result.unmeasured_stage().unwrap_or("none");
             if result.sizes().is_some() {
                 crate::logging::log_warn(
@@ -565,15 +516,10 @@ impl ImportCache {
             }
             return;
         }
-        // A freshly computed value is the definitive reset point for this key's
-        // `Unknown` graduation window (§4.3.1): clearing here means a later transient
-        // error starts a NEW window instead of inheriting a stale `first_seen`/`attempts`
-        // from a prior episode (which would wrongly surface `Unverified` immediately).
         self.clear_unknown(&key);
         // Capture the clear generation BEFORE the disk enqueue and memory insert, and
-        // tag both with it, so a `clear()` racing this insert supersedes the disk copy
-        // (dropped at flush) and the memory-guard rolls back the memory copy — the two
-        // never diverge (RB-3).
+        // tag both with it, so a `clear()` racing this insert drops the disk copy at
+        // flush and rolls back the memory copy: the two never diverge.
         let clear_generation = self.disk.clear_generation();
         let born_seq = RecencyClock::next_seq();
         let cached = CachedImport {
@@ -582,8 +528,7 @@ impl ImportCache {
             verified_generation,
             verified_at: Some(Instant::now()),
             last_seq: Arc::new(AtomicU64::new(born_seq)),
-            // The disk insert below persists this same seq (queued for the
-            // batched flush), so the entry is born with nothing to re-persist.
+            // The disk insert below persists this same seq.
             persisted_seq: Arc::new(AtomicU64::new(born_seq)),
             first_party: crate::cache::key::cache_key_is_first_party(&key),
         };
@@ -603,16 +548,13 @@ impl ImportCache {
     }
 
     /// Evicts the least-recently-used entries while the in-memory map is over either
-    /// cap. The disk copy (if any) survives and re-hydrates on the next hit, so
-    /// this only sheds the memory mirror. Called from every path that grows the
-    /// map (fresh insert and disk re-hydration), not the restamp path (which
-    /// replaces an existing key and cannot grow the map).
+    /// cap; the disk copy re-hydrates on the next hit. Called from every path that
+    /// grows the map (insert and disk re-hydration).
     ///
-    /// Evicts in one batch down to ~90% of both caps: a session pinned at a cap then
-    /// pays one sort per batch instead of a full min-scan per insert.
-    /// `dirty` entries (whose disk insert failed) are never evicted — they exist
-    /// only in memory, and dropping one would silently lose the computed result
-    /// before `flush_to_disk` can replay it.
+    /// Evicts in one batch down to ~90% of both caps, so a session pinned at a cap
+    /// pays one sort per batch instead of a scan per insert. `dirty` entries (disk
+    /// insert failed) are never evicted: they exist only in memory until
+    /// `flush_to_disk` replays them.
     fn enforce_memory_cap(&self) {
         let memory = self.memory.pin();
         let weight = memory
@@ -623,11 +565,9 @@ impl ImportCache {
             return;
         }
 
-        // Capture the clear generation before the candidate snapshot: the re-persist
-        // below reads a memory entry that may be wiped by a racing `clear()`, so tag its
-        // disk write with this generation — a clear that lands mid-eviction bumps the
-        // generation and the flush filter drops the write instead of resurrecting the
-        // shard (RB-3).
+        // Captured before the candidate snapshot: a `clear()` landing mid-eviction bumps
+        // the generation, and the flush filter drops the re-persist below instead of
+        // resurrecting the shard.
         let clear_generation = self.disk.clear_generation();
         let dirty = self
             .dirty
@@ -655,14 +595,9 @@ impl ImportCache {
             }
             count -= 1;
             weight = weight.saturating_sub(entry_weight);
-            // Before dropping the memory mirror, persist any UNFLUSHED recency
-            // promotion (an interactive hit bumps `last_seq` past `persisted_seq`;
-            // the sweep in `flush_to_disk` normally re-persists it). The disk copy
-            // survives this eviction and re-hydrates later, but with the STALE low
-            // persisted seq — so a just-used entry would look cold to the byte-budget
-            // evictor and become a prime disk victim. Flush the promoted seq here so
-            // its recency survives; once the entry leaves the working set,
-            // `flush_to_disk`'s sweep can no longer reach it (F6).
+            // Persist any unflushed recency promotion before dropping the mirror: once
+            // the entry leaves memory, `flush_to_disk`'s sweep cannot reach it, and the
+            // disk copy's old seq would make a just-used entry a prime disk victim.
             if let Some(cached) = memory.get(&key) {
                 let last_seq = cached.last_seq.load(Ordering::Relaxed);
                 if last_seq > cached.persisted_seq.load(Ordering::Relaxed)
@@ -721,7 +656,7 @@ impl ImportCache {
     pub fn clear(&self) {
         // disk.clear() bumps the clear generation BEFORE it wipes; the memory-insert
         // paths captured that generation before their insert and roll back if it moved,
-        // so an insert racing this clear cannot leave a memory-only survivor (RB-3).
+        // so an insert racing this clear cannot leave a memory-only survivor.
         self.disk.clear();
         self.memory.pin().clear();
         if let Ok(mut dirty) = self.dirty.lock() {
@@ -732,36 +667,29 @@ impl ImportCache {
         }
     }
 
-    /// Inserts into the memory mirror, guarding against a racing `clear()`. `clear()`
-    /// wipes disk+memory and bumps the disk clear generation; a change from
-    /// `captured_generation` (read before the caller started deriving `cached`) means a
-    /// wipe may have run between that capture and this insert, which would otherwise
-    /// leave a memory-only survivor of a cleared cache — the "Clear actually clears"
-    /// honesty bug (RB-3). The caller passes the SAME generation it tagged the paired
-    /// `disk.insert_at_generation` with, so the disk and memory copies live or die
-    /// together. Does not enforce the memory cap — callers that grow the map do that
-    /// after.
+    /// Inserts into the memory mirror, guarding against a racing `clear()`. A change
+    /// from `captured_generation` (read before the caller derived `cached`) means a
+    /// wipe may have run since, and the insert would leave a memory-only survivor of a
+    /// cleared cache. The caller passes the same generation it tagged the paired
+    /// `disk.insert_at_generation` with, so both copies live or die together. Does not
+    /// enforce the memory cap.
     fn insert_into_memory_guarded(
         &self,
         key: String,
         cached: CachedImport,
         captured_generation: u64,
     ) {
-        // Pre-check: if a clear() already superseded our generation, skip the insert
-        // entirely. A stale insert would need rolling back and, worse, could clobber a
-        // concurrent post-clear insert of the same key — skipping avoids both.
+        // Skip outright when already superseded: a stale insert could clobber a
+        // concurrent post-clear insert of the same key.
         if self.disk.clear_generation() != captured_generation {
             return;
         }
-        // Identity of the value we insert (its unique last_seq Arc), so the rollback
-        // removes ONLY our own entry — never a concurrent, legitimately post-clear
-        // insert of the same key that replaced ours between our insert and the re-check.
+        // The rollback removes only our own entry (by its unique last_seq Arc), never
+        // a post-clear insert of the same key that replaced it.
         let our_last_seq = Arc::clone(&cached.last_seq);
         let memory = self.memory.pin();
         memory.insert(key.clone(), cached);
-        // Re-check: a clear() landing during/after our insert (its wipe may have preceded
-        // our insert) must still roll us back — but by identity, leaving a racing fresh
-        // insert intact.
+        // A clear() whose wipe preceded our insert still rolls us back.
         if self.disk.clear_generation() != captured_generation {
             self.remove_from_memory_if_current(key, &our_last_seq);
         }
@@ -807,12 +735,9 @@ impl ImportCache {
         self.disk.is_available()
     }
 
-    /// Retries a failed disk open (see `DiskCache::reopen_if_unavailable`). The
-    /// memory layer is kept; entries measured while the disk was away stay
-    /// memory-only.
-    /// Attaches the shard's disk if it is missing. On the transition, entries computed while it
-    /// was missing are written (they were never queued), and the recent-entry preload a cold open
-    /// does runs for every key memory does not already hold a newer value for.
+    /// Attaches the shard's disk if it is missing (see `DiskCache::reopen_if_unavailable`). On
+    /// the transition, entries computed while it was missing are written (they were never
+    /// queued), and the recent-entry preload runs for every key memory does not already hold.
     pub fn reopen_disk(&self) -> bool {
         if self.disk.is_available() {
             return true;
@@ -855,55 +780,41 @@ impl ImportCache {
         self.disk.shard_rollup()
     }
 
-    /// The largest persisted recency seq in this shard's disk layer — a single-key
-    /// SUMMARY read for the startup recency seed (C5). `0` when the disk cache is
+    /// The largest persisted recency seq in this shard's disk layer, a single-key
+    /// summary read for the startup recency seed. `0` when the disk cache is
     /// disabled. See `DiskCache::summary_max_seq`.
     pub fn summary_max_seq(&self) -> u64 {
         self.disk.summary_max_seq()
     }
 
-    /// Up to `n` genuinely-cold eviction victims: the shard's lowest-persisted-seq
-    /// keys beyond its `floor` newest (per-project floor), SKIPPING any that are
-    /// memory-hot. Used by the byte-budget evictor.
+    /// Up to `n` cold eviction victims: the shard's lowest-persisted-seq keys beyond
+    /// its `floor` newest, skipping memory-hot ones. Used by the byte-budget evictor.
     ///
-    /// An entry is memory-hot when it is resident with an in-memory `last_seq`
-    /// promoted past the persisted seq the disk index sorted it by: an interactive
-    /// hit bumps only `last_seq` (the persisted seq refreshes at `flush_to_disk`),
-    /// so a hot entry's true recency is higher than the index knows. It was used
-    /// since it was last persisted and is never a correct victim.
+    /// An entry is memory-hot when its in-memory `last_seq` is promoted past the
+    /// persisted seq the disk index sorted it by (an interactive hit bumps only
+    /// `last_seq` until `flush_to_disk`). It was used since it was last persisted and
+    /// is never a correct victim.
     ///
-    /// Because a hot entry keeps its low persisted seq in the index, the lowest-`n`
-    /// batch can be entirely hot even though thousands of genuinely-cold entries
-    /// sit deeper in the shard. Rather than give up and let the evictor retire a
-    /// shard that is still far over budget (Finding 10c), this PAGES past the hot
-    /// keys through the ascending index until it collects `n` cold keys or exhausts
-    /// the evictable region — bounded by `MAX_EVICTION_SCAN` so a shard whose whole
-    /// evictable prefix is hot still returns empty (→ the evictor retires it) in
-    /// O(log N + window) rather than scanning unbounded.
+    /// The lowest-`n` batch can be entirely hot while cold entries sit deeper, so this
+    /// pages past hot keys until it collects `n` cold keys or exhausts the evictable
+    /// region, bounded by `MAX_EVICTION_SCAN`: an all-hot prefix returns empty and the
+    /// evictor retires the shard.
     pub fn lowest_seq_disk_keys(&self, n: usize, floor: u64) -> Vec<String> {
         if n == 0 {
             return Vec::new();
         }
 
-        // Fast path: the `n` lowest-persisted-seq keys. When none are memory-hot
-        // (the common case) this is exactly the old single batch — no wider scan.
+        // Fast path: the `n` lowest-persisted-seq keys, usually none memory-hot.
         let first = self.disk.lowest_seq_keys(n, floor);
         let region_exhausted = first.len() < n;
         let cold = self.filter_evictable(first, n);
         if cold.len() == n || region_exhausted {
-            // Batch filled, or the evictable region (everything past the floor)
-            // held fewer than `n` keys total, so there is nothing deeper to page
-            // to — the shortfall, if any, is real.
+            // Batch filled, or the evictable region held fewer than `n` keys.
             return cold;
         }
 
-        // The lowest `n` under-filled because ≥1 was memory-hot AND the evictable
-        // region extends past them, so cold victims may sit deeper. Page a bounded
-        // wider window, skipping the hot keys, to find them instead of retiring a
-        // shard that still has evictable entries. `MAX_EVICTION_SCAN` caps the
-        // scan: a shard whose entire evictable prefix is hot returns fewer than
-        // `n` (or empty), and the evictor's progress guard retires it for the pass.
-        // Filling a full batch of `n` relies on `n <= MAX_EVICTION_SCAN`; the sole
+        // Some were memory-hot and the region extends past them: page a bounded wider
+        // window. Filling a full batch relies on `n <= MAX_EVICTION_SCAN`; the sole
         // caller passes `n = EVICTION_BATCH` and the window is `8 * EVICTION_BATCH`.
         let wide = self
             .disk
@@ -911,11 +822,8 @@ impl ImportCache {
         self.filter_evictable(wide, n)
     }
 
-    /// Collects up to `n` NOT-memory-hot keys from ascending `(key, persisted_seq)`
-    /// candidates, preserving their least-recently-used-first order. A key is
-    /// memory-hot when it is resident in the working set with `last_seq` promoted
-    /// strictly past the persisted seq the index sorted it by (used since its last
-    /// persist) — never a correct eviction victim.
+    /// Collects up to `n` keys that are not memory-hot from ascending
+    /// `(key, persisted_seq)` candidates, preserving their order.
     fn filter_evictable(&self, candidates: Vec<(String, u64)>, n: usize) -> Vec<String> {
         let memory = self.memory.pin();
         let mut cold = Vec::with_capacity(n.min(candidates.len()));
@@ -934,8 +842,7 @@ impl ImportCache {
     }
 
     /// Evicts `keys` from both the disk shard and the in-memory mirror, returning
-    /// the on-disk bytes freed. Budget enforcement is the disk deletion; dropping
-    /// the memory mirror just keeps the working set consistent with disk.
+    /// the on-disk bytes freed.
     pub fn evict_keys(&self, keys: &[String]) -> u64 {
         let freed = self.disk.remove_keys(keys);
         let memory = self.memory.pin();
@@ -952,14 +859,12 @@ impl ImportCache {
     }
 
     // Inserts are queued in the disk cache for batched commit; a recycle must
-    // drain that queue. Any entry whose enqueue failed (serialization error) is
-    // marked dirty and re-enqueued here before the queue is flushed.
+    // drain that queue. Any entry whose enqueue failed is marked dirty and
+    // re-enqueued here before the queue is flushed.
     pub fn flush_to_disk(&self) -> Result<(), String> {
-        // Capture the clear generation BEFORE snapshotting memory: both loops below
-        // re-persist entries read from that snapshot, so tag their disk writes with this
-        // generation. A `clear()` landing between the snapshot and the enqueue bumps the
-        // generation, and the flush filter then drops these now-stale writes instead of
-        // resurrecting the wiped shard (RB-3).
+        // Captured BEFORE snapshotting memory: a `clear()` landing between the snapshot
+        // and the enqueue bumps the generation, and the flush filter drops these writes
+        // instead of resurrecting the wiped shard.
         let clear_generation = self.disk.clear_generation();
         let dirty_keys = match self.dirty.lock() {
             Ok(mut dirty) => std::mem::take(&mut *dirty),
@@ -986,10 +891,9 @@ impl ImportCache {
             }
         }
 
-        // Recency sweep: interactive hits bump only the in-memory `last_seq`;
-        // re-persist every entry promoted since its last persist so session
-        // recency survives a restart (the cross-restart half of LRU fidelity —
-        // within a session, `lowest_seq_disk_keys` shields hot entries).
+        // Recency sweep: re-persist every entry promoted since its last persist so
+        // session recency survives a restart (within a session,
+        // `lowest_seq_disk_keys` shields hot entries).
         let promoted = {
             let memory = self.memory.pin();
             memory
@@ -1003,10 +907,9 @@ impl ImportCache {
                 .collect::<Vec<_>>()
         };
         for (key, cached) in promoted {
-            // Capture the seq BEFORE the insert: a concurrent promotion landing
-            // mid-flush must leave `persisted_seq` at or behind what disk holds
-            // (behind is safe — it just re-persists next flush; ahead would hide
-            // the promotion from future sweeps).
+            // Capture the seq BEFORE the insert: a concurrent promotion mid-flush must
+            // leave `persisted_seq` at or behind what disk holds. Behind re-persists next
+            // flush; ahead would hide the promotion from future sweeps.
             let seq_at_flush = cached.last_seq.load(Ordering::Relaxed);
             match self
                 .disk
@@ -1139,7 +1042,7 @@ mod tests {
             "each interactive get promotes: {seq1} -> {seq2}"
         );
 
-        // A bulk/prewarm read must NOT change last_seq (scan resistance).
+        // A bulk/prewarm read does not change last_seq.
         assert!(cache.get_for_prewarm("v4:react").is_some());
         let seq3 = last_seq_of(&cache, "v4:react");
         assert_eq!(seq3, seq2, "prewarm read must not promote recency");
@@ -1168,8 +1071,7 @@ mod tests {
             "interactive force-fresh read must promote recency: {seq1} -> {seq2}"
         );
 
-        // Bulk force-fresh read (WorkspaceReport) must NOT promote recency (scan
-        // resistance, §5.1).
+        // Bulk force-fresh read (WorkspaceReport) does not promote recency.
         assert!(cache.get_if_fresh("v4:react").is_some());
         let seq3 = last_seq_of(&cache, "v4:react");
         assert_eq!(seq3, seq2, "bulk force-fresh read must not promote recency");
@@ -1177,11 +1079,9 @@ mod tests {
 
     #[test]
     fn promoted_seq_survives_memory_cap_eviction() {
-        // F6: an entry promoted in memory (last_seq bumped past persisted_seq by an
-        // interactive hit) but not yet flushed must not lose that promotion when the
-        // memory cap evicts its mirror — otherwise disk keeps the stale low seq and the
-        // just-used entry reads as cold to the disk byte-budget evictor. enforce_memory_cap
-        // now flushes the promoted seq before dropping the mirror.
+        // An entry promoted in memory but not yet flushed keeps that promotion when the
+        // memory cap evicts its mirror, or the disk byte-budget evictor would see it as
+        // cold.
         let dir = std::env::temp_dir().join(format!(
             "il-promote-evict-{}-{:?}",
             std::process::id(),
@@ -1214,9 +1114,8 @@ mod tests {
             "the promotion is not yet persisted"
         );
 
-        // Flood past the cap so the victim (lowest last_seq) is memory-cap evicted.
-        // Every filler is inserted AFTER the promotion, so its born seq exceeds the
-        // victim's promoted seq — the victim stays the least-recently-used.
+        // Flood past the cap. Every filler is born after the promotion, so the victim
+        // stays the least-recently-used.
         for index in 0..=MAX_MEMORY_ENTRIES {
             cache.insert(format!("v4:fill-{index}"), minimal_result("fill"));
         }
@@ -1225,9 +1124,8 @@ mod tests {
             "the victim was evicted from the memory mirror"
         );
 
-        // Re-hydrate via a NON-promoting read: the disk-decoded seq is loaded verbatim
-        // into last_seq. With the fix it is the promoted seq (flushed at eviction); a
-        // regression would show the stale born seq.
+        // Re-hydrate via a non-promoting read: the disk-decoded seq is loaded verbatim
+        // into last_seq, and must be the promoted seq, not the born one.
         assert!(
             cache.get_for_prewarm(&victim).is_some(),
             "the victim's disk copy survives memory-cap eviction and re-hydrates"
@@ -1244,13 +1142,10 @@ mod tests {
 
     #[test]
     fn force_fresh_read_never_rides_the_ttl_fast_path() {
-        // RB-4: a force-fresh read (`get_if_fresh` — the CI / `importlens check` budget
-        // gate, §4.5) must ALWAYS re-verify against disk. A node_modules change with no
-        // generation bump (a watcher-excluded folder — the very case REVERIFY_TTL exists
-        // for) lands inside the 30 s TTL window at the same generation, so the normal
-        // fast path would serve it unverified. Force-fresh must skip that fast path and
-        // catch the staleness. Regression: before the fix `get_if_fresh` shared the
-        // `fresh_without_restat` gate and returned the stale value here too.
+        // A force-fresh read (`get_if_fresh`, the `importlens check` gate) always
+        // re-verifies. A node_modules change with no generation bump (a watcher-excluded
+        // folder) lands inside the TTL window at the same generation, where the normal
+        // fast path serves it unverified.
         let dir = std::env::temp_dir().join(format!(
             "il-rb4-force-fresh-{}-{:?}",
             std::process::id(),
@@ -1260,31 +1155,24 @@ mod tests {
         let dep = dir.join("dep.js");
         std::fs::write(&dep, b"old").unwrap();
 
-        // A stat-only fingerprint (content_hash: None) — the node_modules cheap-check
-        // shape, where mtime+len is all `check_fingerprints` has to go on.
+        // A stat-only fingerprint: mtime+len is all the check has to go on.
         let fingerprint = crate::cache::key::file_fingerprint_with_hash(&dep, None)
             .expect("fingerprint the dep file");
 
-        // A non-first-party (opaque) key, so the entry is eligible for the TTL fast path
-        // (first-party keys bypass it unconditionally).
+        // An opaque key is not first-party, so the entry is eligible for the fast path.
         let key = "v4:react".to_owned();
         let cache = ImportCache::new(None, false);
         cache.insert_with_fingerprints(key.clone(), minimal_result("react"), vec![fingerprint]);
 
-        // Change the dep so it is genuinely stale on disk (different length → mtime+len
-        // mismatch → Stale) WITHOUT bumping the cache generation — exactly the
-        // watcher-excluded node_modules case.
+        // Change the dep's length without bumping the cache generation.
         std::fs::write(&dep, b"new-and-longer-content").unwrap();
 
-        // A normal interactive read still rides the fast path (verified_at < TTL, same
-        // generation) and serves the now-stale value: the fast path is genuinely live.
+        // A normal read still rides the fast path and serves the now-stale value.
         assert!(
             cache.get(&key).is_some(),
             "the TTL fast path is active — a normal get serves the entry without re-probing"
         );
 
-        // The force-fresh read MUST re-verify, detect the staleness, evict, and return
-        // None so the caller recomputes synchronously.
         assert!(
             cache.get_if_fresh(&key).is_none(),
             "force-fresh must skip the TTL fast path, re-probe, and reject the stale entry (RB-4)"
@@ -1294,18 +1182,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A node_modules entry is not made of node_modules files only. A stylesheet's `url()` may
-    /// resolve outside the package root (D18), so a WORKSPACE font can sit in a node_modules
-    /// entry's fingerprint set — and a workspace file changes with no generation bump behind it.
-    ///
-    /// Routing strict-vs-cheap per ENTRY meant that file's stored content hash was computed and
-    /// then never consulted: the entry was "not first party", so every one of its fingerprints took
-    /// the cheap mtime+len pre-filter. An equal-length, mtime-preserving rewrite (`cp -p`,
-    /// `rsync -a`, a CI cache restore) therefore read Fresh forever — and because the post-TTL
-    /// check restamps on success, neither waiting, nor a generation bump, nor a restart cleared it.
-    ///
-    /// The fingerprint below carries the real file's length and mtime with the hash of DIFFERENT
-    /// content of the SAME length, which is exactly what such a rewrite leaves behind.
+    /// A stylesheet's `url()` may resolve outside the package root (D18), so a workspace font can
+    /// sit in a node_modules entry's fingerprint set, and it changes with no generation bump. The
+    /// fingerprint below carries the real file's length and mtime with the hash of different
+    /// content of the same length, which is what an mtime-preserving rewrite leaves behind.
     #[test]
     fn a_workspace_file_inside_a_node_modules_entry_is_still_hash_verified() {
         let dir = std::env::temp_dir().join(format!(
@@ -1314,7 +1194,7 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // Deliberately NOT under node_modules: this is the shape a CSS `url()` escape produces.
+        // Deliberately not under node_modules: the shape a CSS `url()` escape produces.
         let font = dir.join("Inter.woff2");
         std::fs::write(&font, b"AAAA").unwrap();
         assert!(
@@ -1399,12 +1279,9 @@ mod tests {
 
     #[test]
     fn guarded_memory_insert_rolls_back_when_a_clear_races() {
-        // RB-3 (memory side): the insert and disk-hydration paths are disk-then-memory.
-        // If a `clear()` wipes the map AFTER a writer captured the clear generation but
-        // BEFORE its memory insert lands, the entry would survive in memory only — the
-        // "Clear cache silently doesn't clear" trust failure. The guard rolls it back
-        // when the generation moved. Memory-only cache (disk disabled): `clear()` still
-        // bumps the generation, which is exactly what the guard keys off.
+        // A `clear()` that lands after a writer captured the clear generation but before
+        // its memory insert must not leave a memory-only survivor. With disk disabled,
+        // `clear()` still bumps the generation the guard keys off.
         let cache = ImportCache::new(None, false);
         let key = "v4:react".to_owned();
 
@@ -1412,7 +1289,7 @@ mod tests {
         let captured = cache.disk.clear_generation();
         cache.clear();
 
-        // The guarded insert — its captured generation now superseded — must roll back.
+        // The guarded insert, its captured generation superseded, must roll back.
         cache.insert_into_memory_guarded(key.clone(), cached_import("react"), captured);
         assert!(
             cache.memory.pin().get(&key).is_none(),

@@ -300,12 +300,11 @@ fn kebab_case(name: &str) -> Option<String> {
 
 /// The import runtime in effect at a document cursor, from the one document classifier.
 ///
-/// This is the sole authority for "what conditions does an import here resolve under?"
-/// (ADR-0002): completion and export enumeration both go through it, so a name offered
-/// and the size measured for that same import can never disagree. A cursor outside every
-/// runtime-bearing region — a plain `.ts`/`.js`/`.jsx` file, or the HTML body of an
-/// `.astro`/`.vue`/`.svelte` document — is `Component`, the default a bare file already
-/// carries.
+/// The sole authority for which conditions an import here resolves under (ADR-0002):
+/// completion and export enumeration both go through it, so a name offered and the size
+/// measured for that import cannot disagree. A cursor outside every runtime-bearing region
+/// (a plain `.ts`/`.js`/`.jsx` file, or the HTML body of an `.astro`/`.vue`/`.svelte`
+/// document) is `Component`.
 pub fn runtime_at_offset(
     filename: &str,
     source: &str,
@@ -497,10 +496,9 @@ fn script_blocks(source: &str) -> Vec<ScriptBlock<'_>> {
             break;
         };
         let content_start = tag_end + 1;
-        // The close tag is the next real `</script...>` (see find_script_close):
-        // a legal `</script >` must not be missed, and a `</scriptx>` inside the
-        // script text must not be mistaken for it - either error would drop this
-        // block and every later block.
+        // The close tag is the next real `</script...>` (see find_script_close). Missing a
+        // legal `</script >` or taking a `</scriptx>` in script text for it drops this block
+        // and every later one.
         let Some((content_end, close_end)) = find_script_close(&lower_source, content_start) else {
             break;
         };

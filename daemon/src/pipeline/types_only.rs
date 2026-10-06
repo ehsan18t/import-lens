@@ -35,10 +35,8 @@ pub fn declaration_only_package_result(
         return None;
     }
 
-    // MEASURED, not Unmeasured (ADR-0006). A declarations-only package genuinely ships zero
-    // runtime bytes: nothing failed, there was simply nothing to build. `Some(0)` stays
-    // unambiguous because the `types_only` diagnostic stage identifies it — this is the one place
-    // in the daemon where a zero is an answer rather than the absence of one.
+    // Measured, not Unmeasured (ADR-0006): a declarations-only package ships zero runtime bytes;
+    // nothing failed. The `types_only` stage keeps the zero unambiguous as an answer.
     let mut result = ImportResult::measured(request.specifier.clone(), MeasuredSizes::ZERO);
     result.truly_treeshakeable = true;
     result.confidence = ConfidenceLevel::High;

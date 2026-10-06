@@ -2,10 +2,9 @@ use std::path::Path;
 
 use crate::ipc::protocol::ImportDiagnostic;
 
-/// Directories that never hold first-party package sources worth scanning:
-/// dependency trees, VCS metadata, and build/coverage output. This list is
-/// correctness-relevant - the approximate size walk and the types-only scan
-/// must agree on what to skip - so it lives in exactly one place.
+/// Directories that never hold package sources worth scanning: dependency trees, VCS
+/// metadata, and build/coverage output. The one list shared by the types-only scan and the
+/// workspace report scanner.
 pub(crate) fn should_skip_package_directory(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;

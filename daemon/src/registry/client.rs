@@ -50,8 +50,7 @@ impl super::types::RegistryHttpClient for UreqRegistryHttpClient {
             .limit(MAX_REGISTRY_BODY_BYTES)
             .read_to_string()
             .map_err(|error| match error {
-                // Translate ureq's oversize-body error into a stable marker so the
-                // permanent-failure classifier does not depend on ureq's wording.
+                // A stable marker, so the classifier does not depend on ureq's wording.
                 ureq::Error::BodyExceedsLimit(_) => REGISTRY_BODY_TOO_LARGE_ERROR.to_owned(),
                 other => other.to_string(),
             })?;
@@ -80,10 +79,8 @@ fn retry_after_delay_ms(header: &str, now: SystemTime) -> Option<u64> {
             .then(|| (seconds.max(0.0) * 1000.0).round() as u64);
     }
 
-    // RFC 7231 allows Retry-After to carry an HTTP-date instead of
-    // delta-seconds; proxies/CDNs in front of registries emit this form.
-    // A past date clamps to zero (retry immediately), matching the old
-    // extension-host parser this daemon client replaced.
+    // RFC 7231 allows an HTTP-date instead of delta-seconds (proxies and CDNs emit it). A past
+    // date clamps to zero (retry immediately).
     let retry_at = httpdate::parse_http_date(header).ok()?;
     Some(
         retry_at

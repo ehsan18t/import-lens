@@ -1,30 +1,24 @@
 use crate::cache::disk::ShardRollup;
 use std::collections::{HashMap, HashSet};
 
-// Per-project floor: the evictor never touches a shard's `FLOOR` most-recently
-// -used entries, so switching to a large project cannot evict a small project's
-// warm set out from under the user (design §5.3 / 3.4).
+// Per-project floor: the evictor never touches a shard's newest `EVICTION_FLOOR`
+// entries, so switching to a large project cannot evict a small project's warm set.
 pub const EVICTION_FLOOR: u64 = 128;
-// Low-water mark: once over budget (high water), evict down to this fraction of
-// the budget so a steady insert stream does not thrash the evictor every insert.
+// Once over budget, evict down to this fraction of it so a steady insert stream
+// does not run the evictor on every insert.
 pub const LOW_WATER: f64 = 0.9;
-// Keys evicted per victim per round before the victim's rollup is recomputed and
-// victim selection re-runs. Bounds re-scan frequency without over-evicting.
+// Keys evicted per victim per round before its rollup is recomputed and victim
+// selection re-runs.
 pub const EVICTION_BATCH: usize = 128;
-// Upper bound on how far victim selection pages through a shard's ascending
-// `(last_seq, key)` index while SKIPPING memory-hot entries (promoted in memory
-// but not yet flushed — never valid victims). Without a bound, a shard whose
-// entire evictable prefix is hot would scan the whole shard every round; with it,
-// selection stays O(log N + window) and a genuinely all-hot shard still
-// terminates — it returns an empty batch and the evictor retires it for the pass.
-// Eight batches deep tolerates a large run of hot entries before giving up; the
-// next flush re-persists their promoted seqs, sorting them out of the evictable
-// prefix so the shard self-heals on a later pass (Finding 10c).
+// How far victim selection pages through a shard's `(last_seq, key)` index while
+// skipping memory-hot entries (promoted in memory, not yet flushed, never valid
+// victims). Keeps selection O(log N + window); an all-hot shard returns an empty
+// batch and is retired for the pass. The next flush persists the promoted seqs,
+// moving them out of the evictable prefix for a later pass.
 pub const MAX_EVICTION_SCAN: usize = 8 * EVICTION_BATCH;
 
 /// A shard the byte-budget evictor can inspect and trim. Implemented over the real
-/// disk cache in production and over fakes in tests, so the cross-shard eviction
-/// loop is unit-testable in isolation.
+/// disk cache in production and over fakes in tests.
 pub trait EvictableShard {
     fn shard_id(&self) -> &str;
     /// Current byte/recency/count summary of the shard.
@@ -83,13 +77,9 @@ impl BudgetCoordinator {
             return outcome;
         }
 
-        // De-dupe by shard_id before anything keys on it. `collect_shard_targets`
-        // should never yield two targets with the same id, but a copied/corrupted
-        // shard dir (or a shard-id hash collision) could. Everything below keys on
-        // shard_id — the `rollups` map, the `exhausted` set, victim selection — so a
-        // duplicate left in the vec would alias ONE rollup across two entries and make
-        // `total` (summed over the id-keyed map) under-count the pair. Keeping only the
-        // first occurrence per id keeps the vec and the id-keyed accounting consistent.
+        // De-dupe by shard_id (a copied or corrupted shard dir can repeat one).
+        // Everything below keys on shard_id, so a duplicate would alias one rollup
+        // across two entries and under-count `total`. The first occurrence wins.
         let mut seen_ids: HashSet<&str> = HashSet::new();
         let shards: Vec<&dyn EvictableShard> = shards
             .iter()
@@ -97,8 +87,6 @@ impl BudgetCoordinator {
             .filter(|shard| seen_ids.insert(shard.shard_id()))
             .collect();
 
-        // Snapshot each shard's rollup (ShardRollup is Copy, so no borrow is held
-        // across the eviction mutations below).
         let mut rollups: HashMap<String, ShardRollup> = shards
             .iter()
             .map(|shard| (shard.shard_id().to_owned(), shard.rollup()))
@@ -146,15 +134,10 @@ impl BudgetCoordinator {
             outcome.evicted_keys += evicted;
             total = total.saturating_sub(freed);
 
-            // Recompute the victim's rollup (fresh oldest_seq/total/count) so the
-            // next round's victim selection reflects the eviction.
             let after = victim.rollup();
-            // Progress guard: if the removal did not actually shrink the shard (a
-            // failed/uncommitted write on a full or read-only disk returns
-            // freed = 0 and removes no rows), the victim would be re-selected forever.
-            // Retire it so the loop terminates rather than spinning at 100% CPU.
-            // Entry count alone is not progress: concurrent refills may keep the
-            // count flat while bytes are genuinely being freed.
+            // Progress guard: a failed write on a full or read-only disk frees 0 and
+            // removes nothing, so the victim would be re-selected forever. Progress is
+            // bytes freed, not entry count: concurrent refills can hold the count flat.
             if freed == 0 {
                 exhausted.insert(victim.shard_id().to_owned());
             }
@@ -260,10 +243,8 @@ mod tests {
 
     #[test]
     fn duplicate_shard_ids_are_deduped_to_a_single_target() {
-        // Two targets sharing a shard_id (a copied/corrupted shard dir) must collapse
-        // to one: everything downstream keys on shard_id, so a duplicate left in the
-        // vec would alias one rollup across both. The evictor keeps the FIRST
-        // occurrence; the second is never inspected or evicted.
+        // Two targets sharing a shard_id collapse to the first; the second is never
+        // inspected or evicted.
         let first = FakeShard::new("dup", (1..=1_000).map(|seq| (seq, 10)).collect());
         let second = FakeShard::new("dup", (5_000..=5_999).map(|seq| (seq, 10)).collect());
 
@@ -302,8 +283,8 @@ mod tests {
         let coordinator = BudgetCoordinator::new(11_000);
         let outcome = coordinator.evict_to_budget(&[&shard_a, &shard_b]);
 
-        // Deterministic: two EVICTION_BATCH rounds of a's lowest seqs — exactly
-        // seqs 1..=256 (2560 bytes) — bring 12000 down to 9440 ≤ 9900.
+        // Deterministic: two EVICTION_BATCH rounds of a's lowest seqs (exactly
+        // seqs 1..=256, 2560 bytes) bring 12000 down to 9440 ≤ 9900.
         assert_eq!(outcome.evicted_keys, 2 * EVICTION_BATCH as u64);
         assert_eq!(outcome.evicted_bytes, 2 * EVICTION_BATCH as u64 * 10);
         assert!(!outcome.still_over_budget);
@@ -331,9 +312,9 @@ mod tests {
 
     #[test]
     fn a_stuck_shard_does_not_stop_eviction_from_healthy_shards() {
-        // The stuck shard is globally oldest, so it is selected first — and its
-        // evictions never persist. The progress guard must retire it and let the
-        // loop continue into the healthy shard rather than bail (or spin).
+        // The stuck shard is globally oldest, so it is selected first, and its
+        // evictions never persist. The progress guard retires it and the loop
+        // continues into the healthy shard.
         let stuck = StuckShard {
             id: "stuck".to_owned(),
             rollup: ShardRollup {
@@ -384,9 +365,8 @@ mod tests {
 
     #[test]
     fn a_shard_whose_eviction_never_progresses_does_not_spin() {
-        // Over budget, entry_count well above the floor, but evict_keys frees
-        // nothing and the rollup never changes. The progress guard must retire the
-        // shard so evict_to_budget returns instead of looping forever.
+        // Over budget and above the floor, but evict_keys frees nothing. The
+        // progress guard retires the shard so evict_to_budget returns.
         let stuck = StuckShard {
             id: "stuck".to_owned(),
             rollup: ShardRollup {
@@ -396,8 +376,6 @@ mod tests {
             },
         };
         let coordinator = BudgetCoordinator::new(1_000);
-        // If the guard is missing this call never returns (the test harness times
-        // out); with it, it completes and reports still-over-budget.
         let outcome = coordinator.evict_to_budget(&[&stuck]);
         assert_eq!(outcome.evicted_bytes, 0);
         assert!(outcome.still_over_budget);
@@ -405,7 +383,7 @@ mod tests {
 
     #[test]
     fn per_project_floor_protects_a_small_shards_newest_entries() {
-        // Shard b is small: only FLOOR entries, all newest — must survive intact.
+        // Shard b holds only EVICTION_FLOOR entries, all newest: it survives intact.
         let big: Vec<(u64, u64)> = (1..=1000).map(|s| (s, 100)).collect();
         let small: Vec<(u64, u64)> = (1..=EVICTION_FLOOR).map(|s| (2_000 + s, 100)).collect();
         let shard_big = FakeShard::new("big", big);

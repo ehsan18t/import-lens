@@ -246,14 +246,9 @@ mod tests {
             })
         });
 
-        // Wait for the follower to actually JOIN the flight, rather than guessing that 50ms is
-        // enough for it to get there. Under load it sometimes was not: the leader was released
-        // first, published, and removed the flight, so the follower arrived to an empty registry,
-        // became a leader itself, and computed a second time — failing on `compute_count == 2`.
-        // The test was reporting scheduling latency, not coalescing.
-        //
-        // The refcount is the real signal: the map holds one reference and the leader holds one, so
-        // a third means the follower has claimed the same flight and is about to block on it.
+        // Wait until the follower has joined the flight. Releasing the leader first lets it publish
+        // and remove the flight, and a late follower then computes again as a new leader. The map
+        // and the leader hold one reference each, so a third means the follower has claimed it.
         let joined_by = Instant::now();
         loop {
             let references = {
