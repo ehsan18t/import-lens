@@ -58,6 +58,13 @@ const SEQ_INDEX_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("
 // opened; it is harmless dead space reclaimed by the compactor.
 const CURRENT_SCHEMA_VERSION: u64 = 8;
 const INSERT_FLUSH_BATCH: usize = 64;
+/// Queue ceiling, reachable only while flushes keep failing: past it the least
+/// recently used queued inserts are dropped. They are rebuildable and still live
+/// in the memory layer.
+const MAX_PENDING_INSERTS: usize = 16 * INSERT_FLUSH_BATCH;
+/// After a failed flush, inserts stop triggering flushes for this long; explicit
+/// flushes (recycle, shutdown, maintenance reads) still try.
+const FLUSH_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// Compact a shard when more than this fraction of its `.redb` file is
 /// reclaimable free space (redb reuses freed pages rather than shrinking).
 pub const COMPACT_THRESHOLD: f64 = 0.5;
@@ -149,6 +156,9 @@ pub struct DiskCache {
     // the user is actively analyzing is never compacted (§5.5 / Finding 12). A
     // heuristic, not a correctness gate — a relaxed store/load is enough.
     last_access: AtomicU64,
+    // Unix millis before which an insert must not trigger a flush, set by a failed
+    // flush (`FLUSH_RETRY_BACKOFF`); 0 when the last flush succeeded.
+    flush_retry_after: AtomicU64,
 }
 
 impl DiskCache {
@@ -175,6 +185,7 @@ impl DiskCache {
             // stamps `now` and protects an actively-analyzed shard; the brief
             // open->first-access window reading as idle is benign.
             last_access: AtomicU64::new(0),
+            flush_retry_after: AtomicU64::new(0),
         }
     }
 
@@ -412,7 +423,12 @@ impl DiskCache {
         let should_flush = match self.pending_inserts.lock() {
             Ok(mut pending) => {
                 pending.insert(key.to_owned(), (generation, bytes));
+                shed_oldest_pending_inserts(&mut pending);
                 pending.len() >= INSERT_FLUSH_BATCH
+                    && crate::time::unix_millis_now()
+                        >= self
+                            .flush_retry_after
+                            .load(std::sync::atomic::Ordering::Relaxed)
             }
             Err(_) => return Err("cache pending-insert lock poisoned".to_owned()),
         };
@@ -463,15 +479,26 @@ impl DiskCache {
             return;
         }
 
-        if let Err(error) = write_pending_inserts(db, &kept) {
-            if let Ok(mut current) = self.pending_inserts.lock() {
-                // Re-queue only the entries we tried to write, preserving their
-                // (still-current) generation tag so a later flush retries them.
-                for (key, bytes) in kept {
-                    current.entry(key).or_insert((generation, bytes));
+        match write_pending_inserts(db, &kept) {
+            Ok(()) => self
+                .flush_retry_after
+                .store(0, std::sync::atomic::Ordering::Relaxed),
+            Err(error) => {
+                self.flush_retry_after.store(
+                    crate::time::unix_millis_now()
+                        .saturating_add(FLUSH_RETRY_BACKOFF.as_millis() as u64),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Ok(mut current) = self.pending_inserts.lock() {
+                    // Re-queue only the entries we tried to write, preserving their
+                    // (still-current) generation tag so a later flush retries them.
+                    for (key, bytes) in kept {
+                        current.entry(key).or_insert((generation, bytes));
+                    }
+                    shed_oldest_pending_inserts(&mut current);
                 }
+                cache_warn(format!("failed to flush cache inserts: {error}"));
             }
-            cache_warn(format!("failed to flush cache inserts: {error}"));
         }
     }
 
@@ -1032,6 +1059,7 @@ impl DiskCache {
             // immaterial; 0 (the `Default` for the enabled-but-never-opened case
             // too) simply reads as idle.
             last_access: AtomicU64::new(0),
+            flush_retry_after: AtomicU64::new(0),
         }
     }
 
@@ -1311,6 +1339,10 @@ fn fragmentation_ratio(db: &Database) -> f64 {
 }
 
 fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> Result<(), String> {
+    #[cfg(test)]
+    if test_support::should_fail_flush(pending.keys()) {
+        return Err("forced cache flush failure".to_owned());
+    }
     let write_txn = db
         .begin_write()
         .map_err(|error| format!("failed to begin cache write: {error}"))?;
@@ -1369,6 +1401,24 @@ fn write_pending_inserts(db: &Database, pending: &HashMap<String, Vec<u8>>) -> R
     write_txn
         .commit()
         .map_err(|error| format!("failed to commit cache write: {error}"))
+}
+
+/// Drops the least recently used queued inserts once the queue passes
+/// `MAX_PENDING_INSERTS`, which only failing flushes allow. Sheds a batch at a time
+/// so a queue pinned at the ceiling does not sort on every insert.
+fn shed_oldest_pending_inserts(pending: &mut HashMap<String, (u64, Vec<u8>)>) {
+    if pending.len() <= MAX_PENDING_INSERTS {
+        return;
+    }
+    let mut by_recency = pending
+        .iter()
+        .map(|(key, (_, bytes))| (decode_last_seq(bytes), key.clone()))
+        .collect::<Vec<_>>();
+    by_recency.sort_unstable();
+    let excess = pending.len() - (MAX_PENDING_INSERTS - INSERT_FLUSH_BATCH);
+    for (_, key) in by_recency.into_iter().take(excess) {
+        pending.remove(&key);
+    }
 }
 
 /// Reads a `u64` summary field, defaulting to `0` when the key is absent (a fresh
@@ -1867,6 +1917,56 @@ mod tests {
         assert!(
             disk.get("v4:asset:legacy").is_none(),
             "the L2 read boundary must evict a pre-fix unverifiable observation"
+        );
+
+        drop(disk);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On a full disk or a read-only remount every flush fails. Retrying the whole backlog on each
+    /// insert past the batch size made the cost O(N) per insert, and re-queueing every failed entry
+    /// let the queue hold one serialized envelope per distinct key for the rest of the process.
+    #[test]
+    fn a_failing_disk_neither_retries_every_insert_nor_grows_the_queue_without_bound() {
+        use super::{DiskCache, MAX_PENDING_INSERTS, test_support};
+
+        let dir = std::env::temp_dir().join(format!(
+            "il-flush-backoff-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let disk = DiskCache::new(Some(dir.clone()), true);
+        let token = test_support::unique_failure_token("flush-backoff");
+        test_support::fail_flushes_containing(&token);
+        let key = |index: usize| format!("v4:{token}:{index}");
+
+        let inserted = MAX_PENDING_INSERTS * 2;
+        for index in 0..inserted {
+            disk.insert(&key(index), &sample_cached(index as u64 + 1))
+                .expect("a queued insert is not an error");
+        }
+
+        assert_eq!(
+            test_support::take_flush_attempts_for_token(&token),
+            1,
+            "one failed flush, then inserts back off instead of retrying the backlog"
+        );
+        assert!(disk.pending_inserts.lock().unwrap().len() <= MAX_PENDING_INSERTS);
+        assert!(
+            disk.get(&key(inserted - 1)).is_some(),
+            "the newest entries stay queued"
+        );
+        assert!(
+            disk.get(&key(0)).is_none(),
+            "the least recently used are shed"
+        );
+
+        test_support::stop_failing_flushes_containing(&token);
+        disk.flush_pending_inserts();
+        assert!(disk.pending_inserts.lock().unwrap().is_empty());
+        assert!(
+            disk.get(&key(inserted - 1)).is_some(),
+            "a recovered disk persists the queue"
         );
 
         drop(disk);
