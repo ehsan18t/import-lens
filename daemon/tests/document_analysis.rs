@@ -386,3 +386,134 @@ export const x = 1;
         "a JavaScript import must never be elided: {imports:?}"
     );
 }
+
+fn named_imports_of<'a>(
+    imports: &'a [import_lens_daemon::ipc::protocol::DetectedImport],
+    specifier: &str,
+) -> Vec<&'a str> {
+    imports
+        .iter()
+        .filter(|item| item.specifier == specifier)
+        .flat_map(|item| item.named.iter().map(String::as_str))
+        .collect()
+}
+
+// A component script is not the whole module: the compiler keeps an import the markup uses, even
+// when the script itself only uses it as a type.
+
+#[test]
+fn a_vue_component_used_in_the_template_is_not_elided() {
+    let source = r#"<script setup lang="ts">
+import { ref } from 'vue'
+import { NButton, NCard } from 'naive-ui'
+import { PropType } from 'vue-types-only'
+const btn = ref<InstanceType<typeof NButton>>()
+const card = ref<InstanceType<typeof NCard>>()
+const p = null as unknown as PropType<string>
+</script>
+<template><NButton ref="btn"/><n-card ref="card"/></template>
+"#;
+
+    let imports = analyze_imports("App.vue", source).expect("vue should parse");
+
+    let naive = named_imports_of(&imports, "naive-ui");
+    assert!(
+        naive.contains(&"NButton") && naive.contains(&"NCard"),
+        "components the template renders ship at runtime: {imports:?}"
+    );
+    assert!(
+        imports
+            .iter()
+            .all(|item| item.specifier != "vue-types-only"),
+        "a binding neither the script nor the markup uses as a value is still erased: {imports:?}"
+    );
+}
+
+#[test]
+fn a_svelte_component_used_in_markup_is_not_elided() {
+    let source = r#"<script lang="ts">
+  import type { ComponentProps } from 'svelte'
+  import { Button } from 'ui-kit'
+  type P = ComponentProps<typeof Button>
+  export let props: P
+</script>
+<Button {...props} />
+"#;
+
+    let imports = analyze_imports("Panel.svelte", source).expect("svelte should parse");
+
+    assert_eq!(
+        named_imports_of(&imports, "ui-kit"),
+        vec!["Button"],
+        "a component the markup renders ships at runtime: {imports:?}"
+    );
+}
+
+#[test]
+fn an_astro_frontmatter_binding_used_in_the_template_is_not_elided() {
+    let source = r#"---
+import { Card } from 'astro-ui'
+type Props = Parameters<typeof Card>[0]
+const props: Props = { title: 'x' }
+---
+<Card {...props} />
+"#;
+
+    let imports = analyze_imports("Page.astro", source).expect("astro should parse");
+
+    assert_eq!(
+        named_imports_of(&imports, "astro-ui"),
+        vec!["Card"],
+        "a component the template renders ships at runtime: {imports:?}"
+    );
+}
+
+#[test]
+fn a_quoted_angle_bracket_in_a_script_attribute_does_not_end_the_tag() {
+    let source = r#"<script setup lang="ts" generic="T extends Record<string, unknown>">
+import { ref } from 'vue'
+import dayjs from 'dayjs'
+const value = ref<T>()
+</script>
+<template><div>{{ dayjs().format() }}</div></template>
+"#;
+
+    let imports = analyze_imports("Generic.vue", source).expect("a generic SFC should parse");
+    assert!(
+        imports.iter().any(|item| item.specifier == "dayjs"),
+        "{imports:?}"
+    );
+
+    // `lang` after `generic` is still read, so the block parses as TypeScript.
+    let reordered = r#"<script setup generic="T extends Array<string>" lang="ts">
+import dayjs from 'dayjs'
+const value: T | null = null
+</script>
+"#;
+    let imports = analyze_imports("Generic.vue", reordered).expect("lang after generic is read");
+    assert!(
+        imports.iter().any(|item| item.specifier == "dayjs"),
+        "{imports:?}"
+    );
+}
+
+#[test]
+fn a_commented_out_script_tag_is_not_a_script_block() {
+    let source = r#"<!-- <script>import old from 'old-lib'</script> -->
+<!-- <script> -->
+<template><p>Hello</p></template>
+<script setup lang="ts">
+import dayjs from 'dayjs'
+</script>
+"#;
+
+    let imports = analyze_imports("Commented.vue", source).expect("commented SFC should parse");
+    assert_eq!(
+        imports
+            .iter()
+            .map(|item| item.specifier.as_str())
+            .collect::<Vec<_>>(),
+        vec!["dayjs"],
+        "only the live script block is analyzed: {imports:?}"
+    );
+}

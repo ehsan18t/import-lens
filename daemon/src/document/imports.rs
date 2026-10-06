@@ -1,6 +1,8 @@
 use super::{
     positions::LineIndex,
-    script_regions::{ScriptRegion, script_regions_for_document},
+    script_regions::{
+        ScriptRegion, markup_outside, markup_references, script_regions_for_document,
+    },
     specifier::{get_package_name, is_runtime_package_specifier},
 };
 use crate::ipc::protocol::{DetectedImport, ImportKind, ImportSyntax};
@@ -16,9 +18,11 @@ use std::collections::{HashMap, HashSet};
 pub fn analyze_imports(filename: &str, source: &str) -> Result<Vec<DetectedImport>, String> {
     let mut imports = Vec::new();
     let line_index = LineIndex::new(source);
+    let regions = script_regions_for_document(filename, source);
+    let markup = markup_outside(source, &regions);
 
-    for region in script_regions_for_document(filename, source) {
-        imports.extend(imports_from_region(source, &line_index, &region)?);
+    for region in &regions {
+        imports.extend(imports_from_region(source, &line_index, region, &markup)?);
     }
 
     imports.sort_by_key(|item| {
@@ -34,6 +38,7 @@ fn imports_from_region(
     document_source: &str,
     line_index: &LineIndex,
     region: &ScriptRegion<'_>,
+    markup: &[&str],
 ) -> Result<Vec<DetectedImport>, String> {
     let allocator = Allocator::default();
     let source_type = super::script_regions::source_type_for_region(&region.filename);
@@ -65,7 +70,9 @@ fn imports_from_region(
             .any(|entry| !entry.is_type)
     {
         let semantic = SemanticBuilder::new().build(&parsed.program).semantic;
-        type_only_binding_spans(&semantic)
+        let markup_uses =
+            |name: &str| region.shares_bindings_with_markup && markup_references(markup, name);
+        type_only_binding_spans(&semantic, &markup_uses)
     } else {
         HashSet::new()
     };
@@ -122,7 +129,13 @@ struct ImportGroup {
 /// `verbatimModuleSyntax` / `isolatedModules` TypeScript preserves an unused value
 /// import, and it has real runtime cost. Eliding it would silently under-count, which
 /// is a worse failure than the one being fixed.
-fn type_only_binding_spans(semantic: &Semantic<'_>) -> HashSet<Span> {
+///
+/// Nor is a binding the component markup uses (`markup_uses`): the Vue, Svelte and Astro
+/// compilers keep an import the template renders, whatever the script does with it.
+fn type_only_binding_spans(
+    semantic: &Semantic<'_>,
+    markup_uses: &dyn Fn(&str) -> bool,
+) -> HashSet<Span> {
     let scoping = semantic.scoping();
     scoping
         .symbol_ids()
@@ -135,6 +148,7 @@ fn type_only_binding_spans(semantic: &Semantic<'_>) -> HashSet<Span> {
                     let flags = reference.flags();
                     (flags.is_type() && !flags.is_value()) || flags.is_value_as_type()
                 })
+                && !markup_uses(scoping.symbol_name(*symbol_id))
         })
         .map(|symbol_id| scoping.symbol_span(symbol_id))
         .collect()
