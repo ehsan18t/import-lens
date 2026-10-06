@@ -53,15 +53,27 @@ pub fn script_regions_for_document<'a>(filename: &str, source: &'a str) -> Vec<S
     }]
 }
 
-/// The document text outside every script region, which is what component markup can reference.
-/// Empty when no region shares its bindings with markup.
-pub(super) fn markup_outside<'a>(source: &'a str, regions: &[ScriptRegion<'_>]) -> Vec<&'a str> {
+/// The places in a component's markup its compiler treats as references to script bindings:
+/// Vue `{{ }}` interpolations, bound and directive attribute values (`:x`, `@x`, `#x`, `v-x`) and
+/// component tags; Svelte and Astro `{ }` expressions and component tags. Static text, comments,
+/// `<style>` and raw `<script>` bodies are not references, so a type-only name that merely appears
+/// there stays elided. Empty when no region shares its bindings with markup.
+pub(super) fn template_references<'a>(
+    filename: &str,
+    source: &'a str,
+    regions: &[ScriptRegion<'_>],
+) -> Vec<&'a str> {
     if !regions
         .iter()
         .any(|region| region.shares_bindings_with_markup)
     {
         return Vec::new();
     }
+    let syntax = if filename.to_ascii_lowercase().ends_with(".vue") {
+        TemplateSyntax::Vue
+    } else {
+        TemplateSyntax::Braces
+    };
 
     let mut spans: Vec<(usize, usize)> = regions
         .iter()
@@ -69,29 +81,192 @@ pub(super) fn markup_outside<'a>(source: &'a str, regions: &[ScriptRegion<'_>]) 
         .collect();
     spans.sort_unstable();
 
-    let mut markup = Vec::new();
+    let mut references = Vec::new();
     let mut cursor = 0;
     for (start, end) in spans {
         if start > cursor {
-            markup.push(&source[cursor..start]);
+            scan_template(&source[cursor..start], syntax, &mut references);
         }
         cursor = cursor.max(end);
     }
-    markup.push(&source[cursor..]);
-    markup
+    scan_template(&source[cursor..], syntax, &mut references);
+    references
 }
 
-/// Whether markup mentions `name` as a whole identifier, or a multi-word PascalCase `name` in the
-/// kebab-case spelling Vue templates also resolve (`NButton` as `<n-button>`). Erring towards a
-/// mention keeps an import that ships rather than dropping it from the total.
-pub(super) fn markup_references(markup: &[&str], name: &str) -> bool {
+/// Whether a template reference names `name`, or a multi-word PascalCase `name` in the kebab-case
+/// tag spelling Vue also resolves (`NButton` as `<n-button>`).
+pub(super) fn markup_references(references: &[&str], name: &str) -> bool {
     let kebab = kebab_case(name);
-    markup.iter().any(|text| {
+    references.iter().any(|text| {
         contains_identifier(text, name)
             || kebab
                 .as_deref()
                 .is_some_and(|kebab| contains_identifier(text, kebab))
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateSyntax {
+    /// `{{ expr }}` in text; expressions only in bound or directive attribute values.
+    Vue,
+    /// `{expr}` in text and attributes (Svelte, Astro).
+    Braces,
+}
+
+/// Collects the reference-bearing slices of one markup fragment. Byte-indexed; every slice starts
+/// and ends at an ASCII delimiter, so it is always on a char boundary.
+fn scan_template<'a>(markup: &'a str, syntax: TemplateSyntax, references: &mut Vec<&'a str>) {
+    let bytes = markup.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let rest = &bytes[index..];
+        if rest.starts_with(b"<!--") {
+            index = find_bytes(bytes, index + 4, b"-->").map_or(bytes.len(), |end| end + 3);
+        } else if rest.starts_with(b"</") {
+            index = find_bytes(bytes, index, b">").map_or(bytes.len(), |end| end + 1);
+        } else if rest[0] == b'<' && rest.get(1).is_some_and(u8::is_ascii_alphabetic) {
+            index = scan_tag(markup, index + 1, syntax, references);
+        } else if let Some(end) = expression_end(bytes, index, syntax) {
+            references.push(&markup[index..end]);
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+/// Scans one open tag whose name starts at `name_start` and returns the index after it, or after
+/// the body of a raw-text element (`<style>`, an unprocessed `<script>`), which is never markup.
+fn scan_tag<'a>(
+    markup: &'a str,
+    name_start: usize,
+    syntax: TemplateSyntax,
+    references: &mut Vec<&'a str>,
+) -> usize {
+    let bytes = markup.as_bytes();
+    let name_end = until(bytes, name_start, |byte| {
+        byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
+    });
+    let name = &markup[name_start..name_end];
+    // A lowercase single-word tag is a native element in all three compilers; only these can name
+    // a component (`Card`, `n-card`, `Foo.Bar`).
+    if name
+        .bytes()
+        .any(|byte| byte.is_ascii_uppercase() || matches!(byte, b'-' | b'.'))
+    {
+        references.push(name);
+    }
+
+    let mut index = name_end;
+    loop {
+        index = skip_ascii_whitespace(markup, index);
+        match bytes.get(index) {
+            None => return bytes.len(),
+            Some(b'>') => break,
+            Some(b'{') if syntax == TemplateSyntax::Braces => {
+                let end = expression_end(bytes, index, syntax).unwrap_or(bytes.len());
+                references.push(&markup[index..end]);
+                index = end;
+            }
+            Some(_) => {
+                let attribute_end = until(bytes, index, |byte| {
+                    byte.is_ascii_whitespace() || matches!(byte, b'=' | b'>')
+                })
+                .max(index + 1);
+                let attribute = &markup[index..attribute_end];
+                index = skip_ascii_whitespace(markup, attribute_end);
+                if bytes.get(index) != Some(&b'=') {
+                    continue;
+                }
+                index = skip_ascii_whitespace(markup, index + 1);
+                let (value, next) = attribute_value_at(markup, index, syntax);
+                let is_expression = match syntax {
+                    TemplateSyntax::Vue => {
+                        attribute.starts_with([':', '@', '#']) || attribute.starts_with("v-")
+                    }
+                    TemplateSyntax::Braces => value.contains('{'),
+                };
+                if is_expression {
+                    references.push(value);
+                }
+                index = next;
+            }
+        }
+    }
+
+    let after_tag = index + 1;
+    if name.eq_ignore_ascii_case("style") || name.eq_ignore_ascii_case("script") {
+        let close = format!("</{}", name.to_ascii_lowercase());
+        return markup[after_tag..]
+            .to_ascii_lowercase()
+            .find(&close)
+            .map_or(bytes.len(), |relative| after_tag + relative);
+    }
+    after_tag
+}
+
+/// An attribute value starting at `index` (quoted, a `{ }` expression, or bare) and the index
+/// after it.
+fn attribute_value_at(markup: &str, index: usize, syntax: TemplateSyntax) -> (&str, usize) {
+    let bytes = markup.as_bytes();
+    match bytes.get(index) {
+        Some(&quote @ (b'"' | b'\'')) => {
+            let end = find_bytes(bytes, index + 1, &[quote]).unwrap_or(bytes.len());
+            (&markup[index + 1..end], (end + 1).min(bytes.len()))
+        }
+        Some(b'{') if syntax == TemplateSyntax::Braces => {
+            let end = expression_end(bytes, index, syntax).unwrap_or(bytes.len());
+            (&markup[index..end], end)
+        }
+        _ => {
+            let end = until(bytes, index, |byte| {
+                byte.is_ascii_whitespace() || byte == b'>'
+            });
+            (&markup[index..end], end)
+        }
+    }
+}
+
+/// The end of the interpolation starting at `index`, if one starts there: `{{ ... }}` for Vue, a
+/// brace-balanced `{ ... }` otherwise.
+fn expression_end(bytes: &[u8], index: usize, syntax: TemplateSyntax) -> Option<usize> {
+    match syntax {
+        TemplateSyntax::Vue => bytes[index..]
+            .starts_with(b"{{")
+            .then(|| find_bytes(bytes, index + 2, b"}}").map_or(bytes.len(), |end| end + 2)),
+        TemplateSyntax::Braces => (bytes[index] == b'{').then(|| {
+            let mut depth = 0usize;
+            for (offset, byte) in bytes[index..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return index + offset + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            bytes.len()
+        }),
+    }
+}
+
+fn until(bytes: &[u8], from: usize, stop: impl Fn(u8) -> bool) -> usize {
+    bytes[from..]
+        .iter()
+        .position(|&byte| stop(byte))
+        .map_or(bytes.len(), |relative| from + relative)
+}
+
+fn find_bytes(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|relative| from + relative)
 }
 
 fn contains_identifier(text: &str, word: &str) -> bool {
@@ -179,9 +354,17 @@ pub(super) fn source_type_for_region(filename: &str) -> SourceType {
 }
 
 fn language_from_attributes(attributes: &str) -> ScriptLanguage {
-    // Walk the attributes as `name[=value]` tokens and match the attribute
-    // named exactly `lang`. A substring search would mis-fire on an earlier
-    // attribute that merely contains "lang" (e.g. `data-slang="x"`).
+    match attribute_value(attributes, "lang").as_deref() {
+        Some("ts" | "typescript") => ScriptLanguage::Ts,
+        Some("tsx") => ScriptLanguage::Tsx,
+        Some("jsx") => ScriptLanguage::Jsx,
+        _ => ScriptLanguage::Js,
+    }
+}
+
+/// The lowercased value of the attribute named exactly `wanted`: `Some("")` for a valueless one
+/// (`setup`), `None` when absent. Walks `name[=value]` tokens, so `data-slang="x"` is not `lang`.
+fn attribute_value(attributes: &str, wanted: &str) -> Option<String> {
     let lower = attributes.to_ascii_lowercase();
     let mut offset = skip_ascii_whitespace(&lower, 0);
 
@@ -193,7 +376,6 @@ fn language_from_attributes(attributes: &str) -> ScriptLanguage {
             .map_or(lower.len(), |relative| offset + relative);
 
         if name_end == offset {
-            // Not an attribute-name character (e.g. a stray `/`); skip it.
             offset = skip_ascii_whitespace(&lower, offset + 1);
             continue;
         }
@@ -205,28 +387,32 @@ fn language_from_attributes(attributes: &str) -> ScriptLanguage {
             let value_start = skip_ascii_whitespace(&lower, after_name + 1);
             let (value, value_end) = read_attribute_value_with_end(&lower, value_start)
                 .unwrap_or((String::new(), value_start + 1));
-
-            if name == "lang" {
-                return match value.as_str() {
-                    "ts" | "typescript" => ScriptLanguage::Ts,
-                    "tsx" => ScriptLanguage::Tsx,
-                    "jsx" => ScriptLanguage::Jsx,
-                    _ => ScriptLanguage::Js,
-                };
+            if name == wanted {
+                return Some(value);
             }
-
             offset = skip_ascii_whitespace(&lower, value_end);
         } else {
-            // A valueless attribute (`setup`, or `lang` with no value → JS).
+            if name == wanted {
+                return Some(String::new());
+            }
             offset = after_name;
         }
     }
 
-    ScriptLanguage::Js
+    None
 }
 
+/// Every Svelte script's top-level bindings reach the markup. In Vue only `<script setup>` does,
+/// together with a plain `<script>` beside it; an Options API template sees only what the component
+/// object registers, never the script's imports.
 fn component_script_regions<'a>(filename: &str, source: &'a str) -> Vec<ScriptRegion<'a>> {
-    script_blocks(source)
+    let blocks = script_blocks(source);
+    let template_sees_imports = !filename.to_ascii_lowercase().ends_with(".vue")
+        || blocks
+            .iter()
+            .any(|block| attribute_value(block.attributes, "setup").is_some());
+
+    blocks
         .into_iter()
         .enumerate()
         .map(|(index, block)| {
@@ -236,7 +422,7 @@ fn component_script_regions<'a>(filename: &str, source: &'a str) -> Vec<ScriptRe
                 source: block.source,
                 offset: block.content_start,
                 runtime: ImportRuntime::Component,
-                shares_bindings_with_markup: true,
+                shares_bindings_with_markup: template_sees_imports,
             }
         })
         .collect()

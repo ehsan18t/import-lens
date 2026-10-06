@@ -552,3 +552,81 @@ import dayjs from 'dayjs'
         "only the live script block is analyzed: {imports:?}"
     );
 }
+
+#[test]
+fn a_type_name_in_static_markup_text_comments_or_styles_stays_elided() {
+    let source = r#"<script setup lang="ts" generic="T extends User">
+import { getAuth, User } from 'auth-lib'
+const user = ref<User | null>(getAuth())
+</script>
+<template>
+  <!-- User row -->
+  <th title="User">User</th>
+</template>
+<style>.User { color: red }</style>
+"#;
+
+    let imports = analyze_imports("Users.vue", source).expect("vue should parse");
+
+    assert_eq!(
+        named_imports_of(&imports, "auth-lib"),
+        vec!["getAuth"],
+        "static text, comments, styles and the generic attribute are not template references: {imports:?}"
+    );
+}
+
+#[test]
+fn a_vue_binding_used_in_an_interpolation_or_bound_attribute_is_kept() {
+    let source = r#"<script setup lang="ts">
+import { Icon, format } from 'ui-kit'
+type I = typeof Icon
+type F = typeof format
+</script>
+<template><component :is="Icon" />{{ format(1) }}</template>
+"#;
+
+    let imports = analyze_imports("Bound.vue", source).expect("vue should parse");
+
+    let mut named = named_imports_of(&imports, "ui-kit");
+    named.sort_unstable();
+    assert_eq!(named, vec!["Icon", "format"], "{imports:?}");
+}
+
+#[test]
+fn an_options_api_template_cannot_reach_script_imports() {
+    let source = r#"<script lang="ts">
+import { defineComponent } from 'vue'
+import { NButton } from 'naive-ui'
+type B = typeof NButton
+export default defineComponent({})
+</script>
+<template><NButton /></template>
+"#;
+
+    let imports = analyze_imports("Options.vue", source).expect("vue should parse");
+
+    assert!(
+        imports.iter().all(|item| item.specifier != "naive-ui"),
+        "without <script setup> the template sees only registered components: {imports:?}"
+    );
+}
+
+#[test]
+fn a_svelte_type_name_only_in_markup_text_stays_elided_but_an_expression_keeps_it() {
+    let source = r#"<script lang="ts">
+  import { User, Avatar } from 'ui-kit'
+  let u: User
+  type A = typeof Avatar
+</script>
+<p>User</p>
+<div>{Avatar}</div>
+"#;
+
+    let imports = analyze_imports("Card.svelte", source).expect("svelte should parse");
+
+    assert_eq!(
+        named_imports_of(&imports, "ui-kit"),
+        vec!["Avatar"],
+        "{imports:?}"
+    );
+}

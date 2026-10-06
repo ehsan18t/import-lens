@@ -1,7 +1,7 @@
 use super::{
     positions::LineIndex,
     script_regions::{
-        ScriptRegion, markup_outside, markup_references, script_regions_for_document,
+        ScriptRegion, markup_references, script_regions_for_document, template_references,
     },
     specifier::{get_package_name, is_runtime_package_specifier},
 };
@@ -19,7 +19,7 @@ pub fn analyze_imports(filename: &str, source: &str) -> Result<Vec<DetectedImpor
     let mut imports = Vec::new();
     let line_index = LineIndex::new(source);
     let regions = script_regions_for_document(filename, source);
-    let markup = markup_outside(source, &regions);
+    let markup = template_references(filename, source, &regions);
 
     for region in &regions {
         imports.extend(imports_from_region(source, &line_index, region, &markup)?);
