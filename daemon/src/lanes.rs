@@ -69,10 +69,10 @@ impl Lane {
                     }
                 }
             };
+            let _work = crate::reclaim::work();
             if catch_unwind(AssertUnwindSafe(job)).is_err() {
                 crate::logging::log_warn("lanes", format!("a {} job panicked", self.name));
             }
-            crate::reclaim::note_activity();
         }
     }
 }

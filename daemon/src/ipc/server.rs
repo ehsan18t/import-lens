@@ -289,7 +289,7 @@ mod ipc_server_teardown_tests;
 fn spawn_cache_maintenance(service: std::sync::Arc<ImportLensService>) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
         tokio::time::sleep(CACHE_MAINTENANCE_DELAY).await;
-        if tokio::task::spawn_blocking(move || service.run_cache_maintenance())
+        if spawn_blocking_noted(move || service.run_cache_maintenance())
             .await
             .is_err()
         {
@@ -341,12 +341,8 @@ fn spawn_request<T, R>(
 {
     let outbound = outbound.clone();
     let handle = tokio::spawn(async move {
-        let response = response_from_join(
-            tokio::task::spawn_blocking(handler),
-            &request_for_error,
-            on_error,
-        )
-        .await;
+        let response =
+            response_from_join(spawn_blocking_noted(handler), &request_for_error, on_error).await;
         queue_outbound(&outbound, &response);
     });
     track_active_task(active_tasks, handle);
@@ -687,7 +683,7 @@ where
                 if request.version >= 2 && request.streaming {
                     let request_for_error = request.clone();
                     let (partial_tx, partial_rx) = mpsc::unbounded_channel();
-                    let response_handle = tokio::task::spawn_blocking(move || {
+                    let response_handle = spawn_blocking_noted(move || {
                         svc.handle_analyze_package_json_streaming(request, move |partial| {
                             let _ = partial_tx.send(partial);
                         })
@@ -1112,6 +1108,17 @@ where
     Ok(())
 }
 
+/// Every blocking handler runs here, holding a `reclaim::Work` so the sweep waits for it and then
+/// follows the frees it made as it finished.
+fn spawn_blocking_noted<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    tokio::task::spawn_blocking(move || {
+        let _work = crate::reclaim::work();
+        work()
+    })
+}
+
 /// Run a cache invalidation off the connection loop. It rewrites every shard on disk, blocking redb
 /// I/O that grows with the number of projects ever opened, and the loop must keep writing frames
 /// meanwhile. The returned receiver settles when the invalidation has finished.
@@ -1123,7 +1130,7 @@ fn spawn_invalidation(
     let service = std::sync::Arc::clone(service);
     let (done_tx, done_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
-        if let Err(error) = tokio::task::spawn_blocking(move || invalidate(&service)).await {
+        if let Err(error) = spawn_blocking_noted(move || invalidate(&service)).await {
             logging::log_warn("cache", format!("cache invalidation failed: {error}"));
         }
         let _ = done_tx.send(());
@@ -1243,7 +1250,7 @@ fn spawn_document_analysis(
     tokio::spawn(async move {
         let request_for_error = request.clone();
         let analysis_service = std::sync::Arc::clone(&service);
-        let analysis_handle = tokio::task::spawn_blocking(move || {
+        let analysis_handle = spawn_blocking_noted(move || {
             analysis_service.handle_analyze_document_streaming(
                 request,
                 &crate::document::IgnoreRuleResolver::default(),
@@ -1264,7 +1271,7 @@ fn spawn_document_analysis(
         }
 
         let request = request_for_error;
-        let build = tokio::task::spawn_blocking(move || {
+        let build = spawn_blocking_noted(move || {
             let context = AnalysisContext {
                 workspace_root: PathBuf::from(&request.workspace_root),
                 active_document_path: PathBuf::from(&request.active_document_path),
@@ -1342,9 +1349,8 @@ fn spawn_file_size_document(
         // The file totals come from a real combined build; per-import misses come back `loading`
         // (the preceding `AnalyzeDocument` is building them). A force-fresh request is served
         // complete by this same call.
-        let response_handle = tokio::task::spawn_blocking(move || {
-            size_service.handle_file_size_document_streaming(request)
-        });
+        let response_handle =
+            spawn_blocking_noted(move || size_service.handle_file_size_document_streaming(request));
         let response = response_from_join(
             response_handle,
             &request_for_error,
@@ -1367,7 +1373,7 @@ fn spawn_file_size_document(
         }
 
         // Cancellation is per document: only a newer size read of this document supersedes it.
-        let revalidation = tokio::task::spawn_blocking(move || {
+        let revalidation = spawn_blocking_noted(move || {
             if let Some((workspace_root, document_path, results, identities)) = service
                 .revalidate_document_sizes(&request_for_error, &stale_specifiers, || {
                     !swr_cancelled.load(Ordering::Acquire)

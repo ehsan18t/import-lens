@@ -55,6 +55,12 @@ ureq = { version = "^3.3", default-features = false, features = ["rustls"] }
 xxhash-rust = { version = "^0.8", features = ["xxh3"] }
 zstd = "^0.13"
 
+# On Linux the C dependencies (zstd) allocate through glibc malloc, whose per-thread arenas keep
+# freed memory resident outside anything idle reclaim collects; mimalloc overrides malloc there.
+# A static Windows build cannot override it, and the Windows heap does not keep per-thread arenas.
+[target.'cfg(target_os = "linux")'.dependencies]
+libmimalloc-sys = { version = "^0.1", default-features = false, features = ["extended", "no_thp", "override"] }
+
 [dev-dependencies]
 zip = "^2"
 

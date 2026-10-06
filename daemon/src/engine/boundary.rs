@@ -76,8 +76,9 @@ fn engine_runtime_workers() -> usize {
 /// The engine runtime is separate from the IPC runtime so `bundle_sync` can
 /// be called from rayon/service threads (which are never Tokio workers)
 /// without deadlocking the I/O executor.
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
 fn engine_runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(engine_runtime_workers())
@@ -94,23 +95,39 @@ fn engine_runtime() -> &'static Runtime {
     })
 }
 
+/// Makes every engine worker run once, so each parks again and its park hook collects its heap. A
+/// parked worker otherwise never processes the blocks other threads freed into its pages after it
+/// parked, and an idle daemon never wakes it. Tokio cannot target a worker, but a task that holds
+/// its worker for a moment makes the scheduler wake another idle worker for the next one.
+pub(crate) fn wake_workers_to_collect() {
+    let Some(runtime) = RUNTIME.get() else {
+        return;
+    };
+    for _ in 0..engine_runtime_workers() {
+        runtime.spawn(async { std::thread::sleep(Duration::from_millis(2)) });
+    }
+}
+
 /// Decrements on drop, so a build future dropped before it finishes (the `BUILD_TIMEOUT`
 /// cancellation, runtime shutdown) cannot leak the counter.
-struct InFlight;
+struct InFlight {
+    _work: crate::reclaim::Work,
+}
 
 impl InFlight {
     fn enter() -> Self {
         STARTED.fetch_add(1, Ordering::Relaxed);
         let current = IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
         PEAK_IN_FLIGHT.fetch_max(current, Ordering::Relaxed);
-        Self
+        Self {
+            _work: crate::reclaim::work(),
+        }
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
         IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
-        crate::reclaim::note_activity();
     }
 }
 
