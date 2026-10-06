@@ -1,7 +1,9 @@
 use import_lens_daemon::{
     cache::key::{CacheIdentity, decode_cache_identity},
     ipc::protocol::ImportKind,
-    prefetch::{CancellationToken, Prefetcher, package_json_dependency_names, prewarm_pool},
+    prefetch::{
+        CancellationToken, Prefetcher, package_json_dependency_names, prewarm_pool, prewarm_root,
+    },
     service::ImportLensService,
 };
 use std::{
@@ -61,6 +63,7 @@ fn prewarmed_identities(workspace: &Path, expected: usize) -> Vec<CacheIdentity>
     let package_json_path = workspace.join("package.json");
     prefetcher.prewarm_package_json(
         Arc::clone(&service),
+        prewarm_root(Some(workspace), &package_json_path),
         package_json_path.clone(),
         package_json_path,
     );
@@ -177,6 +180,42 @@ fn package_json_prewarm_skips_the_default_import_of_a_package_without_one() {
     assert_eq!(identities.len(), 1, "{identities:?}");
     assert_eq!(identities[0].specifier, "named-lib");
     assert_eq!(identities[0].import_kind, ImportKind::Namespace);
+}
+
+/// Interactive analysis of every file in a workspace reads the shard of the connection's workspace
+/// root, so a manifest anywhere inside it must be prewarmed into that shard, not its own directory.
+#[test]
+fn a_manifest_inside_the_workspace_is_prewarmed_into_the_workspace_root() {
+    let workspace = temp_workspace();
+    let nested = workspace.join("packages").join("app").join("package.json");
+    let dependency = workspace
+        .join("node_modules")
+        .join("react")
+        .join("package.json");
+    let outside = std::env::temp_dir()
+        .join("import-lens-elsewhere")
+        .join("package.json");
+
+    assert_eq!(prewarm_root(Some(&workspace), &nested), workspace);
+    assert_eq!(prewarm_root(Some(&workspace), &dependency), workspace);
+    assert_eq!(
+        prewarm_root(Some(&workspace), &outside),
+        outside.parent().expect("manifest directory")
+    );
+    assert_eq!(
+        prewarm_root(None, &nested),
+        nested.parent().expect("manifest directory")
+    );
+    if cfg!(windows) {
+        let upper = PathBuf::from(workspace.to_string_lossy().to_uppercase());
+        assert_eq!(
+            prewarm_root(Some(&upper), &nested),
+            upper,
+            "Windows paths compare case-insensitively"
+        );
+    }
+
+    fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }
 
 #[test]

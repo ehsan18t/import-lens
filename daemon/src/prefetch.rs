@@ -80,9 +80,12 @@ impl Prefetcher {
         self.cancellation.cancel();
     }
 
+    /// Prewarm a manifest's dependencies into the cache of `workspace_root`, the analysis root
+    /// interactive requests for this workspace read (see [`prewarm_root`]).
     pub fn prewarm_package_json(
         &self,
         service: Arc<ImportLensService>,
+        workspace_root: PathBuf,
         package_json_path: PathBuf,
         active_document_path: PathBuf,
     ) {
@@ -92,8 +95,11 @@ impl Prefetcher {
         dispatch_prewarm(move || {
             run_prewarm_job(
                 service,
+                AnalysisContext {
+                    workspace_root,
+                    active_document_path,
+                },
                 package_json_path,
-                active_document_path,
                 cancellation,
                 generation,
             );
@@ -294,10 +300,33 @@ fn entry_stat_token(path: &Path) -> u64 {
     metadata.len() ^ modified.rotate_left(32)
 }
 
+/// The analysis root a package.json prewarm caches under. Interactive analysis of a workspace's
+/// files reads the shard of the workspace root the connection was opened for, so a manifest inside
+/// that workspace (a monorepo package, or a dependency under `node_modules`) is prewarmed into that
+/// shard; prewarming under the manifest's own directory would fill a shard nothing reads. A
+/// manifest outside the workspace falls back to its own directory.
+pub fn prewarm_root(workspace_root: Option<&Path>, package_json_path: &Path) -> PathBuf {
+    let manifest_dir = package_json_path.parent().unwrap_or(package_json_path);
+    match workspace_root {
+        Some(root) if is_within(manifest_dir, root) => root.to_path_buf(),
+        _ => manifest_dir.to_path_buf(),
+    }
+}
+
+fn is_within(path: &Path, root: &Path) -> bool {
+    if cfg!(windows) {
+        // Windows paths compare case-insensitively, the drive letter included.
+        let lower = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
+        lower(path).starts_with(lower(root))
+    } else {
+        path.starts_with(root)
+    }
+}
+
 fn run_prewarm_job(
     service: Arc<ImportLensService>,
+    context: AnalysisContext,
     package_json_path: PathBuf,
-    active_document_path: PathBuf,
     cancellation: Arc<CancellationToken>,
     generation: u64,
 ) {
@@ -305,23 +334,17 @@ fn run_prewarm_job(
         return;
     }
 
-    let Ok(jobs) = package_json_prewarm_jobs(&package_json_path, &active_document_path, &|| {
-        cancellation.is_current(generation)
-    }) else {
+    let Ok(jobs) =
+        package_json_prewarm_jobs(&package_json_path, &context.active_document_path, &|| {
+            cancellation.is_current(generation)
+        })
+    else {
         return;
     };
 
     if jobs.is_empty() || !cancellation.is_current(generation) {
         return;
     }
-
-    let context = AnalysisContext {
-        workspace_root: package_json_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| active_document_path.clone()),
-        active_document_path,
-    };
 
     drain_ordered(&jobs, |_, job| {
         if cancellation.is_current(generation) {

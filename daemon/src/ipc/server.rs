@@ -16,7 +16,7 @@ use crate::{
     lifecycle::{LifecycleState, record_recycle_timestamp},
     logging::{self, parse_log_level, set_log_level},
     pipeline::analyze::AnalysisContext,
-    prefetch::Prefetcher,
+    prefetch::{Prefetcher, prewarm_root},
     service::{
         ImportLensService, StreamedDocumentAnalysis, protocol_error_analyze_document_response,
         protocol_error_exports_response, protocol_error_file_size_document_response,
@@ -508,6 +508,8 @@ where
     // Set while a cache invalidation runs. No frame is read until it settles, so every request
     // that follows an invalidation still sees its effect; frames already queued keep going out.
     let mut invalidation: Option<oneshot::Receiver<()>> = None;
+    // The workspace root the client opened this connection for.
+    let mut connection_workspace_root: Option<PathBuf> = None;
 
     loop {
         let payload = tokio::select! {
@@ -685,6 +687,7 @@ where
                 // full shard scans). Replacing the handle aborts the previous
                 // task if a client re-handshakes.
                 _maintenance_task = Some(spawn_cache_maintenance(std::sync::Arc::clone(&service)));
+                connection_workspace_root = Some(hello_workspace_root.clone());
                 prefetcher.prewarm_recent_cache_entries(
                     std::sync::Arc::clone(&service),
                     hello_workspace_root,
@@ -1039,9 +1042,11 @@ where
                 );
             }
             ClientMessage::PrewarmPackageJson(message) if hello_received => {
+                let package_json_path = PathBuf::from(message.package_json_path);
                 prefetcher.prewarm_package_json(
                     std::sync::Arc::clone(&service),
-                    PathBuf::from(message.package_json_path),
+                    prewarm_root(connection_workspace_root.as_deref(), &package_json_path),
+                    package_json_path,
                     PathBuf::from(message.active_document_path),
                 );
             }
