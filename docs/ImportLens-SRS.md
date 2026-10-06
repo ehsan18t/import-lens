@@ -533,7 +533,7 @@ Every requested surface must carry a unique entry alias so strict entry signatur
 
   Shown, never stored, never judged — the same three rules as a floor, for the opposite error.
 
-  A per-import deterministic failure is still **cached as a per-import fact** (FR-026c), because it is a property of the package's bytes. The two rules are about different things: caching the *failure* is right, caching the *file total that is missing it* is not.
+  A per-import deterministic failure is still **cached as a per-import fact** (FR-026c), because it is a property of the package's bytes. The two rules are about different things: caching the *failure* is right, caching the *file total that is missing it* is not. The same holds one level up: a runtime group's combined build that fails deterministically is memoized as a failure, keyed by the document, the group's exact entries, the bytes the build read, its manifests and the cache generation, so the file's next size request recomputes the floor without re-running a build that can only fail again. A request-local failure (`timeout`, `panic`, `engine_gone`, `asset_io`) is never memoized.
 
 **Known limitation: no named-CJS typo warning.** No warning is emitted for a named import of a CommonJS package that the module does not export. Interop exposes a CJS entry's surface as `default` only, so there is no validated name set to check an import against, and adding one would mean hand-rolled, regex-grade module analysis of the kind Rolldown exists to replace, for a lint, at the cost of a second source of truth for CJS semantics.
 

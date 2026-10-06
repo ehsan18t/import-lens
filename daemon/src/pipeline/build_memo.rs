@@ -9,7 +9,12 @@
 //! - export enumeration for completion (§8.4), which was an uncached full build of
 //!   the whole package graph on every popup.
 //!
-//! Both are memoized here. Correctness rests on the memo expiring exactly when the
+//! A third answer is a failure: a file's combined File Cost build that failed for a
+//! reason its inputs' bytes decide (`file_size_cache`), keyed by the document rather
+//! than an entry. Its total is a floor and is never cached, but rebuilding it only
+//! reproduces the same failure until those bytes change.
+//!
+//! All three are memoized here. Correctness rests on the memo expiring exactly when the
 //! value it holds would have gone wrong, which takes **two** independent guards:
 //!
 //! 1. **Read-time fingerprints.** The build's own fingerprints — the bytes it was
@@ -124,6 +129,12 @@ impl<V: Clone> BuildMemo<V> {
             entry.used_at = self.tick.fetch_add(1, Ordering::Relaxed);
         }
         Some(value)
+    }
+
+    /// Drop whatever is stored for this entry, so a value the caller knows no longer applies is
+    /// not re-verified on every later lookup.
+    pub(crate) fn remove(&self, entry_path: &Path, runtime: ImportRuntime) {
+        self.lock().remove(&(entry_path.to_path_buf(), runtime));
     }
 
     /// Store a value against the fingerprints of the exact bytes it was measured from.
