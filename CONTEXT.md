@@ -100,3 +100,13 @@ What adding an import to a project that already contains some of its dependencie
 cost. Requires a Bundle Size model, so it is outside this context. Named here only so
 that "what does this really cost me" questions resolve to a term the product does not
 implement.
+
+### The daemon's resources
+
+**Visible Document**:
+A document shown in an editor pane right now, as the extension reports it in `visible_documents`. Only a Visible Document's queued builds are worth running: a document that stopped being visible keeps the builds already inside Rolldown (they finish and are cached) and loses every build that had not started.
+_Avoid_: open document (VS Code opens documents that are never shown)
+
+**Retained Memory**:
+Resident memory the daemon holds that no live allocation needs: freed pages an allocator kept, and stacks of threads that only exist to wait. It grows with thread count, not with project size, so it is gated after a full cache clear, where live data is near zero. Live data (the caches, a large project's graphs) is not Retained Memory and has no RSS cap.
+_Avoid_: memory leak (nothing is unreachable), RAM usage (says nothing about which kind)
