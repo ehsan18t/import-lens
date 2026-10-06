@@ -3,7 +3,7 @@ use crate::{
         FileFingerprint, fingerprints_are_reusable, sort_and_dedup_fingerprints,
         unverifiable_file_fingerprint,
     },
-    engine::BundleEntry,
+    engine::{BundleEntry, BundlePurpose, BundleRequest, boundary},
     ipc::protocol::{
         AssetContribution, ImportDiagnostic, ImportRequest, ImportResult, ImportRuntime,
         ModuleContribution,
@@ -12,7 +12,6 @@ use crate::{
         analyze::{AnalysisContext, engine_selection},
         assets::{asset_diagnostics, process_assets_bounded},
         compress::{CompressionSizes, compress_all},
-        file_size_cache::bundle_file_size_group,
         minify::minify_source,
         resolver::resolve_package_entry,
         util::diagnostic,
@@ -504,7 +503,11 @@ fn compute_file_size_with(
     let mut any_sized = false;
 
     for (runtime, group) in groups {
-        let artifact = match bundle_file_size_group(context, runtime, group.entries) {
+        let artifact = match boundary::bundle_sync(BundleRequest {
+            entries: group.entries,
+            runtime,
+            purpose: BundlePurpose::FileSize,
+        }) {
             Ok(artifact) => artifact,
             Err(failure) => {
                 // Only this runtime's entries degrade. The other groups keep their real,

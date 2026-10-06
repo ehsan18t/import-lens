@@ -9,23 +9,18 @@
 //! - export enumeration for completion (§8.4), which was an uncached full build of
 //!   the whole package graph on every popup.
 //!
-//! A third answer is a failure: a file's combined File Cost build that failed for a
-//! reason its inputs' bytes decide (`file_size_cache`), keyed by the document rather
-//! than an entry. Its total is a floor and is never cached, but rebuilding it only
-//! reproduces the same failure until those bytes change.
-//!
-//! All three are memoized here. Correctness rests on the memo expiring exactly when the
+//! Both are memoized here. Correctness rests on the memo expiring exactly when the
 //! value it holds would have gone wrong, which takes **two** independent guards:
 //!
 //! 1. **Read-time fingerprints.** The build's own fingerprints (the bytes it was
 //!    actually measured from) are checked with `check_fingerprints_strict`, the same
 //!    validator the import cache uses. First-party inputs are hash-verified on every
 //!    lookup, so even an edit that preserves mtime and length is caught. Installed
-//!    (`node_modules`) inputs are re-checked once per `REVERIFY_TTL` at a given
-//!    generation, exactly as the import cache's fast path trusts them: they change only
-//!    through an install, which bumps the generation, and the window bounds an install
-//!    no watcher reported. A build whose graph held a module the plugin could not
-//!    fingerprint as it read it is not memoized at all.
+//!    (`node_modules`) inputs are verified on every lookup too, except in a memo built
+//!    with `trusting_installed_window` (the export list, which feeds no durable store):
+//!    that one re-checks them once per `REVERIFY_TTL` at a given generation, as the
+//!    import cache's fast path does. A build whose graph held a module the plugin could
+//!    not fingerprint as it read it is not memoized at all.
 //!
 //! 2. **The cache generation.** Fingerprints alone are not enough. `node_modules`
 //!    manifests are deliberately not fingerprinted — an installed manifest cannot
@@ -77,13 +72,28 @@ struct Entry<V> {
 pub(crate) struct BuildMemo<V> {
     entries: Mutex<HashMap<Key, Entry<V>>>,
     tick: AtomicU64,
+    /// Whether installed inputs may go unchecked within `REVERIFY_TTL`. Only for a memo whose
+    /// values reach no durable store: a value served unverified inside the window and folded into
+    /// a cached result would outlive the window.
+    trusts_installed_window: bool,
 }
 
 impl<V: Clone> BuildMemo<V> {
+    /// A memo that verifies every input on every lookup.
     pub(crate) fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             tick: AtomicU64::new(0),
+            trusts_installed_window: false,
+        }
+    }
+
+    /// A memo that re-checks installed inputs once per `REVERIFY_TTL`. First-party inputs are
+    /// still verified on every lookup.
+    pub(crate) fn trusting_installed_window() -> Self {
+        Self {
+            trusts_installed_window: true,
+            ..Self::new()
         }
     }
 
@@ -114,9 +124,10 @@ impl<V: Clone> BuildMemo<V> {
             // can only have changed with no invalidation event, which the window itself bounds
             // (the import cache's fast path). First-party inputs change with no event at all,
             // so they are re-verified on every lookup regardless (D3).
-            let verified_recently = entry
-                .verified_at
-                .is_some_and(|at| at.elapsed() < REVERIFY_TTL);
+            let verified_recently = self.trusts_installed_window
+                && entry
+                    .verified_at
+                    .is_some_and(|at| at.elapsed() < REVERIFY_TTL);
             let fingerprints = if verified_recently {
                 entry.first_party.clone()
             } else {
@@ -161,12 +172,6 @@ impl<V: Clone> BuildMemo<V> {
             }
         }
         Some(value)
-    }
-
-    /// Drop whatever is stored for this entry, so a value the caller knows no longer applies is
-    /// not re-verified on every later lookup.
-    pub(crate) fn remove(&self, entry_path: &Path, runtime: ImportRuntime) {
-        self.lock().remove(&(entry_path.to_path_buf(), runtime));
     }
 
     /// Store a value against the fingerprints of the exact bytes it was measured from.
@@ -276,9 +281,30 @@ mod tests {
             vec![crate::cache::key::file_fingerprint_reading_hash(path).expect("fingerprint")]
         };
         let generation = crate::cache::memory::cache_generation();
-        let memo = BuildMemo::<u64>::new();
         let runtime = ImportRuntime::Client;
 
+        let strict = BuildMemo::<u64>::new();
+        strict.insert(&installed, runtime, 1, fingerprint(&installed), generation);
+        assert_eq!(strict.get(&installed, runtime), Some(1));
+        std::fs::write(
+            &installed,
+            "export const a = 'edit';
+",
+        )
+        .expect("rewrite");
+        assert_eq!(
+            strict.get(&installed, runtime),
+            None,
+            "a memo that does not trust the window verifies installed inputs on every lookup"
+        );
+        std::fs::write(
+            &installed,
+            "export const a = 1;
+",
+        )
+        .expect("restore");
+
+        let memo = BuildMemo::<u64>::trusting_installed_window();
         memo.insert(&installed, runtime, 1, fingerprint(&installed), generation);
         assert_eq!(
             memo.get(&installed, runtime),

@@ -20,7 +20,8 @@ use crate::engine::{BundleFailure, ExportEnumeration, boundary};
 use crate::ipc::protocol::ImportRuntime;
 use crate::pipeline::analyze::{AnalysisContext, manifest_augmented_fingerprints};
 
-static MEMO: LazyLock<BuildMemo<ExportEnumeration>> = LazyLock::new(BuildMemo::new);
+static MEMO: LazyLock<BuildMemo<ExportEnumeration>> =
+    LazyLock::new(BuildMemo::trusting_installed_window);
 
 /// Enumerate a package entry's exports, reusing a previous build's answer while every
 /// file it was derived from is unchanged.

@@ -1,32 +1,26 @@
 use crate::{
     cache::{
         key::{
-            FileFingerprint, Freshness, cache_key_for_resolved_import, check_fingerprints_strict,
-            file_fingerprint_reading_hash, identity_path_string, path_is_definitely_gone,
-            sort_and_dedup_fingerprints, unverifiable_file_fingerprint,
+            Freshness, cache_key_for_resolved_import, check_fingerprints_strict,
+            path_is_definitely_gone,
         },
         memory::cache_generation,
     },
-    engine::{
-        BundleArtifact, BundleEntry, BundleFailure, BundlePurpose, BundleRequest, boundary,
-        dependency_paths::cached_loaded_paths,
-    },
+    engine::dependency_paths::cached_loaded_paths,
     ipc::protocol::{ImportRequest, ImportRuntime},
     pipeline::{
-        analyze::{AnalysisContext, manifest_augmented_fingerprints},
-        build_memo::BuildMemo,
+        analyze::AnalysisContext,
         file_size::{FileSizeComputation, SizedImport, SizedPackage},
         resolver::{ResolvedPackage, resolve_package_entry},
-        stage::may_enter_a_durable_store,
     },
 };
 use papaya::HashMap;
 use std::{
-    collections::{HashSet, hash_map::DefaultHasher},
+    collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
-        LazyLock, OnceLock,
+        OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -172,127 +166,6 @@ static SHARED_FILE_SIZE_CACHE: OnceLock<FileSizeCache> = OnceLock::new();
 /// Process-wide L1 cache instance used by the file-size handlers.
 pub fn shared_file_size_cache() -> &'static FileSizeCache {
     SHARED_FILE_SIZE_CACHE.get_or_init(FileSizeCache::new)
-}
-
-/// A runtime group's combined build that failed for a reason its inputs' bytes decide.
-#[derive(Debug, Clone)]
-struct FailedGroupBuild {
-    /// The exact entries that failed. The memo is keyed by document, whose imports change as it
-    /// is edited, so a stored failure answers only the same entries.
-    entries: Vec<BundleEntry>,
-    stage: String,
-    message: String,
-    diagnostics: Vec<crate::engine::ImportDiagnostic>,
-}
-
-static FAILED_GROUP_BUILDS: LazyLock<BuildMemo<FailedGroupBuild>> = LazyLock::new(BuildMemo::new);
-
-/// Build one runtime group of a file's combined File Cost build, answering from a memoized
-/// deterministic failure when the same entries already failed over the same bytes.
-///
-/// The total built from a failed group is a floor and is never cached, so without this a file with
-/// one deterministically unbuildable import re-ran its biggest build on every size request. Only a
-/// failure whose every stage is durable is memoized; a timeout, panic, lost engine or unreadable
-/// input always rebuilds. The memo expires on the failing build's read-time fingerprints, its
-/// entries' manifests, and the cache generation, the same set the import cache expires a cached
-/// failure on.
-pub(crate) fn bundle_file_size_group(
-    context: &AnalysisContext,
-    runtime: ImportRuntime,
-    entries: Vec<BundleEntry>,
-) -> Result<BundleArtifact, BundleFailure> {
-    let document = context.active_document_path.as_path();
-    if let Some(failed) = FAILED_GROUP_BUILDS.get(document, runtime)
-        && failed.entries == entries
-    {
-        return Err(BundleFailure {
-            stage: failed.stage,
-            message: failed.message,
-            diagnostics: failed.diagnostics,
-            loaded_paths: Vec::new(),
-            read_time_fingerprints: Vec::new(),
-        });
-    }
-
-    // Read before the build: an invalidation landing mid-build must not be stamped onto a failure
-    // derived from the bytes it invalidated.
-    let generation = cache_generation();
-    let failure = match boundary::bundle_sync(BundleRequest {
-        entries: entries.clone(),
-        runtime,
-        purpose: BundlePurpose::FileSize,
-    }) {
-        Ok(artifact) => {
-            FAILED_GROUP_BUILDS.remove(document, runtime);
-            return Ok(artifact);
-        }
-        Err(failure) => failure,
-    };
-
-    if failure_is_deterministic(&failure) {
-        let fingerprints = failure_fingerprints(context, &entries, &failure);
-        FAILED_GROUP_BUILDS.insert(
-            document,
-            runtime,
-            FailedGroupBuild {
-                entries,
-                stage: failure.stage.clone(),
-                message: failure.message.clone(),
-                diagnostics: failure.diagnostics.clone(),
-            },
-            fingerprints,
-            generation,
-        );
-    } else {
-        FAILED_GROUP_BUILDS.remove(document, runtime);
-    }
-    Err(failure)
-}
-
-/// A stage this function has never classified refuses the memo, as it refuses every durable store.
-fn failure_is_deterministic(failure: &BundleFailure) -> bool {
-    may_enter_a_durable_store(&failure.stage)
-        && failure
-            .diagnostics
-            .iter()
-            .all(|diagnostic| may_enter_a_durable_store(&diagnostic.stage))
-}
-
-/// The bytes a failed group build was derived from: every module it read, the entries' own
-/// manifests, and the first-party manifests its modules sit under. A module the build parsed
-/// without a read-time fingerprint (one handed back to Rolldown unread) has nothing to expire
-/// against, so it is recorded as unverifiable, which keeps the failure out of the memo.
-fn failure_fingerprints(
-    context: &AnalysisContext,
-    entries: &[BundleEntry],
-    failure: &BundleFailure,
-) -> Vec<FileFingerprint> {
-    let Some((first, rest)) = entries.split_first() else {
-        return Vec::new();
-    };
-    let mut fingerprints = manifest_augmented_fingerprints(
-        context,
-        &first.package_root,
-        &failure.read_time_fingerprints,
-        &failure.loaded_paths,
-    );
-    fingerprints.extend(rest.iter().filter_map(|entry| {
-        file_fingerprint_reading_hash(entry.package_root.join("package.json"))
-    }));
-    let read: HashSet<&str> = failure
-        .read_time_fingerprints
-        .iter()
-        .map(|fingerprint| fingerprint.path.as_str())
-        .collect();
-    fingerprints.extend(
-        failure
-            .loaded_paths
-            .iter()
-            .filter(|path| !read.contains(identity_path_string(path).as_str()))
-            .map(unverifiable_file_fingerprint),
-    );
-    sort_and_dedup_fingerprints(&mut fingerprints);
-    fingerprints
 }
 
 /// Freshness key for an L1 file-size entry: sorted per-import freshness tokens (see
@@ -448,48 +321,6 @@ mod tests {
     /// reads the request, so the measurement is irrelevant here.
     fn sized(request: ImportRequest) -> SizedImport {
         SizedImport::installed(request, None)
-    }
-
-    /// A combined-build failure that describes this run rather than the bytes must rebuild next
-    /// time, so it never enters the failure memo; nor does one carrying a stage nobody classified.
-    #[test]
-    fn only_a_failure_the_bytes_decide_may_be_memoized() {
-        use crate::engine::{ImportDiagnostic, stage};
-        let failure = |failure_stage: &str, diagnostic_stages: &[&str]| BundleFailure {
-            stage: failure_stage.to_owned(),
-            message: String::new(),
-            diagnostics: diagnostic_stages
-                .iter()
-                .map(|diagnostic_stage| ImportDiagnostic {
-                    stage: (*diagnostic_stage).to_owned(),
-                    message: String::new(),
-                })
-                .collect(),
-            loaded_paths: Vec::new(),
-            read_time_fingerprints: Vec::new(),
-        };
-
-        assert!(failure_is_deterministic(&failure(
-            stage::PARSE,
-            &[stage::PARSE]
-        )));
-        assert!(failure_is_deterministic(&failure(
-            stage::MISSING_EXPORT,
-            &[]
-        )));
-        for transient in [
-            stage::TIMEOUT,
-            stage::PANIC,
-            stage::ENGINE_GONE,
-            stage::ASSET_IO,
-        ] {
-            assert!(!failure_is_deterministic(&failure(transient, &[])));
-            assert!(!failure_is_deterministic(&failure(
-                stage::PARSE,
-                &[transient]
-            )));
-        }
-        assert!(!failure_is_deterministic(&failure("never_classified", &[])));
     }
 
     #[test]

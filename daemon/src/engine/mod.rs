@@ -32,7 +32,7 @@ pub struct BundleRequest {
 /// package's `sideEffects` itself, from the manifest the plugin supplies, and is the only authority
 /// on retention (FR-021). The daemon's own reading of the field decides a badge, never a byte, so
 /// it stays on the pipeline's side of this boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BundleEntry {
     /// Pre-resolved absolute entry file; the engine never re-resolves the
     /// bare package specifier.
@@ -41,7 +41,7 @@ pub struct BundleEntry {
     pub selection: BundleSelection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum BundleSelection {
     Named(Vec<String>),
     Default,

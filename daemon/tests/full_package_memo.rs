@@ -89,7 +89,7 @@ fn temp_workspace() -> PathBuf {
 }
 
 #[test]
-fn the_comparison_build_is_paid_once_per_entry() {
+fn the_comparison_build_is_paid_once_per_entry_and_expires_on_edit() {
     let _serial = serialized();
     let workspace = temp_workspace();
     write_package(&workspace);
@@ -109,10 +109,14 @@ fn the_comparison_build_is_paid_once_per_entry() {
         "a second named import off the same entry must reuse the memoized comparison"
     );
 
-    // An installed module edited with no install is re-checked once per REVERIFY_TTL, the
-    // import cache's own window, and an install expires the memo through the generation
-    // (below). The fingerprint expiry itself is pinned by `build_memo`'s unit tests and by
-    // `export_list_memo`, whose package is first-party.
+    // Its length feeds `truly_treeshakeable`, which is cached durably, so editing an installed
+    // module the comparison measured must expire it on the very next lookup.
+    write_alpha(&workspace, "gamma");
+    assert_eq!(
+        analyze(&workspace, "alpha"),
+        2,
+        "editing a module the comparison measured must expire the memo"
+    );
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
 }

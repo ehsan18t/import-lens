@@ -350,6 +350,23 @@ consumer can see without reading diagnostic text. Doing it means deciding whethe
 "a contributor is a floor" rather than "a contributor is missing", which changes what every durable store and
 budget check does with an `external` boundary — far past the blast radius of the change that found it.
 
+### D4: A file with one unmeasurable import can never cache its total
+**Status: Deferred** · A performance cost of an invariant we want
+
+An aggregate missing a contributor's bytes is a **floor**, and a floor is never cached. So a file containing
+one permanently-broken import, or one deterministically unprocessable supported asset, re-runs its combined
+build and asset tail on every size request. The per-import deterministic outcome is still cached; the file
+aggregate cannot be, because it is not a complete File Cost.
+
+A memo of the deterministic build failure was implemented and reverted (2026-10-06): it is not safe with the
+inputs a failed build records. A relative JavaScript module that is missing when the build runs fails it at
+`resolve`, a durable stage, but the plugin records an absent-file fingerprint only for asset candidates, so the
+memo never expires when the module appears; a module deleted and recreated mid-build (`rimraf dist && tsc`, a
+checkout) is memoized the same way; and a workspace tsconfig error is durable `link` while a tsconfig edit
+bumps no generation. Each served a stale floor indefinitely where the uncached path recovers on the next
+request. **Prerequisite for a retry:** absent-file fingerprints for every module the build failed to read or
+resolve, and a generation bump on tsconfig edits.
+
 ### D3: Marginal cost, a project-level bundle model
 **Status: Deferred** · A different product, decided on its own merits
 
@@ -770,7 +787,6 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
-| D4 | A file with one deterministically unbuildable import re-ran its combined build on every size request | 2026-10-06 |
 | R2 | The legacy entry-field fallback searched `module`, `browser`, `main`, against the resolver's own per-runtime order | 2026-10-06 |
 | G2 | A failed (unmeasured) import was counted and badged as a "Conservative estimate" in the workspace report | 2026-10-06 |
 | K2 | The project-cache metadata and the recycle timestamp were written in place, so a crash mid-write could tear them | 2026-10-06 |
