@@ -1118,7 +1118,7 @@ fn side_effects_mode(
 ///   is `[]`.
 ///
 /// Answering `Unknown` (side-effectful) for either would contradict the build the size came from.
-/// `Unknown` is only for an entry path with no package-relative form to match against.
+/// `Unknown` is only for an entry path that cannot be canonicalized.
 fn side_effects_array_mode(
     patterns: &[Value],
     package_root: &Path,
@@ -1146,14 +1146,18 @@ fn side_effects_array_mode(
 /// `node_modules/<name>` onto `packages/<name>`). Canonicalizing both sides makes the strip survive
 /// a junction, a pnpm store link, and a Windows `\\?\` spelling on one side only.
 ///
-/// `None` means the entry does not live under its own package root, the one case for
-/// [`SideEffectsMode::Unknown`]. It is reachable: a `dist/` that is a junction or symlink outside
-/// the package canonicalizes beyond the root, so the badge says side-effectful while Rolldown drops
-/// the entry's effects as pure. Recorded as **S1** in `docs/known-issues.md`.
+/// An entry that canonicalizes outside its root (a `dist/` that is a junction or symlink out of the
+/// package) gets the `../`-led path Rolldown's own `relative_path` computes, so the glob is matched
+/// against what the build matched, not against a path the build never saw. `None` means a path
+/// could not be canonicalized, the one case for [`SideEffectsMode::Unknown`].
 fn normalized_side_effect_path(package_root: &Path, entry_path: &Path) -> Option<String> {
     let root = fs::canonicalize(package_root).ok()?;
     let entry = fs::canonicalize(entry_path).ok()?;
-    let relative = entry.strip_prefix(&root).ok()?;
+    let relative = match entry.strip_prefix(&root) {
+        Ok(inside) => inside.to_path_buf(),
+        Err(_) => rolldown_common::ModuleId::new(entry.to_string_lossy().into_owned())
+            .relative_path(&root),
+    };
 
     let joined = relative
         .components()

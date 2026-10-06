@@ -440,28 +440,6 @@ Rolldown output as an ES module, and it is not a `BundleRequest` field). Only th
 **What would fix it:** resolve the entry's format on the prefetch path instead of passing `false`, or fold
 `is_cjs` into `CacheIdentity` so the two paths cannot share a row.
 
-### S1: An entry outside its own package root gets a side-effectful badge it may not deserve
-**Status: Accepted** · Wrong badge, never a wrong size · Pre-existing
-
-`normalized_side_effect_path` derives the package-relative path by stripping the canonicalized package root
-from the canonicalized entry. If the strip fails, the mode falls to `Unknown`, which reports side-effectful,
-and therefore `truly_treeshakeable: false` by construction (the full-package comparison is gated off) and
-confidence capped at Medium.
-
-**The strip can fail.** A package whose `dist/` is itself a junction (Windows) or symlink (POSIX) onto a
-directory outside the package resolves, after canonicalization, to an entry that is not under its own root.
-
-**MEASURED:** such a package declaring `["dist/index.js"]` gets `side_effects: true`,
-`truly_treeshakeable: false`, Medium, while Rolldown dropped the entry's gated effect (45 B minified). The
-badge contradicts the build its own number came out of.
-
-**Why it is accepted:** the size is right. Rolldown resolves the link exactly as webpack does, so the bytes are
-the bytes. Only the badge is wrong, and only for a layout (a package whose build output directory is a link out
-of the package) that essentially nobody ships.
-
-**What would fix it:** carry the pre-canonical package-relative path alongside the entry, so the relative form
-survives a link that the canonical form cannot express.
-
 ### G1: The negative-`error` Guard catches 18 of 24 spellings
 **Status: Accepted** · The number is machine-pinned, not claimed
 

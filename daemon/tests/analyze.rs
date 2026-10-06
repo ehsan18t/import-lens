@@ -2655,6 +2655,72 @@ fn a_workspace_linked_package_answers_with_what_rolldown_retained() {
     );
 }
 
+/// **An entry whose build directory links out of its package gets the badge Rolldown's retention
+/// gives it.** `dist/` is a junction (Windows) / symlink (POSIX) onto a directory outside the
+/// package, so the canonical entry is not under the canonical root and Rolldown matches the glob
+/// against a `../`-led path. Each declaration is judged against what the build actually kept.
+#[test]
+fn an_entry_linked_outside_its_package_answers_with_what_rolldown_retained() {
+    const EFFECT_PAYLOAD_BYTES: usize = 60_000;
+
+    for side_effects in [
+        r#"["dist/index.js"]"#,
+        r#"["**/index.js"]"#,
+        r#"["index.js"]"#,
+    ] {
+        let workspace = temp_workspace();
+        let package_root = workspace.join("node_modules").join("linked-dist-lib");
+        let build_out = workspace.join("build-out");
+        fs::create_dir_all(&package_root).expect("package root");
+        fs::create_dir_all(&build_out).expect("build output");
+        fs::write(
+            package_root.join("package.json"),
+            format!(
+                r#"{{"version":"1.0.0","module":"dist/index.js","sideEffects":{side_effects}}}"#
+            ),
+        )
+        .expect("manifest");
+        fs::write(
+            build_out.join("index.js"),
+            format!(
+                "const payload = '{}';\n\
+                 globalThis.__il_side_effect_payload = payload;\n\
+                 export {{ used }} from './impl.js';\n",
+                "z".repeat(EFFECT_PAYLOAD_BYTES)
+            ),
+        )
+        .expect("entry");
+        fs::write(build_out.join("impl.js"), "export const used = 1;\n").expect("impl");
+        link_package_directory(&build_out, &package_root.join("dist"));
+
+        let context = AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        };
+        let result = analyze_import(
+            &context,
+            &import_request(
+                "linked-dist-lib",
+                "linked-dist-lib",
+                "1.0.0",
+                ImportKind::Named,
+                &["used"],
+            ),
+        );
+        let sizes = common::measured_sizes(&result);
+        fs::remove_dir_all(&workspace).ok();
+
+        assert_eq!(result.error, None, "{side_effects}: {result:?}");
+        let retained = sizes.minified_bytes as usize >= EFFECT_PAYLOAD_BYTES;
+        assert_eq!(
+            result.side_effects, retained,
+            "{side_effects}: the badge must be the answer Rolldown gave the same manifest, \
+             minified={} {result:?}",
+            sizes.minified_bytes,
+        );
+    }
+}
+
 /// A CSS-shipping package builds, and says what it did not count.
 ///
 /// Rolldown 1.1.5 cannot bundle CSS at all: a `.css` module reaching it fails the WHOLE build at the
