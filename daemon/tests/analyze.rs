@@ -3472,6 +3472,49 @@ fn analyze_measures_an_asset_imported_with_a_loader_suffix() {
     assert_eq!(font.raw_bytes, 4 * 1024, "{result:?}");
 }
 
+/// The same suffix on a module that is neither JavaScript nor an asset. The load hook reads
+/// `payload.json` for the id `payload.json?raw`, and Rolldown infers the type from the id, where
+/// `json?raw` names nothing, so JSON text reached the JavaScript parser and the package failed at
+/// `parse`. It is measured as the JSON its extension says it is.
+#[test]
+fn analyze_measures_json_imported_with_a_loader_suffix() {
+    let workspace = temp_workspace();
+    write_package(
+        &workspace,
+        "suffixed-json-lib",
+        r#"{"version":"1.0.0","module":"index.js"}"#,
+        "import payload from './payload.json?raw';\nexport const widget = () => payload;\n",
+    );
+    fs::write(
+        workspace
+            .join("node_modules")
+            .join("suffixed-json-lib")
+            .join("payload.json"),
+        r#"{"greeting":"a payload large enough to show up in the measured bytes"}"#,
+    )
+    .expect("json fixture should be written");
+
+    let result = analyze_import(
+        &AnalysisContext {
+            workspace_root: workspace.clone(),
+            active_document_path: workspace.join("src").join("index.ts"),
+        },
+        &import_request(
+            "suffixed-json-lib",
+            "suffixed-json-lib",
+            "1.0.0",
+            ImportKind::Named,
+            &["widget"],
+        ),
+    );
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    assert!(
+        result.sizes().is_some(),
+        "a JSON module under a loader suffix must measure, not fail at parse: {result:?}"
+    );
+}
+
 /// The way most UI kits actually ship CSS: the package's JavaScript does not import its stylesheet
 /// at all, and the consumer is told to write `import "pkg/dist/styles.css"` themselves. That is a
 /// bare, side-effect-only import with no bindings, so it takes a different route through detection,

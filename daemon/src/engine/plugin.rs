@@ -332,6 +332,19 @@ impl BuildState {
     }
 }
 
+/// The module type of a file `load` read under a loader suffix (`./data.json?raw`), named from the
+/// file's own extension through Rolldown's type names. Rolldown infers the type from the id it was
+/// given, and `json?raw` is no extension it knows, so the JSON would reach the JavaScript parser.
+/// `None` when nothing was stripped, or the extension names no Rolldown type (`.mjs`): Rolldown
+/// then infers it as it does for any id.
+fn loader_suffix_module_type(read: &Path, id: &Path) -> Option<ModuleType> {
+    if read == id {
+        return None;
+    }
+    let extension = read.extension()?.to_str()?;
+    ModuleType::from_known_str(extension).ok()
+}
+
 /// The filesystem-looking portion of a specifier or module id, with any loader suffix removed.
 ///
 /// Shared by `resolve_id` and `load`, so both agree on what a module id like `./font.woff2?url`
@@ -954,8 +967,7 @@ impl Plugin for ImportLensPlugin {
 
         Ok(Some(HookLoadOutput {
             code: source.into(),
-            // Let Rolldown infer the module type from the extension, exactly as it
-            // does when it reads the file itself.
+            module_type: loader_suffix_module_type(path, literal),
             ..HookLoadOutput::default()
         }))
     }

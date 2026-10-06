@@ -265,26 +265,6 @@ correct number into a floor to prevent something that is not a defect.
 
 Accepted: it moves no number and can wedge nothing, and a memo on the snapshot path sits directly on the read that freshness is derived from, which is worth more care than a fraction of a millisecond buys. Revisit if the asset stage shows up in a p95 regression.
 
-### D24: A loader suffix on a non-JavaScript, non-asset module still fails the build
-**Status: Accepted** · Blocker identified 2026-07-19
-
-The load hook strips a loader suffix from any module id and falls back to the literal path when the
-stripped one is not on disk, so `./font.woff2?url` (asset, stubbed) and `./util.js?v=1` (JavaScript,
-parsed) both measure. `./payload.json?raw` does not: the file is found, but **Rolldown infers module
-type from the id's extension**, and `payload.json?raw` is not `.json`, so JSON text reaches the
-JavaScript parser and the build fails with `PARSE_ERROR` instead of the earlier filesystem error.
-Same outcome for the package, different stage.
-
-Not fixed because both routes cost more than the shape is worth. Overriding the module type needs an
-extension-to-`ModuleType` table, which duplicates inference Rolldown already owns — the second
-mechanism this codebase's rules exist to prevent. Stripping the suffix in `resolve_id` instead would
-let Rolldown's own inference see a clean id, which is the right shape, but that arm currently fires
-only for asset specifiers and widening it changes resolution semantics for every module in the graph.
-
-Revisit if a real package ships this; `?raw` and `?url` are app-author vocabulary, and a sweep of two
-project trees found no resolvable instance inside `node_modules`.
-
-
 ### D2: An honest lower bound on a failed build
 **Status: Deferred** · The intended successor to ADR-0003
 
