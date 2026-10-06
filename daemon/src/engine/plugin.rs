@@ -226,8 +226,7 @@ impl BuildState {
     }
 
     /// Canonicalize once per build. A path that no longer resolves (deleted
-    /// mid-build) falls back to the resolver's form, matching the previous
-    /// behavior.
+    /// mid-build) falls back to the resolver's form.
     fn canonical_path(&self, path: &Path) -> PathBuf {
         if let Some(canonical) = self
             .canonical
@@ -247,6 +246,16 @@ impl BuildState {
             .expect("canonical-path memo should not be poisoned")
             .insert(path.to_path_buf(), canonical.clone());
         canonical
+    }
+
+    /// Bind a module id carrying a loader suffix (`./font.woff2?url`) to the file `load` read for
+    /// it. `module_parsed` sees only the raw id, and canonicalizing that would key the module under
+    /// a path with no read-time fingerprint, which makes the whole result uncacheable.
+    fn alias_canonical(&self, id: &Path, canonical: &Path) {
+        self.canonical
+            .lock()
+            .expect("canonical-path memo should not be poisoned")
+            .insert(id.to_path_buf(), canonical.to_path_buf());
     }
 
     pub(super) fn take_breach(&self) -> Option<String> {
@@ -828,11 +837,8 @@ impl Plugin for ImportLensPlugin {
         // ids are absolute paths; anything else is left to Rolldown.
         // A module id can carry a loader suffix that is not part of the file name —
         // `./font.woff2?url`, `./styles.css?inline`, `./data.json?raw`. oxc_resolver re-appends the
-        // query it parsed and Rolldown builds the id from that, so the suffix arrives here.
-        // Classifying the raw id reads the extension as `woff2?url`, which matches nothing: the
-        // asset is never stubbed, Rolldown reads the id verbatim, and the whole build dies on a path
-        // the filesystem rejects — `?` is an illegal Windows filename character. That failure is
-        // durable, so the package stayed unmeasurable until its bytes changed.
+        // query it parsed and Rolldown builds the id from that, so the suffix arrives here, and the
+        // raw id names no file (`?` is illegal in a Windows filename).
         let literal = Path::new(args.id);
         let stripped = Path::new(path_portion(args.id));
         if !stripped.is_absolute() {
@@ -849,7 +855,8 @@ impl Plugin for ImportLensPlugin {
         // Strip to rescue a loader suffix, never to lose a real file. `?` is illegal in a Windows
         // filename but legal on Linux, and `#` is legal on both, so a stripped path that is not on
         // disk means the suffix was part of the name — fall back to the literal id. The second stat
-        // runs only where the alternative was an outright build failure.
+        // runs only where the alternative was an outright build failure. Whichever file is chosen
+        // is the module's identity for `module_parsed` too.
         let mut path = stripped;
         let mut canonical = self.state.canonical_path(stripped);
         let mut stat = tokio::fs::metadata(&canonical).await;
@@ -860,6 +867,9 @@ impl Plugin for ImportLensPlugin {
                 canonical = literal_canonical;
                 stat = Ok(metadata);
             }
+        }
+        if stat.is_ok() && path != literal {
+            self.state.alias_canonical(literal, &canonical);
         }
 
         let asset_class = classify_asset_class(path);

@@ -8,11 +8,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use import_lens_daemon::cache::key::{Freshness, check_fingerprint, content_hash};
+use import_lens_daemon::cache::key::{
+    FileFingerprint, Freshness, check_fingerprint, content_hash, fingerprints_are_reusable,
+};
 use import_lens_daemon::engine::{
     AssetKind, BundleArtifact, BundleEntry, BundlePurpose, BundleRequest, BundleSelection, boundary,
 };
-use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportRuntime};
+use import_lens_daemon::ipc::protocol::{ImportKind, ImportRequest, ImportResult, ImportRuntime};
 use import_lens_daemon::pipeline::analyze::{
     AnalysisContext, FingerprintSource, analyze_resolved_import_with_dependencies,
 };
@@ -256,4 +258,60 @@ fn css_children_and_local_resources_carry_read_time_fingerprints() {
     }
 
     fs::remove_dir_all(root).ok();
+}
+
+fn analyze_fixture(root: &Path, package_name: &str) -> (ImportResult, Vec<FileFingerprint>) {
+    let context = AnalysisContext {
+        workspace_root: root.to_path_buf(),
+        active_document_path: root.join("src").join("index.ts"),
+    };
+    let request = ImportRequest {
+        specifier: package_name.to_owned(),
+        package_name: package_name.to_owned(),
+        version: "1.0.0".to_owned(),
+        named: vec!["used".to_owned()],
+        import_kind: ImportKind::Named,
+        runtime: ImportRuntime::Component,
+    };
+    let resolved = resolve_package_entry(&context.active_document_path, &request)
+        .expect("fixture package should resolve");
+    let (result, source) = analyze_resolved_import_with_dependencies(&context, &request, resolved);
+    let FingerprintSource::ReadTime { fingerprints, .. } =
+        source.expect("an engine build should return freshness inputs");
+    (result, fingerprints)
+}
+
+/// A loader suffix is not part of the file name, so the module it names is the file `load` read and
+/// fingerprinted. Keyed under the suffixed id instead, it has no read-time fingerprint and the
+/// result can never be reused by any cache.
+#[test]
+fn an_asset_imported_with_a_loader_suffix_is_fingerprinted_under_its_file() {
+    let root = common::temp_workspace("import-lens-asset-loader-suffix");
+    let package_root = root.join("node_modules").join("suffix-lib");
+    write_file(
+        &package_root,
+        "package.json",
+        r#"{"name":"suffix-lib","version":"1.0.0","module":"index.js"}"#,
+    );
+    write_file(
+        &package_root,
+        "index.js",
+        "import fontUrl from './probe.woff2?url';\nexport const used = () => fontUrl;\n",
+    );
+    write_file(&package_root, "probe.woff2", vec![0x3c; 1024]);
+
+    let (result, fingerprints) = analyze_fixture(&root, "suffix-lib");
+    fs::remove_dir_all(&root).ok();
+
+    assert_eq!(result.error, None, "{result:?}");
+    assert!(
+        fingerprints_are_reusable(&fingerprints),
+        "a measured suffixed asset must not make the result uncacheable: {fingerprints:?}"
+    );
+    assert!(
+        fingerprints
+            .iter()
+            .all(|fingerprint| !fingerprint.path.ends_with("?url")),
+        "no module may be keyed under its loader suffix: {fingerprints:?}"
+    );
 }
