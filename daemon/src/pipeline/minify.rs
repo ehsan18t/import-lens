@@ -5,14 +5,10 @@ use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 
-pub fn minify_source(source: &str, is_cjs: bool) -> Result<String, String> {
+/// Minifies a Rolldown output chunk, which is always an ES module.
+pub fn minify_source(source: &str) -> Result<String, String> {
     let allocator = Allocator::default();
-    let source_type = if is_cjs {
-        SourceType::cjs()
-    } else {
-        SourceType::mjs()
-    };
-    let parsed = Parser::new(&allocator, source, source_type).parse();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
 
     if parsed.panicked || parsed.diagnostics.has_errors() {
         return Err(format!(

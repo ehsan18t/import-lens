@@ -302,3 +302,88 @@ fn find_package_root_error_lists_probed_paths() {
         "error should list probed paths: {error}"
     );
 }
+
+/// `node_modules/<name>` as a package manager links a workspace package: a junction (Windows) or
+/// symlink (POSIX) onto `packages/<name>`.
+fn link_package_directory(target: &Path, link: &Path) {
+    fs::create_dir_all(link.parent().expect("link should have a parent")).expect("link parent");
+    #[cfg(windows)]
+    {
+        // A junction, not a symlink: `mklink /J` needs no privilege, `symlink_dir` does.
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("mklink should run");
+        assert!(status.success(), "junction should be created: {link:?}");
+    }
+    #[cfg(not(windows))]
+    std::os::unix::fs::symlink(target, link).expect("symlink should be created");
+}
+
+/// A workspace package is edited and built in place, where no watcher reports it and no
+/// invalidation message arrives, so its entry must resolve against the disk as it is now: an
+/// `exports` subpath added later, a `dist/` built after the first lookup, and an entry retargeted
+/// to another file that still exists.
+#[test]
+fn a_workspace_linked_package_resolves_against_its_current_manifest_and_files() {
+    let root = temp_workspace();
+    write_source(&root, "apps/web/src/app.ts", "");
+    write_source(
+        &root,
+        "packages/ui/package.json",
+        r#"{"name":"@app/ui","version":"1.0.0","exports":{".":"./dist/index.js"}}"#,
+    );
+    link_package_directory(
+        &root.join("packages").join("ui"),
+        &root
+            .join("apps")
+            .join("web")
+            .join("node_modules")
+            .join("@app")
+            .join("ui"),
+    );
+    let document = root.join("apps/web/src/app.ts");
+    let root_request = request("@app/ui", ImportRuntime::Component);
+    let button_request =
+        request_for_specifier("@app/ui/button", "@app/ui", ImportRuntime::Component);
+
+    assert!(
+        resolve_package_entry(&document, &root_request).is_err(),
+        "the premise: dist/ is not built yet"
+    );
+    assert!(resolve_package_entry(&document, &button_request).is_err());
+
+    write_source(&root, "packages/ui/dist/index.js", "export const a = 1;");
+    write_source(&root, "packages/ui/dist/next.js", "export const b = 2;");
+    write_source(
+        &root,
+        "packages/ui/src/button.js",
+        "export const Button = 1;",
+    );
+    let built = resolve_package_entry(&document, &root_request)
+        .expect("a dist built after the first lookup must resolve")
+        .entry_path;
+    assert!(built.ends_with("index.js"), "{built:?}");
+
+    write_source(
+        &root,
+        "packages/ui/package.json",
+        r#"{"name":"@app/ui","version":"1.0.0","exports":{".":"./dist/next.js","./button":"./src/button.js"}}"#,
+    );
+    let retargeted = resolve_package_entry(&document, &root_request)
+        .expect("retargeted entry")
+        .entry_path;
+    let button = resolve_package_entry(&document, &button_request)
+        .expect("an exports subpath added after the first lookup must resolve")
+        .entry_path;
+
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        retargeted.ends_with("next.js"),
+        "the measured entry must be the one the manifest names now: {retargeted:?}"
+    );
+    assert!(button.ends_with("button.js"), "{button:?}");
+}

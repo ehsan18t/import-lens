@@ -18,7 +18,7 @@ use import_lens_daemon::engine::{
     BundleEntry, BundleFailure, BundlePurpose, BundleRequest, BundleSelection, ImportRuntime,
     RolldownEngine, boundary, stage,
 };
-use import_lens_daemon::pipeline::stage::may_enter_a_durable_store;
+use import_lens_daemon::pipeline::stage::{is_transient, may_enter_a_durable_store};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -343,9 +343,7 @@ fn a_graph_limit_breach_outranks_every_stage_a_module_can_fail_at() {
     let module_failures: Vec<&str> = stage::ALL
         .iter()
         .copied()
-        .filter(|candidate| {
-            !stage::is_transient(candidate) && *candidate != stage::MODULE_GRAPH_LIMIT
-        })
+        .filter(|candidate| !is_transient(candidate) && *candidate != stage::MODULE_GRAPH_LIMIT)
         .collect();
 
     assert!(!module_failures.is_empty());
@@ -377,7 +375,7 @@ fn no_deterministic_stage_can_outrank_a_transient_one() {
     let (transient, deterministic): (Vec<&str>, Vec<&str>) = stage::ALL
         .iter()
         .copied()
-        .partition(|candidate| stage::is_transient(candidate));
+        .partition(|candidate| is_transient(candidate));
 
     assert!(!transient.is_empty() && !deterministic.is_empty());
 
@@ -436,7 +434,7 @@ fn a_lost_build_reports_a_transient_stage_and_brings_no_diagnostics_to_rank() {
         .expect_err("the synthetic build panics inside the boundary");
 
     assert!(
-        stage::is_transient(&failure.stage),
+        is_transient(&failure.stage),
         "a build that unwound describes the moment, not the package: {failure:?}"
     );
     assert!(

@@ -342,12 +342,9 @@ pub fn compute_file_size(
     context: &AnalysisContext,
     imports: &[SizedImport],
 ) -> FileSizeComputation {
-    compute_file_size_with(
-        context,
-        imports,
-        &|code| minify_source(code, false),
-        &|code| compress_all(code).map_err(|error| error.to_string()),
-    )
+    compute_file_size_with(context, imports, &minify_source, &|code| {
+        compress_all(code).map_err(|error| error.to_string())
+    })
 }
 
 /// [`compute_file_size`] with the minifier injected, which no production caller does.
@@ -617,18 +614,6 @@ fn compute_file_size_with(
                 // coherent measurement. Degrade this group exactly like a combined-build failure:
                 // keep the already-known per-import floor and never cache or judge it as File Cost.
                 totals.degraded = true;
-                totals
-                    .dependency_fingerprints
-                    .extend(artifact.read_time_fingerprints.iter().cloned());
-                totals
-                    .dependency_fingerprints
-                    .extend(failure.read_time_fingerprints);
-                totals.dependency_fingerprints.extend(
-                    artifact
-                        .unhashed_paths
-                        .iter()
-                        .map(unverifiable_file_fingerprint),
-                );
                 diagnostics.push(diagnostic(
                     failure.stage,
                     failure.message,
@@ -1111,7 +1096,7 @@ mod tests {
                 totals
                     .diagnostics
                     .iter()
-                    .any(|item| stage::is_transient(&item.stage)),
+                    .any(|item| crate::pipeline::stage::is_transient(&item.stage)),
                 "`{transient}`: the import's transient stage must reach the aggregate: {:?}",
                 totals.diagnostics
             );
@@ -1816,7 +1801,7 @@ mod tests {
                     Some(result("client-lib", 20)),
                 ),
             ],
-            &|code| minify_source(code, false),
+            &minify_source,
             &|code| {
                 if code.contains("MARKER_SERVER") {
                     return Err("compressor gave up on the Server chunk".to_owned());

@@ -3705,7 +3705,7 @@ mod every_durable_store_rejects_a_non_durable_outcome {
         for stage in stage::ALL
             .iter()
             .copied()
-            .filter(|candidate| stage::is_transient(candidate))
+            .filter(|candidate| pipeline_stage::is_transient(candidate))
         {
             let cache = ImportCache::new(None, false);
             let key = format!("v4:healthy-lib:comparison:{stage}");

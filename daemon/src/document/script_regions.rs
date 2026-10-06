@@ -27,6 +27,10 @@ pub struct ScriptRegion<'a> {
     pub source: &'a str,
     pub offset: usize,
     pub runtime: ImportRuntime,
+    /// The document's markup can reference this region's top-level bindings: a Vue or Svelte
+    /// component script, or Astro frontmatter. The region is then not the whole module, so a
+    /// binding its script uses only as a type is still a runtime value when the markup uses it.
+    pub shares_bindings_with_markup: bool,
 }
 
 pub fn script_regions_for_document<'a>(filename: &str, source: &'a str) -> Vec<ScriptRegion<'a>> {
@@ -45,7 +49,78 @@ pub fn script_regions_for_document<'a>(filename: &str, source: &'a str) -> Vec<S
         source,
         offset: 0,
         runtime: ImportRuntime::Component,
+        shares_bindings_with_markup: false,
     }]
+}
+
+/// The document text outside every script region, which is what component markup can reference.
+/// Empty when no region shares its bindings with markup.
+pub(super) fn markup_outside<'a>(source: &'a str, regions: &[ScriptRegion<'_>]) -> Vec<&'a str> {
+    if !regions
+        .iter()
+        .any(|region| region.shares_bindings_with_markup)
+    {
+        return Vec::new();
+    }
+
+    let mut spans: Vec<(usize, usize)> = regions
+        .iter()
+        .map(|region| (region.offset, region.offset + region.source.len()))
+        .collect();
+    spans.sort_unstable();
+
+    let mut markup = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in spans {
+        if start > cursor {
+            markup.push(&source[cursor..start]);
+        }
+        cursor = cursor.max(end);
+    }
+    markup.push(&source[cursor..]);
+    markup
+}
+
+/// Whether markup mentions `name` as a whole identifier, or a multi-word PascalCase `name` in the
+/// kebab-case spelling Vue templates also resolve (`NButton` as `<n-button>`). Erring towards a
+/// mention keeps an import that ships rather than dropping it from the total.
+pub(super) fn markup_references(markup: &[&str], name: &str) -> bool {
+    let kebab = kebab_case(name);
+    markup.iter().any(|text| {
+        contains_identifier(text, name)
+            || kebab
+                .as_deref()
+                .is_some_and(|kebab| contains_identifier(text, kebab))
+    })
+}
+
+fn contains_identifier(text: &str, word: &str) -> bool {
+    let is_identifier_char = |char: char| char.is_alphanumeric() || char == '_' || char == '$';
+    text.match_indices(word).any(|(start, _)| {
+        !text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_identifier_char)
+            && !text[start + word.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_identifier_char)
+    })
+}
+
+/// `NButton` -> `n-button`; `None` for a name with no inner capital, whose kebab spelling would be
+/// a plain lowercase word and match ordinary template text.
+fn kebab_case(name: &str) -> Option<String> {
+    let mut kebab = String::with_capacity(name.len() + 4);
+    let mut hyphenated = false;
+    for (index, char) in name.char_indices() {
+        if index > 0 && char.is_ascii_uppercase() {
+            kebab.push('-');
+            hyphenated = true;
+        }
+        kebab.push(char.to_ascii_lowercase());
+    }
+    hyphenated.then_some(kebab)
 }
 
 /// The import runtime in effect at a document cursor, from the one document classifier.
@@ -161,6 +236,7 @@ fn component_script_regions<'a>(filename: &str, source: &'a str) -> Vec<ScriptRe
                 source: block.source,
                 offset: block.content_start,
                 runtime: ImportRuntime::Component,
+                shares_bindings_with_markup: true,
             }
         })
         .collect()
@@ -175,6 +251,7 @@ fn astro_regions<'a>(filename: &str, source: &'a str) -> Vec<ScriptRegion<'a>> {
             source: &source[frontmatter.source_start..frontmatter.source_end],
             offset: frontmatter.source_start,
             runtime: ImportRuntime::Server,
+            shares_bindings_with_markup: true,
         });
     }
 
@@ -188,6 +265,7 @@ fn astro_regions<'a>(filename: &str, source: &'a str) -> Vec<ScriptRegion<'a>> {
             source: block.source,
             offset: block.content_start,
             runtime: ImportRuntime::Client,
+            shares_bindings_with_markup: false,
         });
     }
 
@@ -212,16 +290,26 @@ fn script_blocks(source: &str) -> Vec<ScriptBlock<'_>> {
 
     while let Some(relative_start) = lower_source[search_offset..].find("<script") {
         let tag_start = search_offset + relative_start;
+        // A `<script` inside an HTML comment is not a tag. An unterminated comment runs to the
+        // end of the document, as it does in HTML.
+        if let Some(comment_start) = lower_source[search_offset..tag_start].find("<!--") {
+            let after_open = search_offset + comment_start + "<!--".len();
+            let Some(comment_end) = lower_source[after_open..].find("-->") else {
+                break;
+            };
+            search_offset = after_open + comment_end + "-->".len();
+            continue;
+        }
+
         let after_name = tag_start + "<script".len();
         if !is_tag_boundary(lower_source.as_bytes().get(after_name).copied()) {
             search_offset = after_name;
             continue;
         }
 
-        let Some(relative_tag_end) = lower_source[tag_start..].find('>') else {
+        let Some(tag_end) = open_tag_end(&lower_source, after_name) else {
             break;
         };
-        let tag_end = tag_start + relative_tag_end;
         let content_start = tag_end + 1;
         // The close tag is the next real `</script...>` (see find_script_close):
         // a legal `</script >` must not be missed, and a `</scriptx>` inside the
@@ -240,6 +328,31 @@ fn script_blocks(source: &str) -> Vec<ScriptBlock<'_>> {
     }
 
     blocks
+}
+
+/// The index of the `>` that closes an open tag whose attributes start at `from`. A quoted
+/// attribute value may contain `>` (Vue's `generic="T extends Record<K, V>"`), so quoted values are
+/// skipped; a quote only opens a value right after `=`, as in HTML.
+fn open_tag_end(lower_source: &str, from: usize) -> Option<usize> {
+    let bytes = lower_source.as_bytes();
+    let mut index = from;
+    let mut after_equals = false;
+
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'>' => return Some(index),
+            b'"' | b'\'' if after_equals => {
+                index += 1 + lower_source[index + 1..].find(byte as char)?;
+                after_equals = false;
+            }
+            b'=' => after_equals = true,
+            byte if byte.is_ascii_whitespace() => {}
+            _ => after_equals = false,
+        }
+        index += 1;
+    }
+
+    None
 }
 
 /// Finds the next real `</script...>` close tag at or after `from`, skipping
