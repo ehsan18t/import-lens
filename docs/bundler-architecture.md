@@ -38,14 +38,12 @@ bundler does not do.
 
 **Why this line, and not a little further to either side.**
 
-Import Lens used to implement bundling itself, and it was a slow-motion disaster. The old
-engine made three separate decisions — which exports are reachable, which modules to include,
-which statements to emit — and nothing forced them to agree. When they disagreed, its fallbacks
-converted the disagreement into *believable wrong numbers*: one path kept every import when it
-couldn't tell which mattered (over-counting), another invented the name of a binding it
-couldn't resolve (emitting a reference to a symbol no module declared, under-counting). One
-real package under-reported by a third. The test suite passed the entire time, because it
-tested individual rewriting cases rather than whether the emitted bundle was closed.
+Owning part of bundler semantics means making separate decisions (which exports are reachable,
+which modules to include, which statements to emit) that nothing forces to agree, and their
+disagreement surfaces as *believable wrong numbers*: over-counting when every import is kept
+because it is unclear which matter, under-counting when a reference to an unresolved binding is
+emitted. A test suite of individual rewriting cases passes through all of it, because it never
+checks whether the emitted bundle is closed.
 
 The lesson is sharp enough to be a rule: **a tool whose only output is a number may not contain
 a code path that guesses.** Bundler semantics are not a feature Import Lens can own part of. It
@@ -107,11 +105,10 @@ Editing is debounced in the editor, so a burst of keystrokes produces one analys
 **The answer does not wait for the builds.** The response comes back immediately with every
 import the cache could answer, and each import still being built is marked as *Loading* and
 **pushed to the editor as it lands**. This is not a performance nicety — it is what makes one
-slow import survivable. The response used to be all-or-nothing, so a single pathological package
-could push it past the editor's deadline and the editor would then discard **the entire
-document's results, including the nineteen imports already answered from cache**. Now a
-pathological package delays *its own number* and nothing else. (§9 explains why a package can be
-pathological in the first place.)
+slow import survivable. Without it, one pathological package could push the response past the
+editor's deadline and cost **the whole document its results, including the imports already
+answered from cache**; with it, such a package delays *its own number* and nothing else. (§9
+explains why a package can be pathological in the first place.)
 
 ### Opening `package.json`
 
@@ -139,7 +136,9 @@ signal and evict the entries the user is actively working with.
 
 Nothing the user did, but worth knowing: on connect, the daemon replays the most recently used
 cache entries and rebuilds any that have gone stale, so the first file the user opens is
-already warm. Any real user request cancels this instantly — prewarm never makes a user wait.
+already warm. Any real user request cancels prewarm: no further prewarm job starts, but a prewarm
+build already in progress runs to completion (bounded by `BUILD_TIMEOUT`) and holds its engine
+permit until then, so a user cache miss can briefly queue behind it.
 
 ### Package installs
 
@@ -215,11 +214,11 @@ classified before anything else looks at it:
 | Anything else | `.js`, `.ts`, unknown extensions | Handed back to the bundler untouched |
 
 Stubbing is not an optimisation, it is what makes the JavaScript number exact — and for several of
-these it is the difference between a number and nothing at all. Rolldown 1.1.5 refuses to bundle CSS
-and fails the *entire* build at link, so every package whose entry does `import "./styles.css"` was
-once unmeasurable. A `.png` is not UTF-8 and dies in the loader; an `.svg` **is** valid UTF-8, so it
-reaches the JavaScript parser and dies there instead. One such import used to cost the whole package
-its number.
+these it is the difference between a number and nothing at all. Without the stub, the pinned
+Rolldown (1.2.0) rejects CSS as an unsupported feature and fails the *entire* build, so any package whose entry does
+`import "./styles.css"` would be unmeasurable. A `.png` is not UTF-8 and dies in the loader; an
+`.svg` **is** valid UTF-8, so it reaches the JavaScript parser and dies there instead. Either would
+cost the whole package its number.
 
 The Unmeasured list is deliberately an allowlist. An unknown extension still falls through to the
 bundler, because stubbing something we cannot name might stub real JavaScript.
@@ -234,14 +233,12 @@ number no browser downloads.
 
 **A stylesheet's own references are followed.** Lightning CSS reports every `url()` against the file
 that declared it, and each one resolves to exactly one outcome — counted, disclosed at its real size,
-named as an omission, or external. Nothing is dropped silently, which is the failure this part was
-built to end: a shipped image once left through a single unhandled branch, taking its bytes out of a
-number that still claimed to be complete.
+named as an omission, or external. Nothing is dropped silently.
 
 **Failure falls back, never below.** Anything the pipeline cannot process reverts to raw-byte
-disclosure with a diagnostic. That is the pre-asset behaviour, so the result is a strict improvement
-or a tie — and a package that discloses anything is held at Medium confidence, because a number that
-omits bytes the user's bundle carries is not a High-confidence measurement of that package.
+disclosure with a diagnostic, and a package that discloses anything is held at Medium confidence,
+because a number that omits bytes the user's bundle carries is not a High-confidence measurement of
+that package.
 
 ---
 
@@ -274,9 +271,10 @@ graph TD
 
 Three things about this flow are non-obvious and load-bearing.
 
-**The build produces exactly one chunk.** Not "usually one" — exactly one, with no extra
-assets. Any other output shape is treated as a failure, because a second chunk means something
-was split off and would not be counted.
+**The build produces exactly one JavaScript chunk.** More than one chunk is an `output_shape`
+failure, because a second chunk means something was split off and would not be counted. An
+asset that Rolldown emits beside the chunk does not fail the build: its bytes are disclosed as
+uncounted.
 
 **The raw and minified numbers come from the same link pass.** The bundler can minify its own
 output, but asking it to would mean linking the graph *twice* — once to get the unminified
@@ -334,8 +332,8 @@ number.
 
 But confidence is a *qualifier on a real measurement* — it is not a licence to report a made-up
 one. There is no such thing as a low-confidence guess here: a build either produced a number or
-it did not (§9). The product once used confidence that way, and a badge is no defence against a
-byte count that is wrong by an order of magnitude, because users read the number.
+it did not (§9). A badge is no defence against a byte count that is wrong by an order of
+magnitude, because users read the number.
 
 ---
 
@@ -381,7 +379,7 @@ And the things that avoid a build without any cache at all:
 - **Cache hits never queue behind builds.** Hits are resolved on the full-width worker pool, in
   parallel, and never take a build slot. A file where nine of ten imports are cached does not
   wait on the tenth.
-- **Prewarm runs before the user asks**, and is abandoned the instant they do.
+- **Prewarm runs before the user asks**, and starts no further job once they do (§3).
 - **Stale-while-revalidate** serves a known-stale number immediately, then quietly pushes the
   corrected one when the rebuild lands. A user staring at a file gets an instant answer that may
   be slightly out of date, rather than a spinner that is precisely correct.
@@ -392,10 +390,10 @@ Two builds may run at once. That number bounds **peak memory** — a build holds
 graph in RAM, and the daemon shares a machine with the editor.
 
 Each running build, however, may use most of the machine's cores, because the bundler
-parallelizes *within* a build. These are different bounds and conflating them was a real bug:
-the build's thread pool was once sized to the build *concurrency* limit, which pinned every
-build to two threads no matter how many cores existed. Separating them made real-package builds
-substantially faster without changing memory usage at all.
+parallelizes *within* a build. The engine runtime's worker count is the machine's parallelism
+clamped to 2..8 (`engine_runtime_workers` in `engine/boundary.rs`), independent of the two-build
+permit count; sizing it to the permit count would pin every build to two threads no matter how
+many cores exist.
 
 ### A build can hang forever, and that is not our bug to fix
 
@@ -410,20 +408,23 @@ parked build must not hold one of the two build slots for the life of the daemon
 would wedge it permanently — no further import could ever be measured, and only a restart would
 recover it.
 
-This is the *only* timeout the design has. Nothing else needs one, because — since imports
-stream (§3) — **no request waits on a build**. A parked build costs its own number and nothing
-else. Earlier designs tried to bound the *request* instead, with a per-request deadline and with
-a circuit-breaker that remembered which packages had parked. Both were deleted: neither could
-bound a request that named several bad packages, and the circuit-breaker durably condemned
-*healthy* packages that had merely been slow once. Bounding the build, and refusing to make
-anyone wait for it, is the whole answer.
+Two timeouts exist: the engine build limit (`BUILD_TIMEOUT`, 8 s) and the asset-processing
+deadline (`ASSET_PROCESSING_TIMEOUT`, 8 s), each behind its own two-wide admission gate. No
+request-level deadline exists. Only interactive per-import document analysis streams (§3), so
+there a parked build costs its own number and nothing else. The workspace report, specifier
+comparison, export enumeration and the combined file-size build still wait for their builds,
+each bounded only by `BUILD_TIMEOUT` per build. Do not bound the request or remember parked
+packages: a request naming several bad packages cannot be bounded that way, and remembering slow
+packages condemns healthy ones.
 
 ---
 
 ## 8. Freshness: knowing when an answer went wrong
 
 A cached number is only valuable if it is *provably* still correct. Every cached result carries
-the identity of every file it was measured from, and a request re-verifies them before serving.
+the identity of every file it was measured from, and a request re-verifies them before serving,
+except for an installed-dependency entry already verified at the current invalidation generation
+within the last 30 s (`REVERIFY_TTL`), which is served without a re-stat.
 
 **The identity of a cached answer** includes the package, its version, the exact resolved entry
 file, the runtime it was resolved for, what kind of import it was, and — for a named import —
@@ -453,8 +454,9 @@ fingerprint always describes exactly the bytes that were measured.
 
 **A file that cannot be read is not the same as a file that changed.** A transient failure —
 a locked file, a directory being rewritten by an installer — is treated as *unknown*, not as
-stale. Unknown declines to serve the cached answer, but does not throw it away, and does not
-trigger a rebuild against a filesystem that is mid-flight.
+stale. Unknown never evicts the entry and never triggers a rebuild against a filesystem that is
+mid-flight. Force-fresh and bulk reads decline to serve it. The interactive size read serves it
+flagged Stale while the error is recent, then Unverified once the error persists.
 
 ---
 
@@ -475,7 +477,7 @@ graph TD
     R -->|"still running"| LOAD([Loading — no size YET;<br/>delivered when it lands])
     R -->|"could not answer"| UN{why?}
     UN -->|"parse · link · missing export ·<br/>graph limit · output shape"| DET([Unmeasured — DETERMINISTIC<br/>a fact about the package's bytes])
-    UN -->|"panic · timeout · engine gone"| TR([Unmeasured — TRANSIENT<br/>a fact about this moment])
+    UN -->|"panic · timeout · engine gone ·<br/>asset io · entry metadata · compression"| TR([Unmeasured: TRANSIENT<br/>a fact about this moment])
 
     style OK fill:#22543d,color:#fff
     style LOAD fill:#1a365d,color:#fff
@@ -483,32 +485,15 @@ graph TD
     style TR fill:#742a2a,color:#fff
 ```
 
-### Why the fallback was deleted
+### No fallback size
 
-The product used to substitute a number when a build failed: the entry file's own bytes, or the
-package's size on disk. It carried a low-confidence badge, and it looked responsible.
-
-It was not. A large UI kit that breached a graph limit was reported at **the few kilobytes of
-its barrel file** when the true answer was megabytes. Users read the byte count; a number wrong
-by an order of magnitude while *looking* like a measurement is worse than no number, because it
-is actionable and the action is wrong.
-
-Worse, the fabricated result carried `error: null` **plus that plausible size** — so every
-consumer that asked *"is this usable?"* by checking `!result.error` let it straight through.
-That single missing distinction produced **the same defect seven times in seven different
-places**: a healthy package condemned to static sizing for a whole cache generation; a
-58-byte fabrication cached over a healthy 17,550-byte package; an incomplete total cached;
-a fabrication written to the persisted cost history, destroying that import's real baseline;
-a fabricated import *count*; and — worst — the CI gate deciding pass/fail from a fabricated
-size and **silently passing**, so the regression merged.
-
-It was never seven bugs. It was one missing model, replicated everywhere anyone needed to ask
-the question. The fix is not a seventh patch: it is to make the state **unrepresentable**. With
-no size to misuse, every one of those checks becomes correct by construction.
+A fabricated size with `error: null` passes every `!result.error` usability check, so the
+fallback state is made unrepresentable rather than flagged. The rationale is recorded in
+[ADR-0003](adr/0003-no-size-without-a-build.md) and [ADR-0006](adr/0006-the-result-model.md).
 
 ### Deterministic and request-local are not the same outcome
 
-This is the distinction the code never made, and it is the one everything else rests on.
+This is the distinction everything else rests on.
 
 A **deterministic** failure — a parse error, an unresolvable link, a breached limit — is a fact
 about the package's **bytes**. Same input, same outcome, forever. It **may be cached**: the
@@ -542,7 +527,7 @@ with a code distinct from a real budget failure, so a flaky CI machine is diagno
 never mistaken for a genuine regression. A silent pass is the worst outcome available — it
 merges the regression.
 
-### The one thing that is still true from before
+### Missing or ambiguous exports
 
 A **missing or ambiguous export** means the user asked for a name the package does not provide.
 Producing a size there would paper over a real mistake in their code. It is reported as an error
@@ -560,23 +545,15 @@ The decisions most likely to look like bugs to someone who wasn't there.
 **Contributions don't sum to the total.** Measured before final minification, and chunk glue
 belongs to no module. Approximate by construction. (§6)
 
-**The whole-file compressed total is a lower bound when a file mixes runtimes — and this is a
-known defect, not a trade-off.** A file that imports both client and server code must be built
-once per runtime, because the two resolve dependencies under genuinely different conditions.
-Those results are currently compressed *together*, so an identifier appearing in both is
-compressed only once.
-
-This was originally defended on the grounds that "compressing separately and adding is no more
-true, because compression is not additive." **That reasoning is wrong.** Non-additivity applies
-to parts that would, in reality, be compressed *together*. Two runtime groups never are: they
-are two artifacts that genuinely ship, and each is genuinely compressed on its own. Summing their
-separately-compressed sizes therefore models reality **exactly** — it is the concatenation that
-distorts it, by compressing away redundancy between two payloads that never meet.
+**A file that mixes runtimes is summed across runtimes, not compressed as one.** A file that
+imports both client and server code must be built once per runtime, because the two resolve
+dependencies under genuinely different conditions. Each runtime group is built, minified and
+compressed on its own, and the compressed sizes are added (`compute_file_size_with` in
+`pipeline/file_size.rs`).
 
 **A runtime is an artifact boundary.** Compressed bytes may be summed *across* one and never
-*within* one. The same rule extends to the non-JavaScript assets a package ships. Measured on a
-shared-heavy two-runtime Astro file, the current concatenation under-reports by ~36%. The
-correction is decided and pending.
+*within* one, because two runtime groups never ship compressed together. The same rule extends to
+the non-JavaScript assets a package ships.
 
 **A namespace import is measured at full weight, with no attempt to be clever.** A namespace
 object can be indexed dynamically, so nothing in the package can be proven dead. Some bundlers
@@ -612,8 +589,7 @@ knowingly — it is the cost of not owning bundler semantics, and it is a bargai
 
 ## 11. The invariants
 
-If you change the bundler, these are the things that must remain true. Most of them exist
-because they were once false.
+If you change the bundler, these are the things that must remain true.
 
 1. **Bundler semantics are never reimplemented.** Not reachability, not side-effect
    classification, not binding, not liveness, not interop, not renaming. If the product starts
@@ -625,12 +601,13 @@ because they were once false.
    is a lie.
 5. **Bytes are fingerprinted as they are read**, never afterwards.
 6. **The analyzer revision is bumped whenever a change can move a number.**
-7. **Nothing waits for a build.** A cache hit never queues behind one, and a request never
-   blocks on one: results are delivered as they land. A single slow import may cost its own
-   number and nothing else.
+7. **A cache hit never queues behind a build, and interactive per-import analysis never blocks
+   on one**: pending imports are delivered as they land, so a single slow import costs its own
+   number and nothing else. One-shot requests (report, specifier comparison, export enumeration,
+   file total) wait, bounded by `BUILD_TIMEOUT` per build.
 8. **No failure path fabricates a symbol, measures partial code, or invents a size.**
 
-And the five that exist because ignoring them produced the same defect seven times:
+And the five that guard the result model ([ADR-0006](adr/0006-the-result-model.md)):
 
 9. **A size exists if and only if a build succeeded.** There is no fallback number anywhere in
    the system.
@@ -641,8 +618,11 @@ And the five that exist because ignoring them produced the same defect seven tim
 11. **A transient failure may never become durable.** Not cached, not persisted, not compared
     against a baseline, not turned into a pass/fail verdict. A *deterministic* failure may be
     cached — it is a fact about the bytes, and the cache is keyed by those bytes.
-12. **An aggregate is only as complete as its inputs.** Any Loading or Unmeasured contributor
-    makes the total a **floor**, and **no verdict may be drawn from a floor** — a budget judged
+12. **An aggregate is only as complete as its inputs.** A successful combined build is complete,
+    even while per-import results are still Loading, except that any import which is not an entry
+    of the build (not installed, unresolvable) makes it a **floor**. When the total falls back to
+    a per-import sum, any Loading or Unmeasured contributor makes it a floor too. **No verdict may
+    be drawn from a floor**: a budget judged
     against one is not failed, it is *not evaluated*. **A gate that cannot measure must never
     report success.** A deterministic `imprecise_assets` upper bound is cacheable but equally
     non-budgetable, because a verdict from it can falsely fail.
@@ -718,8 +698,8 @@ build (indexes `0..n`) so shared dependencies link once.
 ### 13.2 Compression (§6 in exact form)
 
 After codegen emits the minified string, the three compressions run in parallel (nested
-`rayon::join`): **gzip level 6**, **brotli level 4**, **zstd level 3**, all over the minified string,
-never the raw one. All three are collected before the response is sent.
+`rayon::join`): **gzip level 6**, **brotli quality 9** (window 22), **zstd level 3**, all over the minified
+string, never the raw one. All three are collected before the response is sent.
 
 ### 13.3 The tree-shakeability threshold (§6 in exact form)
 
@@ -753,7 +733,7 @@ invariants:
 second bundler: the daemon *does* match `package.json#sideEffects` globs against the entry it
 measures, but that match is **reporting-only and retention-neutral**: it never reaches Rolldown and
 cannot change what is retained or what size is reported. It survives on the **successful measurement**
-path, where it decides the `side_effects` badge the UI shows, because Rolldown 1.1.5 does not expose
+path, where it decides the `side_effects` badge the UI shows, because the pinned Rolldown (1.2.0) does not expose
 its own retention decisions and there is no other way to tell the user whether the file they imported
 is one the package declared effectful. The matcher itself is **not ours**: it is
 `fast_glob::glob_match` (the crate `rolldown_common`/`rolldown_utils` match `sideEffects` with),
@@ -767,10 +747,5 @@ where upstream vendors a component, we use *that* component).
 The authoritative value and its format live in `daemon/src/cache/key.rs` (`ANALYZER_REVISION`). Past
 values are not kept there: each was set by the commit that moved the numbers, so
 `git log -S analyzer_revision -- daemon/src/cache/key.rs` gives every one alongside the change that
-caused it.
-History: `graph2` (old custom engine) → `rolldown1` (Phase 3 cutover) → `rolldown2` (2026-07-12,
-post-cutover correctness fixes) → `rolldown-1.1.x+3` (2026-07-15, the release-review fixes: the
-Windows verbatim-path `sideEffects` bug behind `refractor`'s 3.7x under-report, the deleted
-fabricator, per-runtime compression, deterministic failure-stage ranking, runtime-correct
-enumeration). Format `<engine>-<minor line>.x+<revision>`: the patch is a wildcard so a Rolldown
+caused it. Format `<engine>-<minor line>.x+<revision>`: the patch is a wildcard so a Rolldown
 patch that moves no numbers needs no bump; our own number-moving changes advance the counter.

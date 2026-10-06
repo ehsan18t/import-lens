@@ -1,10 +1,9 @@
 # Cache Lifecycle — Decision Log
 
 Chronological record of the design and scope decisions for the cache-lifecycle
-redesign (branch `redesign/cache-lifecycle`). This is the companion to the review
-backlog (`superpowers/plans/2026-07-08-cache-lifecycle-review-backlog.md`, which
-tracks the findings); this file tracks the **decisions**. Keep it updated as new
-decisions are made.
+redesign (branch `redesign/cache-lifecycle`). The review backlog that tracked the
+findings (RB-*, P1-*, P2-*) was removed in `447aa32`; this file tracks the
+**decisions**. Keep it updated as new decisions are made.
 
 Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
 **Consequences / status**, with the commits and related findings.
@@ -56,7 +55,7 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   nothing scans for. The old scan was also unsafe (RB-7): a Windows unplugged drive
   reports `ERROR_PATH_NOT_FOUND` (→ `NotFound`), so it could destroy a valid shard.
   The fix is to make it safe, not to delete it.
-- **Consequences / status:** Done — see [RB-17](superpowers/plans/2026-07-08-cache-lifecycle-review-backlog.md#rb-17-orphaned-project-cache-shards-are-never-proactively-reclaimed--purge-must-be-drive-safe).
+- **Consequences / status:** Done (RB-17).
   - `354d297` — daemon: `classify_project_root` (Present / Orphaned /
     VolumeUnreachable) so an offline drive keeps its shard (**closes RB-7**);
     drive-safe `purge_orphans`; throttled `sweep_orphaned_shards_if_due` on the
@@ -109,7 +108,10 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   rebuild storm; serving the last-known graph while the error is transient mirrors L2's
   stale-while-revalidate contract. Reuse-on-`Unknown` is therefore intentional, not a
   staleness hole.
-- **Status:** `6eddb2f` (RB-1).
+- **Status:** `6eddb2f` (RB-1). **Superseded:** `GRAPH_CACHE` was deleted with the
+  Phase 3 cutover (D12). Its successor, `pipeline::build_memo`, keeps (a) and re-checks
+  with `check_fingerprints_strict`, but reverses (b): on `Unknown` it keeps the entry
+  and recomputes rather than serving it (`build_memo.rs:103-110`).
 
 ### D6 — First-party CJS freshness via a cached module set, not a short TTL · 2026-07-08
 - **Context:** The CommonJS analyzer walks and reads every transitive `require()`, but
@@ -145,10 +147,11 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   drops any entry whose tag is stale. Only the rare `clear()` and the batched flush take a
   lock (`clear_lock`); the per-insert path stays lock-free apart from one atomic load.
 - **Rationale:** The generation makes a stale write self-identify, so correctness needs
-  mutual exclusion only between `clear()` and the flush — not on every insert. Two
-  `disk.insert` variants exist by design: `insert` tags the CURRENT generation (fresh,
-  derive-now bytes), `insert_at_generation` tags a caller-captured one (snapshot-derived
-  writers: `flush_to_disk`, `enforce_memory_cap`) — not redundancy.
+  mutual exclusion only between `clear()` and the flush, not on every insert. Every
+  production disk write uses `insert_at_generation` with a generation the caller captured
+  before deriving its bytes: the fresh insert (`memory.rs:593`), `flush_to_disk` and
+  `enforce_memory_cap`. `DiskCache::insert`, which tags the CURRENT generation, is a
+  convenience used only by tests.
 - **Accepted residual (so it is not later filed as a bug):** the memory-side guard
   (`insert_into_memory_guarded`) is optimistic — pre-check, insert, then an
   identity-checked (`Arc::ptr_eq`) rollback. It never resurrects a cleared entry and never
@@ -165,18 +168,20 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   result over a good last-known size. The finding offered two fixes: filter *errors*, or
   "push only when the cache also accepts them."
 - **Decision:** Gate the SWR push on the SAME `should_cache_result` predicate the cache
-  write uses (daemon `revalidate_document_sizes`) — so it drops BOTH hard errors AND
-  request-specific diagnostics (e.g. a default import of a named-only package → missing
-  export). The client-side merge keeps a weaker `error === null` filter.
+  write uses (daemon `revalidate_document_sizes`). That predicate is now
+  `ImportResult::is_durable`, so the push drops exactly what the cache refuses:
+  request-local (transient) outcomes and any stage not classified as durable.
+  Deterministic outcomes, `missing_export` among them, are cached and pushed. The
+  client-side merge keeps a weaker `error === null` filter.
 - **Rationale (so this is not misread as a bug):** coupling push⟺cacheable means display
-  and cache can never disagree (the exact RB-13 harm). Dropping diagnostic-carrying results
+  and cache can never disagree (the exact RB-13 harm). Dropping non-durable results
   from the *proactive* push is deliberate, not an oversight — they are still shown on the
   next interactive `file_size_document` (not cached → recomputed), so nothing is hidden;
   the SWR badge just doesn't chase them. The daemon/client filter asymmetry is intentional:
   the daemon is the authoritative filter (the client never receives a diagnostic result to
   mishandle), and the client's `error === null` is redundant defense-in-depth for other
   push paths / an older daemon — the client can't cheaply replicate
-  `has_request_specific_diagnostics`. *Test note:* the pre-existing same-specifier-variants
+  `ImportResult::is_durable`. *Test note:* the pre-existing same-specifier-variants
   test was reconciled (its fixture gained a real default export) because its default variant
   is now correctly filtered; the identity-alignment purpose is preserved and the filtered
   case is covered by a new dedicated test.
@@ -186,9 +191,9 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
 - **Context:** RB-14 — SWR revalidation was starved by the prefetcher's *global* cancel
   token (any unrelated message cancelled it) and by a per-cache-key in-flight claim (a
   second document sharing a package got no push).
-- **Decision:** Give SWR its own per-document cancel token (`SwrRefreshLifecycle`, keyed by
-  workspace+document) and make the in-flight claim document+generation-scoped, not the bare
-  cache key.
+- **Decision:** Give SWR its own per-document cancel token (`DocumentTaskLifecycle` in
+  `ipc/server.rs`, keyed by workspace+document) and make the in-flight claim
+  document+generation-scoped, not the bare cache key.
 - **Rationale (so these are not misread as bugs):** (a) two different documents importing
   the same package now BOTH recompute it — deliberate redundant CPU traded for
   anti-starvation; the global cache key means the *result* is still shared, only the compute
@@ -223,7 +228,7 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   superseded — they surface as real "hint unavailable", and the manifest renders no versions.
   Warm cache hid it (the web block finished before the backend block arrived).
 - **Decision:** Key `RegistryRefreshLifecycle` **per source manifest** (a `HashMap<source,
-  flag>`, exactly mirroring `SwrRefreshLifecycle` / D9). A refresh supersedes only the prior
+  flag>`, exactly mirroring `DocumentTaskLifecycle` / D9). A refresh supersedes only the prior
   block for the *same* source; other manifests keep draining; connection-drop still cancels all.
   Threaded a new optional `source` field (the client's document key) through
   `RefreshRegistryHintsRequest`; absent source (older peer) shares one empty-key bucket,
@@ -250,9 +255,14 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   via the pre-analysis generation gate, and the L1/L2 re-verify TTLs bound residual staleness
   to one window. Hashing in the plugin would double file reads on every build to close a
   race that eviction already bounds. Related: the old first-party CJS cached-module-set
-  freshness (D6) is superseded, not lost — the engine failure fallback measures only the
-  entry file, so its manifest+entry fingerprints now cover exactly the inputs of the cached
-  computation.
+  freshness (D6) is superseded; an engine failure is Unmeasured, so nothing is sized from
+  the entry file alone.
+- **Superseded for modules (`53f1e37`):** every module the plugin's `load` hook reads is
+  now fingerprinted at read time (`engine/plugin.rs:701`, exposed through
+  `read_time_fingerprints`), which closes the post-build re-read window for module
+  source. What the hook does not read is still hashed by reading it after the build: the
+  package and first-party manifests (`analyze::manifest_augmented_fingerprints`) and a
+  binary module the hook hands back to Rolldown (`unhashed_paths`).
 - **Consequences / status:** lands with the Phase 3 cutover commit. Also removed in the same
   commit: the named→namespace cache alias (`cache_full_variant_alias`), whose premise —
   side-effectful packages size identically for named and namespace imports — was only true of
@@ -268,9 +278,13 @@ Each entry: **Context** (why it came up) → **Decision** → **Rationale** →
   That is how one parked build taught the cache that a healthy 17,550-byte package weighs 58
   bytes, for a whole cache generation.
 - **Decision (cache):** every cache and memo gates on the failure STAGE, not merely on
-  `error`. `engine::stage::is_transient` (`timeout` | `panic` | `engine_gone`) is the single
-  source of truth; `should_cache_result` and `FileSizeComputation::is_cacheable` consult it,
-  covering L1 memory, L2 disk, and the L1 aggregate file-size cache. The full-package and
+  `error`. `pipeline::stage::is_transient` (`TRANSIENT_ANALYSIS_STAGES`: `panic` | `timeout` |
+  `engine_gone` | `asset_io` | `entry_metadata` | `compression`) names the request-local
+  stages, and `FileSizeComputation::is_cacheable` refuses any of them. `should_cache_result`
+  goes through `ImportResult::is_durable`, an allowlist
+  (`pipeline::stage::may_enter_a_durable_store`) that refuses every stage it has not
+  classified as durable. Together they cover L1 memory, L2 disk, and the L1 aggregate
+  file-size cache. The full-package and
   export-list build memos and the dependency-path index need no gate — they are written only
   on the success path. A DETERMINISTIC failure (`parse`, `link`, `module_graph_limit`, a
   minify failure) is still cached: it is a fact about the code, and re-deriving it costs a

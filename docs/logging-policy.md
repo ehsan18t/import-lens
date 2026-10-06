@@ -6,16 +6,16 @@ Normative rules for extension host and daemon logging. The VS Code output channe
 
 | Level | Use for | Must not use for |
 |-------|---------|------------------|
-| **error** | Daemon hash mismatch, crash-degraded mode entry, unrecoverable security or integrity failures | Per-import sizing fallbacks that still return usable bytes |
-| **warn** | Daemon or IPC unavailable, startup failure, final analysis failure, cache flush failure, globalState write failure, registry fetch exhausted after retries | Successful low-confidence import results (FR-039c) |
+| **error** | Daemon hash mismatch, crash-degraded mode entry, unrecoverable security or integrity failures | Import results that carry a measured size |
+| **warn** | Daemon or IPC unavailable, startup failure, final analysis failure, cache flush failure, globalState write failure, registry fetch exhausted after retries | Measured results with medium confidence or disclosure diagnostics (FR-039c) |
 | **info** | Activation, daemon ready, cache invalidation, config changes, user-triggered commands | Per-import partial streaming frames |
-| **debug** | IPC request summaries, batch partial frames, registry fetch attempts, prewarm, import diagnostic detail | Default user sessions at `importLens.logLevel: info` |
+| **debug** | IPC request summaries, package.json and registry-refresh partial frames, registry fetch attempts, prewarm, import diagnostic detail | Default user sessions at `importLens.logLevel: info` |
 
 ## FR-039c deduplication
 
 - **Warn once** per `(request_id, specifier, error)` when `ImportResult.error` is set and no measured size exists, or when the daemon returns no result for a scheduled import.
-- **Debug once** per `(request_id, specifier)` for diagnostics, confidence reasons, and low-confidence fallback detail on otherwise successful results.
-- Do not warn for imports that produced a usable size with low confidence; surface detail in hover, report, copied diagnostics, and debug logs only.
+- **Debug once** per `(request_id, specifier)` for diagnostics and confidence reasons on Measured results (high or medium confidence).
+- Do not warn for Measured results with medium confidence or disclosure diagnostics; surface detail in hover, report, copied diagnostics, and debug logs only.
 
 ## Message format
 

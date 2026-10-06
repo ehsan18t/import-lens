@@ -63,8 +63,6 @@ fabricated size, silently passing, so the regression merges.
 
    - **If the combined build SUCCEEDS, the total is real** — even while every per-import result
      is still Loading. On a cold document that is the normal case, and it is not a floor.
-     *(An earlier draft of this ADR said any Loading contributor made the total a floor. That was
-     wrong: it would flag every cold document, and taking it literally caused a regression.)*
      Success of the JavaScript build is not success of every asset, however: a combined result
      carrying `uncounted_assets` is a measured lower bound whose supported missing bytes set
      `incomplete`. A separately processed CSS set carrying only `imprecise_assets` is an over-count,
@@ -110,8 +108,7 @@ fabricated size, silently passing, so the regression merges.
 
 ### A size and a request-local stage together are NOT unrepresentable — and must not be
 
-An earlier draft of this ADR demanded that shape be made impossible in the type system. **That
-was wrong, and it is retracted.** The shape is real and load-bearing. A primary measurement can
+The shape is real and load-bearing; it must stay representable. A primary measurement can
 succeed while the *full-package comparison* fails, leaving an untrustworthy
 `truly_treeshakeable`; or asset processing can retain the measured portion while an input read or
 compressor fails, leaving a disclosed floor. In both cases the request-local diagnostic is the

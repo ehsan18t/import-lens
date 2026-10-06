@@ -1,7 +1,7 @@
 # Measure a neutral build, not a production or development one
 
 Rolldown is configured with `Platform::Neutral` and no `process.env.NODE_ENV` define
-(`daemon/src/engine/adapter.rs:111-120`), so a package's development-only branches are
+(`build_options` in `daemon/src/engine/adapter.rs`), so a package's development-only branches are
 counted in its Import Cost. This looks like an oversight and has been reported as one; it
 is deliberate. Our accuracy oracle is **esbuild**, which likewise injects no `NODE_ENV`
 define by default, so a neutral measurement is what keeps the two comparable — injecting

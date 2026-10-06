@@ -12,9 +12,10 @@ that distinction.
 The bytes a single import contributes to an application that is otherwise empty. Every
 number the product reports is an Import Cost or an arithmetic view over Import Costs. It
 prices the package as published, under no project's build configuration — see
-[ADR-0001](docs/adr/0001-measure-a-neutral-build.md). It currently counts JavaScript only;
-non-JavaScript bytes a package ships (CSS, wasm, fonts) are real cost, are not yet included,
-and must be **disclosed on the result** rather than silently omitted.
+[ADR-0001](docs/adr/0001-measure-a-neutral-build.md). It counts the JavaScript chunk plus the
+non-JavaScript assets the entry reaches (CSS through its `@import` tree, wasm, fonts), each
+compressed as its own artifact and summed. Shipped bytes it cannot process or does not count
+are **disclosed on the result** (uncounted, or imprecise) rather than silently omitted.
 _Avoid_: bundle size, footprint
 
 **Bundle Size**:
@@ -84,9 +85,9 @@ _Avoid_: fallback size, approximate size, conservative estimate
 The two causes of an Unmeasured import, and the distinction the whole caching model rests on.
 **Deterministic** (`parse`, `link`, `missing_export`, `module_graph_limit`, …) is a property of
 the package's **bytes** — same input, same outcome — so it may be cached. **Transient**
-(`panic`, `timeout`, `engine_gone`) is a property of **this moment's scheduling** and says
-nothing about the package: it may never be cached, persisted, compared, or turned into a
-pass/fail verdict.
+(`panic`, `timeout`, `engine_gone`, `asset_io`, `entry_metadata`, `compression`) is a property
+of **this moment's scheduling, filesystem, or machine** and says nothing about the package: it
+may never be cached, persisted, compared, or turned into a pass/fail verdict.
 
 **Floor**:
 An aggregate computed from inputs that were not all Measured. It is a lower bound, not a size.

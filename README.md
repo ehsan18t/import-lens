@@ -56,14 +56,13 @@ Every label is designed to be understood at a glance:
 | Label         | Meaning                                                                      |
 | ------------- | ---------------------------------------------------------------------------- |
 | `12.4 kB br`  | Post-tree-shake, minified, Brotli-compressed cost of this exact import.      |
-| `~1.6 kB br`  | Low-confidence estimate, marked with a leading `~`. Hover for the reasons.   |
 | `+2.1 kB br`  | Working-tree delta: this import was added/changed in your current Git diff.  |
 | `over budget` | The import exceeds your configured Brotli budget.                            |
 | `types only`  | Declaration-only package with zero runtime bytes.                            |
 | `checking…`   | Analysis in progress (results stream in per import).                         |
 | `unavailable` | Size could not be determined. Hover and use **Copy diagnostics** to see why. |
 
-**Confidence colors** (default renderer): high confidence uses a muted success color, medium uses amber, low uses red. Prefer VS Code's screen-reader-accessible rendering? Set `importLens.inlineRenderer` to `native`.
+**Confidence colors** (default renderer): high confidence uses a muted success color, medium uses amber. Prefer VS Code's screen-reader-accessible rendering? Set `importLens.inlineRenderer` to `native`.
 
 ### The number is not only JavaScript
 
@@ -156,7 +155,8 @@ All settings live under `importLens.*` in your VS Code `settings.json`:
 | `importLens.enableRegistryHints` | `true`        | npm registry metadata hints for `package.json`, served from the daemon's local cache with bounded refreshes.       |
 | `importLens.enableDiskCache`     | `true`        | Persist computed sizes to disk across editor restarts.                                                             |
 | `importLens.cacheMaxSizeMB`      | `512`         | Global disk-byte budget for project caches; least-recently-used entries are evicted across projects when exceeded. |
-| `importLens.cacheMaxAgeDays`     | `30`          | **Deprecated and ignored** — capacity is governed entirely by `cacheMaxSizeMB`.                                    |
+| `importLens.registryCacheMaxSizeMB` | `32`       | Byte budget for the shared npm registry metadata store; oldest entries are evicted when exceeded.                  |
+| `importLens.verboseRegistryLogging` | `false`    | Log every package's registry refresh outcome (cache hit or network fetch). Noisy on large dependency lists.        |
 | `importLens.logLevel`            | `"info"`      | Output channel verbosity: `error`, `warn`, `info`, or `debug`.                                                     |
 
 ## Ignoring Imports

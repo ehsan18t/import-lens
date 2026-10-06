@@ -62,9 +62,7 @@ release, but each is worth turning into a task.
 **What the user sees.** In a real `package.json`, some dependencies render **unavailable**. The bigger the
 project, the more of them, which reads as "the build was too big." It is not a size problem.
 
-**What still lands here.** Two classes remain, and the fatal-leaf classes that used to dominate this entry
-(native `.node` addons, `exports`-blocked deep-path requires, unresolvable bare specifiers, directly imported
-images and media) are closed — see [Resolved](#resolved):
+**What still lands here.** Two classes remain:
 
 - **No importable entry.** A package declaring no `main`/`module`/`exports`/`browser` at all — confirmed on
   `@next/font`, whose real code is subpath-only (`./google`, `./local`) — is **Unmeasured**, and correctly so:
@@ -125,10 +123,10 @@ failure this repository has been bitten by before.
 
 Re-verified 2026-07-18, and the other two blockers are structural rather than incremental. Rolldown's
 `HookLoadArgs` carries `id`, `module_idx` and `asserted_module_type` and no importer at all; `resolve_id` has
-the importer and discards it on the success path, and the word appears in no daemon file outside `plugin.rs`,
-so no asset-to-package mapping exists anywhere to build on. And the `sideEffects` patterns are collapsed to a
-bool deliberately — `resolver.rs` says in prose that retaining them "invited a second reading of them", which
-is precisely the second reading D7 would need.
+the importer and discards it on the success path, so no asset-to-package mapping exists anywhere to build on
+(the importer is read only in `plugin.rs`'s resolve hook and is never retained). And the `sideEffects`
+patterns are collapsed to a bool deliberately: `resolver.rs` says in prose that retaining them "invited a
+second reading of them", which is precisely the second reading D7 would need.
 
 Accepted rather than Deferred, because Deferred says "worth doing, not now" and this is not queued work: it is
 a measured non-shape in the ecosystem whose fix conflicts with a Critical requirement. Revisit only if the
@@ -140,10 +138,9 @@ ecosystem survey changes.
 Lightning CSS parses plain CSS. A published package that imports a preprocessor source (`.scss`, `.less`) or a
 stylesheet with a bare `@import "pkg/base.css"` cannot be bundled, so that sheet falls back to raw-byte
 disclosure. That is the ADR-0006 fallback working: it lands exactly on the pre-B2 behaviour, never below it.
-Originally one such sheet sank every stylesheet in the set; a failed set now retries per sheet, so only the
-offender falls back and the rest stay counted. In that degraded mode two sheets sharing an `@import` are no
-longer deduped against each other, which over-counts the shared part, a smaller and rarer error than dropping
-them all.
+A failed set retries per sheet, so only the offender falls back and the rest stay counted. In that degraded
+mode two sheets sharing an `@import` are no longer deduped against each other, which over-counts the shared
+part, a smaller and rarer error than dropping them all.
 
 A stylesheet caught in an `@import` cycle keeps its `@import`ed rules but loses its own, which undercounts that
 one sheet. Cycles are silent in browsers and in every real bundler, so a package can ship one unknowingly. It no
@@ -151,10 +148,9 @@ longer threatens the daemon (that wedge is fixed and pinned by a regression test
 edge on broken input, and still strictly better than before B2, when the package contributed zero CSS either
 way.
 
-A since-deleted plan claimed the provider falls back to `oxc_resolver` for a bare `@import`. It never did, and
-resolving CSS with the JavaScript resolver would be worse than not resolving it: that profile has no `style`
-main field, no `style` condition and no `.css` extension, so it would answer `pkg/base` with `pkg/base.js` and
-measure the wrong file. Doing it properly needs a purpose-built CSS resolver profile.
+Do not resolve a bare `@import` with the JavaScript resolver: that profile has no `style` main field, no
+`style` condition and no `.css` extension, so it would answer `pkg/base` with `pkg/base.js` and measure the
+wrong file. Doing it properly needs a purpose-built CSS resolver profile.
 
 ### D9: A stylesheet's own `@import` tree is bounded at 256 files
 **Status: Accepted** · A bound where there was none · Found by the B2 adversarial review
@@ -190,10 +186,10 @@ non-budgetable-stage list; `imprecise_assets` produces no pass or failure, and C
 "could not evaluate" result instead of reporting a false regression.
 
 The byte half of the budget is reserved from metadata before each read and reconciled with the exact bytes
-afterward, so it bounds a tree's total rather than any single file's peak memory. The 20 MB guard on module source
-does not cover `@import` children, since they are never graph modules. No real package ships a stylesheet large
-enough for that to matter, and a tree that breaches the budget is refused rather than mismeasured, so this is
-recorded as a property of the bound rather than treated as a hole in it.
+afterward, so it bounds a tree's total. A single `@import` child is also held to the 20 MiB per-file limit on
+module source (`MAX_MODULE_SOURCE_BYTES`) through the asset read ledger, though the 8 MB per-attempt bound and
+the 16 MiB build-wide CSS work limit are both tighter, so one of those refuses an oversized child first. A tree
+that breaches the budget is refused rather than mismeasured.
 
 ### D13: An image referenced from counted CSS is disclosed, not counted
 **Status: Accepted scope** · Decided 2026-07-18 while fixing the silent-drop defect
@@ -209,9 +205,7 @@ and every accuracy baseline would have to be re-measured to confirm the two side
 emits for an image reference. That is a measurement task, not a code change, and it is not this fix.
 
 The cost of the current choice is real and should not be hidden: a UI kit shipping sprites reads Medium with a
-floor rather than High with a total. That is the honest reading of what we know, and it is a strict improvement
-on the previous behaviour, where those bytes left the headline through a silent `None` while the result still
-claimed High confidence.
+floor rather than High with a total. That is the honest reading of what we know.
 
 ### D14: Runtime-fetched CSS resources are disclosed but never counted
 **Status: Accepted scope** · Decided 2026-07-18
@@ -262,9 +256,6 @@ attribution was the only missing piece. Re-examination found three separate bloc
 - The engine boundary contract states the daemon's own reading of `sideEffects` is "reporting
   metadata — it decides a badge, never a byte". Dropping an asset on that reading makes it decide
   bytes, which is the thing the contract exists to prevent.
-
-Adding asset paths to the contribution model (D15) did **not** unblock this, contrary to an earlier
-note in the 2026-07-18 review.
 
 ### D18: A CSS `url()` may resolve outside the package root
 **Status: Accepted** · Decided 2026-07-18
@@ -341,9 +332,10 @@ engine currently discards the partial graph on failure, so this needs plumbing t
 ### D29: A measured-but-floor import does not flag its file total incomplete
 **Status: Deferred** · Pre-existing, and now with one more way to reach it
 
-`FileSizeResult::incomplete` has exactly two triggers: an import that was **not measured**, or a disclosed
-`uncounted_assets` omission. An import that *was* measured but is knowingly a **floor** sets neither, so the
-file total is presented as complete while summing slightly less than the file.
+`FileSizeComputation::incomplete` (on the wire, `FileSizeDocumentResponse::incomplete`) has exactly two
+triggers: an import that was **not measured**, or a disclosed `uncounted_assets` omission. An import that *was*
+measured but is knowingly a **floor** sets neither, so the file total is presented as complete while summing
+slightly less than the file.
 
 Two things produce such an import. An unresolvable bare specifier kept as an `external` boundary — "anything it
 would have pulled in is NOT in this size" — which has behaved this way since that disclosure existed. And, now,
@@ -383,15 +375,15 @@ and it must be a deliberate decision, not smuggled in as a bug fix.
 
 `is_conservative_item` (`report/model.rs:92-96`) returns `is_cjs || side_effects || !truly_treeshakeable` and
 gates only on `result.is_some()`. `ImportResult::unmeasured` sets `side_effects: true`,
-`truly_treeshakeable: false` (`ipc/protocol.rs:337-338`), the honest conservative reading for a build that
+`truly_treeshakeable: false` (`ipc/protocol.rs:352-353`), the honest conservative reading for a build that
 produced nothing, so every failed-build row also satisfies the predicate.
 
 **What actually happens.** A workspace report with 1 genuinely-conservative measured import and 2 failed
 imports reports `conservative_count = 3`, and each failed row carries a "Conservative estimate" warning stacked
 next to its failure message. No byte figure moves: `combined_import_cost_brotli_bytes` sums
 `filter_map(row.brotli_bytes)` (`model.rs:74-75`) and an unmeasured row's `brotli_bytes` is `None`
-(`model.rs:131`), so the headline, treemap, budget verdict, duplicate-import and shared-module figures all
-exclude it (pinned by `an_unmeasured_import_has_no_size_in_the_report_not_a_zero`, `model.rs:509`).
+(`model.rs:134`), so the headline, treemap, budget verdict, duplicate-import and shared-module figures all
+exclude it (pinned by `an_unmeasured_import_has_no_size_in_the_report_not_a_zero`, `model.rs:564`).
 
 **Why it is not blocking:** it inflates a badge or count on a row the user already sees failed; the S1/R1
 "wrong badge, never a wrong size" class, and it cannot wedge (a pure `filter().count()`).
@@ -402,8 +394,8 @@ different category, so a totally-unmeasured import should not be counted as cons
 **Status: Deferred** · Not reproduced as a wrong number · Found in the 2026-07-16 module audit (D2)
 
 `resolve_legacy_fallback` searches the pre-resolved entry in the order `module`, `browser`, `main`
-(`resolver.rs:222-232`). For a Client or Component import the resolver itself prefers `browser`, `module`,
-`main` (`profile_entry_fields`, `resolver.rs:277`; `main_fields`, `resolver.rs:1046`), so the fallback
+(`resolver.rs:258-271`). For a Client or Component import the resolver itself prefers `browser`, `module`,
+`main` (`profile_entry_fields`, `resolver.rs:357`; `main_fields`, `resolver.rs:1128`), so the fallback
 contradicts that order.
 
 **What actually happens.** The fallback fires only when oxc's full resolution fails AND the package has no
@@ -420,17 +412,17 @@ one-line change.
 ### K2: The project-cache metadata file is written non-atomically
 **Status: Deferred** · Self-healing · Off the number-serving path · Found in the 2026-07-16 module audit (D5)
 
-`write_metadata` (`cache/project.rs:1038-1047`) is a plain `fs::write`: no temp-file plus rename, no fsync. A
+`write_metadata` (`cache/project.rs:1084-1093`) is a plain `fs::write`: no temp-file plus rename, no fsync. A
 crash mid-write can leave a truncated or corrupt `metadata.json` for a shard.
 
 **What actually happens, nothing to a served number.** `read_metadata` returns `None` on a corrupt file
 (`serde_json::from_str(...).ok()?`), and every consumer drops the shard on `None`: budget eviction,
 `invalidate_packages`, orphan sweeps, cache-management listing, and the recency seed. Import numbers are served
 through `cache_for_root` then `ImportCache::get` then `DiskCache::get_entry`, which recomputes the shard id
-from the root and opens redb without reading metadata (`project.rs:339-404`), rewriting the metadata on that
-cold open, so a corrupt metadata file is invisible to the number-serving path and self-heals on next open. The
-one theoretical effect (a `NodeModulesChanged` invalidation skipped for the shard) is backstopped by
-`check_fingerprints` on the next `get`.
+from the root and opens redb without reading metadata (`project.rs:350-419`), rewriting the metadata on that
+cold open once the disk opens, so a corrupt metadata file is invisible to the number-serving path and
+self-heals on next open. The one theoretical effect (a `NodeModulesChanged` invalidation skipped for the shard)
+is backstopped by `check_fingerprints` on the next `get`.
 
 **Why it is not fixed now:** it cannot serve a wrong number, wedge, or lose a durable measurement (the redb
 cache is the source of truth; metadata is observability plus invalidation bookkeeping).
@@ -510,11 +502,13 @@ degradation, never a wrong size and never a wedge.
 ### R1: The "Conservative estimate" warning is path-dependent (interactive versus prefetch)
 **Status: Accepted** · Wrong badge, never a wrong size · Found in the 2026-07-16 module audit (D2)
 
-The resolver computes `is_cjs` from oxc's real resolution on the interactive path (`resolver.rs:128`) but
-hard-codes it to `false` on the prefetch-refill path (`resolved_from_cache_identity`, `resolver.rs:153`,
-reached from `prefetch.rs`). `CacheIdentity` carries no `is_cjs` (`cache/key.rs`), so the two paths share one
-cache key. The value flows only into `result.is_cjs`, whose single consumer is the "Conservative estimate"
-warning (`report/model.rs:95`: `is_cjs || side_effects || !truly_treeshakeable`).
+The resolver computes `is_cjs` from oxc's real resolution on the interactive path (`resolver.rs:133`) but
+passes `false` as the resolver's verdict on the prefetch-refill path (`resolved_from_cache_identity`,
+`resolver.rs:148-158`, reached from `prefetch.rs`). `resolved_entry_is_commonjs` classifies from the extension,
+manifest fields, `exports` conditions and `type` first, so that `false` decides only an entry none of those
+classify, in practice an extensionless one. `CacheIdentity` carries no `is_cjs` (`cache/key.rs`), so the two
+paths share one cache key. The value flows only into `result.is_cjs`, whose single consumer is the
+"Conservative estimate" warning (`report/model.rs:95`: `is_cjs || side_effects || !truly_treeshakeable`).
 
 **What actually happens.** For an extensionless CommonJS entry, the same package can show the warning when
 first measured on the interactive path and hide it when the row was populated by prefetch (or the reverse). The
@@ -542,21 +536,20 @@ badge contradicts the build its own number came out of.
 
 **Why it is accepted:** the size is right. Rolldown resolves the link exactly as webpack does, so the bytes are
 the bytes. Only the badge is wrong, and only for a layout (a package whose build output directory is a link out
-of the package) that essentially nobody ships. A previous version of the code comment asserted this case could
-not happen; that was never measured, and it is false.
+of the package) that essentially nobody ships.
 
 **What would fix it:** carry the pre-canonical package-relative path alongside the entry, so the relative form
 survives a link that the canonical form cannot express.
 
-### G1: The negative-`error` Guard catches 14 of 18 spellings
+### G1: The negative-`error` Guard catches 18 of 24 spellings
 **Status: Accepted** · The number is machine-pinned, not claimed
 
 The Guard bans the `!result.error` usability check, the single root cause of the "transient becomes durable"
 defect that recurred seven times (see [ADR-0006](adr/0006-the-result-model.md)).
 
-It catches 14 of 18 planted spellings. The four misses are named in the test file with reasons (destructured
-`const { error } = result`; a ternary; a bare `== null` expression; Rust `let Some(_) = ... else`). The count
-is asserted, so a future change that silently weakens it fails the test.
+It catches 18 of 24 planted spellings (`STATED_COVERAGE` in `scripts/test/result-model-guards.test.mjs`). The
+misses are named in the test file with reasons. The count is asserted, so a future change that silently weakens
+it fails the test.
 
 **Static analysis is the second line here, not the first.** The real enforcement is that a degraded result has
 no size to misuse: the size fields are `Option`, and the durability gate lives inside each store.
@@ -567,7 +560,7 @@ no size to misuse: the size fields are `Option`, and the durability gate lives i
 The exported workspace report (`extension/src/ui/reportContent.ts`) prints three figures under the "Combined
 Import Cost" label: the headline and the Duplicate Imports column render `combinedImportCostBrotliBytes`
 (compressed, brotli), while the Shared Modules column renders `combinedImportCostBytes`
-(`DuplicateModuleGroup.combinedImportCostBytes`, `ipc/protocol.ts:607-608`), which is rendered, uncompressed
+(`DuplicateModuleGroup.combinedImportCostBytes`, `ipc/protocol.ts:641-642`), which is rendered, uncompressed
 bytes. So one header names a compressed figure in two tables and an uncompressed one in the third.
 
 **What actually happens.** Every individual number is correct for the quantity it represents (the shared-module
@@ -630,20 +623,21 @@ waste rebuilds or disk but can never surface a wrong import cost or lose a durab
 Two graceful-degradation paths in the daemon's connection loop, neither able to corrupt a number:
 
 - **Oversized or malformed frame tears the connection.** A frame-decode `Err` (for example larger than
-  `MAX_FRAME_BYTES` = 32 MiB) calls `close_connection` and returns (`server.rs:526-539`), unlike the
-  payload-decode arm which `continue`s. But `close_connection` runs `wait_for_active_tasks` then
-  `flush_cache()` unconditionally first (`server.rs:1285-1307`), so no measured result is lost and the
-  extension respawns the daemon. A trusted client on the mirrored TS codec does not emit a 32 MiB frame.
+  `MAX_FRAME_BYTES` = 32 MiB) calls `close_connection` and returns (`server.rs:539-551`), unlike the
+  payload-decode arm which `continue`s. But `close_connection` cancels all cancellable work, runs
+  `wait_for_active_tasks`, then `flush_cache()` unconditionally (`server.rs:1266-1288`), so no measured
+  result is lost and the extension respawns the daemon. A trusted client on the mirrored TS codec does not
+  emit a 32 MiB frame.
 - **A reply that fails to serialize is dropped.** `queue_outbound` logs and returns on a
-  `rmp_serde::to_vec_named` `Err` (`server.rs:340-350`) with no retry; the client's `request_id` stays
-  unanswered until its own timeout, showing Loading or timeout, never a wrong size. Dropping one frame (rather
-  than tearing the connection) preserves the warm cache and every other in-flight request. `to_vec_named` on
-  these plain `String`, `u64`, `Vec`, `Option` structs does not fail in practice.
+  `rmp_serde::to_vec_named` `Err` (through `payload_bytes`, `server.rs:339-349`) with no retry; the client's
+  `request_id` stays unanswered until its own timeout, showing Loading or timeout, never a wrong size.
+  Dropping one frame (rather than tearing the connection) preserves the warm cache and every other in-flight
+  request. `to_vec_named` on these plain `String`, `u64`, `Vec`, `Option` structs does not fail in practice.
 
 **Why it is accepted:** both are last-resort paths for inputs a trusted client does not produce, and both fail
 toward "no answer" (client retries, daemon respawns), never toward a fabricated or misrouted number. Handler
-panics are already converted to routed protocol errors (`response_from_join`), so a panic does not wedge a
-batch either.
+panics are converted to routed protocol errors (`response_from_join`), so a panic does not wedge a request
+either.
 
 ### E2: Windows ARM64 (`win32-arm64`) is a declared target with no shipped binary or hash, so the daemon never starts
 **Status: Accepted** · Fail-safe · Out of the current release scope (Windows x64) · Found in the 2026-07-16 module audit (E1 module)
@@ -802,7 +796,6 @@ From the release review's improvement list. All real; none blocking. Each is a k
 | --- | --- |
 | P1 | **Prewarm priority inversion.** A user typing an import can queue behind two in-progress prewarm builds. Reserve an interactive permit. |
 | P2 | **Answer `CacheProbe::Unresolved` in the classify pass.** Types-only, node-builtin and unresolvable imports construct no bundler, yet route through the engine drain. |
-| P3 | **Drop the per-module source clone.** The graph's source is copied once per build for nothing. Hash first, then move the buffer. |
 | P4 | **Avoid copying the linked chunk.** A multi-megabyte `clone()` purely to move it into the artifact. |
 | P5 | **LRU the dependency-path index.** Capped at 32 entries with an arbitrary eviction victim; a monorepo thrashes it and first-party freshness degrades nondeterministically. |
 | P6 | **`drain_ordered` uses 2 workers where `drain_classified` uses 4.** package.json analysis and both prefetch drains idle a permit with work queued. |
@@ -844,6 +837,7 @@ resolves to nothing is worse than the bloat.
 | ID | What it was | Fixed |
 | --- | --- | --- |
 | C5 | The process outlived its connection for as long as an uncancellable blocking drain ran, holding its cache shards open | 2026-10-06 |
+| P3 | The load hook copied every module's source per build purely to keep the bytes alive for hashing | 2026-07-19 |
 | D25 | The always-on-screen file total could not say what share of it was not JavaScript | 2026-07-19 |
 | D27 | A first-party dependency manifest edit left the File Cost stale while per-import numbers updated | 2026-07-19 |
 | D26 | A waiter that could not use an admission wake swallowed it, so a freed permit sat idle | 2026-07-19 |

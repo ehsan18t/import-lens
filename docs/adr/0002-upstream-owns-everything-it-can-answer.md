@@ -24,8 +24,9 @@ Two rules follow:
 
 ## The exception: metadata upstream will not expose
 
-In Rolldown 1.1.5, `ModuleInfo` — everything a plugin can learn about a module — carries
-`code`, `id`, `is_entry`, `importers`, `imported_ids`, `exports` and `input_format`, but
+In Rolldown 1.2.0, `ModuleInfo` (everything a plugin can learn about a module) carries
+`code`, `id`, `is_entry`, `importers`, `dynamic_importers`, `imported_ids`,
+`dynamically_imported_ids`, `exports` and `input_format`, but
 **nothing about side effects**; the real classification (`DeterminedSideEffects`) lives on
 internal module types and reaches no output type. So the Side-Effectful badge cannot be
 sourced from Rolldown and must come from our own manifest reader.
