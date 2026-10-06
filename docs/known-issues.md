@@ -385,19 +385,6 @@ degradation, never a wrong size and never a wedge.
 
 Each engine worker keeps a stack and an allocator heap. Four workers saved about 10 MB of idle RSS on Linux over a 60-file, 25-package session, but rounds ran about 12 percent slower (10.8 to 11.6 s against 9.7 to 9.9 s), because Rolldown parallelizes within a build. Speed wins: the workers stay at `min(cores, 8)`.
 
-### G1: The negative-`error` Guard catches 18 of 24 spellings
-**Status: Accepted** · The number is machine-pinned, not claimed
-
-The Guard bans the `!result.error` usability check, the single root cause of the "transient becomes durable"
-defect that recurred seven times (see [ADR-0006](adr/0006-the-result-model.md)).
-
-It catches 18 of 24 planted spellings (`STATED_COVERAGE` in `scripts/test/result-model-guards.test.mjs`). The
-misses are named in the test file with reasons. The count is asserted, so a future change that silently weakens
-it fails the test.
-
-**Static analysis is the second line here, not the first.** The real enforcement is that a degraded result has
-no size to misuse: the size fields are `Option`, and the durability gate lives inside each store.
-
 ### K3: Disk-cache budget is enforced on logical bytes, and shard ids can collide
 **Status: Accepted** · Feeds eviction and observability only, never an import number · Found in the 2026-07-16 module audit (D5)
 
