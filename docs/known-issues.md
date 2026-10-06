@@ -409,30 +409,6 @@ theoretical case is a browser-versus-module entry delta on an exotic malformed p
 **What would fix it:** reorder the fallback to `browser`, `module`, `main` for parity with the resolver, a
 one-line change.
 
-### K2: The project-cache metadata file is written non-atomically
-**Status: Deferred** · Self-healing · Off the number-serving path · Found in the 2026-07-16 module audit (D5)
-
-`write_metadata` (`cache/project.rs:1084-1093`) is a plain `fs::write`: no temp-file plus rename, no fsync. A
-crash mid-write can leave a truncated or corrupt `metadata.json` for a shard.
-
-**What actually happens, nothing to a served number.** `read_metadata` returns `None` on a corrupt file
-(`serde_json::from_str(...).ok()?`), and every consumer drops the shard on `None`: budget eviction,
-`invalidate_packages`, orphan sweeps, cache-management listing, and the recency seed. Import numbers are served
-through `cache_for_root` then `ImportCache::get` then `DiskCache::get_entry`, which recomputes the shard id
-from the root and opens redb without reading metadata (`project.rs:350-419`), rewriting the metadata on that
-cold open once the disk opens, so a corrupt metadata file is invisible to the number-serving path and
-self-heals on next open. The one theoretical effect (a `NodeModulesChanged` invalidation skipped for the shard)
-is backstopped by `check_fingerprints` on the next `get`.
-
-**Why it is not fixed now:** it cannot serve a wrong number, wedge, or lose a durable measurement (the redb
-cache is the source of truth; metadata is observability plus invalidation bookkeeping).
-**What would fix it:** write to a temp file and `rename` (atomic replace).
-
-**Same pattern, second file (found in the D7b audit).** `record_recycle_timestamp` writes
-`importlens-recycles.json` with a plain `fs::write` (`lifecycle.rs:71-87`), read back with `unwrap_or_default()`
-on corruption. It gates only idle-recycle detection (after 4 h uptime plus 15 min idle), never a served number;
-worst case on a torn write is one extra, already-4h-gated recycle. Same class, same fix (temp plus rename).
-
 ### G0: The legacy `performance.rs` smoke suite still claims to gate the NFR numbers, at 8x loose
 **Status: Deferred** · Not an active hole, but a second suite that appears to gate what it does not
 
@@ -836,6 +812,7 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| K2 | The project-cache metadata and the recycle timestamp were written in place, so a crash mid-write could tear them | 2026-10-06 |
 | C5 | The process outlived its connection for as long as an uncancellable blocking drain ran, holding its cache shards open | 2026-10-06 |
 | P3 | The load hook copied every module's source per build purely to keep the bytes alive for hashing | 2026-07-19 |
 | D25 | The always-on-screen file total could not say what share of it was not JavaScript | 2026-07-19 |

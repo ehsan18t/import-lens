@@ -1,4 +1,5 @@
 pub mod analysis_flight;
+pub mod atomic_write;
 pub mod cache;
 pub mod document;
 pub mod engine;

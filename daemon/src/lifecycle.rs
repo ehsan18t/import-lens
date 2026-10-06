@@ -83,7 +83,7 @@ pub fn record_recycle_timestamp(storage_path: &Path, now: SystemTime) -> io::Res
     file.recycles.push(now_millis);
     file.recycles.sort_unstable();
 
-    fs::write(path, serde_json::to_string(&file)?)
+    crate::atomic_write::write_atomic(&path, serde_json::to_string(&file)?.as_bytes())
 }
 
 fn duration_millis(duration: Duration) -> u64 {
