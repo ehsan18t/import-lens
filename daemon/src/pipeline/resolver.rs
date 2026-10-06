@@ -118,12 +118,17 @@ pub fn resolve_package_entry(
     validate_package_name(&request.package_name)?;
 
     let manifest = find_package_manifest(active_document_path, request)?;
-    let resolution = resolve_with_oxc(active_document_path, request);
+    let entry_resolver = EntryResolver::for_package(&manifest.root, request.runtime);
+    let resolution = resolve_with_oxc(entry_resolver.get(), active_document_path, request);
     let (entry_path, is_cjs) = match resolution {
         Ok(resolved) => {
             let entry_path = resolved.entry_path;
             if subpath_for_request(request).is_none() {
-                validate_declared_entry_resolution(&manifest, request.runtime)?;
+                validate_declared_entry_resolution(
+                    entry_resolver.get(),
+                    &manifest,
+                    request.runtime,
+                )?;
             }
             let is_cjs = resolved_entry_is_commonjs(&manifest, &entry_path, resolved.is_cjs);
             (entry_path, is_cjs)
@@ -168,7 +173,43 @@ struct ResolvedEntry {
     is_cjs: bool,
 }
 
+/// The resolver one package-entry resolution runs through.
+///
+/// An installed package resolves through the shared set, whose memoized filesystem facts
+/// [`invalidate_shared_resolvers`] lifts when `node_modules` changes. A workspace package (a link
+/// whose real root sits outside `node_modules`) is edited and built in place, where no watcher
+/// reports it, so a memoized fact about it (its manifest, or a miss on a `dist/` file not built
+/// yet) would stand for the daemon's life. It resolves through a resolver that lives for this one
+/// resolution.
+enum EntryResolver {
+    Shared(Arc<ResolverSet>, ImportRuntime),
+    Fresh(Box<Resolver>),
+}
+
+impl EntryResolver {
+    fn for_package(package_root: &Path, runtime: ImportRuntime) -> Self {
+        let installed = fs::canonicalize(package_root).is_ok_and(|real_root| {
+            real_root
+                .components()
+                .any(|component| component.as_os_str() == "node_modules")
+        });
+        if installed {
+            Self::Shared(shared_resolvers(), runtime)
+        } else {
+            Self::Fresh(Box::new(Resolver::new(resolve_options(runtime))))
+        }
+    }
+
+    fn get(&self) -> &Resolver {
+        match self {
+            Self::Shared(resolvers, runtime) => resolvers.resolver(*runtime),
+            Self::Fresh(resolver) => resolver,
+        }
+    }
+}
+
 fn resolve_with_oxc(
+    resolver: &Resolver,
     active_document_path: &Path,
     request: &ImportRequest,
 ) -> Result<ResolvedEntry, String> {
@@ -176,12 +217,7 @@ fn resolve_with_oxc(
         .parent()
         .ok_or_else(|| "active document path has no parent directory".to_owned())?;
 
-    let resolvers = shared_resolvers();
-    let resolved = resolve_module_path(
-        resolvers.resolver(request.runtime),
-        directory,
-        &request.specifier,
-    )?;
+    let resolved = resolve_module_path(resolver, directory, &request.specifier)?;
 
     Ok(ResolvedEntry {
         entry_path: resolved.path,
@@ -286,6 +322,7 @@ fn importable_subpaths(package_root: &Path) -> Vec<String> {
 }
 
 fn validate_declared_entry_resolution(
+    resolver: &Resolver,
     manifest: &PackageManifest,
     runtime: ImportRuntime,
 ) -> Result<(), String> {
@@ -307,8 +344,6 @@ fn validate_declared_entry_resolution(
         return Ok(());
     }
 
-    let resolvers = shared_resolvers();
-    let resolver = resolvers.resolver(runtime);
     for (_, target) in &declared_entries {
         if resolve_manifest_target(resolver, &manifest.root, target).is_ok() {
             return Ok(());
