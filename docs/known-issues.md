@@ -370,26 +370,6 @@ re-doing the build is waste.
 bundle. Answering this means building that union model. It is the highest-value idea absent from the design,
 and it must be a deliberate decision, not smuggled in as a bug fix.
 
-### G2: A failed (unmeasured) import is counted and badged as a "Conservative estimate"
-**Status: Deferred** · Wrong badge or count, never a wrong size · Found in the 2026-07-16 module audit (D9)
-
-`is_conservative_item` (`report/model.rs:92-96`) returns `is_cjs || side_effects || !truly_treeshakeable` and
-gates only on `result.is_some()`. `ImportResult::unmeasured` sets `side_effects: true`,
-`truly_treeshakeable: false` (`ipc/protocol.rs:352-353`), the honest conservative reading for a build that
-produced nothing, so every failed-build row also satisfies the predicate.
-
-**What actually happens.** A workspace report with 1 genuinely-conservative measured import and 2 failed
-imports reports `conservative_count = 3`, and each failed row carries a "Conservative estimate" warning stacked
-next to its failure message. No byte figure moves: `combined_import_cost_brotli_bytes` sums
-`filter_map(row.brotli_bytes)` (`model.rs:74-75`) and an unmeasured row's `brotli_bytes` is `None`
-(`model.rs:134`), so the headline, treemap, budget verdict, duplicate-import and shared-module figures all
-exclude it (pinned by `an_unmeasured_import_has_no_size_in_the_report_not_a_zero`, `model.rs:564`).
-
-**Why it is not blocking:** it inflates a badge or count on a row the user already sees failed; the S1/R1
-"wrong badge, never a wrong size" class, and it cannot wedge (a pure `filter().count()`).
-**What would fix it:** gate `is_conservative_item` on a measured size too. A failure is not an estimate but a
-different category, so a totally-unmeasured import should not be counted as conservative.
-
 ### R2: The legacy entry-field fallback orders `module`, `browser`, `main`, against the resolver's own preference
 **Status: Deferred** · Not reproduced as a wrong number · Found in the 2026-07-16 module audit (D2)
 
@@ -484,7 +464,8 @@ passes `false` as the resolver's verdict on the prefetch-refill path (`resolved_
 manifest fields, `exports` conditions and `type` first, so that `false` decides only an entry none of those
 classify, in practice an extensionless one. `CacheIdentity` carries no `is_cjs` (`cache/key.rs`), so the two
 paths share one cache key. The value flows only into `result.is_cjs`, whose single consumer is the
-"Conservative estimate" warning (`report/model.rs:95`: `is_cjs || side_effects || !truly_treeshakeable`).
+"Conservative estimate" warning (`is_conservative_item` in `report/model.rs`: a measured size with
+`is_cjs || side_effects || !truly_treeshakeable`).
 
 **What actually happens.** For an extensionless CommonJS entry, the same package can show the warning when
 first measured on the interactive path and hide it when the row was populated by prefetch (or the reverse). The
@@ -812,6 +793,7 @@ resolves to nothing is worse than the bloat.
 
 | ID | What it was | Fixed |
 | --- | --- | --- |
+| G2 | A failed (unmeasured) import was counted and badged as a "Conservative estimate" in the workspace report | 2026-10-06 |
 | K2 | The project-cache metadata and the recycle timestamp were written in place, so a crash mid-write could tear them | 2026-10-06 |
 | C5 | The process outlived its connection for as long as an uncancellable blocking drain ran, holding its cache shards open | 2026-10-06 |
 | P3 | The load hook copied every module's source per build purely to keep the bytes alive for hashing | 2026-07-19 |

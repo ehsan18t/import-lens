@@ -87,12 +87,14 @@ pub fn build_report_summary(row_set: &WorkspaceReportRowSet) -> WorkspaceReportS
     }
 }
 
-/// Mirrors the condition that pushes "Conservative estimate" into the row
-/// warning (TS: `is_cjs || side_effects || truly_treeshakeable === false`).
+/// Whether a row's size is a conservative estimate. Only a measured size can be one: an
+/// unmeasured result carries the conservative flags because nothing was built, and a failure is
+/// not an estimate.
 fn is_conservative_item(item: &WorkspaceReportItem) -> bool {
-    item.result
-        .as_ref()
-        .is_some_and(|result| result.is_cjs || result.side_effects || !result.truly_treeshakeable)
+    item.result.as_ref().is_some_and(|result| {
+        result.sizes().is_some()
+            && (result.is_cjs || result.side_effects || !result.truly_treeshakeable)
+    })
 }
 
 /// A budget is judged against a **size**, and only a measured import has one (ADR-0006, invariant
@@ -470,6 +472,32 @@ mod tests {
             .find(|row| row.specifier == "heavy")
             .expect("conservative row");
         assert!(conservative_row.warning.contains("Conservative estimate"));
+    }
+
+    #[test]
+    fn a_failed_import_is_neither_counted_nor_badged_as_a_conservative_estimate() {
+        let mut conservative = ok_result("heavy", 5);
+        conservative.is_cjs = true;
+        let unmeasured = |specifier: &str| {
+            ImportResult::unmeasured(specifier, "parse", "engine build failed", Vec::new())
+        };
+        let items = vec![
+            report_item("heavy", 0, "src/a.ts", Some(conservative)),
+            report_item("broken", 1, "src/a.ts", Some(unmeasured("broken"))),
+            report_item("missing", 2, "src/a.ts", Some(unmeasured("missing"))),
+        ];
+
+        let row_set = build_report_rows(&items, &no_budgets());
+        let summary = build_report_summary(&row_set);
+
+        assert_eq!(summary.conservative_count, 1);
+        for row in row_set.rows.iter().filter(|row| row.specifier != "heavy") {
+            assert!(
+                !row.warning.contains("Conservative estimate"),
+                "a failed row must not be labelled an estimate: {}",
+                row.warning
+            );
+        }
     }
 
     #[test]
