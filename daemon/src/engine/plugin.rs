@@ -443,12 +443,12 @@ async fn resolve_failure_kind(candidate: &Path) -> AssetInputFailure {
 /// Atomically reserve bytes without ever moving the counter past `limit` on rejection.
 ///
 /// `fetch_add` is not suitable for a hard resource ceiling: it mutates first, so every rejected
-/// module permanently inflates the total and can manufacture follow-on breaches. `fetch_update`
+/// module permanently inflates the total and can manufacture follow-on breaches. `try_update`
 /// makes the check and increment one compare/exchange operation and leaves the counter untouched
 /// when the reservation does not fit.
 fn try_reserve_source_bytes(total: &AtomicUsize, bytes: usize, limit: usize) -> Result<(), usize> {
     total
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current
                 .checked_add(bytes)
                 .filter(|candidate| *candidate <= limit)
@@ -458,7 +458,7 @@ fn try_reserve_source_bytes(total: &AtomicUsize, bytes: usize, limit: usize) -> 
 
 fn release_source_bytes(total: &AtomicUsize, bytes: usize) {
     total
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_sub(bytes)
         })
         .expect("released source bytes must have an existing reservation");
