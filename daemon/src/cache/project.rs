@@ -1,5 +1,5 @@
 use crate::{
-    cache::budget::{BudgetCoordinator, EvictableShard, MaintenanceOutcome},
+    cache::budget::{BudgetCoordinator, EvictableShard, LOW_WATER, MaintenanceOutcome},
     cache::disk::ShardRollup,
     cache::memory::ImportCache,
     ipc::protocol::{CacheOperationResult, CacheShardInfo},
@@ -20,6 +20,9 @@ const LEGACY_CENTRAL_CACHE_DB_FILE_NAME: &str = "importlens.redb";
 const LEGACY_CENTRAL_CACHE_SHARD_ID: &str = "legacy-central";
 const PROJECT_METADATA_WRITE_INTERVAL_MILLIS: u64 = 60_000;
 const AGGREGATE_OVER_BUDGET_COMPACT_THRESHOLD: f64 = 0.0;
+/// Each pass re-measures the value-to-file ratio, so it converges in one or two; the bound only
+/// stops a pass whose eviction frees bytes the files never give back.
+const MAX_PHYSICAL_BUDGET_PASSES: usize = 4;
 /// Minimum wall-clock gap between automatic orphan-shard sweeps. The sweep stats every shard
 /// root and abandoned projects are rare, so it runs at most hourly however often projects open.
 const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
@@ -265,15 +268,40 @@ impl ProjectCacheRegistry {
             self.total_shard_file_bytes(),
             self.coordinator.budget_bytes(),
         );
-        // Eviction stops at the logical (value-byte) low-water mark, so key, index and
-        // page overhead can leave the files over budget even after compaction.
+
+        // The budget is a disk-byte budget, but eviction counts stored values; keys, the recency
+        // index and page overhead make the files larger. While they stay over, evict again
+        // toward the low-water mark scaled by the measured value-to-file ratio, and compact.
+        let mut eviction = eviction;
+        for _ in 0..MAX_PHYSICAL_BUDGET_PASSES {
+            let physical_bytes = self.total_shard_file_bytes();
+            if physical_bytes <= self.coordinator.budget_bytes() || eviction.still_over_budget {
+                break;
+            }
+            let logical_bytes = refs
+                .iter()
+                .map(|shard| shard.rollup().total_bytes)
+                .sum::<u64>();
+            let ratio = logical_bytes as f64 / physical_bytes as f64;
+            let target = (self.coordinator.budget_bytes() as f64 * LOW_WATER * ratio) as u64;
+            let more = self.coordinator.evict_down_to(&refs, target);
+            if more.evicted_bytes == 0 {
+                break;
+            }
+            eviction.evicted_bytes += more.evicted_bytes;
+            eviction.evicted_keys += more.evicted_keys;
+            compacted_shards += compact_targets(
+                &compactable_targets,
+                AGGREGATE_OVER_BUDGET_COMPACT_THRESHOLD,
+            );
+        }
         let physical_bytes = self.total_shard_file_bytes();
         if !eviction.still_over_budget && physical_bytes > self.coordinator.budget_bytes() {
             crate::logging::log_warn(
                 "cache",
                 format!(
                     "cache files total {} MB after eviction and compaction, over the {} MB \
-                     budget: the budget counts stored values, not key, index or page overhead",
+                     budget: every remaining entry is floor-protected",
                     physical_bytes / (1024 * 1024),
                     self.coordinator.budget_bytes() / (1024 * 1024)
                 ),

@@ -72,6 +72,22 @@ impl BudgetCoordinator {
     /// eviction). Victim selection is by smallest `oldest_seq`; each shard's newest
     /// `EVICTION_FLOOR` entries are protected.
     pub fn evict_to_budget(&self, shards: &[&dyn EvictableShard]) -> EvictionOutcome {
+        self.evict(shards, None)
+    }
+
+    /// Evicts until the summed logical bytes are at or below `target_bytes`, whether or not they
+    /// are over the budget. Maintenance uses it when the files are over budget though the values
+    /// are not: keys, the recency index and page overhead are physical bytes the logical total
+    /// does not count.
+    pub fn evict_down_to(
+        &self,
+        shards: &[&dyn EvictableShard],
+        target_bytes: u64,
+    ) -> EvictionOutcome {
+        self.evict(shards, Some(target_bytes))
+    }
+
+    fn evict(&self, shards: &[&dyn EvictableShard], target_bytes: Option<u64>) -> EvictionOutcome {
         let mut outcome = EvictionOutcome::default();
         if self.budget_bytes == 0 {
             return outcome;
@@ -93,10 +109,11 @@ impl BudgetCoordinator {
             .collect();
         let mut total: u64 = rollups.values().map(|rollup| rollup.total_bytes).sum();
 
-        if total <= self.budget_bytes {
-            return outcome;
-        }
-        let low_water = (self.budget_bytes as f64 * LOW_WATER) as u64;
+        let low_water = match target_bytes {
+            Some(target) => target,
+            None if total <= self.budget_bytes => return outcome,
+            None => (self.budget_bytes as f64 * LOW_WATER) as u64,
+        };
 
         // Shards with nothing left to evict (all remaining entries floor-protected).
         let mut exhausted: HashSet<String> = HashSet::new();

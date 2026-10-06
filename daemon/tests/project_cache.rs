@@ -840,6 +840,51 @@ fn maintenance_and_status_never_recreate_a_shard_database() {
     fs::remove_dir_all(storage).expect("temp storage should be removed");
 }
 
+/// `cacheMaxSizeMB` is a disk-byte budget. A shard whose stored values fit the budget while its
+/// file (values plus keys, the recency index and page overhead) does not must still end the pass
+/// with its file inside the budget, not only its values.
+#[test]
+fn maintenance_brings_the_files_within_budget_not_only_the_values() {
+    let storage = common::temp_workspace("import-lens-project-cache-physical-budget");
+    let root = storage.join("app");
+    fs::create_dir_all(&root).expect("root");
+    let shard_file = storage
+        .join(project_cache_shard_id(&root))
+        .join(CACHE_DB_FILE_NAME);
+
+    let logical_bytes = {
+        let registry =
+            ProjectCacheRegistry::new_with_budget_bytes(Some(storage.clone()), true, 512, 0);
+        let cache = registry.cache_for_root(&root);
+        for index in 0..3000 {
+            cache.insert(format!("pkg{index:05}@1.0.0::default"), result("pkg"));
+        }
+        registry.flush_to_disk().expect("flush should persist");
+        cache.shard_rollup().total_bytes
+    };
+    let file_bytes = fs::metadata(&shard_file).expect("shard file").len();
+    assert!(
+        (logical_bytes as f64) < file_bytes as f64 * 0.8,
+        "the fixture needs file overhead to exceed the low-water slack: {logical_bytes} values, \
+         {file_bytes} file"
+    );
+    let budget_bytes = (logical_bytes + file_bytes) / 2;
+
+    let registry =
+        ProjectCacheRegistry::new_with_budget_bytes(Some(storage.clone()), true, 512, budget_bytes);
+    let outcome = registry.run_maintenance(false);
+    drop(registry);
+
+    assert!(!outcome.skipped_under_budget);
+    let file_after = fs::metadata(&shard_file).expect("shard file").len();
+    assert!(
+        file_after <= budget_bytes,
+        "the shard file is {file_after} bytes after maintenance, over the {budget_bytes} byte budget"
+    );
+
+    fs::remove_dir_all(storage).expect("temp storage should be removed");
+}
+
 #[test]
 fn byte_budget_evicts_unloaded_shards_and_shrinks_their_files() {
     use import_lens_daemon::cache::budget::EVICTION_FLOOR;

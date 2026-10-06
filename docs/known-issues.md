@@ -367,15 +367,12 @@ degradation, never a wrong size and never a wedge.
 
 Each engine worker keeps a stack and an allocator heap. Four workers saved about 10 MB of idle RSS on Linux over a 60-file, 25-package session, but rounds ran about 12 percent slower (10.8 to 11.6 s against 9.7 to 9.9 s), because Rolldown parallelizes within a build. Speed wins: the workers stay at `min(cores, 8)`.
 
-### K3: Disk-cache budget is enforced on logical bytes, and shard ids can collide
-**Status: Accepted** · Feeds eviction and observability only, never an import number · Found in the 2026-07-16 module audit (D5)
+### K3: Two project roots can share a cache shard id
+**Status: Accepted** · Never an import number · Found in the 2026-07-16 module audit (D5)
 
-Two independent bookkeeping approximations, neither on the number-serving path:
+`project_cache_shard_id` (`project.rs`) is 64-bit FNV-1a; two roots can map to one redb shard. Entries stay isolated (keyed by `package_root` and `entry_path`), so no cross-read of a wrong number; a read only crosses projects when both resolve the identical absolute entry (the same bytes, so the shared measurement is correct). Effect is limited to co-mingled cache-management display and a shared eviction budget. Widening the id would orphan every existing shard for a negligible risk.
 
-- **Budget enforced on logical bytes, gated on physical ones.** `run_maintenance` skips its pass while the summed `.redb` file sizes are within `cacheMaxSizeMB`, but `BudgetCoordinator` evicts only until the summed value bytes reach the low-water mark. File size also carries keys (stored twice, with the recency index), B-tree pages and free pages, so the cache can sit with values under budget and files over it. The pass then compacts at a zero fragmentation threshold and, if the files are still over budget, logs a warning naming both figures; it does not evict further. Maintenance runs once per connection (60 s after the Hello), so this costs one redundant pass per connection, not a loop. Manage Cache shows both `total_size_bytes` (physical) and `total_bytes` (logical). The SRS settings table calls `cacheMaxSizeMB` a disk-byte budget, which the files can exceed by that overhead.
-- **Shard-id collision.** `project_cache_shard_id` (`project.rs`) is 64-bit FNV-1a; two roots can map to one redb shard. Entries stay isolated (keyed by `package_root` and `entry_path`), so no cross-read of a wrong number; a read only crosses projects when both resolve the identical absolute entry (the same bytes, so the shared measurement is correct). Effect is limited to co-mingled cache-management display and a shared eviction budget. Widening the id would orphan every existing shard for a negligible risk.
-
-**Why it is accepted:** the cache is rebuildable and keyed by dependency fingerprints, so bookkeeping drift can waste rebuilds or disk but can never surface a wrong import cost or lose a durable answer. A summary byte total driven negative is drift and is rebuilt from a scan in the same transaction.
+**Why it is accepted:** a 64-bit collision across the handful of roots one machine opens is around one in 10^18, and when it happens no number is wrong. Widening the id would orphan every user's existing shards, a cold cache for everyone, to remove a display quirk nobody will see.
 
 ### E2: Windows ARM64 (`win32-arm64`) is a declared target with no shipped binary or hash, so the daemon never starts
 **Status: Accepted** · Fail-safe · Out of the current release scope (Windows x64) · Found in the 2026-07-16 module audit (E1 module)
