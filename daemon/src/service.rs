@@ -43,12 +43,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Whether a cached-analyze read promotes the entry's LRU recency (scan
-/// resistance, §5.1). An interactive read whose result the user is looking at now
-/// promotes; a bulk/background scan (`WorkspaceReport`, `Compare`) does not, so a
-/// full-workspace pass can't flood the recency signal and evict the user's warm
-/// working set. When a caller's intent is ambiguous, prefer `Interactive` —
-/// over-promoting is safe; the finding targets full-workspace report/Compare scans.
+/// Whether a cached-analyze read promotes the entry's LRU recency (FR-026b, scan
+/// resistance §5.1). An interactive read whose result the user is looking at now
+/// promotes; the workspace report does not, so a full-workspace pass can't flood
+/// the recency signal and evict the user's warm working set. When a caller's
+/// intent is ambiguous, prefer `Interactive`: over-promoting is safe.
 #[derive(Clone, Copy)]
 enum ReadIntent {
     Interactive,
@@ -2661,14 +2660,9 @@ impl ImportLensService {
             let lookup_started_at = Instant::now();
             // SWR: serve the last-known value (flagged Stale/Unverified) instead of
             // evicting-and-recomputing. The FileSizeDocument handler spawns a background
-            // recompute + push when a served result is Stale. A bulk read
-            // (WorkspaceReport, Compare) uses the non-promoting variant so a
-            // full-workspace scan can't flood the recency signal (scan resistance, §5.1).
-            let served = match intent {
-                ReadIntent::Interactive => cache.get_with_result_freshness(&key),
-                ReadIntent::Bulk => cache.get_with_result_freshness_for_bulk(&key),
-            };
-            if let Some((result, _freshness)) = served {
+            // recompute + push when a served result is Stale. Only that interactive size
+            // read serves stale, and the read promotes recency.
+            if let Some((result, _freshness)) = cache.get_with_result_freshness(&key) {
                 log_cache_lookup_timing(
                     request,
                     cache_read_mode_label(serve_stale, intent),
@@ -2976,7 +2970,10 @@ fn fresh_cached_result_for_key(
     intent: ReadIntent,
 ) -> Option<ImportResult> {
     let lookup_started_at = Instant::now();
-    let result = cache.get_if_fresh(key);
+    let result = match intent {
+        ReadIntent::Interactive => cache.get_if_fresh_and_promote(key),
+        ReadIntent::Bulk => cache.get_if_fresh(key),
+    };
     log_cache_lookup_timing(
         request,
         cache_read_mode_label(false, intent),

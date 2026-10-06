@@ -4,7 +4,7 @@ use import_lens_daemon::{
         CacheRemoveRequest, CacheRemoveScope, CacheStatusRequest, CompleteImportMembersRequest,
         EnumerateExportsRequest, FileSizeDocumentRequest, FileSizeRequest, ImportAnalysisStatus,
         ImportKind, ImportRequest, ImportRuntime, PROTOCOL_VERSION, RegistryHintMode,
-        RegistryHintTarget,
+        RegistryHintTarget, WorkspaceReportRequest,
     },
     pipeline::file_size::FileSizeComputation,
     pipeline::file_size_cache::shared_file_size_cache,
@@ -3835,4 +3835,83 @@ fn direct_asset_observation_preserves_the_client_browser_alias() {
         font.raw_bytes, 4096,
         "the observing hook must delegate to the configured browser-aware resolver: {response:?}"
     );
+}
+
+/// FR-026b: an interactive cache hit promotes the entry's recency and a bulk scan does not, so
+/// the byte-budget evictor and the startup preload rank what the user keeps reading above what a
+/// workspace report touched once.
+#[test]
+fn an_interactive_cache_hit_promotes_recency_and_a_workspace_report_does_not() {
+    let workspace = temp_workspace();
+    let storage = temp_workspace();
+    write_named_package(&workspace, "first-lib");
+    write_named_package(&workspace, "second-lib");
+    fs::create_dir_all(workspace.join("src")).expect("src should be created");
+    fs::write(
+        workspace.join("src").join("index.ts"),
+        // A namespace import: the same cache key `AnalyzeSpecifiers` reads.
+        "import * as first from 'first-lib';\nconsole.log(first);\n",
+    )
+    .expect("source should be written");
+    let service = Arc::new(ImportLensService::new_with_cache_policy(
+        Some(storage.clone()),
+        true,
+        512,
+        32,
+    ));
+    let analyze = |specifier: &str| {
+        service.handle_analyze_specifiers(AnalyzeSpecifiersRequest {
+            message_type: "analyze_specifiers".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 1,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            active_document_path: active_document_path(&workspace),
+            specifiers: vec![specifier.to_owned()],
+        })
+    };
+    let recency_order = || {
+        service.flush_cache().expect("flush should succeed");
+        service.recent_cache_keys(&workspace, 2)
+    };
+
+    analyze("first-lib");
+    analyze("second-lib");
+    let built = recency_order();
+    assert_eq!(built.len(), 2, "both imports should be cached: {built:?}");
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    service.spawn_workspace_report(
+        WorkspaceReportRequest {
+            message_type: "workspace_report".to_owned(),
+            version: PROTOCOL_VERSION,
+            request_id: 2,
+            workspace_root: workspace.to_string_lossy().to_string(),
+            budgets: Default::default(),
+        },
+        tx,
+    );
+    let report = rx.blocking_recv().expect("the report should answer");
+    assert_eq!(report.rows.len(), 1, "{report:?}");
+    assert_eq!(
+        recency_order(),
+        built,
+        "a workspace report must not promote what it reads"
+    );
+
+    let hit = analyze("first-lib");
+    assert!(
+        hit.imports[0]
+            .result
+            .as_ref()
+            .is_some_and(|result| result.cache_hit),
+        "the second analysis should be a cache hit: {hit:?}"
+    );
+    assert_eq!(
+        recency_order(),
+        vec![built[1].clone(), built[0].clone()],
+        "an interactive hit must make its entry the most recent"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&storage);
 }
