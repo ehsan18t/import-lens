@@ -334,8 +334,7 @@ impl ImportCache {
                 Freshness::Stale if stale == StalePolicy::Serve => self.clear_unknown(key),
                 Freshness::Stale | Freshness::Gone => {
                     self.clear_unknown(key);
-                    memory.remove(key);
-                    self.disk.remove(key);
+                    self.evict_if_current(key, &cached.last_seq);
                     return None;
                 }
                 Freshness::Fresh if fast_path => {}
@@ -732,13 +731,34 @@ impl ImportCache {
         // our insert) must still roll us back — but by identity, leaving a racing fresh
         // insert intact.
         if self.disk.clear_generation() != captured_generation {
-            memory.compute(key, |entry| match entry {
-                Some((_, current)) if Arc::ptr_eq(&current.last_seq, &our_last_seq) => {
+            self.remove_from_memory_if_current(key, &our_last_seq);
+        }
+    }
+
+    /// Evicts the entry a read judged Stale or Gone from both layers, unless a
+    /// recompute replaced it while it was being verified: the verdict is about the
+    /// old measurement only. The disk copy goes only with the memory one; if memory
+    /// no longer held the entry at all, a later disk read re-verifies it anyway.
+    fn evict_if_current(&self, key: &str, identity: &Arc<AtomicU64>) {
+        if self.remove_from_memory_if_current(key.to_owned(), identity) {
+            self.disk.remove(key);
+        }
+    }
+
+    /// Removes `key` from memory only while it still holds the entry identified by
+    /// `identity` (its `last_seq` Arc, unique per insert and shared by a restamp, so
+    /// a restamped copy of the same measurement still matches). Returns whether it
+    /// removed anything.
+    fn remove_from_memory_if_current(&self, key: String, identity: &Arc<AtomicU64>) -> bool {
+        matches!(
+            self.memory.pin().compute(key, |entry| match entry {
+                Some((_, current)) if Arc::ptr_eq(&current.last_seq, identity) => {
                     papaya::Operation::Remove
                 }
                 _ => papaya::Operation::Abort(()),
-            });
-        }
+            }),
+            papaya::Compute::Removed(..)
+        )
     }
 
     pub fn memory_len(&self) -> usize {
@@ -1220,6 +1240,44 @@ mod tests {
             "the workspace font's content hash must be consulted, not skipped because the ENTRY \
              lives under node_modules"
         );
+
+        drop(cache);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A read verifies the entry it fetched, and a recompute can replace that entry before the
+    /// verdict lands. The verdict is about the old measurement only: evicting by key would throw
+    /// away the fresh one from memory and its queued disk write, costing a rebuild.
+    #[test]
+    fn a_stale_verdict_never_evicts_the_entry_that_replaced_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "il-evict-identity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let cache = ImportCache::new(Some(dir.clone()), true);
+        let key = "v4:react";
+        let identity_of = |cache: &ImportCache| {
+            Arc::clone(&cache.memory.pin().get(key).expect("entry present").last_seq)
+        };
+
+        cache.insert(key.to_owned(), minimal_result("react"));
+        let verified = identity_of(&cache);
+        cache.insert(key.to_owned(), minimal_result("react"));
+
+        cache.evict_if_current(key, &verified);
+        assert!(
+            cache.memory.pin().get(key).is_some(),
+            "the replacement must survive a verdict on the entry it replaced"
+        );
+        assert!(
+            cache.disk.get(key).is_some(),
+            "and so must its queued disk write"
+        );
+
+        cache.evict_if_current(key, &identity_of(&cache));
+        assert!(cache.memory.pin().get(key).is_none());
+        assert!(cache.disk.get(key).is_none());
 
         drop(cache);
         std::fs::remove_dir_all(&dir).ok();
