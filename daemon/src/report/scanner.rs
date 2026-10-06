@@ -1,3 +1,4 @@
+use crate::pipeline::util::should_skip_package_directory;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -6,7 +7,11 @@ use std::{
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "js", "jsx", "ts", "tsx", "mts", "cts", "svelte", "astro", "vue",
 ];
-const SKIPPED_DIRECTORIES: &[&str] = &["node_modules", "dist", "build", "out", "coverage"];
+/// Build output a workspace report must not count as the user's imports, on top of the dependency,
+/// VCS and tool-cache directories every scan skips (`should_skip_package_directory`). They are not
+/// in that shared list on purpose: a package ships its code in `dist`, and the package-size walk
+/// must read it.
+const BUILD_OUTPUT_DIRECTORIES: &[&str] = &["dist", "build", "out"];
 const MAX_SCAN_DEPTH: usize = 64;
 
 pub fn scan_workspace_sources(workspace_root: &Path) -> Vec<PathBuf> {
@@ -54,9 +59,11 @@ fn scan_directory(directory: &Path, depth: usize, files: &mut Vec<PathBuf>) {
 }
 
 fn should_skip_directory(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| SKIPPED_DIRECTORIES.contains(&name))
+    should_skip_package_directory(path)
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| BUILD_OUTPUT_DIRECTORIES.contains(&name))
 }
 
 fn is_supported_source(path: &Path) -> bool {
@@ -119,6 +126,29 @@ mod tests {
         fs::remove_dir_all(&workspace).expect("workspace cleanup");
         assert_eq!(files.len(), 1, "{files:?}");
         assert!(files[0].ends_with(Path::new("src/nested/deep/app.ts")));
+    }
+
+    /// Generated and tool-owned trees hold imports the user never wrote; counting them inflates the
+    /// report's import counts and totals.
+    #[test]
+    fn scan_skips_generated_tool_and_build_output_directories() {
+        let workspace = temp_workspace();
+        for directory in [
+            ".next", ".nuxt", ".git", ".turbo", ".cache", ".vite", "dist", "build", "out",
+            "coverage", "target",
+        ] {
+            let generated = workspace.join(directory).join("types");
+            fs::create_dir_all(&generated).expect("generated dir");
+            fs::write(generated.join("routes.ts"), "import 'react';").expect("generated source");
+        }
+        fs::create_dir_all(workspace.join("src")).expect("src dir");
+        fs::write(workspace.join("src").join("page.ts"), "import 'react';").expect("user source");
+
+        let files = scan_workspace_sources(&workspace);
+
+        fs::remove_dir_all(&workspace).expect("workspace cleanup");
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(files[0].ends_with(Path::new("src/page.ts")));
     }
 
     #[test]
