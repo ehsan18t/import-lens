@@ -22,11 +22,21 @@ use std::{
 
 pub const RECENT_PRELOAD_LIMIT: usize = 20;
 
-// Cap the in-memory entry count so a long multi-package session cannot grow the
-// map without bound. Eviction drops the least-recently-used entry; its disk copy
-// (if any) survives and re-hydrates on the next hit. The cap is generous, so it
-// only triggers in very large sessions.
+// The in-memory map is capped by entry count and by approximate size, because an
+// entry's fingerprint and contribution lists grow with the measured package's graph
+// (up to thousands of modules, each with an absolute path). Eviction drops the
+// least-recently-used entry; its disk copy (if any) re-hydrates on the next hit.
 pub const MAX_MEMORY_ENTRIES: usize = 4096;
+const MAX_MEMORY_WEIGHT_BYTES: usize = 128 * 1024 * 1024;
+/// Rough heap cost of one fingerprint or contribution row: the struct plus a typical
+/// absolute module path (pnpm store paths run 150-250 bytes).
+const GRAPH_ROW_WEIGHT_BYTES: usize = 256;
+
+fn memory_weight(cached: &CachedImport) -> usize {
+    (cached.dependency_fingerprints.len() + cached.result.internal_contributions.len())
+        .saturating_add(1)
+        .saturating_mul(GRAPH_ROW_WEIGHT_BYTES)
+}
 
 // Dependency fingerprints only change when node_modules changes, which the
 // extension signals via cache invalidation. Between invalidations, re-stat'ing
@@ -599,20 +609,24 @@ impl ImportCache {
         self.enforce_memory_cap();
     }
 
-    /// Evicts the least-recently-used entries while the in-memory map is over the
+    /// Evicts the least-recently-used entries while the in-memory map is over either
     /// cap. The disk copy (if any) survives and re-hydrates on the next hit, so
     /// this only sheds the memory mirror. Called from every path that grows the
     /// map (fresh insert and disk re-hydration), not the restamp path (which
     /// replaces an existing key and cannot grow the map).
     ///
-    /// Evicts in one batch down to ~90% of the cap: a session pinned at the cap
-    /// then pays one sort per ~400 inserts instead of a full min-scan per insert.
+    /// Evicts in one batch down to ~90% of both caps: a session pinned at a cap then
+    /// pays one sort per batch instead of a full min-scan per insert.
     /// `dirty` entries (whose disk insert failed) are never evicted — they exist
     /// only in memory, and dropping one would silently lose the computed result
     /// before `flush_to_disk` can replay it.
     fn enforce_memory_cap(&self) {
         let memory = self.memory.pin();
-        if memory.len() <= MAX_MEMORY_ENTRIES {
+        let weight = memory
+            .values()
+            .map(memory_weight)
+            .fold(0usize, usize::saturating_add);
+        if memory.len() <= MAX_MEMORY_ENTRIES && weight <= MAX_MEMORY_WEIGHT_BYTES {
             return;
         }
 
@@ -630,13 +644,24 @@ impl ImportCache {
         let mut candidates = memory
             .iter()
             .filter(|(key, _)| !dirty.contains(*key))
-            .map(|(key, entry)| (entry.last_seq.load(Ordering::Relaxed), key.clone()))
+            .map(|(key, entry)| {
+                (
+                    entry.last_seq.load(Ordering::Relaxed),
+                    key.clone(),
+                    memory_weight(entry),
+                )
+            })
             .collect::<Vec<_>>();
         candidates.sort_unstable();
 
-        let target = MAX_MEMORY_ENTRIES * 9 / 10;
-        let excess = memory.len().saturating_sub(target);
-        for (_, key) in candidates.into_iter().take(excess) {
+        let mut count = memory.len();
+        let mut weight = weight;
+        for (_, key, entry_weight) in candidates {
+            if count <= MAX_MEMORY_ENTRIES * 9 / 10 && weight <= MAX_MEMORY_WEIGHT_BYTES * 9 / 10 {
+                break;
+            }
+            count -= 1;
+            weight = weight.saturating_sub(entry_weight);
             // Before dropping the memory mirror, persist any UNFLUSHED recency
             // promotion (an interactive hit bumps `last_seq` past `persisted_seq`;
             // the sweep in `flush_to_disk` normally re-persists it). The disk copy
@@ -990,6 +1015,7 @@ mod cache_memory_flush_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::protocol::ModuleContribution;
 
     fn minimal_result(specifier: &str) -> ImportResult {
         let mut result = ImportResult::measured(
@@ -1004,6 +1030,30 @@ mod tests {
         );
         result.truly_treeshakeable = true;
         result
+    }
+
+    #[test]
+    fn graph_sized_entries_are_evicted_before_the_entry_count_cap() {
+        let cache = ImportCache::new(None, false);
+        let rows_per_entry = 100_000;
+        for index in 0..6 {
+            let mut result = minimal_result("pkg");
+            result.internal_contributions = (0..rows_per_entry)
+                .map(|row| ModuleContribution {
+                    path: format!("m{row}"),
+                    bytes: 1,
+                })
+                .collect();
+            cache.insert(format!("key-{index}"), result);
+        }
+
+        let entry_weight = (rows_per_entry + 1) * GRAPH_ROW_WEIGHT_BYTES;
+        assert!(cache.memory_len() * entry_weight <= MAX_MEMORY_WEIGHT_BYTES);
+        assert!(cache.memory_len() < 6);
+        assert!(
+            cache.get("key-5").is_some(),
+            "the most recent entry survives"
+        );
     }
 
     #[test]
