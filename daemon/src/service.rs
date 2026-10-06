@@ -26,7 +26,7 @@ use crate::{
         is_supported_protocol_version,
     },
     pipeline::analyze::{
-        AnalysisContext, analyze_import, analyze_resolved_import_with_dependencies,
+        AnalysisContext, analyze_resolved_import_with_dependencies, analyze_unresolved_import,
     },
     pipeline::file_size::{SizedImport, annotate_shared_bytes, compute_file_size},
     pipeline::resolver::{
@@ -64,9 +64,9 @@ enum CacheProbe {
     /// Boxed: this rides in the `Err` arm of the classify closure for every import in
     /// a batch, and `ResolvedPackage` dwarfs the discriminant.
     Miss(Box<PendingBuild>),
-    /// The specifier did not resolve to a package; the static path handles it, and it
-    /// may still build, so it is not a hit.
-    Unresolved,
+    /// The package entry did not resolve. Carries the resolver's message, so the answer is
+    /// built from this resolution and never from a second one that could start a build.
+    Unresolved(String),
 }
 
 struct PendingBuild {
@@ -1299,7 +1299,7 @@ impl ImportLensService {
         // package.json read) in parallel; into_par_iter preserves order, so the
         // resulting states and import_requests still line up with streaming
         // indexes exactly as the sequential loop did.
-        type PreparedDependency = (ImportRequest, Option<ResolvedPackage>);
+        type PreparedDependency = (ImportRequest, Result<ResolvedPackage, String>);
         let resolution_started_at = Instant::now();
         let resolved: Vec<(
             PackageJsonDependencyAnalysisItem,
@@ -1312,8 +1312,8 @@ impl ImportLensService {
                 // instead of resolve_installed_package_version + a second
                 // resolve_package_entry per dependency. Entry resolution can
                 // fail for an installed-but-unresolvable package (e.g. types
-                // -only); fall back to the lightweight version read so the
-                // analysis pass still applies its declaration-only handling.
+                // -only); fall back to the lightweight version read and carry
+                // the resolver's message, which settles it without a build.
                 let probe = ImportRequest {
                     specifier: entry.name.clone(),
                     package_name: entry.name.clone(),
@@ -1331,14 +1331,14 @@ impl ImportLensService {
                                 .and_then(Value::as_str)
                                 .unwrap_or("unknown")
                                 .to_owned();
-                            (Ok(version), Some(resolved))
+                            (Ok(version), Ok(resolved))
                         }
-                        Err(_) => (
+                        Err(message) => (
                             resolve_installed_package_version(
                                 &context.active_document_path,
                                 &entry.name,
                             ),
-                            None,
+                            Err(message),
                         ),
                     };
 
@@ -1419,19 +1419,16 @@ impl ImportLensService {
             );
         }
 
-        enum PendingPackageJsonAnalysis {
-            Resolved {
-                import_request: ImportRequest,
-                resolved: ResolvedPackage,
-                cache_key: String,
-            },
-            Unresolved {
-                import_request: ImportRequest,
-            },
+        struct PendingPackageJsonAnalysis {
+            import_request: ImportRequest,
+            resolved: ResolvedPackage,
+            cache_key: String,
         }
 
+        // Settled: a fresh cache hit, or a package that does not resolve (answered without a
+        // build). Only a real miss is Pending and queues for an engine permit.
         enum PackageJsonCacheClassification {
-            Cached {
+            Settled {
                 index: usize,
                 result: ImportResult,
             },
@@ -1448,13 +1445,18 @@ impl ImportLensService {
             .filter_map(|(index, prepared)| {
                 let (import_request, resolved) = prepared.as_ref()?;
 
-                let Some(resolved) = resolved else {
-                    return Some(PackageJsonCacheClassification::Pending {
-                        index,
-                        analysis: PendingPackageJsonAnalysis::Unresolved {
-                            import_request: import_request.clone(),
-                        },
-                    });
+                let resolved = match resolved {
+                    Ok(resolved) => resolved,
+                    Err(message) => {
+                        return Some(PackageJsonCacheClassification::Settled {
+                            index,
+                            result: analyze_unresolved_import(
+                                &context,
+                                import_request,
+                                message.clone(),
+                            ),
+                        });
+                    }
                 };
 
                 let (cache_key, cached_result) = fresh_cached_result_for_resolved_import(
@@ -1464,12 +1466,12 @@ impl ImportLensService {
                     ReadIntent::Interactive,
                 );
                 if let Some(result) = cached_result {
-                    return Some(PackageJsonCacheClassification::Cached { index, result });
+                    return Some(PackageJsonCacheClassification::Settled { index, result });
                 }
 
                 Some(PackageJsonCacheClassification::Pending {
                     index,
-                    analysis: PendingPackageJsonAnalysis::Resolved {
+                    analysis: PendingPackageJsonAnalysis {
                         import_request: import_request.clone(),
                         resolved: resolved.clone(),
                         cache_key,
@@ -1481,7 +1483,7 @@ impl ImportLensService {
         let mut pending_analysis = Vec::new();
         for classification in classifications {
             match classification {
-                PackageJsonCacheClassification::Cached { index, result } => {
+                PackageJsonCacheClassification::Settled { index, result } => {
                     cached_indexed_results.push((index, result));
                 }
                 PackageJsonCacheClassification::Pending { index, analysis } => {
@@ -1526,22 +1528,14 @@ impl ImportLensService {
 
         let analysis_started_at = Instant::now();
         let analyzed_results = drain_ordered_owned(pending_analysis, |_, (index, pending)| {
-            let result = match pending {
-                PendingPackageJsonAnalysis::Resolved {
-                    import_request,
-                    resolved,
-                    cache_key,
-                } => self.analyze_and_cache(
-                    package_cache.as_ref(),
-                    &context,
-                    &import_request,
-                    cache_key,
-                    resolved,
-                    || true,
-                ),
-                PendingPackageJsonAnalysis::Unresolved { import_request } => self
-                    .analyze_with_cache(&context, &import_request, false, ReadIntent::Interactive),
-            };
+            let result = self.analyze_and_cache(
+                package_cache.as_ref(),
+                &context,
+                &pending.import_request,
+                pending.cache_key,
+                pending.resolved,
+                || true,
+            );
 
             if let Some(emit_partial) = emit_partial.as_ref() {
                 let mut state = states[index].clone();
@@ -2221,8 +2215,8 @@ impl ImportLensService {
     ///
     /// - a cache hit → `Ready` with its result;
     /// - an import that does not resolve to a package at all → settled here, because that path
-    ///   never reaches the engine: `analyze_import` falls through to the manifest approximation,
-    ///   the declaration-only result, or a typed error, all of which are filesystem work;
+    ///   never reaches the engine: `analyze_unresolved_import` answers with the declaration-only
+    ///   result, the native-binary result, or a typed error, all of which are filesystem work;
     /// - a real miss → `Loading`, with the resolved package and cache key carried out in
     ///   [`StreamedDocumentAnalysis::pending`] so the caller can build it off the response path.
     ///
@@ -2267,8 +2261,8 @@ impl ImportLensService {
                         },
                         None,
                     ),
-                    CacheProbe::Unresolved => {
-                        let result = analyze_import(context, &request);
+                    CacheProbe::Unresolved(message) => {
+                        let result = analyze_unresolved_import(context, &request, message);
                         (
                             ImportAnalysisItem {
                                 detected,
@@ -2392,10 +2386,18 @@ impl ImportLensService {
         serve_stale: bool,
         intent: ReadIntent,
     ) -> Vec<ImportAnalysisItem> {
-        // Same split as the batch handlers: an import the cache can answer — or one
-        // that does not resolve at all — is settled at pool width; only a real miss
-        // queues for an engine permit. This path serves both interactive document
-        // analysis and every file of a workspace report.
+        // An import the cache can answer, or one that does not resolve at all, is settled
+        // at pool width; only a real miss queues for an engine permit. This path serves both
+        // interactive document analysis and every file of a workspace report.
+        let ready = |detected: &DetectedImport, request: ImportRequest, result: ImportResult| {
+            ImportAnalysisItem {
+                result: Some(result),
+                detected: detected.clone(),
+                status: ImportAnalysisStatus::Ready,
+                message: None,
+                request: Some(request),
+            }
+        };
         let mut items = drain_classified(
             &detected,
             |_, detected| {
@@ -2414,22 +2416,17 @@ impl ImportLensService {
                     };
 
                 match self.probe_cache(context, &request, serve_stale, intent) {
-                    CacheProbe::Hit(result) => Ok(ImportAnalysisItem {
-                        result: Some(*result),
-                        detected: detected.clone(),
-                        status: ImportAnalysisStatus::Ready,
-                        message: None,
-                        request: Some(request),
-                    }),
-                    pending => Err((request, pending)),
+                    CacheProbe::Hit(result) => Ok(ready(detected, request, *result)),
+                    CacheProbe::Unresolved(message) => {
+                        let result = analyze_unresolved_import(context, &request, message);
+                        Ok(ready(detected, request, result))
+                    }
+                    CacheProbe::Miss(pending) => Err((request, pending)),
                 }
             },
-            |_, detected, (request, pending)| ImportAnalysisItem {
-                result: Some(self.complete_probe(context, &request, pending)),
-                detected: detected.clone(),
-                status: ImportAnalysisStatus::Ready,
-                message: None,
-                request: Some(request),
+            |_, detected, (request, pending)| {
+                let result = self.build_miss(context, &request, *pending);
+                ready(detected, request, result)
             },
         );
 
@@ -2464,25 +2461,14 @@ impl ImportLensService {
         computed
     }
 
-    fn analyze_with_cache(
-        &self,
-        context: &AnalysisContext,
-        request: &ImportRequest,
-        serve_stale: bool,
-        intent: ReadIntent,
-    ) -> ImportResult {
-        let probe = self.probe_cache(context, request, serve_stale, intent);
-        self.complete_probe(context, request, probe)
-    }
-
-    /// The lookup half of `analyze_with_cache`, with the build half left undone.
+    /// The lookup half of an analysis; `build_miss` is the build half.
     ///
     /// Splitting the two is what lets a batch classify every import pool-wide and
     /// then feed only the misses to the two-permit engine drain. §9 bounds *builds*
     /// at two; it says nothing about cache hits, and serving those two-at-a-time
     /// throttled the overwhelmingly common case to the width of the rarest one.
     ///
-    /// A miss carries its resolved package and cache key forward so `complete_probe`
+    /// A miss carries its resolved package and cache key forward so `build_miss`
     /// does not resolve the manifest a second time.
     fn probe_cache(
         &self,
@@ -2491,8 +2477,9 @@ impl ImportLensService {
         serve_stale: bool,
         intent: ReadIntent,
     ) -> CacheProbe {
-        let Ok(resolved) = resolve_package_entry(&context.active_document_path, request) else {
-            return CacheProbe::Unresolved;
+        let resolved = match resolve_package_entry(&context.active_document_path, request) {
+            Ok(resolved) => resolved,
+            Err(message) => return CacheProbe::Unresolved(message),
         };
         let key = cache_key_for_resolved_import(request, &resolved);
         let cache = self.cache_registry.cache_for_root(&context.workspace_root);
@@ -2539,27 +2526,21 @@ impl ImportLensService {
     }
 
     /// The build half. Only this may occupy an engine permit.
-    fn complete_probe(
+    fn build_miss(
         &self,
         context: &AnalysisContext,
         request: &ImportRequest,
-        probe: CacheProbe,
+        pending: PendingBuild,
     ) -> ImportResult {
-        match probe {
-            CacheProbe::Hit(result) => *result,
-            CacheProbe::Unresolved => analyze_import(context, request),
-            CacheProbe::Miss(pending) => {
-                let cache = self.cache_registry.cache_for_root(&context.workspace_root);
-                self.analyze_and_cache(
-                    cache.as_ref(),
-                    context,
-                    request,
-                    pending.key,
-                    pending.resolved,
-                    || true,
-                )
-            }
-        }
+        let cache = self.cache_registry.cache_for_root(&context.workspace_root);
+        self.analyze_and_cache(
+            cache.as_ref(),
+            context,
+            request,
+            pending.key,
+            pending.resolved,
+            || true,
+        )
     }
 
     fn analyze_and_cache(

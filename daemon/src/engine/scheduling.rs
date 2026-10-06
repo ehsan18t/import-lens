@@ -79,11 +79,10 @@ where
 
 /// Classify every item at pool width, then drain only the ones that need the engine.
 ///
-/// The engine permits (§9) bound *builds* to two. They say nothing about cache hits,
-/// yet running the whole of `analyze_with_cache` inside `drain_ordered` throttled hit
-/// and miss alike to two at a time — so a batch of ninety cached imports, none of
-/// which touches the engine, was served two-wide. `classify` runs on the Rayon pool
-/// (`Ok` = answered, `Err` = pending work); only the `Err`s reach the bounded drain.
+/// The engine permits (§9) bound *builds* to two. They say nothing about cache hits or
+/// imports that never resolve, and running those inside the bounded drain would serve
+/// them at drain width. `classify` runs on the Rayon pool (`Ok` = answered, `Err` =
+/// pending work); only the `Err`s reach the bounded drain.
 ///
 /// The miss drain runs slightly wider than the permit count on purpose: a worker
 /// that finished its build still has to minify, compress, fingerprint and insert,

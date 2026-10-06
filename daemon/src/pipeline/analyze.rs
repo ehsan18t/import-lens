@@ -245,29 +245,9 @@ fn analyze_import_inner(
     // package directory's bytes ON DISK — unminified, uncompressed, tests, source maps and all —
     // and that one number was assigned to all five size fields, so the "brotli" size of such an
     // import was an uncompressed directory. It is Unmeasured now (ADR-0006).
-    let resolved = match resolve_import_package(context, request) {
+    let resolved = match resolve_package_entry(&context.active_document_path, request) {
         Ok(resolved) => resolved,
-        Err(error) if error.stage == crate::pipeline::stage::ENTRY_RESOLUTION => {
-            // A declarations-only package is MEASURED, not Unmeasured: it really does ship zero
-            // runtime bytes. Its diagnostic stage is what keeps `Some(0)` unambiguous.
-            if let Some(result) =
-                declaration_only_package_result(&context.active_document_path, request)
-            {
-                return Ok(result);
-            }
-
-            // A native-binary-only package (a `bin` plus a platform-specific native binary as
-            // `optionalDependencies`, no importable JS entry) is likewise MEASURED at zero and
-            // labelled, rather than shown as a bare "unavailable" (B3).
-            if let Some(result) =
-                native_binary_only_package_result(&context.active_document_path, request)
-            {
-                return Ok(result);
-            }
-
-            return Err(error);
-        }
-        Err(error) => return Err(error),
+        Err(message) => return unresolved_import_result(context, request, message),
     };
     // The non-resolved path has no caller that needs the analyzed graph, so it
     // discards it and keeps returning a bare `ImportResult`.
@@ -275,23 +255,56 @@ fn analyze_import_inner(
     Ok(result)
 }
 
-fn resolve_import_package(
+/// The answer for an import whose package entry did not resolve, from the resolver's own
+/// message. It never resolves again, so it can never start an engine build: callers settle it
+/// at pool width instead of queueing it for an engine permit.
+pub fn analyze_unresolved_import(
     context: &AnalysisContext,
     request: &ImportRequest,
-) -> Result<ResolvedPackage, AnalysisError> {
-    resolve_package_entry(&context.active_document_path, request).map_err(|message| {
-        let stage = if message.contains("unsafe package name") {
-            crate::pipeline::stage::PACKAGE_VALIDATION
-        } else if message.contains("package manifest not found") {
-            crate::pipeline::stage::PACKAGE_RESOLUTION
-        } else if is_manifest_fallback_error(&message) {
-            crate::pipeline::stage::PACKAGE_MANIFEST
-        } else {
-            crate::pipeline::stage::ENTRY_RESOLUTION
-        };
-        let details = resolver_details(&message);
-        error_with_context(stage, message, context, request, details)
-    })
+    resolver_message: String,
+) -> ImportResult {
+    unresolved_import_result(context, request, resolver_message)
+        .unwrap_or_else(|error| error_result(request, error))
+}
+
+fn unresolved_import_result(
+    context: &AnalysisContext,
+    request: &ImportRequest,
+    message: String,
+) -> Result<ImportResult, AnalysisError> {
+    let stage = if message.contains("unsafe package name") {
+        crate::pipeline::stage::PACKAGE_VALIDATION
+    } else if message.contains("package manifest not found") {
+        crate::pipeline::stage::PACKAGE_RESOLUTION
+    } else if is_manifest_fallback_error(&message) {
+        crate::pipeline::stage::PACKAGE_MANIFEST
+    } else {
+        crate::pipeline::stage::ENTRY_RESOLUTION
+    };
+
+    if stage == crate::pipeline::stage::ENTRY_RESOLUTION {
+        // A declarations-only package is MEASURED, not Unmeasured: it really does ship zero
+        // runtime bytes. Its diagnostic stage is what keeps `Some(0)` unambiguous.
+        if let Some(result) =
+            declaration_only_package_result(&context.active_document_path, request)
+        {
+            return Ok(result);
+        }
+
+        // A native-binary-only package (a `bin` plus a platform-specific native binary as
+        // `optionalDependencies`, no importable JS entry) is likewise MEASURED at zero and
+        // labelled, rather than shown as a bare "unavailable" (B3).
+        if let Some(result) =
+            native_binary_only_package_result(&context.active_document_path, request)
+        {
+            return Ok(result);
+        }
+    }
+
+    let details = resolver_details(&message);
+    Err(error_with_context(
+        stage, message, context, request, details,
+    ))
 }
 
 fn is_manifest_fallback_error(message: &str) -> bool {

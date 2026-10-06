@@ -3891,3 +3891,79 @@ fn an_interactive_cache_hit_promotes_recency_and_a_workspace_report_does_not() {
     let _ = fs::remove_dir_all(&workspace);
     let _ = fs::remove_dir_all(&storage);
 }
+
+/// An import whose entry does not resolve is settled in the classify pass from the resolver's own
+/// message, never queued for the engine. Both batch surfaces must still give it the per-import
+/// answer: a declarations-only package is measured at zero, a broken entry is Unmeasured.
+#[test]
+fn unresolvable_packages_are_settled_with_the_per_import_answer_on_batch_surfaces() {
+    let workspace = temp_workspace();
+    let types_root = workspace.join("node_modules").join("types-demo");
+    fs::create_dir_all(&types_root).expect("package root should be created");
+    fs::write(
+        types_root.join("package.json"),
+        r#"{"name":"types-demo","version":"1.0.0","types":"index.d.ts"}"#,
+    )
+    .expect("package manifest should be written");
+    fs::write(
+        types_root.join("index.d.ts"),
+        "export interface Demo { a: string }",
+    )
+    .expect("declarations should be written");
+    let broken_root = workspace.join("node_modules").join("broken-entry");
+    fs::create_dir_all(&broken_root).expect("package root should be created");
+    fs::write(
+        broken_root.join("package.json"),
+        r#"{"name":"broken-entry","version":"1.0.0","main":"missing.js"}"#,
+    )
+    .expect("package manifest should be written");
+    let manifest = r#"{"dependencies":{"types-demo":"1.0.0","broken-entry":"1.0.0"}}"#;
+    fs::write(workspace.join("package.json"), manifest).expect("manifest should be written");
+    let service = ImportLensService::new(None, false);
+
+    let specifiers = service.handle_analyze_specifiers(AnalyzeSpecifiersRequest {
+        message_type: "analyze_specifiers".to_owned(),
+        version: PROTOCOL_VERSION,
+        request_id: 1,
+        workspace_root: workspace.to_string_lossy().to_string(),
+        active_document_path: active_document_path(&workspace),
+        specifiers: vec!["types-demo".to_owned(), "broken-entry".to_owned()],
+    });
+    let package_json =
+        service.handle_analyze_package_json(package_json_request(&workspace, 2, manifest, false));
+
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+    let by_name = |name: &str| {
+        let from_specifiers = specifiers
+            .imports
+            .iter()
+            .find(|item| item.detected.specifier == name)
+            .and_then(|item| item.result.clone())
+            .unwrap_or_else(|| panic!("{name} should be settled: {specifiers:?}"));
+        let from_package_json = package_json
+            .states
+            .iter()
+            .find(|state| state.name == name)
+            .and_then(|state| state.result.clone())
+            .unwrap_or_else(|| panic!("{name} should be settled: {package_json:?}"));
+        [from_specifiers, from_package_json]
+    };
+    for result in by_name("types-demo") {
+        assert_eq!(result.error, None, "{result:?}");
+        assert_eq!(
+            result.sizes(),
+            Some(import_lens_daemon::ipc::protocol::MeasuredSizes::ZERO)
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == "types_only"),
+            "{result:?}"
+        );
+    }
+    for result in by_name("broken-entry") {
+        assert!(result.error.is_some(), "{result:?}");
+        assert_eq!(result.sizes(), None, "{result:?}");
+    }
+}
