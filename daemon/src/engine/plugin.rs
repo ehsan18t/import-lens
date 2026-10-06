@@ -78,6 +78,9 @@ pub(super) struct BuildState {
     /// Bare specifiers this build turned into an import boundary because the resolver refused them.
     /// Disclosed, never silent: the graph behind such an edge is not in the number.
     unresolved_externals: Mutex<BTreeSet<String>>,
+    /// Stable ids of the build's entry modules, spelled exactly as Rolldown's diagnostics name an
+    /// importer: the virtual entry for a size build, the real entry for export enumeration.
+    entry_stable_ids: Mutex<Vec<String>>,
 }
 
 impl BuildState {
@@ -178,6 +181,13 @@ impl BuildState {
             .iter()
             .cloned()
             .collect()
+    }
+
+    pub(super) fn entry_stable_ids(&self) -> Vec<String> {
+        self.entry_stable_ids
+            .lock()
+            .expect("entry stable-id list should not be poisoned")
+            .clone()
     }
 
     /// Only the UNREADABLE ones. This drives the `asset_io` diagnostic and the `asset_io` failure
@@ -1058,8 +1068,15 @@ impl Plugin for ImportLensPlugin {
         &self,
         _ctx: &PluginContext,
         module_info: Arc<ModuleInfo>,
-        _normal_module: &NormalModule,
+        normal_module: &NormalModule,
     ) -> HookNoopReturn {
+        if module_info.is_entry {
+            self.state
+                .entry_stable_ids
+                .lock()
+                .expect("entry stable-id list should not be poisoned")
+                .push(normal_module.stable_id.to_string());
+        }
         if module_info.id.as_str() == VIRTUAL_ENTRY_ID {
             return Ok(());
         }
