@@ -1,5 +1,9 @@
 use import_lens_daemon::{
-    cache::{disk::DiskCache, memory::CachedImport, memory::ImportCache},
+    cache::{
+        disk::{DiskCache, ShardRollup},
+        memory::CachedImport,
+        memory::ImportCache,
+    },
     ipc::protocol::{ConfidenceLevel, ImportDiagnostic, ImportResult},
 };
 use redb::{Database, ReadableDatabase, TableDefinition};
@@ -7,7 +11,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicU64},
-    time::Duration,
 };
 
 const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("size_cache");
@@ -290,7 +293,7 @@ fn removing_an_entry_leaves_no_orphan_recency() {
 
     // Recency lives inside the entry, so invalidating the entry removes its recency
     // with no separate recents row to dangle.
-    cache.invalidate_package("react");
+    cache.invalidate_packages(&std::collections::HashSet::from(["react".to_owned()]));
 
     assert_eq!(
         cache.recent_keys(10),
@@ -551,8 +554,6 @@ fn a_transient_result_never_reaches_the_disk_table() {
 
 #[test]
 fn shard_rollup_sums_bytes_and_tracks_oldest_seq() {
-    use import_lens_daemon::cache::disk::ShardRollup;
-
     let storage = temp_storage();
     fs::create_dir_all(&storage).expect("storage dir");
 
@@ -600,197 +601,6 @@ fn shard_rollup_sums_bytes_and_tracks_oldest_seq() {
     assert_eq!(empty.entry_count, 0);
     assert_eq!(empty.total_bytes, 0);
     assert_eq!(empty.oldest_seq, u64::MAX);
-
-    drop(disk);
-    fs::remove_dir_all(storage).expect("cleanup");
-}
-
-#[test]
-fn compaction_shrinks_the_file_after_heavy_eviction() {
-    use import_lens_daemon::cache::disk::COMPACT_THRESHOLD;
-
-    let storage = temp_storage();
-    fs::create_dir_all(&storage).expect("storage dir");
-
-    // Insert a batch, flush to disk, then evict almost all of it so most of the
-    // file becomes reclaimable free space.
-    let disk = DiskCache::new(Some(storage.clone()), true);
-    let mut all_keys = Vec::new();
-    for index in 0..1000 {
-        let key = format!("pkg{index}@1.0.0::default");
-        let mut entry = cached(&key);
-        entry.last_seq = Arc::new(AtomicU64::new(index as u64 + 1));
-        disk.insert(&key, &entry).expect("insert should queue");
-        all_keys.push(key);
-    }
-    disk.flush_pending_inserts();
-
-    let size_before = fs::metadata(db_path(&storage))
-        .expect("db file should exist")
-        .len();
-
-    // Evict 950 of 1000 entries.
-    let freed = disk.remove_keys(&all_keys[..950]);
-    assert!(freed > 0, "eviction should free bytes");
-
-    // redb reuses freed pages rather than shrinking, so the file is still large.
-    let size_after_evict = fs::metadata(db_path(&storage))
-        .expect("db file should exist")
-        .len();
-
-    // Compaction reclaims the free pages and shrinks the file — but only once the
-    // shard is idle (the fill/evict above just touched it), so mark it idle first.
-    disk.mark_idle_for_test();
-    let compacted = disk.compact_if_fragmented(COMPACT_THRESHOLD);
-    assert!(
-        compacted,
-        "a mostly-empty file must exceed the fragmentation threshold and compact"
-    );
-
-    let size_after_compact = fs::metadata(db_path(&storage))
-        .expect("db file should exist")
-        .len();
-    assert!(
-        size_after_compact < size_after_evict,
-        "compaction must shrink the file: {size_after_compact} >= {size_after_evict}"
-    );
-    // Sanity: it is smaller than the fully-populated file too.
-    assert!(size_after_compact < size_before);
-
-    // Compaction must shrink the file WITHOUT losing surviving data: every
-    // non-evicted entry must still decode and serve.
-    for key in &all_keys[950..] {
-        assert!(
-            disk.get(key).is_some(),
-            "entry {key} must survive compaction intact"
-        );
-    }
-
-    drop(disk);
-    fs::remove_dir_all(storage).expect("cleanup");
-}
-
-#[test]
-fn compaction_is_gated_on_shard_idleness() {
-    use import_lens_daemon::cache::disk::COMPACT_THRESHOLD;
-
-    let storage = temp_storage();
-    fs::create_dir_all(&storage).expect("storage dir");
-
-    // Fragment the shard: fill, flush, then evict almost all of it so most of
-    // the file is reclaimable free space (crosses COMPACT_THRESHOLD).
-    let disk = DiskCache::new(Some(storage.clone()), true);
-    let mut all_keys = Vec::new();
-    for index in 0..1000 {
-        let key = format!("pkg{index}@1.0.0::default");
-        let mut entry = cached(&key);
-        entry.last_seq = Arc::new(AtomicU64::new(index as u64 + 1));
-        disk.insert(&key, &entry).expect("insert should queue");
-        all_keys.push(key);
-    }
-    disk.flush_pending_inserts();
-    let freed = disk.remove_keys(&all_keys[..950]);
-    assert!(freed > 0, "eviction should free bytes");
-
-    // A surviving get marks the shard as just-accessed — the user is actively
-    // analyzing it. A fragmented BUT actively-used shard must NOT be compacted:
-    // Database::compact holds the exclusive lock across the whole rewrite, which
-    // would block the user's concurrent gets.
-    assert!(disk.get(&all_keys[950]).is_some());
-    assert!(
-        !disk.compact_if_fragmented(COMPACT_THRESHOLD),
-        "a fragmented but recently-accessed shard must not be compacted"
-    );
-    let size_while_busy = fs::metadata(db_path(&storage))
-        .expect("db file should exist")
-        .len();
-
-    // Once the shard goes idle (no get/insert within COMPACT_IDLE), the same
-    // fragmented shard IS compacted and the file shrinks.
-    disk.mark_idle_for_test();
-    assert!(
-        disk.compact_if_fragmented(COMPACT_THRESHOLD),
-        "an idle fragmented shard must be compacted"
-    );
-    let size_after_compact = fs::metadata(db_path(&storage))
-        .expect("db file should exist")
-        .len();
-    assert!(
-        size_after_compact < size_while_busy,
-        "compaction must shrink the idle shard: {size_after_compact} >= {size_while_busy}"
-    );
-
-    // Compaction must not drop surviving data.
-    for key in &all_keys[950..] {
-        assert!(
-            disk.get(key).is_some(),
-            "entry {key} must survive compaction intact"
-        );
-    }
-
-    drop(disk);
-    fs::remove_dir_all(storage).expect("cleanup");
-}
-
-#[test]
-fn stale_disk_get_does_not_deadlock_with_concurrent_compaction() {
-    use import_lens_daemon::cache::key::fingerprints_for_paths;
-    use std::sync::mpsc;
-
-    let storage = temp_storage();
-    fs::create_dir_all(&storage).expect("storage dir");
-    let dep = storage.join("dep.js");
-    let key = "react@18.3.1::default";
-
-    // A getter thread repeatedly lands on the Stale eviction path inside
-    // `get_entry` (db read guard → decode → remove) while a compactor thread
-    // hammers the exclusive write lock. Before the guard-scoping fix, the
-    // re-entrant `remove` under a held read guard deadlocked against the queued
-    // compaction writer; the channel timeout below is the failure signal.
-    let disk = Arc::new(DiskCache::new(Some(storage.clone()), true));
-
-    let (done_tx, done_rx) = mpsc::channel();
-    let getter = {
-        let disk = Arc::clone(&disk);
-        let dep = dep.clone();
-        std::thread::spawn(move || {
-            for round in 0..50 {
-                // Fresh content each round, fingerprinted, then changed → Stale.
-                fs::write(&dep, format!("export const v = {round};")).expect("dep write");
-                let mut entry = cached("react");
-                entry.dependency_fingerprints = fingerprints_for_paths([dep.clone()]);
-                disk.insert(key, &entry).expect("insert should queue");
-                disk.flush_pending_inserts();
-                fs::write(
-                    &dep,
-                    format!("export const v = 'changed {round} with longer bytes';"),
-                )
-                .expect("dep rewrite");
-                // Stale → the re-entrant remove path.
-                assert!(disk.get_with_freshness(key).is_none());
-            }
-            let _ = done_tx.send(());
-        })
-    };
-    let compactor = {
-        let disk = Arc::clone(&disk);
-        std::thread::spawn(move || {
-            for _ in 0..200 {
-                // Force the idle gate open each iteration so this still drives the
-                // exclusive compaction writer against the concurrent stale-get
-                // remove path (threshold 0.0 → attempts the exclusive write lock).
-                disk.mark_idle_for_test();
-                let _ = disk.compact_if_fragmented(0.0);
-            }
-        })
-    };
-
-    assert!(
-        done_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
-        "stale disk get deadlocked against a concurrent compaction"
-    );
-    getter.join().expect("getter thread");
-    compactor.join().expect("compactor thread");
 
     drop(disk);
     fs::remove_dir_all(storage).expect("cleanup");
@@ -998,8 +808,28 @@ fn flush_persists_promoted_recency_for_the_next_session() {
 //
 // These exercise the O(1) summary / O(log N) index accounting through the public
 // DiskCache API. The drift property test is the anti-drift guard: after a random
-// op sequence, the incrementally-maintained rollup must be bit-identical to a
-// fresh `rebuild_summary_from_scan` recomputation.
+// op sequence, the incrementally-maintained rollup must equal one recomputed here
+// from the raw CACHE_TABLE rows.
+
+/// The rollup a full scan of the closed shard's CACHE_TABLE implies, computed
+/// independently of the daemon's own accounting: every value starts with its
+/// 8-byte little-endian `last_seq`.
+fn full_scan_rollup(storage_path: &Path) -> ShardRollup {
+    use redb::ReadableTable;
+    let db = Database::open(db_path(storage_path)).expect("reopen the closed shard");
+    let read = db.begin_read().expect("read");
+    let table = read.open_table(CACHE_TABLE).expect("cache table");
+    let mut rollup = ShardRollup::empty();
+    for row in table.iter().expect("iterate") {
+        let (_, value) = row.expect("row");
+        let bytes = value.value();
+        let seq = u64::from_le_bytes(bytes[..8].try_into().expect("seq prefix"));
+        rollup.total_bytes += bytes.len() as u64;
+        rollup.entry_count += 1;
+        rollup.oldest_seq = rollup.oldest_seq.min(seq);
+    }
+    rollup
+}
 
 #[test]
 fn summary_tracks_bytes_count_seq_across_insert_replace_remove() {
@@ -1032,12 +862,12 @@ fn summary_tracks_bytes_count_seq_across_insert_replace_remove() {
     // Remove the oldest (a@10).
     disk.remove_keys(&["a@1::default".to_owned()]);
 
-    // The incrementally-maintained rollup must equal a fresh full-scan rebuild.
+    // The incrementally-maintained rollup must equal a full scan of the rows.
     let incremental = disk.shard_rollup();
-    disk.rebuild_summary_from_scan();
-    let rebuilt = disk.shard_rollup();
+    drop(disk);
     assert_eq!(
-        incremental, rebuilt,
+        incremental,
+        full_scan_rollup(&storage),
         "incrementally-maintained summary must match a full scan"
     );
 
@@ -1049,7 +879,6 @@ fn summary_tracks_bytes_count_seq_across_insert_replace_remove() {
     );
     assert!(incremental.total_bytes > 0);
 
-    drop(disk);
     fs::remove_dir_all(storage).expect("cleanup");
 }
 
@@ -1166,23 +995,25 @@ fn drift_property_random_ops_keep_summary_equal_to_full_scan() {
     // The anti-drift guard: the incrementally-maintained summary + index must be
     // identical to a fresh recomputation from a full CACHE_TABLE scan.
     let incremental = disk.shard_rollup();
-    disk.rebuild_summary_from_scan();
-    let rebuilt = disk.shard_rollup();
-    assert_eq!(
-        incremental, rebuilt,
-        "incremental accounting drifted from a full scan: {incremental:?} != {rebuilt:?}"
-    );
 
-    // The index-backed victim list stays globally ascending by seq.
-    let victims = disk.lowest_seq_keys(64, 0);
+    // The index-backed victim list stays globally ascending by seq, and covers
+    // exactly the live rows.
+    let victims = disk.lowest_seq_keys(usize::MAX, 0);
     for pair in victims.windows(2) {
         assert!(
             pair[0].1 <= pair[1].1,
             "lowest_seq_keys must be ascending by seq"
         );
     }
+    assert_eq!(victims.len() as u64, incremental.entry_count);
 
     drop(disk);
+    let scanned = full_scan_rollup(&storage);
+    assert_eq!(
+        incremental, scanned,
+        "incremental accounting drifted from a full scan: {incremental:?} != {scanned:?}"
+    );
+
     fs::remove_dir_all(storage).expect("cleanup");
 }
 

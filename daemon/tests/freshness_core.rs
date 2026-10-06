@@ -1,5 +1,5 @@
 use import_lens_daemon::cache::disk::DiskCache;
-use import_lens_daemon::cache::key::{FileFingerprint, fingerprints_for_paths};
+use import_lens_daemon::cache::key::{FileFingerprint, file_fingerprint_with_hash};
 use import_lens_daemon::cache::memory::{
     CachedImport, ImportCache, bump_cache_generation, cache_generation,
 };
@@ -72,7 +72,7 @@ fn insert_at_captured_generation_does_not_serve_stale_after_bump() {
     let dir = temp_dir("d4");
     let dep = dir.join("dep.js");
     fs::write(&dep, "export const x = 1;").expect("dep v1");
-    let fp_v1 = fingerprints_for_paths(vec![dep.clone()]);
+    let fp_v1 = vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")];
 
     let cache = ImportCache::new(None, false);
     let captured = cache_generation();
@@ -105,7 +105,7 @@ fn get_evicts_on_changed_or_missing_but_keeps_on_fresh() {
     let dir = temp_dir("tristate");
     let dep = dir.join("dep.js");
     fs::write(&dep, "export const x = 1;").expect("dep");
-    let fp = fingerprints_for_paths(vec![dep.clone()]);
+    let fp = vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")];
 
     let cache = ImportCache::new(None, false);
     cache.insert_with_fingerprints("v3:ts".to_owned(), sample_result("dep"), fp);
@@ -142,7 +142,7 @@ fn disk_hydrated_entry_evicts_when_dependency_content_changes() {
     let dep_dir = temp_dir("disk-tristate-stale-dep");
     let dep = dep_dir.join("dep.js");
     fs::write(&dep, "export const x = 1;").expect("dep");
-    let fp = fingerprints_for_paths(vec![dep.clone()]);
+    let fp = vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")];
     let key = "v3:disk-stale".to_owned();
 
     {
@@ -178,7 +178,7 @@ fn disk_hydrated_entry_evicts_when_dependency_is_deleted() {
     let dep_dir = temp_dir("disk-tristate-gone-dep");
     let dep = dep_dir.join("dep.js");
     fs::write(&dep, "export const x = 1;").expect("dep");
-    let fp = fingerprints_for_paths(vec![dep.clone()]);
+    let fp = vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")];
     let key = "v3:disk-gone".to_owned();
 
     {
@@ -206,7 +206,7 @@ fn fresh_insert_serves_on_fast_path_within_ttl() {
     let dir = temp_dir("ttl");
     let dep = dir.join("dep.js");
     fs::write(&dep, "export const x = 1;").expect("dep");
-    let fp = fingerprints_for_paths(vec![dep.clone()]);
+    let fp = vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")];
 
     let cache = ImportCache::new(None, false);
     cache.insert_with_fingerprints("v3:ttl".to_owned(), sample_result("dep"), fp);
@@ -268,7 +268,7 @@ fn first_party_entry_is_reverified_on_get_within_ttl() {
     cache.insert_with_fingerprints(
         key.clone(),
         sample_result("ui"),
-        fingerprints_for_paths(vec![dep.clone()]),
+        vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")],
     );
     fs::write(&dep, "export const v = 22222;").expect("dep v2");
 
@@ -293,7 +293,7 @@ fn get_with_result_freshness_serves_stale_without_evicting_and_dedupes() {
     cache.insert_with_fingerprints(
         "v4:swr".to_owned(),
         sample_result("dep"),
-        fingerprints_for_paths(vec![dep.clone()]),
+        vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")],
     );
 
     // Change the dep (different length) and force the slow path.
@@ -356,7 +356,7 @@ fn pending_unflushed_disk_insert_evicts_when_dependency_content_changes() {
     let dep_dir = temp_dir("disk-pending-stale-dep");
     let dep = dep_dir.join("dep.js");
     fs::write(&dep, "export const x = 1;").expect("dep");
-    let fp = fingerprints_for_paths(vec![dep.clone()]);
+    let fp = vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")];
     let key = "v3:disk-pending-stale";
 
     let disk = DiskCache::new(Some(storage_dir.clone()), true);
@@ -388,7 +388,7 @@ fn pending_unflushed_disk_insert_evicts_when_dependency_is_deleted() {
     let dep_dir = temp_dir("disk-pending-gone-dep");
     let dep = dep_dir.join("dep.js");
     fs::write(&dep, "export const x = 1;").expect("dep");
-    let fp = fingerprints_for_paths(vec![dep.clone()]);
+    let fp = vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")];
     let key = "v3:disk-pending-gone";
 
     let disk = DiskCache::new(Some(storage_dir.clone()), true);
@@ -424,7 +424,7 @@ fn swr_read_hydrates_fresh_from_disk_but_never_serves_disk_only_stale() {
         cache.insert_with_fingerprints(
             key.to_owned(),
             sample_result("dep"),
-            fingerprints_for_paths(vec![dep.clone()]),
+            vec![file_fingerprint_with_hash(&dep, None).expect("stat the dependency")],
         );
         cache.flush_to_disk().expect("flush should succeed");
     }

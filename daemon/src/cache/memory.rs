@@ -820,10 +820,6 @@ impl ImportCache {
         }
     }
 
-    pub fn invalidate_package(&self, package_name: &str) {
-        self.invalidate_packages(&HashSet::from([package_name.to_owned()]));
-    }
-
     /// Evicts every entry for any package in `package_names` from both the disk
     /// and memory layers in a single scan per layer (each key decoded once),
     /// rather than one full scan per package.

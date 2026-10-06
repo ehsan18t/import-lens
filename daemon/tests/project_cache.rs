@@ -1,7 +1,7 @@
 use import_lens_daemon::{
     cache::{
         disk::DiskCache,
-        key::fingerprints_for_paths,
+        key::file_fingerprint_with_hash,
         memory::CachedImport,
         project::{
             ProjectCacheRegistry, normalize_project_root, project_cache_shard_id,
@@ -335,7 +335,7 @@ fn project_cache_registry_invalidates_unloaded_shards_without_recent_preload() {
         cache.insert_with_fingerprints(
             "vue@3.4.0::default".to_owned(),
             result("vue"),
-            fingerprints_for_paths([stale_dependency.clone()]),
+            vec![file_fingerprint_with_hash(&stale_dependency, None).expect("stat the dependency")],
         );
         cache.insert("react@18.3.1::default".to_owned(), result("react"));
     }
@@ -651,7 +651,7 @@ fn byte_budget_evicts_oldest_entries_across_shards_respecting_the_floor() {
         "test fixture must exceed the budget ({total_before} <= {budget_bytes})"
     );
 
-    let outcome = registry.evict_to_budget();
+    let outcome = registry.run_maintenance(true).eviction;
     assert!(outcome.evicted_bytes > 0, "eviction must free bytes");
 
     let rollup_a = cache_a.shard_rollup();
@@ -733,7 +733,7 @@ fn byte_budget_pages_past_memory_hot_keys_instead_of_retiring_the_shard() {
         assert!(cache.get(key).is_some(), "hot fixture entry should hydrate");
     }
 
-    let outcome = registry.evict_to_budget();
+    let outcome = registry.run_maintenance(true).eviction;
 
     assert!(
         outcome.evicted_bytes > 0,

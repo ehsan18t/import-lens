@@ -30,8 +30,8 @@ const SUMMARY_TABLE: TableDefinition<&str, u64> = TableDefinition::new("summary"
 const SUMMARY_TOTAL_BYTES: &str = "total_bytes";
 const SUMMARY_ENTRY_COUNT: &str = "entry_count";
 // Recency high-water: the largest `last_seq` ever inserted. Advances on insert,
-// is left untouched by removals (a high-water mark), and is recomputed by a full
-// scan in `rebuild_summary_from_scan`. Used to keep the recency clock ahead of
+// is left untouched by removals (a high-water mark), and is recomputed by the
+// heal-on-open scan. Used to keep the recency clock ahead of
 // persisted seqs in O(1) (and by C5's startup seed).
 const SUMMARY_MAX_SEQ: &str = "max_seq";
 // Secondary index: ascending `(last_seq, key)` → the evictor's lowest-N is a
@@ -80,6 +80,10 @@ const SEQ_PREFIX_LEN: usize = 8;
 #[cfg(test)]
 #[path = "../../tests/unit/cache_disk_test_support.rs"]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+#[path = "../../tests/unit/cache_disk_compaction.rs"]
+mod cache_disk_compaction_tests;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEnvelope {
@@ -194,13 +198,10 @@ impl DiskCache {
         );
     }
 
-    /// Test-only seam: pushes the last-access clock to the epoch so the shard
-    /// reads as idle to `compact_if_fragmented`, letting a test exercise the
-    /// idle gate without sleeping `COMPACT_IDLE`. `#[doc(hidden)]` and not part
-    /// of the supported API — the idle window is wall-clock based, so there is
-    /// otherwise no deterministic way to make a just-written shard read as idle.
-    #[doc(hidden)]
-    pub fn mark_idle_for_test(&self) {
+    /// Pushes the last-access clock to the epoch so the shard reads as idle to
+    /// `compact_if_fragmented` without sleeping `COMPACT_IDLE`.
+    #[cfg(test)]
+    pub(crate) fn mark_idle_for_test(&self) {
         self.last_access
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -780,10 +781,6 @@ impl DiskCache {
         }
     }
 
-    pub fn invalidate_package(&self, package_name: &str) {
-        self.invalidate_packages(&HashSet::from([package_name.to_owned()]));
-    }
-
     /// Evicts every entry belonging to any package in `package_names` in a single
     /// table scan that decodes each key once, rather than one full scan (with a
     /// per-key decode) per package.
@@ -1014,36 +1011,6 @@ impl DiskCache {
         }
         if let Ok(mut pending) = self.pending_inserts.lock() {
             pending.clear();
-        }
-    }
-
-    /// Recomputes SUMMARY (`total_bytes`/`entry_count`/`max_seq`) and rebuilds
-    /// SEQ_INDEX from a full CACHE_TABLE scan, writing them authoritatively. The
-    /// drift oracle for tests and the heal fallback if incremental maintenance
-    /// ever misses a mutation site. No-op when disk caching is disabled.
-    pub fn rebuild_summary_from_scan(&self) {
-        // Flush first so the scan sees every queued insert, exactly as the read
-        // paths do before consulting the summary.
-        self.flush_pending_inserts();
-
-        let db_guard = self.db_read();
-        let db = match db_guard.as_ref().and_then(|guard| guard.as_ref()) {
-            Some(db) => db,
-            None => return,
-        };
-        let Ok(write_txn) = db.begin_write() else {
-            return;
-        };
-        match rebuild_summary_in_txn(&write_txn) {
-            Ok(()) => {
-                if let Err(error) = write_txn.commit() {
-                    cache_warn(format!("failed to commit cache summary rebuild: {error}"));
-                }
-            }
-            Err(error) => {
-                cache_warn(format!("failed to rebuild cache summary: {error}"));
-                let _ = write_txn.abort();
-            }
         }
     }
 
@@ -1515,9 +1482,8 @@ fn maintain_removals<'a>(
 }
 
 /// Recomputes SUMMARY and rebuilds SEQ_INDEX from a full CACHE_TABLE scan inside
-/// `write_txn` (caller commits). The authoritative source of truth: the drift
-/// oracle for tests and the heal fallback if incremental maintenance ever misses
-/// a site.
+/// `write_txn` (caller commits): the heal fallback if incremental maintenance
+/// ever misses a site.
 fn rebuild_summary_in_txn(write_txn: &WriteTransaction) -> Result<(), String> {
     let cache = write_txn
         .open_table(CACHE_TABLE)

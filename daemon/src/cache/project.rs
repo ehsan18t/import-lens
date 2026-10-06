@@ -1,5 +1,5 @@
 use crate::{
-    cache::budget::{BudgetCoordinator, EvictableShard, EvictionOutcome, MaintenanceOutcome},
+    cache::budget::{BudgetCoordinator, EvictableShard, MaintenanceOutcome},
     cache::disk::ShardRollup,
     cache::memory::ImportCache,
     ipc::protocol::{CacheOperationResult, CacheShardInfo},
@@ -206,22 +206,6 @@ impl ProjectCacheRegistry {
                 scanned_shards
             ),
         );
-    }
-
-    /// Enforces the global disk-byte budget by evicting the least-recently-used
-    /// entries across all shards (loaded and on-disk) down to the low-water mark.
-    /// Off the request hot path — driven by the periodic maintenance tick and on
-    /// demand. A no-op when the disk cache is disabled or the budget is 0.
-    pub fn evict_to_budget(&self) -> EvictionOutcome {
-        if !self.enable_disk_cache || self.coordinator.budget_bytes() == 0 {
-            return EvictionOutcome::default();
-        }
-        let targets = self.collect_shard_targets();
-        let refs = targets
-            .iter()
-            .map(|target| target as &dyn EvictableShard)
-            .collect::<Vec<_>>();
-        self.coordinator.evict_to_budget(&refs)
     }
 
     /// One full maintenance pass: byte-budget eviction, then normal per-shard
@@ -701,14 +685,6 @@ impl ProjectCacheRegistry {
 
     pub fn clear_all(&self) {
         let _ = self.remove_all();
-    }
-
-    pub fn memory_len(&self) -> usize {
-        if let Ok(loaded) = self.loaded.lock() {
-            return loaded.values().map(|shard| shard.cache.memory_len()).sum();
-        }
-
-        0
     }
 
     pub fn recent_keys(&self, project_root: &Path, limit: usize) -> Vec<String> {
