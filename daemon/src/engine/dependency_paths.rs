@@ -7,7 +7,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{OnceLock, RwLock},
+    sync::{
+        LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::{cache::key::path_is_definitely_gone, ipc::protocol::ImportRuntime};
@@ -15,70 +18,106 @@ use crate::{cache::key::path_is_definitely_gone, ipc::protocol::ImportRuntime};
 const MAX_DEPENDENCY_PATH_SETS: usize = 32;
 type DependencyKey = (PathBuf, ImportRuntime);
 
-static DEPENDENCY_PATHS: OnceLock<RwLock<HashMap<DependencyKey, Vec<PathBuf>>>> = OnceLock::new();
+static INDEX: LazyLock<DependencyPathIndex> =
+    LazyLock::new(|| DependencyPathIndex::new(MAX_DEPENDENCY_PATH_SETS));
 
-fn index() -> &'static RwLock<HashMap<DependencyKey, Vec<PathBuf>>> {
-    DEPENDENCY_PATHS.get_or_init(|| RwLock::new(HashMap::new()))
+struct PathSet {
+    paths: Vec<PathBuf>,
+    /// Bumped by reads under the shared lock, so a lookup never takes the write lock.
+    last_used: AtomicU64,
 }
 
-/// Poison-tolerant, like every other shared map in the daemon (`analysis_flight`, the
-/// caches, `build_memo`).
-///
-/// The release build unwinds, precisely so a panicking file can be isolated and
-/// skipped. That means a panic *can* poison this lock — and an `.expect()` here would
-/// then turn one contained panic into a daemon that panics on every subsequent
-/// analysis, which is the exact failure the isolation exists to prevent. A poisoned
-/// index is not dangerous: the worst case is a stale or partial path set, which costs
-/// one re-record on the next build.
-fn read_index() -> std::sync::RwLockReadGuard<'static, HashMap<DependencyKey, Vec<PathBuf>>> {
-    index()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Least-recently-used: the file-size poll reads a first-party set on every request, so a
+/// set in use is never the victim of a build recording another package's paths. A missing
+/// set silently degrades that file's freshness token to the entry stat alone.
+struct DependencyPathIndex {
+    sets: RwLock<HashMap<DependencyKey, PathSet>>,
+    clock: AtomicU64,
+    capacity: usize,
 }
 
-fn write_index() -> std::sync::RwLockWriteGuard<'static, HashMap<DependencyKey, Vec<PathBuf>>> {
-    index()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+impl DependencyPathIndex {
+    fn new(capacity: usize) -> Self {
+        Self {
+            sets: RwLock::new(HashMap::new()),
+            clock: AtomicU64::new(0),
+            capacity,
+        }
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Poison-tolerant, like every other shared map in the daemon (`analysis_flight`, the
+    /// caches, `build_memo`).
+    ///
+    /// The release build unwinds, precisely so a panicking file can be isolated and
+    /// skipped. That means a panic *can* poison this lock — and an `.expect()` here would
+    /// then turn one contained panic into a daemon that panics on every subsequent
+    /// analysis, which is the exact failure the isolation exists to prevent. A poisoned
+    /// index is not dangerous: the worst case is a stale or partial path set, which costs
+    /// one re-record on the next build.
+    fn read(&self) -> RwLockReadGuard<'_, HashMap<DependencyKey, PathSet>> {
+        self.sets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, HashMap<DependencyKey, PathSet>> {
+        self.sets
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record(&self, key: DependencyKey, mut paths: Vec<PathBuf>) {
+        paths.sort();
+        paths.dedup();
+        let last_used = AtomicU64::new(self.tick());
+
+        let mut sets = self.write();
+        if sets.len() >= self.capacity
+            && !sets.contains_key(&key)
+            && let Some(victim) = sets
+                .iter()
+                .min_by_key(|(_, set)| set.last_used.load(Ordering::Relaxed))
+                .map(|(key, _)| key.clone())
+        {
+            sets.remove(&victim);
+        }
+        sets.insert(key, PathSet { paths, last_used });
+    }
+
+    fn get(&self, key: &DependencyKey) -> Option<Vec<PathBuf>> {
+        let sets = self.read();
+        let set = sets.get(key)?;
+        set.last_used.store(self.tick(), Ordering::Relaxed);
+        Some(set.paths.clone())
+    }
 }
 
 pub(crate) fn record_loaded_paths(
     entry_path: PathBuf,
     runtime: ImportRuntime,
-    mut loaded_paths: Vec<PathBuf>,
+    loaded_paths: Vec<PathBuf>,
 ) {
-    loaded_paths.sort();
-    loaded_paths.dedup();
-
-    let mut index = write_index();
-    // Bounded, not LRU: HashMap iteration order makes this an arbitrary
-    // victim, which is acceptable because a dropped set only costs one
-    // re-record on the next successful build.
-    if index.len() >= MAX_DEPENDENCY_PATH_SETS
-        && !index.contains_key(&(entry_path.clone(), runtime))
-        && let Some(victim) = index.keys().next().cloned()
-    {
-        index.remove(&victim);
-    }
-    index.insert((entry_path, runtime), loaded_paths);
+    INDEX.record((entry_path, runtime), loaded_paths);
 }
 
 pub(crate) fn cached_loaded_paths(
     entry_path: &Path,
     runtime: ImportRuntime,
 ) -> Option<Vec<PathBuf>> {
-    read_index()
-        .get(&(entry_path.to_path_buf(), runtime))
-        .cloned()
+    INDEX.get(&(entry_path.to_path_buf(), runtime))
 }
 
 pub(crate) fn clear() {
-    write_index().clear();
+    INDEX.write().clear();
 }
 
 pub(crate) fn invalidate_package(package_name: &str) {
     let package_segment = format!("node_modules/{package_name}/");
-    write_index().retain(|(entry_path, _), _| {
+    INDEX.write().retain(|(entry_path, _), _| {
         !entry_path
             .to_string_lossy()
             .replace('\\', "/")
@@ -87,10 +126,10 @@ pub(crate) fn invalidate_package(package_name: &str) {
 }
 
 pub(crate) fn purge_missing() -> usize {
-    let mut index = write_index();
-    let before = index.len();
-    index.retain(|(entry_path, _), _| !path_is_definitely_gone(entry_path));
-    before - index.len()
+    let mut sets = INDEX.write();
+    let before = sets.len();
+    sets.retain(|(entry_path, _), _| !path_is_definitely_gone(entry_path));
+    before - sets.len()
 }
 
 #[cfg(test)]
@@ -99,7 +138,7 @@ mod tests {
 
     use crate::ipc::protocol::ImportRuntime;
 
-    use super::{cached_loaded_paths, clear, record_loaded_paths};
+    use super::{DependencyPathIndex, cached_loaded_paths, clear, record_loaded_paths};
 
     #[test]
     fn records_sorted_deduplicated_paths_by_runtime() {
@@ -121,5 +160,45 @@ mod tests {
         );
         assert_eq!(cached_loaded_paths(&entry, ImportRuntime::Server), None);
         clear();
+    }
+
+    /// A set the file-size poll keeps reading must survive any number of builds recording
+    /// other packages; only the least recently used set is evicted.
+    #[test]
+    fn eviction_spares_the_sets_in_use() {
+        let index = DependencyPathIndex::new(32);
+        let key = |name: &str| {
+            (
+                PathBuf::from(format!("/ws/{name}/index.js")),
+                ImportRuntime::Component,
+            )
+        };
+        let hot = ["a", "b", "c", "d"].map(key);
+        for hot_key in &hot {
+            index.record(hot_key.clone(), vec![hot_key.0.clone()]);
+        }
+        for cold in 0..28 {
+            index.record(key(&format!("node_modules/cold{cold}")), Vec::new());
+        }
+
+        for round in 0..200 {
+            for hot_key in &hot {
+                assert!(
+                    index.get(hot_key).is_some(),
+                    "round {round}: {hot_key:?} was evicted"
+                );
+            }
+            index.record(key(&format!("node_modules/new{round}")), Vec::new());
+        }
+
+        assert_eq!(index.read().len(), 32, "the index stays bounded");
+        assert!(
+            index.get(&key("node_modules/new199")).is_some(),
+            "the most recent record is kept"
+        );
+        assert!(
+            index.get(&key("node_modules/cold0")).is_none(),
+            "the least recently used set is the victim"
+        );
     }
 }
