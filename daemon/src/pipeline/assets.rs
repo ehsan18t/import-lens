@@ -29,13 +29,16 @@ use crate::pipeline::asset_budget::AssetBudgetLimits;
 use crate::pipeline::asset_budget::{AssetBudgetFailure, AssetBudgetStage, AssetProcessingContext};
 use crate::pipeline::compress::{CompressionSizes, compress_all_bytes};
 use crate::pipeline::css_dependencies::{collect_referenced_assets, is_remote_reference};
+use crate::pipeline::css_import_cycles::{self, ImportEdge};
 use lightningcss::bundler::{Bundler, FileProvider, ResolveResult, SourceProvider};
 use lightningcss::dependencies::DependencyOptions;
-use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions};
+use lightningcss::rules::CssRule;
+use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions, StyleSheet};
 use lightningcss::targets::Targets;
+use oxc_resolver::Resolver;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// How many files one `@import` tree may pull in, and how many bytes of them.
@@ -141,6 +144,14 @@ struct TrackingProvider {
     /// bundle into ONE artifact. `None` when there is a single real entry to bundle directly.
     synthetic: Option<(PathBuf, String)>,
     budget: Mutex<ReadBudget>,
+    /// Every `@import` edge resolved to a file, as (importing sheet, imported sheet).
+    edges: Mutex<BTreeSet<ImportEdge>>,
+    /// Edges that close a cycle, each answered with its own empty in-memory sheet so the bundle
+    /// skips it the way a browser does. Set between the two bundling passes, and only when the
+    /// first pass found a cycle.
+    cut_edges: Mutex<BTreeMap<ImportEdge, PathBuf>>,
+    /// Built on the first bare `@import`; most trees never have one.
+    package_resolver: OnceLock<Resolver>,
     /// The ONE read ledger for every union/per-sheet attempt in this build: every path, snapshot
     /// and failed read is recorded there and nowhere else. Never optional: production safety that
     /// a caller can omit is safety the tests will omit.
@@ -169,6 +180,9 @@ impl TrackingProvider {
                 .collect(),
             synthetic,
             budget: Mutex::new(ReadBudget::default()),
+            edges: Mutex::new(BTreeSet::new()),
+            cut_edges: Mutex::new(BTreeMap::new()),
+            package_resolver: OnceLock::new(),
             context,
         }
     }
@@ -237,6 +251,165 @@ impl TrackingProvider {
     fn should_continue_dependency_reads(&self) -> bool {
         self.context.check_deadline().is_ok()
     }
+
+    /// Where an `@import` lands, without recording the edge.
+    fn resolve_target(
+        &self,
+        specifier: &str,
+        originating_file: &Path,
+    ) -> Result<ResolveResult, std::io::Error> {
+        // A REMOTE `@import` (`@import url("https://fonts.googleapis.com/…")`, or any other scheme
+        // such as `data:`) has no file behind it; a real bundler leaves it in the sheet, and so do
+        // we. Treating it as a resolve failure would sink the whole set to raw disclosure.
+        if is_remote_reference(specifier) {
+            return Ok(ResolveResult::External(specifier.to_owned()));
+        }
+
+        // The synthetic entry `@import`s absolute paths; resolve those directly. `FileProvider`'s
+        // own resolve is a naive relative join and would mangle them.
+        let candidate = Path::new(specifier);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            match self.inner.resolve(specifier, originating_file)? {
+                ResolveResult::File(path) if is_bare_specifier(specifier) => {
+                    self.bare_import_target(specifier, originating_file, path)
+                }
+                ResolveResult::File(path) => path,
+                external @ ResolveResult::External(_) => return Ok(external),
+            }
+        };
+
+        // CANONICALIZE: Lightning CSS cycle-detects on the PathBuf spelling this returns, and
+        // `FileProvider::resolve` never normalizes `..`. A cycle crossing `../` would hand back
+        // a longer, distinct key for the same file on every hop and overflow the stack, which
+        // `catch_unwind` cannot catch, killing the daemon. Browsers and real bundlers tolerate
+        // `@import` cycles, so packages can ship one unknowingly. A canonical key terminates it.
+        Ok(ResolveResult::File(
+            std::fs::canonicalize(&resolved).unwrap_or(resolved),
+        ))
+    }
+
+    /// A bare `@import "pkg/base.css"` is a URL relative to the sheet first, as CSS defines it,
+    /// and names a package only when no such file exists, which is how esbuild, Vite and
+    /// postcss-import read it. A package entry that is not a stylesheet is left unresolved rather
+    /// than measured as CSS.
+    fn bare_import_target(
+        &self,
+        specifier: &str,
+        originating_file: &Path,
+        relative: PathBuf,
+    ) -> PathBuf {
+        match std::fs::metadata(&relative) {
+            Ok(metadata) if metadata.is_file() => return relative,
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return relative,
+            _ => {}
+        }
+        let Some(directory) = originating_file.parent() else {
+            return relative;
+        };
+        let resolver = self
+            .package_resolver
+            .get_or_init(|| Resolver::new(crate::pipeline::resolver::stylesheet_resolve_options()));
+        match resolver.resolve(directory, specifier) {
+            Ok(resolution) if is_stylesheet_path(resolution.path()) => {
+                // A file appearing at the relative spelling would take precedence, so its absence
+                // is part of what this result was measured from.
+                self.record_failed_read(&relative, std::io::ErrorKind::NotFound);
+                resolution.into_path_buf()
+            }
+            _ => relative,
+        }
+    }
+
+    /// The sheet's `@import` targets in source order. Only the cycle-cutting pass reads it, so a
+    /// sheet is parsed a second time only in a tree that has a cycle.
+    fn ordered_imports(&self, sheet: &Path) -> Vec<PathBuf> {
+        let bytes = match &self.synthetic {
+            Some((path, content)) if path == sheet => content.clone().into_bytes(),
+            _ => match self
+                .preloaded
+                .get(sheet)
+                .cloned()
+                .or_else(|| self.context.snapshot_for(sheet))
+            {
+                Some(asset) => asset.bytes().to_vec(),
+                None => return Vec::new(),
+            },
+        };
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            return Vec::new();
+        };
+        let Ok(stylesheet) = StyleSheet::parse(source, ParserOptions::default()) else {
+            return Vec::new();
+        };
+        stylesheet
+            .rules
+            .0
+            .iter()
+            .filter_map(|rule| match rule {
+                CssRule::Import(import) => match self.resolve_target(&import.url, sheet) {
+                    Ok(ResolveResult::File(target)) => Some(target),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The edges to cut so the tree bundles as a browser applies it, or `None` for an acyclic tree.
+    fn closing_edges(&self, entry: &Path) -> Option<BTreeSet<ImportEdge>> {
+        let recorded = css_import_cycles::sorted_adjacency(
+            &self
+                .edges
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let any_order = |sheet: &Path| recorded.get(sheet).cloned().unwrap_or_default();
+        if css_import_cycles::closing_edges(entry, &any_order).is_empty() {
+            return None;
+        }
+        Some(css_import_cycles::closing_edges(entry, &|sheet| {
+            self.ordered_imports(sheet)
+        }))
+    }
+
+    /// Answer every closing edge with an empty sheet, and give the second pass a fresh per-tree
+    /// budget: it walks the same tree again, not a bigger one.
+    fn cut(&self, closing: BTreeSet<ImportEdge>) {
+        let mut cut_edges = self
+            .cut_edges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (index, edge) in closing.into_iter().enumerate() {
+            let empty = edge
+                .0
+                .with_file_name(format!("__import_lens_cut_import_{index}__.css"));
+            cut_edges.insert(edge, empty);
+        }
+        *self
+            .budget
+            .lock()
+            .expect("css read budget should not be poisoned") = ReadBudget::default();
+    }
+
+    fn is_cut_sheet(&self, file: &Path) -> bool {
+        self.cut_edges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|empty| empty == file)
+    }
+}
+
+/// Neither `./`, `../` nor rooted: the spelling that may name a package.
+fn is_bare_specifier(specifier: &str) -> bool {
+    !(specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/'))
+}
+
+fn is_stylesheet_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("css"))
 }
 
 impl SourceProvider for TrackingProvider {
@@ -250,6 +423,10 @@ impl SourceProvider for TrackingProvider {
             && file == path
         {
             return Ok(content.as_str());
+        }
+        // A cut edge's stand-in is empty and has no file behind it either.
+        if self.is_cut_sheet(file) {
+            return Ok("");
         }
 
         // Canonicalize so a cache key is stable across `..` / symlink spellings of the same file.
@@ -323,33 +500,25 @@ impl SourceProvider for TrackingProvider {
         specifier: &str,
         originating_file: &Path,
     ) -> Result<ResolveResult, Self::Error> {
-        // A REMOTE `@import` (`@import url("https://fonts.googleapis.com/…")`, or any other scheme
-        // such as `data:`) has no file behind it; a real bundler leaves it in the sheet, and so do
-        // we. Treating it as a resolve failure would sink the whole set to raw disclosure.
-        if is_remote_reference(specifier) {
-            return Ok(ResolveResult::External(specifier.to_owned()));
-        }
-
-        // The synthetic entry `@import`s absolute paths; resolve those directly. `FileProvider`'s
-        // own resolve is a naive relative join and would mangle them.
-        let candidate = Path::new(specifier);
-        let resolved = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            match self.inner.resolve(specifier, originating_file)? {
-                ResolveResult::File(path) => path,
-                external @ ResolveResult::External(_) => return Ok(external),
-            }
+        let target = match self.resolve_target(specifier, originating_file)? {
+            ResolveResult::File(target) => target,
+            external @ ResolveResult::External(_) => return Ok(external),
         };
-
-        // CANONICALIZE: Lightning CSS cycle-detects on the PathBuf spelling this returns, and
-        // `FileProvider::resolve` never normalizes `..`. A cycle crossing `../` would hand back
-        // a longer, distinct key for the same file on every hop and overflow the stack, which
-        // `catch_unwind` cannot catch, killing the daemon. Browsers and real bundlers tolerate
-        // `@import` cycles, so packages can ship one unknowingly. A canonical key terminates it.
-        Ok(ResolveResult::File(
-            std::fs::canonicalize(&resolved).unwrap_or(resolved),
-        ))
+        let edge = (originating_file.to_path_buf(), target);
+        if let Some(empty) = self
+            .cut_edges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&edge)
+        {
+            return Ok(ResolveResult::File(empty.clone()));
+        }
+        let target = edge.1.clone();
+        self.edges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(edge);
+        Ok(ResolveResult::File(target))
     }
 }
 
@@ -537,13 +706,25 @@ fn bundle_with(provider: &TrackingProvider, entry: &Path) -> Result<CssBundle, S
     provider
         .check_deadline()
         .map_err(|error| error.to_string())?;
-    let mut bundler = Bundler::new(provider, None, ParserOptions::default());
-    let mut stylesheet = bundler.bundle(entry).map_err(|error| {
-        format!(
-            "lightningcss failed to bundle {}: {error:?}",
-            entry.display()
-        )
-    })?;
+    let bundle = || {
+        Bundler::new(provider, None, ParserOptions::default())
+            .bundle(entry)
+            .map_err(|error| {
+                format!(
+                    "lightningcss failed to bundle {}: {error:?}",
+                    entry.display()
+                )
+            })
+    };
+    let mut stylesheet = bundle()?;
+    if let Some(closing) = provider.closing_edges(entry) {
+        drop(stylesheet);
+        provider.cut(closing);
+        provider
+            .check_deadline()
+            .map_err(|error| error.to_string())?;
+        stylesheet = bundle()?;
+    }
     provider
         .check_deadline()
         .map_err(|error| error.to_string())?;
@@ -1556,13 +1737,73 @@ mod tests {
         // Terminating at all is the whole assertion: reaching this line means the process survived.
         let bundle = result.expect("a cyclic @import must terminate, not overflow the stack");
         let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
-        // Sheets outside the cycle are still counted, so one package's broken CSS cannot sink the
-        // set. Lightning CSS drops the cyclic sheet's own rules, undercounting that one stylesheet
-        // (known-issues D8).
         assert!(
             css.contains(".other"),
             "a stylesheet outside the cycle must still be counted: {css}"
         );
+        // A browser skips only the `@import` that closes the cycle, so each sheet's own rules ship.
+        assert_eq!(css.matches(".button").count(), 1, "{css}");
+        assert_eq!(css.matches("--x").count(), 1, "{css}");
+    }
+
+    /// A browser skips the `@import` that closes a cycle and applies every sheet's own rules once, so
+    /// both sheets of a mutual cycle are counted, each once.
+    #[test]
+    fn every_sheet_of_an_import_cycle_keeps_its_own_rules() {
+        let fixture = Fixture::new(
+            "cycle-rules",
+            &[
+                (
+                    "button.css",
+                    "@import \"./tokens.css\";\n.button { color: red }\n",
+                ),
+                (
+                    "tokens.css",
+                    "@import \"./button.css\";\n.tokens { color: blue }\n",
+                ),
+            ],
+        );
+
+        let bundle = bundle_css(&fixture.path("button.css")).expect("a cycle must bundle");
+        let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
+
+        assert_eq!(css.matches(".button").count(), 1, "{css}");
+        assert_eq!(css.matches(".tokens").count(), 1, "{css}");
+    }
+
+    /// A bare `@import` names a package, the way Vite and postcss-import read it once the path
+    /// is not a file next to the sheet: its `style` field or condition, else its CSS entry.
+    #[test]
+    fn a_bare_import_resolves_into_the_named_package() {
+        let fixture = Fixture::new(
+            "bare-import",
+            &[
+                (
+                    "node_modules/theme-kit/package.json",
+                    r#"{"name":"theme-kit","version":"1.0.0","style":"dist/theme.css"}"#,
+                ),
+                (
+                    "node_modules/theme-kit/dist/theme.css",
+                    ".theme-kit-root { color: green }\n",
+                ),
+                (
+                    "node_modules/theme-kit/base.css",
+                    ".theme-kit-base { margin: 0 }\n",
+                ),
+                (
+                    "node_modules/widget/index.css",
+                    "@import \"theme-kit\";\n@import \"theme-kit/base.css\";\n.widget { color: red }\n",
+                ),
+            ],
+        );
+
+        let bundle = bundle_css(&fixture.path("node_modules/widget/index.css"))
+            .expect("a bare import must bundle");
+        let css = String::from_utf8(bundle.minified_bytes).expect("utf8");
+
+        assert!(css.contains(".theme-kit-root"), "{css}");
+        assert!(css.contains(".theme-kit-base"), "{css}");
+        assert!(css.contains(".widget"), "{css}");
     }
 
     /// The file count bounds BOTH breadth and depth because it is the only bound available: giving

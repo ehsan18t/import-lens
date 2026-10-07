@@ -977,6 +977,19 @@ pub(crate) fn resolve_options(runtime: ImportRuntime) -> ResolveOptions {
     }
 }
 
+/// How a bare stylesheet `@import "pkg"` names a package: the `style` condition and `style` main
+/// field, the profile Vite and postcss-import share. Never the JavaScript profile: it has no `.css`
+/// extension and would answer `pkg/base` with `pkg/base.js`.
+pub(crate) fn stylesheet_resolve_options() -> ResolveOptions {
+    ResolveOptions {
+        condition_names: vec!["style".to_owned(), "default".to_owned()],
+        extensions: vec![".css".to_owned()],
+        main_fields: vec!["style".to_owned()],
+        node_path: false,
+        ..ResolveOptions::default()
+    }
+}
+
 fn main_fields(runtime: ImportRuntime) -> Vec<String> {
     profile_entry_fields(runtime)
         .iter()

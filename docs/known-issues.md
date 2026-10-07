@@ -131,25 +131,12 @@ Accepted rather than Deferred, because Deferred says "worth doing, not now" and 
 a measured non-shape in the ecosystem whose fix conflicts with a Critical requirement. Revisit only if the
 ecosystem survey changes.
 
-### D8: One stylesheet Lightning CSS cannot parse falls back alone, but a cyclic one undercounts
+### D8: A stylesheet Lightning CSS cannot parse falls back alone
 **Status: Accepted** · Never below raw-byte disclosure · Found by the asset-counting adversarial review
 
-Lightning CSS parses plain CSS. A published package that imports a preprocessor source (`.scss`, `.less`) or a
-stylesheet with a bare `@import "pkg/base.css"` cannot be bundled, so that sheet falls back to raw-byte
-disclosure. That is the ADR-0006 fallback working: it lands exactly on raw-byte disclosure, never below it.
-A failed set retries per sheet, so only the offender falls back and the rest stay counted. In that degraded
-mode two sheets sharing an `@import` are no longer deduped against each other, which over-counts the shared
-part, a smaller and rarer error than dropping them all.
+Lightning CSS parses plain CSS. A published package that imports a preprocessor source (`.scss`, `.less`) cannot be bundled, so that sheet falls back to raw-byte disclosure. That is the ADR-0006 fallback working: it lands exactly on raw-byte disclosure, never below it. A failed set retries per sheet, so only the offender falls back and the rest stay counted. In that degraded mode two sheets sharing an `@import` are no longer deduped against each other, which over-counts the shared part, a smaller and rarer error than dropping them all.
 
-A stylesheet caught in an `@import` cycle keeps its `@import`ed rules but loses its own, which undercounts that
-one sheet. Cycles are silent in browsers and in every real bundler, so a package can ship one unknowingly. It no
-longer threatens the daemon (that wedge is fixed and pinned by a regression test); it is now only an accuracy
-edge on broken input, and still strictly better than not counting CSS at all, when the package contributed zero CSS either
-way.
-
-Do not resolve a bare `@import` with the JavaScript resolver: that profile has no `style` main field, no
-`style` condition and no `.css` extension, so it would answer `pkg/base` with `pkg/base.js` and measure the
-wrong file. Doing it properly needs a purpose-built CSS resolver profile.
+Compiling a preprocessor source would mean shipping a Sass and a Less compiler and choosing their options for the package, which no published package records; the raw bytes are the honest number.
 
 ### D9: A stylesheet's own `@import` tree is bounded at 256 files
 **Status: Accepted** · A bound where there was none · Found by the asset-counting adversarial review
