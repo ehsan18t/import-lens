@@ -43,6 +43,7 @@ export const durableResultStages: readonly string[] = [
   "package_resolution",
   "package_manifest",
   "entry_resolution",
+  "no_root_entry",
   "oversized_entry",
   "minify",
   "types_only",

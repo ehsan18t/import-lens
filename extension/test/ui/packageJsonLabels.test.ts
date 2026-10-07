@@ -144,6 +144,30 @@ test("packageJsonDependencyHintLabel shows native binary only for a no-entry nat
   );
 });
 
+test("packageJsonDependencyHintLabel names a subpath-only package instead of calling it unavailable", () => {
+  assert.equal(
+    packageJsonDependencyHintLabel(
+      {
+        name: "firebase",
+        section: "dependencies",
+        status: "ready",
+        result: result({
+          raw_bytes: null,
+          minified_bytes: null,
+          gzip_bytes: null,
+          brotli_bytes: null,
+          zstd_bytes: null,
+          error: "package 'firebase' has no importable root entry",
+          unmeasured_stage: "no_root_entry",
+        }),
+        registryHint: { latestVersion: "12.0.0", isLatest: true },
+      },
+      config(),
+    ),
+    "no root entry · latest",
+  );
+});
+
 test("packageJsonDependencyHintLabel flags a native-binary-backed shim beside its size", () => {
   assert.equal(
     packageJsonDependencyHintLabel(

@@ -1,5 +1,14 @@
 import type { ImportResult } from "../ipc/protocol.js";
 
+/**
+ * A package with nothing importable at its root, only subpaths (`firebase`, `@next/font`). It is
+ * Unmeasured, because the bare specifier resolves in no bundler, but it is not broken, so it is
+ * labelled rather than reported as unavailable. The stage string is the daemon contract
+ * (`pipeline::stage::NO_ROOT_ENTRY`).
+ */
+export const isNoRootEntryResult = (result: ImportResult | undefined): boolean =>
+  result?.unmeasured_stage === "no_root_entry";
+
 export const isTypesOnlyResult = (result: ImportResult): boolean =>
   result.diagnostics.some((diagnostic) => diagnostic.stage === "types_only");
 

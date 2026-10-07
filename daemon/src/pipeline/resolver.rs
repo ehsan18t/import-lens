@@ -233,6 +233,14 @@ fn resolve_legacy_fallback(
                 .map(|path| classify_resolved_entry(manifest, path, false));
         }
 
+        if let Some(subpaths) = subpath_only_exports(&manifest.json) {
+            return Err(no_root_entry_message(
+                &request.package_name,
+                "its exports map has no \".\"",
+                &subpaths,
+            ));
+        }
+
         return Err(format!(
             "failed to resolve package entry with oxc_resolver: {resolution_error}"
         ));
@@ -263,18 +271,37 @@ fn resolve_legacy_fallback(
             if !crate::pipeline::native_binary::manifest_declares_no_js_entry(&manifest.json) {
                 return probed;
             }
-            let subpaths = importable_subpaths(&manifest.root);
-            let hint = if subpaths.is_empty() {
-                String::new()
-            } else {
-                format!("; importable subpaths include {}", subpaths.join(", "))
-            };
-            format!(
-                "package '{}' declares no importable entry (no main, module, browser or exports) \
-                 and has no index.js{hint}",
-                request.package_name
+            no_root_entry_message(
+                &request.package_name,
+                "it declares no main, module, browser or exports, and has no index.js",
+                &importable_subpaths(&manifest.root),
             )
         })
+}
+
+/// The one message for a package with nothing importable at its root. `pipeline::analyze` keys the
+/// `no_root_entry` stage on its opening words, so both shapes must come through here.
+fn no_root_entry_message(package_name: &str, reason: &str, subpaths: &[String]) -> String {
+    let hint = if subpaths.is_empty() {
+        String::new()
+    } else {
+        format!("; importable subpaths include {}", subpaths.join(", "))
+    };
+    format!("package '{package_name}' {NO_ROOT_ENTRY_PHRASE} ({reason}){hint}")
+}
+
+pub(crate) const NO_ROOT_ENTRY_PHRASE: &str = "has no importable root entry";
+
+/// The subpaths of an `exports` map that maps subpaths only (every key starts with `./`, none is
+/// `"."`), first eight in declaration order. `None` for a map with a root entry or a conditions
+/// object, whose failure to resolve is something else.
+fn subpath_only_exports(manifest: &Value) -> Option<Vec<String>> {
+    let exports = manifest.get("exports")?.as_object()?;
+    let subpath_only = !exports.is_empty()
+        && exports
+            .keys()
+            .all(|key| key.starts_with("./") && key != ".");
+    subpath_only.then(|| exports.keys().take(8).cloned().collect())
 }
 
 /// Immediate subdirectories that are themselves importable, so a "no entry" message can say where

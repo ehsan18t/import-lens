@@ -35,6 +35,11 @@ pub const PATH_ALIAS: &str = "path_alias";
 pub const PACKAGE_MANIFEST: &str = "package_manifest";
 /// The manifest is fine but no entry point can be resolved from it.
 pub const ENTRY_RESOLUTION: &str = "entry_resolution";
+/// The package has nothing importable at its root, only subpaths: it declares no entry field and
+/// ships no `index.js` (`@next/font`), or its `exports` map has no `"."` (`firebase`). The bare
+/// specifier does not resolve in any bundler either, so it is Unmeasured, but it is not a broken
+/// install, and it is labelled as what it is.
+pub const NO_ROOT_ENTRY: &str = "no_root_entry";
 /// `fs::metadata` on the resolved entry failed.
 ///
 /// Not durable and not deterministic: an IO condition (a lock, a permission blip, a drive that
@@ -79,6 +84,7 @@ pub const ALL: &[&str] = &[
     PATH_ALIAS,
     PACKAGE_MANIFEST,
     ENTRY_RESOLUTION,
+    NO_ROOT_ENTRY,
     ENTRY_METADATA,
     OVERSIZED_ENTRY,
     MINIFY,
@@ -136,6 +142,7 @@ pub const DURABLE_RESULT_STAGES: &[&str] = &[
     PACKAGE_RESOLUTION,
     PACKAGE_MANIFEST,
     ENTRY_RESOLUTION,
+    NO_ROOT_ENTRY,
     OVERSIZED_ENTRY,
     MINIFY,
     // Real measurements of zero and the informational native-binary flag.

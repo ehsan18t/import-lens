@@ -53,46 +53,6 @@ Nothing is open.
 Real work, queued rather than abandoned. None of these is a wrong number or a wedge today, so none blocks the
 release, but each is worth turning into a task.
 
-### D6: "Unavailable" is one label for several causes, and one unbundleable leaf discards the whole package
-**Status: Deferred — RESOLVER scope** · The most visible gap in real projects · Fix universally, never per-package
-
-**What the user sees.** In a real `package.json`, some dependencies render **unavailable**. The bigger the
-project, the more of them, which reads as "the build was too big." It is not a size problem.
-
-**What still lands here.** Two classes remain:
-
-- **No importable entry.** A package declaring no `main`/`module`/`exports`/`browser` at all — confirmed on
-  `@next/font`, whose real code is subpath-only (`./google`, `./local`) — is **Unmeasured**, and correctly so:
-  importing that specifier does not cost nothing, it does not resolve at all, and a zero would be a fabricated
-  number. The message now names the reason and lists the importable subpaths. What is open is the **stage**: it
-  is still the generic `entry_resolution`, so the badge cannot distinguish this from a broken install.
-- **An unfollowable dynamic `require`.** A leaf a bundler cannot statically resolve still fails the whole
-  package build, so a 2 MB graph with one such edge reports nothing rather than "at least 2 MB, excluding it."
-
-**The universal fix (never per-package).** At the engine/resolver boundary, treat every unbundleable leaf as an
-import boundary rather than a hard failure: measure the graph that did bundle as a **floor**, and disclose the
-uncounted leaf exactly as non-JS asset bytes are disclosed today. Same shape as D2 — a floor beats a blank —
-but triggered by a build error rather than a graph-limit breach. **This shape now has a working instance to
-copy:** an unmatched import binding *between two dependencies* is stubbed, measured as a floor, and disclosed
-under `missing_export` (SRS failure-stage table), which is what makes a package like `tsdown` measurable at all.
-The remaining classes above want the same treatment, and the constraint that instance had to respect is the one
-they will meet too — the leniency must never extend to the thing the **user requested**, or a typo comes back
-as a confident number. Pair it with a labelled reason in the UI
-("no importable entry", "unresolved: X") so the badge names the truth instead of a blanket "unavailable". Two
-probes already answer with a labelled Measured zero (`types_only`, `native_binary_only`); note
-`native_binary_only` ships with no SRS requirement behind it, so if a dedicated stage is added here, charter
-both at the same time. Do this at the boundary so it covers every package by construction; do NOT special-case
-any named dependency.
-
-**Why it is not a blocker.** "Unavailable" is honest: no wrong number is shown, and nothing can wedge. This is
-a coverage and UX upgrade, not a correctness fix. The suspicion that a pure-JS package "should measure and does
-not" was flushed out — every instance traced to a genuine unresolvable or unbundleable leaf, not a measurement
-bug.
-
-**Prerequisite: get the distribution before designing the fix.** A diagnostic that runs the daemon over a real
-project's whole dependency set and buckets each "unavailable" by its actual stage (no-entry, dynamic-require,
-graph-limit, timeout, parse) sizes the fix and surfaces any genuine bug. Build that first.
-
 ### D7: A stylesheet its own package declares droppable is counted anyway
 **Status: Accepted** · A wrong number on a package shape measured to be absent from the real ecosystem · Found by the asset-counting adversarial review
 

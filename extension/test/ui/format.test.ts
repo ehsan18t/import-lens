@@ -69,6 +69,22 @@ test("formatImportSizePrimary shows unavailable and applies compression and conf
   );
   assert.equal(
     formatImportSizePrimary(
+      {
+        ...result,
+        raw_bytes: null,
+        minified_bytes: null,
+        gzip_bytes: null,
+        brotli_bytes: null,
+        zstd_bytes: null,
+        error: "package 'firebase' has no importable root entry",
+        unmeasured_stage: "no_root_entry",
+      },
+      { display: "standard", compression: "brotli", showWarnings: true },
+    ),
+    "No root entry",
+  );
+  assert.equal(
+    formatImportSizePrimary(
       { ...result, side_effects: true },
       { display: "minimal", compression: "gzip", showWarnings: true },
     ),

@@ -253,11 +253,15 @@ fn unresolved_import_result(
         crate::pipeline::stage::PACKAGE_RESOLUTION
     } else if is_manifest_fallback_error(&message) {
         crate::pipeline::stage::PACKAGE_MANIFEST
+    } else if message.contains(crate::pipeline::resolver::NO_ROOT_ENTRY_PHRASE) {
+        crate::pipeline::stage::NO_ROOT_ENTRY
     } else {
         crate::pipeline::stage::ENTRY_RESOLUTION
     };
 
-    if stage == crate::pipeline::stage::ENTRY_RESOLUTION {
+    if stage == crate::pipeline::stage::ENTRY_RESOLUTION
+        || stage == crate::pipeline::stage::NO_ROOT_ENTRY
+    {
         // A declarations-only package is Measured: it ships zero runtime bytes. Its diagnostic
         // stage keeps `Some(0)` unambiguous.
         if let Some(result) =

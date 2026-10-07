@@ -3,6 +3,7 @@ import type { InlineHintTone } from "./inlineHintVisuals.js";
 import {
   isNativeBinaryOnlyResult,
   isNativeBinaryResult,
+  isNoRootEntryResult,
   isTypesOnlyResult,
 } from "./resultDiagnostics.js";
 
@@ -166,7 +167,7 @@ export const formatImportSizePrimary = (result: ImportResult, options: FormatOpt
   const sizes = measuredSizes(result);
 
   if (!sizes) {
-    return "Size unavailable";
+    return isNoRootEntryResult(result) ? "No root entry" : "Size unavailable";
   }
 
   if (options.display === "verbose" || options.compression === "all") {

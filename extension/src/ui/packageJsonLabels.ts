@@ -12,6 +12,7 @@ import type { PackageJsonPrimaryTone, PackageJsonSuffixTone } from "./packageJso
 import {
   isNativeBinaryOnlyResult,
   isNativeBinaryResult,
+  isNoRootEntryResult,
   isTypesOnlyResult,
 } from "./resultDiagnostics.js";
 
@@ -121,6 +122,16 @@ export const packageJsonDependencyHintParts = (
   // "Is there a size?" — a dependency the engine could not measure reads "unavailable", which is
   // what it is, rather than borrowing a number from somewhere else.
   const sizes = measuredSizes(state.result);
+
+  // Nothing importable at the root is a fact about the package, not a failure: named, in the
+  // neutral tone, so it is not read as a broken install.
+  if (state.status === "ready" && isNoRootEntryResult(state.result)) {
+    return {
+      primary: "no root entry",
+      primaryTone: "neutral",
+      ...packageJsonDependencyVersionStatusSuffix(state),
+    };
+  }
 
   if (state.status === "unavailable" || !state.result || !sizes) {
     return {

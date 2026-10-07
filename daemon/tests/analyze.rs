@@ -3230,9 +3230,10 @@ fn analyze_names_the_reason_a_subpath_only_package_has_no_root_entry() {
         .error
         .as_deref()
         .expect("a package with no root entry stays Unmeasured");
-    assert!(
-        message.contains("declares no importable entry"),
-        "the message must name the reason: {message}"
+    assert_eq!(
+        result.unmeasured_stage(),
+        Some("no_root_entry"),
+        "a subpath-only package is not a broken install: {result:?}"
     );
     assert!(
         message.contains("./google"),
@@ -3241,6 +3242,56 @@ fn analyze_names_the_reason_a_subpath_only_package_has_no_root_entry() {
     assert!(
         !message.contains("index.js.mjs"),
         "reciting probed spellings reads as a resolver malfunction: {message}"
+    );
+}
+
+/// The `exports` spelling of the same fact: a map of subpaths with no `"."` (`firebase`, whose
+/// code is all under `firebase/app`, `firebase/auth`, …). The bare specifier resolves in no
+/// bundler, and the answer names the subpaths instead of oxc's condition list.
+#[test]
+fn analyze_names_a_subpath_only_exports_map_as_having_no_root_entry() {
+    let workspace = temp_workspace();
+    let package_root = workspace.join("node_modules").join("subpath-exports");
+    fs::create_dir_all(package_root.join("app")).expect("subpath directory should be created");
+    fs::write(
+        package_root.join("package.json"),
+        r#"{"version":"1.0.0","exports":{"./app":"./app/index.js","./auth":"./auth/index.js"}}"#,
+    )
+    .expect("manifest should be written");
+    fs::write(
+        package_root.join("app").join("index.js"),
+        "export const app = 1;\n",
+    )
+    .expect("subpath entry should be written");
+
+    let context = AnalysisContext {
+        workspace_root: workspace.clone(),
+        active_document_path: workspace.join("src").join("index.ts"),
+    };
+    let result = analyze_import(
+        &context,
+        &import_request(
+            "subpath-exports",
+            "subpath-exports",
+            "1.0.0",
+            ImportKind::Namespace,
+            &[],
+        ),
+    );
+    fs::remove_dir_all(&workspace).expect("temp workspace should be removed");
+
+    assert_eq!(
+        result.unmeasured_stage(),
+        Some("no_root_entry"),
+        "{result:?}"
+    );
+    let message = result
+        .error
+        .as_deref()
+        .expect("Unmeasured carries its reason");
+    assert!(
+        message.contains("./app") && message.contains("./auth"),
+        "the importable subpaths are named: {message}"
     );
 }
 
