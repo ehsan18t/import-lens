@@ -229,12 +229,23 @@ It would also cost accuracy. A monorepo package legitimately referencing a share
 is a real shape, and a containment check would stop counting bytes that genuinely ship — turning a
 correct number into a floor to prevent something that is not a defect.
 
-### D2: An honest lower bound on a failed build
-**Status: Deferred** · The intended successor to ADR-0003
+### D2: A graph over 2,000 modules that the import really reaches reports no size
+**Status: Accepted** · Measured both alternatives · A blank, never a wrong number
 
-Today an unbuildable import reports no size. A graph-limit breach means much of the graph was loaded before we
-stopped, so a real floor exists: "at least 4 MB; graph limit exceeded" is strictly better than a blank. The
-engine currently discards the partial graph on failure, so this needs plumbing through the engine boundary.
+A named import from a side-effect-free barrel no longer lands here: a breach retries with Rolldown's lazy barrel, and the import is measured exactly (SRS §7.3). What remains is an import that genuinely reaches more than 2,000 modules. In a survey of 181 popular packages imported as a namespace (the export the `package.json` view prewarms), four do: `@mui/icons-material`, `@babylonjs/core`, `next` and `webpack`. A named import from `@babylonjs/core` or `webpack` breaches as well, because neither package is side-effect-free.
+
+**"At least X" from the partial graph is not honest, so it is not offered.** Rolldown loads modules concurrently, so which 2,000 are in when the limit trips depends on scheduling, and the same import would show a different floor on every run, with a deterministic cache stage behind it. Nor is it a floor: cutting the graph removes the cross-module facts (a constant an unloaded module exports, an unloaded module's side-effect freedom) that let the full build drop code, so a partial build can come out larger than the whole.
+
+**Raising the limit was measured, at 20,000 modules (Windows, release build):**
+
+| Namespace import | At the limit (fails) | At 20,000 (measures) |
+|---|---|---|
+| `@mui/icons-material` | 192 MiB peak | 586 KB brotli in 5.1 s, 463 MiB peak |
+| `@babylonjs/core` | 239 MiB | 1.4 MB in 5.5 s, 462 MiB |
+| `next` | 605 MiB | 3.8 MB in 17 s, 1,128 MiB |
+| `webpack` | 276 MiB | 1.4 MB in 5.2 s, 428 MiB |
+
+Every one doubles the daemon's peak and takes seconds, for an import nobody writes in application code (the whole of `next` or `webpack`). The limit stays.
 
 ### D3: Marginal cost, a project-level bundle model
 **Status: Deferred** · A different product, decided on its own merits

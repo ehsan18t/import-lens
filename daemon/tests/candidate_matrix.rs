@@ -858,6 +858,45 @@ async fn matrix_32_module_count_limit() {
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
 
+// Row 32b: a named import from a side-effect-free barrel over the module limit is measured.
+// Rolldown loads every re-exported module before tree-shaking, so the barrel alone breaches the
+// limit; the lazy-barrel retry loads only what the import reaches, and the size is the one module
+// the import names. A namespace import reaches all of them, so it still breaches.
+#[tokio::test]
+async fn matrix_32b_named_import_from_a_barrel_over_the_module_limit() {
+    let root = temp_workspace();
+    write_source(
+        &root,
+        "package.json",
+        r#"{"name":"barrel","sideEffects":false}"#,
+    );
+    let reexports = (0..2100)
+        .map(|index| format!("export {{ icon as Icon{index} }} from './icon_{index}.js';"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_source(&root, "entry.js", &reexports);
+    for index in 0..2100 {
+        write_source(
+            &root,
+            &format!("icon_{index}.js"),
+            &format!("export const icon = {{ id: {index}, path: 'M0 0L{index} {index}' }};"),
+        );
+    }
+
+    let artifact = bundle_ok(&root, "entry.js", named(&["Icon7"])).await;
+    assert_eq!(
+        contribution_basenames(&artifact),
+        vec!["icon_7.js"],
+        "{artifact:?}"
+    );
+
+    let failure = run(&root, "entry.js", BundleSelection::Namespace)
+        .await
+        .expect_err("a namespace import reaches every module");
+    assert_eq!(failure.stage, "module_graph_limit", "{failure:?}");
+    fs::remove_dir_all(root).expect("temp workspace should be removed");
+}
+
 // Row 33: a single module over the per-module source limit is a typed
 // failure.
 #[tokio::test]

@@ -45,7 +45,7 @@ impl RolldownEngine {
             });
         };
         let package_root = first_entry.package_root.clone();
-        let (output, state, unbound_imports) = build_with_unbound_import_retry(|| {
+        let (output, state, unbound_imports) = build_with_retries(|| {
             let input = InputItem {
                 name: None,
                 import: entry::VIRTUAL_ENTRY_ID.to_owned(),
@@ -69,7 +69,7 @@ impl RolldownEngine {
         let cwd = entry_path
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let (output, state, unbound_imports) = build_with_unbound_import_retry(|| {
+        let (output, state, unbound_imports) = build_with_retries(|| {
             let input = InputItem {
                 name: None,
                 import: rolldown_entry_path(&entry_path),
@@ -257,14 +257,22 @@ async fn run_build(
     result.map_err(|error| classify_failure(error.into_vec(), state))
 }
 
-/// Run one build, and when [`is_internal_unbound_import`] admits its failure, run it once more with
-/// the unmatched bindings stubbed (`shim_missing_exports`). Returns the output, the state of the
-/// attempt that produced it, and the failed attempt's diagnostics: a stubbed build reports nothing
-/// of its own, so those are the whole disclosure.
+/// Run one build, and retry it at most twice, each retry switching on one thing for good:
 ///
-/// Every attempt gets a fresh plugin and state: the failed one recorded the paths and fingerprints
+/// * a graph-limit breach retries with Rolldown's lazy barrel, which leaves unloaded every module a
+///   side-effect-free barrel re-exports and the import never reaches. Rolldown otherwise loads the
+///   whole barrel before tree-shaking it, so `import { Home } from "@mui/icons-material"` breaches
+///   while measuring one icon. Only a breach turns it on: it changes the bytes of builds that
+///   already succeed, so turning it on everywhere would move numbers that are right today;
+/// * when [`is_internal_unbound_import`] admits the failure, the build runs with the unmatched
+///   bindings stubbed (`shim_missing_exports`).
+///
+/// Returns the output, the state of the attempt that produced it, and the unbound-import attempt's
+/// diagnostics: a stubbed build reports nothing of its own, so those are the whole disclosure.
+///
+/// Every attempt gets a fresh plugin and state: a failed one recorded the paths and fingerprints
 /// of a graph that was thrown away, and freshness must describe the graph the answer came from.
-async fn build_with_unbound_import_retry(
+async fn build_with_retries(
     attempt: impl Fn() -> (BundlerOptions, ImportLensPlugin),
 ) -> Result<
     (
@@ -274,20 +282,35 @@ async fn build_with_unbound_import_retry(
     ),
     BundleFailure,
 > {
-    let (options, plugin) = attempt();
-    let state = plugin.state();
-    let failure = match run_build(options, plugin, &state).await {
-        Ok(output) => return Ok((output, state, Vec::new())),
-        Err(failure) => failure,
-    };
-    if !is_internal_unbound_import(&failure, &state.entry_stable_ids()) {
-        return Err(failure);
+    let mut lazy_barrel = false;
+    let mut unbound_imports: Option<Vec<ImportDiagnostic>> = None;
+    loop {
+        let (mut options, plugin) = attempt();
+        if lazy_barrel && let Some(experimental) = options.experimental.as_mut() {
+            experimental.lazy_barrel = Some(true);
+        }
+        if unbound_imports.is_some() {
+            options.shim_missing_exports = Some(true);
+        }
+        let state = plugin.state();
+        match run_build(options, plugin, &state).await {
+            Ok(output) => return Ok((output, state, unbound_imports.unwrap_or_default())),
+            Err(failure)
+                if !lazy_barrel
+                    && unbound_imports.is_none()
+                    && failure.stage == stage::MODULE_GRAPH_LIMIT =>
+            {
+                lazy_barrel = true;
+            }
+            Err(failure)
+                if unbound_imports.is_none()
+                    && is_internal_unbound_import(&failure, &state.entry_stable_ids()) =>
+            {
+                unbound_imports = Some(failure.diagnostics);
+            }
+            Err(failure) => return Err(failure),
+        }
     }
-    let (mut options, plugin) = attempt();
-    options.shim_missing_exports = Some(true);
-    let state = plugin.state();
-    let output = run_build(options, plugin, &state).await?;
-    Ok((output, state, failure.diagnostics))
 }
 
 /// Whether a failed build may be retried with the unmatched binding stubbed.

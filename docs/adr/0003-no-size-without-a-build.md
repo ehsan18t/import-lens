@@ -23,8 +23,4 @@ is *actionable* and the action is wrong.
   The `sideEffects` glob matcher stays on the successful-measurement path as a reporting-only
   badge source ([ADR-0002](0002-upstream-owns-everything-it-can-answer.md)); it never affects
   retention or size.
-- An honest **lower bound** ("at least 4 MB; graph limit exceeded") is strictly better than
-  either a fabrication or a blank, because a limit breach means much of the graph *was* loaded
-  before we stopped. The engine currently discards the partial graph on failure, so this needs
-  plumbing through the engine boundary and is deliberately not bundled into a stability fix.
-  It is the intended successor to this decision, not a hypothetical.
+- A graph-limit breach is not a size either. A partial graph gives no honest lower bound: which modules loaded before the limit tripped depends on scheduling, so the figure would change from run to run, and cutting the graph removes the cross-module facts that let the full build drop code, so it is not even a floor. A breach instead retries with Rolldown's lazy barrel, which measures a named import from a side-effect-free barrel exactly; an import that genuinely reaches more than the limit stays unmeasured (known-issues D2 holds the measurements).
