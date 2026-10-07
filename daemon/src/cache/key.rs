@@ -34,7 +34,7 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// `git log -S analyzer_revision -- daemon/src/cache/key.rs`.
 macro_rules! analyzer_revision {
     () => {
-        "rolldown-1.2.x+27"
+        "rolldown-1.2.x+28"
     };
 }
 

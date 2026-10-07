@@ -897,6 +897,24 @@ async fn matrix_32b_named_import_from_a_barrel_over_the_module_limit() {
     fs::remove_dir_all(root).expect("temp workspace should be removed");
 }
 
+// Row 32c: a module-level directive (`"use client"`, which every React Server Components library
+// ships) is dropped from the bundle as in any bundler. It changes no byte that matters, so it must
+// not surface as a diagnostic, which would cost the result its High confidence.
+#[tokio::test]
+async fn matrix_32c_a_module_level_directive_is_not_a_diagnostic() {
+    let root = temp_workspace();
+    write_source(&root, "entry.js", "\"use client\";\nexport const a = 1;");
+
+    let artifact = bundle_ok(&root, "entry.js", named(&["a"])).await;
+
+    assert!(
+        artifact.diagnostics.is_empty(),
+        "{:?}",
+        artifact.diagnostics
+    );
+    fs::remove_dir_all(root).expect("temp workspace should be removed");
+}
+
 // Row 33: a single module over the per-module source limit is a typed
 // failure.
 #[tokio::test]

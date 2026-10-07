@@ -11,8 +11,9 @@ use std::task::{Context, Poll};
 
 use rolldown::plugin::Pluginable;
 use rolldown::{
-    AttachDebugInfo, Bundler, BundlerOptions, CodeSplittingMode, ExperimentalOptions, InputItem,
-    IsExternal, OutputFormat, Platform, PreserveEntrySignatures, RawMinifyOptions, ResolveOptions,
+    AttachDebugInfo, Bundler, BundlerOptions, ChecksOptions, CodeSplittingMode,
+    ExperimentalOptions, InputItem, IsExternal, OutputFormat, Platform, PreserveEntrySignatures,
+    RawMinifyOptions, ResolveOptions,
 };
 use rolldown_common::{Output, OutputChunk};
 use rolldown_error::{BuildDiagnostic, EventKind};
@@ -168,6 +169,15 @@ fn build_options(input: InputItem, cwd: PathBuf, runtime: ImportRuntime) -> Bund
             ..ExperimentalOptions::default()
         }),
         resolve: Some(resolve_options_for(runtime)),
+        // Advisories about the build, not about the bytes, and every warning that reaches the
+        // result costs it its High confidence. A module-level directive (`"use client"`) is dropped
+        // as in any bundler; the other two are build-speed advice.
+        checks: Some(ChecksOptions {
+            module_level_directive: Some(false),
+            large_barrel_modules: Some(false),
+            bundler_timings: Some(false),
+            ..ChecksOptions::default()
+        }),
         ..BundlerOptions::default()
     }
 }

@@ -274,13 +274,23 @@ accuracy suite, and any follow-ups.
 - A rolldown bump is never routine: it moves the production semantic bundling
   engine, so rerun the bundler-redesign qualification gates before shipping —
   the construct matrix (`--test candidate_matrix`), the real-package suite
-  (`--test candidate_packages -- --ignored`), the performance gates
+  (`--test candidate_packages -- --ignored`), the real-package badge baseline
+  (`--release --test candidate_badges -- --ignored`), the performance gates
   (`--release --test candidate_performance -- --ignored`), and the accuracy
   suite — and update `ANALYZER_REVISION` (`daemon/src/cache/key.rs`) when
   measured output can change. Its format is `<engine>-<minor line>.x+<revision>`:
   a patch bump that moves numbers increments `+<revision>`, a minor or major bump
   rewrites the line itself (`rolldown-1.3.x+1`). The doc comment on the macro is
   the authority.
+- **Diff Rolldown's warning kinds.** Every warning that reaches a result becomes a
+  diagnostic (`stage_for` in `daemon/src/engine/adapter.rs` maps unknown kinds to
+  `link`) and costs the result its High confidence. A release that adds or starts
+  emitting an advisory (1.2.x began emitting `MODULE_LEVEL_DIRECTIVE` for every
+  `"use client"` module) drops whole package families to Medium with no number
+  moving — only the badge baseline catches it. Compare `EventKind` and the
+  `ChecksOptions` defaults across the bump; switch off at the source (the
+  `checks` field of `build_options`) only advisories about the build, never a
+  warning that can describe the bytes.
 - **Check memory, not only speed.** A release that changes how rolldown or OXC
   allocates (arena reuse, thread-local caches, new parallelism, I/O model) moves
   the daemon's resident set. The performance gates assert NFR-004 (idle and
