@@ -607,8 +607,10 @@ impl AssetProcessingContext {
 
 /// A missing file cannot be canonicalized, but its directory usually can. Spelling it through the
 /// canonical directory keeps an absent observation and a later read of the same file under one
-/// identity, so the two are seen as conflicting rather than as two unrelated paths.
-fn canonical_path(path: &Path) -> PathBuf {
+/// identity, so the two are seen as conflicting rather than as two unrelated paths. A failure
+/// disclosed to the user must use this same spelling, or it names a different path than its ledger
+/// entry (`pkg/./missing.woff2` on Unix, where `join` keeps the `.`).
+pub(super) fn canonical_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| {
         path.parent()
             .zip(path.file_name())

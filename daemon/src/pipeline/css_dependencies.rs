@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use lightningcss::dependencies::{Dependency, ImportDependency, UrlDependency};
 
 use crate::engine::{AssetClass, AssetKind, CollectedAsset, UncountedAsset, classify_asset_class};
+use crate::pipeline::asset_budget::canonical_path;
 
 /// Resolve the local files referenced by `url()` in a bundled stylesheet.
 ///
@@ -198,7 +199,7 @@ fn collect_supported_asset(
     if !located.insert(path.clone()) {
         return None;
     }
-    let path = fs::canonicalize(&path).unwrap_or(path);
+    let path = canonical_path(&path);
     let metadata = stat(&path);
     let raw_bytes = metadata.as_ref().map_or(0, |metadata| metadata.len());
 
