@@ -7,8 +7,12 @@ const defaultNodeModulesInvalidationDelayMs = 250;
  * `references`). The daemon discovers `tsconfig.json` / `jsconfig.json` by name and then follows
  * `extends` and `references` into the rest, so an edit to any of them can change the alias table
  * and all of them must be watched.
+ *
+ * A Vite, webpack or Rollup config is an alias table too: the daemon reads its `alias` entries
+ * (`daemon/src/pipeline/bundler_aliases.rs`, whose name list this mirrors).
  */
-const workspaceConfigFileName = /^(?:ts|js)config(?:\.[^./\\]+)?\.json$/u;
+const workspaceConfigFileName =
+  /^(?:(?:ts|js)config(?:\.[^./\\]+)?\.json|(?:vite|webpack|rollup)\.config\.(?:js|mjs|cjs|ts|mts|cts))$/u;
 
 const basenameOf = (candidate: string): string => candidate.split(/[/\\]/u).pop() ?? "";
 

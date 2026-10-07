@@ -3,6 +3,7 @@ pub(crate) mod asset_boundary;
 mod asset_budget;
 pub mod assets;
 mod build_memo;
+mod bundler_aliases;
 pub mod compress;
 mod css_dependencies;
 mod css_import_cycles;

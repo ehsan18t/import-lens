@@ -1,8 +1,9 @@
 use crate::cache::key::CacheIdentity;
 use crate::ipc::protocol::{ImportRequest, ImportRuntime};
+use crate::pipeline::bundler_aliases;
 use oxc_resolver::{
-    ModuleType, PathUtil, ResolveOptions, Resolver, TsConfig, TsconfigDiscovery, TsconfigOptions,
-    TsconfigReferences,
+    AliasValue, ModuleType, PathUtil, ResolveOptions, Resolver, TsConfig, TsconfigDiscovery,
+    TsconfigOptions, TsconfigReferences,
 };
 use serde_json::Value;
 use std::{
@@ -393,7 +394,7 @@ fn find_package_manifest(
 }
 
 /// Whether a specifier resolves, through the project's `tsconfig.json` / `jsconfig.json` `paths` /
-/// `baseUrl`, to a real file **outside `node_modules`**: first-party source, and therefore a **path
+/// `baseUrl` or a bundler config's alias table, to a real file **outside `node_modules`**: first-party source, and therefore a **path
 /// alias** rather than a package.
 ///
 /// **Request-scoped, on both counts.** Not longer: each alias `Resolver` carries an `oxc_resolver`
@@ -435,7 +436,8 @@ fn find_package_manifest(
 ///
 /// Residual limits (docs/known-issues.md A1 to A3). All but the last land on floor:
 ///
-/// * an alias declared only in a Vite / webpack / Rollup config, which the daemon does not read;
+/// * an alias a Vite / webpack / Rollup config computes in a way a static read cannot follow (a
+///   variable or a helper of its own, see [`bundler_aliases`]);
 /// * an alias whose target file does not exist (the pattern matching is not evidence; the file is);
 /// * a `references` graph wider than [`MAX_REACHABLE_ALIAS_CONFIGS`], whose tail is not asked;
 /// * because every reachable table is asked, an alias defined only in `tsconfig.node.json` also
@@ -868,19 +870,28 @@ impl ResolverSet {
     /// Each alias resolver holds its own oxc FS cache: oxc memoizes a manually configured tsconfig
     /// in one slot (the cache entry for `/`) whatever the config path, so two configs sharing a
     /// cache would answer with whichever loaded first.
+    ///
+    /// A Vite, webpack or Rollup config is an alias table too ([`bundler_aliases`]), one resolver
+    /// each, read on the same per-request terms.
     fn alias_resolvers(
         &self,
         workspace_root: &Path,
         active_document_path: &Path,
     ) -> Option<Vec<Resolver>> {
-        let config_file = find_workspace_config(workspace_root, active_document_path)?;
-
-        Some(
-            reachable_alias_configs(&config_file)
-                .iter()
-                .map(|config| Resolver::new(alias_resolve_options(config)))
-                .collect(),
-        )
+        let mut resolvers = find_workspace_config(workspace_root, active_document_path)
+            .map(|config_file| {
+                reachable_alias_configs(&config_file)
+                    .iter()
+                    .map(|config| Resolver::new(alias_resolve_options(config)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        resolvers.extend(
+            bundler_aliases::alias_tables(workspace_root, active_document_path)
+                .into_iter()
+                .map(|aliases| Resolver::new(bundler_alias_resolve_options(aliases))),
+        );
+        (!resolvers.is_empty()).then_some(resolvers)
     }
 }
 
@@ -901,17 +912,39 @@ impl ResolverSet {
 /// first-party source, and this resolver never picks a package entry, so no measurement can reach
 /// these extensions.
 fn alias_resolve_options(config_file: &Path) -> ResolveOptions {
-    let mut extensions = module_extensions();
-    extensions.extend([".vue", ".svelte", ".astro"].map(str::to_owned));
-
     ResolveOptions {
         tsconfig: Some(TsconfigDiscovery::Manual(TsconfigOptions {
             config_file: config_file.to_path_buf(),
             references: TsconfigReferences::Disabled,
         })),
-        extensions,
+        extensions: alias_target_extensions(),
         ..resolve_options(ImportRuntime::Component)
     }
+}
+
+/// Resolution options for ONE bundler config's alias table. Its keys match the way webpack and
+/// `@rollup/plugin-alias` match them, which is oxc's own alias rule: the key itself or the key
+/// followed by `/`, and a trailing `$` for an exact match only.
+fn bundler_alias_resolve_options(aliases: Vec<(String, PathBuf)>) -> ResolveOptions {
+    ResolveOptions {
+        alias: aliases
+            .into_iter()
+            .map(|(key, target)| {
+                (
+                    key,
+                    vec![AliasValue::Path(target.to_string_lossy().into_owned())],
+                )
+            })
+            .collect(),
+        extensions: alias_target_extensions(),
+        ..resolve_options(ImportRuntime::Component)
+    }
+}
+
+fn alias_target_extensions() -> Vec<String> {
+    let mut extensions = module_extensions();
+    extensions.extend([".vue", ".svelte", ".astro"].map(str::to_owned));
+    extensions
 }
 
 static SHARED_RESOLVERS: OnceLock<RwLock<Arc<ResolverSet>>> = OnceLock::new();
@@ -1422,6 +1455,32 @@ mod tests {
         expected.sort();
 
         assert_eq!(reachable, expected);
+    }
+
+    /// A JavaScript-only Vite project has no `jsconfig.json`; its Vite config is its alias table.
+    #[test]
+    fn a_javascript_vite_project_declares_its_aliases_in_the_vite_config_alone() {
+        let fixture = ConfigFixture::new("vite-alias");
+        fixture.write("src/components/Button.vue", "<template />\n");
+        fixture.write(
+            "vite.config.js",
+            r#"import { fileURLToPath, URL } from "node:url";
+            export default { resolve: { alias: { components: fileURLToPath(new URL("./src/components", import.meta.url)) } } };"#,
+        );
+        let document = fixture.root.join("src").join("main.js");
+
+        assert!(
+            resolves_to_first_party_source(&fixture.root, &document, "components/Button"),
+            "the only alias table is the Vite config, and its target exists outside node_modules"
+        );
+        assert!(
+            !resolves_to_first_party_source(&fixture.root, &document, "components/Missing"),
+            "an aliased path to no file is still no evidence"
+        );
+        assert!(
+            !resolves_to_first_party_source(&fixture.root, &document, "lodash"),
+            "a specifier no table maps is a package that is not installed"
+        );
     }
 
     /// **An alias target above the workspace root is first-party source.** A monorepo opened at

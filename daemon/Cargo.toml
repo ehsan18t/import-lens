@@ -33,6 +33,8 @@ mimalloc = { version = "^0.1", default-features = false }
 # alphas, so the exact pin is load-bearing.
 lightningcss = { version = "=1.0.0-alpha.72", default-features = false, features = ["bundler"] }
 oxc_allocator = "=0.152.0"
+oxc_ast = "=0.152.0"
+oxc_ast_visit = "=0.152.0"
 oxc_codegen = "=0.152.0"
 oxc_minifier = "=0.152.0"
 oxc_parser = "=0.152.0"

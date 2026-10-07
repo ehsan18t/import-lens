@@ -317,16 +317,14 @@ A1 and A2 degrade to a **floor** (the file's total is flagged incomplete, is not
 check` declines to judge it); A3 errs the other way and flags nothing. Neither direction invents a number. That
 is why none of them is fixed.
 
-### A1: An alias declared only in a Vite, webpack, or Rollup config is not seen
-**Status: Accepted** · The only one with real-world reach
+### A1: A bundler alias the static read cannot follow is not seen
+**Status: Accepted** · Never a wrong number, only a floor
 
-We read `paths` from `tsconfig.json` and `jsconfig.json` (and their `references` and `extends`). An alias
-configured only in a bundler config is invisible, so the file is a floor.
+We read `paths` from `tsconfig.json` and `jsconfig.json` (and their `references` and `extends`), and the `alias` tables of `vite.config.*`, `webpack.config.*` and `rollup.config.*`. A bundler config is parsed, never run, so an alias whose target sits in a variable, is built by a helper of the config's own, or is matched by a regular expression is invisible, and the file importing it is a floor.
 
-Narrow in practice: a TypeScript project must mirror aliases into tsconfig anyway or the editor breaks. A
-JavaScript-only Vite project with no `jsconfig.json` is the real exposure.
+Running the config would answer every spelling, but it means executing workspace code (and its imports) to draw a decoration, which the daemon never does. The forms read are the ones the scaffolds and the bundlers' docs write.
 
-**Repair for a user:** mirror the alias into `tsconfig` or `jsconfig` `paths`.
+**Repair for a user:** spell the alias target inline, or mirror the alias into `tsconfig` or `jsconfig` `paths`.
 
 ### A2: More than 24 reachable configs, the tail is not walked
 **Status: Accepted** · `MAX_REACHABLE_ALIAS_CONFIGS = 24`

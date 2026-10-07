@@ -67,6 +67,28 @@ test("nodeModulesInvalidationDecision routes workspace configs to the tsconfig h
 
 // A config edit on its own must still reach the daemon: it is the single deliberate keystroke the
 // whole fix exists for.
+// A JavaScript-only Vite project keeps its aliases in its Vite config; an edit there must take the
+// config half, never the package half, where it would be read as a manifest.
+test("a bundler config is routed to the config half", () => {
+  assert.deepEqual(
+    nodeModulesInvalidationDecision([
+      "C:/workspace/vite.config.ts",
+      "C:/workspace/webpack.config.cjs",
+      "C:/workspace/rollup.config.mjs",
+      "C:/workspace/node_modules/lib/vite.config.js",
+    ]),
+    {
+      kind: "changed",
+      packageJsonPaths: [],
+      tsconfigPaths: [
+        "C:/workspace/vite.config.ts",
+        "C:/workspace/webpack.config.cjs",
+        "C:/workspace/rollup.config.mjs",
+      ],
+    },
+  );
+});
+
 test("nodeModulesInvalidationDecision reports a lone workspace config change", () => {
   assert.deepEqual(nodeModulesInvalidationDecision(["C:/workspace/tsconfig.json"]), {
     kind: "changed",

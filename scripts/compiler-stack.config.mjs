@@ -29,6 +29,8 @@ export const compilerStackConfig = {
   rolldownSupportCrates: ["rolldown_common", "rolldown_error"],
   oxcCrates: [
     "oxc_allocator",
+    "oxc_ast",
+    "oxc_ast_visit",
     "oxc_codegen",
     "oxc_minifier",
     "oxc_parser",

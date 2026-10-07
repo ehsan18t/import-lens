@@ -13,7 +13,7 @@ import { createNodeModulesInvalidationBuffer } from "./watcherInvalidation.js";
  * prescribes for an unrecognized alias (add the `paths` entry) saw the file stay a floor forever.
  *
  * The `*` in the config globs is what catches `tsconfig.app.json`, where the Vue and Astro
- * scaffolds actually keep `paths`. Configs under `node_modules` are dropped downstream
+ * scaffolds actually keep `paths`. A Vite, webpack or Rollup config is an alias table as well. Configs under `node_modules` are dropped downstream
  * (`isWorkspaceConfigPath`) — they belong to a dependency's own build and an install would queue
  * thousands of them.
  */
@@ -22,6 +22,7 @@ const watchedPatterns = [
   "**/node_modules/@*/*/package.json",
   "**/tsconfig*.json",
   "**/jsconfig*.json",
+  "**/{vite,webpack,rollup}.config.{js,mjs,cjs,ts,mts,cts}",
 ];
 
 export const registerNodeModulesWatchers = (
