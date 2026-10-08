@@ -61,6 +61,28 @@ export const shiftRange = (range: SourceRange, edit: SourceEdit): SourceRange | 
   };
 };
 
+/** A range carried through edits in order, or `null` once one of them replaced all of it. */
+export const shiftRangeThrough = (
+  range: SourceRange,
+  edits: readonly SourceEdit[],
+): SourceRange | null => {
+  let shifted: SourceRange | null = range;
+
+  for (const edit of edits) {
+    if (!shifted) {
+      return null;
+    }
+
+    shifted = shiftRange(shifted, edit);
+  }
+
+  return shifted;
+};
+
+/** Whether a range covers no text: what a range an edit replaced collapses to. */
+export const isEmptyRange = (range: SourceRange): boolean =>
+  comparePositions(range.start, range.end) === 0;
+
 /** A detected import's positions after the edits, or `null` once its statement is gone. */
 export const shiftDetectedImport = (
   detected: DetectedImport,

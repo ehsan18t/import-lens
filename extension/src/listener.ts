@@ -20,7 +20,7 @@ import {
   recordImportCostHistory,
 } from "./analysis/history.js";
 import { applyImportAnalysisInsights } from "./analysis/insights.js";
-import { DocumentEditLog, type SourceEdit, shiftLines } from "./analysis/rangeTracking.js";
+import { DocumentEditLog, shiftLines } from "./analysis/rangeTracking.js";
 import { ImportResultLogTracker } from "./analysis/resultLogging.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
@@ -36,6 +36,7 @@ import { supportedLanguageIds } from "./languages.js";
 import type { ImportLensLogger } from "./logger.js";
 import { bytesForCompression } from "./ui/format.js";
 import type { StatusBarController, StatusBarState } from "./ui/statusbar.js";
+import { sourceEditFromChange } from "./ui/vscodeRanges.js";
 import { isShownDocument, newlyVisibleDocuments } from "./visibleDocuments.js";
 import { analysisRootForFile } from "./workspaceContext.js";
 
@@ -44,14 +45,6 @@ const isAnalyzableDocument = (document: vscode.TextDocument): boolean =>
 
 const isShown = (document: vscode.TextDocument): boolean =>
   isShownDocument(document, vscode.window);
-
-const sourceEditFromChange = (change: vscode.TextDocumentContentChangeEvent): SourceEdit => ({
-  range: {
-    start: { line: change.range.start.line, character: change.range.start.character },
-    end: { line: change.range.end.line, character: change.range.end.character },
-  },
-  text: change.text,
-});
 
 /** What one analysis generation owns: the inputs a File Cost re-read needs, and the history its captions compare against. @see DocumentAnalysisController.refetchFileSizeWhenSettled */
 interface AnalysisContext {

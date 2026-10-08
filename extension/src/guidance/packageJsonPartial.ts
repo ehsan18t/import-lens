@@ -1,9 +1,77 @@
+import { type SourceEdit, shiftRangeThrough } from "../analysis/rangeTracking.js";
 import type {
   AnalyzePackageJsonResponse,
   PackageJsonDependencyAnalysisItem,
+  PackageJsonDependencySection,
   RegistryHint,
+  SourceRange,
 } from "../ipc/protocol.js";
 import type { RegistryHintRefreshStatus } from "./packageJsonState.js";
+
+const collapsedRange = (range: SourceRange | null, fallback: SourceRange): SourceRange =>
+  range ?? { start: fallback.start, end: fallback.start };
+
+/**
+ * Dependency states laid onto the manifest's text after edits. A state is never removed, because
+ * streamed partials address the list by index; one whose entry an edit replaced collapses to an
+ * empty range, which the decorations skip until the re-analysis the edit scheduled replaces it.
+ */
+export const shiftPackageJsonStates = <TState extends PackageJsonDependencyAnalysisItem>(
+  states: readonly TState[],
+  edits: readonly SourceEdit[],
+): TState[] =>
+  edits.length === 0
+    ? [...states]
+    : states.map((state) => {
+        const range = shiftRangeThrough(state.entry.range, edits);
+
+        if (!range) {
+          const gone = collapsedRange(null, state.entry.range);
+          return {
+            ...state,
+            entry: { ...state.entry, range: gone, nameRange: gone, valueRange: gone },
+          };
+        }
+
+        return {
+          ...state,
+          entry: {
+            ...state.entry,
+            range,
+            nameRange: collapsedRange(shiftRangeThrough(state.entry.nameRange, edits), range),
+            valueRange: collapsedRange(shiftRangeThrough(state.entry.valueRange, edits), range),
+          },
+        };
+      });
+
+/** Section ranges laid onto the manifest's text after edits (collapsed when an edit replaced them). */
+export const shiftPackageJsonSections = (
+  sections: readonly PackageJsonDependencySection[],
+  edits: readonly SourceEdit[],
+): PackageJsonDependencySection[] =>
+  edits.length === 0
+    ? [...sections]
+    : sections.map((section) => ({
+        ...section,
+        range: collapsedRange(shiftRangeThrough(section.range, edits), section.range),
+        objectRange: collapsedRange(
+          shiftRangeThrough(section.objectRange, edits),
+          section.objectRange,
+        ),
+      }));
+
+/** A response the daemon computed for an older text, laid onto the text on screen. */
+export const shiftPackageJsonResponse = (
+  response: AnalyzePackageJsonResponse,
+  edits: readonly SourceEdit[],
+): AnalyzePackageJsonResponse =>
+  edits.length === 0
+    ? response
+    : {
+        ...response,
+        states: shiftPackageJsonStates(response.states, edits),
+        sections: shiftPackageJsonSections(response.sections, edits),
+      };
 
 type PackageJsonRefreshStateFields = {
   registryHintRefreshStatus?: RegistryHintRefreshStatus;

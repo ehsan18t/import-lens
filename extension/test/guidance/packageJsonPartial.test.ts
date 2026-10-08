@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { isEmptyRange } from "../../src/analysis/rangeTracking.js";
 import {
   markPackageJsonLoadingUnavailable,
   mergePackageJsonAnalysisPartial,
   packageJsonFinalResponseOutcome,
+  shiftPackageJsonStates,
 } from "../../src/guidance/packageJsonPartial.js";
 import type {
   AnalyzePackageJsonResponse,
@@ -325,4 +327,43 @@ test("markPackageJsonLoadingUnavailable preserves completed states and marks onl
   assert.equal(next[0], ready);
   assert.equal(next[1]?.status, "unavailable");
   assert.equal(next[1]?.message, "Daemon unavailable");
+});
+
+test("package.json states follow edits without changing the list partials index", () => {
+  const onLine = (name: string, line: number) => {
+    const state = stateFor(name, "ready");
+    const shift = (range: { start: { character: number }; end: { character: number } }) => ({
+      start: { line, character: range.start.character },
+      end: { line, character: range.end.character },
+    });
+    return {
+      ...state,
+      entry: {
+        ...state.entry,
+        range: shift(state.entry.range),
+        nameRange: shift(state.entry.nameRange),
+        valueRange: shift(state.entry.valueRange),
+      },
+    };
+  };
+  const states = [onLine("a", 2), onLine("b", 3)];
+  const insertLineAbove = {
+    range: { start: { line: 2, character: 0 }, end: { line: 2, character: 0 } },
+    text: '    "z": "1",\n',
+  };
+  const deleteLineA = {
+    range: { start: { line: 2, character: 0 }, end: { line: 3, character: 0 } },
+    text: "",
+  };
+
+  const shifted = shiftPackageJsonStates(states, [insertLineAbove]);
+  assert.deepEqual(
+    shifted.map((state) => state.entry.valueRange.end.line),
+    [3, 4],
+  );
+
+  const removed = shiftPackageJsonStates(states, [deleteLineA]);
+  assert.equal(removed.length, 2);
+  assert.equal(isEmptyRange(removed[0]?.entry.range ?? states[0].entry.range), true);
+  assert.equal(removed[1]?.entry.valueRange.end.line, 2);
 });

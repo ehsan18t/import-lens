@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { isEmptyRange } from "../analysis/rangeTracking.js";
 import { getImportLensConfig } from "../config.js";
 import type {
   PackageJsonAnalysisController,
@@ -55,7 +56,10 @@ export class PackageJsonDecorationController extends InlineHintDecorationControl
       ...sections.flatMap(
         (section) => this.hintForSection(editor.document, section, states, config) ?? [],
       ),
-      ...states.map((state) => this.hintForState(editor.document, state, config)),
+      // An entry an edit removed has an empty range until the re-analysis replaces it.
+      ...states
+        .filter((state) => !isEmptyRange(state.entry.range))
+        .map((state) => this.hintForState(editor.document, state, config)),
     ];
 
     this.decorationPool.applyToEditor(editor, inlineHintLanes(hints));

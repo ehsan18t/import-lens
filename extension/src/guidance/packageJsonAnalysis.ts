@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import * as vscode from "vscode";
 import { DebouncedDocumentScheduler } from "../analysis/debouncedDocumentScheduler.js";
+import { DocumentEditLog, isEmptyRange } from "../analysis/rangeTracking.js";
 import { getImportLensConfig } from "../config.js";
 import type { DaemonManager } from "../daemon/manager.js";
 import {
@@ -13,12 +14,16 @@ import {
 } from "../ipc/protocol.js";
 import type { ImportLensLogger } from "../logger.js";
 import { isPackageJsonPath } from "../prewarm/packageJsonHelpers.js";
+import { sourceEditFromChange } from "../ui/vscodeRanges.js";
 import { isShownDocument } from "../visibleDocuments.js";
 import { analysisRootForFile } from "../workspaceContext.js";
 import {
   markPackageJsonLoadingUnavailable,
   mergePackageJsonAnalysisPartial,
   packageJsonFinalResponseOutcome,
+  shiftPackageJsonResponse,
+  shiftPackageJsonSections,
+  shiftPackageJsonStates,
 } from "./packageJsonPartial.js";
 import { PackageJsonRequestLifecycle } from "./packageJsonRequestLifecycle.js";
 import type { PackageJsonDependencyHintState } from "./packageJsonState.js";
@@ -54,6 +59,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   // Read once per analysis request and reused by its partials and by the refresh commands, which
   // only act on analyzed states.
   readonly #privateRegistryScopes = new Map<string, ReadonlySet<string>>();
+  // What each manifest was edited by since the text an in-flight analysis read: its partials and
+  // final response are laid onto the text on screen before they are merged.
+  readonly #editLog = new DocumentEditLog();
   readonly #scheduledAt = new Map<string, number>();
   readonly #requestTimings = new Map<number, PackageJsonRequestTiming>();
   readonly #onDidChange = new vscode.EventEmitter<vscode.Uri>();
@@ -88,7 +96,10 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     // Only shown documents are analyzed (see `isShownDocument`); the unchanged-content guard makes
     // rescheduling an already-analyzed manifest on every visibility change free.
     context.subscriptions.push(
-      vscode.workspace.onDidChangeTextDocument((event) => this.schedule(event.document, "change")),
+      vscode.workspace.onDidChangeTextDocument((event) => {
+        this.followEdits(event);
+        this.schedule(event.document, "change");
+      }),
       vscode.workspace.onDidCloseTextDocument((document) => this.disposeDocument(document)),
       vscode.window.onDidChangeVisibleTextEditors((editors) => {
         for (const editor of editors) {
@@ -152,6 +163,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     // Skip redundant re-analysis on passive triggers (tab focus, re-open) when
     // the document text is already covered by a sent request. Explicit refreshes
     // call refreshVisibleDocuments(), which forgets this first.
+    const sourceVersion = document.version;
     const currentText = document.getText();
     if (this.reuseUnchangedPackageJsonAnalysis(document, key, currentText)) {
       return;
@@ -205,7 +217,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
           include_registry_hints: config.enableRegistryHints,
           registry_hint_mode: config.enableRegistryHints ? "cached" : "off",
         },
-        (partial) => this.handlePackageJsonPartial(document.uri, key, partial),
+        (partial) => this.handlePackageJsonPartial(document.uri, key, partial, sourceVersion),
       );
 
       if (!response) {
@@ -221,6 +233,17 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       if (!this.#lifecycle.isCurrent(key, response.request_id)) {
         return;
       }
+
+      const editsSinceSource = this.#editLog.since(key, sourceVersion);
+
+      // More edits than the log keeps: the response cannot be placed on the text, and the analysis
+      // those edits scheduled will replace it.
+      if (!editsSinceSource) {
+        return;
+      }
+
+      const placed = shiftPackageJsonResponse(response, editsSinceSource);
+      this.#editLog.prune(key, sourceVersion);
 
       this.logPackageJsonResponseTiming(
         response.request_id,
@@ -239,9 +262,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
         return;
       }
 
-      this.#sections.set(key, response.sections);
+      this.#sections.set(key, placed.sections);
       const states = withRegistryEligibility(
-        mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], response),
+        mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], placed),
         privateScopes,
       );
       this.setStates(document.uri, states);
@@ -305,10 +328,53 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     const key = uri.toString();
     this.#states.delete(key);
     this.#sections.delete(key);
+    this.#editLog.forget(key);
     this.#privateRegistryScopes.delete(key);
     this.#lifecycle.forget(key);
     this.#registryRefresher.forget(uri);
     this.#onDidChange.fire(uri);
+  }
+
+  /**
+   * Carry the manifest's stored ranges through an edit as it happens. Partials and registry
+   * refreshes keep arriving while the user types, and each redraw reads these ranges: unfollowed,
+   * a dependency added above others would draw every later hint one line off.
+   */
+  private followEdits(event: vscode.TextDocumentChangeEvent): void {
+    if (!isPackageJsonDocument(event.document) || event.contentChanges.length === 0) {
+      return;
+    }
+
+    const key = event.document.uri.toString();
+    const edits = event.contentChanges.map(sourceEditFromChange);
+    this.#editLog.record(key, event.document.version, edits);
+
+    const sections = this.#sections.get(key);
+
+    if (sections) {
+      this.#sections.set(key, shiftPackageJsonSections(sections, edits));
+    }
+
+    const states = this.#states.get(key);
+
+    if (!states) {
+      return;
+    }
+
+    const shifted = shiftPackageJsonStates(states, edits);
+    this.#states.set(key, shifted);
+
+    // The editor moves painted hints with the text by itself; one whose entry was just removed has
+    // to be taken down.
+    const removed = states.some(
+      (state, index) =>
+        !isEmptyRange(state.entry.range) &&
+        isEmptyRange(shifted[index]?.entry.range ?? state.entry.range),
+    );
+
+    if (removed) {
+      this.#onDidChange.fire(event.document.uri);
+    }
   }
 
   private setStates(uri: vscode.Uri, states: PackageJsonDependencyAnalysisState[]): void {
@@ -349,11 +415,20 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   private handlePackageJsonPartial(
     uri: vscode.Uri,
     key: string,
-    partial: AnalyzePackageJsonResponse,
+    response: AnalyzePackageJsonResponse,
+    sourceVersion: number,
   ): void {
-    if (!this.#lifecycle.isCurrent(key, partial.request_id) || partial.error) {
+    const editsSinceSource = this.#editLog.since(key, sourceVersion);
+
+    if (
+      !this.#lifecycle.isCurrent(key, response.request_id) ||
+      response.error ||
+      !editsSinceSource
+    ) {
       return;
     }
+
+    const partial = shiftPackageJsonResponse(response, editsSinceSource);
 
     const timing = this.#requestTimings.get(partial.request_id);
     if (timing && !timing.firstPartialLogged) {
