@@ -407,14 +407,19 @@ const changedFilesGitArgs = ({ base } = {}) => ({
   ],
 });
 
+// A path listing grows with the repository: an untracked generated tree is easily tens of
+// thousands of names, and Node's 1 MiB default would end the run with exit 2 instead of a verdict.
+const gitListingMaxBufferBytes = 256 * 1024 * 1024;
+
 export const changedFiles = async (cwd, { base } = {}) => {
   // Paths are repository-root-relative, so file resolution must anchor at the git top level, not
   // the invocation directory (budget discovery stays cwd-scoped).
   const args = changedFilesGitArgs({ base });
+  const options = { cwd, maxBuffer: gitListingMaxBufferBytes };
   const [{ stdout: diff }, { stdout: untracked }, { stdout: topLevel }] = await Promise.all([
-    execFile("git", args.diff, { cwd }),
-    execFile("git", args.untracked, { cwd }),
-    execFile("git", ["rev-parse", "--show-toplevel"], { cwd }),
+    execFile("git", args.diff, options),
+    execFile("git", args.untracked, options),
+    execFile("git", ["rev-parse", "--show-toplevel"], options),
   ]);
 
   return {

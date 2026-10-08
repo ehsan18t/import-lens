@@ -887,6 +887,24 @@ test("changedFiles reads a non-ASCII path git would quote", async () => {
   }
 });
 
+test("changedFiles lists an untracked tree larger than a default child-process buffer", async () => {
+  const workspace = gitWorkspace();
+  try {
+    const generated = path.join(workspace, "generated");
+    mkdirSync(generated);
+    const stem = "g".repeat(100);
+    // 11,000 names of about 120 bytes each: past the 1 MiB child-process default.
+    for (let index = 0; index < 11_000; index += 1) {
+      writeFileSync(path.join(generated, `${stem}-${index}.ts`), "");
+    }
+
+    const { files } = await changedFiles(workspace);
+    assert.equal(files.length, 11_000);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 // The CI shape: the branch's changes are committed, so the working tree equals HEAD and a diff
 // against HEAD finds none of them.
 test("changedFiles diffs against a base ref's merge base and lists untracked files", async () => {
