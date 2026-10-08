@@ -668,7 +668,7 @@ export const startDaemon = async (
     });
   } catch (error) {
     stopConnecting.abort();
-    if (child.exitCode === null && child.signalCode === null) {
+    if (isRunning(child)) {
       child.kill();
     }
     socket?.destroy();
@@ -677,18 +677,46 @@ export const startDaemon = async (
 
   return {
     request: client.request,
-    shutdown: async () => {
-      try {
-        client.send({ type: "shutdown" });
-      } catch {
-        // best effort shutdown
-      }
-      socket.destroy();
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill();
-      }
-    },
+    shutdown: () => shutdownDaemon({ client, socket, child }),
   };
+};
+
+// How long a daemon told to shut down may take to exit before it is killed. It joins its tasks for
+// at most 2 s (`TASK_JOIN_TIMEOUT` in daemon/src/ipc/server.rs) and then flushes the disk cache.
+const daemonExitGraceMs = 10000;
+
+const isRunning = (child) => child.exitCode === null && child.signalCode === null;
+
+/**
+ * The daemon commits its batched disk-cache inserts only while closing the connection (on
+ * `shutdown` or EOF), so it must be let exit on its own: killing it at once discards every
+ * measurement of the run, and the next run starts cold. The socket is ended rather than destroyed,
+ * so the shutdown frame is delivered and EOF backs it up if the frame could not be written.
+ */
+export const shutdownDaemon = async ({ client, socket, child, graceMs = daemonExitGraceMs }) => {
+  const exited = isRunning(child)
+    ? new Promise((resolve) => child.once("exit", resolve))
+    : Promise.resolve();
+  try {
+    client.send({ type: "shutdown" });
+  } catch {
+    // EOF from the `end` below also makes the daemon flush and exit.
+  }
+  socket.end();
+
+  let timer;
+  await Promise.race([
+    exited,
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, graceMs);
+    }),
+  ]);
+  clearTimeout(timer);
+
+  if (isRunning(child)) {
+    child.kill();
+  }
+  socket.destroy();
 };
 
 // `sun_path` holds 108 bytes on Linux and 104 on macOS, one of which is the terminating NUL. A

@@ -19,6 +19,7 @@ import {
   parseCliArgs,
   resolveCliStoragePaths,
   runImportLensCheck,
+  shutdownDaemon,
   startDaemon,
 } from "../../cli/importlens.mjs";
 
@@ -669,6 +670,47 @@ test("startDaemon rejects promptly when the daemon cannot be spawned", async () 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+class FakeChild extends EventEmitter {
+  exitCode = null;
+  signalCode = null;
+  killed = false;
+
+  kill() {
+    this.killed = true;
+    this.signalCode = "SIGTERM";
+  }
+}
+
+const shutdownHarness = () => {
+  const events = [];
+  const socket = {
+    end: () => events.push("end"),
+    destroy: () => events.push("destroy"),
+  };
+  const client = { send: (message) => events.push(`send ${message.type}`) };
+  return { events, socket, client, child: new FakeChild() };
+};
+
+test("shutdownDaemon lets the daemon exit on its own so it can flush its cache", async () => {
+  const { events, socket, client, child } = shutdownHarness();
+  const done = shutdownDaemon({ client, socket, child, graceMs: 60_000 });
+
+  assert.deepEqual(events, ["send shutdown", "end"], "the socket is not destroyed before exit");
+  child.exitCode = 0;
+  child.emit("exit", 0);
+  await done;
+
+  assert.equal(child.killed, false);
+  assert.deepEqual(events, ["send shutdown", "end", "destroy"]);
+});
+
+test("shutdownDaemon kills a daemon that outlives the grace period", async () => {
+  const { socket, client, child } = shutdownHarness();
+  await shutdownDaemon({ client, socket, child, graceMs: 10 });
+
+  assert.equal(child.killed, true);
 });
 
 test("createDaemonClient resolves concurrent responses by request id", async () => {
