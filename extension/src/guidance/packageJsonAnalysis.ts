@@ -22,7 +22,7 @@ import {
 } from "./packageJsonPartial.js";
 import { PackageJsonRequestLifecycle } from "./packageJsonRequestLifecycle.js";
 import type { PackageJsonDependencyHintState } from "./packageJsonState.js";
-import { readPrivateRegistryScopes, withoutNonPublicRegistryHints } from "./registryEligibility.js";
+import { readPrivateRegistryScopes, withRegistryEligibility } from "./registryEligibility.js";
 import { RegistryHintRefresher, registryTargetsForStates } from "./registryRefresh.js";
 
 export interface PackageJsonDependencyAnalysisState extends PackageJsonDependencyHintState {
@@ -240,7 +240,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       }
 
       this.#sections.set(key, response.sections);
-      const states = withoutNonPublicRegistryHints(
+      const states = withRegistryEligibility(
         mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], response),
         privateScopes,
       );
@@ -371,7 +371,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       this.#sections.set(key, partial.sections);
     }
 
-    const states = withoutNonPublicRegistryHints(
+    const states = withRegistryEligibility(
       mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], partial),
       this.privateScopesFor(uri),
     );

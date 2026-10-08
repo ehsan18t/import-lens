@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   privateRegistryScopes,
   type RegistryTargetState,
-  withoutNonPublicRegistryHints,
+  withRegistryEligibility,
 } from "../../src/guidance/registryEligibility.js";
 import { registryTargetsForStates } from "../../src/guidance/registryRefresh.js";
 
@@ -65,9 +65,9 @@ test("privateRegistryScopes keeps scopes mapped away from the public registry, l
   assert.deepEqual([...privateRegistryScopes([user, project])].sort(), ["@corp", "@env", "@gh"]);
 });
 
-test("withoutNonPublicRegistryHints clears a cached hint for a dependency that is not looked up", () => {
+test("withRegistryEligibility clears a cached hint for a dependency that is not looked up", () => {
   const hint = { latestVersion: "2.0.0", isLatest: false, fetchedAt: 1 };
-  const [workspace, registry] = withoutNonPublicRegistryHints(
+  const [workspace, registry] = withRegistryEligibility(
     [
       stateFor("@acme/ui", "workspace:*", { registryHint: hint }),
       stateFor("react", "^19.0.0", { registryHint: hint }),
@@ -76,5 +76,7 @@ test("withoutNonPublicRegistryHints clears a cached hint for a dependency that i
   );
 
   assert.equal(workspace?.registryHint, null);
+  assert.equal(workspace?.registryLookup, false);
   assert.equal(registry?.registryHint, hint);
+  assert.equal(registry?.registryLookup, true);
 });

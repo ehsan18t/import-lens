@@ -397,15 +397,6 @@ That is deliberate: a gate that cannot measure must never report success, and a 
 regression. But it is a real workflow cost, and if it proves noisy the answer is to make fewer imports
 unmeasurable, not to make the gate lie.
 
-## package.json registry hints
-
-### R1: A dependency that is never looked up still offers a registry refresh
-**Status: Accepted** · Never a wrong number
-
-A dependency whose spec is not a public registry range (`workspace:*`, `file:`, a git URL, an `npm:` alias) or whose scope an `.npmrc` maps to another registry is never sent to the npm lookup and shows no registry hint. Its dependency hover still offers "Refresh npm registry info", which does nothing when clicked, and a section containing one keeps saying "Some registry info has not been fetched yet" in its summary hover.
-
-**Why it is not fixed:** the hovers render from the shared dependency state, which carries no spec or `.npmrc` scopes, and both texts are inert (no number, no lookup). Threading the eligibility check into the hover is the fix if the stale wording proves confusing.
-
 ---
 
 # Performance backlog

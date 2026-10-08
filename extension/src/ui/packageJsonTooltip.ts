@@ -111,12 +111,12 @@ const registryDetailsMarkdown = (
   return details;
 };
 
-export const packageJsonDependencyTooltipMarkdown = (
+/** The size block of a dependency hover: its measurement, or why there is none. */
+const dependencySizeMarkdown = (
   state: PackageJsonDependencyTooltipState,
-  config: Pick<ImportLensConfig, "compression" | "enableRegistryHints">,
-  options: PackageJsonTooltipActionOptions = {},
-): string => {
-  const parts: string[] = [`**${escapeMarkdown(state.name)}**`];
+  config: Pick<ImportLensConfig, "compression">,
+): string[] => {
+  const parts: string[] = [];
   // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). This branch renders one
   // — through `importResultSizeMarkdown`, which is why the guard that scans for the banned check
   // never saw this file: it names no size of its own. It asks the question correctly now, and the
@@ -152,6 +152,25 @@ export const packageJsonDependencyTooltipMarkdown = (
     parts.push(escapeMarkdown(state.message));
   }
 
+  return parts;
+};
+
+/** Whether the hover can offer a registry refresh: never for a dependency that is not looked up. */
+const offersRegistryRefresh = (
+  state: PackageJsonDependencyTooltipState,
+  config: PackageJsonRegistryTooltipConfig,
+): boolean => config.enableRegistryHints && state.registryLookup !== false;
+
+export const packageJsonDependencyTooltipMarkdown = (
+  state: PackageJsonDependencyTooltipState,
+  config: Pick<ImportLensConfig, "compression" | "enableRegistryHints">,
+  options: PackageJsonTooltipActionOptions = {},
+): string => {
+  const parts: string[] = [
+    `**${escapeMarkdown(state.name)}**`,
+    ...dependencySizeMarkdown(state, config),
+  ];
+
   if (state.status === "ready" && state.result) {
     parts.push(["**Analysis**", confidenceRowMarkdown(state.result)].join("\n"));
     parts.push(confidenceNotesMarkdown(state.result.confidence_reasons) ?? "");
@@ -165,7 +184,7 @@ export const packageJsonDependencyTooltipMarkdown = (
     );
   }
 
-  const refreshAction = config.enableRegistryHints
+  const refreshAction = offersRegistryRefresh(state, config)
     ? refreshPackageRegistryHintMarkdown(state, options)
     : null;
 
@@ -191,22 +210,29 @@ export const packageJsonDependencyTooltipTrustedCommands = (
     commands.push(copyImportDiagnosticsCommand);
   }
 
-  if (config.enableRegistryHints && options.packageJsonUri) {
+  if (offersRegistryRefresh(state, config) && options.packageJsonUri) {
     commands.push(refreshPackageJsonRegistryHintCommand);
   }
 
   return commands;
 };
 
+// Only the dependencies that are looked up can have been fetched; the rest never will be.
 const sectionFetchedAtMarkdown = (
-  states: readonly PackageJsonDependencyHintState[],
+  sectionStates: readonly PackageJsonDependencyHintState[],
   options: PackageJsonSectionSummaryTooltipOptions,
 ): string => {
+  const states = sectionStates.filter((state) => state.registryLookup !== false);
+
+  if (states.length === 0) {
+    return "No dependency here is looked up on the npm registry";
+  }
+
   const fetchedTimes = states.flatMap((state) =>
     typeof state.registryHint?.fetchedAt === "number" ? [state.registryHint.fetchedAt] : [],
   );
 
-  if (states.length === 0 || fetchedTimes.length !== states.length) {
+  if (fetchedTimes.length !== states.length) {
     return "Some registry info has not been fetched yet";
   }
 

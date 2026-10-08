@@ -499,3 +499,41 @@ test("tooltipForResultMarkdown keeps normal import hover free of package registr
   assert.doesNotMatch(markdown, /Latest version:/u);
   assert.doesNotMatch(markdown, /Version status:/u);
 });
+
+test("a dependency that is never looked up offers no registry refresh and does not count as unfetched", () => {
+  const workspaceDependency = {
+    name: "@acme/ui",
+    section: "dependencies" as const,
+    status: "ready" as const,
+    result: result(),
+    registryHint: null,
+    registryLookup: false,
+  };
+  const options = { packageJsonUri: "file:///workspace/package.json" };
+
+  const markdown = packageJsonDependencyTooltipMarkdown(workspaceDependency, config(), options);
+  assert.doesNotMatch(markdown, /Refresh npm registry info/u);
+  assert.equal(
+    packageJsonDependencyTooltipTrustedCommands(workspaceDependency, config(), options).includes(
+      refreshPackageJsonRegistryHintCommand,
+    ),
+    false,
+  );
+
+  const summary = packageJsonSectionSummaryTooltipMarkdown(
+    "2/2 measured · 8.2 kB br",
+    [
+      workspaceDependency,
+      {
+        name: "react",
+        section: "dependencies",
+        status: "ready",
+        result: result(),
+        registryHint: { latestVersion: "19.0.0", fetchedAt: 5_000 },
+      },
+    ],
+    config(),
+    { ...options, section: "dependencies", formatFetchedAt: (timestamp) => `time:${timestamp}` },
+  );
+  assert.match(summary, /All registry info fetched since: time:5000/u);
+});

@@ -17,4 +17,6 @@ export interface PackageJsonDependencyHintState {
   registryHint?: RegistryHint | null;
   registryHintRefreshStatus?: RegistryHintRefreshStatus;
   registryHintRefreshError?: string | null;
+  /** `false` when the dependency is never looked up on the public registry (`isPublicRegistryDependency`). */
+  registryLookup?: boolean;
 }

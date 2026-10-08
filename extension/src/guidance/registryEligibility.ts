@@ -41,19 +41,28 @@ export const isPublicRegistryDependency = (
 };
 
 /**
- * Clears a registry hint the daemon served from its cache for a dependency that is not on the
- * public registry: such a hint describes an unrelated public package that shares the key.
+ * Records on each state whether it is looked up on the public registry, so the hovers offer a
+ * refresh only where one can happen. A dependency that is not looked up also loses any hint the
+ * daemon served from its cache: such a hint describes an unrelated public package that shares the
+ * key.
  */
-export const withoutNonPublicRegistryHints = <TState extends RegistryTargetState>(
+export const withRegistryEligibility = <TState extends RegistryTargetState>(
   states: TState[],
   privateScopes: ReadonlySet<string>,
 ): TState[] =>
-  states.map((state) =>
-    state.registryHint &&
-    !isPublicRegistryDependency(state.name, state.entry.version, privateScopes)
-      ? { ...state, registryHint: null }
-      : state,
-  );
+  states.map((state) => {
+    const registryLookup = isPublicRegistryDependency(
+      state.name,
+      state.entry.version,
+      privateScopes,
+    );
+
+    return {
+      ...state,
+      registryLookup,
+      registryHint: registryLookup ? state.registryHint : null,
+    };
+  });
 
 /**
  * The scopes that `.npmrc` texts map to a registry other than the public one. Texts are given in
