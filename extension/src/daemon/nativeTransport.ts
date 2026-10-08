@@ -62,6 +62,10 @@ const PACKAGE_JSON_ANALYSIS_TIMEOUT_MS = 300_000;
 type DaemonHostContext = DaemonStorageContext & { readonly extensionPath: string };
 
 const WORKSPACE_REPORT_TIMEOUT_MS = 300_000;
+// How long a registry refresh may go without a partial. A 429 makes the daemon pause every registry
+// worker for up to `REGISTRY_MAX_BACKOFF_MS` (5 min, daemon/src/registry/constants.rs) and then
+// fetch, so this is that pause plus a fetch; a shorter wait abandons hints the daemon still delivers.
+const REGISTRY_REFRESH_IDLE_TIMEOUT_MS = 330_000;
 
 export class NativeDaemonTransport implements AnalysisTransport {
   readonly #context: DaemonHostContext;
@@ -631,7 +635,11 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#logger.debug(
       `Requesting registry hint refresh ${request.request_id} for ${request.targets.length} package(s): ${preview}.`,
     );
-    return this.#client.requestRefreshRegistryHints(request, 30000, onPartial);
+    return this.#client.requestRefreshRegistryHints(
+      request,
+      REGISTRY_REFRESH_IDLE_TIMEOUT_MS,
+      onPartial,
+    );
   }
 
   async requestWorkspaceReport(
