@@ -172,3 +172,22 @@ test("a specifier the daemon never analysed is still disclosed", () => {
     detail: "Not compared: not a package import Import Lens can size",
   });
 });
+
+test("a package that ships no runtime is badged after the ranking, and a low-confidence size keeps its ~", () => {
+  const typesOnly: ImportResult = {
+    ...result("@types/node", 0),
+    diagnostics: [{ stage: "types_only", message: "declarations only", details: [] }],
+  };
+  const approximate: ImportResult = { ...result("approx-lib", 900), confidence: "low" };
+
+  const { items, comparedCount } = compareImportItemsForResults(
+    ["@types/node", "approx-lib", "small-lib"],
+    [analysed(typesOnly), analysed(approximate), analysed(result("small-lib", 500))],
+  );
+
+  assert.deepEqual(
+    items.map((item) => item.label),
+    ["small-lib: 500 B br", "approx-lib: ~900 B br", "@types/node: types only"],
+  );
+  assert.equal(comparedCount, 3);
+});

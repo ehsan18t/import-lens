@@ -119,7 +119,8 @@ export const formatBytes = (bytes: number): string => {
   return `${(bytes / 1000).toFixed(1)} kB`;
 };
 
-const confidencePrefix = (result: ImportResult): string => (result.confidence === "low" ? "~" : "");
+export const confidencePrefix = (result: ImportResult): string =>
+  result.confidence === "low" ? "~" : "";
 
 export const importSizePrimaryTone = (confidence: ConfidenceLevel): InlineHintTone => {
   if (confidence === "medium") {

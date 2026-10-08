@@ -1,5 +1,10 @@
-import type { ImportAnalysisItem } from "../ipc/protocol.js";
-import { formatBytes, type MeasuredSizes, measuredSizes } from "./format.js";
+import type { ImportAnalysisItem, ImportResult } from "../ipc/protocol.js";
+import { confidencePrefix, formatBytes, type MeasuredSizes, measuredSizes } from "./format.js";
+import {
+  isNativeBinaryOnlyResult,
+  isNativeBinaryResult,
+  isTypesOnlyResult,
+} from "./resultDiagnostics.js";
 
 export interface CompareImportQuickPickItem {
   label: string;
@@ -96,17 +101,29 @@ export const compareImportItemsForResults = (
     };
   }
 
-  const ranked = analysed
-    .flatMap((item): [string, MeasuredSizes][] => {
-      const sizes = item.result ? measuredSizes(item.result) : null;
+  const measured = analysed.flatMap((item): [ImportResult, MeasuredSizes][] => {
+    const sizes = item.result ? measuredSizes(item.result) : null;
 
-      return sizes ? [[item.result?.specifier ?? item.detected.specifier, sizes]] : [];
-    })
-    .sort(([, left], [, right]) => left.brotli_bytes - right.brotli_bytes)
-    .map(([specifier, sizes]) => ({
-      label: `${specifier}: ${formatBytes(sizes.brotli_bytes)} br`,
-      detail: `${formatBytes(sizes.minified_bytes)} min · ${formatBytes(sizes.gzip_bytes)} gz · ${formatBytes(sizes.zstd_bytes)} zstd`,
-    }));
+    return item.result && sizes ? [[item.result, sizes]] : [];
+  });
+  // A types-only or native-binary-only package is measured at zero because it ships no runtime
+  // JavaScript. It is shown with its badge, as on every other surface, and after the ranking: a
+  // "0 B br" at the top would read as the cheapest real alternative.
+  const shipsNoRuntime = ([result]: [ImportResult, MeasuredSizes]): boolean =>
+    isTypesOnlyResult(result) || isNativeBinaryOnlyResult(result);
+  const ranked = [
+    ...measured
+      .filter((entry) => !shipsNoRuntime(entry))
+      .sort(([, left], [, right]) => left.brotli_bytes - right.brotli_bytes)
+      .map(([result, sizes]) => ({
+        label: `${result.specifier}: ${confidencePrefix(result)}${formatBytes(sizes.brotli_bytes)} br${isNativeBinaryResult(result) ? " · native binary" : ""}`,
+        detail: `${formatBytes(sizes.minified_bytes)} min · ${formatBytes(sizes.gzip_bytes)} gz · ${formatBytes(sizes.zstd_bytes)} zstd`,
+      })),
+    ...measured.filter(shipsNoRuntime).map(([result]) => ({
+      label: `${result.specifier}: ${isTypesOnlyResult(result) ? "types only" : "native binary only"}`,
+      detail: "Ships no runtime JavaScript",
+    })),
+  ];
 
   const excluded = excludedComparisonEntries(requested, analysed);
 
