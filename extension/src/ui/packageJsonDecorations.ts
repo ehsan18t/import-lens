@@ -66,7 +66,7 @@ export class PackageJsonDecorationController extends InlineHintDecorationControl
     state: PackageJsonDependencyAnalysisState,
     config: ReturnType<typeof getImportLensConfig>,
   ): AnchoredInlineHint {
-    const line = document.lineAt(state.entry.valueRange.end.line);
+    const line = lineAtClamped(document, state.entry.valueRange.end.line);
     const anchor = new vscode.Position(
       line.lineNumber,
       packageJsonDependencyHintAnchorCharacter(line.text),
@@ -92,7 +92,7 @@ export class PackageJsonDecorationController extends InlineHintDecorationControl
       return null;
     }
 
-    const line = document.lineAt(section.objectRange.start.line);
+    const line = lineAtClamped(document, section.objectRange.start.line);
     const anchor = line.range.end;
     const sectionStates = states.filter((state) => state.section === section.section);
 
@@ -112,6 +112,11 @@ export class PackageJsonDecorationController extends InlineHintDecorationControl
     };
   }
 }
+
+// The ranges come from the analysis of an earlier text, and lines may have been deleted since:
+// `lineAt` past the end throws, which would abandon the whole refresh.
+const lineAtClamped = (document: vscode.TextDocument, line: number): vscode.TextLine =>
+  document.lineAt(Math.max(0, Math.min(line, document.lineCount - 1)));
 
 const tooltipForPackageJsonState = (
   state: PackageJsonDependencyAnalysisState,
