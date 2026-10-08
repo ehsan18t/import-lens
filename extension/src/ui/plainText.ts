@@ -12,7 +12,8 @@ export const plainTextFromMarkdown = (markdown: string): string =>
     .replace(/\[([^\]]*)\]\([^)]*\)/gu, "$1")
     .replace(/\$\([a-z0-9-]+\)\s?/gu, "")
     .replace(/\*\*|__|`/gu, "")
-    .replace(/\\([\\`*_{}[\]()#+\-.!|<>~])/gu, "$1")
+    // CommonMark: a backslash escapes any ASCII punctuation character (`escapeMarkdown`'s output).
+    .replace(/\\([!-/:-@[-`{-~])/gu, "$1")
     .replace(/^[ \t]*- \s*$/gmu, "")
     .replace(/\n{3,}/gu, "\n\n")
     .trim();

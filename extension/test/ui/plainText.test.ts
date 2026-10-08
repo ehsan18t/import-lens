@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ImportResult } from "../../src/ipc/protocol.js";
+import { escapeMarkdown } from "../../src/ui/markdownEscape.js";
 import { plainTextFromMarkdown } from "../../src/ui/plainText.js";
 import { tooltipForResultMarkdown } from "../../src/ui/tooltipMarkdown.js";
 
@@ -34,5 +35,9 @@ test("a rendered import tooltip reads as plain text", () => {
   const text = plainTextFromMarkdown(tooltipForResultMarkdown(result, { compression: "brotli" }));
 
   assert.match(text, /^react\n/u);
+  assert.equal(
+    plainTextFromMarkdown(escapeMarkdown("@scope/a-b_c (1.0.0) $x & ~y")),
+    "@scope/a-b_c (1.0.0) $x & ~y",
+  );
   assert.doesNotMatch(text, /\*\*|\$\(|\]\(/u);
 });
