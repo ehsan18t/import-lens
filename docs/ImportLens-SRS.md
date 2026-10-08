@@ -1365,7 +1365,7 @@ interface RefreshRegistryHintsResponse {
 }
 ```
 
-`RefreshRegistryHintsResponse` may be emitted multiple times for the same `request_id`. Partial responses contain `indexes` for the completed target positions and one result per completed package. The final response omits `indexes` and contains the full ordered result set. A package fetch failure sets `RegistryHintResult.error` for that package and leaves `RefreshRegistryHintsResponse.error` null unless the whole request is invalid. When stale cache fallback is available, `RegistryHintResult.hint` contains the cached metadata and `RegistryHintResult.error` contains the live refresh failure reason.
+`RefreshRegistryHintsResponse` may be emitted multiple times for the same `request_id`. Partial responses contain `indexes` for the completed target positions and one result per completed package. The final response omits `indexes` and contains the ordered result set: every target, except that a block superseded by a newer request for the same `source` leaves out the targets it skipped, because skipped work is not a failure. A package fetch failure sets `RegistryHintResult.error` for that package and leaves `RefreshRegistryHintsResponse.error` null unless the whole request is invalid. When stale cache fallback is available, `RegistryHintResult.hint` contains the cached metadata and `RegistryHintResult.error` contains the live refresh failure reason.
 
 #### WorkspaceReportRequest / WorkspaceReportResponse
 
