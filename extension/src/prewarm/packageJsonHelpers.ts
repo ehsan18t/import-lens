@@ -13,7 +13,11 @@ export interface PackageJsonPrewarmDocument {
 }
 
 export interface PackageJsonPrewarmTarget {
-  prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void;
+  prewarmPackageJson(
+    packageJsonPath: string,
+    activeDocumentPath: string,
+    workspaceRoot: string,
+  ): void;
 }
 
 export const isPackageJsonPath = (filePath: string): boolean =>
@@ -30,11 +34,17 @@ export const packageJsonPrewarmPayload = (filePath: string): PackageJsonPrewarmP
   };
 };
 
-export const prewarmPackageJsonDocuments = (
-  documents: Iterable<PackageJsonPrewarmDocument>,
+/**
+ * Sends a prewarm for every file-backed manifest among `documents`, under the root package.json
+ * analysis of the same document uses: the cache is sharded by workspace root, so a prewarm under
+ * any other root fills a shard interactive analysis never reads.
+ */
+export const prewarmPackageJsonDocuments = async <TDocument extends PackageJsonPrewarmDocument>(
+  documents: Iterable<TDocument>,
   target: PackageJsonPrewarmTarget,
-): number => {
-  let sent = 0;
+  analysisRoot: (document: TDocument) => Promise<string>,
+): Promise<number> => {
+  const sends: Promise<void>[] = [];
 
   for (const document of documents) {
     if (document.uri.scheme !== "file") {
@@ -47,9 +57,17 @@ export const prewarmPackageJsonDocuments = (
       continue;
     }
 
-    target.prewarmPackageJson(payload.packageJsonPath, payload.activeDocumentPath);
-    sent++;
+    sends.push(
+      analysisRoot(document).then((workspaceRoot) => {
+        target.prewarmPackageJson(
+          payload.packageJsonPath,
+          payload.activeDocumentPath,
+          workspaceRoot,
+        );
+      }),
+    );
   }
 
-  return sent;
+  await Promise.all(sends);
+  return sends.length;
 };

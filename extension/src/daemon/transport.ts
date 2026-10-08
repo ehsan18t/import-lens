@@ -63,7 +63,11 @@ export interface AnalysisTransport {
   nodeModulesChanged(packageJsonPaths: readonly string[], tsconfigPaths?: readonly string[]): void;
   /** The documents shown right now. A transport keeps the latest set and replays it on (re)connect. */
   visibleDocuments(documentPaths: readonly string[]): void;
-  prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void;
+  prewarmPackageJson(
+    packageJsonPath: string,
+    activeDocumentPath: string,
+    workspaceRoot: string,
+  ): void;
   shutdown(): Promise<void>;
   dispose(): void | Promise<void>;
 }
@@ -223,8 +227,12 @@ export class TransportCoordinator implements AnalysisTransport {
     }
   }
 
-  prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {
-    this.#activeTransport?.prewarmPackageJson(packageJsonPath, activeDocumentPath);
+  prewarmPackageJson(
+    packageJsonPath: string,
+    activeDocumentPath: string,
+    workspaceRoot: string,
+  ): void {
+    this.#activeTransport?.prewarmPackageJson(packageJsonPath, activeDocumentPath, workspaceRoot);
   }
 
   async shutdown(): Promise<void> {

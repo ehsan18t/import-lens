@@ -374,6 +374,8 @@ export interface PrewarmPackageJsonMessage {
   type: "prewarm_package_json";
   package_json_path: string;
   active_document_path: string;
+  /** The root package.json analysis of this manifest uses, so the prewarm fills the shard it reads. */
+  workspace_root: string;
 }
 
 /**

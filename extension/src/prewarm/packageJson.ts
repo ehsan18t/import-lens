@@ -1,20 +1,55 @@
 import * as vscode from "vscode";
-import type { DaemonManager } from "../daemon/manager.js";
 import type { Logger } from "../logging/types.js";
 import { newlyVisibleDocuments } from "../visibleDocuments.js";
-import { prewarmPackageJsonDocuments } from "./packageJsonHelpers.js";
+import { analysisRootForFile } from "../workspaceContext.js";
+import {
+  type PackageJsonPrewarmTarget,
+  prewarmPackageJsonDocuments,
+} from "./packageJsonHelpers.js";
+
+// The root PackageJsonAnalysisController resolves for the same document.
+const packageJsonAnalysisRoot = (document: vscode.TextDocument): Promise<string> =>
+  analysisRootForFile(
+    document.fileName,
+    vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath,
+  );
+
+/**
+ * Fire-and-forget prewarm of the manifests among `documents`. Resolving each analysis root reads
+ * the file system, so the sends happen asynchronously and a failure is only logged.
+ */
+export const prewarmPackageJsonManifests = (
+  documents: readonly vscode.TextDocument[],
+  target: PackageJsonPrewarmTarget,
+  logger: Pick<Logger, "debug" | "warn">,
+  describeSent: (count: number) => string,
+): void => {
+  prewarmPackageJsonDocuments(documents, target, packageJsonAnalysisRoot).then(
+    (sent) => {
+      if (sent > 0) {
+        logger.debug(describeSent(sent));
+      }
+    },
+    (error: unknown) => {
+      logger.warn(
+        `package.json prewarm failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    },
+  );
+};
 
 export const registerPackageJsonPrewarm = (
   context: vscode.ExtensionContext,
-  daemon: DaemonManager,
-  logger: Pick<Logger, "debug">,
+  target: PackageJsonPrewarmTarget,
+  logger: Pick<Logger, "debug" | "warn">,
 ): void => {
   const sendPrewarm = (documents: readonly vscode.TextDocument[]): void => {
-    const sent = prewarmPackageJsonDocuments(documents, daemon);
-
-    if (sent > 0) {
-      logger.debug(`Sent package.json prewarm for ${sent} manifest(s).`);
-    }
+    prewarmPackageJsonManifests(
+      documents,
+      target,
+      logger,
+      (sent) => `Sent package.json prewarm for ${sent} manifest(s).`,
+    );
   };
 
   // A manifest is prewarmed when it becomes visible or is saved, never merely opened: VS Code and

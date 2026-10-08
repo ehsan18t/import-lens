@@ -18,8 +18,7 @@ import type {
 import { languageSelector } from "./languages.js";
 import { DocumentAnalysisController } from "./listener.js";
 import { ImportLensLogger } from "./logger.js";
-import { registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
-import { prewarmPackageJsonDocuments } from "./prewarm/packageJsonHelpers.js";
+import { prewarmPackageJsonManifests, registerPackageJsonPrewarm } from "./prewarm/packageJson.js";
 import { BudgetDiagnosticsController } from "./ui/budgetDiagnostics.js";
 import {
   clearAllCaches,
@@ -355,13 +354,12 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
         setStatus: (state) =>
           statusBar.setState({ kind: state === "ready" ? "ready" : "unavailable" }),
         prewarmPackageJson: () => {
-          const prewarmCount = prewarmPackageJsonDocuments(
+          prewarmPackageJsonManifests(
             vscode.window.visibleTextEditors.map((editor) => editor.document),
             activeDaemon,
+            logger,
+            (sent) => `Replayed package.json prewarm for ${sent} visible document(s).`,
           );
-          if (prewarmCount > 0) {
-            logger.debug(`Replayed package.json prewarm for ${prewarmCount} visible document(s).`);
-          }
         },
         refreshPackageJsonHints: () => packageJsonAnalysis.refreshVisibleDocuments(),
         refreshPackageJsonDecorations: () => packageJsonDecorations.refreshVisibleEditors(),

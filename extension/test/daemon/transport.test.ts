@@ -252,8 +252,12 @@ class FakeTransport implements AnalysisTransport {
     this.calls.push(`visible:${documentPaths.join(",")}`);
   }
 
-  prewarmPackageJson(packageJsonPath: string): void {
-    this.calls.push(`prewarm:${packageJsonPath}`);
+  prewarmPackageJson(
+    packageJsonPath: string,
+    _activeDocumentPath: string,
+    workspaceRoot: string,
+  ): void {
+    this.calls.push(`prewarm:${packageJsonPath}@${workspaceRoot}`);
   }
 
   async shutdown(): Promise<void> {
@@ -363,7 +367,11 @@ test("TransportCoordinator selects the first ready transport and delegates reque
   await coordinator.listCache(cacheListRequest(12));
   await coordinator.removeCache(cacheRemoveRequest(13));
   coordinator.invalidatePackage("react");
-  coordinator.prewarmPackageJson("/workspace/package.json", "/workspace/package.json");
+  coordinator.prewarmPackageJson(
+    "/workspace/package.json",
+    "/workspace/package.json",
+    "/workspace",
+  );
 
   assert.deepEqual(unavailable.calls, ["start"]);
   assert.deepEqual(ready.calls, [
@@ -373,7 +381,7 @@ test("TransportCoordinator selects the first ready transport and delegates reque
     "listCache:12",
     "removeCache:13:current_project",
     "invalidate:react",
-    "prewarm:/workspace/package.json",
+    "prewarm:/workspace/package.json@/workspace",
   ]);
 });
 

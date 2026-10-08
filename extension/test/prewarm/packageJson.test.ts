@@ -26,28 +26,33 @@ test("packageJsonPrewarmPayload returns null for non-package files", () => {
   assert.equal(packageJsonPrewarmPayload(path.join("workspace", "src", "index.ts")), null);
 });
 
-test("prewarmPackageJsonDocuments sends only file package.json documents", () => {
+test("prewarmPackageJsonDocuments sends file package.json documents under their analysis root", async () => {
   const sent: string[] = [];
   const packageJsonPath = path.join("workspace", "package.json");
-  const nestedPackageJsonPath = path.join("workspace", "packages", "app", "package.json");
+  const secondFolderPackageJsonPath = path.join("other", "packages", "app", "package.json");
+  const analysisRoots = new Map([
+    [packageJsonPath, "workspace"],
+    [secondFolderPackageJsonPath, "other"],
+  ]);
 
-  const count = prewarmPackageJsonDocuments(
+  const count = await prewarmPackageJsonDocuments(
     [
       { uri: { scheme: "file", fsPath: packageJsonPath } },
       { uri: { scheme: "untitled", fsPath: path.join("workspace", "package.json") } },
       { uri: { scheme: "file", fsPath: path.join("workspace", "package-lock.json") } },
-      { uri: { scheme: "file", fsPath: nestedPackageJsonPath } },
+      { uri: { scheme: "file", fsPath: secondFolderPackageJsonPath } },
     ],
     {
-      prewarmPackageJson: (packageJsonPath, activeDocumentPath) => {
-        sent.push(`${packageJsonPath}:${activeDocumentPath}`);
+      prewarmPackageJson: (packageJsonPath, activeDocumentPath, workspaceRoot) => {
+        sent.push(`${packageJsonPath}:${activeDocumentPath}@${workspaceRoot}`);
       },
     },
+    async (document) => analysisRoots.get(document.uri.fsPath) ?? "unexpected",
   );
 
   assert.equal(count, 2);
   assert.deepEqual(sent, [
-    `${packageJsonPath}:${packageJsonPath}`,
-    `${nestedPackageJsonPath}:${nestedPackageJsonPath}`,
+    `${packageJsonPath}:${packageJsonPath}@workspace`,
+    `${secondFolderPackageJsonPath}:${secondFolderPackageJsonPath}@other`,
   ]);
 });

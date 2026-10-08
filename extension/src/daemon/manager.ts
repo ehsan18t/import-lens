@@ -139,8 +139,12 @@ export class DaemonManager implements vscode.Disposable {
     this.#transport.visibleDocuments(documentPaths);
   }
 
-  prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {
-    this.#transport.prewarmPackageJson(packageJsonPath, activeDocumentPath);
+  prewarmPackageJson(
+    packageJsonPath: string,
+    activeDocumentPath: string,
+    workspaceRoot: string,
+  ): void {
+    this.#transport.prewarmPackageJson(packageJsonPath, activeDocumentPath, workspaceRoot);
   }
 
   dispose(): Promise<void> {

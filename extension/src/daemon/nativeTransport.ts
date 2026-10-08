@@ -695,7 +695,11 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
   }
 
-  prewarmPackageJson(packageJsonPath: string, activeDocumentPath: string): void {
+  prewarmPackageJson(
+    packageJsonPath: string,
+    activeDocumentPath: string,
+    workspaceRoot: string,
+  ): void {
     if (!this.#client || this.#state !== "ready") {
       this.#logger.debug(
         `Skipping package.json prewarm because daemon is ${this.#state}: ${packageJsonPath}.`,
@@ -708,6 +712,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       type: "prewarm_package_json",
       package_json_path: packageJsonPath,
       active_document_path: activeDocumentPath,
+      workspace_root: workspaceRoot,
     });
   }
 
