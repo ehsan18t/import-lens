@@ -199,15 +199,41 @@ export class NativeDaemonTransport implements AnalysisTransport {
     // Never orphan a live daemon: it would keep its socket and cache shard lock until it recycles.
     if (this.#process) this.#cleanup();
 
-    const childProcess = this.#launcher.spawn(binaryPath, [
-      "--pipe",
-      pipeName,
-      "--workspace",
-      workspaceRoot,
-      "--storage",
-      storagePaths.lifecycleStoragePath,
-    ]);
+    let childProcess: DaemonChildProcess;
+
+    try {
+      childProcess = this.#launcher.spawn(binaryPath, [
+        "--pipe",
+        pipeName,
+        "--workspace",
+        workspaceRoot,
+        "--storage",
+        storagePaths.lifecycleStoragePath,
+      ]);
+    } catch (error) {
+      this.#logger.warn(
+        `Failed to spawn daemon: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.#handleCrash();
+      return this.#state;
+    }
     this.#process = childProcess;
+
+    // A spawn that fails asynchronously (EACCES, ENOENT) emits only "error", never "exit"; with no
+    // listener it would be an uncaught exception in the extension host. The first one for the
+    // current process takes the failed-startup path; later ones, and those of a replaced process,
+    // are stale because #process no longer points at it.
+    childProcess.on("error", (error) => {
+      if (childProcess !== this.#process) {
+        this.#logger.debug(`Ignoring stale daemon process error: ${error.message}`);
+        return;
+      }
+
+      this.#logger.warn(`Daemon process error: ${error.message}`);
+      this.#startPromise = null;
+      this.#cleanup();
+      this.#handleCrash();
+    });
     this.#logger.info(`Spawned Import Lens daemon process ${childProcess.pid ?? "unknown"}.`);
     pipeDaemonProcessLogs(childProcess, this.#logger);
 

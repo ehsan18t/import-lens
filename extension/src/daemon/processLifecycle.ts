@@ -26,6 +26,7 @@ export interface DaemonLogStreams {
 export interface DaemonChildProcess extends WaitableDaemonProcess, DaemonLogStreams {
   readonly pid?: number | undefined;
   once(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  on(event: "error", listener: (error: Error) => void): this;
 }
 
 type DaemonLogLogger = Pick<Logger, "error" | "warn" | "info" | "debug">;

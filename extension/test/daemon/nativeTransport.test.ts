@@ -69,7 +69,10 @@ interface TransportHarness {
   readonly lines: string[];
 }
 
-const withTransport = async (run: (harness: TransportHarness) => Promise<void>): Promise<void> => {
+const withTransport = async (
+  run: (harness: TransportHarness) => Promise<void>,
+  launcherOverrides: (spawned: FakeDaemonProcess[]) => Partial<DaemonLauncher> = () => ({}),
+): Promise<void> => {
   const root = await mkdtemp(path.join(tmpdir(), "importlens-native-transport-"));
   const spawned: FakeDaemonProcess[] = [];
   const lines: string[] = [];
@@ -80,7 +83,7 @@ const withTransport = async (run: (harness: TransportHarness) => Promise<void>):
     () => {
       throw new Error("config is only read after a daemon connects");
     },
-    refusingLauncher(spawned),
+    { ...refusingLauncher(spawned), ...launcherOverrides(spawned) },
   );
 
   try {
@@ -176,4 +179,49 @@ test("a tripped crash breaker holds degraded mode until an explicit restart", as
     await transport.start(root);
     assert.equal(spawned.length, 4);
   });
+});
+
+test("a spawn that fails asynchronously counts one crash without waiting for connect", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+
+  await withTransport(
+    async ({ transport, root, lines }) => {
+      const pending = transport.start(root);
+      await until(() => countLines(lines, "Restarting daemon in") === 1);
+      assert.equal(countLines(lines, "Failed to connect"), 0);
+
+      // The failed spawn's connect timeout and the restart both fire; only the restart's own
+      // failed spawn may count as a second crash.
+      t.mock.timers.tick(2000);
+      assert.equal(await pending, "unavailable");
+      await until(() => countLines(lines, "Restarting daemon in") === 2);
+      assert.equal(countLines(lines, "crashed three times"), 0);
+    },
+    (spawned) => ({
+      spawn: () => {
+        const child = new FakeDaemonProcess();
+        spawned.push(child);
+        process.nextTick(() => child.emit("error", new Error("spawn EACCES")));
+        return child;
+      },
+      connect: () =>
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("connect timed out")), 2000);
+        }),
+    }),
+  );
+});
+
+test("a spawn that throws leaves the daemon unavailable and schedules a restart", async () => {
+  await withTransport(
+    async ({ transport, root, lines }) => {
+      assert.equal(await transport.start(root), "unavailable");
+      assert.equal(countLines(lines, "Restarting daemon in"), 1);
+    },
+    () => ({
+      spawn: () => {
+        throw new Error("spawn EINVAL");
+      },
+    }),
+  );
 });
