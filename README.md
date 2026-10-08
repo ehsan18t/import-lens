@@ -120,7 +120,7 @@ Open any `package.json` and Import Lens annotates dependency blocks as results s
   }
   ```
 
-- **The CI gate**, `importlens check`, analyzes files changed in `git diff HEAD` against budgets from `.importlensrc.json` (`{ "budgets": { … } }`) or `package.json` (`{ "importLens": { "budgets": { … } } }`). It exits non-zero on violations and uses the same native daemon for real Brotli sizes.
+- **The CI gate**, `importlens check`, analyzes changed files (tracked changes against `HEAD`, or with `--base <ref>` everything since the branch left `<ref>`, plus untracked files) against budgets from `.importlensrc.json` (`{ "budgets": { … } }`) or `package.json` (`{ "importLens": { "budgets": { … } } }`). It exits non-zero on violations and uses the same native daemon for real Brotli sizes. In CI pass the pull request's target, for example `importlens check --base origin/main`, and fetch enough history for git to find the merge base: a CI checkout has nothing uncommitted, so a diff against `HEAD` finds no files.
 - **`Import Lens: Compare Imports`** compares comma-separated package imports side by side, sorted by Brotli size.
 - **History** builds up automatically: `Show Current File Size` records deduplicated file totals, and `Show Bundle Impact History` charts them over time in a script-free SVG panel.
 

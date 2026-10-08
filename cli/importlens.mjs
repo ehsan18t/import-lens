@@ -38,6 +38,7 @@ export const parseCliArgs = (argv) => {
   }
 
   let configPath;
+  let base;
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index];
 
@@ -50,10 +51,19 @@ export const parseCliArgs = (argv) => {
       continue;
     }
 
+    if (arg === "--base") {
+      base = rest[index + 1];
+      if (!base) {
+        throw new Error("--base requires a git ref");
+      }
+      index += 1;
+      continue;
+    }
+
     throw new Error(`Unknown option: ${arg}\n${usage()}`);
   }
 
-  return { command, configPath };
+  return { command, configPath, base };
 };
 
 export const loadBudgetConfig = async ({
@@ -295,7 +305,7 @@ const main = async () => {
   const cwd = process.cwd();
   const budgets = await loadBudgetConfig({ configPath: args.configPath });
   const { topLevel, files } = hasBudgets(budgets)
-    ? await changedFiles(cwd)
+    ? await changedFiles(cwd, { base: args.base })
     : { topLevel: cwd, files: [] };
   const supportedFiles = files.filter((filePath) =>
     supportedExtensions.has(path.extname(filePath)),
@@ -350,34 +360,55 @@ const findDefaultBudgetConfig = async (readText) => {
   return null;
 };
 
-export const changedFiles = async (cwd) => {
-  // `git diff --name-only` prints repository-root-relative paths regardless of
-  // cwd, so file resolution must anchor at the git top level, not the
-  // invocation directory (budget discovery stays cwd-scoped).
-  //
-  // `-z` with `core.quotePath=false`: by default git C-quotes a non-ASCII path (`"caf\303\251.ts"`),
-  // whose extension then reads `.ts"` and the file is silently dropped from the gate.
-  const [{ stdout: diff }, { stdout: topLevel }] = await Promise.all([
-    execFile(
-      "git",
-      [
-        "-c",
-        "core.quotePath=false",
-        "diff",
-        "--name-only",
-        "-z",
-        "--diff-filter=ACMRTUXB",
-        "HEAD",
-        "--",
-      ],
-      { cwd },
-    ),
+/**
+ * The git invocations that name a run's changed files. Without a base the diff is against `HEAD`,
+ * which in a CI checkout equals the working tree and so finds nothing; `--merge-base <ref>` diffs
+ * the working tree against the point the branch left `<ref>`, which is what a pull request changed.
+ * Untracked, not-ignored files are listed in both modes, because a new file is a change too.
+ *
+ * Every path is repository-root-relative: `git diff` prints them that way regardless of cwd, and
+ * `--full-name` with the `:/` pathspec makes `ls-files` match from any subdirectory.
+ *
+ * `-z` with `core.quotePath=false`: by default git C-quotes a non-ASCII path (`"caf\303\251.ts"`),
+ * whose extension then reads `.ts"` and the file is silently dropped from the gate.
+ */
+const changedFilesGitArgs = ({ base } = {}) => ({
+  diff: [
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    "--name-only",
+    "-z",
+    "--diff-filter=ACMRTUXB",
+    ...(base === undefined ? ["HEAD"] : ["--merge-base", base]),
+    "--",
+  ],
+  untracked: [
+    "-c",
+    "core.quotePath=false",
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "--full-name",
+    "-z",
+    "--",
+    ":/",
+  ],
+});
+
+export const changedFiles = async (cwd, { base } = {}) => {
+  // Paths are repository-root-relative, so file resolution must anchor at the git top level, not
+  // the invocation directory (budget discovery stays cwd-scoped).
+  const args = changedFilesGitArgs({ base });
+  const [{ stdout: diff }, { stdout: untracked }, { stdout: topLevel }] = await Promise.all([
+    execFile("git", args.diff, { cwd }),
+    execFile("git", args.untracked, { cwd }),
     execFile("git", ["rev-parse", "--show-toplevel"], { cwd }),
   ]);
 
   return {
     topLevel: topLevel.trim(),
-    files: diff.split("\0").filter(Boolean),
+    files: [...new Set([...diff.split("\0"), ...untracked.split("\0")].filter(Boolean))],
   };
 };
 
@@ -889,7 +920,7 @@ const formatBytes = (bytes) => {
   return `${(bytes / 1000).toFixed(1)} kB`;
 };
 
-const usage = () => "Usage: importlens check [--config <path>]";
+const usage = () => "Usage: importlens check [--config <path>] [--base <ref>]";
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {

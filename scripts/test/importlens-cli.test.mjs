@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -50,12 +50,17 @@ const frame = (message) => {
 };
 
 test("parseCliArgs supports importlens check and optional config", () => {
-  assert.deepEqual(parseCliArgs(["check"]), { command: "check", configPath: undefined });
-  assert.deepEqual(parseCliArgs(["check", "--config", ".importlensrc.json"]), {
+  assert.deepEqual(parseCliArgs(["check"]), {
     command: "check",
-    configPath: ".importlensrc.json",
+    configPath: undefined,
+    base: undefined,
   });
+  assert.deepEqual(
+    parseCliArgs(["check", "--config", ".importlensrc.json", "--base", "origin/main"]),
+    { command: "check", configPath: ".importlensrc.json", base: "origin/main" },
+  );
   assert.throws(() => parseCliArgs([]), /Usage:/u);
+  assert.throws(() => parseCliArgs(["check", "--base"]), /--base requires a git ref/u);
 });
 
 test("loadBudgetConfig rejects malformed budget config", async () => {
@@ -757,6 +762,41 @@ test("changedFiles reads a non-ASCII path git would quote", async () => {
 
     const { files } = await changedFiles(workspace);
     assert.deepEqual(files, ["café.ts"]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+// The CI shape: the branch's changes are committed, so the working tree equals HEAD and a diff
+// against HEAD finds none of them.
+test("changedFiles diffs against a base ref's merge base and lists untracked files", async () => {
+  const workspace = gitWorkspace();
+  try {
+    git(workspace, "checkout", "-q", "-b", "feature");
+    mkdirSync(path.join(workspace, "src"));
+    writeFileSync(path.join(workspace, "src", "committed.ts"), "export {};\n");
+    git(workspace, "add", ".");
+    git(workspace, "commit", "-q", "-m", "feature");
+    git(workspace, "checkout", "-q", "main");
+    writeFileSync(path.join(workspace, "main-only.ts"), "export {};\n");
+    git(workspace, "add", ".");
+    git(workspace, "commit", "-q", "-m", "main moves on");
+    git(workspace, "checkout", "-q", "feature");
+    writeFileSync(path.join(workspace, "src", "untracked.ts"), "export {};\n");
+    writeFileSync(path.join(workspace, ".gitignore"), "ignored.ts\n");
+    writeFileSync(path.join(workspace, "ignored.ts"), "export {};\n");
+
+    // Run from a subdirectory: every path must still be repository-root-relative.
+    const subdirectory = path.join(workspace, "src");
+    const sinceBase = await changedFiles(subdirectory, { base: "main" });
+    assert.deepEqual(sinceBase.files.sort(), [
+      ".gitignore",
+      "src/committed.ts",
+      "src/untracked.ts",
+    ]);
+
+    const sinceHead = await changedFiles(subdirectory);
+    assert.deepEqual(sinceHead.files.sort(), [".gitignore", "src/untracked.ts"]);
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }
