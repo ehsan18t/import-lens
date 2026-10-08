@@ -99,43 +99,18 @@ export const changedLinesForFile = async (
   fileName: string,
   currentText: string,
 ): Promise<Set<number>> => {
-  if (!(await isGitRepository(fileName))) {
-    return new Set();
-  }
-
   try {
-    const directory = path.dirname(fileName);
-    const { stdout: topLevel } = await execFileAsync(
-      "git",
-      ["-C", directory, "rev-parse", "--show-toplevel"],
-      { encoding: "utf8", timeout: 500 },
-    );
-    const relativePath = path.relative(topLevel.trim(), fileName).split(path.sep).join("/");
+    // One process per analysis, which runs on every debounced edit: `HEAD:./<name>` resolves the
+    // path against `-C`, so neither a work-tree probe nor a top-level lookup is needed. Outside a
+    // repository, or for a file HEAD does not hold, git exits non-zero and the result is empty.
     const { stdout: baseText } = await execFileAsync(
       "git",
-      ["-C", directory, "show", `HEAD:${relativePath}`],
+      ["-C", path.dirname(fileName), "show", `HEAD:./${path.basename(fileName)}`],
       { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 1500 },
     );
 
     return changedLinesBetween(baseText, currentText);
   } catch {
     return new Set();
-  }
-};
-
-const isGitRepository = async (fileName: string): Promise<boolean> => {
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-C", path.dirname(fileName), "rev-parse", "--is-inside-work-tree"],
-      {
-        encoding: "utf8",
-        timeout: 500,
-      },
-    );
-
-    return stdout.trim() === "true";
-  } catch {
-    return false;
   }
 };

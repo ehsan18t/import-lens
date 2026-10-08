@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { changedLinesBetween } from "../../src/analysis/gitDiff.js";
+import { changedLinesBetween, changedLinesForFile } from "../../src/analysis/gitDiff.js";
 
 const sorted = (lines: Set<number>): number[] => [...lines].sort((left, right) => left - right);
 
@@ -38,4 +42,43 @@ test("identical inputs mark nothing", () => {
 
 test("a byte-order mark on the committed text is not a change", () => {
   assert.equal(changedLinesBetween("﻿import a from 'a';\nb\n", "import a from 'a';\nb\n").size, 0);
+});
+
+test("changedLinesForFile diffs a nested tracked file against HEAD and ignores untracked ones", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "import-lens-gitdiff-"));
+  try {
+    const git = (...args: string[]): void => {
+      execFileSync("git", ["-C", root, "-c", "user.name=t", "-c", "user.email=t@t", ...args]);
+    };
+    git("init", "-q");
+    await mkdir(path.join(root, "src"));
+    const tracked = path.join(root, "src", "a.ts");
+    const committed = "import a from 'a';\nconst x = 1;\n";
+    await writeFile(tracked, committed);
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+
+    assert.equal((await changedLinesForFile(tracked, committed)).size, 0);
+    assert.deepEqual(
+      sorted(
+        await changedLinesForFile(
+          tracked,
+          "import a from 'a';\nimport b from 'b';\nconst x = 1;\n",
+        ),
+      ),
+      [1],
+    );
+    assert.equal((await changedLinesForFile(path.join(root, "src", "new.ts"), "x\n")).size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("changedLinesForFile outside a repository reports no changed lines", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "import-lens-nogit-"));
+  try {
+    assert.equal((await changedLinesForFile(path.join(root, "a.ts"), "x\n")).size, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
