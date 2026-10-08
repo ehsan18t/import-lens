@@ -113,6 +113,10 @@ export class AnalysisStore implements vscode.Disposable {
     return this.#documents.all();
   }
 
+  documentUris(): vscode.Uri[] {
+    return this.#documents.keys().map((key) => vscode.Uri.parse(key));
+  }
+
   dispose(): void {
     this.#onDidChange.dispose();
   }

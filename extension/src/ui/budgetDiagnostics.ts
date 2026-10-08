@@ -15,9 +15,23 @@ export class BudgetDiagnosticsController implements vscode.Disposable {
     this.#subscription = this.#store.onDidChange((uri) => this.refreshUri(uri));
   }
 
-  refreshVisibleEditors(): void {
-    for (const editor of vscode.window.visibleTextEditors) {
-      this.refreshUri(editor.document.uri);
+  /**
+   * Re-judge every document that has a warning or stored states, not only the visible ones: the
+   * Problems panel lists background documents too, and a budget change (or disabling the extension)
+   * must not leave their warnings standing against the old limit.
+   */
+  refreshAll(): void {
+    const uris = new Map<string, vscode.Uri>();
+
+    this.#collection.forEach((uri) => {
+      uris.set(uri.toString(), uri);
+    });
+    for (const uri of this.#store.documentUris()) {
+      uris.set(uri.toString(), uri);
+    }
+
+    for (const uri of uris.values()) {
+      this.refreshUri(uri);
     }
   }
 

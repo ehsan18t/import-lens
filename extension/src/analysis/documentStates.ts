@@ -199,6 +199,10 @@ export class DocumentAnalysisStates {
     return [...this.#states.values()].flat();
   }
 
+  keys(): string[] {
+    return [...this.#states.keys()];
+  }
+
   /**
    * `refine` overrides the push's own: {@link set} passes the analysis's refiner when it replays a
    * push, and the live merge (no override) uses the one the push arrived with.
