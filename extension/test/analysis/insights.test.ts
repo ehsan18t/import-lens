@@ -69,7 +69,7 @@ const measuredHistoryItem = (
   resultValue: ImportResult,
   timestamp: number,
 ): ImportCostHistoryItem => {
-  const item = importCostHistoryItem(detectedImportValue, resultValue, timestamp);
+  const item = importCostHistoryItem(detectedImportValue, resultValue, "/workspace", timestamp);
   assert.ok(item, "the fixture result must be measured");
   return item;
 };
@@ -85,7 +85,11 @@ const readyState = (
 
 test("re-applying insights replaces rather than accumulates", () => {
   const base = readyState({}, { brotli_bytes: 50_000 });
-  const options = { importCostHistory: [], budgets: { perImportBrotliBytes: 10_000 } };
+  const options = {
+    projectRoot: "/workspace",
+    importCostHistory: [],
+    budgets: { perImportBrotliBytes: 10_000 },
+  };
 
   const once = applyImportAnalysisInsights([base], options);
   const twice = applyImportAnalysisInsights(once, options);
@@ -97,18 +101,23 @@ test("re-applying insights replaces rather than accumulates", () => {
 test("re-applying insights clears entries whose inputs no longer produce them", () => {
   const base = readyState({}, { brotli_bytes: 50_000 });
   const over = applyImportAnalysisInsights([base], {
+    projectRoot: "/workspace",
     importCostHistory: [],
     budgets: { perImportBrotliBytes: 10_000 },
   });
   assert.ok((over[0].insights ?? []).some((insight) => insight.label === "over budget"));
 
-  const relaxed = applyImportAnalysisInsights(over, { importCostHistory: [] });
+  const relaxed = applyImportAnalysisInsights(over, {
+    projectRoot: "/workspace",
+    importCostHistory: [],
+  });
   assert.equal((relaxed[0].insights ?? []).length, 0);
 });
 
 test("applyImportAnalysisInsights adds working-tree import cost deltas", () => {
   const [state] = applyImportAnalysisInsights([readyState()], {
     changedLines: new Set([4]),
+    projectRoot: "/workspace",
     importCostHistory: [],
   });
 
@@ -135,7 +144,7 @@ test("applyImportAnalysisInsights explains shared dependency modules", () => {
         },
       ),
     ],
-    { importCostHistory: [] },
+    { projectRoot: "/workspace", importCostHistory: [] },
   );
 
   assert.match(states[0]?.insights?.[0]?.tooltip ?? "", /my-ui-lib/u);
@@ -172,7 +181,7 @@ test("applyImportAnalysisInsights names the sibling import that shares the same 
       { detected: detected(reactDefaultDetected), status: "ready", result: reactResult() },
       { detected: detected(reactNamedDetected), status: "ready", result: reactResult() },
     ],
-    { importCostHistory: [] },
+    { projectRoot: "/workspace", importCostHistory: [] },
   );
 
   const defaultTooltip = states[0]?.insights?.[0]?.tooltip ?? "";
@@ -210,7 +219,10 @@ test("the shared-dependency tooltip works on a COLD document, where results arri
   const merged = mergeRefreshedResults(cold, [reactResult(), reactResult()], {
     identities: [identity("default", []), identity("named", ["useState"])],
   });
-  const states = applyImportAnalysisInsights(merged.next, { importCostHistory: [] });
+  const states = applyImportAnalysisInsights(merged.next, {
+    projectRoot: "/workspace",
+    importCostHistory: [],
+  });
 
   assert.equal(merged.changed, true);
   assert.match(
@@ -244,7 +256,7 @@ test("applyImportAnalysisInsights still reports sharing outside the public top-m
         },
       ),
     ],
-    { importCostHistory: [] },
+    { projectRoot: "/workspace", importCostHistory: [] },
   );
 
   assert.match(
@@ -279,7 +291,7 @@ test("applyImportAnalysisInsights does not name a cross-runtime import as a shar
         { specifier: "client-gamma", shared_bytes: 0, module_breakdown: [sharedModule] },
       ),
     ],
-    { importCostHistory: [] },
+    { projectRoot: "/workspace", importCostHistory: [] },
   );
 
   const tooltip = states[0]?.insights?.[0]?.tooltip ?? "";
@@ -308,7 +320,7 @@ test("applyImportAnalysisInsights warns about barrel re-export boundaries", () =
         { truly_treeshakeable: false },
       ),
     ],
-    { importCostHistory: [] },
+    { projectRoot: "/workspace", importCostHistory: [] },
   );
 
   assert.equal(insightLabelSuffix(state.insights), " · barrel");
@@ -318,6 +330,7 @@ test("applyImportAnalysisInsights warns about barrel re-export boundaries", () =
 test("applyImportAnalysisInsights adds import cost history trends", () => {
   const previous = measuredHistoryItem(detected(), result({ brotli_bytes: 1200 }), 1_700_000);
   const [state] = applyImportAnalysisInsights([readyState()], {
+    projectRoot: "/workspace",
     importCostHistory: [previous],
   });
 
@@ -325,12 +338,25 @@ test("applyImportAnalysisInsights adds import cost history trends", () => {
   assert.match(state.insights?.[0]?.tooltip ?? "", /\+300 B/u);
 });
 
+test("another project's measurement of the same import is not a trend", () => {
+  const previous = measuredHistoryItem(detected(), result({ brotli_bytes: 1200 }), 1_700_000);
+  const [state] = applyImportAnalysisInsights([readyState()], {
+    projectRoot: "/another-project",
+    importCostHistory: [previous],
+  });
+
+  assert.equal(
+    (state.insights ?? []).some((insight) => insight.tooltip.startsWith("History:")),
+    false,
+  );
+});
+
 test("recordImportCostHistory skips unchanged consecutive import entries", async () => {
   const store = new MemoryStore();
   const first = measuredHistoryItem(detected(), result(), 1_700_000);
 
-  await recordImportCostHistory(store, [readyState()], 1_700_000);
-  await recordImportCostHistory(store, [readyState()], 1_800_000);
+  await recordImportCostHistory(store, [readyState()], "/workspace", 1_700_000);
+  await recordImportCostHistory(store, [readyState()], "/workspace", 1_800_000);
 
   assert.deepEqual(store.get<ImportCostHistoryItem[]>(importCostHistoryKey, []), [first]);
 });

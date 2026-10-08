@@ -164,8 +164,20 @@ export const previousBundleImpactForFile = (
   fileName: string,
 ): BundleImpactHistoryItem | undefined => history.find((item) => item.fileName === fileName);
 
-export const importCostHistoryIdentity = (detected: DetectedImport): string =>
-  [detected.specifier, detected.importKind, detected.runtime, detected.named.join(",")].join("\0");
+/**
+ * One row per import per PROJECT. The same specifier resolves to a different install in another
+ * project (react 17 in one, react 19 in the next), and the history is global storage: keyed by the
+ * import alone, opening the second project would caption its import with the first project's size
+ * as a trend.
+ */
+export const importCostHistoryIdentity = (detected: DetectedImport, projectRoot: string): string =>
+  [
+    projectRoot,
+    detected.specifier,
+    detected.importKind,
+    detected.runtime,
+    detected.named.join(","),
+  ].join("\0");
 
 /**
  * The history row an import result contributes — or `undefined` when that result may not be written
@@ -187,6 +199,7 @@ export const importCostHistoryIdentity = (detected: DetectedImport): string =>
 export const importCostHistoryItem = (
   detected: DetectedImport,
   result: ImportResult,
+  projectRoot: string,
   timestamp: number = Date.now(),
 ): ImportCostHistoryItem | undefined => {
   if (!isDurableImportResult(result)) {
@@ -200,7 +213,7 @@ export const importCostHistoryItem = (
   }
 
   return {
-    identity: importCostHistoryIdentity(detected),
+    identity: importCostHistoryIdentity(detected, projectRoot),
     timestamp,
     specifier: detected.specifier,
     importKind: detected.importKind,
@@ -217,8 +230,9 @@ export const importCostHistoryItem = (
 export const previousImportCostFor = (
   history: readonly ImportCostHistoryItem[],
   detected: DetectedImport,
+  projectRoot: string,
 ): ImportCostHistoryItem | undefined =>
-  history.find((item) => item.identity === importCostHistoryIdentity(detected));
+  history.find((item) => item.identity === importCostHistoryIdentity(detected, projectRoot));
 
 export const importCostHistoryDeltaLabel = (
   current: ImportCostHistoryItem,
@@ -242,11 +256,14 @@ export const importCostHistoryDeltaLabel = (
  */
 export const importCostHistoryItemsForStates = (
   states: readonly ImportCostHistorySource[],
+  projectRoot: string,
   now: number = Date.now(),
 ): ImportCostHistoryItem[] =>
   states
     .filter((state) => state.status === "ready" && state.result !== undefined)
-    .map((state) => importCostHistoryItem(state.detected, state.result as ImportResult, now))
+    .map((state) =>
+      importCostHistoryItem(state.detected, state.result as ImportResult, projectRoot, now),
+    )
     .filter((item): item is ImportCostHistoryItem => item !== undefined);
 
 /**
@@ -275,10 +292,11 @@ let historyWriteChain: Promise<void> = Promise.resolve();
 export const recordImportCostHistory = (
   store: BundleImpactHistoryStore,
   states: readonly ImportCostHistorySource[],
+  projectRoot: string,
   now: number = Date.now(),
   limit = 200,
 ): Promise<void> => {
-  const items = importCostHistoryItemsForStates(states, now);
+  const items = importCostHistoryItemsForStates(states, projectRoot, now);
 
   // Serialize writes so concurrent analyses (e.g. switching tabs while a
   // previous file's analysis is still in flight) do not read-modify-write the

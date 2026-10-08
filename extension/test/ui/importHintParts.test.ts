@@ -57,7 +57,7 @@ const readyState = (overrides: Partial<ImportAnalysisState> = {}): ImportAnalysi
 test("importHintParts splits size, tags, and insight suffixes", () => {
   const [withInsights] = applyImportAnalysisInsights(
     [readyState({ result: result({ is_cjs: true, confidence: "low" }) })],
-    { changedLines: new Set([0]), importCostHistory: [] },
+    { changedLines: new Set([0]), projectRoot: "/workspace", importCostHistory: [] },
   );
 
   const parts = importHintParts(withInsights, config());
@@ -91,6 +91,7 @@ test("importHintParts returns neutral loading and missing states", () => {
 
 test("importHintParts maps budget insight to alert tone", () => {
   const [state] = applyImportAnalysisInsights([readyState()], {
+    projectRoot: "/workspace",
     importCostHistory: [],
     budgets: { perImportBrotliBytes: 1000 },
   });

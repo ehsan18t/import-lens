@@ -151,6 +151,7 @@ test("no durable store takes a transient outcome, in any of its shapes", async (
       await recordImportCostHistory(
         store,
         [stateFor("lodash-es", shape), stateFor("dayjs", measured)],
+        "/workspace",
         1_000,
       );
 
@@ -243,6 +244,7 @@ test("a measured asset I/O fallback is not durable", async () => {
   await recordImportCostHistory(
     store,
     [stateFor("asset-lib", assetIoFallback), stateFor("dayjs", measured)],
+    "/workspace",
     1_000,
   );
   assert.deepEqual(
@@ -254,6 +256,7 @@ test("a measured asset I/O fallback is not durable", async () => {
 test("the persisted import-cost history records only what was measured", () => {
   const items = importCostHistoryItemsForStates(
     [stateFor("lodash-es", failedToParse), stateFor("dayjs", measured)],
+    "/workspace",
     1_000,
   );
 

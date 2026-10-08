@@ -302,11 +302,12 @@ test("`set` captions a replayed push with the analysis's insight inputs, not the
   const analysisRefine = (states: ImportAnalysisState[]): ImportAnalysisState[] =>
     applyImportAnalysisInsights(states, {
       changedLines: new Set([0]),
+      projectRoot: "/workspace",
       importCostHistory: [],
     });
   // What the push captured: the analysis had not run its `git diff` yet when it landed.
   const pushRefine = (states: ImportAnalysisState[]): ImportAnalysisState[] =>
-    applyImportAnalysisInsights(states, { importCostHistory: [] });
+    applyImportAnalysisInsights(states, { projectRoot: "/workspace", importCostHistory: [] });
 
   // The analysis stores its response's states...
   documents.set(documentKey, stateFor(loadingResponse(12)), 12, analysisRefine);

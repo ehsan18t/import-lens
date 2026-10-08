@@ -14,6 +14,8 @@ import type { ImportAnalysisInsight, ImportAnalysisState } from "./state.js";
 export interface ImportAnalysisInsightOptions {
   changedLines?: ReadonlySet<number>;
   importCostHistory: readonly ImportCostHistoryItem[];
+  /** The analysis root the states were measured under; history rows are per project. */
+  projectRoot: string;
   budgets?: ImportLensBudgets;
   now?: number;
 }
@@ -36,7 +38,7 @@ export const applyImportAnalysisInsights = (
       budgetInsightForState(state, options.budgets ?? {}),
       sharedDependencyInsight(state, sharedModules),
       barrelReexportInsight(state),
-      historyTrendInsight(state, options.importCostHistory, options.now),
+      historyTrendInsight(state, options.importCostHistory, options.projectRoot, options.now),
     ].filter((insight): insight is ImportAnalysisInsight => Boolean(insight));
 
     // Insights are derived entirely from the current state and options, so
@@ -180,6 +182,7 @@ const barrelReexportInsight = (state: ImportAnalysisState): ImportAnalysisInsigh
 const historyTrendInsight = (
   state: ImportAnalysisState,
   history: readonly ImportCostHistoryItem[],
+  projectRoot: string,
   now: number | undefined,
 ): ImportAnalysisInsight | null => {
   const result = state.result;
@@ -188,12 +191,12 @@ const historyTrendInsight = (
     return null;
   }
 
-  const previous = previousImportCostFor(history, state.detected);
+  const previous = previousImportCostFor(history, state.detected, projectRoot);
   if (!previous) {
     return null;
   }
 
-  const current = importCostHistoryItem(state.detected, result, now);
+  const current = importCostHistoryItem(state.detected, result, projectRoot, now);
   if (!current) {
     return null;
   }

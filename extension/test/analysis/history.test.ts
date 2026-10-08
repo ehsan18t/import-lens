@@ -160,8 +160,8 @@ test("concurrent import-cost history writes both persist", async () => {
   const store = new SlowStore();
 
   await Promise.all([
-    recordImportCostHistory(store, [costSource("react", 100)]),
-    recordImportCostHistory(store, [costSource("lodash-es", 200)]),
+    recordImportCostHistory(store, [costSource("react", 100)], "/workspace"),
+    recordImportCostHistory(store, [costSource("lodash-es", 200)], "/workspace"),
   ]);
 
   const specifiers = store
@@ -174,8 +174,8 @@ test("concurrent import-cost history writes both persist", async () => {
 test("recording a changed import cost keeps one row per identity", async () => {
   const store = new MemoryStore();
 
-  await recordImportCostHistory(store, [costSource("react", 100)]);
-  await recordImportCostHistory(store, [costSource("react", 150)]);
+  await recordImportCostHistory(store, [costSource("react", 100)], "/workspace");
+  await recordImportCostHistory(store, [costSource("react", 150)], "/workspace");
 
   const rows = store
     .get<ImportCostHistoryItem[]>(importCostHistoryKey, [])

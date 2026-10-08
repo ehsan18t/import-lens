@@ -164,7 +164,9 @@ export class DocumentAnalysisController implements vscode.Disposable {
       generation === undefined ? true : this.#freshness.isCurrent(documentKey, generation);
     const config = getImportLensConfig();
     const changedLines = this.#changedLines.get(documentKey);
-    const importCostHistory = this.#generationHistory(documentKey);
+    // Stored states always have the context of the analysis that stored them; a push with none to
+    // caption against merges uncaptioned and writes no history row.
+    const context = this.#analysisContexts.get(documentKey);
 
     this.#store.applyRefreshedResults(uri, results, {
       identities,
@@ -173,12 +175,15 @@ export class DocumentAnalysisController implements vscode.Disposable {
       // same socket chunk as its own response is re-applied by the `set` that stores that
       // response's states — and only by that one.
       generation,
-      refine: (states) =>
-        applyImportAnalysisInsights(states, {
-          changedLines,
-          importCostHistory,
-          budgets: config.budgets,
-        }),
+      refine: context
+        ? (states) =>
+            applyImportAnalysisInsights(states, {
+              changedLines,
+              importCostHistory: context.history,
+              projectRoot: context.workspaceRoot,
+              budgets: config.budgets,
+            })
+        : undefined,
     });
 
     // A streamed import is the first time its size is ever known, so this is where its
@@ -186,14 +191,18 @@ export class DocumentAnalysisController implements vscode.Disposable {
     // `recordImportCostHistory` serializes its writes and skips unchanged rows, so a push
     // that merged nothing costs nothing.
     if (isCurrent) {
-      // The STORE applies the gate — it takes the states, not rows built for it.
-      void recordImportCostHistory(this.#historyStore, this.#store.get(uri)).catch(
-        (error: unknown) => {
+      if (context) {
+        // The STORE applies the gate — it takes the states, not rows built for it.
+        void recordImportCostHistory(
+          this.#historyStore,
+          this.#store.get(uri),
+          context.workspaceRoot,
+        ).catch((error: unknown) => {
           this.#logger.warn(
             `Import history update failed: ${error instanceof Error ? error.message : String(error)}`,
           );
-        },
-      );
+        });
+      }
       this.refetchFileSizeWhenSettled(uri, generation);
     }
   }
@@ -266,14 +275,15 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
       this.setStatusForActive(document, { kind: "computing" });
       this.#logger.debug(`Starting document analysis request ${requestId}.`);
-      // What a streamed push will need to re-read the File Cost when the document settles: a push
-      // knows only the document's path.
+      // What a streamed push will need to re-read the File Cost when the document settles, and to
+      // caption what it carries: a push knows only the document's path.
+      const history = this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
       this.#analysisContexts.set(documentKey, {
         document,
         workspaceRoot,
         generation: requestId,
         reads: initialFileSizeReadState,
-        history: this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []),
+        history,
       });
 
       const resultLogger = new ImportResultLogTracker(
@@ -336,7 +346,6 @@ export class DocumentAnalysisController implements vscode.Disposable {
       // captions arrive together, below, when the inputs they are derived from do.
       this.#store.set(document.uri, responseStates, requestId);
 
-      const history = this.#generationHistory(documentKey);
       const changedLines = await changedLinesPromise;
 
       if (!this.#freshness.isCurrent(documentKey, requestId)) {
@@ -357,11 +366,12 @@ export class DocumentAnalysisController implements vscode.Disposable {
         applyImportAnalysisInsights(states, {
           changedLines,
           importCostHistory: history,
+          projectRoot: workspaceRoot,
           budgets: config.budgets,
         });
       this.#store.set(document.uri, refine(currentStates), requestId, refine);
       try {
-        await recordImportCostHistory(this.#historyStore, currentStates);
+        await recordImportCostHistory(this.#historyStore, currentStates, workspaceRoot);
       } catch (error) {
         this.#logger.warn(
           `Import history update failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -499,30 +509,24 @@ export class DocumentAnalysisController implements vscode.Disposable {
     const budgets = getImportLensConfig().budgets;
 
     for (const document of documents) {
+      const documentKey = document.uri.toString();
       const states = this.#store.get(document.uri);
+      const context = this.#analysisContexts.get(documentKey);
 
-      if (states.length === 0) {
+      if (states.length === 0 || !context) {
         continue;
       }
 
-      const documentKey = document.uri.toString();
       this.#store.replace(
         document.uri,
         applyImportAnalysisInsights(states, {
           changedLines: this.#changedLines.get(documentKey),
-          importCostHistory: this.#generationHistory(documentKey),
+          importCostHistory: context.history,
+          projectRoot: context.workspaceRoot,
           budgets,
         }),
       );
     }
-  }
-
-  /** The history the document's current generation compares against; the live store only when no analysis has opened one. */
-  #generationHistory(documentKey: string): readonly ImportCostHistoryItem[] {
-    return (
-      this.#analysisContexts.get(documentKey)?.history ??
-      this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, [])
-    );
   }
 
   /** Clear a document whose analysis could not run, unless a newer analysis owns it by now. */
