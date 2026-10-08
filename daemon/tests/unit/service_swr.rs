@@ -1,10 +1,9 @@
-use super::{ImportLensService, revalidated_with_shared_bytes};
+use super::{ImportLensService, MeasuredImport, revalidated_with_shared_bytes};
 use crate::{
     cache::key::cache_key_for_resolved_import,
     ipc::protocol::{
-        DetectedImport, FileSizeDocumentRequest, ImportAnalysisItem, ImportAnalysisStatus,
-        ImportKind, ImportResult, MeasuredSizes, ModuleContribution, PROTOCOL_VERSION,
-        RefreshedImportIdentity,
+        DetectedImport, FileSizeDocumentRequest, ImportKind, ImportResult, MeasuredSizes,
+        ModuleContribution, PROTOCOL_VERSION, RefreshedImportIdentity,
     },
     pipeline::resolver::resolve_package_entry,
     service::{detected_imports_for_document, import_request_for_detected},
@@ -84,7 +83,7 @@ fn revalidate_document_sizes_claim_is_scoped_to_document_delivery() {
         .expect("test setup should hold the old raw-key claim");
 
     let stale = HashSet::from(["shared-swr-lib".to_owned()]);
-    let refreshed = service.revalidate_document_sizes(&second_request, &stale, &[], || true);
+    let refreshed = service.revalidate_document_sizes(&second_request, &stale, || true);
 
     fs::remove_dir_all(&workspace).ok();
     assert!(
@@ -138,16 +137,14 @@ fn a_revalidated_import_is_pushed_with_its_shared_figure_and_moves_its_siblings(
         ),
         (2, measured("other", &[("other.js", 50)], Some(0))),
     ]
-    .map(|(index, result)| ImportAnalysisItem {
-        detected: detected[index].clone(),
-        status: ImportAnalysisStatus::Ready,
-        message: None,
-        request: None,
-        result: Some(result),
-    });
+    .map(|(index, result)| MeasuredImport {
+        result,
+        identity: identity(&detected[index]),
+    })
+    .to_vec();
 
     let (results, identities) = revalidated_with_shared_bytes(
-        &served,
+        served.clone(),
         vec![measured("lib", &[("shared.js", 100), ("def.js", 5)], None)],
         vec![identity(&detected[0])],
     );
@@ -155,7 +152,7 @@ fn a_revalidated_import_is_pushed_with_its_shared_figure_and_moves_its_siblings(
     assert_eq!(results[0].shared_bytes, Some(100));
 
     let (results, identities) = revalidated_with_shared_bytes(
-        &served,
+        served,
         vec![measured("lib", &[("def.js", 5)], None)],
         vec![identity(&detected[0])],
     );

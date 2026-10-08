@@ -925,7 +925,6 @@ impl ImportLensService {
         &self,
         request: &FileSizeDocumentRequest,
         stale_specifiers: &HashSet<String>,
-        served: &[ImportAnalysisItem],
         should_continue: impl Fn() -> bool,
     ) -> Option<(
         String,
@@ -1042,7 +1041,10 @@ impl ImportLensService {
         if fresh.is_empty() {
             return None;
         }
-        let (results, identities) = revalidated_with_shared_bytes(served, fresh, identities);
+        let document = self
+            .cached_analysis_items_for_detected(&context, detected, true, ReadIntent::Bulk)
+            .measured();
+        let (results, identities) = revalidated_with_shared_bytes(document, fresh, identities);
         Some((
             request.workspace_root.clone(),
             request.active_document_path.clone(),
@@ -2438,29 +2440,21 @@ fn shared_bytes_corrections(
 /// `analyze_and_cache` returns a recomputed import with no `shared_bytes`: sharing is a relation
 /// between a document's imports, not a property of one. Pushed as is, the client replaces the whole
 /// result and the hover loses its shared figure, while a sibling served from the cache keeps one
-/// computed against the old graph. So the figure is annotated over the document as it was served,
-/// with the recomputed results in place, and the push carries every recomputed import plus each
-/// served sibling whose figure the recomputed graphs change.
+/// computed against the old graph. So the figure is annotated over the document's other measured
+/// imports with the recomputed results in place, and the push carries every recomputed import plus
+/// each sibling whose figure the recomputed graphs change.
+///
+/// `document` is the document as the cache holds it NOW, never as the size read served it: an
+/// import that was still building then has landed since, and a figure derived without it would
+/// overwrite the correct one its streamed build pushed.
 fn revalidated_with_shared_bytes(
-    served: &[ImportAnalysisItem],
+    document: Vec<MeasuredImport>,
     fresh: Vec<ImportResult>,
     identities: Vec<RefreshedImportIdentity>,
 ) -> (Vec<ImportResult>, Vec<RefreshedImportIdentity>) {
-    let siblings = served
-        .iter()
-        .filter_map(|item| {
-            let result = item.result.as_ref()?;
-            let identity = RefreshedImportIdentity {
-                specifier: item.detected.specifier.clone(),
-                import_kind: item.detected.import_kind,
-                named: item.detected.named.clone(),
-                runtime: item.detected.runtime,
-            };
-            (!identities.contains(&identity)).then(|| MeasuredImport {
-                result: result.clone(),
-                identity,
-            })
-        })
+    let siblings = document
+        .into_iter()
+        .filter(|import| !identities.contains(&import.identity))
         .collect::<Vec<_>>();
     let sibling_count = siblings.len();
     let document = siblings
