@@ -373,8 +373,10 @@ const findDefaultBudgetConfig = async (readText) => {
 
 /**
  * The git invocations that name a run's changed files. Without a base the diff is against `HEAD`,
- * which in a CI checkout equals the working tree and so finds nothing; `--merge-base <ref>` diffs
- * the working tree against the point the branch left `<ref>`, which is what a pull request changed.
+ * which in a CI checkout equals the working tree and so finds nothing; with one it is against the
+ * commit `git merge-base <ref> HEAD` names, the point the branch left `<ref>`, which is what a pull
+ * request changed. That commit is looked up separately rather than with `git diff --merge-base`,
+ * which needs git 2.30 and older CI images still ship 2.20 to 2.25.
  * Untracked, not-ignored files are listed in both modes, because a new file is a change too.
  *
  * Every path is repository-root-relative: `git diff` prints them that way regardless of cwd, and
@@ -383,7 +385,7 @@ const findDefaultBudgetConfig = async (readText) => {
  * `-z` with `core.quotePath=false`: by default git C-quotes a non-ASCII path (`"caf\303\251.ts"`),
  * whose extension then reads `.ts"` and the file is silently dropped from the gate.
  */
-const changedFilesGitArgs = ({ base } = {}) => ({
+const changedFilesGitArgs = ({ mergeBase } = {}) => ({
   diff: [
     "-c",
     "core.quotePath=false",
@@ -391,7 +393,7 @@ const changedFilesGitArgs = ({ base } = {}) => ({
     "--name-only",
     "-z",
     "--diff-filter=ACMRTUXB",
-    ...(base === undefined ? ["HEAD"] : ["--merge-base", base]),
+    mergeBase ?? "HEAD",
     "--",
   ],
   untracked: [
@@ -414,8 +416,12 @@ const gitListingMaxBufferBytes = 256 * 1024 * 1024;
 export const changedFiles = async (cwd, { base } = {}) => {
   // Paths are repository-root-relative, so file resolution must anchor at the git top level, not
   // the invocation directory (budget discovery stays cwd-scoped).
-  const args = changedFilesGitArgs({ base });
   const options = { cwd, maxBuffer: gitListingMaxBufferBytes };
+  const mergeBase =
+    base === undefined
+      ? undefined
+      : (await execFile("git", ["merge-base", base, "HEAD"], options)).stdout.trim();
+  const args = changedFilesGitArgs({ mergeBase });
   const [{ stdout: diff }, { stdout: untracked }, { stdout: topLevel }] = await Promise.all([
     execFile("git", args.diff, options),
     execFile("git", args.untracked, options),
