@@ -919,8 +919,6 @@ const startDaemon = async (workspace) => {
       "--",
       "--pipe",
       pipeName,
-      "--workspace",
-      workspace,
       "--storage",
       storagePath,
     ],

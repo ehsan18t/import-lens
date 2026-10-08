@@ -104,11 +104,6 @@ where
     while let Some(arg) = iterator.next() {
         match arg.as_str() {
             "--pipe" => parsed.pipe = iterator.next(),
-            // Accepted and ignored: the extension and the CLI pass it, but the workspace root of
-            // every request comes from the client's `hello`.
-            "--workspace" => {
-                iterator.next();
-            }
             "--storage" => parsed.storage = iterator.next().map(PathBuf::from),
             unknown => return Err(format!("unknown argument: {unknown}").into()),
         }
