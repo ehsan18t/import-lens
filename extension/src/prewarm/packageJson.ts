@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { getImportLensConfig } from "../config.js";
 import type { Logger } from "../logging/types.js";
 import { newlyVisibleDocuments } from "../visibleDocuments.js";
 import { analysisRootForFile } from "../workspaceContext.js";
@@ -16,7 +17,8 @@ const packageJsonAnalysisRoot = (document: vscode.TextDocument): Promise<string>
 
 /**
  * Fire-and-forget prewarm of the manifests among `documents`. Resolving each analysis root reads
- * the file system, so the sends happen asynchronously and a failure is only logged.
+ * the file system, so the sends happen asynchronously and a failure is only logged. Nothing is
+ * sent while Import Lens is disabled: each prewarm makes the daemon build every dependency.
  */
 export const prewarmPackageJsonManifests = (
   documents: readonly vscode.TextDocument[],
@@ -24,6 +26,10 @@ export const prewarmPackageJsonManifests = (
   logger: Pick<Logger, "debug" | "warn">,
   describeSent: (count: number) => string,
 ): void => {
+  if (!getImportLensConfig().enabled) {
+    return;
+  }
+
   prewarmPackageJsonDocuments(documents, target, packageJsonAnalysisRoot).then(
     (sent) => {
       if (sent > 0) {

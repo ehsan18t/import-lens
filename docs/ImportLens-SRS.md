@@ -1277,7 +1277,7 @@ interface VisibleDocumentsMessage {
 
 #### PrewarmPackageJsonMessage
 
-Sent by the extension host when a workspace `package.json` becomes visible in an editor pane or is saved, and replayed for the visible manifests when the daemon becomes ready. A manifest that is only opened (VS Code and other extensions open manifests nobody looks at) is not prewarmed.
+Sent by the extension host when a workspace `package.json` becomes visible in an editor pane or is saved, and replayed for the visible manifests when the daemon becomes ready. A manifest that is only opened (VS Code and other extensions open manifests nobody looks at) is not prewarmed, and nothing is prewarmed while `importLens.enabled` is `false`.
 
 ```typescript
 interface PrewarmPackageJsonMessage {
