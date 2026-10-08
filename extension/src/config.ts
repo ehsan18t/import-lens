@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { type ImportLensBudgets, sanitizeBudgets } from "./analysis/budgets.js";
+import { wholeMegabytes } from "./configValues.js";
 import type { LogLevel } from "./ipc/protocol.js";
 import { defaultLogLevel } from "./loggerCore.js";
 import type { CompressionFormat, DisplayMode } from "./ui/format.js";
@@ -35,8 +36,8 @@ export const getImportLensConfig = (): ImportLensConfig => {
     showWarnings: config.get("showWarnings", true),
     useCodeLens: config.get("useCodeLens", false),
     enableDiskCache: config.get("enableDiskCache", true),
-    cacheMaxSizeMB: config.get("cacheMaxSizeMB", 512),
-    registryCacheMaxSizeMB: config.get("registryCacheMaxSizeMB", 32),
+    cacheMaxSizeMB: wholeMegabytes(config.get("cacheMaxSizeMB"), 64, 512),
+    registryCacheMaxSizeMB: wholeMegabytes(config.get("registryCacheMaxSizeMB"), 1, 32),
     enableRegistryHints: config.get("enableRegistryHints", true),
     verboseRegistryLogging: config.get("verboseRegistryLogging", false),
     logLevel: config.get<LogLevel>("logLevel", defaultLogLevel),

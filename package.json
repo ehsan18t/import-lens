@@ -163,13 +163,13 @@
           "markdownDescription": "Persist computed sizes to disk across editor restarts. Use the `Import Lens: Manage Cache` command to inspect or clean cached data."
         },
         "importLens.cacheMaxSizeMB": {
-          "type": "number",
+          "type": "integer",
           "default": 512,
           "minimum": 64,
           "description": "Disk-byte budget in megabytes for one workspace's project caches. Import Lens keeps a separate cache base per workspace, so this budget covers every project shard within a single window (a multi-root window shares one budget), and every other window is budgeted separately. It is not a machine-wide total. When a base exceeds the budget, its least-recently-used cache entries are evicted (entry-granular, across that base's shards) down to ~90% of it."
         },
         "importLens.registryCacheMaxSizeMB": {
-          "type": "number",
+          "type": "integer",
           "default": 32,
           "minimum": 1,
           "description": "Byte budget in megabytes for the shared npm registry metadata store. When the store grows past this, the oldest (least-recently-updated) entries are evicted on the periodic maintenance pass, alongside a 30-day retention prune of stale entries."
