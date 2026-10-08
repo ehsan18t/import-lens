@@ -239,27 +239,31 @@ export class DocumentAnalysisController implements vscode.Disposable {
     }
 
     const changedLinesPromise = changedLinesForFile(document.fileName, document.getText());
-    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
-    const workspaceRoot = await analysisRootForFile(document.fileName, workspaceFolder?.uri.fsPath);
-
-    if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
-      this.#store.clear(document.uri);
-      this.setStatusForActive(document, { kind: "unavailable" });
-      return;
-    }
-
-    this.setStatusForActive(document, { kind: "computing" });
-    this.#logger.debug(`Starting document analysis request ${requestId}.`);
-    // What a streamed push will need to re-read the File Cost when the document settles: a push
-    // knows only the document's path.
-    this.#analysisContexts.set(documentKey, {
-      document,
-      workspaceRoot,
-      generation: requestId,
-      reads: initialFileSizeReadState,
-    });
 
     try {
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+      const workspaceRoot = await analysisRootForFile(
+        document.fileName,
+        workspaceFolder?.uri.fsPath,
+      );
+
+      if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
+        this.#store.clear(document.uri);
+        this.setStatusForActive(document, { kind: "unavailable" });
+        return;
+      }
+
+      this.setStatusForActive(document, { kind: "computing" });
+      this.#logger.debug(`Starting document analysis request ${requestId}.`);
+      // What a streamed push will need to re-read the File Cost when the document settles: a push
+      // knows only the document's path.
+      this.#analysisContexts.set(documentKey, {
+        document,
+        workspaceRoot,
+        generation: requestId,
+        reads: initialFileSizeReadState,
+      });
+
       const resultLogger = new ImportResultLogTracker(
         this.#logger.child({ component: "analysis" }),
         requestId,
