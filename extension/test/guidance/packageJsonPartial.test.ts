@@ -151,8 +151,10 @@ test("mergePackageJsonAnalysisPartial refines names-only package.json loading ro
   assert.equal(done[0]?.registryHint?.latestVersion, "19.0.0");
 });
 
-test("mergePackageJsonAnalysisPartial ignores stale indexes and mismatched package names", () => {
-  const current = [stateFor("react", "loading")];
+test("an indexed partial replaces whatever another dependency left at that index", () => {
+  const current = [
+    { ...stateFor("react", "ready"), registryHint: { latestVersion: "19.0.0", fetchedAt: 1 } },
+  ];
   const partial: AnalyzePackageJsonResponse = {
     version: 5,
     request_id: 8,
@@ -163,7 +165,61 @@ test("mergePackageJsonAnalysisPartial ignores stale indexes and mismatched packa
     diagnostics: [],
   };
 
-  assert.deepEqual(mergePackageJsonAnalysisPartial(current, partial), current);
+  const [merged] = mergePackageJsonAnalysisPartial(current, partial);
+
+  assert.equal(merged?.name, "vue");
+  assert.equal(merged?.registryHint, undefined);
+});
+
+test("the first partial of a request re-lays the list, so an added dependency shifts nothing", () => {
+  const section = {
+    section: "dependencies" as const,
+    range: entryFor("x").range,
+    objectRange: entryFor("x").range,
+  };
+  const previous = ["a", "b", "c"].map((name) => ({
+    ...stateFor(name, "ready"),
+    result: resultFor(name),
+    registryHint: { latestVersion: `${name}-latest`, fetchedAt: 1 },
+  }));
+  const skeleton: AnalyzePackageJsonResponse = {
+    version: 8,
+    request_id: 11,
+    sections: [section],
+    indexes: [0, 1, 2, 3],
+    states: ["z", "a", "b", "c"].map((name) => stateFor(name, "loading")),
+    error: null,
+    diagnostics: [],
+  };
+  const cachedA: AnalyzePackageJsonResponse = {
+    ...skeleton,
+    sections: [],
+    indexes: [1],
+    states: [{ ...stateFor("a", "ready"), result: resultFor("a") }],
+  };
+
+  const laid = mergePackageJsonAnalysisPartial(previous, skeleton);
+  const filled = mergePackageJsonAnalysisPartial(laid, cachedA);
+
+  assert.deepEqual(
+    filled.map((state) => [state.name, state.status, state.registryHint?.latestVersion]),
+    [
+      ["z", "loading", undefined],
+      ["a", "ready", "a-latest"],
+      ["b", "loading", "b-latest"],
+      ["c", "loading", "c-latest"],
+    ],
+  );
+
+  const removed = mergePackageJsonAnalysisPartial(previous, {
+    ...skeleton,
+    indexes: [0],
+    states: [stateFor("c", "loading")],
+  });
+  assert.deepEqual(
+    removed.map((state) => state.name),
+    ["c"],
+  );
 });
 
 test("mergePackageJsonAnalysisPartial preserves stale registry refresh status", () => {

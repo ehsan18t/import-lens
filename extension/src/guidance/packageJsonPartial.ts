@@ -16,7 +16,7 @@ export const mergePackageJsonAnalysisPartial = (
   currentStates: readonly PackageJsonMergeState[],
   partial: AnalyzePackageJsonResponse,
 ): PackageJsonMergeState[] => {
-  if (!partial.indexes) {
+  if (!partial.indexes || isDependencySkeleton(partial)) {
     return mergePackageJsonFinalStates(currentStates, partial.states);
   }
 
@@ -29,17 +29,29 @@ export const mergePackageJsonAnalysisPartial = (
       return;
     }
 
+    // The index is a position in the CURRENT request's dependency list, so whatever sits there
+    // now is replaced; it carries over only what belongs to the same dependency.
     const current = nextStates[stateIndex];
-
-    if (current && !isSameDependencyState(current, incoming)) {
-      return;
-    }
-
-    nextStates[stateIndex] = mergePackageJsonState(current, incoming);
+    nextStates[stateIndex] =
+      current && isSameDependencyState(current, incoming)
+        ? mergePackageJsonState(current, incoming)
+        : incoming;
   });
 
   return nextStates;
 };
+
+/**
+ * The daemon's first partial of a request: every dependency of the manifest as it is now, loading,
+ * with the sections (later partials carry no sections). It replaces the previous list rather than
+ * patching it by index, because an added, removed or re-sorted dependency shifts every index after
+ * it: patched by position, each line showed its neighbour's size until the final response.
+ */
+const isDependencySkeleton = (partial: AnalyzePackageJsonResponse): boolean =>
+  partial.sections.length > 0 &&
+  partial.indexes !== undefined &&
+  partial.indexes.length === partial.states.length &&
+  partial.indexes.every((stateIndex, position) => stateIndex === position);
 
 // Matched by identity, never by index: adding or re-sorting a dependency shifts every index
 // after it, and a hint is only true of the package it was fetched for.
