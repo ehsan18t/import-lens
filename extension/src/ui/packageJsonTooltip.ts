@@ -3,6 +3,7 @@ import type { PackageJsonDependencyHintState } from "../guidance/packageJsonStat
 import type { PackageJsonDependencySectionName } from "../ipc/protocol.js";
 import { copyImportDiagnosticsCommand } from "./diagnostics.js";
 import { measuredSizes } from "./format.js";
+import { commandUriArgs, escapeMarkdown } from "./markdownEscape.js";
 import {
   isFreshLatestRelease,
   packageJsonCombinedImportCostNote,
@@ -44,8 +45,6 @@ export interface PackageJsonSectionSummaryTooltipOptions extends PackageJsonTool
 
 const defaultFormatFetchedAt = (timestamp: number): string => new Date(timestamp).toLocaleString();
 
-const commandArgs = (args: readonly unknown[]): string => encodeURIComponent(JSON.stringify(args));
-
 const refreshPackageRegistryHintMarkdown = (
   state: PackageJsonDependencyTooltipState,
   options: PackageJsonTooltipActionOptions,
@@ -54,7 +53,7 @@ const refreshPackageRegistryHintMarkdown = (
     return null;
   }
 
-  const args = commandArgs([options.packageJsonUri, state.name, state.installedVersion]);
+  const args = commandUriArgs([options.packageJsonUri, state.name, state.installedVersion]);
   return `[$(sync) Refresh npm registry info](command:${refreshPackageJsonRegistryHintCommand}?${args})`;
 };
 
@@ -65,7 +64,7 @@ const refreshPackageRegistryHintsMarkdown = (
     return null;
   }
 
-  const args = commandArgs([options.packageJsonUri, options.section]);
+  const args = commandUriArgs([options.packageJsonUri, options.section]);
   return `[$(sync) Refresh all npm registry info](command:${refreshPackageJsonRegistryHintsCommand}?${args})`;
 };
 
@@ -78,19 +77,19 @@ const registryDetailsMarkdown = (
   const formatFetchedAt = options.formatFetchedAt ?? defaultFormatFetchedAt;
 
   if (state.installedVersion) {
-    details.push(`Installed version: ${state.installedVersion}`);
+    details.push(`Installed version: ${escapeMarkdown(state.installedVersion)}`);
   }
 
   if (state.registryHint?.latestVersion) {
-    details.push(`Latest version: ${state.registryHint.latestVersion}`);
+    details.push(`Latest version: ${escapeMarkdown(state.registryHint.latestVersion)}`);
   }
 
   if (versionStatus) {
-    details.push(`Version status: ${versionStatus}`);
+    details.push(`Version status: ${escapeMarkdown(versionStatus)}`);
   }
 
   if (state.registryHint?.latestPublishedAt) {
-    details.push(`Latest published: ${state.registryHint.latestPublishedAt}`);
+    details.push(`Latest published: ${escapeMarkdown(state.registryHint.latestPublishedAt)}`);
   }
 
   if (typeof state.registryHint?.fetchedAt === "number") {
@@ -106,7 +105,7 @@ const registryDetailsMarkdown = (
   }
 
   if (state.registryHintRefreshError) {
-    details.push(`Refresh error: ${state.registryHintRefreshError}`);
+    details.push(`Refresh error: ${escapeMarkdown(state.registryHintRefreshError)}`);
   }
 
   return details;
@@ -117,7 +116,7 @@ export const packageJsonDependencyTooltipMarkdown = (
   config: Pick<ImportLensConfig, "compression" | "enableRegistryHints">,
   options: PackageJsonTooltipActionOptions = {},
 ): string => {
-  const parts: string[] = [`**${state.name}**`];
+  const parts: string[] = [`**${escapeMarkdown(state.name)}**`];
   // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). This branch renders one
   // — through `importResultSizeMarkdown`, which is why the guard that scans for the banned check
   // never saw this file: it names no size of its own. It asks the question correctly now, and the
@@ -144,9 +143,13 @@ export const packageJsonDependencyTooltipMarkdown = (
     }
   } else if (state.status === "ready" && state.result) {
     parts.push("Import Lens could not compute this dependency size.");
-    parts.push(state.result.error ?? "No size was produced for this dependency.");
+    parts.push(
+      state.result.error
+        ? escapeMarkdown(state.result.error)
+        : "No size was produced for this dependency.",
+    );
   } else if (state.message) {
-    parts.push(state.message);
+    parts.push(escapeMarkdown(state.message));
   }
 
   if (state.status === "ready" && state.result) {

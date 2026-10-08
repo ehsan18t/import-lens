@@ -12,6 +12,7 @@ import {
   type MeasuredSizes,
   measuredSizes,
 } from "./format.js";
+import { commandUriArgs, escapeMarkdown } from "./markdownEscape.js";
 import {
   isNativeBinaryOnlyResult,
   isNativeBinaryResult,
@@ -42,8 +43,7 @@ const selectedCompressionSize = (
 });
 
 export const copyDiagnosticsMarkdown = (result: ImportResult): string => {
-  const args = encodeURIComponent(JSON.stringify([result]));
-  return `[$(copy) Copy diagnostics](command:${copyImportDiagnosticsCommand}?${args})`;
+  return `[$(copy) Copy diagnostics](command:${copyImportDiagnosticsCommand}?${commandUriArgs([result])})`;
 };
 
 export const resultHasDiagnosticsLink = (result: ImportResult): boolean =>
@@ -122,7 +122,7 @@ export const confidenceRowMarkdown = (result: ImportResult): string =>
 
 export const confidenceNotesMarkdown = (reasons: readonly string[]): string | null =>
   reasons.length > 0
-    ? ["**Confidence notes**", ...reasons.map((reason) => `- ${reason}`)].join("\n")
+    ? ["**Confidence notes**", ...reasons.map((reason) => `- ${escapeMarkdown(reason)}`)].join("\n")
     : null;
 
 const analysisMarkdown = (result: ImportResult, runtime: ImportRuntime): string => {
@@ -158,9 +158,9 @@ const errorDiagnosticsMarkdown = (result: ImportResult): string => {
     "Import Lens could not compute this import size.",
     // A result with no size normally carries the reason; a still-building one carries none, and the
     // tooltip says what it knows rather than printing `null`.
-    `- Error: ${result.error ?? "no size was produced for this import"}`,
+    `- Error: ${result.error ? escapeMarkdown(result.error) : "no size was produced for this import"}`,
     confidenceRowMarkdown(result),
-    ...result.confidence_reasons.map((reason) => `- ${reason}`),
+    ...result.confidence_reasons.map((reason) => `- ${escapeMarkdown(reason)}`),
     `- ${copyDiagnosticsMarkdown(result)}`,
   ];
 
@@ -173,7 +173,7 @@ export const tooltipForResultMarkdown = (
   runtime: ImportRuntime = "component",
   insights: readonly ImportAnalysisInsight[] = [],
 ): string => {
-  const parts: string[] = [`**${result.specifier}**`];
+  const parts: string[] = [`**${escapeMarkdown(result.specifier)}**`];
 
   // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). Everything below this
   // renders a number; the check that decides whether to render one has to be the check for whether
@@ -199,7 +199,11 @@ export const tooltipForResultMarkdown = (
   }
 
   if (insights.length > 0) {
-    parts.push(["**Insights**", ...insights.map((insight) => `- ${insight.tooltip}`)].join("\n"));
+    parts.push(
+      ["**Insights**", ...insights.map((insight) => `- ${escapeMarkdown(insight.tooltip)}`)].join(
+        "\n",
+      ),
+    );
   }
 
   if (result.diagnostics.length > 0) {

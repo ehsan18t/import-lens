@@ -3,6 +3,7 @@ import test from "node:test";
 import type { ImportLensConfig } from "../../src/config.js";
 import type { ImportResult } from "../../src/ipc/protocol.js";
 import { copyImportDiagnosticsCommand } from "../../src/ui/diagnostics.js";
+import { escapeMarkdown } from "../../src/ui/markdownEscape.js";
 import {
   refreshPackageJsonRegistryHintCommand,
   refreshPackageJsonRegistryHintsCommand,
@@ -80,9 +81,9 @@ test("packageJsonDependencyTooltipMarkdown includes package registry freshness d
   );
 
   assert.match(markdown, /\*\*react\*\*/u);
-  assert.match(markdown, /Installed version: 18\.2\.0/u);
-  assert.match(markdown, /Latest version: 19\.0\.0/u);
-  assert.match(markdown, /Version status: ✦ update 19\.0\.0/u);
+  assert.match(markdown, /Installed version: 18\\\.2\\\.0/u);
+  assert.match(markdown, /Latest version: 19\\\.0\\\.0/u);
+  assert.match(markdown, /Version status: ✦ update 19\\\.0\\\.0/u);
   assert.match(markdown, /✦ New release under 24h/u);
   assert.match(markdown, /Latest published:/u);
 });
@@ -256,7 +257,11 @@ test("packageJsonDependencyTooltipMarkdown shows confidence like the source hove
   );
   const sourceHover = tooltipForResultMarkdown(measured, config());
 
-  for (const line of ["- Confidence: **Medium**", "**Confidence notes**", `- ${reason}`]) {
+  for (const line of [
+    "- Confidence: **Medium**",
+    "**Confidence notes**",
+    `- ${escapeMarkdown(reason)}`,
+  ]) {
     assert.ok(markdown.includes(line), line);
     assert.ok(sourceHover.includes(line), line);
   }
@@ -282,7 +287,60 @@ test("packageJsonDependencyTooltipMarkdown shows confidence like the source hove
   );
 
   assert.match(unmeasured, /- Confidence: \*\*Low\*\*/u);
-  assert.match(unmeasured, /- The entry could not be bundled\./u);
+  assert.match(unmeasured, /- The entry could not be bundled\\\./u);
+});
+
+// A Markdown link is live only when its brackets and parenthesis are unescaped.
+const liveCommandLinks = (markdown: string): string[] =>
+  markdown.match(/(?<!\\)\[[^\]\n]*(?<!\\)\]\(command:[^)]*\)/gu) ?? [];
+
+test("trusted hovers render untrusted text with no live command link", () => {
+  const injected = `[Update](command:${copyImportDiagnosticsCommand}?%5B%22x%22%5D)`;
+  const dependencyHover = packageJsonDependencyTooltipMarkdown(
+    {
+      name: injected,
+      section: "dependencies",
+      status: "ready",
+      installedVersion: injected,
+      result: result({
+        specifier: injected,
+        confidence: "medium",
+        confidence_reasons: [injected],
+        diagnostics: [{ stage: "resolve", message: "x", details: [] }],
+      }),
+      registryHint: { latestVersion: injected, isLatest: false, latestPublishedAt: injected },
+      registryHintRefreshError: injected,
+    },
+    config(),
+    { packageJsonUri: "file:///workspace/package.json" },
+  );
+  const sourceHover = tooltipForResultMarkdown(
+    result({
+      specifier: injected,
+      raw_bytes: null,
+      minified_bytes: null,
+      gzip_bytes: null,
+      brotli_bytes: null,
+      zstd_bytes: null,
+      error: injected,
+      confidence_reasons: [injected],
+    }),
+    config(),
+  );
+
+  assert.deepEqual(
+    liveCommandLinks(dependencyHover).map((link) => link.slice(0, link.indexOf("]") + 1)),
+    ["[$(sync) Refresh npm registry info]", "[$(copy) Copy diagnostics]"],
+  );
+  assert.deepEqual(
+    liveCommandLinks(sourceHover).map((link) => link.slice(0, link.indexOf("]") + 1)),
+    ["[$(copy) Copy diagnostics]"],
+  );
+  assert.equal(
+    commandArgs(dependencyHover, refreshPackageJsonRegistryHintCommand)[1],
+    injected,
+    "an unbalanced parenthesis in an argument must not end the link early",
+  );
 });
 
 test("importResultSizeMarkdown renders sectioned size rows", () => {
@@ -367,7 +425,7 @@ test("tooltipForResultMarkdown renders size and analysis sections", () => {
   assert.match(markdown, /- Confidence: \*\*High\*\*/u);
   assert.match(markdown, /- Shared in file: 700 B/u);
   assert.match(markdown, /\*\*Confidence notes\*\*/u);
-  assert.match(markdown, /- Detected side-effect import\./u);
+  assert.match(markdown, /- Detected side\\-effect import\\\./u);
 });
 
 test("tooltipForResultMarkdown renders conservative sizing without em dash", () => {
@@ -410,7 +468,7 @@ test("tooltipForResultMarkdown renders compact diagnostics for an unmeasured res
   assert.match(markdown, /Import Lens could not compute this import size\./u);
   assert.match(markdown, /- Error: failed to resolve package/u);
   assert.match(markdown, /- Confidence: \*\*Low\*\*/u);
-  assert.match(markdown, /- Resolver returned no entry\./u);
+  assert.match(markdown, /- Resolver returned no entry\\\./u);
   assert.match(markdown, /\$\(copy\) Copy diagnostics/u);
   assert.equal(commandArgs(markdown, copyImportDiagnosticsCommand).length, 1);
 });
