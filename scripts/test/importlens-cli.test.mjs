@@ -19,6 +19,7 @@ import {
   parseCliArgs,
   resolveCliStoragePaths,
   runImportLensCheck,
+  startDaemon,
 } from "../../cli/importlens.mjs";
 
 const analyzed = (overrides = {}) => ({
@@ -646,6 +647,28 @@ test("daemonPipePath keeps a Unix socket path inside sun_path", () => {
 
   assert.notEqual(daemonPipePath({ platform: "linux" }), daemonPipePath({ platform: "linux" }));
   assert.match(daemonPipePath({ platform: "win32", pid: 7 }), /^\\\\\.\\pipe\\import-lens-cli-7-/u);
+});
+
+// A directory exists but cannot be executed, so the spawn fails asynchronously with EACCES or
+// ENOENT: the shape of a daemon binary that lost its execute bit.
+test("startDaemon rejects promptly when the daemon cannot be spawned", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "importlens-cli-spawn-"));
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      startDaemon(root, {
+        binary: root,
+        storagePaths: {
+          cachePath: path.join(root, "cache"),
+          lifecyclePath: path.join(root, "lifecycle"),
+        },
+      }),
+      /failed to start the Import Lens daemon/u,
+    );
+    assert.ok(Date.now() - started < 2000, "a spawn error must not wait out the connect retry");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("createDaemonClient resolves concurrent responses by request id", async () => {

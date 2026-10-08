@@ -618,15 +618,15 @@ const nonBudgetableImportStages = (result) =>
     .filter((stage, index, stages) => stages.indexOf(stage) === index)
     .sort();
 
-const startDaemon = async (workspaceRoot) => {
-  const target = platformTarget();
-  const binary = daemonBinaryPath({ platformTarget: target });
-
+export const startDaemon = async (
+  workspaceRoot,
+  { binary = daemonBinaryPath(), storagePaths = resolveCliStoragePaths() } = {},
+) => {
   if (!existsSync(binary)) {
     throw new Error(`Import Lens daemon binary is unavailable at ${binary}`);
   }
 
-  const { cachePath, lifecyclePath } = resolveCliStoragePaths();
+  const { cachePath, lifecyclePath } = storagePaths;
   await mkdir(cachePath, { recursive: true });
   await mkdir(lifecyclePath, { recursive: true });
   const pipeName = daemonPipePath();
@@ -635,11 +635,24 @@ const startDaemon = async (workspaceRoot) => {
     ["--pipe", pipeName, "--workspace", workspaceRoot, "--storage", lifecyclePath],
     { stdio: ["ignore", "ignore", "inherit"] },
   );
+  // A spawn failure (EACCES, ENOENT) arrives as an 'error' event. Unheard, it is an uncaught
+  // exception and exit 1, which CI reads as "budget exceeded"; as a rejection it reaches `main`'s
+  // exit 2. The listener stays attached for the child's lifetime so a later error is never uncaught.
+  const spawnFailed = new Promise((_, reject) => {
+    child.on("error", (error) => {
+      reject(new Error(`failed to start the Import Lens daemon at ${binary}: ${error.message}`));
+    });
+  });
+  spawnFailed.catch(() => {});
+  const stopConnecting = new AbortController();
   let socket;
   let client;
 
   try {
-    socket = await connectWithRetry(pipeName, 5000);
+    socket = await Promise.race([
+      connectWithRetry(pipeName, 5000, stopConnecting.signal),
+      spawnFailed,
+    ]);
     client = createDaemonClient(socket);
     client.send({
       type: "hello",
@@ -654,6 +667,7 @@ const startDaemon = async (workspaceRoot) => {
       log_level: "warn",
     });
   } catch (error) {
+    stopConnecting.abort();
     if (child.exitCode === null && child.signalCode === null) {
       child.kill();
     }
@@ -738,20 +752,25 @@ const DAEMON_ROOT = "dist/bin";
 const daemonBinaryName = (target) =>
   target.startsWith("win32-") ? "import-lens-daemon.exe" : "import-lens-daemon";
 
-const connectWithRetry = async (pipeName, timeoutMs) => {
+const connectWithRetry = async (pipeName, timeoutMs, signal) => {
   const started = Date.now();
   let lastError;
 
-  while (Date.now() - started < timeoutMs) {
+  while (Date.now() - started < timeoutMs && !signal?.aborted) {
     try {
-      return await new Promise((resolve, reject) => {
-        const socket = net.createConnection(pipeName);
-        socket.once("connect", () => resolve(socket));
-        socket.once("error", (error) => {
-          socket.destroy();
+      const socket = await new Promise((resolve, reject) => {
+        const attempt = net.createConnection(pipeName);
+        attempt.once("connect", () => resolve(attempt));
+        attempt.once("error", (error) => {
+          attempt.destroy();
           reject(error);
         });
       });
+      if (signal?.aborted) {
+        socket.destroy();
+        break;
+      }
+      return socket;
     } catch (error) {
       lastError = error;
       await new Promise((resolve) => setTimeout(resolve, 50));
