@@ -78,6 +78,11 @@ test("sanitizeBudgets accepts positive thresholds and drops invalid values", () 
     }),
     {},
   );
+  assert.deepEqual(
+    sanitizeBudgets({ perImportBrotliBytes: 0.5 }),
+    {},
+    "a budget that floors to zero would put every import over budget",
+  );
 });
 
 test("budgetViolationsForStates reports per-import violations and the File Cost's file violation", () => {

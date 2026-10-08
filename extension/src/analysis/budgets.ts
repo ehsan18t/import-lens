@@ -148,8 +148,10 @@ export const budgetViolationsForStates = (
   return violations;
 };
 
+// Below 1 a budget floors to zero, which every measured import would exceed: it is dropped, like
+// any other value that is not a byte count.
 const positiveIntegerBudget = (value: unknown, key: keyof ImportLensBudgets): ImportLensBudgets => {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) {
     return {};
   }
 
