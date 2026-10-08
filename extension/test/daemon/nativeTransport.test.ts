@@ -62,19 +62,21 @@ const refusingLauncher = (spawned: FakeDaemonProcess[]): DaemonLauncher => ({
   },
 });
 
-const withTransport = async (
-  run: (
-    transport: NativeDaemonTransport,
-    root: string,
-    spawned: FakeDaemonProcess[],
-  ) => Promise<void>,
-): Promise<void> => {
+interface TransportHarness {
+  readonly transport: NativeDaemonTransport;
+  readonly root: string;
+  readonly spawned: FakeDaemonProcess[];
+  readonly lines: string[];
+}
+
+const withTransport = async (run: (harness: TransportHarness) => Promise<void>): Promise<void> => {
   const root = await mkdtemp(path.join(tmpdir(), "importlens-native-transport-"));
   const spawned: FakeDaemonProcess[] = [];
+  const lines: string[] = [];
   const transport = new NativeDaemonTransport(
     fakeContext(root),
-    capturingLogger([]),
-    () => undefined,
+    capturingLogger(lines),
+    () => root,
     () => {
       throw new Error("config is only read after a daemon connects");
     },
@@ -82,12 +84,24 @@ const withTransport = async (
   );
 
   try {
-    await run(transport, root, spawned);
+    await run({ transport, root, spawned, lines });
   } finally {
     await transport.shutdown();
     await rm(root, { recursive: true, force: true });
   }
 };
+
+// Turns the event loop (setImmediate is never mocked) until the transport's real file I/O and
+// promise chains have caught up with a mocked timer that just fired.
+const until = async (condition: () => boolean): Promise<void> => {
+  for (let turn = 0; turn < 10_000 && !condition(); turn++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.ok(condition(), "condition was not reached");
+};
+
+const countLines = (lines: readonly string[], text: string): number =>
+  lines.filter((line) => line.includes(text)).length;
 
 test("start() after shutdown() re-attempts startup instead of latching disposed", async () => {
   const root = path.join("C:", "tmp", "importlens-native-transport-test");
@@ -120,7 +134,7 @@ test("start() after shutdown() re-attempts startup instead of latching disposed"
 });
 
 test("concurrent start() calls share one attempt and spawn one daemon", async () => {
-  await withTransport(async (transport, root, spawned) => {
+  await withTransport(async ({ transport, root, spawned }) => {
     const states = await Promise.all([transport.start(root), transport.start(root)]);
 
     assert.deepEqual(states, ["unavailable", "unavailable"]);
@@ -129,11 +143,37 @@ test("concurrent start() calls share one attempt and spawn one daemon", async ()
 });
 
 test("shutdown() during a start's pre-spawn work stops that start from spawning", async () => {
-  await withTransport(async (transport, root, spawned) => {
+  await withTransport(async ({ transport, root, spawned }) => {
     const pending = transport.start(root);
     await transport.shutdown();
 
     assert.equal(await pending, "unavailable");
     assert.equal(spawned.length, 0);
+  });
+});
+
+test("a tripped crash breaker holds degraded mode until an explicit restart", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+
+  await withTransport(async ({ transport, root, spawned, lines }) => {
+    assert.equal(await transport.start(root), "unavailable");
+    assert.equal(spawned.length, 1);
+
+    // A start() while the backoff restart is pending leaves the restart to the timer.
+    assert.equal(await transport.start(root), "unavailable");
+    assert.equal(spawned.length, 1);
+
+    t.mock.timers.tick(1000);
+    await until(() => countLines(lines, "Restarting daemon in") === 2);
+    t.mock.timers.tick(2000);
+    await until(() => countLines(lines, "crashed three times") === 1);
+    assert.equal(spawned.length, 3);
+
+    assert.equal(await transport.start(root), "unavailable");
+    assert.equal(spawned.length, 3);
+
+    await transport.shutdown();
+    await transport.start(root);
+    assert.equal(spawned.length, 4);
   });
 });

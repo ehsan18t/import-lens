@@ -79,6 +79,12 @@ export class NativeDaemonTransport implements AnalysisTransport {
   // Bumped by shutdown(). An attempt that sees a different value after an await was superseded
   // and must not spawn, connect, or report ready.
   #startGeneration = 0;
+  // Degraded mode (FR-015): the crash breaker tripped, the recycle-loop guard fired, the platform
+  // is unsupported, or the binary is missing or fails its hash. While latched, start() does no
+  // work, because callers start on every edit and would otherwise respawn a crashing daemon (or
+  // rehash the binary) per keystroke. Only shutdown(), the first half of an explicit restart,
+  // clears it.
+  #degraded = false;
   #restartAttempt = 0;
   #crashTimes: number[] = [];
   #restartTimer: NodeJS.Timeout | null = null;
@@ -141,6 +147,9 @@ export class NativeDaemonTransport implements AnalysisTransport {
     // calling start(), so a genuine dispose still prevents self-resurrection.
     this.#isDisposed = false;
     if (this.#state === "ready" && this.#process && this.#client) return Promise.resolve("ready");
+    if (this.#degraded) return Promise.resolve("unavailable");
+    // A backoff restart is pending; starting now would skip the delay the crash policy chose.
+    if (this.#restartTimer) return Promise.resolve(this.#state);
 
     if (this.#startPromise) {
       this.#logger.debug("Joining the daemon start already in flight.");
@@ -156,7 +165,6 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async #startDaemon(analysisRoot: string | undefined, generation: number): Promise<DaemonState> {
     const superseded = (): boolean => generation !== this.#startGeneration;
-    this.#clearRestartTimer();
     this.#clearDisconnectTimer();
 
     if (this.#process || this.#client) {
@@ -180,6 +188,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     if (superseded()) return this.#state;
 
     if (!binaryPath) {
+      this.#degraded = true;
       this.#setState("unavailable");
       return this.#state;
     }
@@ -365,6 +374,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
       this.#logger.error(
         "Daemon crashed three times within 60 seconds. Import Lens is entering unavailable mode.",
       );
+      this.#degraded = true;
       this.#setState("unavailable");
       return;
     }
@@ -679,6 +689,11 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#isDisposed = true;
     this.#startGeneration++;
     this.#startPromise = null;
+    // An explicit restart is a fresh start: the crashes that tripped the breaker do not count
+    // against the next session.
+    this.#degraded = false;
+    this.#crashTimes = [];
+    this.#restartAttempt = 0;
     this.#clearRestartTimer();
     if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
     if (this.#cleanRecycleTimer) clearTimeout(this.#cleanRecycleTimer);
