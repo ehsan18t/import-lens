@@ -13,10 +13,11 @@ export interface SourceEdit {
 /**
  * Where a position lands after an edit.
  *
- * `stickiness` decides the one ambiguous case, text inserted exactly at the position: the start of
- * a range moves along with text typed in front of it, the end of a range stays where it is (typing
- * after a statement's `;` does not grow the statement). A position inside the replaced text moves to
- * the replacement's start (a range start) or end (a range end).
+ * `stickiness` decides the ambiguous case, an edit that starts exactly at the position: the start
+ * of a range moves along with text typed in front of it, the end of a range stays where it is
+ * (typing after a statement's `;`, or over a comment that follows it, does not grow the statement).
+ * A position inside the replaced text moves to the replacement's start (a range start) or end (a
+ * range end).
  */
 export const shiftPosition = (
   position: SourcePosition,
@@ -34,7 +35,9 @@ export const shiftPosition = (
     return positionAfterEdit(position, edit);
   }
 
-  if (comparePositions(position, start) < 0 || (isInsertion && stickiness === "end")) {
+  const fromStart = comparePositions(position, start);
+
+  if (fromStart < 0 || (fromStart === 0 && stickiness === "end")) {
     return position;
   }
 

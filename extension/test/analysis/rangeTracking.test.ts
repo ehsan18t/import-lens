@@ -43,6 +43,12 @@ test("text typed after the statement's semicolon does not grow the statement", (
   assert.deepEqual(shifted?.statementRange, { start: at(0, 0), end: at(0, 18) });
 });
 
+test("text typed over a comment that follows the statement does not grow the statement", () => {
+  const shifted = shiftDetectedImport(importOnLine(0), [edit([0, 18], [0, 30], " // retyped")]);
+
+  assert.deepEqual(shifted?.statementRange, { start: at(0, 0), end: at(0, 18) });
+});
+
 test("text typed in front of the statement moves its start and end along the line", () => {
   const shifted = shiftDetectedImport(importOnLine(0), [edit([0, 0], [0, 0], "  ")]);
 
