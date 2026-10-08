@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   markPackageJsonLoadingUnavailable,
   mergePackageJsonAnalysisPartial,
+  packageJsonFinalResponseOutcome,
 } from "../../src/guidance/packageJsonPartial.js";
 import type {
   AnalyzePackageJsonResponse,
@@ -241,6 +242,19 @@ test("mergePackageJsonAnalysisPartial drops a registry hint computed for another
   };
 
   assert.equal(mergePackageJsonAnalysisPartial(current, final)[0]?.registryHint, undefined);
+});
+
+test("packageJsonFinalResponseOutcome keeps the last view while the manifest does not parse", () => {
+  const empty = { states: [], error: null };
+  const midEdit = '{\n  "dependencies": {\n    "react": "^19.0.0",\n  }\n}';
+
+  assert.equal(packageJsonFinalResponseOutcome(empty, midEdit), "keep");
+  assert.equal(packageJsonFinalResponseOutcome(empty, '{ "name": "app" }'), "clear");
+  assert.equal(packageJsonFinalResponseOutcome({ states: [], error: "invalid" }, midEdit), "clear");
+  assert.equal(
+    packageJsonFinalResponseOutcome({ states: [stateFor("react", "ready")], error: null }, midEdit),
+    "apply",
+  );
 });
 
 test("markPackageJsonLoadingUnavailable preserves completed states and marks only loading states", () => {

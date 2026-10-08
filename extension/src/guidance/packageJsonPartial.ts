@@ -134,3 +134,33 @@ const isSameDependencyState = (
   current.name === incoming.name &&
   current.section === incoming.section &&
   current.entry.name === incoming.entry.name;
+
+export type PackageJsonFinalResponseOutcome = "apply" | "clear" | "keep";
+
+// The daemon answers JSON it cannot parse with no states and no error, exactly as it answers a
+// manifest with no dependencies. Clearing on the first would blank every annotation each time an
+// edit passes through invalid JSON (typing the comma before a new dependency line), so only a
+// manifest that really parses clears; an unparseable one keeps the last good view.
+export const packageJsonFinalResponseOutcome = (
+  response: Pick<AnalyzePackageJsonResponse, "error" | "states">,
+  source: string,
+): PackageJsonFinalResponseOutcome => {
+  if (response.error) {
+    return "clear";
+  }
+
+  if (response.states.length > 0) {
+    return "apply";
+  }
+
+  return isParseableJson(source) ? "clear" : "keep";
+};
+
+const isParseableJson = (source: string): boolean => {
+  try {
+    JSON.parse(source);
+    return true;
+  } catch {
+    return false;
+  }
+};

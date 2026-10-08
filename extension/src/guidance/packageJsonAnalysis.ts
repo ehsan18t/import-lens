@@ -18,6 +18,7 @@ import { analysisRootForFile } from "../workspaceContext.js";
 import {
   markPackageJsonLoadingUnavailable,
   mergePackageJsonAnalysisPartial,
+  packageJsonFinalResponseOutcome,
 } from "./packageJsonPartial.js";
 import { PackageJsonRequestLifecycle } from "./packageJsonRequestLifecycle.js";
 import type { PackageJsonDependencyHintState } from "./packageJsonState.js";
@@ -226,7 +227,13 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
         `final response (states=${response.states.length}, sections=${response.sections.length})`,
       );
 
-      if (response.error || response.states.length === 0) {
+      const outcome = packageJsonFinalResponseOutcome(response, currentText);
+
+      if (outcome === "keep") {
+        return;
+      }
+
+      if (outcome === "clear") {
         this.#lifecycle.fail(key);
         this.clear(document.uri);
         return;
