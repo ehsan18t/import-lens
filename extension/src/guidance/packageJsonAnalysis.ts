@@ -373,6 +373,10 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     );
 
     if (removed) {
+      // The stored states no longer describe the text they were analyzed from, so an edit that
+      // restores that text (an undo of the cut) must analyze it again, not reuse them with the
+      // entry still removed.
+      this.#lifecycle.fail(key);
       this.#onDidChange.fire(event.document.uri);
     }
   }
