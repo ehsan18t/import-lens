@@ -254,11 +254,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       );
 
       if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
-        if (isSuperseded()) {
-          return;
-        }
-        this.#store.clear(document.uri);
-        this.setStatusForActive(document, { kind: "unavailable" });
+        this.markUnavailable(document, !isSuperseded());
         return;
       }
 
@@ -294,11 +290,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       });
 
       if (!response) {
-        if (isSuperseded()) {
-          return;
-        }
-        this.#store.clear(document.uri);
-        this.setStatusForActive(document, { kind: "unavailable" });
+        this.markUnavailable(document, !isSuperseded());
         return;
       }
 
@@ -308,8 +300,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
       if (response.error) {
         this.#logger.warn(`Document analysis failed: ${response.error}`);
-        this.#store.clear(document.uri);
-        this.setStatusForActive(document, { kind: "unavailable" });
+        this.markUnavailable(document, true);
         return;
       }
 
@@ -384,11 +375,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       );
       // A failure of a superseded request (a timeout, typically) says nothing about the states a
       // newer analysis has stored since.
-      if (isSuperseded()) {
-        return;
-      }
-      this.#store.clear(document.uri);
-      this.setStatusForActive(document, { kind: "unavailable" });
+      this.markUnavailable(document, !isSuperseded());
     }
   }
 
@@ -536,6 +523,16 @@ export class DocumentAnalysisController implements vscode.Disposable {
       this.#analysisContexts.get(documentKey)?.history ??
       this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, [])
     );
+  }
+
+  /** Clear a document whose analysis could not run, unless a newer analysis owns it by now. */
+  private markUnavailable(document: vscode.TextDocument, isCurrent: boolean): void {
+    if (!isCurrent) {
+      return;
+    }
+
+    this.#store.clear(document.uri);
+    this.setStatusForActive(document, { kind: "unavailable" });
   }
 
   private setStatusForActive(document: vscode.TextDocument, state: StatusBarState): void {
