@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import {
+  decorationLanesForAnchors,
   INLINE_HINT_DECORATION_SLOTS,
   type InlineHintDecorationSlot,
   inlineHintDecorationLayerBuckets,
@@ -78,44 +79,76 @@ export const mergeInlineHintDecorationLayers = (
   }
 };
 
-export class InlineHintSlotDecorationPool implements vscode.Disposable {
-  readonly #types: Record<InlineHintDecorationSlot, vscode.TextEditorDecorationType>;
+export interface AnchoredInlineHint {
+  readonly anchor: vscode.Position;
+  readonly layers: InlineHintDecorationLayers;
+}
 
-  constructor() {
-    this.#types = {
-      primary: vscode.window.createTextEditorDecorationType({
-        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-      }),
-      suffix0: vscode.window.createTextEditorDecorationType({
-        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-      }),
-      suffix1: vscode.window.createTextEditorDecorationType({
-        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-      }),
-      suffix2: vscode.window.createTextEditorDecorationType({
-        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-      }),
-      suffix3: vscode.window.createTextEditorDecorationType({
-        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
-      }),
-    };
+/** Hints grouped into decoration lanes, so hints that share an anchor render one after another. */
+export const inlineHintLanes = (
+  hints: readonly AnchoredInlineHint[],
+): InlineHintDecorationLayers[] => {
+  const laneIndexes = decorationLanesForAnchors(
+    hints.map(({ anchor }) => `${anchor.line}:${anchor.character}`),
+  );
+  const lanes: InlineHintDecorationLayers[] = [];
+
+  for (const [index, { layers }] of hints.entries()) {
+    const lane = laneIndexes[index] ?? 0;
+    lanes[lane] ??= emptyInlineHintDecorationLayers();
+    mergeInlineHintDecorationLayers(lanes[lane], layers);
   }
 
-  applyToEditor(editor: vscode.TextEditor, layers: InlineHintDecorationLayers): void {
-    for (const slot of INLINE_HINT_DECORATION_SLOTS) {
-      editor.setDecorations(this.#types[slot], layers[slot]);
+  return lanes;
+};
+
+type InlineHintLaneTypes = Record<InlineHintDecorationSlot, vscode.TextEditorDecorationType>;
+
+const createLaneTypes = (): InlineHintLaneTypes => {
+  const lane: Partial<InlineHintLaneTypes> = {};
+
+  for (const slot of INLINE_HINT_DECORATION_SLOTS) {
+    lane[slot] = vscode.window.createTextEditorDecorationType({
+      rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+    });
+  }
+
+  return lane as InlineHintLaneTypes;
+};
+
+/**
+ * The slot decoration types, in lanes. A lane holds one hint per anchor; a second import at the same
+ * anchor (`import React, { useState } from "react"` is two) goes in the next lane, which is set after
+ * the previous one, so its whole hint renders after the first instead of interleaving slot by slot
+ * ("45 kB br 3.2 kB br · over budget" with the suffix beside the wrong number). Lanes are created on
+ * first need.
+ */
+export class InlineHintSlotDecorationPool implements vscode.Disposable {
+  readonly #lanes: InlineHintLaneTypes[] = [];
+
+  applyToEditor(editor: vscode.TextEditor, lanes: readonly InlineHintDecorationLayers[]): void {
+    while (this.#lanes.length < lanes.length) {
+      this.#lanes.push(createLaneTypes());
+    }
+
+    for (const [index, types] of this.#lanes.entries()) {
+      const layers = lanes[index];
+
+      for (const slot of INLINE_HINT_DECORATION_SLOTS) {
+        editor.setDecorations(types[slot], layers ? layers[slot] : []);
+      }
     }
   }
 
   clearEditor(editor: vscode.TextEditor): void {
-    for (const slot of INLINE_HINT_DECORATION_SLOTS) {
-      editor.setDecorations(this.#types[slot], []);
-    }
+    this.applyToEditor(editor, []);
   }
 
   dispose(): void {
-    for (const slot of INLINE_HINT_DECORATION_SLOTS) {
-      this.#types[slot].dispose();
+    for (const types of this.#lanes) {
+      for (const slot of INLINE_HINT_DECORATION_SLOTS) {
+        types[slot].dispose();
+      }
     }
   }
 }

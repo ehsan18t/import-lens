@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  decorationLanesForAnchors,
   INLINE_HINT_DECORATION_SLOTS,
   inlineHintDecorationLayerBuckets,
   slotForSegmentIndex,
@@ -47,4 +48,11 @@ test("INLINE_HINT_DECORATION_SLOTS applies primary before suffix layers", () => 
     "suffix2",
     "suffix3",
   ]);
+});
+
+test("hints sharing an anchor go in successive lanes, others stay in the first", () => {
+  assert.deepEqual(
+    decorationLanesForAnchors(["0:40", "0:40", "2:10", "0:40", "3:5"]),
+    [0, 1, 0, 2, 0],
+  );
 });

@@ -6,9 +6,9 @@ import { importHintAnchorPosition } from "./importHintAnchor.js";
 import { importHintParts } from "./importHintParts.js";
 import { InlineHintDecorationController } from "./inlineHintDecorationController.js";
 import {
-  emptyInlineHintDecorationLayers,
+  type AnchoredInlineHint,
   inlineHintDecorationLayers,
-  mergeInlineHintDecorationLayers,
+  inlineHintLanes,
 } from "./inlineHintDecorationTypes.js";
 import { inlineHintSegmentsFromParts } from "./inlineHintSegments.js";
 import { tooltipForAnalysisState } from "./tooltip.js";
@@ -37,26 +37,18 @@ export class DecorationController extends InlineHintDecorationController {
       return;
     }
 
-    const layers = emptyInlineHintDecorationLayers();
+    const hints = this.#store
+      .get(editor.document.uri)
+      .flatMap((state) => this.hintForState(editor.document, state, config) ?? []);
 
-    for (const state of this.#store.get(editor.document.uri)) {
-      const stateLayers = this.decorationLayersForState(editor.document, state, config);
-
-      if (!stateLayers) {
-        continue;
-      }
-
-      mergeInlineHintDecorationLayers(layers, stateLayers);
-    }
-
-    this.decorationPool.applyToEditor(editor, layers);
+    this.decorationPool.applyToEditor(editor, inlineHintLanes(hints));
   }
 
-  private decorationLayersForState(
+  private hintForState(
     document: vscode.TextDocument,
     state: ImportAnalysisState,
     config: ImportLensConfig,
-  ): ReturnType<typeof inlineHintDecorationLayers> | null {
+  ): AnchoredInlineHint | null {
     const parts = importHintParts(state, config);
 
     if (!parts) {
@@ -68,7 +60,10 @@ export class DecorationController extends InlineHintDecorationController {
       primaryMargin: config.display === "inlayHint" ? "0 0 0 0.35rem" : "0 0 0 0.75rem",
     });
 
-    return inlineHintDecorationLayers(segments, anchor, tooltipForAnalysisState(state));
+    return {
+      anchor,
+      layers: inlineHintDecorationLayers(segments, anchor, tooltipForAnalysisState(state)),
+    };
   }
 
   private positionForState(

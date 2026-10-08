@@ -25,6 +25,20 @@ export const emptyInlineHintDecorationLayerBuckets = (): InlineHintDecorationLay
   suffix3: [],
 });
 
+/**
+ * The decoration lane each hint goes in, given each hint's anchor key: the first hint at an anchor
+ * takes lane 0, the next one at the same anchor lane 1, and so on.
+ */
+export const decorationLanesForAnchors = (anchorKeys: readonly string[]): number[] => {
+  const seen = new Map<string, number>();
+
+  return anchorKeys.map((key) => {
+    const lane = seen.get(key) ?? 0;
+    seen.set(key, lane + 1);
+    return lane;
+  });
+};
+
 export const slotForSegmentIndex = (index: number): InlineHintDecorationSlot | undefined => {
   if (index === 0) {
     return "primary";
