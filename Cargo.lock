@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "import-lens-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brotli",
  "bytes",
