@@ -644,11 +644,10 @@ export const startDaemon = async (
   await mkdir(cachePath, { recursive: true });
   await mkdir(lifecyclePath, { recursive: true });
   const pipeName = daemonPipePath();
-  const child = spawn(
-    binary,
-    ["--pipe", pipeName, "--workspace", workspaceRoot, "--storage", lifecyclePath],
-    { stdio: ["ignore", "ignore", "inherit"] },
-  );
+  // The workspace root travels in `hello`, not on the command line.
+  const child = spawn(binary, ["--pipe", pipeName, "--storage", lifecyclePath], {
+    stdio: ["ignore", "ignore", "inherit"],
+  });
   // A spawn failure (EACCES, ENOENT) arrives as an 'error' event. Unheard, it is an uncaught
   // exception and exit 1, which CI reads as "budget exceeded"; as a rejection it reaches `main`'s
   // exit 2. The listener stays attached for the child's lifetime so a later error is never uncaught.
