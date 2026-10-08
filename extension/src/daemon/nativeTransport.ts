@@ -202,11 +202,10 @@ export class NativeDaemonTransport implements AnalysisTransport {
     let childProcess: DaemonChildProcess;
 
     try {
+      // The workspace root travels in hello, never on the command line.
       childProcess = this.#launcher.spawn(binaryPath, [
         "--pipe",
         pipeName,
-        "--workspace",
-        workspaceRoot,
         "--storage",
         storagePaths.lifecycleStoragePath,
       ]);
