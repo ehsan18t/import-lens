@@ -13,3 +13,9 @@ test("substitutionSuggestionsFor uses local curated mappings only", () => {
   );
   assert.deepEqual(substitutionSuggestionsFor("unknown-lib"), []);
 });
+
+test("substitutionSuggestionsFor finds nothing for Object.prototype member names", () => {
+  for (const specifier of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+    assert.deepEqual(substitutionSuggestionsFor(specifier), [], specifier);
+  }
+});
