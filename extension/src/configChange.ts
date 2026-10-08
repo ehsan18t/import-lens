@@ -17,6 +17,12 @@ export const classifyImportLensConfigChange = (
     return "daemonRestart";
   }
 
+  // The daemon takes its log level from `hello` once per process, so a new level reaches its own
+  // logging only through a new process. The host-side filter alone can hide lines, never add them.
+  if (event.affectsConfiguration("importLens.logLevel")) {
+    return "daemonRestart";
+  }
+
   if (event.affectsConfiguration("importLens.enabled")) {
     return "reanalyze";
   }
