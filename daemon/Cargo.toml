@@ -9,7 +9,7 @@ name = "import-lens-daemon"
 path = "src/main.rs"
 
 [dependencies]
-brotli = "^8"
+brotli = "^9"
 bytes = "^1"
 # Coordinated compiler stack, exact-pinned: this is the matcher Rolldown itself
 # reads `sideEffects` globs with (`rolldown_common`, `rolldown_utils`). Its whole
@@ -55,7 +55,7 @@ tokio = { version = "^1.52", features = ["rt-multi-thread", "net", "io-util", "m
 tokio-util = { version = "^0.7", features = ["codec"] }
 ureq = { version = "^3.3", default-features = false, features = ["rustls"] }
 xxhash-rust = { version = "^0.8", features = ["xxh3"] }
-zstd = "^0.13"
+zstd = "^0.14"
 
 # On Linux the C dependencies (zstd) allocate through glibc malloc, whose per-thread arenas keep
 # freed memory resident outside anything idle reclaim collects; mimalloc overrides malloc there.
@@ -64,7 +64,9 @@ zstd = "^0.13"
 libmimalloc-sys = { version = "^0.1", default-features = false, features = ["extended", "no_thp", "override"] }
 
 [dev-dependencies]
-zip = "^2"
+# Reads the fixture archive, which holds only deflate and stored entries. The default
+# features compile bzip2, lzma, xz, ppmd, AES and a second zstd into every test build.
+zip ={ version = "^8", default-features = false, features = ["deflate-flate2"] }
 
 [lints]
 workspace = true
