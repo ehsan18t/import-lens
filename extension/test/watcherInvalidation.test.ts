@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createNodeModulesInvalidationBuffer,
   isWorkspaceConfigPath,
+  nodeModulesDeletionPath,
   nodeModulesInvalidationBurstLimit,
   nodeModulesInvalidationDecision,
 } from "../src/watcherInvalidation.js";
@@ -161,4 +162,23 @@ test("createNodeModulesInvalidationBuffer clears pending timer on dispose", () =
 
   assert.equal(clearedHandle, "watcher-timer");
   assert.deepEqual(calls, []);
+});
+
+test("a deleted package folder invalidates its manifest and a deleted node_modules everything", () => {
+  assert.equal(
+    nodeModulesDeletionPath("C:/w/node_modules/lodash"),
+    "C:/w/node_modules/lodash/package.json",
+  );
+  assert.equal(
+    nodeModulesDeletionPath("C:\\w\\node_modules\\@babel\\core"),
+    "C:\\w\\node_modules\\@babel\\core\\package.json",
+  );
+  assert.equal(nodeModulesDeletionPath("C:/w/node_modules/.pnpm"), null);
+  assert.equal(nodeModulesDeletionPath("C:/w/src/lodash"), null);
+
+  for (const deleted of ["C:/w/node_modules", "C:/w/node_modules/@babel"]) {
+    const queued = nodeModulesDeletionPath(deleted);
+    assert.ok(queued);
+    assert.equal(nodeModulesInvalidationDecision([queued]).kind, "all");
+  }
 });

@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
 import type { DaemonManager } from "./daemon/manager.js";
 import type { Logger } from "./logging/types.js";
-import { createNodeModulesInvalidationBuffer } from "./watcherInvalidation.js";
+import {
+  createNodeModulesInvalidationBuffer,
+  nodeModulesDeletionPath,
+} from "./watcherInvalidation.js";
 
 /**
  * The files the daemon memoizes and cannot see change on its own.
@@ -25,6 +28,9 @@ const watchedPatterns = [
   "**/{vite,webpack,rollup}.config.{js,mjs,cjs,ts,mts,cts}",
 ];
 
+/** Deletes only: a removed folder is reported once, for the folder (`nodeModulesDeletionPath`). */
+const deletedFolderPatterns = ["**/node_modules", "**/node_modules/*", "**/node_modules/@*/*"];
+
 export const registerNodeModulesWatchers = (
   context: vscode.ExtensionContext,
   daemon: DaemonManager,
@@ -42,6 +48,20 @@ export const registerNodeModulesWatchers = (
     watcher.onDidCreate(queue, undefined, context.subscriptions);
     watcher.onDidChange(queue, undefined, context.subscriptions);
     watcher.onDidDelete(queue, undefined, context.subscriptions);
+    context.subscriptions.push(watcher);
+  }
+
+  const queueDeletedFolder = (uri: vscode.Uri): void => {
+    const invalidated = nodeModulesDeletionPath(uri.fsPath);
+
+    if (invalidated) {
+      invalidationBuffer.queue(invalidated);
+    }
+  };
+
+  for (const pattern of deletedFolderPatterns) {
+    const watcher = vscode.workspace.createFileSystemWatcher(pattern, true, true, false);
+    watcher.onDidDelete(queueDeletedFolder, undefined, context.subscriptions);
     context.subscriptions.push(watcher);
   }
 

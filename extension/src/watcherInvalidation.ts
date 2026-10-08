@@ -27,6 +27,48 @@ const hasNodeModulesSegment = (candidate: string): boolean =>
 export const isWorkspaceConfigPath = (candidate: string): boolean =>
   workspaceConfigFileName.test(basenameOf(candidate)) && !hasNodeModulesSegment(candidate);
 
+const pathSegments = (candidate: string): string[] => candidate.split(/[/\\]/u);
+
+const isNodeModulesDirectory = (candidate: string): boolean =>
+  basenameOf(candidate) === "node_modules";
+
+/**
+ * What a deleted folder under `node_modules` invalidates, as a path the burst understands.
+ *
+ * VS Code reports a deleted folder as one event for the folder and none for the files inside it,
+ * so `rm -rf node_modules` or an uninstall never matches the `package.json` globs. A package folder
+ * maps to its manifest path, which the daemon resolves to a package name. A `node_modules` folder,
+ * or a whole `@scope` folder, maps to the `node_modules` directory itself, which the burst turns
+ * into a full invalidation: the packages it held cannot be listed after the fact. Dot entries
+ * (`.bin`, `.pnpm`, lockfile caches) carry no package and map to nothing.
+ */
+export const nodeModulesDeletionPath = (deletedPath: string): string | null => {
+  const segments = pathSegments(deletedPath);
+  const name = segments.at(-1) ?? "";
+  const parent = segments.at(-2);
+  const separator = deletedPath.includes("\\") ? "\\" : "/";
+
+  if (name === "node_modules") {
+    return deletedPath;
+  }
+
+  if (name.length === 0 || name.startsWith(".")) {
+    return null;
+  }
+
+  if (parent === "node_modules") {
+    return name.startsWith("@")
+      ? segments.slice(0, -1).join(separator)
+      : `${deletedPath}${separator}package.json`;
+  }
+
+  if (parent?.startsWith("@") && segments.at(-3) === "node_modules") {
+    return `${deletedPath}${separator}package.json`;
+  }
+
+  return null;
+};
+
 export type NodeModulesInvalidationDecision =
   | { kind: "none" }
   | { kind: "changed"; packageJsonPaths: string[]; tsconfigPaths: string[] }
@@ -74,7 +116,7 @@ export const nodeModulesInvalidationDecision = (
     (path: string) => !workspaceConfigFileName.test(basenameOf(path)),
   );
 
-  if (packageJsonPaths.length > burstLimit) {
+  if (packageJsonPaths.length > burstLimit || packageJsonPaths.some(isNodeModulesDirectory)) {
     return {
       kind: "all",
       count: packageJsonPaths.length,
