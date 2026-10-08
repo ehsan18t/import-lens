@@ -1,7 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ImportLensConfig } from "../config.js";
 import { IpcClient } from "../ipc/client.js";
@@ -34,6 +33,7 @@ import type {
 import { protocolVersion } from "../ipc/protocol.js";
 import type { Logger } from "../logging/types.js";
 import { knownDaemonHashes } from "./knownHashes.generated.js";
+import { daemonPipeName } from "./pipeName.js";
 import { currentPlatformTarget, daemonRelativePath } from "./platform.js";
 import {
   cleanupFailedDaemonStartup,
@@ -182,10 +182,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
     await mkdir(storagePaths.lifecycleStoragePath, { recursive: true });
     await mkdir(storagePaths.cacheBasePath, { recursive: true });
 
-    const pipeName =
-      process.platform === "win32"
-        ? `\\\\.\\pipe\\import-lens-${process.pid}-${randomUUID()}`
-        : path.join(tmpdir(), `import-lens-${process.pid}-${randomUUID()}.sock`);
+    const pipeName = daemonPipeName();
 
     const childProcess = spawn(binaryPath, [
       "--pipe",
