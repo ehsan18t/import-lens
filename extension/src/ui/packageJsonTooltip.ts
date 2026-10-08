@@ -18,6 +18,8 @@ import {
   isTypesOnlyResult,
 } from "./resultDiagnostics.js";
 import {
+  confidenceNotesMarkdown,
+  confidenceRowMarkdown,
   conservativeSizingMarkdown,
   copyDiagnosticsMarkdown,
   importResultSizeMarkdown,
@@ -145,6 +147,11 @@ export const packageJsonDependencyTooltipMarkdown = (
     parts.push(state.result.error ?? "No size was produced for this dependency.");
   } else if (state.message) {
     parts.push(state.message);
+  }
+
+  if (state.status === "ready" && state.result) {
+    parts.push(["**Analysis**", confidenceRowMarkdown(state.result)].join("\n"));
+    parts.push(confidenceNotesMarkdown(state.result.confidence_reasons) ?? "");
   }
 
   const registryDetails = registryDetailsMarkdown(state, options);

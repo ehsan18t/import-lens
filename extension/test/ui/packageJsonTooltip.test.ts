@@ -247,6 +247,44 @@ test("packageJsonDependencyTooltipMarkdown includes type-only status", () => {
   assert.doesNotMatch(markdown, /0 B br · types only/u);
 });
 
+test("packageJsonDependencyTooltipMarkdown shows confidence like the source hover", () => {
+  const reason = "A stylesheet this package imports was not counted.";
+  const measured = result({ confidence: "medium", confidence_reasons: [reason] });
+  const markdown = packageJsonDependencyTooltipMarkdown(
+    { name: "react", section: "dependencies", status: "ready", result: measured },
+    config(),
+  );
+  const sourceHover = tooltipForResultMarkdown(measured, config());
+
+  for (const line of ["- Confidence: **Medium**", "**Confidence notes**", `- ${reason}`]) {
+    assert.ok(markdown.includes(line), line);
+    assert.ok(sourceHover.includes(line), line);
+  }
+
+  const unmeasured = packageJsonDependencyTooltipMarkdown(
+    {
+      name: "broken",
+      section: "dependencies",
+      status: "ready",
+      result: result({
+        specifier: "broken",
+        raw_bytes: null,
+        minified_bytes: null,
+        gzip_bytes: null,
+        brotli_bytes: null,
+        zstd_bytes: null,
+        confidence: "low",
+        confidence_reasons: ["The entry could not be bundled."],
+        error: "bundle failed",
+      }),
+    },
+    config(),
+  );
+
+  assert.match(unmeasured, /- Confidence: \*\*Low\*\*/u);
+  assert.match(unmeasured, /- The entry could not be bundled\./u);
+});
+
 test("importResultSizeMarkdown renders sectioned size rows", () => {
   assert.equal(
     importResultSizeMarkdown(result(), "brotli"),

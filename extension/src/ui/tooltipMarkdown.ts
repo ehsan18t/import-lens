@@ -115,20 +115,21 @@ const assetBreakdownRows = (
 
 const yesNo = (value: boolean): "yes" | "no" => (value ? "yes" : "no");
 
-const confidenceNotesMarkdown = (reasons: readonly string[]): string | null =>
+// Shared by the source hover and the package.json dependency hover, so one package reads with the
+// same confidence badge and reasons wherever it is hovered.
+export const confidenceRowMarkdown = (result: ImportResult): string =>
+  `- Confidence: **${confidenceVisualFor(result.confidence).badge}**`;
+
+export const confidenceNotesMarkdown = (reasons: readonly string[]): string | null =>
   reasons.length > 0
     ? ["**Confidence notes**", ...reasons.map((reason) => `- ${reason}`)].join("\n")
     : null;
 
-const analysisMarkdown = (
-  result: ImportResult,
-  runtime: ImportRuntime,
-  confidenceBadge: string,
-): string => {
+const analysisMarkdown = (result: ImportResult, runtime: ImportRuntime): string => {
   const rows = [
     "**Analysis**",
     `- Runtime: ${runtime}`,
-    `- Confidence: **${confidenceBadge}**`,
+    confidenceRowMarkdown(result),
     `- Side effects: ${yesNo(result.side_effects)}`,
     `- CommonJS: ${yesNo(result.is_cjs)}`,
     `- Tree-shakeable: ${yesNo(result.truly_treeshakeable)}`,
@@ -151,14 +152,14 @@ const analysisMarkdown = (
   return rows.join("\n");
 };
 
-const errorDiagnosticsMarkdown = (result: ImportResult, confidenceBadge: string): string => {
+const errorDiagnosticsMarkdown = (result: ImportResult): string => {
   const rows = [
     "**Diagnostics**",
     "Import Lens could not compute this import size.",
     // A result with no size normally carries the reason; a still-building one carries none, and the
     // tooltip says what it knows rather than printing `null`.
     `- Error: ${result.error ?? "no size was produced for this import"}`,
-    `- Confidence: **${confidenceBadge}**`,
+    confidenceRowMarkdown(result),
     ...result.confidence_reasons.map((reason) => `- ${reason}`),
     `- ${copyDiagnosticsMarkdown(result)}`,
   ];
@@ -173,18 +174,17 @@ export const tooltipForResultMarkdown = (
   insights: readonly ImportAnalysisInsight[] = [],
 ): string => {
   const parts: string[] = [`**${result.specifier}**`];
-  const confidence = confidenceVisualFor(result.confidence);
 
   // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). Everything below this
   // renders a number; the check that decides whether to render one has to be the check for whether
   // there IS one.
   if (!measuredSizes(result)) {
-    parts.push(errorDiagnosticsMarkdown(result, confidence.badge));
+    parts.push(errorDiagnosticsMarkdown(result));
     return parts.filter(Boolean).join("\n\n");
   }
 
   parts.push(importResultSizeMarkdown(result, config.compression));
-  parts.push(analysisMarkdown(result, runtime, confidence.badge));
+  parts.push(analysisMarkdown(result, runtime));
 
   const confidenceNotes = confidenceNotesMarkdown(result.confidence_reasons);
 
