@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import path from "node:path";
 import * as vscode from "vscode";
 import { DebouncedDocumentScheduler } from "../analysis/debouncedDocumentScheduler.js";
 import { getImportLensConfig } from "../config.js";
@@ -19,6 +21,7 @@ import {
 } from "./packageJsonPartial.js";
 import { PackageJsonRequestLifecycle } from "./packageJsonRequestLifecycle.js";
 import type { PackageJsonDependencyHintState } from "./packageJsonState.js";
+import { readPrivateRegistryScopes, withoutNonPublicRegistryHints } from "./registryEligibility.js";
 import { RegistryHintRefresher, registryTargetsForStates } from "./registryRefresh.js";
 
 export interface PackageJsonDependencyAnalysisState extends PackageJsonDependencyHintState {
@@ -47,6 +50,9 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
   readonly #lifecycle = new PackageJsonRequestLifecycle();
   readonly #states = new Map<string, PackageJsonDependencyAnalysisState[]>();
   readonly #sections = new Map<string, PackageJsonDependencySection[]>();
+  // Read once per analysis request and reused by its partials and by the refresh commands, which
+  // only act on analyzed states.
+  readonly #privateRegistryScopes = new Map<string, ReadonlySet<string>>();
   readonly #scheduledAt = new Map<string, number>();
   readonly #requestTimings = new Map<number, PackageJsonRequestTiming>();
   readonly #onDidChange = new vscode.EventEmitter<vscode.Uri>();
@@ -157,10 +163,18 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
 
     try {
       const workspaceRoot = await this.resolveWorkspaceRootForRequest(document, requestId);
+      // Lowest precedence first: the user's file, then the workspace's, then the manifest's own.
+      const privateScopes = await readPrivateRegistryScopes([
+        homedir(),
+        workspaceRoot,
+        path.dirname(document.fileName),
+      ]);
 
       if (!this.#lifecycle.isCurrent(key, requestId)) {
         return;
       }
+
+      this.#privateRegistryScopes.set(key, privateScopes);
 
       if (!(await this.ensureDaemonReadyForRequest(workspaceRoot, requestId, key, document.uri))) {
         return;
@@ -219,7 +233,10 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       }
 
       this.#sections.set(key, response.sections);
-      const states = mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], response);
+      const states = withoutNonPublicRegistryHints(
+        mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], response),
+        privateScopes,
+      );
       this.setStates(document.uri, states);
       this.queueRegistryRefreshes(document.uri, states);
     } catch (error) {
@@ -281,6 +298,7 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
     const key = uri.toString();
     this.#states.delete(key);
     this.#sections.delete(key);
+    this.#privateRegistryScopes.delete(key);
     this.#lifecycle.forget(key);
     this.#registryRefresher.forget(uri);
     this.#onDidChange.fire(uri);
@@ -312,7 +330,13 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       return;
     }
 
-    await this.#registryRefresher.refresh(uri, registryTargetsForStates(targets), "force_refresh");
+    const registryTargets = registryTargetsForStates(targets, this.privateScopesFor(uri));
+
+    if (registryTargets.length === 0) {
+      return;
+    }
+
+    await this.#registryRefresher.refresh(uri, registryTargets, "force_refresh");
   }
 
   private handlePackageJsonPartial(
@@ -340,7 +364,10 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       this.#sections.set(key, partial.sections);
     }
 
-    const states = mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], partial);
+    const states = withoutNonPublicRegistryHints(
+      mergePackageJsonAnalysisPartial(this.#states.get(key) ?? [], partial),
+      this.privateScopesFor(uri),
+    );
     this.setStates(uri, states);
     // Registry refreshes are queued once from analyze() after the final response,
     // not per streaming partial — otherwise every per-package partial fires its
@@ -355,13 +382,17 @@ export class PackageJsonAnalysisController implements vscode.Disposable {
       return;
     }
 
-    const targets = registryTargetsForStates(states);
+    const targets = registryTargetsForStates(states, this.privateScopesFor(uri));
 
     if (targets.length === 0) {
       return;
     }
 
     void this.#registryRefresher.refresh(uri, targets, "refresh_stale");
+  }
+
+  private privateScopesFor(uri: vscode.Uri): ReadonlySet<string> {
+    return this.#privateRegistryScopes.get(uri.toString()) ?? new Set();
   }
 
   private markLoadingUnavailable(uri: vscode.Uri, message: string): void {
