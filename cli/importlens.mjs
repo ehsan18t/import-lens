@@ -957,11 +957,12 @@ const validateBudgets = (value, sourcePath) => {
     if (bytes === undefined) {
       continue;
     }
-    if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) {
+    // Below 1 floors to a zero budget, which every measured import would exceed.
+    if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 1) {
       // `String`, not `JSON.stringify`, for a number: an overflowing literal parses to Infinity,
       // which JSON would print as `null`.
       const shown = typeof bytes === "number" ? String(bytes) : JSON.stringify(bytes);
-      fail(`${key} must be a positive number of bytes, got ${shown}`);
+      fail(`${key} must be a number of bytes of at least 1, got ${shown}`);
     }
     budgets[key] = Math.floor(bytes);
   }

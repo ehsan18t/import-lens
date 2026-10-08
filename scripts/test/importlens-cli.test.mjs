@@ -88,9 +88,10 @@ test("loadBudgetConfig refuses a budget it cannot enforce instead of dropping it
   for (const [text, message] of [
     [
       '{"budgets":{"perFileBrotliBytes":"50kB"}}',
-      /perFileBrotliBytes must be a positive number of bytes, got "50kB"/u,
+      /perFileBrotliBytes must be a number of bytes of at least 1, got "50kB"/u,
     ],
-    ['{"budgets":{"perImportBrotliBytes":0}}', /perImportBrotliBytes must be a positive number/u],
+    ['{"budgets":{"perImportBrotliBytes":0}}', /perImportBrotliBytes must be a number of bytes/u],
+    ['{"budgets":{"perImportBrotliBytes":0.5}}', /got 0.5/u],
     ['{"budgets":{"perImportBrotliBytes":1e400}}', /got Infinity/u],
     ['{"budgets":{"perFileBrotliByte":50000}}', /unknown budget "perFileBrotliByte"/u],
     ['{"budgets":[50000]}', /expected an object/u],
