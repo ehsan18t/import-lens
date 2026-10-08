@@ -98,7 +98,8 @@ export const loadBudgetConfig = async ({
     );
   }
 
-  return sanitizeBudgets(parsed.budgets ?? parsed.importLens?.budgets ?? {});
+  const budgets = parsed?.budgets !== undefined ? parsed.budgets : parsed?.importLens?.budgets;
+  return budgets === undefined ? {} : validateBudgets(budgets, source.path);
 };
 
 // A budget was exceeded: the regression is real, and this is the code CI is meant to fail on.
@@ -927,25 +928,38 @@ const requestIdForMessage = (message) => {
   return message.request_id;
 };
 
-const sanitizeBudgets = (value) => {
-  if (!value || typeof value !== "object") {
-    return {};
+const budgetKeys = ["perImportBrotliBytes", "perFileBrotliBytes"];
+
+// Refuses rather than drops: a budget the gate silently ignores reports "No Import Lens budgets
+// configured." and exits 0, a green CI run for a budget the user believes is enforced.
+const validateBudgets = (value, sourcePath) => {
+  const fail = (reason) => {
+    throw new Error(`invalid budgets in ${sourcePath}: ${reason}`);
+  };
+
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    fail(`expected an object with ${budgetKeys.join(" and/or ")}, got ${JSON.stringify(value)}`);
+  }
+
+  for (const key of Object.keys(value)) {
+    if (!budgetKeys.includes(key)) {
+      fail(`unknown budget "${key}" (expected ${budgetKeys.join(" or ")})`);
+    }
   }
 
   const budgets = {};
-  if (
-    typeof value.perImportBrotliBytes === "number" &&
-    Number.isFinite(value.perImportBrotliBytes) &&
-    value.perImportBrotliBytes > 0
-  ) {
-    budgets.perImportBrotliBytes = Math.floor(value.perImportBrotliBytes);
-  }
-  if (
-    typeof value.perFileBrotliBytes === "number" &&
-    Number.isFinite(value.perFileBrotliBytes) &&
-    value.perFileBrotliBytes > 0
-  ) {
-    budgets.perFileBrotliBytes = Math.floor(value.perFileBrotliBytes);
+  for (const key of budgetKeys) {
+    const bytes = value[key];
+    if (bytes === undefined) {
+      continue;
+    }
+    if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) {
+      // `String`, not `JSON.stringify`, for a number: an overflowing literal parses to Infinity,
+      // which JSON would print as `null`.
+      const shown = typeof bytes === "number" ? String(bytes) : JSON.stringify(bytes);
+      fail(`${key} must be a positive number of bytes, got ${shown}`);
+    }
+    budgets[key] = Math.floor(bytes);
   }
   return budgets;
 };

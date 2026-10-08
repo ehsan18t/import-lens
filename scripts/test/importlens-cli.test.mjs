@@ -77,6 +77,34 @@ test("loadBudgetConfig rejects malformed budget config", async () => {
   );
 });
 
+test("loadBudgetConfig refuses a budget it cannot enforce instead of dropping it", async () => {
+  const load = (text) =>
+    loadBudgetConfig({
+      configPath: ".importlensrc.json",
+      readText: async () => text,
+      findDefaultConfig: async () => null,
+    });
+
+  for (const [text, message] of [
+    [
+      '{"budgets":{"perFileBrotliBytes":"50kB"}}',
+      /perFileBrotliBytes must be a positive number of bytes, got "50kB"/u,
+    ],
+    ['{"budgets":{"perImportBrotliBytes":0}}', /perImportBrotliBytes must be a positive number/u],
+    ['{"budgets":{"perImportBrotliBytes":1e400}}', /got Infinity/u],
+    ['{"budgets":{"perFileBrotliByte":50000}}', /unknown budget "perFileBrotliByte"/u],
+    ['{"budgets":[50000]}', /expected an object/u],
+    ['{"importLens":{"budgets":"50kB"}}', /expected an object/u],
+  ]) {
+    await assert.rejects(load(text), message, text);
+  }
+
+  assert.deepEqual(await load('{"name":"app"}'), {}, "absent budgets stay unconfigured");
+  assert.deepEqual(await load('{"importLens":{"budgets":{"perFileBrotliBytes":50000.7}}}'), {
+    perFileBrotliBytes: 50000,
+  });
+});
+
 test("runImportLensCheck exits non-zero on daemon-backed budget violations", async () => {
   const output = [];
   const exitCode = await runImportLensCheck({
