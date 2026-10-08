@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,6 +8,7 @@ import test from "node:test";
 import { encode } from "@msgpack/msgpack";
 import {
   analyzeFileWithDaemon,
+  changedFiles,
   createDaemonClient,
   daemonBinaryPath,
   daemonPipePath,
@@ -729,4 +731,33 @@ test("a file that throws is one unmeasurable file, not an abandoned run", async 
   );
 
   rmSync(workspace, { recursive: true, force: true });
+});
+
+const git = (cwd, ...args) =>
+  execFileSync(
+    "git",
+    ["-c", "user.name=Import Lens", "-c", "user.email=ci@import-lens.test", ...args],
+    { cwd, encoding: "utf8" },
+  );
+
+const gitWorkspace = () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "importlens-cli-git-"));
+  git(workspace, "init", "-q", "-b", "main");
+  writeFileSync(path.join(workspace, "base.ts"), "export {};\n");
+  git(workspace, "add", ".");
+  git(workspace, "commit", "-q", "-m", "base");
+  return workspace;
+};
+
+test("changedFiles reads a non-ASCII path git would quote", async () => {
+  const workspace = gitWorkspace();
+  try {
+    writeFileSync(path.join(workspace, "café.ts"), "export {};\n");
+    git(workspace, "add", "café.ts");
+
+    const { files } = await changedFiles(workspace);
+    assert.deepEqual(files, ["café.ts"]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
 });

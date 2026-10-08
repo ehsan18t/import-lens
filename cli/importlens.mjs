@@ -350,18 +350,34 @@ const findDefaultBudgetConfig = async (readText) => {
   return null;
 };
 
-const changedFiles = async (cwd) => {
+export const changedFiles = async (cwd) => {
   // `git diff --name-only` prints repository-root-relative paths regardless of
   // cwd, so file resolution must anchor at the git top level, not the
   // invocation directory (budget discovery stays cwd-scoped).
+  //
+  // `-z` with `core.quotePath=false`: by default git C-quotes a non-ASCII path (`"caf\303\251.ts"`),
+  // whose extension then reads `.ts"` and the file is silently dropped from the gate.
   const [{ stdout: diff }, { stdout: topLevel }] = await Promise.all([
-    execFile("git", ["diff", "--name-only", "--diff-filter=ACMRTUXB", "HEAD", "--"], { cwd }),
+    execFile(
+      "git",
+      [
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--name-only",
+        "-z",
+        "--diff-filter=ACMRTUXB",
+        "HEAD",
+        "--",
+      ],
+      { cwd },
+    ),
     execFile("git", ["rev-parse", "--show-toplevel"], { cwd }),
   ]);
 
   return {
     topLevel: topLevel.trim(),
-    files: diff.split(/\r?\n/u).filter(Boolean),
+    files: diff.split("\0").filter(Boolean),
   };
 };
 
