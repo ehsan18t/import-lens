@@ -1963,7 +1963,7 @@ fn revalidate_document_sizes_recomputes_only_stale_specifiers() {
     // recomputed — one changed dep must not trigger a full re-analysis of the file.
     let stale = HashSet::from(["dependent-lib".to_owned()]);
     let (_, _, results, identities) = service
-        .revalidate_document_sizes(&request, &stale, || true)
+        .revalidate_document_sizes(&request, &stale, &[], || true)
         .expect("a stale specifier should produce a refreshed result");
 
     let specifiers = results
@@ -1986,7 +1986,7 @@ fn revalidate_document_sizes_recomputes_only_stale_specifiers() {
     // An empty stale set is a no-op (nothing to revalidate).
     assert!(
         service
-            .revalidate_document_sizes(&request, &HashSet::new(), || true)
+            .revalidate_document_sizes(&request, &HashSet::new(), &[], || true)
             .is_none(),
         "an empty stale set recomputes nothing"
     );
@@ -2022,7 +2022,7 @@ fn revalidation_pushes_an_entry_that_is_fresh_again_without_rebuilding_it() {
 
     let stale = HashSet::from(["tiny-lib".to_owned()]);
     let (_, _, results, _) = service
-        .revalidate_document_sizes(&request, &stale, || true)
+        .revalidate_document_sizes(&request, &stale, &[], || true)
         .expect("the served-stale import should still be pushed");
 
     fs::remove_dir_all(&workspace).ok();
@@ -2057,14 +2057,14 @@ fn revalidate_document_sizes_bails_when_superseded() {
 
     assert!(
         service
-            .revalidate_document_sizes(&request, &stale, || false)
+            .revalidate_document_sizes(&request, &stale, &[], || false)
             .is_none(),
         "a superseded revalidation recomputes nothing"
     );
     // Control: with a live continuation the same stale specifier still recomputes.
     assert!(
         service
-            .revalidate_document_sizes(&request, &stale, || true)
+            .revalidate_document_sizes(&request, &stale, &[], || true)
             .is_some(),
         "a live revalidation still recomputes the stale specifier"
     );
@@ -2102,7 +2102,7 @@ fn revalidate_document_sizes_pushes_a_deterministic_failure_carrying_no_size() {
     let stale = HashSet::from(["missing-effectful-lib".to_owned()]);
 
     let (_, _, results, _) = service
-        .revalidate_document_sizes(&request, &stale, || true)
+        .revalidate_document_sizes(&request, &stale, &[], || true)
         .expect("a deterministic failure is durable, so it is cached and pushed");
 
     fs::remove_dir_all(workspace).expect("temp workspace should be removed");
@@ -2149,7 +2149,7 @@ fn revalidate_document_sizes_distinguishes_same_specifier_variants() {
     // Both variants share the specifier `tiny-lib`, so both are recomputed.
     let stale = HashSet::from(["tiny-lib".to_owned()]);
     let (_, _, results, identities) = service
-        .revalidate_document_sizes(&request, &stale, || true)
+        .revalidate_document_sizes(&request, &stale, &[], || true)
         .expect("stale same-specifier variants should produce refreshed results");
 
     assert_eq!(

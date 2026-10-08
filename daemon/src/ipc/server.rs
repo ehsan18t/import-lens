@@ -1427,10 +1427,12 @@ fn spawn_file_size_document(
             return;
         }
 
+        // What the client was just served: the revalidation re-derives shared bytes over it.
+        let served = response.states;
         // Cancellation is per document: only a newer size read of this document supersedes it.
         let revalidation = spawn_blocking_noted(move || {
             if let Some((workspace_root, document_path, results, identities)) = service
-                .revalidate_document_sizes(&request_for_error, &stale_specifiers, || {
+                .revalidate_document_sizes(&request_for_error, &stale_specifiers, &served, || {
                     !swr_cancelled.load(Ordering::Acquire)
                 })
             {

@@ -925,6 +925,7 @@ impl ImportLensService {
         &self,
         request: &FileSizeDocumentRequest,
         stale_specifiers: &HashSet<String>,
+        served: &[ImportAnalysisItem],
         should_continue: impl Fn() -> bool,
     ) -> Option<(
         String,
@@ -1041,10 +1042,11 @@ impl ImportLensService {
         if fresh.is_empty() {
             return None;
         }
+        let (results, identities) = revalidated_with_shared_bytes(served, fresh, identities);
         Some((
             request.workspace_root.clone(),
             request.active_document_path.clone(),
-            fresh,
+            results,
             identities,
         ))
     }
@@ -2429,6 +2431,73 @@ fn shared_bytes_corrections(
     }
 
     (results, identities)
+}
+
+/// A revalidation push with its shared figures re-derived.
+///
+/// `analyze_and_cache` returns a recomputed import with no `shared_bytes`: sharing is a relation
+/// between a document's imports, not a property of one. Pushed as is, the client replaces the whole
+/// result and the hover loses its shared figure, while a sibling served from the cache keeps one
+/// computed against the old graph. So the figure is annotated over the document as it was served,
+/// with the recomputed results in place, and the push carries every recomputed import plus each
+/// served sibling whose figure the recomputed graphs change.
+fn revalidated_with_shared_bytes(
+    served: &[ImportAnalysisItem],
+    fresh: Vec<ImportResult>,
+    identities: Vec<RefreshedImportIdentity>,
+) -> (Vec<ImportResult>, Vec<RefreshedImportIdentity>) {
+    let siblings = served
+        .iter()
+        .filter_map(|item| {
+            let result = item.result.as_ref()?;
+            let identity = RefreshedImportIdentity {
+                specifier: item.detected.specifier.clone(),
+                import_kind: item.detected.import_kind,
+                named: item.detected.named.clone(),
+                runtime: item.detected.runtime,
+            };
+            (!identities.contains(&identity)).then(|| MeasuredImport {
+                result: result.clone(),
+                identity,
+            })
+        })
+        .collect::<Vec<_>>();
+    let sibling_count = siblings.len();
+    let document = siblings
+        .into_iter()
+        .chain(
+            fresh
+                .into_iter()
+                .zip(identities)
+                .map(|(result, identity)| MeasuredImport { result, identity }),
+        )
+        .collect::<Vec<_>>();
+
+    let mut annotated = document
+        .iter()
+        .map(|import| import.result.clone())
+        .collect::<Vec<_>>();
+    annotate_shared_bytes(
+        document
+            .iter()
+            .map(|import| import.identity.runtime)
+            .zip(annotated.iter_mut()),
+    );
+
+    let mut results = Vec::new();
+    let mut pushed = Vec::new();
+    for (index, (import, result)) in document.into_iter().zip(annotated).enumerate() {
+        let recomputed = index >= sibling_count;
+        if recomputed
+            || import.result.shared_bytes.unwrap_or_default()
+                != result.shared_bytes.unwrap_or_default()
+        {
+            results.push(result);
+            pushed.push(import.identity);
+        }
+    }
+
+    (results, pushed)
 }
 
 /// Shared-byte annotation across a document's *measured* imports.
