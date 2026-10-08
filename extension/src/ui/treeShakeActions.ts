@@ -44,7 +44,7 @@ export class TreeShakeCodeActionProvider implements vscode.CodeActionProvider {
       inspect.command = {
         command: "importLens.showImportDetails",
         title: "Inspect Import Lens tree-shaking diagnostics",
-        arguments: [state.result, state.detected.runtime],
+        arguments: [state.result, state.detected.runtime, state.insights ?? []],
       };
 
       const copy = new vscode.CodeAction(

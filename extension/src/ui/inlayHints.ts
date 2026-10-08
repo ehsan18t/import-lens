@@ -55,7 +55,7 @@ export class ImportLensInlayHintsProvider implements vscode.InlayHintsProvider, 
           labelPart.command = {
             title: "Show Import Details",
             command: "importLens.showImportDetails",
-            arguments: [state.result, state.detected.runtime],
+            arguments: [state.result, state.detected.runtime, state.insights ?? []],
           };
         }
 

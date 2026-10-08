@@ -38,7 +38,7 @@ export class ImportLensCodeLensProvider implements vscode.CodeLensProvider, vsco
         new vscode.CodeLens(range, {
           title,
           command: "importLens.showImportDetails",
-          arguments: [result, state.detected.runtime],
+          arguments: [result, state.detected.runtime, state.insights ?? []],
         }),
       ];
     });

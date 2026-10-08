@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { AnalysisStore } from "./analysis/state.js";
+import { AnalysisStore, type ImportAnalysisInsight } from "./analysis/state.js";
 import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { classifyImportLensConfigChange } from "./configChange.js";
 import {
@@ -48,6 +48,7 @@ import {
   refreshPackageJsonRegistryHintCommand,
   refreshPackageJsonRegistryHintsCommand,
 } from "./ui/packageJsonRegistryCommands.js";
+import { plainTextFromMarkdown } from "./ui/plainText.js";
 import { showReport } from "./ui/report.js";
 import { StatusBarController } from "./ui/statusbar.js";
 import { tooltipForResult } from "./ui/tooltip.js";
@@ -280,7 +281,11 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     ),
     vscode.commands.registerCommand(
       "importLens.showImportDetails",
-      async (result: ImportResult, runtime: ImportRuntime = "component") => {
+      async (
+        result: ImportResult,
+        runtime: ImportRuntime = "component",
+        insights: readonly ImportAnalysisInsight[] = [],
+      ) => {
         // "Is there a size?", never "is there an error?" (ADR-0006, invariant 2). The details view
         // below renders the five sizes; the gate in front of it has to ask whether there are any.
         if (!measuredSizes(result)) {
@@ -296,7 +301,11 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
           return;
         }
 
-        void vscode.window.showInformationMessage(tooltipForResult(result, runtime).value);
+        // A message renders no Markdown and folds newlines unless it is a modal's detail.
+        void vscode.window.showInformationMessage(result.specifier, {
+          modal: true,
+          detail: plainTextFromMarkdown(tooltipForResult(result, runtime, insights).value),
+        });
       },
     ),
     vscode.commands.registerCommand(copyImportDiagnosticsCommand, async (result?: ImportResult) => {
