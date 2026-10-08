@@ -1,5 +1,6 @@
 import type { ImportResult } from "../ipc/protocol.js";
 import type { DocumentFileCost } from "./fileSize.js";
+import { type SourceEdit, shiftDetectedImport } from "./rangeTracking.js";
 import { mergeRefreshedResults, type RefreshMergeOptions } from "./refreshMerge.js";
 import type { ImportAnalysisState } from "./state.js";
 
@@ -47,6 +48,18 @@ interface QueuedRefresh {
  * waiting on.
  */
 const maxQueuedRefreshBatches = 256;
+
+/** States with their ranges carried through the edits; an import whose statement is gone drops out. */
+export const shiftStates = (
+  states: readonly ImportAnalysisState[],
+  edits: readonly SourceEdit[],
+): ImportAnalysisState[] =>
+  edits.length === 0
+    ? [...states]
+    : states.flatMap((state) => {
+        const detected = shiftDetectedImport(state.detected, edits);
+        return detected ? [{ ...state, detected }] : [];
+      });
 
 /**
  * The document → import-states map, plus the queue that makes a pushed import result survive the
@@ -184,6 +197,24 @@ export class DocumentAnalysisStates {
     }
 
     return this.#merge(key, results, options);
+  }
+
+  /**
+   * Lay the document's states onto its text after an edit: every range follows the text it
+   * describes, and an import whose statement the edit removed is dropped. Returns whether one was
+   * dropped, which is the only case the editor cannot follow by itself (it moves decorations with
+   * the text, but a removed import's hint would stay painted).
+   */
+  applyEdits(key: string, edits: readonly SourceEdit[]): boolean {
+    const states = this.#states.get(key);
+
+    if (!states || edits.length === 0) {
+      return false;
+    }
+
+    const shifted = shiftStates(states, edits);
+    this.#states.set(key, shifted);
+    return shifted.length < states.length;
   }
 
   clear(key: string): void {

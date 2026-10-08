@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { importAnalysisStateFromDaemon } from "./analysis/daemonState.js";
 import { DebouncedDocumentScheduler } from "./analysis/debouncedDocumentScheduler.js";
+import { shiftStates } from "./analysis/documentStates.js";
 import { fileCostQuality } from "./analysis/fileCostQuality.js";
 import { assetCompositionParts, documentFileCost } from "./analysis/fileSize.js";
 import {
@@ -19,6 +20,7 @@ import {
   recordImportCostHistory,
 } from "./analysis/history.js";
 import { applyImportAnalysisInsights } from "./analysis/insights.js";
+import { DocumentEditLog, type SourceEdit, shiftLines } from "./analysis/rangeTracking.js";
 import { ImportResultLogTracker } from "./analysis/resultLogging.js";
 import type { AnalysisStore, ImportAnalysisState } from "./analysis/state.js";
 import { getImportLensConfig } from "./config.js";
@@ -42,6 +44,14 @@ const isAnalyzableDocument = (document: vscode.TextDocument): boolean =>
 
 const isShown = (document: vscode.TextDocument): boolean =>
   isShownDocument(document, vscode.window);
+
+const sourceEditFromChange = (change: vscode.TextDocumentContentChangeEvent): SourceEdit => ({
+  range: {
+    start: { line: change.range.start.line, character: change.range.start.character },
+    end: { line: change.range.end.line, character: change.range.end.character },
+  },
+  text: change.text,
+});
 
 /** What one analysis generation owns: the inputs a File Cost re-read needs, and the history its captions compare against. @see DocumentAnalysisController.refetchFileSizeWhenSettled */
 interface AnalysisContext {
@@ -76,6 +86,9 @@ export class DocumentAnalysisController implements vscode.Disposable {
   // both. A push carries only a URI (`daemon.onRefreshedResults`), and the File Cost is fetched per
   // document, per workspace root. Dropped when the document closes.
   readonly #analysisContexts = new Map<string, AnalysisContext>();
+  // What each document was edited by since the text an in-flight analysis read: the response is
+  // laid onto the text on screen before it is stored.
+  readonly #editLog = new DocumentEditLog();
   #visibleDocumentKeys: ReadonlySet<string> = new Set();
 
   constructor(
@@ -94,7 +107,10 @@ export class DocumentAnalysisController implements vscode.Disposable {
     // No `onDidOpenTextDocument`: VS Code opens documents it never shows, and a document that is
     // shown arrives through the visible-editor or active-editor event anyway.
     context.subscriptions.push(
-      vscode.workspace.onDidChangeTextDocument((event) => this.schedule(event.document)),
+      vscode.workspace.onDidChangeTextDocument((event) => {
+        this.followEdits(event);
+        this.schedule(event.document);
+      }),
       vscode.workspace.onDidCloseTextDocument((document) => this.disposeDocument(document)),
       vscode.window.onDidChangeVisibleTextEditors((editors) => this.syncVisibleDocuments(editors)),
       vscode.window.onDidChangeActiveTextEditor((editor) => {
@@ -119,6 +135,28 @@ export class DocumentAnalysisController implements vscode.Disposable {
     }
     this.#visibleDocumentKeys = new Set(documents.map((document) => document.uri.toString()));
     this.#daemon.visibleDocuments([...new Set(documents.map((document) => document.fileName))]);
+  }
+
+  /**
+   * Carry the document's stored ranges through an edit as it happens. Every provider (inlay hints,
+   * CodeLens, hover, code actions) reads them at query time and VS Code queries again after each
+   * keystroke, while the re-analysis waits out the debounce: unfollowed, a line typed above an
+   * import would put its size on the new empty line and the next import's at the end of the wrong one.
+   */
+  private followEdits(event: vscode.TextDocumentChangeEvent): void {
+    if (!isAnalyzableDocument(event.document) || event.contentChanges.length === 0) {
+      return;
+    }
+
+    const documentKey = event.document.uri.toString();
+    const edits = event.contentChanges.map(sourceEditFromChange);
+    this.#editLog.record(documentKey, event.document.version, edits);
+    this.#store.applyEdits(event.document.uri, edits);
+
+    const changedLines = this.#changedLines.get(documentKey);
+    if (changedLines) {
+      this.#changedLines.set(documentKey, shiftLines(changedLines, edits));
+    }
   }
 
   schedule(document: vscode.TextDocument): void {
@@ -252,7 +290,11 @@ export class DocumentAnalysisController implements vscode.Disposable {
       return;
     }
 
-    const changedLinesPromise = changedLinesForFile(document.fileName, document.getText());
+    // One read of the text for everything this analysis computes from it. The response and the git
+    // diff describe THIS version, and are laid onto later edits when they land.
+    const sourceVersion = document.version;
+    const source = document.getText();
+    const changedLinesPromise = changedLinesForFile(document.fileName, source);
     const isSuperseded = (): boolean => !this.#freshness.isCurrent(documentKey, requestId);
 
     try {
@@ -296,7 +338,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
         request_id: requestId,
         workspace_root: workspaceRoot,
         active_document_path: document.fileName,
-        source: document.getText(),
+        source,
       });
 
       if (!response) {
@@ -320,11 +362,23 @@ export class DocumentAnalysisController implements vscode.Disposable {
         return;
       }
 
-      const responseStates = response.imports.map((item) =>
-        importAnalysisStateFromDaemon(item, (specifier, reason) =>
-          resultLogger.logMissingResult(specifier, reason),
+      const editsSinceSource = this.#editLog.since(documentKey, sourceVersion);
+
+      // More edits than the log keeps: the response cannot be placed on the text, and the analysis
+      // those edits scheduled will replace it.
+      if (!editsSinceSource) {
+        return;
+      }
+
+      const responseStates = shiftStates(
+        response.imports.map((item) =>
+          importAnalysisStateFromDaemon(item, (specifier, reason) =>
+            resultLogger.logMissingResult(specifier, reason),
+          ),
         ),
+        editsSinceSource,
       );
+      this.#editLog.prune(documentKey, sourceVersion);
 
       for (const state of responseStates) {
         if (state.status === "ready" && state.result) {
@@ -346,12 +400,17 @@ export class DocumentAnalysisController implements vscode.Disposable {
       // captions arrive together, below, when the inputs they are derived from do.
       this.#store.set(document.uri, responseStates, requestId);
 
-      const changedLines = await changedLinesPromise;
+      const diffedLines = await changedLinesPromise;
 
       if (!this.#freshness.isCurrent(documentKey, requestId)) {
         return;
       }
-      this.#changedLines.set(documentKey, changedLines ?? new Set());
+      // The diff numbers the lines of `source`; the stored states have followed every edit since.
+      const changedLines = shiftLines(
+        diffedLines,
+        this.#editLog.since(documentKey, sourceVersion) ?? [],
+      );
+      this.#changedLines.set(documentKey, changedLines);
 
       // Read the states back rather than reusing `responseStates`: a pushed import may
       // already have landed in them during the await above, and overwriting the store
@@ -553,6 +612,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#freshness.forget(key);
     this.#changedLines.delete(key);
     this.#analysisContexts.delete(key);
+    this.#editLog.forget(key);
     this.#store.clear(document.uri);
   }
 
@@ -561,5 +621,6 @@ export class DocumentAnalysisController implements vscode.Disposable {
     this.#freshness.clear();
     this.#changedLines.clear();
     this.#analysisContexts.clear();
+    this.#editLog.clear();
   }
 }

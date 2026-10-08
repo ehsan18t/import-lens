@@ -6,6 +6,7 @@ import {
   type RefreshApplyOptions,
 } from "./documentStates.js";
 import type { DocumentFileCost } from "./fileSize.js";
+import type { SourceEdit } from "./rangeTracking.js";
 
 export type ImportAnalysisStatus = "loading" | "ready" | "missing" | "unavailable";
 
@@ -100,6 +101,13 @@ export class AnalysisStore implements vscode.Disposable {
     options?: RefreshApplyOptions,
   ): void {
     if (this.#documents.applyRefreshedResults(uri.toString(), results, options)) {
+      this.#onDidChange.fire(uri);
+    }
+  }
+
+  /** @see DocumentAnalysisStates.applyEdits — fires only when an import was dropped. */
+  applyEdits(uri: vscode.Uri, edits: readonly SourceEdit[]): void {
+    if (this.#documents.applyEdits(uri.toString(), edits)) {
       this.#onDidChange.fire(uri);
     }
   }
