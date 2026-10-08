@@ -3,9 +3,11 @@ import test from "node:test";
 import { DocumentAnalysisStates } from "../../src/analysis/documentStates.js";
 import {
   DocumentEditLog,
+  isEmptyRange,
   type SourceEdit,
   shiftDetectedImport,
   shiftLines,
+  shiftRangeThrough,
 } from "../../src/analysis/rangeTracking.js";
 import type { DetectedImport } from "../../src/ipc/protocol.js";
 
@@ -41,6 +43,15 @@ test("text typed after the statement's semicolon does not grow the statement", (
   const shifted = shiftDetectedImport(importOnLine(0), [edit([0, 18], [0, 18], " // note")]);
 
   assert.deepEqual(shifted?.statementRange, { start: at(0, 0), end: at(0, 18) });
+});
+
+test("an empty range stays empty when text is typed exactly at it", () => {
+  const point = shiftRangeThrough({ start: at(5, 4), end: at(5, 4) }, [
+    edit([5, 4], [5, 4], '"z"'),
+  ]);
+
+  assert.deepEqual(point, { start: at(5, 7), end: at(5, 7) });
+  assert.equal(point ? isEmptyRange(point) : false, true);
 });
 
 test("text typed over a comment that follows the statement does not grow the statement", () => {

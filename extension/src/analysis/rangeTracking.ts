@@ -58,6 +58,13 @@ export const shiftRange = (range: SourceRange, edit: SourceEdit): SourceRange | 
     return null;
   }
 
+  // An empty range is a point: its two ends must move together, or text typed exactly there would
+  // push the start past the end and turn the point into an inverted range.
+  if (comparePositions(range.start, range.end) === 0) {
+    const point = shiftPosition(range.start, edit, "start");
+    return { start: point, end: point };
+  }
+
   return {
     start: shiftPosition(range.start, edit, "start"),
     end: shiftPosition(range.end, edit, "end"),
