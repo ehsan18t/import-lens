@@ -43,13 +43,20 @@ const isAnalyzableDocument = (document: vscode.TextDocument): boolean =>
 const isShown = (document: vscode.TextDocument): boolean =>
   isShownDocument(document, vscode.window);
 
-/** The inputs a File Cost re-read needs, and the generation they belong to. @see DocumentAnalysisController.refetchFileSizeWhenSettled */
-interface FileSizeContext {
+/** What one analysis generation owns: the inputs a File Cost re-read needs, and the history its captions compare against. @see DocumentAnalysisController.refetchFileSizeWhenSettled */
+interface AnalysisContext {
   document: vscode.TextDocument;
   workspaceRoot: string;
   generation: number;
   /** How many `file_size_document` reads this generation has issued, and may still issue. @see fileSizeReads */
   reads: FileSizeReadState;
+  /**
+   * The import history as it stood when this generation opened. Every caption of the generation is
+   * judged against it, never against the live store: a streamed import writes its own row the
+   * moment it lands, so re-reading the store for the next push compares each earlier import with
+   * itself and its trend note disappears.
+   */
+  history: readonly ImportCostHistoryItem[];
 }
 
 export class DocumentAnalysisController implements vscode.Disposable {
@@ -68,7 +75,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
   // streaming: the document itself, the root it was analyzed against, and the generation that owns
   // both. A push carries only a URI (`daemon.onRefreshedResults`), and the File Cost is fetched per
   // document, per workspace root. Dropped when the document closes.
-  readonly #analysisContexts = new Map<string, FileSizeContext>();
+  readonly #analysisContexts = new Map<string, AnalysisContext>();
   #visibleDocumentKeys: ReadonlySet<string> = new Set();
 
   constructor(
@@ -157,6 +164,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       generation === undefined ? true : this.#freshness.isCurrent(documentKey, generation);
     const config = getImportLensConfig();
     const changedLines = this.#changedLines.get(documentKey);
+    const importCostHistory = this.#generationHistory(documentKey);
 
     this.#store.applyRefreshedResults(uri, results, {
       identities,
@@ -168,10 +176,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       refine: (states) =>
         applyImportAnalysisInsights(states, {
           changedLines,
-          importCostHistory: this.#historyStore.get<ImportCostHistoryItem[]>(
-            importCostHistoryKey,
-            [],
-          ),
+          importCostHistory,
           budgets: config.budgets,
         }),
     });
@@ -272,6 +277,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
         workspaceRoot,
         generation: requestId,
         reads: initialFileSizeReadState,
+        history: this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []),
       });
 
       const resultLogger = new ImportResultLogTracker(
@@ -339,7 +345,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
       // captions arrive together, below, when the inputs they are derived from do.
       this.#store.set(document.uri, responseStates, requestId);
 
-      const history = this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
+      const history = this.#generationHistory(documentKey);
       const changedLines = await changedLinesPromise;
 
       if (!this.#freshness.isCurrent(documentKey, requestId)) {
@@ -492,6 +498,44 @@ export class DocumentAnalysisController implements vscode.Disposable {
       quality: fileCostQuality(response),
       composition: assetCompositionParts(response, config.compression),
     });
+  }
+
+  /**
+   * Recompute the captions of the given documents' stored states after a settings change (budgets,
+   * display), from the same inputs their analysis used: its git diff and its history snapshot.
+   * Recomputing without them strips the working-tree badge and the trend note off every import.
+   *
+   * `replace`, not `set`: this opens no analysis, so it must not consume the pushes an in-flight
+   * one is still owed.
+   */
+  reapplyInsights(documents: readonly vscode.TextDocument[]): void {
+    const budgets = getImportLensConfig().budgets;
+
+    for (const document of documents) {
+      const states = this.#store.get(document.uri);
+
+      if (states.length === 0) {
+        continue;
+      }
+
+      const documentKey = document.uri.toString();
+      this.#store.replace(
+        document.uri,
+        applyImportAnalysisInsights(states, {
+          changedLines: this.#changedLines.get(documentKey),
+          importCostHistory: this.#generationHistory(documentKey),
+          budgets,
+        }),
+      );
+    }
+  }
+
+  /** The history the document's current generation compares against; the live store only when no analysis has opened one. */
+  #generationHistory(documentKey: string): readonly ImportCostHistoryItem[] {
+    return (
+      this.#analysisContexts.get(documentKey)?.history ??
+      this.#historyStore.get<ImportCostHistoryItem[]>(importCostHistoryKey, [])
+    );
   }
 
   private setStatusForActive(document: vscode.TextDocument, state: StatusBarState): void {

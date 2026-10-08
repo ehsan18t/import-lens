@@ -1,6 +1,4 @@
 import * as vscode from "vscode";
-import { type ImportCostHistoryItem, importCostHistoryKey } from "./analysis/history.js";
-import { applyImportAnalysisInsights } from "./analysis/insights.js";
 import { AnalysisStore } from "./analysis/state.js";
 import { getImportLensConfig, type ImportLensConfig } from "./config.js";
 import { classifyImportLensConfigChange } from "./configChange.js";
@@ -155,28 +153,8 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
   const analysis = new DocumentAnalysisController(context, store, daemon, logger, statusBar);
   context.subscriptions.push(analysis);
 
-  const reapplyInsightsForVisibleDocuments = (): void => {
-    const nextConfig = getImportLensConfig();
-    const history = context.globalState.get<ImportCostHistoryItem[]>(importCostHistoryKey, []);
-
-    for (const editor of vscode.window.visibleTextEditors) {
-      const states = store.get(editor.document.uri);
-
-      if (states.length === 0) {
-        continue;
-      }
-
-      // `replace`, not `set`: this recomputes insights over the states already stored and opens no
-      // analysis, so it must not consume the pushes an in-flight one is still owed.
-      store.replace(
-        editor.document.uri,
-        applyImportAnalysisInsights(states, {
-          importCostHistory: history,
-          budgets: nextConfig.budgets,
-        }),
-      );
-    }
-  };
+  const reapplyInsightsForVisibleDocuments = (): void =>
+    analysis.reapplyInsights(vscode.window.visibleTextEditors.map((editor) => editor.document));
 
   const refreshVisibleDocuments = (
     nextConfig: ImportLensConfig,
