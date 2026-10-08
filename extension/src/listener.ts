@@ -234,6 +234,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
 
     if (!config.enabled || !supportedLanguageIds.has(document.languageId)) {
       this.#store.clear(document.uri);
+      this.setStatusForActive(document, { kind: "ready" });
       return;
     }
 

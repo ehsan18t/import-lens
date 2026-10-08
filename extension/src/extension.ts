@@ -207,6 +207,11 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
       },
       mode,
     );
+
+    // The status bar shows the active file's size, and a disabled extension has none to show.
+    if (!nextConfig.enabled) {
+      statusBar.setState({ kind: "ready" });
+    }
   };
 
   const restartDaemonAndRefresh = async (): Promise<void> => {
