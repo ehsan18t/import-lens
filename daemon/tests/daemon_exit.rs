@@ -119,8 +119,6 @@ fn wait_for_exit(child: &mut Child, bound: Duration) -> Option<Duration> {
 /// The client vanishing (an extension host crash, a killed CLI) is EOF to the daemon. A blocking
 /// handler draining engine builds cannot be cancelled, and the process must not live on until it
 /// finishes: it would hold the project's cache shards open against the next daemon.
-///
-/// Launched without `--workspace`, which the daemon accepts but does not need.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_daemon_exits_promptly_when_its_client_vanishes_mid_drain() {
     let workspace = common::temp_workspace("import-lens-exit");
