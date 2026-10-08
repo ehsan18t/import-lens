@@ -235,7 +235,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<void> 
     ),
     vscode.commands.registerCommand(
       "importLens.showReport",
-      () => void showReport(context, activeDaemon, logger),
+      () => void showReport(activeDaemon, logger),
     ),
     vscode.commands.registerCommand(
       compareImportsCommand,

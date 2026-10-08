@@ -6,8 +6,36 @@ import { nextIpcRequestId } from "../ipc/requestIds.js";
 import type { Logger } from "../logging/types.js";
 import { workspaceReportHtml } from "./reportContent.js";
 
+let openReportPanel: vscode.WebviewPanel | undefined;
+
+/**
+ * The one report panel, reused by every run: a new report replaces the open one's content. Never
+ * pushed to the extension's subscriptions, which would hold every closed panel and its HTML (large
+ * on a big workspace) until deactivation.
+ */
+const reportPanel = (): vscode.WebviewPanel => {
+  if (openReportPanel) {
+    return openReportPanel;
+  }
+
+  const panel = vscode.window.createWebviewPanel(
+    "importLensReport",
+    "Import Lens Report",
+    vscode.ViewColumn.Beside,
+    {
+      enableScripts: false,
+    },
+  );
+  openReportPanel = panel;
+  const closed = panel.onDidDispose(() => {
+    openReportPanel = undefined;
+    closed.dispose();
+  });
+
+  return panel;
+};
+
 export const showReport = async (
-  context: vscode.ExtensionContext,
   daemon: DaemonManager,
   logger: Pick<Logger, "info" | "warn">,
 ): Promise<void> => {
@@ -52,19 +80,12 @@ export const showReport = async (
     }
 
     logger.info(`Workspace report built with ${response.rows.length} import item(s).`);
-    const panel = vscode.window.createWebviewPanel(
-      "importLensReport",
-      "Import Lens Report",
-      vscode.ViewColumn.Beside,
-      {
-        enableScripts: false,
-      },
-    );
+    const panel = reportPanel();
 
     // Every claim the panel makes — the headline metric's name included — is rendered by
     // `reportContent`, which is vscode-free precisely so a test can read what the user is told.
     panel.webview.html = workspaceReportHtml({ rows: response.rows, summary: response.summary });
-    context.subscriptions.push(panel);
+    panel.reveal(vscode.ViewColumn.Beside);
   } catch (error) {
     logger.warn(
       `Workspace report request failed: ${error instanceof Error ? error.message : String(error)}`,
