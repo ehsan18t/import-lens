@@ -154,7 +154,7 @@ const sharedDependencyInsight = (
   const others = [...otherImports].sort().join(", ");
 
   return {
-    tooltip: `Shared dependency: ${modules} also appears in ${others}; shared bytes in this file: ${formatBytes(sharedBytes)}.`,
+    tooltip: `Shared dependency: ${modules} also appears in ${others}; shared in this file: ${formatBytes(sharedBytes)} unminified.`,
   };
 };
 

@@ -423,7 +423,7 @@ test("tooltipForResultMarkdown renders size and analysis sections", () => {
   assert.match(markdown, /\*\*Analysis\*\*/u);
   assert.match(markdown, /- Runtime: server/u);
   assert.match(markdown, /- Confidence: \*\*High\*\*/u);
-  assert.match(markdown, /- Shared in file: 700 B/u);
+  assert.match(markdown, /- Shared in file: 700 B unminified/u);
   assert.match(markdown, /\*\*Confidence notes\*\*/u);
   assert.match(markdown, /- Detected side\\-effect import\\\./u);
 });

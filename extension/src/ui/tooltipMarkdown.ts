@@ -136,7 +136,7 @@ const analysisMarkdown = (result: ImportResult, runtime: ImportRuntime): string 
   ];
 
   if (result.shared_bytes && result.shared_bytes > 0) {
-    rows.push(`- Shared in file: ${formatBytes(result.shared_bytes)}`);
+    rows.push(`- Shared in file: ${formatBytes(result.shared_bytes)} unminified`);
   }
 
   if (isTypesOnlyResult(result)) {

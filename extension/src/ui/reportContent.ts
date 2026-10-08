@@ -158,7 +158,7 @@ th{font-weight:600;white-space:nowrap}
 <h2>Imports</h2>
 <div class="table-scroll">
 <table>
-<thead><tr><th>Package</th><th>Import</th><th>Source</th><th>Line</th><th>Runtime</th><th>Minified</th><th>Gzip</th><th>Brotli</th><th>Zstd</th><th>Shared in File</th><th>Confidence</th><th>Confidence Reasons</th><th>Top Modules</th><th>Warning</th></tr></thead>
+<thead><tr><th>Package</th><th>Import</th><th>Source</th><th>Line</th><th>Runtime</th><th>Minified</th><th>Gzip</th><th>Brotli</th><th>Zstd</th><th>Shared in File (unminified)</th><th>Confidence</th><th>Confidence Reasons</th><th>Top Modules</th><th>Warning</th></tr></thead>
 <tbody>${importRows || `<tr><td class="empty" colspan="14">No package imports found.</td></tr>`}</tbody>
 </table>
 </div>
