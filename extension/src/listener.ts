@@ -239,6 +239,7 @@ export class DocumentAnalysisController implements vscode.Disposable {
     }
 
     const changedLinesPromise = changedLinesForFile(document.fileName, document.getText());
+    const isSuperseded = (): boolean => !this.#freshness.isCurrent(documentKey, requestId);
 
     try {
       const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
@@ -248,8 +249,17 @@ export class DocumentAnalysisController implements vscode.Disposable {
       );
 
       if (this.#daemon.state !== "ready" && (await this.#daemon.start(workspaceRoot)) !== "ready") {
+        if (isSuperseded()) {
+          return;
+        }
         this.#store.clear(document.uri);
         this.setStatusForActive(document, { kind: "unavailable" });
+        return;
+      }
+
+      // A newer analysis (or the document's close) took over while the daemon was starting: the
+      // context below belongs to that one, and storing this one's would pin a stale document.
+      if (isSuperseded()) {
         return;
       }
 
@@ -278,6 +288,9 @@ export class DocumentAnalysisController implements vscode.Disposable {
       });
 
       if (!response) {
+        if (isSuperseded()) {
+          return;
+        }
         this.#store.clear(document.uri);
         this.setStatusForActive(document, { kind: "unavailable" });
         return;
@@ -363,6 +376,11 @@ export class DocumentAnalysisController implements vscode.Disposable {
       this.#logger.warn(
         `Analysis request failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+      // A failure of a superseded request (a timeout, typically) says nothing about the states a
+      // newer analysis has stored since.
+      if (isSuperseded()) {
+        return;
+      }
       this.#store.clear(document.uri);
       this.setStatusForActive(document, { kind: "unavailable" });
     }
