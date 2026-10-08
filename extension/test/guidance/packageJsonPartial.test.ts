@@ -194,6 +194,55 @@ test("mergePackageJsonAnalysisPartial preserves stale registry refresh status", 
   assert.equal(merged[0]?.registryHintRefreshError, "temporary registry failure");
 });
 
+test("mergePackageJsonAnalysisPartial keeps each dependency's own registry hint when rows shift", () => {
+  const reactHint = { latestVersion: "19.0.0", isLatest: false, fetchedAt: 200 };
+  const current = [
+    {
+      ...stateFor("react", "ready"),
+      registryHint: reactHint,
+      registryHintRefreshStatus: "stale" as const,
+      registryHintRefreshError: "temporary registry failure",
+    },
+  ];
+  const final: AnalyzePackageJsonResponse = {
+    version: 8,
+    request_id: 11,
+    sections: [],
+    states: [stateFor("zod", "ready"), stateFor("react", "ready")],
+    error: null,
+    diagnostics: [],
+  };
+
+  const merged = mergePackageJsonAnalysisPartial(current, final);
+
+  assert.equal(merged[0]?.name, "zod");
+  assert.equal(merged[0]?.registryHint, undefined);
+  assert.equal(merged[0]?.registryHintRefreshStatus, undefined);
+  assert.equal(merged[0]?.registryHintRefreshError, undefined);
+  assert.equal(merged[1]?.registryHint, reactHint);
+  assert.equal(merged[1]?.registryHintRefreshStatus, "stale");
+});
+
+test("mergePackageJsonAnalysisPartial drops a registry hint computed for another installed version", () => {
+  const current = [
+    {
+      ...stateFor("react", "ready"),
+      installedVersion: "18.0.0",
+      registryHint: { latestVersion: "19.0.0", isLatest: false, fetchedAt: 200 },
+    },
+  ];
+  const final: AnalyzePackageJsonResponse = {
+    version: 8,
+    request_id: 12,
+    sections: [],
+    states: [{ ...stateFor("react", "ready"), installedVersion: "19.0.0" }],
+    error: null,
+    diagnostics: [],
+  };
+
+  assert.equal(mergePackageJsonAnalysisPartial(current, final)[0]?.registryHint, undefined);
+});
+
 test("markPackageJsonLoadingUnavailable preserves completed states and marks only loading states", () => {
   const ready = {
     ...stateFor("react", "ready"),

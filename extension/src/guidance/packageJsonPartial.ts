@@ -41,11 +41,26 @@ export const mergePackageJsonAnalysisPartial = (
   return nextStates;
 };
 
+// Matched by identity, never by index: adding or re-sorting a dependency shifts every index
+// after it, and a hint is only true of the package it was fetched for.
 export const mergePackageJsonFinalStates = (
   currentStates: readonly PackageJsonMergeState[],
   finalStates: readonly PackageJsonDependencyAnalysisItem[],
-): PackageJsonMergeState[] =>
-  finalStates.map((incoming, index) => mergePackageJsonState(currentStates[index], incoming));
+): PackageJsonMergeState[] => {
+  const currentByIdentity = new Map<string, PackageJsonMergeState>();
+
+  for (const state of currentStates) {
+    const key = dependencyIdentityKey(state);
+
+    if (!currentByIdentity.has(key)) {
+      currentByIdentity.set(key, state);
+    }
+  }
+
+  return finalStates.map((incoming) =>
+    mergePackageJsonState(currentByIdentity.get(dependencyIdentityKey(incoming)), incoming),
+  );
+};
 
 export const markPackageJsonLoadingUnavailable = (
   states: readonly PackageJsonDependencyAnalysisItem[],
@@ -65,7 +80,7 @@ const mergePackageJsonState = (
   current: PackageJsonMergeState | undefined,
   incoming: PackageJsonDependencyAnalysisItem,
 ): PackageJsonMergeState => {
-  if (!current) {
+  if (!current || !isSameInstalledVersion(current, incoming)) {
     return incoming;
   }
 
@@ -96,6 +111,21 @@ export const newerRegistryHint = (
 
   return currentFetchedAt > incomingFetchedAt ? current : incoming;
 };
+
+const dependencyIdentityKey = (state: PackageJsonDependencyAnalysisItem): string =>
+  `${state.section}
+${state.name}`;
+
+// A hint's latest/update verdict is computed against the installed version, so it only carries
+// across states that agree on it. An unknown version (the daemon's names-only loading rows) is not
+// a disagreement: dropping the hint there would blank it on every re-analysis.
+const isSameInstalledVersion = (
+  current: PackageJsonDependencyAnalysisItem,
+  incoming: PackageJsonDependencyAnalysisItem,
+): boolean =>
+  current.installedVersion === undefined ||
+  incoming.installedVersion === undefined ||
+  current.installedVersion === incoming.installedVersion;
 
 const isSameDependencyState = (
   current: PackageJsonDependencyAnalysisItem,
