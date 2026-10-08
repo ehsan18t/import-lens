@@ -222,16 +222,27 @@ export const packageJsonSectionSummaryLabel = (
     0,
   );
   const missingCount = sectionStates.filter((state) => state.status === "missing").length;
+  // Counted on its own, never as unavailable: a package with nothing importable at its root is not
+  // broken, and its own line already says "no root entry".
+  const noRootEntryCount = sectionStates.filter(
+    (state) =>
+      state.status === "ready" &&
+      isNoRootEntryResult(state.result) &&
+      measuredSizes(state.result) === null,
+  ).length;
   const unavailableCount = sectionStates.filter(
     (state) =>
       state.status === "unavailable" ||
-      (state.status === "ready" && measuredSizes(state.result) === null),
+      (state.status === "ready" &&
+        measuredSizes(state.result) === null &&
+        !isNoRootEntryResult(state.result)),
   ).length;
   const loadingCount = sectionStates.filter((state) => state.status === "loading").length;
 
   if (
     measuredStates.length === 0 &&
     missingCount === 0 &&
+    noRootEntryCount === 0 &&
     unavailableCount === 0 &&
     loadingCount > 0
   ) {
@@ -245,6 +256,10 @@ export const packageJsonSectionSummaryLabel = (
 
   if (missingCount > 0) {
     parts.push(`${missingCount} not installed`);
+  }
+
+  if (noRootEntryCount > 0) {
+    parts.push(`${noRootEntryCount} no root entry`);
   }
 
   if (unavailableCount > 0) {

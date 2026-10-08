@@ -340,6 +340,36 @@ test("the package.json section summary names its sum a combined cost, not a size
   );
 });
 
+test("packageJsonSectionSummaryLabel counts a no-root-entry package apart from unavailable ones", () => {
+  const unmeasured = {
+    raw_bytes: null,
+    minified_bytes: null,
+    gzip_bytes: null,
+    brotli_bytes: null,
+    zstd_bytes: null,
+  };
+  const states: PackageJsonDependencyHintState[] = [
+    { name: "react", section: "dependencies", status: "ready", result: result() },
+    {
+      name: "firebase",
+      section: "dependencies",
+      status: "ready",
+      result: result({ ...unmeasured, unmeasured_stage: "no_root_entry" }),
+    },
+    {
+      name: "broken",
+      section: "dependencies",
+      status: "ready",
+      result: result({ ...unmeasured, error: "bundle failed" }),
+    },
+  ];
+
+  assert.equal(
+    packageJsonSectionSummaryLabel("dependencies", states, config()),
+    "1/3 measured · 1.5 kB br combined · 1 no root entry · 1 unavailable",
+  );
+});
+
 test("packageJsonDependencyVersionStatusLabel marks stale cached registry hints", () => {
   const label = packageJsonDependencyVersionStatusLabel({
     name: "react",
