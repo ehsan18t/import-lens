@@ -1,6 +1,6 @@
 export const compilerStackConfig = {
-  currentRolldownVersion: "1.2.12",
-  currentOxcVersion: "0.152.0",
+  currentRolldownVersion: "1.2.13",
+  currentOxcVersion: "0.153.0",
   currentResolverVersion: "11.24.3",
   // The glob matcher Rolldown itself reads `sideEffects` with
   // (`rolldown_common`, `rolldown_utils`, and oxc_resolver). The daemon matches
