@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import net from "node:net";
@@ -582,10 +582,7 @@ const startDaemon = async (workspaceRoot) => {
   const { cachePath, lifecyclePath } = resolveCliStoragePaths();
   await mkdir(cachePath, { recursive: true });
   await mkdir(lifecyclePath, { recursive: true });
-  const pipeName =
-    process.platform === "win32"
-      ? `\\\\.\\pipe\\import-lens-cli-${process.pid}-${randomUUID()}`
-      : path.join(lifecyclePath, `import-lens-cli-${process.pid}-${randomUUID()}.sock`);
+  const pipeName = daemonPipePath();
   const child = spawn(
     binary,
     ["--pipe", pipeName, "--workspace", workspaceRoot, "--storage", lifecyclePath],
@@ -631,6 +628,26 @@ const startDaemon = async (workspaceRoot) => {
       }
     },
   };
+};
+
+// `sun_path` holds 108 bytes on Linux and 104 on macOS, one of which is the terminating NUL. A
+// longer socket path makes the daemon's bind fail, so the gate could never start.
+const unixSocketPathLimit = (platform) => (platform === "darwin" ? 103 : 107);
+
+export const daemonPipePath = ({
+  platform = process.platform,
+  tmpDir = os.tmpdir(),
+  pid = process.pid,
+} = {}) => {
+  if (platform === "win32") {
+    return `\\\\.\\pipe\\import-lens-cli-${pid}-${randomUUID()}`;
+  }
+
+  const name = `il-${randomBytes(6).toString("hex")}.sock`;
+  const preferred = path.posix.join(tmpDir, name);
+  return Buffer.byteLength(preferred) <= unixSocketPathLimit(platform)
+    ? preferred
+    : path.posix.join("/tmp", name);
 };
 
 const cliPackageRoot = () => path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

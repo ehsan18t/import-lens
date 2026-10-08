@@ -9,6 +9,7 @@ import {
   analyzeFileWithDaemon,
   createDaemonClient,
   daemonBinaryPath,
+  daemonPipePath,
   EXIT_BUDGET_EXCEEDED,
   EXIT_COULD_NOT_MEASURE,
   isUsableFileSize,
@@ -619,6 +620,25 @@ test("resolveCliStoragePaths keeps daemon cache outside the project directory", 
     path.join("C:", "Users", "Ehsan", "AppData", "Local", "ImportLens", "daemon-lifecycle"),
   );
   assert.equal(paths.cachePath.startsWith(cwd), false);
+});
+
+test("daemonPipePath keeps a Unix socket path inside sun_path", () => {
+  const longTmpDir = `/home/runner/work/${"x".repeat(120)}/tmp`;
+  for (const [platform, limit] of [
+    ["linux", 107],
+    ["darwin", 103],
+  ]) {
+    const typical = daemonPipePath({ platform, tmpDir: "/home/runner/work/_temp" });
+    assert.equal(typical.startsWith("/home/runner/work/_temp/"), true, typical);
+    assert.ok(Buffer.byteLength(typical) <= limit, typical);
+
+    const fallback = daemonPipePath({ platform, tmpDir: longTmpDir });
+    assert.equal(fallback.startsWith("/tmp/"), true, fallback);
+    assert.ok(Buffer.byteLength(fallback) <= limit, fallback);
+  }
+
+  assert.notEqual(daemonPipePath({ platform: "linux" }), daemonPipePath({ platform: "linux" }));
+  assert.match(daemonPipePath({ platform: "win32", pid: 7 }), /^\\\\\.\\pipe\\import-lens-cli-7-/u);
 });
 
 test("createDaemonClient resolves concurrent responses by request id", async () => {
