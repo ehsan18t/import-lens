@@ -232,6 +232,36 @@ test("IpcClient emits one disconnect for external socket closure", async () => {
   }
 });
 
+test("IpcClient rejects a request sent after its socket closed instead of waiting out the timeout", async () => {
+  const pipeName = testPipeName();
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.destroy();
+  });
+  await listen(server, pipeName);
+
+  try {
+    const client = await IpcClient.connect(pipeName);
+    await new Promise<void>((resolve) => client.once("disconnect", () => resolve()));
+
+    await assert.rejects(client.requestExports(exportsRequest(1), 1000), /IPC client is closed/u);
+    await assert.rejects(
+      client.requestAnalyzePackageJson(packageJsonRequest(2), 1000),
+      /IPC client is closed/u,
+    );
+    await assert.rejects(
+      client.requestRefreshRegistryHints(registryRefreshRequest(3), 1000),
+      /IPC client is closed/u,
+    );
+    client.dispose();
+  } finally {
+    destroySockets(sockets);
+    await closeServer(server);
+  }
+});
+
 test("IpcClient emits package.json streaming partials and resolves final response", async () => {
   const pipeName = testPipeName();
   const sockets = new Set<net.Socket>();

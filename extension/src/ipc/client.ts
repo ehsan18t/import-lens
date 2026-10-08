@@ -53,6 +53,11 @@ interface PendingRegistryHintRefreshRequest {
   resetTimeout: () => void;
 }
 
+// Once closed, nothing will ever settle a new pending entry: the close already rejected and
+// cleared every map, and a write to the destroyed socket fails silently. A request then would
+// wait out its whole timeout (up to 300 s, with a progress notification up), so it fails at once.
+const closedClientError = (): Error => new Error("IPC client is closed");
+
 export class IpcClient extends EventEmitter {
   readonly #socket: net.Socket;
   readonly #decoder = new FrameDecoder();
@@ -132,6 +137,8 @@ export class IpcClient extends EventEmitter {
     timeoutMs = 10000,
     onPartial?: (response: AnalyzePackageJsonResponse) => void,
   ): Promise<AnalyzePackageJsonResponse> {
+    if (this.#closed) return Promise.reject(closedClientError());
+
     return new Promise((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
 
@@ -169,6 +176,8 @@ export class IpcClient extends EventEmitter {
     timeoutMs = 30000,
     onPartial?: (response: RefreshRegistryHintsResponse) => void,
   ): Promise<RefreshRegistryHintsResponse> {
+    if (this.#closed) return Promise.reject(closedClientError());
+
     return new Promise((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
 
@@ -257,6 +266,8 @@ export class IpcClient extends EventEmitter {
     request: TRequest & ClientMessage,
     timeoutMs: number,
   ): Promise<TResponse> {
+    if (this.#closed) return Promise.reject(closedClientError());
+
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (pendingMap.has(request.request_id)) {
