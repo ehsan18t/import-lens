@@ -1,9 +1,7 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { ImportLensConfig } from "../config.js";
-import { IpcClient } from "../ipc/client.js";
+import type { IpcClient } from "../ipc/client.js";
 import type {
   AnalyzeDocumentRequest,
   AnalyzeDocumentResponse,
@@ -32,11 +30,12 @@ import type {
 } from "../ipc/protocol.js";
 import { protocolVersion } from "../ipc/protocol.js";
 import type { Logger } from "../logging/types.js";
-import { knownDaemonHashes } from "./knownHashes.generated.js";
+import { type DaemonLauncher, nativeDaemonLauncher } from "./launcher.js";
 import { daemonPipeName } from "./pipeName.js";
 import { currentPlatformTarget, daemonRelativePath } from "./platform.js";
 import {
   cleanupFailedDaemonStartup,
+  type DaemonChildProcess,
   pipeDaemonProcessLogs,
   terminateProcess,
 } from "./processLifecycle.js";
@@ -70,10 +69,16 @@ export class NativeDaemonTransport implements AnalysisTransport {
   readonly #recycleGuard: RecycleGuard;
   readonly #stateListeners = new Set<(state: DaemonState) => void>();
   readonly #refreshedResultsListeners = new Set<(message: RefreshedResultsResponse) => void>();
-  #process: ChildProcessWithoutNullStreams | null = null;
+  #process: DaemonChildProcess | null = null;
   #client: IpcClient | null = null;
   #state: DaemonState = "unavailable";
   #isDisposed = false;
+  // Every caller of start(), the restart timer included, shares the attempt in flight: two
+  // concurrent attempts would each spawn a daemon, and the one overwritten would live on unowned.
+  #startPromise: Promise<DaemonState> | null = null;
+  // Bumped by shutdown(). An attempt that sees a different value after an await was superseded
+  // and must not spawn, connect, or report ready.
+  #startGeneration = 0;
   #restartAttempt = 0;
   #crashTimes: number[] = [];
   #restartTimer: NodeJS.Timeout | null = null;
@@ -88,17 +93,20 @@ export class NativeDaemonTransport implements AnalysisTransport {
   // manager supplies the active workspace folder's path.
   readonly #workspaceFallbackRoot: () => string | undefined;
   readonly #getConfig: () => ImportLensConfig;
+  readonly #launcher: DaemonLauncher;
 
   constructor(
     context: DaemonHostContext,
     logger: Logger,
     workspaceFallbackRoot: () => string | undefined,
     getConfig: () => ImportLensConfig,
+    launcher: DaemonLauncher = nativeDaemonLauncher,
   ) {
     this.#context = context;
     this.#logger = logger;
     this.#workspaceFallbackRoot = workspaceFallbackRoot;
     this.#getConfig = getConfig;
+    this.#launcher = launcher;
     this.#recycleGuard = new RecycleGuard(resolveDaemonStoragePaths(context).lifecycleStoragePath);
   }
 
@@ -126,13 +134,28 @@ export class NativeDaemonTransport implements AnalysisTransport {
     };
   };
 
-  async start(analysisRoot?: string): Promise<DaemonState> {
+  start(analysisRoot?: string): Promise<DaemonState> {
     // An explicit start() (including the one DaemonManager.restart() performs
     // after shutdown()) is a request to run, so clear the disposal latch that
     // shutdown() set. The auto-restart timer still checks #isDisposed before
     // calling start(), so a genuine dispose still prevents self-resurrection.
     this.#isDisposed = false;
-    if (this.#state === "ready" && this.#process && this.#client) return "ready";
+    if (this.#state === "ready" && this.#process && this.#client) return Promise.resolve("ready");
+
+    if (this.#startPromise) {
+      this.#logger.debug("Joining the daemon start already in flight.");
+      return this.#startPromise;
+    }
+
+    const attempt = this.#startDaemon(analysisRoot, this.#startGeneration).finally(() => {
+      if (this.#startPromise === attempt) this.#startPromise = null;
+    });
+    this.#startPromise = attempt;
+    return attempt;
+  }
+
+  async #startDaemon(analysisRoot: string | undefined, generation: number): Promise<DaemonState> {
+    const superseded = (): boolean => generation !== this.#startGeneration;
     this.#clearRestartTimer();
     this.#clearDisconnectTimer();
 
@@ -153,38 +176,21 @@ export class NativeDaemonTransport implements AnalysisTransport {
     }
     this.#logger.info(`Starting Import Lens daemon for workspace ${workspaceRoot}.`);
 
-    if (await this.#recycleGuard.shouldEnterDegradedMode()) {
-      this.#logger.warn("Daemon recycle loop detected. Import Lens is entering unavailable mode.");
+    const binaryPath = await this.#prepareLaunch();
+    if (superseded()) return this.#state;
+
+    if (!binaryPath) {
       this.#setState("unavailable");
       return this.#state;
     }
-
-    const target = currentPlatformTarget();
-
-    if (!target) {
-      this.#logger.warn(
-        `Unsupported platform ${process.platform}-${process.arch}; daemon unavailable.`,
-      );
-      this.#setState("unavailable");
-      return this.#state;
-    }
-
-    const relativeBinaryPath = daemonRelativePath(target);
-    const binaryPath = path.join(this.#context.extensionPath, relativeBinaryPath);
-
-    if (!(await this.#verifyBinary(relativeBinaryPath, binaryPath))) {
-      this.#setState("unavailable");
-      return this.#state;
-    }
-    this.#logger.info(`Daemon binary verified: ${relativeBinaryPath}.`);
 
     const storagePaths = resolveDaemonStoragePaths(this.#context);
-    await mkdir(storagePaths.lifecycleStoragePath, { recursive: true });
-    await mkdir(storagePaths.cacheBasePath, { recursive: true });
-
     const pipeName = daemonPipeName();
 
-    const childProcess = spawn(binaryPath, [
+    // Never orphan a live daemon: it would keep its socket and cache shard lock until it recycles.
+    if (this.#process) this.#cleanup();
+
+    const childProcess = this.#launcher.spawn(binaryPath, [
       "--pipe",
       pipeName,
       "--workspace",
@@ -202,17 +208,18 @@ export class NativeDaemonTransport implements AnalysisTransport {
         return;
       }
 
+      // The start that spawned this daemon may still be awaiting its connect. Release it so the
+      // restart this exit schedules begins a fresh attempt instead of joining a dead one.
+      this.#startPromise = null;
       void this.#handleProcessExit(code, signal);
     });
 
     let client: IpcClient;
 
     try {
-      client = await IpcClient.connect(pipeName, {
-        logger: this.#logger.child({ component: "ipc" }),
-      });
-      if (childProcess !== this.#process) {
-        client.dispose();
+      client = await this.#launcher.connect(pipeName, this.#logger.child({ component: "ipc" }));
+      if (superseded() || childProcess !== this.#process) {
+        cleanupFailedDaemonStartup(client, childProcess);
         return this.#state;
       }
 
@@ -223,7 +230,7 @@ export class NativeDaemonTransport implements AnalysisTransport {
         `Failed to connect to daemon: ${error instanceof Error ? error.message : String(error)}`,
       );
       cleanupFailedDaemonStartup(null, childProcess);
-      if (childProcess === this.#process) {
+      if (!superseded() && childProcess === this.#process) {
         this.#client = null;
         this.#process = null;
         this.#handleCrash();
@@ -273,6 +280,40 @@ export class NativeDaemonTransport implements AnalysisTransport {
     this.#logger.info("Import Lens daemon is ready.");
 
     return this.#state;
+  }
+
+  /**
+   * Everything that can rule a spawn out before it happens: the recycle-loop guard, a supported
+   * platform, and a verified binary. Returns the binary path, or null once the reason is logged.
+   */
+  async #prepareLaunch(): Promise<string | null> {
+    if (await this.#recycleGuard.shouldEnterDegradedMode()) {
+      this.#logger.warn("Daemon recycle loop detected. Import Lens is entering unavailable mode.");
+      return null;
+    }
+
+    const target = currentPlatformTarget();
+
+    if (!target) {
+      this.#logger.warn(
+        `Unsupported platform ${process.platform}-${process.arch}; daemon unavailable.`,
+      );
+      return null;
+    }
+
+    const relativeBinaryPath = daemonRelativePath(target);
+    const binaryPath = path.join(this.#context.extensionPath, relativeBinaryPath);
+
+    if (!(await this.#launcher.verifyBinary(relativeBinaryPath, binaryPath, this.#logger))) {
+      return null;
+    }
+    this.#logger.info(`Daemon binary verified: ${relativeBinaryPath}.`);
+
+    const storagePaths = resolveDaemonStoragePaths(this.#context);
+    await mkdir(storagePaths.lifecycleStoragePath, { recursive: true });
+    await mkdir(storagePaths.cacheBasePath, { recursive: true });
+
+    return binaryPath;
   }
 
   async #handleProcessExit(code: number | null, signal: NodeJS.Signals | null): Promise<void> {
@@ -636,6 +677,8 @@ export class NativeDaemonTransport implements AnalysisTransport {
 
   async shutdown(): Promise<void> {
     this.#isDisposed = true;
+    this.#startGeneration++;
+    this.#startPromise = null;
     this.#clearRestartTimer();
     if (this.#stabilityTimer) clearTimeout(this.#stabilityTimer);
     if (this.#cleanRecycleTimer) clearTimeout(this.#cleanRecycleTimer);
@@ -682,35 +725,6 @@ export class NativeDaemonTransport implements AnalysisTransport {
   #emitRefreshedResults(message: RefreshedResultsResponse): void {
     for (const listener of this.#refreshedResultsListeners) {
       listener(message);
-    }
-  }
-
-  async #verifyBinary(relativePath: string, binaryPath: string): Promise<boolean> {
-    const expectedHash = knownDaemonHashes[relativePath];
-
-    if (!expectedHash) {
-      this.#logger.warn(
-        `No trusted hash is available for ${relativePath}. Build the daemon and run pnpm hash:daemon.`,
-      );
-      return false;
-    }
-
-    try {
-      const actualHash = createHash("sha256")
-        .update(await readFile(binaryPath))
-        .digest("hex");
-
-      if (actualHash !== expectedHash) {
-        this.#logger.error(`Daemon hash mismatch for ${relativePath}.`);
-        return false;
-      }
-
-      return true;
-    } catch (error) {
-      this.#logger.warn(
-        `Daemon binary is unavailable at ${binaryPath}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      return false;
     }
   }
 
