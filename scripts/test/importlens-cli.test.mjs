@@ -523,6 +523,33 @@ test("analyzeFileWithDaemon reports a failed aggregate instead of aborting the r
   }
 });
 
+test("analyzeFileWithDaemon gives each file a distinct id and a build-length deadline", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "importlens-cli-ids-"));
+  const filePath = path.join(workspace, "app.ts");
+  writeFileSync(filePath, "export {};\n");
+  const requests = [];
+  const daemon = {
+    request: async (message, timeoutMs) => {
+      requests.push({ id: message.request_id, timeoutMs });
+      return { brotli_bytes: 0, imports: [], diagnostics: [] };
+    },
+  };
+
+  try {
+    await Promise.all([
+      analyzeFileWithDaemon(filePath, workspace, daemon),
+      analyzeFileWithDaemon(filePath, workspace, daemon),
+    ]);
+
+    assert.notEqual(requests[0].id, requests[1].id);
+    for (const { timeoutMs } of requests) {
+      assert.ok(timeoutMs > 10_000, `a cold file size outlives the default deadline: ${timeoutMs}`);
+    }
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 // The gate the CLI applies to the raw wire response, in isolation. The daemon's
 // `FileSizeComputation::is_file_cost` and the extension's `isDurableFileSize` are the same rule, and
 // a drift check holds all three together (file-size-usability-coordination.test.mjs).

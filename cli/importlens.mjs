@@ -29,6 +29,16 @@ const supportedExtensions = new Set([
   ".astro",
 ]);
 const defaultIpcTimeoutMs = 10000;
+// A wedge guard, not a budget: the daemon bounds each build itself (`BUILD_TIMEOUT`), and a cold
+// `force_fresh` file size waits for every per-import build plus the combined one.
+const fileSizeRequestTimeoutMs = 180000;
+
+let lastRequestId = 0;
+// Monotonic, so two requests issued within one millisecond never share an id.
+const takeRequestId = () => {
+  lastRequestId += 1;
+  return lastRequestId;
+};
 
 export const parseCliArgs = (argv) => {
   const [command, ...rest] = argv;
@@ -421,17 +431,20 @@ export const changedFiles = async (cwd, { base } = {}) => {
  */
 export const analyzeFileWithDaemon = async (filePath, workspaceRoot, daemon) => {
   const source = await readFile(filePath, "utf8");
-  const response = await daemon.request({
-    type: "file_size_document",
-    version: protocolVersion,
-    request_id: Date.now(),
-    workspace_root: workspaceRoot,
-    active_document_path: filePath,
-    source,
-    // CI budget checks must judge against the true current size — never a
-    // stale-while-revalidate value — so force a synchronous fresh recompute.
-    force_fresh: true,
-  });
+  const response = await daemon.request(
+    {
+      type: "file_size_document",
+      version: protocolVersion,
+      request_id: takeRequestId(),
+      workspace_root: workspaceRoot,
+      active_document_path: filePath,
+      source,
+      // CI budget checks must judge against the true current size — never a
+      // stale-while-revalidate value — so force a synchronous fresh recompute.
+      force_fresh: true,
+    },
+    fileSizeRequestTimeoutMs,
+  );
 
   // "Is there a size?", never "is there an error?". The old filter was `!item.error`, and a
   // transiently-degraded import carried `error: null` PLUS a fabricated size, so it sailed
