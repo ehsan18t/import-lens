@@ -9,8 +9,8 @@ use crate::{
             CacheStatusRequest, CacheStatusResponse, ClientMessage, CompleteImportMembersRequest,
             CompleteImportMembersResponse, FreshnessKind, ImportDiagnostic, PROTOCOL_VERSION,
             RefreshRegistryHintsResponse, RefreshedResultsResponse, RegistryHintResult,
-            WorkspaceReportRequest, WorkspaceReportResponse, WorkspaceReportSummary,
-            is_supported_protocol_version,
+            RegistryHintTarget, WorkspaceReportRequest, WorkspaceReportResponse,
+            WorkspaceReportSummary, is_supported_protocol_version,
         },
     },
     lifecycle::{LifecycleState, record_recycle_timestamp},
@@ -109,6 +109,32 @@ impl Drop for RegistryRefreshLifecycle {
     fn drop(&mut self) {
         self.cancel_all();
     }
+}
+
+/// The final response of a bulk registry refresh: one result per target a job answered, in target
+/// order. A slot no job filled is an error only while the block is live. Once a newer block for the
+/// same source cancelled it, the empty slots are work it skipped, and they are left out: reported as
+/// failures they would mark dependencies the newer block never named as failed, with nothing left
+/// to fetch them again.
+fn final_registry_results(
+    ordered: Vec<Option<RegistryHintResult>>,
+    targets: Vec<RegistryHintTarget>,
+    cancelled: bool,
+) -> Vec<RegistryHintResult> {
+    ordered
+        .into_iter()
+        .zip(targets)
+        .filter_map(|(result, target)| match result {
+            Some(result) => Some(result),
+            None if cancelled => None,
+            None => Some(RegistryHintResult {
+                target,
+                hint: None,
+                error: Some("registry refresh worker did not return a result".to_owned()),
+                origin: None,
+            }),
+        })
+        .collect()
 }
 
 /// Per-document cancellation for work a request left running or has not started yet: the SWR
@@ -882,6 +908,7 @@ where
                 // requests supersede each other connection-wide.
                 let source = request.source.clone().unwrap_or_default();
                 let cancelled = lifecycles.registry_refresh.start_new_block(&source);
+                let block_cancelled = Arc::clone(&cancelled);
                 let final_targets = targets.clone();
                 let target_count = targets.len();
 
@@ -891,7 +918,7 @@ where
                     now_ms,
                     cancelled,
                     move |index, result| {
-                        // A skipped job reports `None`; the collector fills its slot below.
+                        // A skipped job reports `None`; `final_registry_results` decides what its slot means.
                         if let Some(result) = result {
                             let _ = partial_tx.send((index, result));
                         }
@@ -927,20 +954,11 @@ where
                     // Every job finished or was skipped: persist in one snapshot write.
                     flush_service.flush_registry_hints();
 
-                    let results = ordered_results
-                        .into_iter()
-                        .zip(final_targets)
-                        .map(|(result, target)| {
-                            result.unwrap_or(RegistryHintResult {
-                                target,
-                                hint: None,
-                                error: Some(
-                                    "registry refresh worker did not return a result".to_owned(),
-                                ),
-                                origin: None,
-                            })
-                        })
-                        .collect();
+                    let results = final_registry_results(
+                        ordered_results,
+                        final_targets,
+                        block_cancelled.load(Ordering::Acquire),
+                    );
 
                     queue_response(
                         &outbound,
@@ -1648,8 +1666,9 @@ fn restrict_unix_socket_permissions(pipe_name: &str) -> Result<(), Box<dyn Error
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentBuildGate, DocumentTaskLifecycle, RegistryRefreshLifecycle, TASK_JOIN_TIMEOUT,
-        queue_response, reap_finished_tasks, wait_for_active_tasks,
+        DocumentBuildGate, DocumentTaskLifecycle, RegistryHintResult, RegistryHintTarget,
+        RegistryRefreshLifecycle, TASK_JOIN_TIMEOUT, final_registry_results, queue_response,
+        reap_finished_tasks, wait_for_active_tasks,
     };
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -1810,6 +1829,36 @@ mod tests {
         assert!(hidden.load(Ordering::Acquire));
         let reopened = lifecycle.start_document("C:/ws", "C:/ws/b.ts");
         assert!(!reopened.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_cancelled_registry_block_omits_the_targets_it_skipped() {
+        let target = |name: &str| RegistryHintTarget {
+            name: name.to_owned(),
+            installed_version: None,
+        };
+        let answered = RegistryHintResult {
+            target: target("react"),
+            hint: None,
+            error: None,
+            origin: None,
+        };
+        let ordered = vec![Some(answered.clone()), None];
+        let targets = vec![target("react"), target("lodash")];
+
+        assert_eq!(
+            final_registry_results(ordered.clone(), targets.clone(), true),
+            vec![answered.clone()],
+            "a superseded block's skipped target is not a failure"
+        );
+
+        let live = final_registry_results(ordered, targets, false);
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0], answered);
+        assert!(
+            live[1].error.is_some(),
+            "a live block with no answer for a target reports the failure"
+        );
     }
 
     #[test]
