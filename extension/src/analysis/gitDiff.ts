@@ -8,6 +8,11 @@ const execFileAsync = promisify(execFile);
 // "too large to diff cheaply" (no badges), keeping mid-keystroke work bounded.
 const maxLcsCells = 4_000_000;
 
+// `git show` returns a committed UTF-8 BOM as U+FEFF, while VS Code strips it from the document
+// text, so line 0 of every BOM-encoded file would read as changed.
+const withoutByteOrderMark = (text: string): string =>
+  text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+
 /**
  * Returns the 0-based line numbers in `current` that are inserted or replaced
  * relative to `base`, computed with a line-level longest-common-subsequence.
@@ -15,12 +20,14 @@ const maxLcsCells = 4_000_000;
  */
 export const changedLinesBetween = (base: string, current: string): Set<number> => {
   const changed = new Set<number>();
-  if (base === current) {
+  const baseText = withoutByteOrderMark(base);
+  const currentText = withoutByteOrderMark(current);
+  if (baseText === currentText) {
     return changed;
   }
 
-  const before = base.split(/\r?\n/u);
-  const after = current.split(/\r?\n/u);
+  const before = baseText.split(/\r?\n/u);
+  const after = currentText.split(/\r?\n/u);
 
   let start = 0;
   while (start < before.length && start < after.length && before[start] === after[start]) {

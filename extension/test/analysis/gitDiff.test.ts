@@ -35,3 +35,7 @@ test("CRLF base against LF buffer compares by line content", () => {
 test("identical inputs mark nothing", () => {
   assert.equal(changedLinesBetween("a\nb\n", "a\nb\n").size, 0);
 });
+
+test("a byte-order mark on the committed text is not a change", () => {
+  assert.equal(changedLinesBetween("﻿import a from 'a';\nb\n", "import a from 'a';\nb\n").size, 0);
+});
