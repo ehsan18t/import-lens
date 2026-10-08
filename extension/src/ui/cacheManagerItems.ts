@@ -29,24 +29,27 @@ export type CacheClearScope =
   | "registry"
   | "everything";
 
+const cacheByteUnits = ["kB", "MB", "GB"] as const;
+
+/**
+ * Cache sizes in 1024-based units, the way `importLens.cacheMaxSizeMB` (and the daemon's budget)
+ * counts a megabyte. One decimal below 10 of a unit, so 1.4 MB is not shown as "1 MB"; a value that
+ * would round up to 1024 of a unit is shown as 1 of the next ("1.0 MB", never "1024 kB").
+ */
 export const formatCacheBytes = (bytes: number): string => {
   if (bytes < 1024) {
     return `${bytes} B`;
   }
 
-  const kilobytes = bytes / 1024;
+  let value = bytes / 1024;
+  let unit = 0;
 
-  if (kilobytes < 1024) {
-    return `${Math.round(kilobytes)} kB`;
+  while (unit < cacheByteUnits.length - 1 && Math.round(value) >= 1024) {
+    value /= 1024;
+    unit += 1;
   }
 
-  const megabytes = kilobytes / 1024;
-
-  if (megabytes < 1024) {
-    return `${Math.round(megabytes)} MB`;
-  }
-
-  return `${(megabytes / 1024).toFixed(1)} GB`;
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${cacheByteUnits[unit]}`;
 };
 
 const entriesLabel = (count: number): string => `${count} entr${count === 1 ? "y" : "ies"}`;

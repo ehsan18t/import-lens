@@ -74,7 +74,7 @@ test("cacheManagerActionItems renders the E-status observability fields", () => 
   // Headroom + project count + registry size.
   assert.equal(usage?.detail, "370 MB free - 3 projects - registry 512 kB");
   // Per-project size + entry count + last used.
-  assert.equal(current?.description, "2 kB - 5 entries");
+  assert.equal(current?.description, "2.0 kB - 5 entries");
   assert.equal(current?.detail, "Last used 2d ago");
 });
 
@@ -168,6 +168,9 @@ test("an orphan purge that removed no shard still reports what it scrubbed", () 
 
 test("formatCacheBytes scales units", () => {
   assert.equal(formatCacheBytes(512), "512 B");
-  assert.equal(formatCacheBytes(2048), "2 kB");
+  assert.equal(formatCacheBytes(2048), "2.0 kB");
   assert.equal(formatCacheBytes(142 * 1024 * 1024), "142 MB");
+  assert.equal(formatCacheBytes(1.49 * 1024 * 1024), "1.5 MB");
+  assert.equal(formatCacheBytes(1023.6 * 1024), "1.0 MB");
+  assert.equal(formatCacheBytes(3 * 1024 * 1024 * 1024), "3.0 GB");
 });
